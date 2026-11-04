@@ -12,8 +12,8 @@
 //! Enforcement happens at the TCP accept boundary: the plain-HTTP and
 //! startup RPC listeners run a manual accept loop (see
 //! `rpc::server::spawn_plain_surface`) that calls [`is_allowed`] on the
-//! peer's source IP for each connection and answers `403 Forbidden` to
-//! any non-allowlisted, non-loopback source — jsonrpsee's high-level
+//! peer's source IP for each connection and closes the connection of any
+//! non-allowlisted, non-loopback source without a reply, as Core v32 does — jsonrpsee's high-level
 //! `Server::start` never exposes the peer address to HTTP middleware, so
 //! a tower layer couldn't do this. The static "must allowlist before
 //! exposing" validation in `Config::load` is a complementary guard that
@@ -111,9 +111,8 @@ pub fn is_allowed(ip: IpAddr, allow: &[IpAllowEntry]) -> bool {
 /// JSON-RPC, and that answer covers both transports.
 ///
 /// A denied peer is refused before the TLS handshake, so it never takes
-/// a connection-cap permit and never sees a certificate — unlike the
-/// plain-HTTP path, which is already speaking HTTP and can answer
-/// `403 Forbidden`.
+/// a connection-cap permit and never sees a certificate. The plain-HTTP
+/// path closes a denied peer's connection the same way.
 pub fn tls_listener_denies(ip: IpAddr, allow: &[IpAllowEntry]) -> bool {
     !allow.is_empty() && !is_allowed(ip, allow)
 }

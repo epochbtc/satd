@@ -396,9 +396,15 @@ unconditionally.
 
 Every PSBT method — `decodepsbt`, `analyzepsbt`, `combinepsbt`,
 `joinpsbts`, `utxoupdatepsbt`, `finalizepsbt` — accepts a version 2 PSBT
-and answers with a version 2 PSBT. Bitcoin Core does not: it rejects any
-PSBT whose `PSBT_GLOBAL_VERSION` is above zero. Version 0 behaviour is
-unchanged, so nothing you already do moves.
+and answers with a version 2 PSBT. Bitcoin Core does the same since v32;
+up to v31 it rejected any PSBT whose `PSBT_GLOBAL_VERSION` was above zero.
+Version 0 behaviour is unchanged, so nothing you already do moves.
+
+One difference in defaults: Core v32's `createpsbt` and `converttopsbt`
+build a version 2 PSBT unless told `psbt_version=0`. satd's build version 0
+unless told `psbt_version=2`, and `converttopsbt` builds version 0 only: it
+refuses `psbt_version=2` by name rather than answering with a version 0
+PSBT.
 
 Version 2 matters because BIP 375, which is how a wallet sends to a
 silent payment address through a PSBT, is version 2 only. Its fields are
@@ -413,8 +419,8 @@ this node on its way between two wallets that do understand it.
 ### What `decodepsbt` returns
 
 A version 2 PSBT decodes to a different shape from a version 0 one.
-Field names follow Bitcoin Core's own version 2 pull request wherever it
-has one.
+Field names follow Bitcoin Core v32's wherever it has one. `unique_id` and
+the silent payment fields are satd's own.
 
 ```jsonc
 {
@@ -474,10 +480,10 @@ reader most needs to see.
 
 ### Creating one: `createpsbt psbt_version=2`
 
-`createpsbt` takes a trailing optional `psbt_version`. It defaults to 0, so
-every existing call is unaffected, and it sits **after** Core's own
-`replaceable` and `version` arguments so a positional call written against
-Core keeps meaning what it meant.
+`createpsbt` takes a trailing optional `psbt_version`, after `replaceable`
+and `version`: the same slot Core v32 gives it, so a positional call reads
+the same on both. satd defaults it to 0, so every existing call is
+unaffected; Core v32 defaults it to 2.
 
 ```sh
 sat-cli createpsbt \

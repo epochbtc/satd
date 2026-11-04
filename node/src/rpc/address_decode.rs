@@ -207,22 +207,10 @@ fn check_characters(s: &str) -> Vec<usize> {
 /// character indices most likely to be wrong.
 pub fn locate_errors(s: &str) -> (String, Vec<usize>) {
     if s.len() > CHAR_LIMIT {
-        // Core builds one index per character past the limit (`bech32.cpp`:
-        // `resize` then `iota`) with no upper bound, and satd, like Core,
-        // reaches this for any string carrying the network's HRP. At the
-        // 20 MiB body limit that turns one request into ~160 MB of indices
-        // and several hundred MB of serialized array -- per concurrent
-        // caller, on a read-only method.
-        //
-        // The locations are a diagnostic pointing at what to fix, and this
-        // message already says the entire tail is the problem, so cap the
-        // list. The bound is far past any string a person could have meant
-        // as an address -- Core's own functional-test vector for this case
-        // is 108 characters, and a valid address is at most 90 -- so the
-        // reported positions stay identical to Core's in practice.
-        const MAX_TOO_LONG_LOCATIONS: usize = 256;
-        let end = s.len().min(CHAR_LIMIT + MAX_TOO_LONG_LOCATIONS);
-        return ("Bech32 string too long".to_string(), (CHAR_LIMIT..end).collect());
+        // Core v32 reports the one position where the string passes the
+        // limit (`src/bech32.cpp:405-407` at v32.1). Core up to v31 listed
+        // every position past it, unbounded.
+        return ("Bech32 string too long".to_string(), vec![CHAR_LIMIT]);
     }
     let bad = check_characters(s);
     if !bad.is_empty() {
@@ -646,14 +634,14 @@ mod tests {
     use super::*;
 
     /// The vectors are Core's own, from `test/functional/rpc_invalid_address_message.py`
-    /// at v31.1 -- the same strings and the same expected positions.
+    /// at v32.1 -- the same strings and the same expected positions.
     #[test]
     fn error_locations_match_core() {
         let cases: &[(&str, &str, &[usize])] = &[
             (
                 "bcrt1q049edschfnwystcqnsvyfpj23mpsg3jcedq9xv049edschfnwystcqnsvyfpj23mpsg3jcedq9xv049edschfnwystcqnsvyfpj23m",
                 "Bech32 string too long",
-                &[90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107],
+                &[90],
             ),
             ("bcrt1q049edschfnwystcqnsvyfpj23mpsg3jcedq9xv", "Invalid Bech32 checksum", &[9]),
             ("bcrt1qax9suht3qv95sw33xavx8crpxduefdrsvgsklu", "Invalid Bech32 checksum", &[22, 43]),
@@ -683,13 +671,8 @@ mod tests {
         let s = format!("bc1{}", "q".repeat(200_000));
         let (msg, locations) = locate_errors(&s);
         assert_eq!(msg, "Bech32 string too long");
-        assert!(
-            locations.len() <= 256,
-            "the location list must stay bounded, got {}",
-            locations.len()
-        );
-        // Still points at the first offending character, as Core does.
-        assert_eq!(locations.first(), Some(&CHAR_LIMIT));
+        // Core v32: the one position where the string passes the limit.
+        assert_eq!(locations, vec![CHAR_LIMIT]);
     }
 
     /// The same input driven through the *whole* decoder, and mixed-case so

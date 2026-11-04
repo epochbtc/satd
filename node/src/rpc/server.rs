@@ -887,8 +887,8 @@ fn parse_estimatesmartfee_options(
 /// loop (jsonrpsee's high-level `Server::start()` never surfaces the
 /// peer `SocketAddr` to the HTTP middleware, so a tower layer can't see
 /// it). A connection whose source IP is neither loopback nor inside a
-/// listed CIDR is answered with `403 Forbidden` and never reaches the
-/// RPC methods. An empty allowlist means loopback-only; the static
+/// listed CIDR is closed without a reply, as Core v32 does, and never
+/// reaches the RPC methods. An empty allowlist means loopback-only; the static
 /// "must allowlist before exposing" check in `Config::load` keeps a
 /// non-loopback bind from ever running without an allowlist.
 #[allow(clippy::too_many_arguments)]
@@ -4971,8 +4971,7 @@ async fn spawn_readonly_listeners(
 /// [`crate::rpc::allowip::tls_listener_denies`]. A denied peer is dropped
 /// at accept, before the handshake and before a connection-cap permit is
 /// taken, so it costs the listener nothing and holds no slot. (The plain
-/// surface answers `403 Forbidden` instead, because by the time it has a
-/// decision it is already speaking HTTP.)
+/// surface does the same, as Core v32 does.)
 ///
 /// The accept loop terminates when the returned [`ServerHandle`] is
 /// stopped — either by the composite [`RpcServerHandle::stop`] call
@@ -5315,17 +5314,11 @@ async fn spawn_tls_surface(
 /// allowlist. A peer past this is dropped at accept.
 pub const DENIED_IN_FLIGHT: usize = 16;
 
-/// How long a refused peer has to send its request before the `403` is
-/// written anyway, and to read it before the socket closes. Fixed, not
-/// `-rpcservertimeout`: that can be `0`, and a refused peer gets no
-/// indefinite hold.
-const DENIED_DEADLINE: Duration = Duration::from_secs(2);
-
 /// What a plain RPC listener does with an accepted socket.
 enum PlainAdmit {
     /// Allowlisted: serve it under a slot of the connection cap.
     Serve(tokio::sync::OwnedSemaphorePermit),
-    /// Outside the allowlist: answer `403` under a refusal slot.
+    /// Outside the allowlist: close it under a refusal slot.
     Refuse(tokio::sync::OwnedSemaphorePermit),
     /// No slot free in the pool the socket needed.
     Drop { denied: bool },
@@ -5353,28 +5346,15 @@ fn admit_plain(
     }
 }
 
-/// Answer a peer outside the allowlist with `403 Forbidden` and close,
-/// without HTTP parsing. It waits up to [`DENIED_DEADLINE`] for the
-/// request to arrive, so the reply follows it the way Core's does, then
-/// writes the reply and closes whether or not anything came.
-async fn refuse_forbidden<S>(mut stream: S)
+/// Close the connection of a peer outside the allowlist without a reply.
+/// Core v32 aborts such a connection at accept, before any HTTP is
+/// exchanged (`HTTPServer::...` in `src/httpserver.cpp:847-853` at v32.1:
+/// "Socket destroyed, connection aborted"); Core up to v31 answered `403`.
+async fn refuse_denied<S>(stream: S)
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    const BODY: &str = "403 Forbidden: source IP not permitted\n";
-    let reply = format!(
-        "HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\
-         Connection: close\r\n\r\n{BODY}",
-        BODY.len(),
-    );
-    let mut buf = [0u8; 4096];
-    let _ = tokio::time::timeout(DENIED_DEADLINE, stream.read(&mut buf)).await;
-    let _ = tokio::time::timeout(DENIED_DEADLINE, async {
-        stream.write_all(reply.as_bytes()).await?;
-        stream.shutdown().await
-    })
-    .await;
+    drop(stream);
 }
 
 /// Bind one plain-HTTP RPC listener and spawn its accept loop, enforcing
@@ -5386,8 +5366,9 @@ where
 /// so a tower layer cannot make an allow/deny decision on the source IP.
 /// Instead we mirror the TLS surface's manual loop: accept the TCP
 /// connection (where the peer addr IS known), decide allow/deny once for
-/// the whole connection, and either serve the real RPC stack or answer
-/// `403 Forbidden` and close (see [`admit_plain`] and [`refuse_forbidden`]).
+/// the whole connection, and either serve the real RPC stack or close the
+/// connection without a reply, as Core v32 does (see [`admit_plain`] and
+/// [`refuse_denied`]).
 ///
 /// Batch limits, WebSocket upgrades and graceful shutdown are preserved
 /// because the per-connection service is the same `to_service_builder()
@@ -5399,8 +5380,8 @@ where
 /// serve task is spawned, and held for the whole connection, so a flood of
 /// idle connections can't exhaust fds/tasks. At capacity the socket is
 /// dropped. A denied peer never draws on that pool: the allowlist is
-/// decided first, and the `403` is written from a small pool of its own
-/// ([`DENIED_IN_FLIGHT`]) under a fixed deadline, so peers outside the
+/// decided first, and a denied connection is closed without a reply under a
+/// small pool of its own ([`DENIED_IN_FLIGHT`]), so peers outside the
 /// allowlist cannot fill the slots allowlisted clients and `sat-cli` need.
 ///
 /// `max_connections` MUST match `server_cfg`'s connection cap; callers
@@ -5550,7 +5531,7 @@ pub async fn spawn_plain_surface(
                     }
                     tokio::spawn(async move {
                         let _permit = p;
-                        refuse_forbidden(stream).await;
+                        refuse_denied(stream).await;
                     });
                     continue;
                 }
@@ -6055,33 +6036,20 @@ mod tls_surface_tests {
         drop((served, refused));
     }
 
-    /// A refused peer is answered `403` with `Connection: close` and the
-    /// socket is closed, with no HTTP stack involved; one that sends
-    /// nothing still gets the reply after the fixed deadline.
+    /// A refused peer's connection is closed without a reply, as Core v32
+    /// aborts it at accept; it is not answered `403` as before.
     #[tokio::test]
-    async fn a_refused_peer_gets_a_403_and_eof() {
+    async fn a_refused_peer_is_closed_without_a_reply() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let (mut client, server) = tokio::io::duplex(8192);
-        let task = tokio::spawn(refuse_forbidden(server));
-        client
+        let task = tokio::spawn(refuse_denied(server));
+        let _ = client
             .write_all(b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\n\r\n{}")
-            .await
-            .unwrap();
-        let mut reply = String::new();
-        client.read_to_string(&mut reply).await.unwrap();
+            .await;
+        let mut reply = Vec::new();
+        client.read_to_end(&mut reply).await.unwrap();
         task.await.unwrap();
-        assert!(reply.starts_with("HTTP/1.1 403 Forbidden\r\n"), "{reply}");
-        assert!(reply.contains("Connection: close\r\n"), "{reply}");
-        let (head, body) = reply.split_once("\r\n\r\n").unwrap();
-        assert!(head.contains(&format!("Content-Length: {}", body.len())), "{reply}");
-
-        tokio::time::pause();
-        let (mut silent, server) = tokio::io::duplex(8192);
-        let task = tokio::spawn(refuse_forbidden(server));
-        let mut reply = String::new();
-        silent.read_to_string(&mut reply).await.unwrap();
-        task.await.unwrap();
-        assert!(reply.starts_with("HTTP/1.1 403 Forbidden\r\n"), "{reply}");
+        assert!(reply.is_empty(), "no reply is written: {:?}", String::from_utf8_lossy(&reply));
     }
 
     #[tokio::test]

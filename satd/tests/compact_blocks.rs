@@ -1659,3 +1659,29 @@ fn an_outbound_peer_is_sent_sendheaders_in_the_handshake_and_only_then() {
     let after = peer.collect_for(Duration::from_secs(2));
     assert_eq!(sendheaders_count(&after), 0, "once per connection: {after:?}");
 }
+
+/// Under `-blocksonly` every `cmpctblock` is ignored, as Core v32 does
+/// (`net_processing.cpp:4790-4793` at v32.1), even for a block the node asked
+/// this peer for after its header: the block does not connect from the
+/// compact form, and does from the full block sent after it.
+#[test]
+fn a_blocksonly_node_ignores_a_requested_cmpctblock() {
+    let node = TestNode::start(&["--blocksonly"]);
+    let wallet = DeterministicWallet::from_secret([0x5e; 32]);
+    node.rpc_ok("generatetoaddress", vec![json!(1), json!(wallet.address.to_string())]);
+    let port = node.p2p_port.unwrap();
+    let mut peer = RawPeer::connect(port);
+    poll_until(|| peer_count(&node) == 1, test_timeout(20), "peer must connect");
+
+    let tip = block_at(&node, &best_hash(&node));
+    let b = build_block(&tip, 2, vec![], true, 61_000);
+    peer.send(NetworkMessage::Headers(vec![b.header]));
+    let asked = peer.recv_until(is_block_request_for(b.block_hash()), test_timeout(20));
+    assert!(asked.is_some(), "the announced block is requested");
+    let compact = HeaderAndShortIds::from_block(&b, 7, 2, &[]).unwrap();
+    peer.send(cmpct(compact));
+    std::thread::sleep(Duration::from_secs(2));
+    assert_ne!(best_hash(&node), b.block_hash(), "the compact block must be ignored");
+    peer.send(NetworkMessage::Block(b.clone()));
+    poll_until(|| best_hash(&node) == b.block_hash(), test_timeout(20), "the full block connects");
+}

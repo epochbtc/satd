@@ -374,7 +374,7 @@ reason = "no-qt"
 file = "interface_http.py"
 status = "skip"
 reason = "needs-triage"
-note = "measured 2026-11-03 at v32.1 (ran under v31.1): L237 check_excessive_request_size expects 'HTTPResponse (status code: 400' in the debug log for an oversized request; not found. Core v32 rewrote this test (1,000 lines changed)"
+note = "measured 2026-11-03 at v32.1 (ran under v31.1): Core v32 rewrote this test for its new HTTP server. Run one check at a time, 17 of its 23 checks pass and 6 fail: check_excessive_request_size (L237, no 'HTTPResponse (status code: 400' logged for an oversized request), check_chunked_transfer (an oversized chunked body gets no '413 Content too large'), check_whitespace_in_headers (the connection is gone before the reply), check_connection_limit (-rpcmaxconnections, which satd does not implement), check_pipelined_data_is_throttled (no read throttling of pipelined requests) and check_slow_read_throttle (no write-side throttling). Follow-up: HTTP server parity with Core v32 (connection cap, request-size limits and their 400/413 answers, header validation, read and write throttling)"
 
 [[test]]
 file = "interface_ipc.py"
@@ -616,9 +616,7 @@ note = "re-measured 2026-09-28 with low-bandwidth compact fetch (#867): make_utx
 
 [[test]]
 file = "p2p_compactblocks_blocksonly.py"
-status = "skip"
-reason = "needs-triage"
-note = "measured 2026-11-03 at v32.1 (ran under v31.1): L170 assert self.ignores_cmpctblock(0, p2p_conn_blocksonly, solicited=True) fails, in the subtest v32 added for a solicited cmpctblock to a blocks-only node"
+status = "run"
 
 [[test]]
 file = "p2p_compactblocks_hb.py"
@@ -761,9 +759,7 @@ status = "run"
 
 [[test]]
 file = "p2p_nobloomfilter_messages.py"
-status = "skip"
-reason = "needs-triage"
-note = "measured 2026-11-03 at v32.1 (ran under v31.1): L30 test_message_causes_disconnect times out waiting for the disconnect"
+status = "run"
 
 [[test]]
 file = "p2p_node_network_limited.py"
@@ -852,9 +848,7 @@ status = "run"
 
 [[test]]
 file = "p2p_tx_download.py"
-status = "skip"
-reason = "needs-triage"
-note = "measured 2026-11-03 at v32.1 (ran under v31.1): L356 test_duplicate_tx_inv: assert_equal(log.count(inv_a_log), 1) is 0 == 1, a debug-log line v32 greps for"
+status = "run"
 
 [[test]]
 file = "p2p_tx_privacy.py"
@@ -890,9 +884,7 @@ status = "run"
 
 [[test]]
 file = "rpc_bind.py"
-status = "skip"
-reason = "needs-triage"
-note = "measured 2026-11-03 at v32.1 (ran under v31.1; --ipv4 and --ipv6 pass): --nonloopback L177 expects a disallowed source IP to get a connection error; satd answers 403 Forbidden, which is what v31.1 asserted. Core v32 drops the connection instead"
+status = "run"
 
 [[test]]
 file = "rpc_blockchain.py"
@@ -985,9 +977,7 @@ status = "run"
 
 [[test]]
 file = "rpc_invalid_address_message.py"
-status = "skip"
-reason = "needs-triage"
-note = "measured 2026-11-03 at v32.1 (ran under v31.1): L59 a too-long Bech32 string reports error_locations [90..107] where v32 expects [90]"
+status = "run"
 
 [[test]]
 file = "rpc_invalidateblock.py"
