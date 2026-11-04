@@ -64,6 +64,7 @@ fn addr(last: u8) -> SocketAddr {
 
 fn deliver(pm: &PeerManager, id: PeerId, msg: NetworkMessage) {
     pm.handle_message(id, msg, InFlight::adopt(None));
+    pm.wait_for_headers();
 }
 
 fn connected(pm: &PeerManager, id: PeerId) -> bool {
