@@ -1271,6 +1271,11 @@ pub struct PeerManager {
     /// without this the service exists but is reachable only by peers handed
     /// the address out of band. Set once at startup.
     advertised_onion: RwLock<Option<PeerAddr>>,
+    /// Every onion host of ours: each one ever advertised this run (kept
+    /// while the service is withdrawn during a Tor restart) and every
+    /// `-externalip` onion, advertised or not. `getaddr` replies never
+    /// carry one.
+    own_onions: RwLock<std::collections::HashSet<String>>,
     /// `-whitelist` permission entries (by source subnet). Set once at
     /// startup; consulted on every peer connect to compute permissions.
     whitelist: RwLock<Vec<crate::net::permissions::WhitelistEntry>>,
@@ -1671,6 +1676,7 @@ impl PeerManager {
             test_resolver: RwLock::new(None),
             external_addrs: RwLock::new(Vec::new()),
             advertised_onion: RwLock::new(None),
+            own_onions: RwLock::new(std::collections::HashSet::new()),
             whitelist: RwLock::new(Vec::new()),
             // Core's rule off regtest: routable addresses only. Regtest keeps
             // private ones, which lab networks run on.
@@ -2072,7 +2078,15 @@ impl PeerManager {
             return;
         }
         tracing::info!(onion = %host, port, "Advertising hidden service to peers");
+        self.own_onions.write().insert(host.to_ascii_lowercase());
         *self.advertised_onion.write() = Some(PeerAddr::Onion { host, port });
+    }
+
+    /// Record onion hosts of ours that are not advertised (the
+    /// `-externalip` onions after the first), so `getaddr` never hands one
+    /// out.
+    pub fn add_own_onions(&self, hosts: impl IntoIterator<Item = String>) {
+        self.own_onions.write().extend(hosts.into_iter().map(|h| h.to_ascii_lowercase()));
     }
 
     /// Stop advertising an onion address: the hidden service is gone (#973).
@@ -2235,17 +2249,13 @@ impl PeerManager {
         self.proxy.is_some() && crate::net::is_routable(addr.ip())
     }
 
-    /// Whether `addr` is one of ours: the onion we advertise (any port), or
-    /// the IP of an `-externalip` address. A `getaddr` reply never carries
-    /// one: our onion arriving from our clearnet IP, or the other way round,
-    /// would link the two.
+    /// Whether `addr` is one of ours: an onion of ours (any port; see
+    /// `own_onions`), or the IP of an `-externalip` address. A `getaddr`
+    /// reply never carries one: our onion arriving from our clearnet IP, or
+    /// the other way round, would link the two.
     fn is_own_address(&self, addr: &PeerAddr) -> bool {
         match addr {
-            PeerAddr::Onion { host, .. } => self
-                .advertised_onion
-                .read()
-                .as_ref()
-                .is_some_and(|ours| matches!(ours, PeerAddr::Onion { host: h, .. } if h.eq_ignore_ascii_case(host))),
+            PeerAddr::Onion { host, .. } => self.own_onions.read().contains(&host.to_ascii_lowercase()),
             PeerAddr::Socket(sa) => {
                 let ip = sa.ip().to_canonical();
                 self.external_addrs.read().iter().any(|e| e.ip().to_canonical() == ip)
@@ -2258,16 +2268,20 @@ impl PeerManager {
     /// `addrv2` if it asked for that and `addr` otherwise. `None` if there
     /// are none, or the peer is an onion peer.
     fn self_advertise_externals(&self, id: PeerId) -> Option<NetworkMessage> {
-        let (peer_v4, wants_v2, onion) = {
+        let (peer_v4, wants_v2, onion, hidden) = {
             let peers = self.peers.read();
             let h = peers.get(&id).filter(|h| h.info.relays_addrs())?;
             let v4 = match h.info.addr.ip() {
                 IpAddr::V4(_) => true,
                 IpAddr::V6(v6) => v6.to_ipv4_mapped().is_some(),
             };
-            (v4, h.info.wants_addrv2, h.info.onion_host.is_some())
+            (v4, h.info.wants_addrv2, h.info.onion_host.is_some(), self.link_hides_our_ip(&h.info))
         };
-        if onion {
+        // A link that hides our IP is told our onion (`self_advertise_addrv2`)
+        // when we have one; our IP beside it would link the two. With no
+        // onion to announce, a proxied peer still learns `-externalip`, as
+        // Core's would.
+        if onion || (hidden && self.advertised_onion.read().is_some()) {
             return None;
         }
         let services = self.local_services();
@@ -14880,13 +14894,12 @@ impl PeerManager {
             .unwrap_or_default()
             .as_secs() as i64;
 
-        // Advertise our first declared external address (`-externalip`)
-        // as addr_from; fall back to the unspecified address otherwise.
-        let sender = self
-            .advertisable_external_addrs()
-            .first()
-            .copied()
-            .unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], 0)));
+        // `addr_from` is a dummy, as Core's `PushNodeVersion` sends
+        // (`CService{}`): our addresses go out in `addr`/`addrv2`, where
+        // the link decides which one (`self_advertise_*`). Sending
+        // `-externalip` here told every peer, onion and proxied ones
+        // included, our clearnet IP.
+        let sender = SocketAddr::from(([0, 0, 0, 0], 0));
 
         VersionMessage {
             version: PROTOCOL_VERSION,

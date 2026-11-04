@@ -236,7 +236,8 @@ fn an_unroutable_externalip_is_never_advertised() {
 
     pm.set_external_addrs(vec![SocketAddr::from(([10, 1, 2, 3], 8333)), public]);
     let version = pm.build_version_message(SocketAddr::from(([198, 51, 100, 7], 8333)), ConnType::OutboundFullRelay);
-    assert_eq!(version.sender.socket_addr().ok(), Some(public), "the sender is the first routable address");
+    let dummy = SocketAddr::from(([0, 0, 0, 0], 0));
+    assert_eq!(version.sender.socket_addr().ok(), Some(dummy), "addr_from is Core's dummy, never -externalip");
 }
 
 /// A block-relay-only link carries no address traffic, so neither our
@@ -320,7 +321,7 @@ fn our_own_addresses_never_come_back_in_getaddr() {
     let (pm, _dir) = mk_pm();
     let external = SocketAddr::from(([44, 33, 22, 11], 8333));
     pm.external_addrs.write().push(external);
-    *pm.advertised_onion.write() = Some(PeerAddr::Onion { host: OUR_ONION.to_string(), port: 8333 });
+    pm.set_advertised_onion(OUR_ONION.to_string(), 8333);
     let stranger = SocketAddr::from(([5, 6, 7, 8], 8333));
     let entry = |addr| GetAddrEntry { addr, time: 1, services: ServiceFlags::NETWORK };
     let planted = vec![
@@ -335,4 +336,55 @@ fn our_own_addresses_never_come_back_in_getaddr() {
         let got: Vec<PeerAddr> = pm.getaddr_reply(key, false).into_iter().map(|e| e.addr).collect();
         assert_eq!(got, vec![PeerAddr::Socket(stranger)], "only the stranger is handed out (onion listener: {onion})");
     }
+}
+
+/// Every onion of ours stays out of `getaddr`: one withdrawn while Tor
+/// restarts, and an `-externalip` onion the node does not advertise.
+/// Perturbation: compare against `advertised_onion` alone and both are
+/// handed out.
+#[test]
+fn withdrawn_and_unadvertised_onions_of_ours_stay_out_of_getaddr() {
+    let (pm, _dir) = mk_pm();
+    let spare = "b".repeat(56) + ".onion";
+    pm.set_advertised_onion(OUR_ONION.to_string(), 8333);
+    pm.clear_advertised_onion();
+    pm.add_own_onions([spare.clone()]);
+    let stranger = SocketAddr::from(([5, 6, 7, 8], 8333));
+    let entry = |addr| GetAddrEntry { addr, time: 1, services: ServiceFlags::NETWORK };
+    let key = GetAddrCacheKey { bind: None, onion: false };
+    pm.addr_response_cache.lock().insert(
+        key,
+        (
+            u64::MAX,
+            vec![
+                entry(PeerAddr::Socket(stranger)),
+                entry(PeerAddr::Onion { host: OUR_ONION.to_string(), port: 8333 }),
+                entry(PeerAddr::Onion { host: spare.to_uppercase(), port: 9999 }),
+            ],
+        ),
+    );
+    let got: Vec<PeerAddr> = pm.getaddr_reply(key, false).into_iter().map(|e| e.addr).collect();
+    assert_eq!(got, vec![PeerAddr::Socket(stranger)]);
+}
+
+/// A link that hides our IP is told our onion and not our `-externalip`:
+/// both on one link would tie them together. With no onion to announce, a
+/// peer reached through `-proxy` still learns `-externalip`. A direct
+/// clearnet peer gets `-externalip` either way. Perturbation: drop the
+/// `hidden` clause and the proxied peer is sent both.
+#[test]
+fn a_link_that_hides_our_ip_never_gets_both_our_onion_and_our_ip() {
+    let (pm, _dir) = mk_pm_with_proxy(Some("127.0.0.1:9050".to_string()));
+    pm.external_addrs.write().push(SocketAddr::from(([44, 33, 22, 11], 8333)));
+    let mut proxied = peer(1, SocketAddr::from(([44, 44, 44, 7], 8333)), Direction::Outbound);
+    proxied.wants_addrv2 = true;
+    let _p = add_peer(&pm, proxied);
+    let _d = add_peer(&pm, peer(2, SocketAddr::from(([10, 1, 2, 3], 8333)), Direction::Outbound));
+    assert!(pm.self_advertise_externals(1).is_some(), "no onion yet: the proxied peer learns -externalip");
+
+    pm.set_advertised_onion(OUR_ONION.to_string(), 8333);
+    assert!(pm.self_advertise_addrv2(1).is_some(), "the proxied peer is told the onion");
+    assert!(pm.self_advertise_externals(1).is_none(), "and so not our IP");
+    assert!(pm.self_advertise_addrv2(2).is_none(), "a direct peer is not told the onion");
+    assert!(pm.self_advertise_externals(2).is_some(), "but still learns -externalip");
 }

@@ -2971,6 +2971,7 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
     } else if let Some((host, port)) = &externalip_onion {
         peer_manager.set_advertised_onion(host.clone(), *port);
     }
+    peer_manager.add_own_onions(config.externalip_onion.iter().map(|(h, _)| h.clone()));
     if config.externalip_onion.len() > 1 {
         tracing::warn!(
             "satd advertises one onion address; the other -externalip .onion entries are not advertised"
