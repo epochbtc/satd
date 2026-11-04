@@ -2085,6 +2085,13 @@ impl Mempool {
         )
     }
 
+    /// The floor every fee estimate is clamped to (sat/kvB): the rolling
+    /// minimum, the relay floor and 1 sat/vB, whichever is highest. See
+    /// [`crate::mempool::estimate::estimate_floor_sat_per_kvb`].
+    pub fn fee_estimate_floor(&self) -> u64 {
+        crate::mempool::estimate::estimate_floor_sat_per_kvb(self.min_fee(), self.min_fee_rate())
+    }
+
     /// Current maximum mempool size in bytes.
     pub fn max_size_bytes(&self) -> usize {
         self.config.read().max_size_bytes
@@ -10508,6 +10515,47 @@ mod tests {
             1_000,
             "an empty pool decays four times as fast and lands back on the incremental fee"
         );
+    }
+
+    /// A full mempool floors `estimatesmartfee` at the rolling minimum: the
+    /// history answer would name a rate this node refuses to relay. The same
+    /// call on the uncongested pool returns the history value untouched.
+    #[test]
+    fn a_full_mempool_floors_estimatesmartfee_at_the_rolling_minimum() {
+        use crate::mempool::estimate::{
+            EstimateMode, EstimateSource, FeeRateEstimator, estimate_smart_fee,
+        };
+        use crate::mempool::fee::FeeEstimator;
+
+        let cheap_op = outpoint(0xE1);
+        let rich_op = outpoint(0xE2);
+        let (cs, mp, _dir) =
+            make_funded_env(&[(cheap_op, coin(100_000)), (rich_op, coin(100_000))]);
+        mp.accept_transaction(tx_from(&[cheap_op], &[(99_000, 0xD1)]), &cs, &NoopVerifier, TxSource::Rpc, false)
+            .expect("cheap");
+        mp.accept_transaction(tx_from(&[rich_op], &[(50_000, 0xD2)]), &cs, &NoopVerifier, TxSource::Rpc, false)
+            .expect("rich");
+
+        let history = FeeEstimator::new();
+        history.record_block(&[5_000; 50]); // 5 sat/vB at every percentile
+
+        let calm = estimate_smart_fee(&mp, &history, 6, EstimateMode::Historical, FeeRateEstimator::Auto)
+            .expect("history answers");
+        assert_eq!(calm.feerate_sat_per_kvb, 5_000, "uncongested: the history value");
+        assert_eq!(calm.estimator, EstimateSource::BlockPolicy);
+
+        let mut inner = mp.inner.write();
+        let half = inner.total_bytes / 2;
+        Mempool::evict_lowest_fee_entries(&mut inner, half, false, 1_000);
+        drop(inner);
+        let rolling = mp.info().mempool_min_fee;
+        assert!(rolling > 5_000, "the eviction must lift the minimum past history ({rolling})");
+
+        let full = estimate_smart_fee(&mp, &history, 6, EstimateMode::Historical, FeeRateEstimator::Auto)
+            .expect("history answers");
+        assert_eq!(full.feerate_sat_per_kvb, rolling, "full: the rolling minimum");
+        assert_eq!(full.estimator, EstimateSource::Floor);
+        assert_eq!(full.blocks, 6);
     }
 
     /// Eviction sets the rolling minimum to the evicted package's feerate plus

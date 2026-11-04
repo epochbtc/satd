@@ -9,7 +9,7 @@ use serde_json::json;
 /// Esplora `/fee-estimates` endpoint and Electrum `blockchain.estimatefee`.
 /// Rates are sat/kvB internally; we surface both BTC/kvB and sat/vB.
 pub fn estimate_fee(ctx: &McpContext, targets: &[u32]) -> String {
-    let floor_sat_per_kvb = ctx.mempool.min_fee_rate().max(1_000);
+    let floor_sat_per_kvb = ctx.mempool.fee_estimate_floor();
     let sf = smart_fees(
         // Fee-estimation surface (design §2.4): the template view, so a tx
         // quarantined `on template` can't inflate the quote — matching the

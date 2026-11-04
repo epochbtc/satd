@@ -806,32 +806,69 @@ fn try_acquire_blockfile_audit(
 /// `EstimateMode` references in this module keep resolving.
 pub use crate::mempool::estimate::EstimateMode;
 
-/// Resolve a single `estimatesmartfee` target into a feerate (sat/kvB).
-///
-/// Isolated so `estimatesmartfee` can stay Core-compatible: the response
-/// shape never changes; only the source of the number does. The mempool sim
-/// is built lazily — `Historical` mode (the Core-compatible default) never
-/// touches the snapshot.
-fn resolve_feerate_sat_per_kvb<F>(
-    mode: EstimateMode,
-    target: u32,
-    fee_estimator: &crate::mempool::fee::FeeEstimator,
-    floor_sat_per_kvb: u64,
-    snapshot_fn: F,
-) -> u64
-where
-    F: FnOnce() -> Vec<(bitcoin::Txid, crate::mempool::pool::MempoolEntry)>,
-{
-    if mode == EstimateMode::Historical {
-        return fee_estimator.estimate_fee(target).unwrap_or(floor_sat_per_kvb);
+/// `estimatesmartfee`'s `options` argument (Core 32.1).
+struct EstimateSmartFeeOptions {
+    fee_rate_estimator: crate::mempool::estimate::FeeRateEstimator,
+    verbosity: i64,
+}
+
+/// Parse `estimatesmartfee`'s `options` with Core 32.1's type checks
+/// (`rpc/fees.cpp`): an object or null, `fee_rate_estimator` a string and
+/// `verbosity` an integer. satd is more lenient than Core in two ways
+/// (`CORE_DIFFERENCES.md`): an unknown `fee_rate_estimator` value means
+/// `auto` rather than `-8`, and an unknown key is ignored rather than
+/// refused with `-3 Unexpected key`.
+fn parse_estimatesmartfee_options(
+    arg: Option<&serde_json::Value>,
+) -> Result<EstimateSmartFeeOptions, ErrorObjectOwned> {
+    let mut out = EstimateSmartFeeOptions {
+        fee_rate_estimator: crate::mempool::estimate::FeeRateEstimator::Auto,
+        verbosity: 1,
+    };
+    let obj = match arg {
+        None | Some(serde_json::Value::Null) => return Ok(out),
+        Some(serde_json::Value::Object(obj)) => obj,
+        Some(other) => {
+            return Err(ErrorObjectOwned::owned(
+                -3,
+                format!(
+                    "JSON value of type {} is not of expected type object",
+                    json_type_name(other),
+                ),
+                None::<()>,
+            ));
+        }
+    };
+    let field_type_error = |field: &str, value: &serde_json::Value, want: &str| {
+        ErrorObjectOwned::owned(
+            -3,
+            format!(
+                "JSON value of type {} for field {field} is not of expected type {want}",
+                json_type_name(value),
+            ),
+            None::<()>,
+        )
+    };
+    match obj.get("fee_rate_estimator") {
+        None | Some(serde_json::Value::Null) => {}
+        Some(serde_json::Value::String(s)) => {
+            out.fee_rate_estimator = crate::mempool::estimate::FeeRateEstimator::parse(Some(s));
+        }
+        Some(other) => return Err(field_type_error("fee_rate_estimator", other, "string")),
     }
-    let est = crate::mempool::estimate::estimate_from_mempool(
-        snapshot_fn(),
-        (target as usize).min(crate::mempool::estimate::MAX_SIM_DEPTH),
-    );
-    let (rate, _conf, _fallback) =
-        crate::mempool::estimate::resolve_target(&est, fee_estimator, target, mode, floor_sat_per_kvb);
-    rate
+    match obj.get("verbosity") {
+        None | Some(serde_json::Value::Null) => {}
+        Some(v @ serde_json::Value::Number(n)) => {
+            out.verbosity = n
+                .as_i64()
+                .ok_or_else(|| field_type_error("verbosity", v, "integer"))?;
+        }
+        Some(other) => return Err(field_type_error("verbosity", other, "number")),
+    }
+    // Any other key is ignored. Core refuses it (`Unexpected key`); satd
+    // treats it as it treats an unknown `fee_rate_estimator` value, and
+    // answers (CORE_DIFFERENCES.md).
+    Ok(out)
 }
 
 /// Start the JSON-RPC HTTP server with authentication.
@@ -2706,7 +2743,7 @@ pub async fn start(
         if args.is_empty() {
             return Err(ErrorObjectOwned::owned(
                 -1,
-                "estimatesmartfee conf_target ( \"estimate_mode\" )\n\nEstimates the approximate fee per kilobyte needed for a transaction.\n",
+                "estimatesmartfee conf_target ( \"estimate_mode\" options )\n\nEstimates the approximate fee per kilobyte needed for a transaction.\n",
                 None::<()>,
             ));
         }
@@ -2745,6 +2782,19 @@ pub async fn start(
         } else {
             None
         };
+        // Arg 2 (optional): Core 32.1's `options`. Its type is checked with
+        // the other arguments', its contents after `conf_target` and
+        // `estimate_mode`, in Core's order.
+        if let Some(other) = args.get(2).filter(|v| !v.is_object() && !v.is_null()) {
+            return Err(ErrorObjectOwned::owned(
+                -3,
+                format!(
+                    "JSON value of type {} is not of expected type object",
+                    json_type_name(other),
+                ),
+                None::<()>,
+            ));
+        }
 
         // Validate estimate_mode if provided
         if let Some(ref mode) = mode_str
@@ -2769,19 +2819,42 @@ pub async fn start(
             ));
         }
 
+        let options = parse_estimatesmartfee_options(args.get(2))?;
         let mode = EstimateMode::parse(mode_str.as_deref()).unwrap_or(EstimateMode::Historical);
 
         let unit = default_unit();
-        let floor_sat_per_kvb = ctx.mempool.info().min_fee_rate.max(1_000);
-        let sat_per_kvb =
-            resolve_feerate_sat_per_kvb(mode, conf_target, &ctx.fee_estimator, floor_sat_per_kvb, || {
-                ctx.mempool.get_template_entries()
-            });
-        let mut response = serde_json::json!({
-            "feerate": format_feerate_sat_per_kvb(sat_per_kvb, unit),
-            "blocks": conf_target,
-            "errors": [],
-        });
+        let estimate = crate::mempool::estimate::estimate_smart_fee(
+            &ctx.mempool,
+            &ctx.fee_estimator,
+            conf_target,
+            mode,
+            options.fee_rate_estimator,
+        );
+        // Core's field order: `feerate` or `errors`, then `estimator`, then
+        // `blocks`. `errors` appears only when there is one, and `estimator`
+        // only with a feerate.
+        let mut response = serde_json::Map::new();
+        let blocks = match estimate {
+            Ok(answer) => {
+                response.insert(
+                    "feerate".into(),
+                    format_feerate_sat_per_kvb(answer.feerate_sat_per_kvb, unit),
+                );
+                response.insert("estimator".into(), answer.estimator.as_str().into());
+                answer.blocks
+            }
+            Err(err) => {
+                response.insert("errors".into(), serde_json::json!([err.reason]));
+                err.blocks
+            }
+        };
+        response.insert("blocks".into(), blocks.into());
+        if options.verbosity >= 2 {
+            // Core's per-block mempool health statistics. satd does not
+            // record them yet, so the list is empty.
+            response.insert("mempool_health_statistics".into(), serde_json::json!([]));
+        }
+        let mut response = serde_json::Value::Object(response);
         annotate_units(&mut response, unit);
         Ok::<_, ErrorObjectOwned>(response)
     })?;
@@ -2906,7 +2979,7 @@ pub async fn start(
         let mode = EstimateMode::parse(mode_str.as_deref()).unwrap_or(EstimateMode::Blend);
 
         let unit = default_unit();
-        let floor_sat_per_kvb = ctx.mempool.info().min_fee_rate.max(1_000);
+        let floor_sat_per_kvb = ctx.mempool.fee_estimate_floor();
         // Single source of truth: blend/mempool/historical selection,
         // monotonicity clamp, and economy tier all happen in `smart_fees`,
         // shared with MCP / Esplora / Electrum.

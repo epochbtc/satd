@@ -455,7 +455,7 @@ fn build_at(ctx: &MetricsContext, sources: &StatusSources, now: u64) -> StatusSn
             bytes: info.bytes,
             min_fee_rate_sat_vb: info.min_fee_rate as f64 / 1000.0,
         },
-        fees: (!syncing).then(|| fees(ctx, sources, info.min_fee_rate)),
+        fees: (!syncing).then(|| fees(ctx, sources)),
         latest_block: if syncing {
             None
         } else {
@@ -536,14 +536,14 @@ fn index_states(ctx: &MetricsContext, sources: &StatusSources) -> Vec<NamedIndex
 
 /// The smart-fee ladder every other fee surface serves, from the same
 /// 3-second simulation cache Esplora and Electrum share.
-fn fees(ctx: &MetricsContext, sources: &StatusSources, min_fee_rate: u64) -> Fees {
+fn fees(ctx: &MetricsContext, sources: &StatusSources) -> Fees {
     let est = sources.fee_estimator.cached_mempool_estimate(&ctx.mempool);
     let sf = crate::mempool::estimate::smart_fees_from_estimate(
         &est,
         &sources.fee_estimator,
         &[1, 3, 6],
         crate::mempool::estimate::EstimateMode::Blend,
-        min_fee_rate.max(1_000),
+        ctx.mempool.fee_estimate_floor(),
     );
     let at = |t: u32| {
         sf.targets

@@ -50,6 +50,7 @@ It includes every fix shipped in 0.7.1:
 - Operator: AssumeUTXO background validation retries a failed block connect instead of stopping, its three alerts reach the `status` stream, webhooks and `satd_alert_active` as well as `getwarnings`, and new `satd_assumeutxo_*` gauges show its progress (#557).
 - Streaming: `Subscribe` and `Watch` responses carry the stream's head cursor in a `satd-head-cursor` header, and the Go and Rust resilient watch and subscription resume from it, so a drop before the first confirmed event no longer loses what was in flight (#777).
 - Packaging: the Nix build of `satd` no longer depends on the build host's CPU; jemalloc's address width, page and hugepage size are pinned on x86_64, and `flake.lock` is committed so a rebuild of a tag evaluates the same Nix inputs; the x86_64 Linux release tarballs pin the same jemalloc constants (#321).
+- RPC: `estimatesmartfee` takes Core 32.1's shape (`options.fee_rate_estimator`, `options.verbosity`, `estimator`, `blocks` as answered, target 1 served as 2, Core's no-data `errors`), and every fee surface floors at the rolling mempool minimum; new, not yet the new estimator (#1200).
 - The C++ script engine is Bitcoin Core's interpreter through `libbitcoinkernel`
   instead of `libbitcoinconsensus`, which redid a transaction's signature
   hashing for every input. About 27x faster on a 3,373-input signet block,

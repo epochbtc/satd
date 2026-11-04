@@ -1185,7 +1185,7 @@ pub fn estimatefee(state: &ElectrumState, params: Value) -> Result<Value, JsonRp
     // Electrum agrees with the JSON-RPC `estimatefees`, the TUI and Esplora.
     // Unauthenticated surface, so the expensive mempool simulation comes from
     // the shared short-TTL cache instead of being rebuilt per request.
-    let floor_sat_per_kvb = state.mempool.min_fee_rate().max(1_000);
+    let floor_sat_per_kvb = state.mempool.fee_estimate_floor();
     let est = state.fee_estimator.cached_mempool_estimate(&state.mempool);
     let sf = node::mempool::estimate::smart_fees_from_estimate(
         &est,

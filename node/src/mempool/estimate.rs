@@ -618,6 +618,176 @@ pub fn resolve_target(
     }
 }
 
+/// The lowest feerate satd's own fee policy lets any estimate quote, in
+/// sat/kvB: 1 sat/vB.
+///
+/// Core floors `estimatesmartfee` at `max(GetMinFee(), minrelaytxfee)` and
+/// has no constant of its own (`rpc/fees.cpp`). satd keeps this one on top
+/// until the estimator rework decides whether to follow Core below 1 sat/vB.
+pub const ESTIMATE_FLOOR_SAT_PER_KVB: u64 = 1_000;
+
+/// The floor every fee estimate is clamped to (sat/kvB): the larger of the
+/// rolling mempool minimum (Core's `GetMinFee`), the relay floor
+/// (`-minrelaytxfee`) and [`ESTIMATE_FLOOR_SAT_PER_KVB`].
+///
+/// Without the rolling minimum a full mempool lets an estimate name a rate
+/// this node would itself refuse to relay.
+pub fn estimate_floor_sat_per_kvb(rolling_min_fee: u64, min_relay_fee: u64) -> u64 {
+    rolling_min_fee
+        .max(min_relay_fee)
+        .max(ESTIMATE_FLOOR_SAT_PER_KVB)
+}
+
+/// `estimatesmartfee`'s `options.fee_rate_estimator` (Core 32.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FeeRateEstimator {
+    /// `auto`, the default.
+    Auto,
+    /// `block_policy`: the history estimator alone.
+    BlockPolicy,
+    /// `mempool_policy`: the mempool simulator alone.
+    MempoolPolicy,
+}
+
+impl FeeRateEstimator {
+    /// Parse the option, case-insensitively as Core does.
+    ///
+    /// Unlike Core, which refuses any other value with `-8`, an unknown value
+    /// (`none`, the empty string, a typo) means `auto`: a caller written
+    /// against a later or earlier vocabulary gets the default answer rather
+    /// than no answer. See `CORE_DIFFERENCES.md`.
+    pub fn parse(s: Option<&str>) -> Self {
+        match s.map(|s| s.to_ascii_lowercase()).as_deref() {
+            Some("block_policy") => Self::BlockPolicy,
+            Some("mempool_policy") => Self::MempoolPolicy,
+            _ => Self::Auto,
+        }
+    }
+}
+
+/// Which side produced an `estimatesmartfee` answer, reported as its
+/// `estimator` field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EstimateSource {
+    /// The history estimator.
+    BlockPolicy,
+    /// The mempool simulator.
+    MempoolPolicy,
+    /// Neither: the estimate was below the floor
+    /// ([`estimate_floor_sat_per_kvb`]), which set the answer.
+    Floor,
+}
+
+impl EstimateSource {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::BlockPolicy => "block_policy",
+            Self::MempoolPolicy => "mempool_policy",
+            Self::Floor => "floor",
+        }
+    }
+}
+
+/// A successful `estimatesmartfee` answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SmartFeeAnswer {
+    /// sat/kvB, already floored.
+    pub feerate_sat_per_kvb: u64,
+    /// The target the estimate was found at (Core's `blocks`).
+    pub blocks: u32,
+    pub estimator: EstimateSource,
+}
+
+/// An `estimatesmartfee` call with nothing to answer from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SmartFeeError {
+    /// Core's `blocks` alongside `errors`.
+    pub blocks: u32,
+    pub reason: &'static str,
+}
+
+/// Core's error when the block policy estimator has no answer
+/// (`policy/fees/block_policy_estimator.cpp`, `EstimateFeeRate`).
+pub const INSUFFICIENT_DATA: &str = "Insufficient data or no feerate found";
+
+/// The mempool estimator's only target in Core 32.1
+/// (`MEMPOOL_FEE_ESTIMATOR_MAX_TARGET`): `mempool_policy` always answers, and
+/// reports, 2 blocks.
+pub const MEMPOOL_POLICY_TARGET: u32 = 2;
+
+/// `estimatesmartfee`, in Core 32.1's shape.
+///
+/// - The source: `fee_rate_estimator=block_policy` is the history estimator
+///   and `mempool_policy` the simulator. `auto` follows `mode`, which for
+///   Core's `unset` / `economical` / `conservative` is the history estimator;
+///   satd's own `mempool` / `blend` modes keep their meaning.
+/// - `blocks`: target 1 is served as 2, as Core's block policy estimator
+///   does, and `mempool_policy` always answers for 2 blocks, as Core's
+///   mempool estimator does.
+/// - With no history, the history path answers Core's
+///   `Insufficient data or no feerate found` with `blocks: 0`, which is what
+///   a Core node with no fee data reports.
+/// - Every answer is floored at [`estimate_floor_sat_per_kvb`]. When the floor
+///   is what set the number, `estimator` says `floor`.
+pub fn estimate_smart_fee(
+    mempool: &crate::mempool::pool::Mempool,
+    fee_estimator: &FeeEstimator,
+    conf_target: u32,
+    mode: EstimateMode,
+    fee_rate_estimator: FeeRateEstimator,
+) -> Result<SmartFeeAnswer, SmartFeeError> {
+    let floor = mempool.fee_estimate_floor();
+    let source_mode = match fee_rate_estimator {
+        FeeRateEstimator::BlockPolicy => EstimateMode::Historical,
+        FeeRateEstimator::MempoolPolicy => EstimateMode::Mempool,
+        FeeRateEstimator::Auto => mode,
+    };
+    let target = if fee_rate_estimator == FeeRateEstimator::MempoolPolicy {
+        MEMPOOL_POLICY_TARGET
+    } else {
+        conf_target.max(2)
+    };
+    // The raw rate and the side it came from, before the floor. A simulator
+    // answer is read with a zero floor so that "the queue says nothing" (an
+    // empty or thin block) reads as 0 and is attributed to the floor below.
+    let (raw, source) = match source_mode {
+        EstimateMode::Historical => match fee_estimator.estimate_fee(target) {
+            Some(h) => (h, EstimateSource::BlockPolicy),
+            None => {
+                return Err(SmartFeeError {
+                    blocks: 0,
+                    reason: INSUFFICIENT_DATA,
+                });
+            }
+        },
+        EstimateMode::Mempool => {
+            let est = fee_estimator.cached_mempool_estimate(mempool);
+            (target_estimate(&est, target, 0).0, EstimateSource::MempoolPolicy)
+        }
+        EstimateMode::Blend => {
+            let est = fee_estimator.cached_mempool_estimate(mempool);
+            let (mp, conf) = target_estimate(&est, target, 0);
+            if matches!(conf, Confidence::High | Confidence::Medium) {
+                (mp, EstimateSource::MempoolPolicy)
+            } else if let Some(h) = fee_estimator.estimate_fee(target) {
+                (h, EstimateSource::BlockPolicy)
+            } else {
+                (0, EstimateSource::Floor)
+            }
+        }
+    };
+    let (feerate_sat_per_kvb, estimator) = if raw < floor {
+        (floor, EstimateSource::Floor)
+    } else {
+        (raw, source)
+    };
+    Ok(SmartFeeAnswer {
+        feerate_sat_per_kvb,
+        blocks: target,
+        estimator,
+    })
+}
+
 /// Compute smart fees for a set of confirmation targets — the unified entry
 /// point behind every fee surface.
 ///
@@ -1302,5 +1472,112 @@ mod tests {
         let sf = smart_fees(Vec::new(), &est, &[1, 1008], EstimateMode::Blend, 1_000);
         assert_eq!(sf.targets.len(), 2);
         assert!(sf.targets[0].feerate_sat_per_kvb >= sf.targets[1].feerate_sat_per_kvb);
+    }
+
+    // ---- estimatesmartfee, Core 32.1 shape ----
+
+    fn empty_pool() -> crate::mempool::pool::Mempool {
+        crate::mempool::pool::Mempool::new(300_000_000, 1_000)
+    }
+
+    /// A history whose p90 (target 1) and p75 (target 2) differ, so serving
+    /// target 1 as 2 is visible in the number.
+    fn spread_history() -> FeeEstimator {
+        let est = FeeEstimator::new();
+        let rates: Vec<u64> = (1..=100).map(|i| i * 1_000).collect();
+        est.record_block(&rates);
+        assert_ne!(est.estimate_fee(1), est.estimate_fee(2));
+        est
+    }
+
+    #[test]
+    fn fee_rate_estimator_unknown_values_mean_auto() {
+        // Core refuses these with -8; satd answers them as `auto`.
+        for v in [None, Some("none"), Some(""), Some("foo"), Some("AUTO")] {
+            assert_eq!(FeeRateEstimator::parse(v), FeeRateEstimator::Auto, "{v:?}");
+        }
+        // Case-insensitive, as Core's `FeeRateEstimatorTypeFromString`.
+        assert_eq!(FeeRateEstimator::parse(Some("Block_Policy")), FeeRateEstimator::BlockPolicy);
+        assert_eq!(FeeRateEstimator::parse(Some("MEMPOOL_POLICY")), FeeRateEstimator::MempoolPolicy);
+    }
+
+    #[test]
+    fn estimate_floor_is_the_highest_of_rolling_relay_and_one_sat_per_vb() {
+        assert_eq!(estimate_floor_sat_per_kvb(0, 100), ESTIMATE_FLOOR_SAT_PER_KVB);
+        assert_eq!(estimate_floor_sat_per_kvb(0, 2_500), 2_500);
+        assert_eq!(estimate_floor_sat_per_kvb(7_000, 2_500), 7_000);
+    }
+
+    #[test]
+    fn estimate_smart_fee_serves_target_one_as_two() {
+        let pool = empty_pool();
+        let est = spread_history();
+        let one = estimate_smart_fee(&pool, &est, 1, EstimateMode::Historical, FeeRateEstimator::Auto)
+            .expect("history answers");
+        assert_eq!(one.blocks, 2);
+        assert_eq!(Some(one.feerate_sat_per_kvb), est.estimate_fee(2));
+        assert_eq!(one.estimator, EstimateSource::BlockPolicy);
+        // Every other target is answered where it was asked.
+        let six = estimate_smart_fee(&pool, &est, 6, EstimateMode::Historical, FeeRateEstimator::Auto)
+            .unwrap();
+        assert_eq!(six.blocks, 6);
+        assert_eq!(Some(six.feerate_sat_per_kvb), est.estimate_fee(6));
+    }
+
+    #[test]
+    fn estimate_smart_fee_without_history_is_cores_insufficient_data() {
+        let pool = empty_pool();
+        let est = FeeEstimator::new();
+        for fre in [FeeRateEstimator::Auto, FeeRateEstimator::BlockPolicy] {
+            let err = estimate_smart_fee(&pool, &est, 6, EstimateMode::Historical, fre)
+                .expect_err("no history, no answer");
+            assert_eq!(err, SmartFeeError { blocks: 0, reason: INSUFFICIENT_DATA });
+        }
+    }
+
+    #[test]
+    fn mempool_policy_answers_for_two_blocks_and_names_the_floor() {
+        let pool = empty_pool();
+        let est = FeeEstimator::new();
+        for target in [1, 6, 144] {
+            let a = estimate_smart_fee(
+                &pool,
+                &est,
+                target,
+                EstimateMode::Historical,
+                FeeRateEstimator::MempoolPolicy,
+            )
+            .expect("the simulator always answers");
+            assert_eq!(a.blocks, MEMPOOL_POLICY_TARGET, "target {target}");
+            // An empty pool says nothing: the floor set the number.
+            assert_eq!(a.estimator, EstimateSource::Floor);
+            assert_eq!(a.feerate_sat_per_kvb, pool.fee_estimate_floor());
+        }
+    }
+
+    #[test]
+    fn block_policy_overrides_a_satd_mode() {
+        // `fee_rate_estimator` picks the source; `estimate_mode=mempool` is
+        // only followed under `auto`.
+        let pool = empty_pool();
+        let est = spread_history();
+        let a = estimate_smart_fee(&pool, &est, 6, EstimateMode::Mempool, FeeRateEstimator::BlockPolicy)
+            .unwrap();
+        assert_eq!(a.estimator, EstimateSource::BlockPolicy);
+        let b = estimate_smart_fee(&pool, &est, 6, EstimateMode::Mempool, FeeRateEstimator::Auto)
+            .unwrap();
+        assert_eq!(b.estimator, EstimateSource::Floor);
+        assert_eq!(b.blocks, 6);
+    }
+
+    #[test]
+    fn a_history_below_the_floor_is_floored_and_says_so() {
+        let pool = empty_pool();
+        let est = FeeEstimator::new();
+        est.record_block(&[100; 50]); // 0.1 sat/vB, below 1 sat/vB
+        let a = estimate_smart_fee(&pool, &est, 6, EstimateMode::Historical, FeeRateEstimator::Auto)
+            .unwrap();
+        assert_eq!(a.feerate_sat_per_kvb, ESTIMATE_FLOOR_SAT_PER_KVB);
+        assert_eq!(a.estimator, EstimateSource::Floor);
     }
 }
