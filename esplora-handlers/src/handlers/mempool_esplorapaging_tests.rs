@@ -60,6 +60,7 @@ fn fee_estimates_map_keeps_simulated_targets_and_leaves_out_floored_ones() {
         sim_blocks,
         histogram: Vec::new(),
         mempool_weight: 6_490_000,
+        template_percentiles: Default::default(),
     };
     let sf = smart_fees_from_estimate(
         &est,

@@ -2850,6 +2850,9 @@ pub async fn start(
             conf_target,
             mode,
             options.fee_rate_estimator,
+            // Core's `FeeModeFromString`: only `conservative` is
+            // conservative; `unset` and `economical` (the default) are not.
+            mode_str.as_deref().is_some_and(|m| m.trim().eq_ignore_ascii_case("conservative")),
         );
         // Core's field order: `feerate` or `errors`, then `estimator`, then
         // `blocks`. `errors` appears only when there is one, and `estimator`
@@ -2865,15 +2868,32 @@ pub async fn start(
                 answer.blocks
             }
             Err(err) => {
-                response.insert("errors".into(), serde_json::json!([err.reason]));
+                response.insert("errors".into(), serde_json::json!([err.reason.as_str()]));
                 err.blocks
             }
         };
         response.insert("blocks".into(), blocks.into());
         if options.verbosity >= 2 {
-            // Core's per-block mempool health statistics. satd does not
-            // record them yet, so the list is empty.
-            response.insert("mempool_health_statistics".into(), serde_json::json!([]));
+            // Core's per-block mempool health statistics, newest first,
+            // and satd's verdict over them beside the list.
+            let stats: Vec<serde_json::Value> = ctx
+                .mempool
+                .health_blocks()
+                .iter()
+                .rev()
+                .map(|b| {
+                    serde_json::json!({
+                        "block_height": b.height,
+                        "block_weight": b.block_weight,
+                        "mempool_txs_weight": b.mempool_txs_weight,
+                    })
+                })
+                .collect();
+            response.insert("mempool_health_statistics".into(), serde_json::Value::Array(stats));
+            response.insert(
+                "mempool_health".into(),
+                ctx.mempool.mempool_health().as_str().into(),
+            );
         }
         let mut response = serde_json::Value::Object(response);
         annotate_units(&mut response, unit);

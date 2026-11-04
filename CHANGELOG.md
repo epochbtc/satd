@@ -52,6 +52,7 @@ It includes every fix shipped in 0.7.1:
 - Packaging: the Nix build of `satd` no longer depends on the build host's CPU; jemalloc's address width, page and hugepage size are pinned on x86_64, and `flake.lock` is committed so a rebuild of a tag evaluates the same Nix inputs; the x86_64 Linux release tarballs pin the same jemalloc constants (#321).
 - RPC: `estimatesmartfee` takes Core 32.1's shape (`options.fee_rate_estimator`, `options.verbosity`, `estimator`, `blocks` as answered, target 1 served as 2, Core's no-data `errors`), and every fee surface floors at the rolling mempool minimum; new, not yet the new estimator (#1200).
 - Config: Core v31 and v32.1's new options (`prevoutfetchthreads`, `inboundrelaypercent`, `rpcmaxconnections`, `txsendrate`) load with a warning instead of being refused as typos; `privatebroadcast`, which satd does not implement, is refused. The node creates `<datadir>/fees/` as Core v32 does. `converttopsbt` takes Core v32's `psbt_version` argument and refuses a version it cannot produce (#1203).
+- RPC: `estimatesmartfee` with `fee_rate_estimator=mempool_policy` is Core 32's mempool estimator (health gate, template percentiles), and `verbosity` 2 reports the health window and a `mempool_health` verdict; opt-in, not yet the default (#1202).
 - The C++ script engine is Bitcoin Core's interpreter through `libbitcoinkernel`
   instead of `libbitcoinconsensus`, which redid a transaction's signature
   hashing for every input. About 27x faster on a 3,373-input signet block,

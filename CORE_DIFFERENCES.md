@@ -494,7 +494,7 @@ preserved; the satd extension is opt-in per request or per flag.
   `confidence: low|medium|high` field. Closes Core's
   [#11500](https://github.com/bitcoin/bitcoin/issues/11500).
 
-- **`estimatesmartfee` in Core 32.1's shape, with three departures, and an interim `auto`.** The
+- **`estimatesmartfee` in Core 32.1's shape, with four departures, and an interim `auto`.** The
   arguments, the `options` type checks (`fee_rate_estimator` a string,
   `verbosity` a number), `blocks` (target 1 answered for 2, `mempool_policy`
   always 2), the floors and the no-data `errors` answer follow Core 32.1.
@@ -511,10 +511,20 @@ preserved; the satd extension is opt-in per request or per flag.
     minimum, `-minrelaytxfee`, and 1 sat/vB, which Core does not have), so
     the floor set the number. Core names only `block_policy` or
     `mempool_policy`.
+  - `verbosity` 2 adds `mempool_health` (`healthy`, `insufficient_data` or
+    `low_coverage`) beside Core's `mempool_health_statistics`: the verdict
+    Core takes over those rows but does not report.
 
-  The numbers come from satd's estimators, not Core's: `block_policy` is the
-  history estimator and `mempool_policy` the mempool simulator, and
-  `mempool_health_statistics` (`verbosity` 2) is an empty list for now.
+  `block_policy` is satd's history estimator, not Core's. `mempool_policy`
+  is Core 32's: refused until the startup mempool load is over and while
+  fewer than 75% of the last six blocks' weight was in the mempool (with
+  Core's exemption for a window lighter than one block), and otherwise the
+  feerate at 50% (`conservative`) or 75% (`economical`) of a block's weight
+  in the next block template, floored. satd builds that template with its
+  own packer, and keeps the health window in `fees/mempool_health.dat`, its
+  own format rather than Core's `fees/mempool_policy_estimator.dat`. As in
+  Core, the window is cleared when no mempool comes back at startup
+  (`-persistmempool=0`, or no `mempool.dat`).
   `auto` does not yet combine the two as Core's does (Core answers the lower
   of the two estimates, falling back to block policy). Until satd's estimator
   rework sets the combination, `auto` with Core's estimate modes is the

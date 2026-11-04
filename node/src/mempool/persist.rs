@@ -66,6 +66,9 @@ pub struct LoadStats {
     /// `prioritisetransaction` deltas restored for transactions not in the
     /// pool.
     pub deltas: usize,
+    /// Whether a `mempool.dat` was found and read. Core's `LoadMempool`
+    /// returns false otherwise, which clears the mempool health window.
+    pub file_read: bool,
 }
 
 /// Serialize the current mempool to `<net_datadir>/mempool.dat`.
@@ -208,7 +211,10 @@ pub fn load_mempool(
     // persisted time, for a record that has not expired yet.
     let expiry_secs = mempool.policy().expiry_secs;
     let now = crate::time::now_secs();
-    let mut stats = LoadStats::default();
+    let mut stats = LoadStats {
+        file_read: true,
+        ..LoadStats::default()
+    };
     for rec in records {
         let fee_delta = rec.fee_delta;
         let unbroadcast = rec.flags & FLAG_UNBROADCAST != 0;
@@ -589,7 +595,7 @@ mod tests {
         let cs = empty_chainstate(&dir);
         let fresh = Mempool::new(300_000_000, 1000);
         let stats = load_mempool(&fresh, &cs, &NoopVerifier, &dir).unwrap();
-        assert_eq!(stats, LoadStats::default());
+        assert_eq!(stats, LoadStats { file_read: true, ..LoadStats::default() });
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -853,7 +859,7 @@ mod tests {
         let cs = empty_chainstate(&dir);
         let mp = Mempool::new(300_000_000, 1000);
         let stats = load_mempool(&mp, &cs, &NoopVerifier, &dir).unwrap();
-        assert_eq!(stats, LoadStats::default());
+        assert_eq!(stats, LoadStats { file_read: true, ..LoadStats::default() });
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -4838,6 +4838,14 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
     // loop starts accepting new transactions. Each tx is re-validated
     // against the current chainstate by `accept_transaction`; ones that
     // have since confirmed or become invalid are silently dropped.
+    // Core 32's mempool health window (`fees/mempool_health.dat`), kept only
+    // if it ends at the active tip.
+    {
+        // One read, so the height and hash are of the same tip.
+        let (tip_hash, tip_height) = chain_state.tip_snapshot();
+        mempool.open_health(&net_datadir, (tip_height as u64, tip_hash));
+    }
+    let mut mempool_file_read = false;
     if config.persistmempool {
         match node::mempool::persist::load_mempool(
             mempool.as_ref(),
@@ -4845,18 +4853,27 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
             chain_state.script_verifier(),
             &net_datadir,
         ) {
-            Ok(stats) if stats.accepted > 0 || stats.skipped > 0 || stats.expired > 0 || stats.deltas > 0 => {
-                tracing::info!(
-                    accepted = stats.accepted,
-                    skipped = stats.skipped,
-                    expired = stats.expired,
-                    deltas = stats.deltas,
-                    "Re-admitted persisted mempool from mempool.dat"
-                );
+            Ok(stats) => {
+                mempool_file_read = stats.file_read;
+                if stats.accepted > 0 || stats.skipped > 0 || stats.expired > 0 || stats.deltas > 0 {
+                    tracing::info!(
+                        accepted = stats.accepted,
+                        skipped = stats.skipped,
+                        expired = stats.expired,
+                        deltas = stats.deltas,
+                        "Re-admitted persisted mempool from mempool.dat"
+                    );
+                }
             }
-            Ok(_) => {}
             Err(e) => tracing::warn!(error = %e, "Failed to load persisted mempool"),
         }
+    }
+    // No mempool came back from disk (`-persistmempool=0`, no file, or an
+    // unreadable one): the health rows describe a pool this node no longer
+    // has, so the mempool estimator waits for the window to refill, as in
+    // Core (`MempoolLoadFailed`).
+    if !mempool_file_read {
+        mempool.health_load_failed();
     }
     // `getmempoolinfo.loaded`: the load attempt is over, whatever it found.
     // Core sets this after `LoadMempool` whether or not `-persistmempool` is
@@ -5321,6 +5338,10 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
             Err(e) => tracing::warn!(error = %e, "Failed to persist mempool"),
         }
     }
+
+    // The mempool health window, written whatever `-persistmempool` says;
+    // the next start keeps it only if it ends at that start's tip.
+    mempool.flush_health();
 
     // Persist the address book so learned peers survive a restart.
     peer_manager.dump_addrman(&net_datadir.join("peers.dat"));

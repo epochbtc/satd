@@ -133,6 +133,47 @@ pub struct MempoolEstimate {
     pub histogram: Vec<HistogramBucket>,
     /// Total weight queued in the mempool at snapshot time.
     pub mempool_weight: u64,
+    /// Core 32's template percentiles over the first simulated block.
+    pub template_percentiles: TemplatePercentiles,
+}
+
+/// Bitcoin Core 32's mempool estimate: the feerate of the package at which
+/// the next block's packages, best first, reach 50% and 75% of a full block's
+/// weight (`CalculateMaxWeightPercentiles`, v32.1
+/// `src/policy/fees/mempool_estimator.cpp:96-115`). Core answers
+/// `conservative` with the 50% point and `economical` with the 75% point. A
+/// point the block does not reach is `None`, and the caller floors it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct TemplatePercentiles {
+    /// sat/kvB.
+    pub p50: Option<u64>,
+    /// sat/kvB.
+    pub p75: Option<u64>,
+}
+
+/// The weight Core's percentiles are taken against: `DEFAULT_BLOCK_MAX_WEIGHT`.
+pub const PERCENTILE_BLOCK_WEIGHT: u64 = BLOCK_WEIGHT_LIMIT;
+
+/// Core's `CalculateMaxWeightPercentiles` over `(feerate sat/kvB, weight)`
+/// packages. Sorted best first here, as Core re-sorts its template's.
+pub fn calculate_max_weight_percentiles(packages: &[(u64, u64)]) -> TemplatePercentiles {
+    let mut sorted = packages.to_vec();
+    sorted.sort_by(|a, b| b.0.cmp(&a.0));
+    let p50_weight = PERCENTILE_BLOCK_WEIGHT / 2;
+    let p75_weight = PERCENTILE_BLOCK_WEIGHT * 3 / 4;
+    let mut out = TemplatePercentiles::default();
+    let mut accumulated: u64 = 0;
+    for (rate, weight) in sorted {
+        accumulated = accumulated.saturating_add(weight);
+        if accumulated >= p50_weight && out.p50.is_none() {
+            out.p50 = Some(rate);
+        }
+        if accumulated >= p75_weight && out.p75.is_none() {
+            out.p75 = Some(rate);
+            break;
+        }
+    }
+    out
 }
 
 /// Default histogram boundaries in sat/vB, converted to sat/kvB on use.
@@ -144,6 +185,11 @@ const HISTOGRAM_BOUNDARIES_SAT_PER_VB: &[u64] = &[
 /// Effective (post-prioritisation) fee of an entry, clamped at zero.
 /// Saturating add: `fee_delta` may be an extreme value from a corrupt
 /// persisted mempool, and must not overflow the i64 sum.
+/// An entry's own feerate (sat/kvB), as the histogram buckets it.
+pub(crate) fn entry_own_rate(entry: &MempoolEntry) -> u64 {
+    crate::mempool::policy::fee_rate_sat_per_kvb(effective_fee(entry), entry.adjusted_weight())
+}
+
 fn effective_fee(entry: &MempoolEntry) -> u64 {
     (entry.fee as i64).saturating_add(entry.fee_delta).max(0) as u64
 }
@@ -234,29 +280,66 @@ fn ancestor_aggregate(
 ///   Trimming the bottom sliver of weight keeps one cheap tx slipping into
 ///   the tail of an otherwise-full block from dragging the next-block
 ///   estimate down to ~min-relay.
-fn simulate_one_block(remaining: &HashMap<Txid, MempoolEntry>) -> (SimBlock, HashSet<Txid>) {
+fn simulate_one_block(
+    remaining: &HashMap<Txid, MempoolEntry>,
+    synthetic: &mut Vec<SynthChunk>,
+) -> (SimBlock, HashSet<Txid>, Vec<(u64, u64)>) {
+    /// A packing candidate: a real transaction (with its ancestors), or
+    /// one chunk of injected arrival weight.
+    enum Cand {
+        Real(Txid),
+        Synth(usize),
+    }
     let mut anc_memo: HashMap<Txid, HashSet<Txid>> = HashMap::with_capacity(remaining.len());
-    let mut sorted: Vec<(Txid, u64)> = Vec::with_capacity(remaining.len());
+    let mut sorted: Vec<(Cand, u64)> = Vec::with_capacity(remaining.len() + synthetic.len());
     for txid in remaining.keys() {
         let (fee, weight) = ancestor_aggregate(txid, remaining, &mut anc_memo);
         if weight == 0 {
             continue;
         }
         let rate = crate::mempool::policy::fee_rate_sat_per_kvb(fee, weight);
-        sorted.push((*txid, rate));
+        sorted.push((Cand::Real(*txid), rate));
+    }
+    for (i, chunk) in synthetic.iter().enumerate() {
+        sorted.push((Cand::Synth(i), chunk.rate));
     }
     // Highest ancestor-feerate first.
     sorted.sort_by(|a, b| b.1.cmp(&a.1));
 
     let mut included: HashSet<Txid> = HashSet::new();
+    let mut synth_used: Vec<bool> = vec![false; synthetic.len()];
     let mut used_weight: u64 = 0;
     let mut used_sigops: u64 = 0;
     // (marginal_rate, marginal_weight) for every admitted package, used to
     // compute the robust block floor once packing is done.
     let mut admissions: Vec<(u64, u64)> = Vec::new();
+    // (marginal_rate, priced weight) per package, for the template
+    // percentiles.
+    let mut packages: Vec<(u64, u64)> = Vec::new();
     let mut filled = false;
 
-    for (txid, _initial_rate) in sorted {
+    for (cand, cand_rate) in sorted {
+        let txid = match cand {
+            Cand::Real(txid) => txid,
+            Cand::Synth(i) => {
+                // Synthetic weight has no ancestors and no sigops: it only
+                // competes for space, so real packages are priced as before.
+                let weight = synthetic[i].weight;
+                if used_weight.saturating_add(weight) > USABLE_WEIGHT_PER_BLOCK {
+                    filled = true;
+                    continue;
+                }
+                used_weight += weight;
+                admissions.push((cand_rate, weight));
+                packages.push((cand_rate, weight));
+                synth_used[i] = true;
+                if used_weight >= USABLE_WEIGHT_PER_BLOCK {
+                    filled = true;
+                    break;
+                }
+                continue;
+            }
+        };
         if included.contains(&txid) {
             continue;
         }
@@ -307,6 +390,7 @@ fn simulate_one_block(remaining: &HashMap<Txid, MempoolEntry>) -> (SimBlock, Has
         used_weight += group_tx_weight;
         used_sigops += group_sigops;
         admissions.push((marginal_rate, group_tx_weight));
+        packages.push((marginal_rate, group_weight));
         for t in group {
             included.insert(t);
         }
@@ -321,13 +405,72 @@ fn simulate_one_block(remaining: &HashMap<Txid, MempoolEntry>) -> (SimBlock, Has
     // cheapest admission — anything at min-relay confirms — and trimming
     // would overcharge. So trim only when filled.
     let floor_trim = if filled { BLOCK_FLOOR_TRIM_PERCENT } else { 0 };
+    let synth_count = synth_used.iter().filter(|u| **u).count();
+    let mut i = 0;
+    synthetic.retain(|_| {
+        let keep = !synth_used[i];
+        i += 1;
+        keep
+    });
     let block = SimBlock {
         min_feerate_sat_per_kvb: weighted_floor_rate(&admissions, floor_trim),
-        tx_count: included.len(),
+        tx_count: included.len() + synth_count,
         weight: used_weight,
         filled,
     };
-    (block, included)
+    (block, included, packages)
+}
+
+/// One chunk of injected arrival weight (see [`arrival_injection`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SynthChunk {
+    /// sat/kvB.
+    pub rate: u64,
+    pub weight: u64,
+}
+
+/// Injected weight is split into chunks of this size, about one ordinary
+/// transaction, so part of a band can fit a block's remaining space.
+pub const SYNTH_CHUNK_WEIGHT: u64 = 4_000;
+
+/// Seconds of arrivals expected before each of the next two blocks.
+pub const ARRIVAL_WINDOW_SECS: f64 = 600.0;
+/// Blocks whose packing gets expected arrivals added: the first two.
+pub const ARRIVAL_BLOCKS: usize = 2;
+
+/// The weight to inject before each of blocks 1 and 2, per band:
+/// `(band lower bound sat/kvB, weight)`. One block's worth of arrivals
+/// (`rate x 600 s`) per band, capped at one block per band; nothing at all
+/// while the tracker is cold.
+pub fn arrival_injection(rates: &crate::mempool::arrivals::ArrivalRates) -> Vec<(u64, u64)> {
+    if !rates.warm {
+        return Vec::new();
+    }
+    rates
+        .bands
+        .iter()
+        .map(|(band, level)| {
+            let w = (level * ARRIVAL_WINDOW_SECS).max(0.0) as u64;
+            (*band, w.min(USABLE_WEIGHT_PER_BLOCK))
+        })
+        .filter(|(_, w)| *w > 0)
+        .collect()
+}
+
+fn push_synthetic(synthetic: &mut Vec<SynthChunk>, injection: &[(u64, u64)]) {
+    for &(rate, weight) in injection {
+        let mut left = weight;
+        while left > 0 {
+            let w = left.min(SYNTH_CHUNK_WEIGHT);
+            synthetic.push(SynthChunk { rate, weight: w });
+            left -= w;
+        }
+    }
+}
+
+/// The histogram band lower bounds, sat/kvB: the bands arrivals are counted in.
+pub fn histogram_bands_sat_per_kvb() -> Vec<u64> {
+    HISTOGRAM_BOUNDARIES_SAT_PER_VB.iter().map(|v| v * 1000).collect()
 }
 
 /// Fraction of admitted block weight (cheapest-first) trimmed before reading
@@ -413,14 +556,31 @@ pub fn estimate_from_mempool(
     snapshot: Vec<(Txid, MempoolEntry)>,
     n_blocks: usize,
 ) -> MempoolEstimate {
+    estimate_from_mempool_with_arrivals(snapshot, n_blocks, &[])
+}
+
+/// [`estimate_from_mempool`] with `injection` (see [`arrival_injection`])
+/// added to the queue before each of the first [`ARRIVAL_BLOCKS`] blocks is
+/// packed. Weight left over competes for later blocks as real transactions
+/// do. An empty `injection` is exactly [`estimate_from_mempool`].
+pub fn estimate_from_mempool_with_arrivals(
+    snapshot: Vec<(Txid, MempoolEntry)>,
+    n_blocks: usize,
+    injection: &[(u64, u64)],
+) -> MempoolEstimate {
     let entries: HashMap<Txid, MempoolEntry> = snapshot.into_iter().collect();
     let mempool_weight: u64 = entries.values().map(|e| e.weight as u64).sum();
     let histogram = build_histogram(&entries);
 
     let mut remaining = entries;
+    let mut synthetic: Vec<SynthChunk> = Vec::new();
+    let mut template_percentiles = TemplatePercentiles::default();
     let mut sim_blocks: Vec<SimBlock> = Vec::with_capacity(n_blocks);
-    for _ in 0..n_blocks {
-        if remaining.is_empty() {
+    for k in 0..n_blocks {
+        if k < ARRIVAL_BLOCKS {
+            push_synthetic(&mut synthetic, injection);
+        }
+        if remaining.is_empty() && synthetic.is_empty() {
             sim_blocks.push(SimBlock {
                 min_feerate_sat_per_kvb: 0,
                 tx_count: 0,
@@ -429,7 +589,10 @@ pub fn estimate_from_mempool(
             });
             continue;
         }
-        let (block, consumed) = simulate_one_block(&remaining);
+        let (block, consumed, packages) = simulate_one_block(&remaining, &mut synthetic);
+        if k == 0 {
+            template_percentiles = calculate_max_weight_percentiles(&packages);
+        }
         for txid in &consumed {
             remaining.remove(txid);
         }
@@ -438,7 +601,7 @@ pub fn estimate_from_mempool(
         sim_blocks.push(block);
         // If the block wasn't filled and produced nothing, further blocks
         // will also be empty — fill out with zeros for caller simplicity.
-        if !was_filled && was_empty {
+        if !was_filled && was_empty && (k + 1 >= ARRIVAL_BLOCKS || injection.is_empty()) {
             while sim_blocks.len() < n_blocks {
                 sim_blocks.push(SimBlock {
                     min_feerate_sat_per_kvb: 0,
@@ -455,6 +618,7 @@ pub fn estimate_from_mempool(
         sim_blocks,
         histogram,
         mempool_weight,
+        template_percentiles,
     }
 }
 
@@ -699,11 +863,27 @@ pub struct SmartFeeAnswer {
 }
 
 /// An `estimatesmartfee` call with nothing to answer from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SmartFeeError {
     /// Core's `blocks` alongside `errors`.
     pub blocks: u32,
-    pub reason: &'static str,
+    pub reason: SmartFeeReason,
+}
+
+/// The text of a [`SmartFeeError`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SmartFeeReason {
+    Static(&'static str),
+    Owned(String),
+}
+
+impl SmartFeeReason {
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Static(s) => s,
+            Self::Owned(s) => s,
+        }
+    }
 }
 
 /// Core's error when the block policy estimator has no answer
@@ -714,6 +894,79 @@ pub const INSUFFICIENT_DATA: &str = "Insufficient data or no feerate found";
 /// (`MEMPOOL_FEE_ESTIMATOR_MAX_TARGET`): `mempool_policy` always answers, and
 /// reports, 2 blocks.
 pub const MEMPOOL_POLICY_TARGET: u32 = 2;
+
+/// The prefix Core puts on every mempool estimator error.
+pub const MEMPOOL_POLICY_ERROR_PREFIX: &str = "mempool_policy: ";
+/// Core's error before the startup mempool load is over.
+pub const MEMPOOL_NOT_LOADED: &str = "Mempool not loaded yet, no fee rate estimate available";
+
+/// Why the mempool estimator cannot answer: Core 32.1's three refusals
+/// (`MemPoolFeeRateEstimator::EstimateFeeRate`).
+fn mempool_policy_refusal(mempool: &crate::mempool::pool::Mempool) -> Option<String> {
+    if !mempool.load_tried() {
+        return Some(format!("{MEMPOOL_POLICY_ERROR_PREFIX}{MEMPOOL_NOT_LOADED}"));
+    }
+    mempool
+        .mempool_health()
+        .error()
+        .map(|e| format!("{MEMPOOL_POLICY_ERROR_PREFIX}{e}"))
+}
+
+/// The candidates for a near-target mempool estimate, for scoring against
+/// each other (the scorecard) before one becomes the default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NearCandidates {
+    /// The simulator's block floor at the target, with expected arrivals
+    /// injected while the arrival tracker is warm. sat/kvB, floored.
+    pub simulator: u64,
+    /// Core 32's template percentile (50% conservative, 75% economical) on
+    /// the plain template. sat/kvB, floored.
+    pub percentile: u64,
+    /// The lower of the two.
+    pub min: u64,
+}
+
+/// `near(N)` for N of 1 or 2: `None` when the mempool estimator would refuse
+/// (not loaded, or the health gate fails).
+pub fn near_candidates(
+    mempool: &crate::mempool::pool::Mempool,
+    fee_estimator: &FeeEstimator,
+    target: u32,
+    conservative: bool,
+) -> Option<NearCandidates> {
+    if mempool_policy_refusal(mempool).is_some() {
+        return None;
+    }
+    let floor = mempool.fee_estimate_floor();
+    let plain = fee_estimator.cached_mempool_estimate(mempool);
+    let percentile = template_percentile(&plain, conservative).unwrap_or(0).max(floor);
+    let injection = arrival_injection(&mempool.arrival_rates());
+    let simulated = if injection.is_empty() {
+        plain
+    } else {
+        std::sync::Arc::new(estimate_from_mempool_with_arrivals(
+            mempool.get_template_entries(),
+            (target.max(1) as usize).min(MAX_SIM_DEPTH),
+            &injection,
+        ))
+    };
+    let simulator = target_estimate(&simulated, target.clamp(1, 2), floor).0;
+    Some(NearCandidates {
+        simulator,
+        percentile,
+        min: simulator.min(percentile),
+    })
+}
+
+/// Core's answer from the template percentiles: the 50% point when
+/// conservative, the 75% point when economical.
+fn template_percentile(est: &MempoolEstimate, conservative: bool) -> Option<u64> {
+    if conservative {
+        est.template_percentiles.p50
+    } else {
+        est.template_percentiles.p75
+    }
+}
 
 /// `estimatesmartfee`, in Core 32.1's shape.
 ///
@@ -729,24 +982,46 @@ pub const MEMPOOL_POLICY_TARGET: u32 = 2;
 ///   a Core node with no fee data reports.
 /// - Every answer is floored at [`estimate_floor_sat_per_kvb`]. When the floor
 ///   is what set the number, `estimator` says `floor`.
+/// - `fee_rate_estimator=mempool_policy` is Core 32.1's mempool estimator:
+///   refused until the startup mempool load is over and while the health
+///   gate fails, with Core's error text, and otherwise the template
+///   percentile (`conservative` picks the 50% point, else the 75% point).
+///   satd's own `mempool` mode is the ungated simulator, as before.
 pub fn estimate_smart_fee(
     mempool: &crate::mempool::pool::Mempool,
     fee_estimator: &FeeEstimator,
     conf_target: u32,
     mode: EstimateMode,
     fee_rate_estimator: FeeRateEstimator,
+    conservative: bool,
 ) -> Result<SmartFeeAnswer, SmartFeeError> {
+    if fee_rate_estimator == FeeRateEstimator::MempoolPolicy {
+        if let Some(reason) = mempool_policy_refusal(mempool) {
+            return Err(SmartFeeError {
+                blocks: MEMPOOL_POLICY_TARGET,
+                reason: SmartFeeReason::Owned(reason),
+            });
+        }
+        let floor = mempool.fee_estimate_floor();
+        let est = fee_estimator.cached_mempool_estimate(mempool);
+        let raw = template_percentile(&est, conservative).unwrap_or(0);
+        let (feerate_sat_per_kvb, estimator) = if raw < floor {
+            (floor, EstimateSource::Floor)
+        } else {
+            (raw, EstimateSource::MempoolPolicy)
+        };
+        return Ok(SmartFeeAnswer {
+            feerate_sat_per_kvb,
+            blocks: MEMPOOL_POLICY_TARGET,
+            estimator,
+        });
+    }
     let floor = mempool.fee_estimate_floor();
     let source_mode = match fee_rate_estimator {
         FeeRateEstimator::BlockPolicy => EstimateMode::Historical,
-        FeeRateEstimator::MempoolPolicy => EstimateMode::Mempool,
-        FeeRateEstimator::Auto => mode,
+        FeeRateEstimator::MempoolPolicy | FeeRateEstimator::Auto => mode,
     };
-    let target = if fee_rate_estimator == FeeRateEstimator::MempoolPolicy {
-        MEMPOOL_POLICY_TARGET
-    } else {
-        conf_target.max(2)
-    };
+    let target = conf_target.max(2);
     // The raw rate and the side it came from, before the floor. A simulator
     // answer is read with a zero floor so that "the queue says nothing" (an
     // empty or thin block) reads as 0 and is attributed to the floor below.
@@ -756,7 +1031,7 @@ pub fn estimate_smart_fee(
             None => {
                 return Err(SmartFeeError {
                     blocks: 0,
-                    reason: INSUFFICIENT_DATA,
+                    reason: SmartFeeReason::Static(INSUFFICIENT_DATA),
                 });
             }
         },
@@ -1249,6 +1524,7 @@ mod tests {
                 .collect(),
             histogram: Vec::new(),
             mempool_weight: THIN_BLOCK_WEIGHT_THRESHOLD + 1,
+            template_percentiles: Default::default(),
         }
     }
 
@@ -1512,13 +1788,13 @@ mod tests {
     fn estimate_smart_fee_serves_target_one_as_two() {
         let pool = empty_pool();
         let est = spread_history();
-        let one = estimate_smart_fee(&pool, &est, 1, EstimateMode::Historical, FeeRateEstimator::Auto)
+        let one = estimate_smart_fee(&pool, &est, 1, EstimateMode::Historical, FeeRateEstimator::Auto, false)
             .expect("history answers");
         assert_eq!(one.blocks, 2);
         assert_eq!(Some(one.feerate_sat_per_kvb), est.estimate_fee(2));
         assert_eq!(one.estimator, EstimateSource::BlockPolicy);
         // Every other target is answered where it was asked.
-        let six = estimate_smart_fee(&pool, &est, 6, EstimateMode::Historical, FeeRateEstimator::Auto)
+        let six = estimate_smart_fee(&pool, &est, 6, EstimateMode::Historical, FeeRateEstimator::Auto, false)
             .unwrap();
         assert_eq!(six.blocks, 6);
         assert_eq!(Some(six.feerate_sat_per_kvb), est.estimate_fee(6));
@@ -1529,30 +1805,257 @@ mod tests {
         let pool = empty_pool();
         let est = FeeEstimator::new();
         for fre in [FeeRateEstimator::Auto, FeeRateEstimator::BlockPolicy] {
-            let err = estimate_smart_fee(&pool, &est, 6, EstimateMode::Historical, fre)
+            let err = estimate_smart_fee(&pool, &est, 6, EstimateMode::Historical, fre, false)
                 .expect_err("no history, no answer");
-            assert_eq!(err, SmartFeeError { blocks: 0, reason: INSUFFICIENT_DATA });
+            assert_eq!(
+                err,
+                SmartFeeError { blocks: 0, reason: SmartFeeReason::Static(INSUFFICIENT_DATA) }
+            );
         }
     }
 
+    fn health_stats(height: u64, block_weight: u64, removed: u64) -> crate::mempool::health::MinedBlockStats {
+        crate::mempool::health::MinedBlockStats { height, block_weight, mempool_txs_weight: removed }
+    }
+
+    fn block_hash(n: u64) -> bitcoin::BlockHash {
+        use bitcoin::hashes::Hash;
+        let mut b = [0u8; 32];
+        b[..8].copy_from_slice(&n.to_le_bytes());
+        bitcoin::BlockHash::from_byte_array(b)
+    }
+
+    /// Record six blocks of the given weights into the pool's health window.
+    fn fill_health(pool: &crate::mempool::pool::Mempool, block_weight: u64, removed: u64) {
+        for h in 1..=crate::mempool::health::HEALTH_WINDOW_BLOCKS as u64 {
+            pool.record_block_health(block_hash(h), health_stats(h, block_weight, removed));
+        }
+    }
+
+    fn mempool_policy(pool: &crate::mempool::pool::Mempool, target: u32, conservative: bool) -> Result<SmartFeeAnswer, SmartFeeError> {
+        estimate_smart_fee(
+            pool,
+            &FeeEstimator::new(),
+            target,
+            EstimateMode::Historical,
+            FeeRateEstimator::MempoolPolicy,
+            conservative,
+        )
+    }
+
+    /// Core 32.1's three refusals, with its text and `blocks: 2`
+    /// (`mempool_estimator.cpp:370-378`, `:149-161`).
     #[test]
-    fn mempool_policy_answers_for_two_blocks_and_names_the_floor() {
+    fn mempool_policy_waits_for_the_load_and_a_healthy_window() {
         let pool = empty_pool();
-        let est = FeeEstimator::new();
+        let err = mempool_policy(&pool, 6, false).unwrap_err();
+        assert_eq!(err.blocks, 2);
+        assert_eq!(
+            err.reason.as_str(),
+            "mempool_policy: Mempool not loaded yet, no fee rate estimate available"
+        );
+        pool.set_load_tried(true);
+        let err = mempool_policy(&pool, 6, false).unwrap_err();
+        assert_eq!(
+            err.reason.as_str(),
+            "mempool_policy: Not enough recent block data for fee rate estimation"
+        );
+        // Six full blocks of which this pool held none: unreliable.
+        fill_health(&pool, 1_000_000, 0);
+        let err = mempool_policy(&pool, 6, false).unwrap_err();
+        assert_eq!(err.reason.as_str(), "mempool_policy: Mempool is unreliable for fee rate estimation");
+        assert!(near_candidates(&pool, &FeeEstimator::new(), 1, false).is_none());
+    }
+
+    #[test]
+    fn mempool_policy_answers_for_two_blocks_once_healthy() {
+        let pool = empty_pool();
+        pool.set_load_tried(true);
+        fill_health(&pool, 1_000_000, 1_000_000);
         for target in [1, 6, 144] {
-            let a = estimate_smart_fee(
-                &pool,
-                &est,
-                target,
-                EstimateMode::Historical,
-                FeeRateEstimator::MempoolPolicy,
-            )
-            .expect("the simulator always answers");
+            let a = mempool_policy(&pool, target, false).expect("healthy");
             assert_eq!(a.blocks, MEMPOOL_POLICY_TARGET, "target {target}");
-            // An empty pool says nothing: the floor set the number.
+            // An empty pool fills neither percentile: the floor sets it.
             assert_eq!(a.estimator, EstimateSource::Floor);
             assert_eq!(a.feerate_sat_per_kvb, pool.fee_estimate_floor());
         }
+    }
+
+    /// An unhealthy mempool refuses `mempool_policy`, and `auto` answers from
+    /// history as it did.
+    #[test]
+    fn an_unhealthy_mempool_leaves_auto_on_history() {
+        let pool = empty_pool();
+        pool.set_load_tried(true);
+        let est = spread_history();
+        assert!(mempool_policy(&pool, 2, false).is_err());
+        let a = estimate_smart_fee(&pool, &est, 2, EstimateMode::Historical, FeeRateEstimator::Auto, false)
+            .unwrap();
+        assert_eq!(a.estimator, EstimateSource::BlockPolicy);
+        assert_eq!(Some(a.feerate_sat_per_kvb), est.estimate_fee(2));
+    }
+
+    /// Core v32.1 `src/test/mempool_fee_estimator_tests.cpp`,
+    /// `calculate_max_weight_percentiles`, in satd's units.
+    #[test]
+    fn template_percentiles_match_cores_calculation() {
+        assert_eq!(calculate_max_weight_percentiles(&[]), TemplatePercentiles::default());
+        let chunks = 10u64;
+        let weight = PERCENTILE_BLOCK_WEIGHT / chunks;
+        let (super_high, high, medium, low) = (500_000, 100_000, 50_000, 10_000);
+        let mut packages = Vec::new();
+        for i in 0..chunks {
+            let rate = match i {
+                0..=2 => super_high,
+                3..=4 => high,
+                5..=7 => medium,
+                _ => low,
+            };
+            packages.push((rate, weight));
+            if (5..7).contains(&i) {
+                let partial = calculate_max_weight_percentiles(&packages);
+                assert_eq!(partial.p50, Some(high));
+                assert_eq!(partial.p75, None, "75% not reached yet");
+            }
+        }
+        let p = calculate_max_weight_percentiles(&packages);
+        assert_eq!(p, TemplatePercentiles { p50: Some(high), p75: Some(medium) });
+    }
+
+    fn u32_txid(n: u32) -> Txid {
+        use bitcoin::hashes::Hash;
+        let mut bytes = [0u8; 32];
+        bytes[..4].copy_from_slice(&n.to_le_bytes());
+        bytes[31] = 0xAB;
+        Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array(bytes))
+    }
+
+    /// Fill `pool` with independent 10,000 vB transactions at `sat_per_vb`
+    /// until its weight passes `percent` of a block. Returns the next index.
+    fn fill_to(pool: &crate::mempool::pool::Mempool, next: &mut u32, sat_per_vb: u64, percent: u64) {
+        const W: usize = 40_000;
+        let target = PERCENTILE_BLOCK_WEIGHT * percent / 100;
+        while pool.get_template_entries().iter().map(|(_, e)| e.weight as u64).sum::<u64>() <= target {
+            let tx = mk_tx(&[(u32_txid(*next), 0)], 1);
+            *next += 1;
+            pool.insert_tx_weighted_for_test(tx, sat_per_vb * 10_000, W, crate::mempool::pool::QuarantineScope::acting());
+        }
+    }
+
+    /// The template percentiles answer `mempool_policy` as Core 32.1's
+    /// mempool estimator does on the same mempool: the steps of Core's
+    /// `MempoolFeeRateEstimator` test (`mempool_fee_estimator_tests.cpp`),
+    /// 25%, 50%, 75% and 105% of a block.
+    #[test]
+    fn mempool_policy_matches_cores_estimates_on_the_same_mempool() {
+        let pool = empty_pool();
+        pool.set_load_tried(true);
+        fill_health(&pool, 0, 0);
+        let floor = pool.fee_estimate_floor();
+        let (low, med, high, very_high) = (2, 10, 100, 1_000);
+        let rate = |c: bool| mempool_policy(&pool, 2, c).unwrap().feerate_sat_per_kvb;
+        let mut next = 0;
+
+        fill_to(&pool, &mut next, high, 25);
+        assert_eq!((rate(true), rate(false)), (floor, floor), "under 50%: both floored");
+
+        fill_to(&pool, &mut next, med, 50);
+        assert_eq!((rate(true), rate(false)), (med * 1000, floor), "50-75%: conservative only");
+
+        fill_to(&pool, &mut next, low, 75);
+        assert_eq!((rate(true), rate(false)), (med * 1000, low * 1000));
+
+        fill_to(&pool, &mut next, very_high, 105);
+        assert_eq!((rate(true), rate(false)), (high * 1000, med * 1000));
+    }
+
+    fn simple_snapshot(n: u32, sat_per_vb: u64, weight: usize) -> Vec<(Txid, MempoolEntry)> {
+        (0..n)
+            .map(|i| {
+                let tx = mk_tx(&[(u32_txid(10_000 + i), 0)], 1);
+                let txid = tx.compute_txid();
+                (txid, mk_entry(tx, sat_per_vb * weight as u64 / 4, weight))
+            })
+            .collect()
+    }
+
+    fn warm_rates(level_wu_per_s: f64) -> crate::mempool::arrivals::ArrivalRates {
+        crate::mempool::arrivals::ArrivalRates {
+            bands: histogram_bands_sat_per_kvb()
+                .into_iter()
+                .map(|b| (b, if b == 50_000 { level_wu_per_s } else { 0.0 }))
+                .collect(),
+            warm: true,
+        }
+    }
+
+    /// A flow of 50 sat/vB arrivals bigger than the room above a 20 sat/vB
+    /// queue pushes that queue out of the next block, so `near(1)` rises.
+    #[test]
+    fn inflow_above_the_queue_raises_near_one() {
+        // Half a block queued at 20 sat/vB: alone, it all fits block 1.
+        let snap = simple_snapshot(50, 20, 40_000);
+        let plain = estimate_from_mempool(snap.clone(), 2);
+        // 10,000 WU/s at 50 sat/vB is 6 MWU per 600 s, capped at one block.
+        let injection = arrival_injection(&warm_rates(10_000.0));
+        assert_eq!(injection, vec![(50_000, USABLE_WEIGHT_PER_BLOCK)]);
+        let with = estimate_from_mempool_with_arrivals(snap, 2, &injection);
+        let floor = 1_000;
+        let (before, _) = target_estimate(&plain, 1, floor);
+        let (after, _) = target_estimate(&with, 1, floor);
+        assert_eq!(before, 20_000);
+        assert!(after > before, "inflow must raise near(1): {before} -> {after}");
+    }
+
+    #[test]
+    fn cold_arrivals_leave_the_simulator_unchanged() {
+        let snap = simple_snapshot(150, 20, 40_000);
+        let mut rates = warm_rates(10_000.0);
+        rates.warm = false;
+        let injection = arrival_injection(&rates);
+        assert!(injection.is_empty());
+        let plain = estimate_from_mempool(snap.clone(), 3);
+        let with = estimate_from_mempool_with_arrivals(snap, 3, &injection);
+        assert_eq!(format!("{:?}", plain.sim_blocks), format!("{:?}", with.sim_blocks));
+        assert_eq!(plain.template_percentiles, with.template_percentiles);
+    }
+
+    #[test]
+    fn the_injection_cap_is_one_block_per_band_per_simulated_block() {
+        let injection = arrival_injection(&warm_rates(1e9));
+        assert_eq!(injection, vec![(50_000, USABLE_WEIGHT_PER_BLOCK)]);
+        // Injected before blocks 1 and 2 only: at most two blocks in all.
+        let est = estimate_from_mempool_with_arrivals(Vec::new(), 5, &injection);
+        let filled: Vec<bool> = est.sim_blocks.iter().map(|b| b.weight > 0).collect();
+        assert_eq!(filled, vec![true, true, false, false, false]);
+    }
+
+    /// Injected weight never changes how a real CPFP package is priced:
+    /// the parent and child still go in together at their package rate.
+    #[test]
+    fn injected_weight_never_changes_cpfp_pricing() {
+        let parent = mk_tx(&[], 1);
+        let parent_txid = parent.compute_txid();
+        let child = mk_tx(&[(parent_txid, 0)], 1);
+        let child_txid = child.compute_txid();
+        let remaining: HashMap<Txid, MempoolEntry> = [
+            (parent_txid, mk_entry(parent, 0, 400)),
+            (child_txid, mk_entry(child, 2_000, 400)),
+        ]
+        .into_iter()
+        .collect();
+        let package = (10_000, 800); // 2,000 sat over 800 WU
+        let (_, _, plain) = simulate_one_block(&remaining, &mut Vec::new());
+        assert_eq!(plain, vec![package]);
+        // Synthetic weight above and below the package's rate.
+        let mut synthetic = Vec::new();
+        push_synthetic(&mut synthetic, &[(50_000, 100_000), (5_000, 100_000)]);
+        let (block, included, packages) = simulate_one_block(&remaining, &mut synthetic);
+        assert!(included.contains(&parent_txid) && included.contains(&child_txid));
+        assert!(packages.contains(&package), "{packages:?}");
+        assert_eq!(packages.iter().filter(|(r, _)| *r == 10_000).count(), 1);
+        assert_eq!(block.tx_count, 2 + 50);
+        assert!(synthetic.is_empty(), "every chunk fit");
     }
 
     #[test]
@@ -1561,10 +2064,10 @@ mod tests {
         // only followed under `auto`.
         let pool = empty_pool();
         let est = spread_history();
-        let a = estimate_smart_fee(&pool, &est, 6, EstimateMode::Mempool, FeeRateEstimator::BlockPolicy)
+        let a = estimate_smart_fee(&pool, &est, 6, EstimateMode::Mempool, FeeRateEstimator::BlockPolicy, false)
             .unwrap();
         assert_eq!(a.estimator, EstimateSource::BlockPolicy);
-        let b = estimate_smart_fee(&pool, &est, 6, EstimateMode::Mempool, FeeRateEstimator::Auto)
+        let b = estimate_smart_fee(&pool, &est, 6, EstimateMode::Mempool, FeeRateEstimator::Auto, false)
             .unwrap();
         assert_eq!(b.estimator, EstimateSource::Floor);
         assert_eq!(b.blocks, 6);
@@ -1575,7 +2078,7 @@ mod tests {
         let pool = empty_pool();
         let est = FeeEstimator::new();
         est.record_block(&[100; 50]); // 0.1 sat/vB, below 1 sat/vB
-        let a = estimate_smart_fee(&pool, &est, 6, EstimateMode::Historical, FeeRateEstimator::Auto)
+        let a = estimate_smart_fee(&pool, &est, 6, EstimateMode::Historical, FeeRateEstimator::Auto, false)
             .unwrap();
         assert_eq!(a.feerate_sat_per_kvb, ESTIMATE_FLOOR_SAT_PER_KVB);
         assert_eq!(a.estimator, EstimateSource::Floor);

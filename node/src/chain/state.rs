@@ -6111,7 +6111,7 @@ impl ChainState {
 
         if report {
             if let Some(mempool) = self.mempool.get() {
-                mempool.remove_for_block(&block, entry.height);
+                mempool.remove_for_connected_block(&block, entry.height);
             }
             self.emit_chain_event(crate::chain::events::ChainEvent::BlockConnected {
                 hash: *hash,
@@ -9078,13 +9078,13 @@ impl ChainState {
                 // every intermediate-block confirmation labelled with
                 // the final tip height.
                 for (side_block, side_height) in &pending.reconnected_blocks {
-                    mempool.remove_for_block(side_block, *side_height);
+                    mempool.remove_for_connected_block(side_block, *side_height);
                 }
             }
             // Triggering block's mempool cleanup. Idempotent with the
             // caller's post-accept_block remove_for_block, so duplicate
-            // calls are safe.
-            mempool.remove_for_block(block, new_height);
+            // calls are safe; only this one records mempool health.
+            mempool.remove_for_connected_block(block, new_height);
 
             if let Some(pending) = pending_reorg.as_ref() {
                 self.return_to_mempool(mempool, &pending.disconnected_txs);
@@ -10810,7 +10810,7 @@ impl ChainState {
         // then re-offer the disconnected-block txs against the new chain.
         if let Some(mempool) = self.mempool.get() {
             for (block, height) in &reconnected_blocks {
-                mempool.remove_for_block(block, *height);
+                mempool.remove_for_connected_block(block, *height);
             }
             self.return_to_mempool(mempool, &disconnect_info.disconnected_txs);
             // Core: removeForReorg — evict mempool txs that are no longer

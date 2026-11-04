@@ -1388,6 +1388,14 @@ pub struct Mempool {
     /// `mempool.dat` has finished, whatever it found. `getmempoolinfo` reports
     /// it as `loaded`.
     load_tried: std::sync::atomic::AtomicBool,
+    /// Bitcoin Core 32's mempool health window, fed by `remove_for_block`.
+    /// Lock order: after `inner`, never while acquiring it.
+    health: Mutex<crate::mempool::health::HealthWindow>,
+    /// When `health` was last written to its file, unix seconds.
+    health_flushed: std::sync::atomic::AtomicU64,
+    /// Incoming weight per feerate band (`mempool::arrivals`). Lock order:
+    /// after `inner`, never while acquiring it.
+    arrivals: Mutex<crate::mempool::arrivals::ArrivalTracker>,
     /// Mempool/relay policy. Behind a `RwLock` so SIGHUP config reload can swap
     /// it live (`reload_policy`); `accept_transaction` snapshots it once at
     /// entry so a transaction is judged against a single policy version.
@@ -1799,6 +1807,11 @@ impl Mempool {
             admission: Mutex::new(()),
             unbroadcast_len: std::sync::atomic::AtomicUsize::new(0),
             load_tried: std::sync::atomic::AtomicBool::new(false),
+            health: Mutex::new(crate::mempool::health::HealthWindow::default()),
+            health_flushed: std::sync::atomic::AtomicU64::new(0),
+            arrivals: Mutex::new(crate::mempool::arrivals::ArrivalTracker::new(
+                crate::mempool::estimate::histogram_bands_sat_per_kvb(),
+            )),
             config: RwLock::new(config),
             policy: arc_swap::ArcSwapOption::empty(),
             policy_sha: Mutex::new(None),
@@ -2002,6 +2015,13 @@ impl Mempool {
     /// Emit an event: push into the ring, then best-effort broadcast.
     /// Never blocks; broadcast backpressure is the subscriber's problem.
     fn emit(&self, event: MempoolEvent) {
+        // An admission is a candidate arrival. The startup reload of
+        // `mempool.dat` is not new demand, so nothing counts before it is over.
+        if let MempoolEvent::Enter { txid, .. } = &event
+            && self.load_tried()
+        {
+            self.arrivals.lock().note(*txid, crate::time::now_secs());
+        }
         {
             let mut ring = self.event_ring.lock();
             ring.push_back(event.without_raw_tx());
@@ -2083,6 +2103,84 @@ impl Mempool {
             max_size_bytes,
             incremental_relay_fee,
         )
+    }
+
+    /// Seconds between writes of the health window during block connects.
+    /// It is written at shutdown as well; a file left stale by a crash ends
+    /// below the active tip and is ignored on the next start.
+    pub const HEALTH_FLUSH_INTERVAL_SECS: u64 = 60;
+
+    pub(crate) fn record_block_health(&self, hash: bitcoin::BlockHash, stats: crate::mempool::health::MinedBlockStats) {
+        let job = {
+            let mut health = self.health.lock();
+            health.record(hash, stats);
+            let now = crate::time::now_secs();
+            let last = self.health_flushed.load(std::sync::atomic::Ordering::Relaxed);
+            if now >= last + Self::HEALTH_FLUSH_INTERVAL_SECS {
+                self.health_flushed.store(now, std::sync::atomic::Ordering::Relaxed);
+                health.flush_job()
+            } else {
+                None
+            }
+        };
+        if let Some((path, bytes)) = job {
+            crate::mempool::health::write_flush_job(&path, &bytes);
+        }
+    }
+
+    /// Bind the health window to `<net_datadir>/fees/mempool_health.dat` and
+    /// load it, keeping it only if it ends at `tip` (height, hash).
+    pub fn open_health(&self, net_datadir: &std::path::Path, tip: (u64, bitcoin::BlockHash)) {
+        self.health.lock().open(net_datadir, tip);
+    }
+
+    /// The mempool did not load from `mempool.dat` (or `-persistmempool` is
+    /// off): the health rows describe a pool this node no longer has, so
+    /// they are cleared, as Core's `MempoolLoadFailed` does, and the window
+    /// must refill before the mempool estimator answers.
+    pub fn health_load_failed(&self) {
+        self.health.lock().clear();
+    }
+
+    /// Write the health window to its file now (shutdown).
+    pub fn flush_health(&self) {
+        let job = self.health.lock().flush_job();
+        if let Some((path, bytes)) = job {
+            crate::mempool::health::write_flush_job(&path, &bytes);
+        }
+    }
+
+    /// Core's mempool health verdict over the last six blocks.
+    pub fn mempool_health(&self) -> crate::mempool::health::MempoolHealth {
+        self.health.lock().health()
+    }
+
+    /// The health window's rows, oldest first.
+    pub fn health_blocks(&self) -> Vec<crate::mempool::health::MinedBlockStats> {
+        self.health.lock().blocks().to_vec()
+    }
+
+    /// Count the noted arrivals that have been resident for
+    /// `arrivals::MIN_RESIDENCE_SECS` and are still in the template class.
+    fn promote_arrivals(&self) {
+        self.promote_arrivals_at(crate::time::now_secs());
+    }
+
+    pub(crate) fn promote_arrivals_at(&self, now: u64) {
+        let inner = self.inner.read();
+        self.arrivals.lock().promote(now, |txid| {
+            inner
+                .entries
+                .get(txid)
+                .filter(|e| e.scope.assists_template())
+                .map(|e| (crate::mempool::estimate::entry_own_rate(e), e.adjusted_weight()))
+        });
+    }
+
+    /// The arrival rates now, per feerate band.
+    pub fn arrival_rates(&self) -> crate::mempool::arrivals::ArrivalRates {
+        self.promote_arrivals();
+        self.arrivals.lock().rates(crate::time::now_secs())
     }
 
     /// The floor every fee estimate is clamped to (sat/kvB): the rolling
@@ -3963,9 +4061,35 @@ impl Mempool {
     /// `height` is the connected block's height and is threaded into
     /// the event so subscribers can filter / correlate.
     pub fn remove_for_block(&self, block: &Block, height: u32) {
+        self.remove_for_block_reported(block, height, false);
+    }
+
+    /// [`Self::remove_for_block`] for the chain itself, which calls it for
+    /// each block it connects while holding its connect lock. Only this call
+    /// records the block in the mempool health window (Core's
+    /// `MempoolTxsRemovedForBlock`). The callers that clean the mempool again
+    /// afterwards use [`Self::remove_for_block`], outside that lock, so their
+    /// report can only add to the block's existing row.
+    pub fn remove_for_connected_block(&self, block: &Block, height: u32) {
+        self.remove_for_block_reported(block, height, true);
+    }
+
+    fn remove_for_block_reported(&self, block: &Block, height: u32, chain_report: bool) {
         let block_hash = block.block_hash();
         let mut confirmed: Vec<(Txid, u64)> = Vec::new();
         let mut evicted_conflicts: Vec<(Txid, u64)> = Vec::new();
+        // Arrivals resident long enough are counted before the block takes
+        // them out of the pool.
+        self.promote_arrivals();
+        // Health window: the block's non-coinbase weight, and how much of it
+        // this pool held (Core's `MempoolTxsRemovedForBlock`).
+        let block_weight: u64 = block
+            .txdata
+            .iter()
+            .filter(|tx| !tx.is_coinbase())
+            .map(|tx| tx.weight().to_wu())
+            .sum();
+        let mut removed_weight: u64 = 0;
         {
             let mut inner = self.inner.write();
             // Core's `removeForBlock`: the rolling minimum starts decaying.
@@ -3977,6 +4101,7 @@ impl Mempool {
             for tx in &block.txdata {
                 let txid = tx.compute_txid();
                 if let Some(entry) = inner.entries.remove(&txid) {
+                    removed_weight = removed_weight.saturating_add(entry.weight as u64);
                     let tx_size = bitcoin::consensus::serialize(&entry.tx).len();
                     let seq = inner.account_remove(entry.scope, tx_size);
                     for input in &entry.tx.input {
@@ -4048,6 +4173,16 @@ impl Mempool {
                 inner.fee_deltas.remove(&txid);
             }
             self.sync_unbroadcast_len(&inner);
+        }
+        let stats = crate::mempool::health::MinedBlockStats {
+            height: height as u64,
+            block_weight,
+            mempool_txs_weight: removed_weight,
+        };
+        if chain_report {
+            self.record_block_health(block_hash, stats);
+        } else {
+            self.health.lock().merge(block_hash, stats);
         }
 
         for (txid, seq) in &confirmed {
@@ -10517,6 +10652,76 @@ mod tests {
         );
     }
 
+    /// `remove_for_block` records the block's non-coinbase weight and the
+    /// weight this pool held, for the health window, and a second report of
+    /// the same block keeps that coverage.
+    #[test]
+    fn remove_for_block_records_the_mempool_coverage_of_the_block() {
+        let held_op = outpoint(0xC1);
+        let other_op = outpoint(0xC2);
+        let (cs, mp, _dir) = make_funded_env(&[(held_op, coin(100_000)), (other_op, coin(100_000))]);
+        let held = tx_from(&[held_op], &[(90_000, 0xC3)]);
+        mp.accept_transaction(held.clone(), &cs, &NoopVerifier, TxSource::Rpc, false)
+            .expect("held");
+        let unseen = tx_from(&[other_op], &[(90_000, 0xC4)]);
+        let mut block = bitcoin::constants::genesis_block(bitcoin::Network::Regtest);
+        block.txdata.push(held.clone());
+        block.txdata.push(unseen.clone());
+        let block_weight = held.weight().to_wu() + unseen.weight().to_wu();
+
+        // A caller's cleanup alone records nothing: only the chain's does.
+        let lone = Mempool::new(300_000_000, 1_000);
+        lone.remove_for_block(&block, 5);
+        assert!(lone.health_blocks().is_empty());
+
+        mp.remove_for_connected_block(&block, 5);
+        let want = crate::mempool::health::MinedBlockStats {
+            height: 5,
+            block_weight,
+            mempool_txs_weight: held.weight().to_wu(),
+        };
+        assert_eq!(mp.health_blocks(), vec![want]);
+        // The caller then cleans up again and finds nothing left to remove.
+        mp.remove_for_block(&block, 5);
+        assert_eq!(mp.health_blocks(), vec![want], "the second report removed nothing");
+    }
+
+    /// Arrivals count only once resident for ten seconds, and only while in
+    /// the template class: a transaction quarantined from templates, or
+    /// gone, adds nothing.
+    #[test]
+    fn arrivals_count_only_resident_template_class_transactions() {
+        let mp = Mempool::new(300_000_000, 1_000);
+        let acting = mp.insert_tx_weighted_for_test(
+            tx_from(&[outpoint(0xD1)], &[(1_000, 0xD1)]),
+            100_000,
+            4_000,
+            QuarantineScope::acting(),
+        );
+        let quarantined = mp.insert_tx_weighted_for_test(
+            tx_from(&[outpoint(0xD2)], &[(1_000, 0xD2)]),
+            100_000,
+            4_000,
+            QuarantineScope { relay: false, template: true },
+        );
+        let gone = <Txid as bitcoin::hashes::Hash>::from_byte_array([0xD3; 32]);
+        let t0 = 1_000_000;
+        for t in [acting, quarantined, gone] {
+            mp.arrivals.lock().note(t, t0);
+        }
+        mp.promote_arrivals_at(t0 + 9);
+        let total = |mp: &Mempool| -> f64 {
+            mp.arrivals.lock().rates(t0 + 10).bands.iter().map(|(_, r)| r).sum()
+        };
+        assert_eq!(total(&mp), 0.0, "nothing counts before 10 s");
+        mp.promote_arrivals_at(t0 + 10);
+        // One arrival's impulse, decayed over the ten seconds since it entered.
+        let half_life = crate::mempool::arrivals::RATE_HALF_LIFE_SECS;
+        let one = 4_000.0 * std::f64::consts::LN_2 / half_life * 0.5f64.powf(10.0 / half_life);
+        let got = total(&mp);
+        assert!((got - one).abs() < 1e-9, "only the acting entry counts: {got} vs {one}");
+    }
+
     /// A full mempool floors `estimatesmartfee` at the rolling minimum: the
     /// history answer would name a rate this node refuses to relay. The same
     /// call on the uncongested pool returns the history value untouched.
@@ -10539,7 +10744,7 @@ mod tests {
         let history = FeeEstimator::new();
         history.record_block(&[5_000; 50]); // 5 sat/vB at every percentile
 
-        let calm = estimate_smart_fee(&mp, &history, 6, EstimateMode::Historical, FeeRateEstimator::Auto)
+        let calm = estimate_smart_fee(&mp, &history, 6, EstimateMode::Historical, FeeRateEstimator::Auto, false)
             .expect("history answers");
         assert_eq!(calm.feerate_sat_per_kvb, 5_000, "uncongested: the history value");
         assert_eq!(calm.estimator, EstimateSource::BlockPolicy);
@@ -10551,7 +10756,7 @@ mod tests {
         let rolling = mp.info().mempool_min_fee;
         assert!(rolling > 5_000, "the eviction must lift the minimum past history ({rolling})");
 
-        let full = estimate_smart_fee(&mp, &history, 6, EstimateMode::Historical, FeeRateEstimator::Auto)
+        let full = estimate_smart_fee(&mp, &history, 6, EstimateMode::Historical, FeeRateEstimator::Auto, false)
             .expect("history answers");
         assert_eq!(full.feerate_sat_per_kvb, rolling, "full: the rolling minimum");
         assert_eq!(full.estimator, EstimateSource::Floor);
