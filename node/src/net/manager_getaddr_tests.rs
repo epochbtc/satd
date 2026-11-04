@@ -388,3 +388,21 @@ fn a_link_that_hides_our_ip_never_gets_both_our_onion_and_our_ip() {
     assert!(pm.self_advertise_addrv2(2).is_none(), "a direct peer is not told the onion");
     assert!(pm.self_advertise_externals(2).is_some(), "but still learns -externalip");
 }
+
+/// Both self-advertisements follow the one read of our onion the handshake
+/// took, not the live value: an onion registered after that read cannot
+/// reach a link that has just been told `-externalip`. Perturbation: read
+/// `advertised_onion` afresh in `self_advertise_addrv2_given` and the link
+/// gets the onion too.
+#[test]
+fn both_self_advertisements_follow_the_handshakes_one_read_of_our_onion() {
+    let (pm, _dir) = mk_pm_with_proxy(Some("127.0.0.1:9050".to_string()));
+    pm.external_addrs.write().push(SocketAddr::from(([44, 33, 22, 11], 8333)));
+    let mut proxied = peer(1, SocketAddr::from(([44, 44, 44, 7], 8333)), Direction::Outbound);
+    proxied.wants_addrv2 = true;
+    let _p = add_peer(&pm, proxied);
+    let read_at_handshake: Option<PeerAddr> = None;
+    pm.set_advertised_onion(OUR_ONION.to_string(), 8333);
+    assert!(pm.self_advertise_externals_given(1, read_at_handshake.as_ref()).is_some());
+    assert!(pm.self_advertise_addrv2_given(1, read_at_handshake).is_none(), "not both on one hidden link");
+}

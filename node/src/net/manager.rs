@@ -2267,7 +2267,16 @@ impl PeerManager {
     /// those on the peer's IP family (IPv4 with IPv4-mapped included), as
     /// `addrv2` if it asked for that and `addr` otherwise. `None` if there
     /// are none, or the peer is an onion peer.
+    #[cfg(test)]
     fn self_advertise_externals(&self, id: PeerId) -> Option<NetworkMessage> {
+        let onion = self.advertised_onion.read().clone();
+        self.self_advertise_externals_given(id, onion.as_ref())
+    }
+
+    /// [`Self::self_advertise_externals`] against `our_onion`, the onion
+    /// the handshake read once for both self-advertisements: read twice, a
+    /// registration between the reads would send a hidden link both.
+    fn self_advertise_externals_given(&self, id: PeerId, our_onion: Option<&PeerAddr>) -> Option<NetworkMessage> {
         let (peer_v4, wants_v2, onion, hidden) = {
             let peers = self.peers.read();
             let h = peers.get(&id).filter(|h| h.info.relays_addrs())?;
@@ -2281,7 +2290,7 @@ impl PeerManager {
         // when we have one; our IP beside it would link the two. With no
         // onion to announce, a proxied peer still learns `-externalip`, as
         // Core's would.
-        if onion || (hidden && self.advertised_onion.read().is_some()) {
+        if onion || (hidden && our_onion.is_some()) {
             return None;
         }
         let services = self.local_services();
@@ -2313,7 +2322,19 @@ impl PeerManager {
     /// or the peer didn't opt into addrv2. The pubkey is recovered from the
     /// stored host; it was validated when the onion was registered, so this is
     /// infallible in practice.
+    #[cfg(test)]
     fn self_advertise_addrv2(&self, id: PeerId) -> Option<bitcoin::p2p::address::AddrV2Message> {
+        let onion = self.advertised_onion.read().clone();
+        self.self_advertise_addrv2_given(id, onion)
+    }
+
+    /// [`Self::self_advertise_addrv2`] against the handshake's one read of
+    /// our onion (see [`Self::self_advertise_externals_given`]).
+    fn self_advertise_addrv2_given(
+        &self,
+        id: PeerId,
+        our_onion: Option<PeerAddr>,
+    ) -> Option<bitcoin::p2p::address::AddrV2Message> {
         // A block-relay-only link carries no address traffic (Core's
         // `SetupAddressRelay`); our onion on one would link the two. Nor
         // does it go on a link that shows the peer our own IP: the onion
@@ -2325,7 +2346,7 @@ impl PeerManager {
         }) {
             return None;
         }
-        let onion = self.advertised_onion.read().clone()?;
+        let onion = our_onion?;
         let PeerAddr::Onion { host, port } = onion else {
             return None;
         };
@@ -13962,6 +13983,11 @@ impl PeerManager {
                 .map_err(|e| format!("send getaddr: {}", e))?;
         }
 
+        // One read of our onion for both self-advertisements below, so a
+        // hidden service registered between them cannot send a link that
+        // hides our IP both the onion and `-externalip`.
+        let our_onion = self.advertised_onion.read().clone();
+
         // Proactively advertise our own hidden service to this peer so the
         // network can discover and dial us inbound. A v3 onion only rides on
         // addrv2, so this fires only for peers that sent `sendaddrv2` (captured
@@ -13979,13 +14005,13 @@ impl PeerManager {
         if direction == Direction::Outbound
             && conn_type != ConnType::AddrFetch
             && !quiet
-            && let Some(msg) = self.self_advertise_externals(id)
+            && let Some(msg) = self.self_advertise_externals_given(id, our_onion.as_ref())
             && let Err(e) = writer.send(msg).await
         {
             tracing::debug!(id, "self-advertise addr send failed: {}", e);
         }
 
-        if !quiet && let Some(addr_msg) = self.self_advertise_addrv2(id) {
+        if !quiet && let Some(addr_msg) = self.self_advertise_addrv2_given(id, our_onion.clone()) {
             // Best-effort gossip: a failed advertisement must NOT tear down an
             // otherwise-healthy peer we just spent a full Tor rendezvous
             // establishing. Log and continue (unlike the session-setup sends
