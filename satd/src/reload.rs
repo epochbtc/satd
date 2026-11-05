@@ -825,6 +825,9 @@ fn field_specs() -> Vec<FieldSpec> {
         }),
         restart!("dns", dns),
         restart!("dnsseed", dnsseed),
+        live!("discover", discover, |c, h| {
+            h.peer_manager.set_discover(c.discover)
+        }),
         restart!("forcednsseed", forcednsseed),
         restart!("fixedseeds", fixedseeds),
         live!("bantime", bantime, |c, h| {

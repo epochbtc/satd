@@ -151,6 +151,7 @@ changed. Their values are redacted in the log, never printed.
 | `maxuploadtarget` | New rolling 24h upload cap. |
 | `v2transport`, `v2only` | Adjusts BIP 324 v2 transport and v2-only peering for new connections. |
 | `externalip`, `whitelist` | Replaces advertised external addresses and the `-whitelist` permission set. |
+| `discover` | Turns announcing the peer-reported address on or off for new outbound connections. |
 | `rpcextendederrors`, `rpcdefaultunits` | Switches the RPC error-payload shape and the default amount unit. |
 | `maxconnections`, `maxinboundperip` | New limits govern subsequent connections. Existing peers above a lowered cap are not dropped. |
 | `bantime` | New ban duration applies to bans created after the change. |
