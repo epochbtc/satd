@@ -418,10 +418,12 @@ fn reporting_peer(pm: &PeerManager, id: PeerId, addr: SocketAddr, seen: SocketAd
 /// `-discover` announces, to an outbound peer, the address that peer
 /// reports seeing us at, with our listen port rather than the port it saw
 /// (Core's `GetLocalAddrForPeer`), and the address joins our own, so
-/// `getaddr` never hands it out. Off, nothing is announced. Perturbation:
-/// drop the `discover` check and the first assertion fails; drop the
-/// `discovered_ips` insert and the `getaddr` one does; keep the set when
-/// turned off and the last one does. Not listening, nothing is announced.
+/// `getaddr` never hands it out. The peer chose that IP, so it is ours at
+/// our listen port only: another node at the IP stays in the reply. Off,
+/// nothing is announced. Perturbation: drop the `discover` check and the
+/// first assertion fails; drop the `discovered` insert and the `getaddr`
+/// one does, and so does matching the IP alone; keep the set when turned
+/// off and the last one does. Not listening, nothing is announced.
 #[test]
 fn discover_announces_the_address_an_outbound_peer_sees_us_at() {
     let (pm, _dir) = mk_pm();
@@ -438,16 +440,15 @@ fn discover_announces_the_address_an_outbound_peer_sees_us_at() {
     let key = GetAddrCacheKey { bind: None, onion: true };
     let entry = |addr| GetAddrEntry { addr, time: 1, services: ServiceFlags::NETWORK };
     let stranger = PeerAddr::Socket(SocketAddr::from(([5, 6, 7, 8], 8333)));
-    pm.addr_response_cache.lock().insert(
-        key,
-        (u64::MAX, vec![entry(stranger.clone()), entry(PeerAddr::Socket(SocketAddr::from(([81, 2, 3, 4], 8333))))]),
-    );
+    let same_ip = PeerAddr::Socket(SocketAddr::from(([81, 2, 3, 4], 8333)));
+    let ours = PeerAddr::Socket(SocketAddr::from(([81, 2, 3, 4], 18444)));
+    pm.addr_response_cache.lock().insert(key, (u64::MAX, vec![entry(stranger.clone()), entry(same_ip.clone()), entry(ours)]));
     let got: Vec<PeerAddr> = pm.getaddr_reply(key, false).into_iter().map(|e| e.addr).collect();
-    assert_eq!(got, vec![stranger], "the discovered address is ours and stays out of getaddr");
+    assert_eq!(got, vec![stranger, same_ip], "the discovered address is ours and stays out of getaddr; its IP at another port is not");
 
     pm.set_discover(false);
     assert!(pm.self_advertise_externals(1).is_none(), "turned off again");
-    assert!(pm.discovered_ips.read().is_empty(), "turning it off forgets what it announced");
+    assert!(pm.discovered.read().is_empty(), "turning it off forgets what it announced");
 
     pm.set_discover(true);
     pm.set_listen_port(None);
@@ -469,10 +470,11 @@ fn discovered_addresses_are_bounded() {
         let _r = add_peer(&pm, reporting_peer(&pm, id, SocketAddr::from(([44, 1, 2, i + 1], 8333)), seen));
         assert!(pm.self_advertise_externals(id).is_some());
     }
-    let kept: Vec<IpAddr> = pm.discovered_ips.read().iter().copied().collect();
+    let kept: Vec<SocketAddr> = pm.discovered.read().iter().copied().collect();
     assert_eq!(kept.len(), MAX_DISCOVERED_IPS);
-    assert_eq!(kept.last(), Some(&IpAddr::from([81, 2, 3, n])), "the latest is kept");
-    assert!(!pm.is_own_address(&PeerAddr::Socket(SocketAddr::from(([81, 2, 3, 1], 8333)))), "the oldest is dropped");
+    assert_eq!(kept.last(), Some(&SocketAddr::from(([81, 2, 3, n], 18444))), "the latest is kept");
+    assert!(pm.is_own_address(&PeerAddr::Socket(SocketAddr::from(([81, 2, 3, n], 18444)))));
+    assert!(!pm.is_own_address(&PeerAddr::Socket(SocketAddr::from(([81, 2, 3, 1], 18444)))), "the oldest is dropped");
 }
 
 /// A report is used only where Core's `IsPeerAddrLocalGood` would, and

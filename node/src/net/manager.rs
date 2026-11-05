@@ -1252,11 +1252,12 @@ pub struct PeerManager {
     /// `-discover`: announce the address an outbound peer says it sees us
     /// at. Off by default.
     discover: std::sync::atomic::AtomicBool,
-    /// The latest IPs (at most [`MAX_DISCOVERED_IPS`]) this node announced
-    /// as its own after a peer reported them. `getaddr` replies never carry
-    /// one, as for `-externalip`. A report comes from the peer, so the set is
-    /// bounded and cleared when `-discover` is turned off.
-    discovered_ips: RwLock<std::collections::VecDeque<IpAddr>>,
+    /// The latest addresses (at most [`MAX_DISCOVERED_IPS`]) this node
+    /// announced as its own after a peer reported its IP, each at our listen
+    /// port. `getaddr` replies never carry one. A report comes from the
+    /// peer, so the set is bounded, matched by IP and port, and cleared when
+    /// `-discover` is turned off.
+    discovered: RwLock<std::collections::VecDeque<SocketAddr>>,
     /// `-whitelist` permission entries (by source subnet). Set once at
     /// startup; consulted on every peer connect to compute permissions.
     whitelist: RwLock<Vec<crate::net::permissions::WhitelistEntry>>,
@@ -1661,7 +1662,7 @@ impl PeerManager {
             own_onions: RwLock::new(std::collections::HashSet::new()),
             listen_port: std::sync::atomic::AtomicU16::new(0),
             discover: std::sync::atomic::AtomicBool::new(false),
-            discovered_ips: RwLock::new(std::collections::VecDeque::new()),
+            discovered: RwLock::new(std::collections::VecDeque::new()),
             whitelist: RwLock::new(Vec::new()),
             // Core's rule off regtest: routable addresses only. Regtest keeps
             // private ones, which lab networks run on.
@@ -2103,21 +2104,21 @@ impl PeerManager {
     pub fn set_discover(&self, on: bool) {
         self.discover.store(on, Ordering::Relaxed);
         if !on {
-            self.discovered_ips.write().clear();
+            self.discovered.write().clear();
         }
     }
 
-    /// Record `ip` as one `-discover` announced, keeping the latest
+    /// Record `sa` as an address `-discover` announced, keeping the latest
     /// [`MAX_DISCOVERED_IPS`].
-    fn note_discovered_ip(&self, ip: IpAddr) {
-        let mut ips = self.discovered_ips.write();
-        if ips.contains(&ip) {
+    fn note_discovered(&self, sa: SocketAddr) {
+        let mut kept = self.discovered.write();
+        if kept.contains(&sa) {
             return;
         }
-        if ips.len() == MAX_DISCOVERED_IPS {
-            ips.pop_front();
+        if kept.len() == MAX_DISCOVERED_IPS {
+            kept.pop_front();
         }
-        ips.push_back(ip);
+        kept.push_back(sa);
     }
 
     /// Core's `IsPeerAddrLocalGood` with `GetLocalAddrForPeer`'s outbound
@@ -2295,17 +2296,19 @@ impl PeerManager {
     }
 
     /// Whether `addr` is one of ours: an onion of ours (any port; see
-    /// `own_onions`), or the IP of an `-externalip` address or of one
-    /// `-discover` announced. A `getaddr`
-    /// reply never carries one: our onion arriving from our clearnet IP, or
-    /// the other way round, would link the two.
+    /// `own_onions`), the IP of an `-externalip` address, or exactly an
+    /// address `-discover` announced. A `getaddr` reply never carries one:
+    /// our onion arriving from our clearnet IP, or the other way round,
+    /// would link the two. A discovered address matches only at our listen
+    /// port, because the peer chose its IP: matched by IP, a peer could
+    /// name another node's and keep it out of our replies at every port.
     fn is_own_address(&self, addr: &PeerAddr) -> bool {
         match addr {
             PeerAddr::Onion { host, .. } => self.own_onions.read().contains(&host.to_ascii_lowercase()),
             PeerAddr::Socket(sa) => {
                 let ip = sa.ip().to_canonical();
                 self.external_addrs.read().iter().any(|e| e.ip().to_canonical() == ip)
-                    || self.discovered_ips.read().contains(&ip)
+                    || self.discovered.read().contains(&SocketAddr::new(ip, sa.port()))
             }
         }
     }
@@ -2368,7 +2371,7 @@ impl PeerManager {
             && let Some(sa) = reported
             && sa.is_ipv4() == peer_v4
         {
-            self.note_discovered_ip(sa.ip());
+            self.note_discovered(sa);
             tracing::debug!("Advertising address {sa} to peer={id}");
             vec![GetAddrEntry { addr: PeerAddr::Socket(sa), time, services }]
         } else {
