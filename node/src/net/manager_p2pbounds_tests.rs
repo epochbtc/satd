@@ -1123,7 +1123,7 @@ mod nap_aggregator {
         let _full = peer_of(&pm, 2, ConnType::OutboundFullRelay, publisher_services());
         pm.handle_peer_connected(1, version(publisher_services()));
         pm.handle_peer_connected(2, version(publisher_services()));
-        let tried = |a: SocketAddr| pm.addrman.read().iter().any(|e| e.addr == a && e.tried);
+        let tried = |a: SocketAddr| pm.addrman.read().iter().any(|e| e.addr == a.into() && e.tried);
         assert!(!tried(addr(1)), "a pull connection proves nothing about the address");
         assert!(tried(addr(2)), "an ordinary outbound connection still promotes it");
     }

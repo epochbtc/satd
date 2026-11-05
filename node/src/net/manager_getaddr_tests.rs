@@ -130,8 +130,8 @@ fn an_inbound_peer_gets_one_sample_of_the_address_book() {
     pm.handle_message(1, NetworkMessage::GetAddr, InFlight::adopt(None));
     let got = answered(&mut rx).expect("an inbound peer is answered");
     assert_eq!(got.len(), 200 * 23 / 100, "23% of the book");
-    let book: std::collections::HashSet<SocketAddr> = pm.addrman.read().iter().map(|e| e.addr).collect();
-    assert!(got.iter().all(|a| book.contains(a)), "only address-book entries");
+    let book: std::collections::HashSet<PeerAddr> = pm.addrman.read().iter().map(|e| e.addr.clone()).collect();
+    assert!(got.iter().all(|a| book.contains(&PeerAddr::Socket(*a))), "only address-book entries");
     assert!(!got.contains(&connected), "no live peer list");
     assert!(!got.contains(&external), "not our own address");
 

@@ -22,12 +22,23 @@
 //! The key that places entries is kept in `peers.dat`, as Core keeps
 //! `nKey`, so they stay put across restarts.
 //!
+//! The book holds Tor v3 onion addresses as well as IPv4 and IPv6 ones, as
+//! Core's holds every BIP 155 network: an entry is keyed by a [`PeerAddr`].
+//! An onion's network group is Core's for Tor (`NetGroupManager::GetGroup`,
+//! v31.1 `src/netgroup.cpp:52`): the network and the first four bits of its
+//! key, so the onion addresses fall into sixteen groups. `-asmap` groups IP
+//! addresses only. Onion addresses are free to make, so one source's onion
+//! entries are held to [`MAX_NEW_PER_GROUP`] of the new table as well; see
+//! [`AddrMan::add_from_replacing`].
+//!
 //! The on-disk format is satd-native and versioned (magic `SADR`); it is
 //! NOT byte-compatible with Core's `peers.dat`, and is treated as
 //! untrusted on load (capped, malformed records skipped). Version 2 adds
 //! each entry's advertised service bits and the address of the peer that
 //! told us about it; a version 1 file still loads, with Core's defaults for
-//! the two fields. The slot key follows the records as a trailer (`SKEY`
+//! the two fields. Version 3 adds onion addresses, an entry's or its
+//! source's, stored as the 32-byte key; a version 1 or 2 file still loads.
+//! The slot key follows the records as a trailer (`SKEY`
 //! and 16 bytes), which a reader that predates it never reaches: such a
 //! file still loads in an older satd. A file without it loads under a fresh
 //! key, and a tried entry whose slot another already took goes back to new.
@@ -51,6 +62,8 @@ use std::io::{self, Read, Write};
 use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 
+use crate::net::peer::PeerAddr;
+
 /// Hard cap on total stored addresses (new + tried). Keeps `peers.dat`
 /// and memory bounded; well above what a single node needs to bootstrap.
 pub const MAX_ENTRIES: usize = 16_384;
@@ -64,7 +77,7 @@ pub const MAX_NEW_PER_GROUP: usize = 64;
 pub const DEFAULT_SERVICES: u64 = 1 | 8;
 
 /// Current `peers.dat` format version (see the module docs).
-const FORMAT_VERSION: u32 = 2;
+const FORMAT_VERSION: u32 = 3;
 
 // Core's table geometry (`src/addrman_impl.h`, `src/addrman.h`): the tried
 // table's slots, and the `bucket/position` slots `getrawaddrman` reports.
@@ -97,9 +110,90 @@ const KEY_TRAILER: &[u8; 4] = b"SKEY";
 const _: () = assert!(MAX_ENTRIES as u64 <= TRIED_BUCKET_COUNT * BUCKET_SIZE);
 const _: () = assert!(MAX_ENTRIES as u64 <= NEW_BUCKET_COUNT * BUCKET_SIZE);
 
+/// An address without a port, as an entry's source is one (Core's
+/// `CNetAddr`, where an entry is a `CService`).
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum NetAddr {
+    Ip(IpAddr),
+    /// A Tor v3 onion, by its ed25519 key.
+    Onion([u8; 32]),
+}
+
+impl NetAddr {
+    /// The address of `addr` without its port; `None` for an onion host
+    /// that is not a well-formed v3 address.
+    pub fn of(addr: &PeerAddr) -> Option<NetAddr> {
+        match addr {
+            PeerAddr::Socket(sa) => Some(NetAddr::Ip(sa.ip())),
+            PeerAddr::Onion { host, .. } => onion_key(host).map(NetAddr::Onion),
+        }
+    }
+
+    /// The network, as Core's `GetNetworkName` spells it.
+    pub fn network_name(&self) -> &'static str {
+        match self {
+            NetAddr::Ip(ip) => network_name(*ip),
+            NetAddr::Onion(_) => "onion",
+        }
+    }
+
+    /// The address as Core's `ToStringAddr` prints it.
+    pub fn addr_string(&self) -> String {
+        match self {
+            NetAddr::Ip(ip) => addr_string(*ip),
+            NetAddr::Onion(key) => crate::net::peer::torv3_to_onion_host(key),
+        }
+    }
+}
+
+impl From<IpAddr> for NetAddr {
+    fn from(ip: IpAddr) -> Self {
+        NetAddr::Ip(ip)
+    }
+}
+
+/// The key of a v3 onion host, in any case; `None` if it is not one.
+fn onion_key(host: &str) -> Option<[u8; 32]> {
+    crate::net::peer::onion_host_to_torv3_pubkey(&host.to_ascii_lowercase())
+}
+
+/// `addr` as the book keys it: an onion host in lower case, as gossip
+/// spells it (`torv3_to_onion_host`), whatever case it was given in.
+fn canonical(addr: &PeerAddr) -> std::borrow::Cow<'_, PeerAddr> {
+    match addr {
+        PeerAddr::Onion { host, port } if host.bytes().any(|b| b.is_ascii_uppercase()) => {
+            std::borrow::Cow::Owned(PeerAddr::Onion { host: host.to_ascii_lowercase(), port: *port })
+        }
+        _ => std::borrow::Cow::Borrowed(addr),
+    }
+}
+
+/// The network of `addr`, as Core's `GetNetworkName` spells it.
+pub fn peer_network_name(addr: &PeerAddr) -> &'static str {
+    match addr {
+        PeerAddr::Socket(sa) => network_name(sa.ip()),
+        PeerAddr::Onion { .. } => "onion",
+    }
+}
+
+/// `addr` without its port, as Core's `ToStringAddr` prints it.
+pub fn peer_addr_string(addr: &PeerAddr) -> String {
+    match addr {
+        PeerAddr::Socket(sa) => addr_string(sa.ip()),
+        PeerAddr::Onion { host, .. } => host.clone(),
+    }
+}
+
+/// The network group of an onion: Core's for Tor, the network and the
+/// first four bits of the key (`GetGroup` sets the low four). Three bytes
+/// long, which no IP group is (two, four, or five under `-asmap`).
+fn onion_group(key: &[u8; 32]) -> Vec<u8> {
+    vec![0xF0, b'o', key[0] | 0x0F]
+}
+
 #[derive(Clone, Debug)]
 pub struct AddrEntry {
-    pub addr: SocketAddr,
+    pub addr: PeerAddr,
     /// We have completed a handshake with this address at least once.
     pub tried: bool,
     /// Unix seconds of last successful connect (0 if never).
@@ -116,7 +210,7 @@ pub struct AddrEntry {
     /// The peer that told us about this address (Core's `source`). An
     /// address we learned by connecting to it, or that was added by hand,
     /// is its own source, as in Core's `addpeeraddress`.
-    pub source: IpAddr,
+    pub source: NetAddr,
     /// Cached network-group key (`group_fn(ip)`), computed once when the
     /// entry is inserted. Cached so the per-group cap check does not have
     /// to re-run `group_fn` for every entry on every `add` — that recompute
@@ -125,6 +219,9 @@ pub struct AddrEntry {
     /// persisted: it depends on the active `group_fn` (`-asmap`), so it is
     /// recomputed on load.
     group: Vec<u8>,
+    /// The source's network group, cached as `group` is: the onion share
+    /// per source counts by it.
+    source_group: Vec<u8>,
 }
 
 /// Core's `ADDRMAN_HORIZON`: an address not seen for this long is terrible.
@@ -168,9 +265,8 @@ const RECENT_TRY_SECS: u64 = 10 * 60;
 /// overly penalizing outages").
 const MAX_CHANCE_ATTEMPTS: u32 = 8;
 
-/// [`AddrEntry::is_terrible`] over the fields it reads, for an address the
-/// book does not hold as well (the onion candidates).
-pub fn is_terrible(last_seen: u64, last_success: u64, last_try: u64, attempts: u32, now: u64) -> bool {
+/// [`AddrEntry::is_terrible`] over the fields it reads.
+fn is_terrible(last_seen: u64, last_success: u64, last_try: u64, attempts: u32, now: u64) -> bool {
     if last_try != 0 && now.saturating_sub(last_try) <= ADDRMAN_TEST_GRACE_SECS {
         return false;
     }
@@ -200,14 +296,14 @@ fn default_group(ip: IpAddr) -> Vec<u8> {
 type GroupFn = Box<dyn Fn(IpAddr) -> Vec<u8> + Send + Sync>;
 
 pub struct AddrMan {
-    entries: HashMap<SocketAddr, AddrEntry>,
+    entries: HashMap<PeerAddr, AddrEntry>,
     /// The tried table (Core's `vvTried`): the entry at each taken slot,
     /// keyed `bucket * BUCKET_SIZE + position`. Holds every tried entry,
     /// each at [`AddrMan::tried_slot`], and nothing else.
-    tried_slots: HashMap<u64, SocketAddr>,
+    tried_slots: HashMap<u64, PeerAddr>,
     /// New entries whose promotion is waiting on a taken tried slot (Core's
     /// `m_tried_collisions`), at most [`TRIED_COLLISION_SIZE`].
-    tried_collisions: std::collections::BTreeSet<SocketAddr>,
+    tried_collisions: std::collections::BTreeSet<PeerAddr>,
     /// Pluggable network-group function (replaced by `-asmap`).
     group_fn: GroupFn,
     /// SipHash key for the `bucket/position` slots (Core's `nKey`). Random
@@ -240,9 +336,8 @@ impl TableCounts {
     }
 }
 
-/// Network of an address, spelled as Core's `GetNetworkName` spells it. An
-/// IPv4-mapped IPv6 address is IPv4. The address book holds only socket
-/// addresses, so the answer is always `ipv4` or `ipv6`.
+/// Network of an IP address, spelled as Core's `GetNetworkName` spells it.
+/// An IPv4-mapped IPv6 address is IPv4.
 pub fn network_name(ip: IpAddr) -> &'static str {
     match ip {
         IpAddr::V4(_) => "ipv4",
@@ -264,11 +359,20 @@ pub fn addr_string(ip: IpAddr) -> String {
 }
 
 /// Core's `CService::GetKey`-equivalent input for the slot hashes: the IP in
-/// its 16-byte form followed by the big-endian port.
-fn addr_key(addr: &SocketAddr) -> Vec<u8> {
-    let mut k = match addr.ip() {
-        IpAddr::V4(v4) => v4.to_ipv6_mapped().octets().to_vec(),
-        IpAddr::V6(v6) => v6.octets().to_vec(),
+/// its 16-byte form, or an onion's network id and key, followed by the
+/// big-endian port.
+fn addr_key(addr: &PeerAddr) -> Vec<u8> {
+    let mut k = match addr {
+        PeerAddr::Socket(sa) => match sa.ip() {
+            IpAddr::V4(v4) => v4.to_ipv6_mapped().octets().to_vec(),
+            IpAddr::V6(v6) => v6.octets().to_vec(),
+        },
+        // BIP 155's network id for Tor v3, then the key.
+        PeerAddr::Onion { host, .. } => {
+            let mut k = vec![4];
+            k.extend_from_slice(&onion_key(host).unwrap_or_default());
+            k
+        }
     };
     k.extend_from_slice(&addr.port().to_be_bytes());
     k
@@ -301,11 +405,18 @@ impl AddrMan {
         self.admit_private = admit;
     }
 
-    /// Whether `addr` may enter the book: it is valid, and it is routable
-    /// unless [`set_admit_private`](Self::set_admit_private) is on.
-    pub fn admits(&self, addr: &SocketAddr) -> bool {
-        let ip = addr.ip();
-        crate::net::is_valid(ip) && (self.admit_private || crate::net::is_routable(ip))
+    /// Whether `addr` may enter the book: an IP address that is valid, and
+    /// routable unless [`set_admit_private`](Self::set_admit_private) is on,
+    /// or a well-formed v3 onion. Port 0 is refused for an onion, as the
+    /// gossip path always refused it.
+    pub fn admits(&self, addr: &PeerAddr) -> bool {
+        match addr {
+            PeerAddr::Socket(sa) => {
+                let ip = sa.ip();
+                crate::net::is_valid(ip) && (self.admit_private || crate::net::is_routable(ip))
+            }
+            PeerAddr::Onion { host, port } => *port != 0 && onion_key(host).is_some(),
+        }
     }
 
     /// Install a custom network-group function (e.g. ASN-based via
@@ -323,8 +434,18 @@ impl AddrMan {
         self.entries.is_empty()
     }
 
-    fn group_of(&self, addr: &SocketAddr) -> Vec<u8> {
-        (self.group_fn)(addr.ip())
+    fn group_of(&self, addr: &PeerAddr) -> Vec<u8> {
+        match addr {
+            PeerAddr::Socket(sa) => (self.group_fn)(sa.ip()),
+            PeerAddr::Onion { host, .. } => onion_key(host).map(|k| onion_group(&k)).unwrap_or_default(),
+        }
+    }
+
+    fn net_group(&self, net: &NetAddr) -> Vec<u8> {
+        match net {
+            NetAddr::Ip(ip) => (self.group_fn)(*ip),
+            NetAddr::Onion(key) => onion_group(key),
+        }
     }
 
     /// The network group of `ip` under the active group function (the /16
@@ -348,15 +469,17 @@ impl AddrMan {
     /// per-group caps. Returns true if a new entry was inserted. The entry
     /// gets the default service bits and is its own source; use
     /// [`add_from`](Self::add_from) when the announcement carried both.
-    pub fn add(&mut self, addr: SocketAddr, now: u64) -> bool {
-        self.add_from(addr, now, DEFAULT_SERVICES, addr.ip())
+    pub fn add(&mut self, addr: impl Into<PeerAddr>, now: u64) -> bool {
+        let addr = addr.into();
+        let Some(source) = NetAddr::of(&addr) else { return false };
+        self.add_from(addr, now, DEFAULT_SERVICES, source)
     }
 
     /// [`add`](Self::add) with the announced service bits and the address
     /// of the peer that announced it. A refresh of a known address updates
     /// its last-seen time and adds the announced services; the source stays
     /// the first.
-    pub fn add_from(&mut self, addr: SocketAddr, now: u64, services: u64, source: IpAddr) -> bool {
+    pub fn add_from(&mut self, addr: impl Into<PeerAddr>, now: u64, services: u64, source: impl Into<NetAddr>) -> bool {
         self.add_from_replacing(addr, now, services, source).0
     }
 
@@ -367,13 +490,13 @@ impl AddrMan {
     /// as seen in the future, and terrible.
     pub fn add_seen_replacing(
         &mut self,
-        addr: SocketAddr,
+        addr: impl Into<PeerAddr>,
         seen: u64,
         now: u64,
         services: u64,
-        source: IpAddr,
-    ) -> (bool, Option<SocketAddr>) {
-        self.add_dated(addr, seen, now, services, source)
+        source: impl Into<NetAddr>,
+    ) -> (bool, Option<PeerAddr>) {
+        self.add_dated(addr.into(), seen, now, services, source.into())
     }
 
     /// [`add_from`](Self::add_from), and when the book or the address's
@@ -386,24 +509,33 @@ impl AddrMan {
     ///
     /// Without this a full book refused every address it did not already
     /// hold, for good: nothing ever left it.
+    ///
+    /// An onion address also counts against its source's share: one
+    /// source's network group holds at most [`MAX_NEW_PER_GROUP`] onion
+    /// entries in the new table, and a full share makes room the same way.
+    /// Anyone can make onion addresses in every onion group, so the
+    /// per-group cap alone would let one peer's `addrv2` answers fill the
+    /// onion part of the book. The share is the one satd's separate onion
+    /// list kept (an eighth of its 512 places per source).
     pub fn add_from_replacing(
         &mut self,
-        addr: SocketAddr,
+        addr: impl Into<PeerAddr>,
         now: u64,
         services: u64,
-        source: IpAddr,
-    ) -> (bool, Option<SocketAddr>) {
-        self.add_dated(addr, now, now, services, source)
+        source: impl Into<NetAddr>,
+    ) -> (bool, Option<PeerAddr>) {
+        self.add_dated(addr.into(), now, now, services, source.into())
     }
 
     fn add_dated(
         &mut self,
-        addr: SocketAddr,
+        addr: PeerAddr,
         seen: u64,
         now: u64,
         services: u64,
-        source: IpAddr,
-    ) -> (bool, Option<SocketAddr>) {
+        source: NetAddr,
+    ) -> (bool, Option<PeerAddr>) {
+        let addr = canonical(&addr).into_owned();
         if !self.admits(&addr) {
             return (false, None);
         }
@@ -417,14 +549,43 @@ impl AddrMan {
             return (false, None);
         }
         let group = self.group_of(&addr);
+        let source_group = self.net_group(&source);
         let mut evicted = None;
-        if self.new_count_in_group(&group) >= MAX_NEW_PER_GROUP {
+        let onion_share_full = addr.is_onion()
+            && self
+                .entries
+                .values()
+                .filter(|e| !e.tried && e.addr.is_onion() && e.source_group == source_group)
+                .count()
+                >= MAX_NEW_PER_GROUP;
+        let group_full = self.new_count_in_group(&group) >= MAX_NEW_PER_GROUP;
+        if onion_share_full {
+            // The source has its share of onions: make room in it, or
+            // refuse. When the onion's own group is full too, the entry
+            // dropped must be of both, or the group would pass its cap.
+            let Some(victim) = self
+                .entries
+                .values()
+                .find(|e| {
+                    !e.tried
+                        && e.addr.is_onion()
+                        && e.source_group == source_group
+                        && (!group_full || e.group == group)
+                        && e.is_terrible(now)
+                })
+                .map(|e| e.addr.clone())
+            else {
+                return (false, None);
+            };
+            self.remove_entry(&victim);
+            evicted = Some(victim);
+        } else if group_full {
             // The group is full: make room in it, or refuse.
             let Some(victim) = self
                 .entries
                 .values()
                 .find(|e| !e.tried && e.group == group && e.is_terrible(now))
-                .map(|e| e.addr)
+                .map(|e| e.addr.clone())
             else {
                 return (false, None);
             };
@@ -438,7 +599,7 @@ impl AddrMan {
                 self.entries
                     .values()
                     .find(|e| e.tried == tried && e.is_terrible(now))
-                    .map(|e| e.addr)
+                    .map(|e| e.addr.clone())
             };
             let Some(victim) = terrible(false).or_else(|| terrible(true)) else {
                 return (false, None);
@@ -447,7 +608,7 @@ impl AddrMan {
             evicted = Some(victim);
         }
         self.entries.insert(
-            addr,
+            addr.clone(),
             AddrEntry {
                 addr,
                 tried: false,
@@ -458,6 +619,7 @@ impl AddrMan {
                 services,
                 source,
                 group,
+                source_group,
             },
         );
         (true, evicted)
@@ -480,7 +642,8 @@ impl AddrMan {
     /// [`resolve_collisions`](Self::resolve_collisions) has tested the
     /// incumbent. satd used to promote every address it reached, with no
     /// bound per network group, so one group could fill the tried table.
-    pub fn mark_good(&mut self, addr: SocketAddr, now: u64) -> bool {
+    pub fn mark_good(&mut self, addr: impl Into<PeerAddr>, now: u64) -> bool {
+        let addr = canonical(&addr.into()).into_owned();
         // A manual peer the operator named can be anything the book would
         // refuse from gossip; connecting to it does not make it an entry.
         // Core's `Good` only promotes an entry `Add` already took.
@@ -503,16 +666,19 @@ impl AddrMan {
                 return false;
             }
         }
-        let entry = self.entries.entry(addr).or_insert_with(|| AddrEntry {
-            addr,
+        let Some(source) = NetAddr::of(&addr) else { return false };
+        let source_group = self.net_group(&source);
+        let entry = self.entries.entry(addr.clone()).or_insert_with(|| AddrEntry {
+            addr: addr.clone(),
             tried: false,
             last_success: 0,
             attempts: 0,
             last_try: 0,
             last_seen: now,
             services: DEFAULT_SERVICES,
-            source: addr.ip(),
+            source,
             group,
+            source_group,
         });
         entry.last_success = now;
         entry.last_try = now;
@@ -523,10 +689,10 @@ impl AddrMan {
         }
         let slot = self.tried_slot(&addr);
         if self.tried_slots.get(&slot).is_some_and(|other| *other != addr) {
+            tracing::debug!(%addr, "Tried-table collision; promotion waits on the incumbent");
             if self.tried_collisions.len() < TRIED_COLLISION_SIZE {
                 self.tried_collisions.insert(addr);
             }
-            tracing::debug!(%addr, "Tried-table collision; promotion waits on the incumbent");
             return false;
         }
         self.make_tried(addr, now);
@@ -540,7 +706,7 @@ impl AddrMan {
     /// room. A terrible new entry of the group gives up its place; if there
     /// is none, the demoted entry is dropped, where Core's `ClearNew` drops
     /// whatever held the slot it moves to.
-    fn make_tried(&mut self, addr: SocketAddr, now: u64) -> Option<SocketAddr> {
+    fn make_tried(&mut self, addr: PeerAddr, now: u64) -> Option<PeerAddr> {
         let slot = self.tried_slot(&addr);
         let mut dropped = None;
         if let Some(old) = self.tried_slots.remove(&slot)
@@ -554,14 +720,14 @@ impl AddrMan {
                     .entries
                     .values()
                     .find(|e| !e.tried && e.group == group && e.addr != old && e.is_terrible(now))
-                    .map_or(old, |e| e.addr);
+                    .map_or(old, |e| e.addr.clone());
                 self.remove_entry(&victim);
                 dropped = Some(victim);
             }
         }
         if let Some(e) = self.entries.get_mut(&addr) {
             e.tried = true;
-            self.tried_slots.insert(slot, addr);
+            self.tried_slots.insert(slot, addr.clone());
         }
         self.tried_collisions.remove(&addr);
         dropped
@@ -574,7 +740,7 @@ impl AddrMan {
     /// slot, and so does one whose incumbent has gone untested for 40
     /// minutes after the newcomer connected. Returns the addresses that left
     /// the book (see [`make_tried`](Self::make_tried)).
-    pub fn resolve_collisions(&mut self, now: u64) -> Vec<SocketAddr> {
+    pub fn resolve_collisions(&mut self, now: u64) -> Vec<PeerAddr> {
         let mut dropped = Vec::new();
         for new in std::mem::take(&mut self.tried_collisions) {
             let Some(info_new) = self.entries.get(&new) else { continue };
@@ -620,28 +786,29 @@ impl AddrMan {
 
     /// Core's `SelectTriedCollision`: the incumbent of a random waiting
     /// promotion, for the node to test by connecting to it.
-    pub fn select_tried_collision(&self) -> Option<SocketAddr> {
+    pub fn select_tried_collision(&self) -> Option<PeerAddr> {
         use rand::seq::IteratorRandom as _;
         let new = self.tried_collisions.iter().choose(&mut rand::thread_rng())?;
-        self.tried_slots.get(&self.tried_slot(new)).copied()
+        self.tried_slots.get(&self.tried_slot(new)).cloned()
     }
 
     /// The incumbents of every waiting promotion.
-    pub fn tried_collision_incumbents(&self) -> Vec<SocketAddr> {
+    pub fn tried_collision_incumbents(&self) -> Vec<PeerAddr> {
         self.tried_collisions
             .iter()
-            .filter_map(|new| self.tried_slots.get(&self.tried_slot(new)).copied())
+            .filter_map(|new| self.tried_slots.get(&self.tried_slot(new)).cloned())
             .collect()
     }
 
     /// The tried bucket `addr` sits in, if it is tried.
-    pub fn tried_bucket(&self, addr: &SocketAddr) -> Option<u64> {
-        self.is_tried(addr).then(|| self.tried_slot(addr) / BUCKET_SIZE)
+    pub fn tried_bucket(&self, addr: &PeerAddr) -> Option<u64> {
+        let addr = canonical(addr);
+        self.is_tried(&addr).then(|| self.tried_slot(&addr) / BUCKET_SIZE)
     }
 
     /// Remove `addr` from the book, and from the tried table and the
     /// collision set with it.
-    fn remove_entry(&mut self, addr: &SocketAddr) {
+    fn remove_entry(&mut self, addr: &PeerAddr) {
         if let Some(e) = self.entries.remove(addr)
             && e.tried
         {
@@ -659,25 +826,30 @@ impl AddrMan {
     /// holds it, with those it stated in its `version`. Only for addresses
     /// we dialled, whose `version` speaks for the address; gossip only adds
     /// ([`Self::add_from_replacing`]).
-    pub fn set_services(&mut self, addr: &SocketAddr, services: u64) {
-        if let Some(e) = self.entries.get_mut(addr) {
+    pub fn set_services(&mut self, addr: &PeerAddr, services: u64) {
+        if let Some(e) = self.entries.get_mut(canonical(addr).as_ref()) {
             e.services = services;
         }
     }
 
     /// Whether `addr` is in the tried table.
-    pub fn is_tried(&self, addr: &SocketAddr) -> bool {
-        self.entries.get(addr).is_some_and(|e| e.tried)
+    pub fn is_tried(&self, addr: &PeerAddr) -> bool {
+        self.entries.get(canonical(addr).as_ref()).is_some_and(|e| e.tried)
     }
 
     /// Whether the book holds `addr`, in either table.
-    pub fn contains(&self, addr: &SocketAddr) -> bool {
-        self.entries.contains_key(addr)
+    pub fn contains(&self, addr: &PeerAddr) -> bool {
+        self.entries.contains_key(canonical(addr).as_ref())
+    }
+
+    /// The entry for `addr`, if the book holds it.
+    pub fn get(&self, addr: &PeerAddr) -> Option<&AddrEntry> {
+        self.entries.get(canonical(addr).as_ref())
     }
 
     /// Record a failed connection attempt at `now`.
-    pub fn mark_attempt(&mut self, addr: SocketAddr, now: u64) {
-        if let Some(e) = self.entries.get_mut(&addr) {
+    pub fn mark_attempt(&mut self, addr: &PeerAddr, now: u64) {
+        if let Some(e) = self.entries.get_mut(canonical(addr).as_ref()) {
             e.attempts = e.attempts.saturating_add(1);
             e.last_try = now;
         }
@@ -702,7 +874,7 @@ impl AddrMan {
         all.into_iter().filter(|e| !e.is_terrible(now)).take(wanted).cloned().collect()
     }
 
-    pub fn select(&self) -> Option<SocketAddr> {
+    pub fn select(&self) -> Option<PeerAddr> {
         let (tried, new): (Vec<&AddrEntry>, Vec<&AddrEntry>) =
             self.entries.values().partition(|e| e.tried);
         let prefer_tried = !tried.is_empty() && (new.is_empty() || rand::random::<bool>());
@@ -711,7 +883,7 @@ impl AddrMan {
             return None;
         }
         let idx = (rand::random::<u64>() as usize) % pool.len();
-        Some(pool[idx].addr)
+        Some(pool[idx].addr.clone())
     }
 
     /// Every entry, in no particular order.
@@ -730,8 +902,9 @@ impl AddrMan {
     /// `AddSingle` refuses an address that is not routable the same way.
     ///
     /// [`admits`]: Self::admits
-    pub fn add_manual(&mut self, addr: SocketAddr, tried: bool, now: u64) -> Result<(), &'static str> {
-        if !self.add_from(addr, now, DEFAULT_SERVICES, addr.ip()) {
+    pub fn add_manual(&mut self, addr: impl Into<PeerAddr>, tried: bool, now: u64) -> Result<(), &'static str> {
+        let addr = canonical(&addr.into()).into_owned();
+        if !self.add(addr.clone(), now) {
             return Err("failed-adding-to-new");
         }
         // A taken tried slot leaves it in new, as Core's `Good` does.
@@ -742,11 +915,11 @@ impl AddrMan {
     }
 
     /// New/tried counts per network, keyed by Core's network name (`ipv4`,
-    /// `ipv6`). Networks with no entries are absent.
+    /// `ipv6`, `onion`). Networks with no entries are absent.
     pub fn counts_by_network(&self) -> std::collections::BTreeMap<&'static str, TableCounts> {
         let mut out: std::collections::BTreeMap<&'static str, TableCounts> = Default::default();
         for e in self.entries.values() {
-            let c = out.entry(network_name(e.addr.ip())).or_default();
+            let c = out.entry(peer_network_name(&e.addr)).or_default();
             if e.tried {
                 c.tried += 1;
             } else {
@@ -766,7 +939,7 @@ impl AddrMan {
 
     /// The tried slot of `addr`, as `bucket * BUCKET_SIZE + position`. The
     /// group is the one cached in its entry, or computed for one not held.
-    pub(crate) fn tried_slot(&self, addr: &SocketAddr) -> u64 {
+    pub(crate) fn tried_slot(&self, addr: &PeerAddr) -> u64 {
         let group = match self.entries.get(addr) {
             Some(e) => self.tried_slot_in(addr, &e.group),
             None => self.tried_slot_in(addr, &self.group_of(addr)),
@@ -774,7 +947,7 @@ impl AddrMan {
         group.bucket * BUCKET_SIZE + group.position
     }
 
-    fn tried_slot_in(&self, addr: &SocketAddr, group: &[u8]) -> AddrSlot {
+    fn tried_slot_in(&self, addr: &PeerAddr, group: &[u8]) -> AddrSlot {
         let key = addr_key(addr);
         let h1 = self.slot_hash(&[&key]) % TRIED_BUCKETS_PER_GROUP;
         let bucket = self.slot_hash(&[group, &h1.to_le_bytes()]) % TRIED_BUCKET_COUNT;
@@ -792,9 +965,9 @@ impl AddrMan {
         let key = addr_key(&e.addr);
         let group = &e.group;
         let bucket = {
-            let src_group = (self.group_fn)(e.source);
-            let h1 = self.slot_hash(&[group, &src_group]) % NEW_BUCKETS_PER_SOURCE_GROUP;
-            self.slot_hash(&[&src_group, &h1.to_le_bytes()]) % NEW_BUCKET_COUNT
+            let src_group = &e.source_group;
+            let h1 = self.slot_hash(&[group, src_group]) % NEW_BUCKETS_PER_SOURCE_GROUP;
+            self.slot_hash(&[src_group, &h1.to_le_bytes()]) % NEW_BUCKET_COUNT
         };
         let position = self.slot_hash(&[b"N", &bucket.to_le_bytes(), &key]) % BUCKET_SIZE;
         AddrSlot { tried: false, bucket, position }
@@ -814,7 +987,7 @@ impl AddrMan {
     /// hold more of one source group than Core's buckets would.
     pub fn positions(&self) -> Vec<(AddrSlot, &AddrEntry)> {
         let mut entries: Vec<&AddrEntry> = self.entries.values().collect();
-        entries.sort_by_key(|e| e.addr);
+        entries.sort_by(|a, b| a.addr.cmp(&b.addr));
         let mut new = TakenSlots::new(NEW_BUCKET_COUNT);
         let mut out = Vec::with_capacity(entries.len());
         for e in entries {
@@ -844,7 +1017,7 @@ impl AddrMan {
             return Err(format!("{}: bad peers.dat magic", path.display()));
         }
         let version = read_u32(&mut cur).map_err(|_| "peers.dat: truncated header")?;
-        if version != 1 && version != FORMAT_VERSION {
+        if !(1..=FORMAT_VERSION).contains(&version) {
             return Err(format!("peers.dat: unsupported version {version}"));
         }
         let count = read_u32(&mut cur).unwrap_or(0).min(MAX_ENTRIES as u32);
@@ -886,6 +1059,7 @@ impl AddrMan {
             // on-disk format does not store it, since `-asmap` can change
             // the grouping between runs).
             e.group = self.group_of(&e.addr);
+            e.source_group = self.net_group(&e.source);
             if e.tried {
                 // Core's `Unserialize` places each tried entry at its slot
                 // and drops one whose slot is taken. A file from before the
@@ -896,7 +1070,7 @@ impl AddrMan {
                 let slot = slot.bucket * BUCKET_SIZE + slot.position;
                 match self.tried_slots.entry(slot) {
                     std::collections::hash_map::Entry::Vacant(v) => {
-                        v.insert(e.addr);
+                        v.insert(e.addr.clone());
                     }
                     std::collections::hash_map::Entry::Occupied(_) => {
                         let in_group =
@@ -908,7 +1082,7 @@ impl AddrMan {
                     }
                 }
             }
-            self.entries.insert(e.addr, e);
+            self.entries.insert(e.addr.clone(), e);
         }
         Ok(())
     }
@@ -920,10 +1094,13 @@ impl AddrMan {
         let mut buf: Vec<u8> = Vec::new();
         buf.extend_from_slice(b"SADR");
         buf.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
-        buf.extend_from_slice(&(self.entries.len() as u32).to_le_bytes());
+        let count_at = buf.len();
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        let mut count = 0u32;
         for e in self.entries.values() {
-            write_entry(&mut buf, e);
+            count += u32::from(write_entry(&mut buf, e));
         }
+        buf[count_at..count_at + 4].copy_from_slice(&count.to_le_bytes());
         buf.extend_from_slice(KEY_TRAILER);
         buf.extend_from_slice(&self.slot_key.0.to_le_bytes());
         buf.extend_from_slice(&self.slot_key.1.to_le_bytes());
@@ -989,39 +1166,54 @@ fn read_u64(cur: &mut io::Cursor<&Vec<u8>>) -> io::Result<u64> {
     Ok(u64::from_le_bytes(b))
 }
 
-fn read_ip(cur: &mut io::Cursor<&Vec<u8>>) -> Option<IpAddr> {
+/// The tag of an onion address in a version 3 record: an IPv4 address is
+/// 0 and an IPv6 one 1, as in every version.
+const ONION_TAG: u8 = 2;
+
+/// An address as a record holds it: a tag, then 4 or 16 bytes of IP, or
+/// (from version 3) the 32-byte key of an onion.
+fn read_net(cur: &mut io::Cursor<&Vec<u8>>, version: u32) -> Option<NetAddr> {
     let mut tag = [0u8; 1];
     cur.read_exact(&mut tag).ok()?;
     match tag[0] {
         0 => {
             let mut o = [0u8; 4];
             cur.read_exact(&mut o).ok()?;
-            Some(IpAddr::from(o))
+            Some(NetAddr::Ip(IpAddr::from(o)))
         }
         1 => {
             let mut o = [0u8; 16];
             cur.read_exact(&mut o).ok()?;
-            Some(IpAddr::from(o))
+            Some(NetAddr::Ip(IpAddr::from(o)))
+        }
+        ONION_TAG if version >= 3 => {
+            let mut k = [0u8; 32];
+            cur.read_exact(&mut k).ok()?;
+            Some(NetAddr::Onion(k))
         }
         _ => None,
     }
 }
 
-fn write_ip(buf: &mut Vec<u8>, ip: IpAddr) {
-    match ip {
-        IpAddr::V4(v4) => {
+fn write_net(buf: &mut Vec<u8>, net: &NetAddr) {
+    match net {
+        NetAddr::Ip(IpAddr::V4(v4)) => {
             buf.push(0);
             buf.extend_from_slice(&v4.octets());
         }
-        IpAddr::V6(v6) => {
+        NetAddr::Ip(IpAddr::V6(v6)) => {
             buf.push(1);
             buf.extend_from_slice(&v6.octets());
+        }
+        NetAddr::Onion(key) => {
+            buf.push(ONION_TAG);
+            buf.extend_from_slice(key);
         }
     }
 }
 
 fn read_entry(cur: &mut io::Cursor<&Vec<u8>>, version: u32) -> Option<AddrEntry> {
-    let ip = read_ip(cur)?;
+    let net = read_net(cur, version)?;
     let port = {
         let mut b = [0u8; 2];
         cur.read_exact(&mut b).ok()?;
@@ -1032,13 +1224,16 @@ fn read_entry(cur: &mut io::Cursor<&Vec<u8>>, version: u32) -> Option<AddrEntry>
     let last_success = read_u64(cur).ok()?;
     let attempts = read_u32(cur).ok()?;
     let last_seen = read_u64(cur).ok()?;
-    let addr = SocketAddr::new(ip, port);
+    let addr = match &net {
+        NetAddr::Ip(ip) => PeerAddr::Socket(SocketAddr::new(*ip, port)),
+        NetAddr::Onion(key) => PeerAddr::Onion { host: crate::net::peer::torv3_to_onion_host(key), port },
+    };
     // Version 1 carried neither field: load Core's defaults (the entry is
     // its own source, with NODE_NETWORK | NODE_WITNESS).
     let (services, source) = if version >= 2 {
-        (read_u64(cur).ok()?, read_ip(cur)?)
+        (read_u64(cur).ok()?, read_net(cur, version)?)
     } else {
-        (DEFAULT_SERVICES, ip)
+        (DEFAULT_SERVICES, net)
     };
     Some(AddrEntry {
         addr,
@@ -1049,21 +1244,26 @@ fn read_entry(cur: &mut io::Cursor<&Vec<u8>>, version: u32) -> Option<AddrEntry>
         last_seen,
         services,
         source,
-        // Filled in by `load` under the active group_fn; the group is not
+        // Filled in by `load` under the active group_fn; the groups are not
         // part of the on-disk format.
         group: Vec::new(),
+        source_group: Vec::new(),
     })
 }
 
-fn write_entry(buf: &mut Vec<u8>, e: &AddrEntry) {
-    write_ip(buf, e.addr.ip());
+/// Write `e` as a record, and say whether it was. The book admits only an
+/// onion whose key it can read, so every entry is.
+fn write_entry(buf: &mut Vec<u8>, e: &AddrEntry) -> bool {
+    let Some(net) = NetAddr::of(&e.addr) else { return false };
+    write_net(buf, &net);
     buf.extend_from_slice(&e.addr.port().to_le_bytes());
     buf.push(if e.tried { 1 } else { 0 });
     buf.extend_from_slice(&e.last_success.to_le_bytes());
     buf.extend_from_slice(&e.attempts.to_le_bytes());
     buf.extend_from_slice(&e.last_seen.to_le_bytes());
     buf.extend_from_slice(&e.services.to_le_bytes());
-    write_ip(buf, e.source);
+    write_net(buf, &e.source);
+    true
 }
 
 #[cfg(test)]
@@ -1081,7 +1281,7 @@ mod tests {
         assert!(!a.add(sa("1.2.3.4:8333"), 200)); // dup refresh
         assert_eq!(a.len(), 1);
         a.mark_good(sa("1.2.3.4:8333"), 300);
-        let e = &a.entries[&sa("1.2.3.4:8333")];
+        let e = &a.entries[&sa("1.2.3.4:8333").into()];
         assert!(e.tried && e.last_success == 300 && e.attempts == 0);
     }
 
@@ -1113,16 +1313,16 @@ mod tests {
         let five_days = 5 * 24 * 60 * 60;
         assert_eq!(a.add_seen_replacing(seed, now - five_days, now, DEFAULT_SERVICES, seed.ip()), (false, None));
         assert_eq!(a.len(), MAX_NEW_PER_GROUP);
-        assert!(!a.contains(&seed));
+        assert!(!a.contains(&seed.into()));
 
         // With room, it goes in under its own date, and a later sighting of
         // a known address never moves its date back.
         let other = sa("45.1.1.1:8333");
         assert!(a.add_seen_replacing(other, now - five_days, now, DEFAULT_SERVICES, other.ip()).0);
-        assert_eq!(a.entries[&other].last_seen, now - five_days);
+        assert_eq!(a.entries[&other.into()].last_seen, now - five_days);
         let known = sa("44.1.0.1:8333");
         a.add_seen_replacing(known, now - five_days, now, DEFAULT_SERVICES, known.ip());
-        assert_eq!(a.entries[&known].last_seen, now);
+        assert_eq!(a.entries[&known.into()].last_seen, now);
     }
 
     #[test]
@@ -1130,12 +1330,12 @@ mod tests {
         let mut a = AddrMan::new();
         assert_eq!(a.select(), None);
         a.add(sa("1.2.3.4:8333"), 1);
-        assert_eq!(a.select(), Some(sa("1.2.3.4:8333")));
+        assert_eq!(a.select(), Some(PeerAddr::from(sa("1.2.3.4:8333"))));
         a.mark_good(sa("5.6.7.8:8333"), 2);
         // With both pools non-empty, select returns one of them.
         for _ in 0..20 {
             let s = a.select().unwrap();
-            assert!(s == sa("1.2.3.4:8333") || s == sa("5.6.7.8:8333"));
+            assert!(s == sa("1.2.3.4:8333").into() || s == sa("5.6.7.8:8333").into());
         }
     }
 
@@ -1152,9 +1352,9 @@ mod tests {
         let mut b = AddrMan::new();
         b.load(&path).unwrap();
         assert_eq!(b.len(), 2);
-        assert!(b.entries[&sa("1.2.3.4:8333")].tried);
-        assert_eq!(b.entries[&sa("1.2.3.4:8333")].last_success, 333);
-        assert!(!b.entries[&sa("[2001:470::1]:8333")].tried);
+        assert!(b.entries[&sa("1.2.3.4:8333").into()].tried);
+        assert_eq!(b.entries[&sa("1.2.3.4:8333").into()].last_success, 333);
+        assert!(!b.entries[&sa("[2001:470::1]:8333").into()].tried);
     }
 
     #[test]
@@ -1185,10 +1385,10 @@ mod tests {
         // A brand-new address at capacity is rejected (not inserted).
         a.mark_good(sa("203.0.113.7:8333"), 2);
         assert_eq!(a.len(), MAX_ENTRIES);
-        assert!(!a.entries.contains_key(&sa("203.0.113.7:8333")));
+        assert!(!a.entries.contains_key(&sa("203.0.113.7:8333").into()));
         // But an address already present is still refreshed/promoted.
         a.mark_good(sa("20.0.1.1:8333"), 99);
-        assert_eq!(a.entries[&sa("20.0.1.1:8333")].last_success, 99);
+        assert_eq!(a.entries[&sa("20.0.1.1:8333").into()].last_success, 99);
     }
 
     #[test]
@@ -1198,10 +1398,10 @@ mod tests {
         // active grouping (default: v4 /16, v6 /32).
         let mut a = AddrMan::new();
         a.add(sa("203.0.113.9:8333"), 1);
-        assert_eq!(a.entries[&sa("203.0.113.9:8333")].group, vec![203, 0]);
+        assert_eq!(a.entries[&sa("203.0.113.9:8333").into()].group, vec![203, 0]);
         a.add(sa("[2001:470::1]:8333"), 1);
         assert_eq!(
-            a.entries[&sa("[2001:470::1]:8333")].group,
+            a.entries[&sa("[2001:470::1]:8333").into()].group,
             vec![0x20, 0x01, 0x04, 0x70]
         );
         // The cached group is what the per-group cap counts against.
@@ -1220,7 +1420,7 @@ mod tests {
 
         let mut b = AddrMan::new();
         b.load(&path).unwrap();
-        assert_eq!(b.entries[&sa("1.2.3.4:8333")].group, vec![1, 2]);
+        assert_eq!(b.entries[&sa("1.2.3.4:8333").into()].group, vec![1, 2]);
     }
 
     #[test]
@@ -1230,17 +1430,17 @@ mod tests {
         let mut a = AddrMan::new();
         let source: IpAddr = "198.51.100.7".parse().unwrap();
         assert!(a.add_from(sa("1.2.3.4:8333"), 5, 1 | 8 | 1024, source));
-        a.add_from(sa("[2001:470::5]:18444"), 6, 1, "2001:470::9".parse().unwrap());
+        a.add_from(sa("[2001:470::5]:18444"), 6, 1, "2001:470::9".parse::<IpAddr>().unwrap());
         a.dump(&path).unwrap();
 
         let mut b = AddrMan::new();
         b.load(&path).unwrap();
-        let e = &b.entries[&sa("1.2.3.4:8333")];
+        let e = &b.entries[&sa("1.2.3.4:8333").into()];
         assert_eq!(e.services, 1 | 8 | 1024);
-        assert_eq!(e.source, source);
-        let e6 = &b.entries[&sa("[2001:470::5]:18444")];
+        assert_eq!(e.source, source.into());
+        let e6 = &b.entries[&sa("[2001:470::5]:18444").into()];
         assert_eq!(e6.services, 1);
-        assert_eq!(e6.source, "2001:470::9".parse::<IpAddr>().unwrap());
+        assert_eq!(e6.source, ("2001:470::9".parse::<IpAddr>().unwrap()).into());
     }
 
     #[test]
@@ -1252,15 +1452,15 @@ mod tests {
         // Gossip only adds: a later announcement with a new bit gains it,
         // and one without a known bit does not take it away.
         a.add_from(addr, 6, 1 << 30, source);
-        assert_eq!(a.entries[&addr].services, 1 | 8 | 1 << 30);
+        assert_eq!(a.entries[&addr.into()].services, 1 | 8 | 1 << 30);
         a.add_from(addr, 7, 1, source);
-        assert_eq!(a.entries[&addr].services, 1 | 8 | 1 << 30);
+        assert_eq!(a.entries[&addr.into()].services, 1 | 8 | 1 << 30);
         // The address's own `version` is authoritative.
-        a.set_services(&addr, 8);
-        assert_eq!(a.entries[&addr].services, 8);
+        a.set_services(&addr.into(), 8);
+        assert_eq!(a.entries[&addr.into()].services, 8);
         // An address the book does not hold is not added.
-        a.set_services(&sa("5.6.7.8:8333"), 1);
-        assert!(!a.contains(&sa("5.6.7.8:8333")));
+        a.set_services(&sa("5.6.7.8:8333").into(), 1);
+        assert!(!a.contains(&sa("5.6.7.8:8333").into()));
     }
 
     /// A `peers.dat` written by the version 1 writer (no services, no
@@ -1296,17 +1496,17 @@ mod tests {
         let mut a = AddrMan::new();
         a.load(&path).unwrap();
         assert_eq!(a.len(), 2);
-        let e = &a.entries[&sa("1.2.3.4:8333")];
+        let e = &a.entries[&sa("1.2.3.4:8333").into()];
         assert!(e.tried);
         assert_eq!((e.last_success, e.last_seen), (333, 333));
         assert_eq!(e.services, DEFAULT_SERVICES);
-        assert_eq!(e.source, "1.2.3.4".parse::<IpAddr>().unwrap());
-        let e6 = &a.entries[&sa("[2001:470::1]:8333")];
+        assert_eq!(e.source, ("1.2.3.4".parse::<IpAddr>().unwrap()).into());
+        let e6 = &a.entries[&sa("[2001:470::1]:8333").into()];
         assert!(!e6.tried);
         assert_eq!((e6.attempts, e6.last_seen), (2, 222));
         assert_eq!(e6.services, DEFAULT_SERVICES);
 
-        // Re-dumped, it is a version 2 file that keeps what it had.
+        // Re-dumped, it is a current file that keeps what it had.
         a.dump(&path).unwrap();
         let bytes = std::fs::read(&path).unwrap();
         assert_eq!(&bytes[4..8], &FORMAT_VERSION.to_le_bytes());
@@ -1320,7 +1520,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("peers.dat");
         let mut bytes = b"SADR".to_vec();
-        bytes.extend_from_slice(&3u32.to_le_bytes());
+        bytes.extend_from_slice(&(FORMAT_VERSION + 1).to_le_bytes());
         bytes.extend_from_slice(&0u32.to_le_bytes());
         std::fs::write(&path, &bytes).unwrap();
         assert!(AddrMan::new().load(&path).is_err());
@@ -1338,9 +1538,9 @@ mod tests {
             a.add_from(sa(&format!("{net}.{}.{}.1:8333", i % 3, i)), 1, DEFAULT_SERVICES, src);
         }
         // Promote a third of them (all inside the three /16s).
-        let tried: Vec<SocketAddr> = a.iter().map(|e| e.addr).step_by(3).collect();
+        let tried: Vec<PeerAddr> = a.iter().map(|e| e.addr.clone()).step_by(3).collect();
         for addr in &tried {
-            a.mark_good(*addr, 2);
+            a.mark_good(addr.clone(), 2);
         }
         let slots = a.positions();
         assert_eq!(slots.len(), 50);
@@ -1394,9 +1594,9 @@ mod tests {
     /// The placement `positions` makes, one slot at a time: the derived
     /// bucket's positions from the derived one, wrapping within the bucket,
     /// then the next bucket's from the same position, and so on.
-    fn probed_positions(a: &AddrMan) -> Vec<(AddrSlot, SocketAddr)> {
+    fn probed_positions(a: &AddrMan) -> Vec<(AddrSlot, PeerAddr)> {
         let mut entries: Vec<&AddrEntry> = a.entries.values().collect();
-        entries.sort_by_key(|e| e.addr);
+        entries.sort_by(|a, b| a.addr.cmp(&b.addr));
         let mut taken = std::collections::HashSet::new();
         entries
             .into_iter()
@@ -1415,7 +1615,7 @@ mod tests {
                         break;
                     }
                 }
-                (slot, e.addr)
+                (slot, e.addr.clone())
             })
             .collect()
     }
@@ -1433,8 +1633,8 @@ mod tests {
         for i in 0..500u32 {
             a.add_from(sa(&format!("{}.{}.7.1:8333", 20 + i % 50, i / 50)), 1, DEFAULT_SERVICES, src);
         }
-        let placed: Vec<(AddrSlot, SocketAddr)> =
-            a.positions().into_iter().map(|(s, e)| (s, e.addr)).collect();
+        let placed: Vec<(AddrSlot, PeerAddr)> =
+            a.positions().into_iter().map(|(s, e)| (s, e.addr.clone())).collect();
         assert_eq!(placed.len(), a.len());
         assert_eq!(placed, probed_positions(&a));
     }
@@ -1527,7 +1727,7 @@ mod tests {
             a.mark_good(sa(&format!("44.7.{}.{}:8333", (i / 250) % 250, i % 250 + 1)), 2);
         }
         for addr in &diverse {
-            assert!(a.is_tried(addr), "{addr} lost its tried slot");
+            assert!(a.is_tried(&(*addr).into()), "{addr} lost its tried slot");
         }
         assert_slots_consistent(&a);
     }
@@ -1538,10 +1738,10 @@ mod tests {
         let mut a = AddrMan::new();
         let old = sa("44.7.0.1:8333");
         assert!(a.mark_good(old, 1_000));
-        let slot = a.tried_slot(&old);
+        let slot = a.tried_slot(&old.into());
         let new = (2..60_000u32)
             .map(|i| sa(&format!("44.7.{}.{}:8333", i / 250, i % 250 + 1)))
-            .find(|c| a.tried_slot(c) == slot)
+            .find(|c| a.tried_slot(&(*c).into()) == slot)
             .expect("a colliding address");
         a.add(new, 1_000);
         (a, old, new)
@@ -1555,23 +1755,23 @@ mod tests {
         let (mut a, old, new) = colliding_pair();
         let t = 1_000;
         assert!(!a.mark_good(new, t), "the slot is taken");
-        assert!(!a.is_tried(&new) && a.is_tried(&old));
-        assert_eq!(a.select_tried_collision(), Some(old));
+        assert!(!a.is_tried(&new.into()) && a.is_tried(&old.into()));
+        assert_eq!(a.select_tried_collision(), Some(PeerAddr::from(old)));
 
         // Alive within four hours: the newcomer stays new.
         assert!(a.resolve_collisions(t + 60).is_empty());
-        assert!(a.is_tried(&old) && !a.is_tried(&new));
+        assert!(a.is_tried(&old.into()) && !a.is_tried(&new.into()));
         assert!(a.tried_collisions.is_empty(), "the collision is settled");
 
         // Five hours on, with the incumbent's dial failing.
         let t2 = t + 5 * 3600;
         a.mark_good(new, t2);
-        a.mark_attempt(old, t2);
+        a.mark_attempt(&old.into(), t2);
         a.resolve_collisions(t2 + 30);
-        assert!(a.is_tried(&old), "a minute's grace after the dial");
+        assert!(a.is_tried(&old.into()), "a minute's grace after the dial");
         a.resolve_collisions(t2 + 61);
-        assert!(a.is_tried(&new), "the newcomer takes the slot");
-        assert!(a.contains(&old) && !a.is_tried(&old), "the incumbent goes back to new");
+        assert!(a.is_tried(&new.into()), "the newcomer takes the slot");
+        assert!(a.contains(&old.into()) && !a.is_tried(&old.into()), "the incumbent goes back to new");
         assert_slots_consistent(&a);
     }
 
@@ -1583,10 +1783,10 @@ mod tests {
         let addr = sa("44.7.0.1:8333");
         a.add(addr, 1_000);
         for _ in 0..3 {
-            a.mark_attempt(addr, 1_000);
+            a.mark_attempt(&addr.into(), 1_000);
         }
-        assert!(!a.entries[&addr].is_terrible(1_060));
-        assert!(a.entries[&addr].is_terrible(1_061));
+        assert!(!a.entries[&addr.into()].is_terrible(1_060));
+        assert!(a.entries[&addr.into()].is_terrible(1_061));
     }
 
     /// A removed tried entry frees the slot it was placed in, under the
@@ -1597,7 +1797,7 @@ mod tests {
         let addr = sa("44.7.0.1:8333");
         assert!(a.mark_good(addr, 1));
         a.set_group_fn(Box::new(|_| vec![9, 9, 9]));
-        a.remove_entry(&addr);
+        a.remove_entry(&addr.into());
         assert!(a.tried_slots.is_empty());
     }
 
@@ -1609,9 +1809,9 @@ mod tests {
         let t = 1_000 + 5 * 3600;
         a.mark_good(new, t);
         a.resolve_collisions(t + 39 * 60);
-        assert!(a.is_tried(&old));
+        assert!(a.is_tried(&old.into()));
         a.resolve_collisions(t + 41 * 60);
-        assert!(a.is_tried(&new) && !a.is_tried(&old));
+        assert!(a.is_tried(&new.into()) && !a.is_tried(&old.into()));
         assert_slots_consistent(&a);
     }
 
@@ -1622,13 +1822,13 @@ mod tests {
         let mut a = AddrMan::new();
         let old = sa("44.7.0.1:8333");
         a.mark_good(old, 1);
-        let slot = a.tried_slot(&old);
+        let slot = a.tried_slot(&old.into());
         let new = (2..60_000u32)
             .map(|i| sa(&format!("44.7.{}.{}:8333", i / 250, i % 250 + 1)))
-            .find(|c| a.tried_slot(c) == slot)
+            .find(|c| a.tried_slot(&(*c).into()) == slot)
             .unwrap();
         assert_eq!(a.add_manual(new, true, 1), Err("failed-adding-to-tried"));
-        assert!(a.contains(&new) && !a.is_tried(&new));
+        assert!(a.contains(&new.into()) && !a.is_tried(&new.into()));
     }
 
     /// The slot key is kept in `peers.dat`, so every tried entry comes back
@@ -1646,8 +1846,8 @@ mod tests {
         let mut b = AddrMan::new();
         b.load(&path).unwrap();
         assert_eq!(b.slot_key, a.slot_key);
-        let mut before: Vec<(u64, SocketAddr)> = a.tried_slots.iter().map(|(k, v)| (*k, *v)).collect();
-        let mut after: Vec<(u64, SocketAddr)> = b.tried_slots.iter().map(|(k, v)| (*k, *v)).collect();
+        let mut before: Vec<(u64, PeerAddr)> = a.tried_slots.iter().map(|(k, v)| (*k, v.clone())).collect();
+        let mut after: Vec<(u64, PeerAddr)> = b.tried_slots.iter().map(|(k, v)| (*k, v.clone())).collect();
         before.sort();
         after.sort();
         assert_eq!(before, after);
@@ -1673,15 +1873,16 @@ mod tests {
         buf.extend_from_slice(&(all.len() as u32).to_le_bytes());
         for (addr, tried) in &all {
             let e = AddrEntry {
-                addr: *addr,
+                addr: (*addr).into(),
                 tried: *tried,
                 last_success: 7,
                 attempts: 0,
                 last_try: 0,
                 last_seen: 7,
                 services: DEFAULT_SERVICES,
-                source: addr.ip(),
+                source: addr.ip().into(),
                 group: Vec::new(),
+                source_group: Vec::new(),
             };
             write_entry(&mut buf, &e);
         }
@@ -1695,7 +1896,7 @@ mod tests {
         assert_eq!(a.new_count_in_group(&[10, 244]), MAX_NEW_PER_GROUP);
         // A single-address group that lost its slot has room in new.
         for i in 0..100u32 {
-            assert!(a.contains(&sa(&format!("{}.9.9.9:8333", 20 + i))), "{i}");
+            assert!(a.contains(&(sa(&format!("{}.9.9.9:8333", 20 + i))).into()), "{i}");
         }
         assert_eq!(a.len(), group_tried + MAX_NEW_PER_GROUP + 100);
         assert_slots_consistent(&a);
@@ -1707,10 +1908,10 @@ mod tests {
         for i in 0..20u8 {
             a.add(sa(&format!("{}.1.1.1:8333", 20 + i)), 1);
         }
-        let first: Vec<(AddrSlot, SocketAddr)> =
-            a.positions().into_iter().map(|(s, e)| (s, e.addr)).collect();
-        let again: Vec<(AddrSlot, SocketAddr)> =
-            a.positions().into_iter().map(|(s, e)| (s, e.addr)).collect();
+        let first: Vec<(AddrSlot, PeerAddr)> =
+            a.positions().into_iter().map(|(s, e)| (s, e.addr.clone())).collect();
+        let again: Vec<(AddrSlot, PeerAddr)> =
+            a.positions().into_iter().map(|(s, e)| (s, e.addr.clone())).collect();
         assert_eq!(first, again);
     }
 
@@ -1721,11 +1922,11 @@ mod tests {
         // Already present: fails at the new table whichever table was asked.
         assert_eq!(a.add_manual(sa("1.0.0.0:8333"), false, 1), Err("failed-adding-to-new"));
         assert_eq!(a.add_manual(sa("1.0.0.0:8333"), true, 1), Err("failed-adding-to-new"));
-        assert!(!a.entries[&sa("1.0.0.0:8333")].tried);
+        assert!(!a.entries[&sa("1.0.0.0:8333").into()].tried);
         assert_eq!(a.add_manual(sa("1.2.3.4:8333"), true, 1), Ok(()));
-        let e = &a.entries[&sa("1.2.3.4:8333")];
+        let e = &a.entries[&sa("1.2.3.4:8333").into()];
         assert!(e.tried);
-        assert_eq!(e.source, e.addr.ip());
+        assert_eq!(Some(e.source.clone()), NetAddr::of(&e.addr));
         assert_eq!(e.services, DEFAULT_SERVICES);
         let counts = a.counts_by_network();
         assert_eq!(counts["ipv4"], TableCounts { new: 1, tried: 1 });
@@ -1742,7 +1943,7 @@ mod tests {
         let invalid = ["0.0.0.0:18444", "255.255.255.255:18444", "[::]:18444", "[2001:db8::1]:8333"];
         let mut a = AddrMan::new();
         for bad in invalid {
-            assert!(!a.admits(&sa(bad)), "{bad}");
+            assert!(!a.admits(&sa(bad).into()), "{bad}");
             assert!(!a.add_from(sa(bad), 1, DEFAULT_SERVICES, sa("1.2.3.4:8333").ip()), "{bad}");
             assert_eq!(a.add_manual(sa(bad), true, 1), Err("failed-adding-to-new"), "{bad}");
             a.mark_good(sa(bad), 1);
@@ -1760,15 +1961,16 @@ mod tests {
         buf.extend_from_slice(&(all.len() as u32).to_le_bytes());
         for addr in &all {
             let e = AddrEntry {
-                addr: *addr,
+                addr: (*addr).into(),
                 tried: true,
                 last_success: 1,
                 attempts: 0,
                 last_try: 0,
                 last_seen: 1,
                 services: DEFAULT_SERVICES,
-                source: addr.ip(),
+                source: addr.ip().into(),
                 group: Vec::new(),
+                source_group: Vec::new(),
             };
             write_entry(&mut buf, &e);
         }
@@ -1776,8 +1978,8 @@ mod tests {
         let mut b = AddrMan::new();
         b.load(&path).unwrap();
         assert_eq!(b.len(), 1, "only the valid entry loads");
-        assert!(b.entries.contains_key(&kept));
-        assert_eq!(b.iter().map(|e| e.addr).collect::<Vec<_>>(), vec![kept]);
+        assert!(b.entries.contains_key(&kept.into()));
+        assert_eq!(b.iter().map(|e| e.addr.clone()).collect::<Vec<_>>(), vec![PeerAddr::from(kept)]);
     }
 
     /// Off regtest the book takes Core's rule: routable addresses only, on
@@ -1789,7 +1991,7 @@ mod tests {
         let mut strict = AddrMan::new();
         strict.set_admit_private(false);
         for p in private {
-            assert!(!strict.admits(&sa(p)), "{p}");
+            assert!(!strict.admits(&sa(p).into()), "{p}");
             assert!(!strict.add(sa(p), 1), "{p}");
             assert_eq!(strict.add_manual(sa(p), false, 1), Err("failed-adding-to-new"), "{p}");
             strict.mark_good(sa(p), 1);
@@ -1818,5 +2020,234 @@ mod tests {
         assert_eq!(network_name("2001:db8::1".parse().unwrap()), "ipv6");
         assert_eq!(addr_string("::ffff:1.2.3.4".parse().unwrap()), "1.2.3.4");
         assert_eq!(addr_string("2001:db8::1".parse().unwrap()), "2001:db8::1");
+    }
+
+    /// A well-formed v3 onion whose key starts with `first` (which sets its
+    /// network group) and is otherwise filled with `fill`.
+    fn onion(first: u8, fill: u8, port: u16) -> PeerAddr {
+        let mut key = [fill; 32];
+        key[0] = first;
+        PeerAddr::Onion { host: crate::net::peer::torv3_to_onion_host(&key), port }
+    }
+
+    fn key_of(addr: &PeerAddr) -> [u8; 32] {
+        match NetAddr::of(addr) {
+            Some(NetAddr::Onion(k)) => k,
+            other => panic!("not an onion: {other:?}"),
+        }
+    }
+
+    /// #1157: an onion entry, and an onion source, survive `peers.dat` in
+    /// version 3, tried or new, and the book reports them as Core does.
+    #[test]
+    fn onion_entries_round_trip_in_version_3() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("peers.dat");
+        let mut a = AddrMan::new();
+        let learned = onion(0x10, 1, 9333);
+        let tried = onion(0x20, 2, 8333);
+        let announcer = NetAddr::of(&onion(0x30, 3, 1)).unwrap();
+        assert!(a.add_from(learned.clone(), 50, 1 | 8 | 64, announcer.clone()));
+        assert!(a.add_from(sa("1.2.3.4:8333"), 50, DEFAULT_SERVICES, announcer.clone()));
+        assert!(a.mark_good(tried.clone(), 60));
+        a.dump(&path).unwrap();
+        assert_eq!(&std::fs::read(&path).unwrap()[4..8], &3u32.to_le_bytes());
+
+        let mut b = AddrMan::new();
+        b.load(&path).unwrap();
+        assert_eq!(b.len(), 3);
+        let e = b.get(&learned).expect("the learned onion loads");
+        assert!(!e.tried);
+        assert_eq!((e.services, e.last_seen), (1 | 8 | 64, 50));
+        assert_eq!(e.source, announcer);
+        assert_eq!(b.get(&sa("1.2.3.4:8333").into()).unwrap().source, announcer, "an onion source of an IP entry");
+        assert!(b.is_tried(&tried), "a tried onion stays tried");
+        assert_eq!(b.tried_slot(&tried), a.tried_slot(&tried), "at its slot");
+        assert_eq!(b.counts_by_network()["onion"], TableCounts { new: 1, tried: 1 });
+        assert_eq!(peer_network_name(&learned), "onion");
+        let PeerAddr::Onion { host, .. } = &learned else { unreachable!() };
+        assert_eq!(peer_addr_string(&learned), *host);
+        assert_eq!(announcer.network_name(), "onion");
+        assert!(announcer.addr_string().ends_with(".onion"));
+    }
+
+    /// The format bump keeps a version 2 file loading: its records have the
+    /// layout of a version 3 IP record. An onion tag is version 3's only: in
+    /// a version 2 file it is garbage, and the read stops there.
+    #[test]
+    fn a_version_2_peers_dat_still_loads() {
+        let entry = |addr: &str, source: &str| AddrEntry {
+            addr: sa(addr).into(),
+            tried: false,
+            last_success: 0,
+            attempts: 1,
+            last_try: 0,
+            last_seen: 77,
+            services: 1 | 1024,
+            source: NetAddr::Ip(source.parse().unwrap()),
+            group: Vec::new(),
+            source_group: Vec::new(),
+        };
+        let file = |records: &[AddrEntry], onion_too: bool| {
+            let mut buf: Vec<u8> = Vec::new();
+            buf.extend_from_slice(b"SADR");
+            buf.extend_from_slice(&2u32.to_le_bytes());
+            buf.extend_from_slice(&(records.len() as u32 + u32::from(onion_too)).to_le_bytes());
+            for e in records {
+                assert!(write_entry(&mut buf, e));
+            }
+            if onion_too {
+                let mut e = records[0].clone();
+                e.addr = onion(0x40, 4, 9333);
+                assert!(write_entry(&mut buf, &e));
+            }
+            buf
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("peers.dat");
+        let records = [entry("1.2.3.4:8333", "198.51.100.1"), entry("[2001:470::1]:8333", "2001:470::9")];
+        std::fs::write(&path, file(&records, false)).unwrap();
+        let mut a = AddrMan::new();
+        a.load(&path).unwrap();
+        assert_eq!(a.len(), 2);
+        let e = a.get(&sa("[2001:470::1]:8333").into()).unwrap();
+        assert_eq!((e.attempts, e.last_seen, e.services), (1, 77, 1 | 1024));
+        assert_eq!(e.source, NetAddr::Ip("2001:470::9".parse().unwrap()));
+
+        std::fs::write(&path, file(&records, true)).unwrap();
+        let mut b = AddrMan::new();
+        b.load(&path).unwrap();
+        assert_eq!(b.len(), 2, "the onion record is not read from a version 2 file");
+    }
+
+    /// An onion's network group is Core's for Tor: the network and the top
+    /// four bits of its key, so sixteen groups in all, none an IP group. Two
+    /// onions whose keys differ past those bits share a group and its cap.
+    #[test]
+    fn onions_are_grouped_by_the_top_four_bits_of_their_key() {
+        let a = AddrMan::new();
+        let group = |addr: &PeerAddr| a.group_of(addr);
+        assert_eq!(group(&onion(0x12, 1, 1)), group(&onion(0x1f, 2, 2)));
+        assert_ne!(group(&onion(0x12, 1, 1)), group(&onion(0x22, 1, 1)));
+        assert_eq!(group(&onion(0x12, 1, 1)), vec![0xF0, b'o', 0x1F]);
+        let groups: std::collections::HashSet<Vec<u8>> = (0..=255u8).map(|b| group(&onion(b, 9, 1))).collect();
+        assert_eq!(groups.len(), 16);
+        // Not an IPv4 /16 such as 3.31.0.0's ([3, 31]), nor any IP group.
+        assert!(groups.iter().all(|g| g.len() == 3));
+
+        // Sixteen keys in one group: its new-table cap holds.
+        let mut b = AddrMan::new();
+        for i in 0..(MAX_NEW_PER_GROUP + 10) {
+            let source = NetAddr::Ip(IpAddr::from([20 + (i % 100) as u8, 1, 1, 1]));
+            b.add_from(onion(0x50 | (i % 16) as u8, i as u8, 9333), 1, DEFAULT_SERVICES, source);
+        }
+        assert_eq!(b.len(), MAX_NEW_PER_GROUP, "one onion group, one cap");
+    }
+
+    /// Anyone can make onions in all sixteen groups, so one source holds at
+    /// most [`MAX_NEW_PER_GROUP`] onion entries in the new table (#1120 kept
+    /// that share for the separate onion list). A full share makes room by
+    /// dropping a terrible onion of that source; another source's onions,
+    /// and the source's own clearnet addresses, are not held back by it.
+    #[test]
+    fn one_source_cannot_fill_the_onion_part_of_the_book() {
+        let mut a = AddrMan::new();
+        let source = NetAddr::Ip("198.51.100.7".parse().unwrap());
+        let now = 10_000_000;
+        for i in 0..200usize {
+            a.add_from(onion((i % 256) as u8, (i / 256) as u8 + 1, 9333), now, DEFAULT_SERVICES, source.clone());
+        }
+        assert_eq!(a.len(), MAX_NEW_PER_GROUP, "one source's share of onions");
+        // The same /16 is the same source group.
+        let neighbour = NetAddr::Ip("198.51.9.9".parse().unwrap());
+        assert!(!a.add_from(onion(0x01, 0xEE, 9333), now, DEFAULT_SERVICES, neighbour));
+        let other = NetAddr::Ip("203.0.113.1".parse().unwrap());
+        assert!(a.add_from(onion(0x01, 0xEE, 9333), now, DEFAULT_SERVICES, other), "another source's onion");
+        assert!(a.add_from(sa("44.1.1.1:8333"), now, DEFAULT_SERVICES, source.clone()), "its clearnet addresses");
+
+        // Past Core's grace, an onion of that source that failed three dials
+        // and never connected is terrible, and gives up its place.
+        let dead = a
+            .iter()
+            .find(|e| e.addr.is_onion() && e.source == source)
+            .map(|e| e.addr.clone())
+            .unwrap();
+        for _ in 0..3 {
+            a.mark_attempt(&dead, now - 120);
+        }
+        let fresh = onion(0x02, 0xEF, 9333);
+        assert_eq!(a.add_from_replacing(fresh.clone(), now, DEFAULT_SERVICES, source.clone()), (true, Some(dead.clone())));
+        assert!(a.contains(&fresh) && !a.contains(&dead));
+    }
+
+    /// A full onion share and a full onion group at once: the entry dropped
+    /// for a newcomer must be of both. One of the source's terrible onions
+    /// from another group would leave the newcomer's group past its cap.
+    #[test]
+    fn a_full_share_and_a_full_group_drop_an_entry_of_both() {
+        let now = 10_000_000;
+        let target = 0x70;
+        let source = NetAddr::Ip("198.51.100.7".parse().unwrap());
+        let newcomer = onion(target, 0xFE, 9333);
+        // The source's share: 63 terrible onions in other groups and one in
+        // the newcomer's, terrible or not. The newcomer's group: that one
+        // and 63 from other sources.
+        let book = |shared_is_terrible: bool| {
+            let mut a = AddrMan::new();
+            for i in 0..MAX_NEW_PER_GROUP - 1 {
+                let other = NetAddr::Ip(IpAddr::from([30 + i as u8, 1, 1, 1]));
+                assert!(a.add_from(onion(target | (i % 16) as u8, i as u8, 9333), now, DEFAULT_SERVICES, other));
+                let elsewhere = onion(((i % 6) as u8) << 4, 0x80 | i as u8, 9333);
+                assert!(a.add_from(elsewhere.clone(), now, DEFAULT_SERVICES, source.clone()));
+                for _ in 0..3 {
+                    a.mark_attempt(&elsewhere, now - 120);
+                }
+            }
+            let shared = onion(target | 1, 0xFD, 9333);
+            assert!(a.add_from(shared.clone(), now, DEFAULT_SERVICES, source.clone()));
+            if shared_is_terrible {
+                for _ in 0..3 {
+                    a.mark_attempt(&shared, now - 120);
+                }
+            }
+            assert_eq!(a.new_count_in_group(&a.group_of(&newcomer)), MAX_NEW_PER_GROUP, "fixture: group full");
+            (a, shared)
+        };
+
+        let (mut a, _) = book(false);
+        assert_eq!(a.add_from_replacing(newcomer.clone(), now, DEFAULT_SERVICES, source.clone()), (false, None));
+        assert_eq!(a.new_count_in_group(&a.group_of(&newcomer)), MAX_NEW_PER_GROUP, "the group stays at its cap");
+
+        let (mut a, shared) = book(true);
+        assert_eq!(a.add_from_replacing(newcomer.clone(), now, DEFAULT_SERVICES, source.clone()), (true, Some(shared)));
+        assert_eq!(a.new_count_in_group(&a.group_of(&newcomer)), MAX_NEW_PER_GROUP);
+    }
+
+    /// An onion is the address it names in any case, and only a well-formed
+    /// v3 onion on a port other than 0 enters the book.
+    #[test]
+    fn onions_are_keyed_in_lower_case_and_must_be_well_formed() {
+        let mut a = AddrMan::new();
+        let addr = onion(0x61, 7, 9333);
+        let PeerAddr::Onion { host, port } = &addr else { unreachable!() };
+        let upper = PeerAddr::Onion { host: host.to_uppercase(), port: *port };
+        assert!(a.add(upper.clone(), 1));
+        assert!(!a.add(addr.clone(), 2), "the same entry");
+        assert!(a.contains(&addr) && a.contains(&upper));
+        assert_eq!(a.iter().next().unwrap().addr, addr, "kept in lower case");
+        assert!(a.mark_good(upper, 3));
+        assert!(a.is_tried(&addr));
+        assert_eq!(key_of(&addr), key_of(&a.iter().next().unwrap().addr));
+
+        let bad_checksum = PeerAddr::Onion { host: format!("{}.onion", "a".repeat(56)), port: 9333 };
+        let v2_length = PeerAddr::Onion { host: "expyuzz4wqqyqhjn.onion".into(), port: 9333 };
+        let port_zero = onion(0x62, 8, 0);
+        for bad in [bad_checksum, v2_length, port_zero] {
+            assert!(!a.admits(&bad), "{bad}");
+            assert!(!a.add(bad.clone(), 1), "{bad}");
+            assert!(!a.mark_good(bad.clone(), 1), "{bad}");
+            assert_eq!(a.add_manual(bad, false, 1), Err("failed-adding-to-new"));
+        }
+        assert_eq!(a.len(), 1);
     }
 }

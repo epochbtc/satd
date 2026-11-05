@@ -18,7 +18,7 @@ pub fn node_intact_blocks() -> ServiceFlags {
 }
 
 /// Address that can represent either a regular socket address or a .onion hostname.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum PeerAddr {
     Socket(SocketAddr),
     Onion { host: String, port: u16 },
@@ -80,6 +80,12 @@ impl PeerAddr {
             return Ok(PeerAddr::Socket(SocketAddr::new(ip.into(), default_port)));
         }
         Err(format!("invalid address '{}': could not resolve", s))
+    }
+}
+
+impl From<SocketAddr> for PeerAddr {
+    fn from(sa: SocketAddr) -> Self {
+        PeerAddr::Socket(sa)
     }
 }
 

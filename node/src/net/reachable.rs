@@ -87,6 +87,14 @@ impl ReachableNets {
         self.contains(self.network_of(addr))
     }
 
+    /// [`Self::contains_socket`] for an address of any network.
+    pub fn contains_peer(&self, addr: &crate::net::peer::PeerAddr) -> bool {
+        match addr {
+            crate::net::peer::PeerAddr::Socket(sa) => self.contains_socket(sa),
+            crate::net::peer::PeerAddr::Onion { .. } => self.onion,
+        }
+    }
+
     /// Whether IPv4 or IPv6 is reachable: DNS seeds answer only with those.
     pub fn clearnet(&self) -> bool {
         self.ipv4 || self.ipv6
