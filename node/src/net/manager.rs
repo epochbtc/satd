@@ -4985,7 +4985,7 @@ impl PeerManager {
         let now = now_unix_secs();
         let incumbents = self.addrman.read().tried_collision_incumbents();
         let connected: Vec<PeerAddr> =
-            incumbents.into_iter().filter(|a| self.is_peer_addr_connected(a)).collect();
+            incumbents.into_iter().filter(|a| self.is_book_addr_connected(a)).collect();
         let dropped = {
             let mut book = self.addrman.write();
             // Only one the book still holds: one dropped since the read
@@ -5516,6 +5516,20 @@ impl PeerManager {
                 }
             }
         });
+    }
+
+    /// Whether the node holds a connection to the book entry `addr` itself.
+    /// An onion counts by host and port: a peer on another port of the same
+    /// host, a manual twin say, has not tested this entry.
+    fn is_book_addr_connected(&self, addr: &PeerAddr) -> bool {
+        match addr {
+            PeerAddr::Socket(sa) => self.is_addr_connected(sa),
+            PeerAddr::Onion { host, port } => self.peers.read().values().any(|h| {
+                h.info.state != PeerState::Disconnected
+                    && h.info.onion_host.as_deref() == Some(host.as_str())
+                    && h.info.addr.port() == *port
+            }),
+        }
     }
 
     /// The address-book key of an outbound peer the node dialled by its

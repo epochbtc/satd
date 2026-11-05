@@ -991,6 +991,21 @@ fn a_connected_onion_moves_to_tried() {
     assert!(!book.contains(&PeerAddr::Socket(SocketAddr::from(([0, 0, 0, 0], 9333)))), "not the placeholder");
 }
 
+/// A tried-collision incumbent passes its test only by a connection to the
+/// entry itself: for an onion, the same host and port. A peer on another
+/// port of the host, a manual twin say, used to count, and kept an untested
+/// entry in its tried slot.
+#[test]
+fn an_onion_twin_on_another_port_does_not_test_the_entry() {
+    let (pm, _dir) = mk_pm_tor();
+    let host = onion_host(4);
+    let mut twin = peer(1, SocketAddr::from(([0, 0, 0, 0], 9444)), Direction::Outbound);
+    twin.onion_host = Some(host.clone());
+    add_peer(&pm, twin);
+    assert!(!pm.is_book_addr_connected(&PeerAddr::Onion { host: host.clone(), port: 9333 }));
+    assert!(pm.is_book_addr_connected(&PeerAddr::Onion { host, port: 9444 }));
+}
+
 /// The reconnect loop's onion dials count as attempts in the book, which is
 /// what makes a dead onion terrible and replaceable there.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -558,13 +558,20 @@ impl AddrMan {
                 .filter(|e| !e.tried && e.addr.is_onion() && e.source_group == source_group)
                 .count()
                 >= MAX_NEW_PER_GROUP;
+        let group_full = self.new_count_in_group(&group) >= MAX_NEW_PER_GROUP;
         if onion_share_full {
-            // The source has its share of onions: make room in it, or refuse.
+            // The source has its share of onions: make room in it, or
+            // refuse. When the onion's own group is full too, the entry
+            // dropped must be of both, or the group would pass its cap.
             let Some(victim) = self
                 .entries
                 .values()
                 .find(|e| {
-                    !e.tried && e.addr.is_onion() && e.source_group == source_group && e.is_terrible(now)
+                    !e.tried
+                        && e.addr.is_onion()
+                        && e.source_group == source_group
+                        && (!group_full || e.group == group)
+                        && e.is_terrible(now)
                 })
                 .map(|e| e.addr.clone())
             else {
@@ -572,7 +579,7 @@ impl AddrMan {
             };
             self.remove_entry(&victim);
             evicted = Some(victim);
-        } else if self.new_count_in_group(&group) >= MAX_NEW_PER_GROUP {
+        } else if group_full {
             // The group is full: make room in it, or refuse.
             let Some(victim) = self
                 .entries
@@ -2171,6 +2178,49 @@ mod tests {
         let fresh = onion(0x02, 0xEF, 9333);
         assert_eq!(a.add_from_replacing(fresh.clone(), now, DEFAULT_SERVICES, source.clone()), (true, Some(dead.clone())));
         assert!(a.contains(&fresh) && !a.contains(&dead));
+    }
+
+    /// A full onion share and a full onion group at once: the entry dropped
+    /// for a newcomer must be of both. One of the source's terrible onions
+    /// from another group would leave the newcomer's group past its cap.
+    #[test]
+    fn a_full_share_and_a_full_group_drop_an_entry_of_both() {
+        let now = 10_000_000;
+        let target = 0x70;
+        let source = NetAddr::Ip("198.51.100.7".parse().unwrap());
+        let newcomer = onion(target, 0xFE, 9333);
+        // The source's share: 63 terrible onions in other groups and one in
+        // the newcomer's, terrible or not. The newcomer's group: that one
+        // and 63 from other sources.
+        let book = |shared_is_terrible: bool| {
+            let mut a = AddrMan::new();
+            for i in 0..MAX_NEW_PER_GROUP - 1 {
+                let other = NetAddr::Ip(IpAddr::from([30 + i as u8, 1, 1, 1]));
+                assert!(a.add_from(onion(target | (i % 16) as u8, i as u8, 9333), now, DEFAULT_SERVICES, other));
+                let elsewhere = onion(((i % 6) as u8) << 4, 0x80 | i as u8, 9333);
+                assert!(a.add_from(elsewhere.clone(), now, DEFAULT_SERVICES, source.clone()));
+                for _ in 0..3 {
+                    a.mark_attempt(&elsewhere, now - 120);
+                }
+            }
+            let shared = onion(target | 1, 0xFD, 9333);
+            assert!(a.add_from(shared.clone(), now, DEFAULT_SERVICES, source.clone()));
+            if shared_is_terrible {
+                for _ in 0..3 {
+                    a.mark_attempt(&shared, now - 120);
+                }
+            }
+            assert_eq!(a.new_count_in_group(&a.group_of(&newcomer)), MAX_NEW_PER_GROUP, "fixture: group full");
+            (a, shared)
+        };
+
+        let (mut a, _) = book(false);
+        assert_eq!(a.add_from_replacing(newcomer.clone(), now, DEFAULT_SERVICES, source.clone()), (false, None));
+        assert_eq!(a.new_count_in_group(&a.group_of(&newcomer)), MAX_NEW_PER_GROUP, "the group stays at its cap");
+
+        let (mut a, shared) = book(true);
+        assert_eq!(a.add_from_replacing(newcomer.clone(), now, DEFAULT_SERVICES, source.clone()), (true, Some(shared)));
+        assert_eq!(a.new_count_in_group(&a.group_of(&newcomer)), MAX_NEW_PER_GROUP);
     }
 
     /// An onion is the address it names in any case, and only a well-formed
