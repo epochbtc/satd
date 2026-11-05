@@ -8654,14 +8654,6 @@ fn parse_onion_externalip(s: &str, default_port: u16) -> Option<(String, u16)> {
     Some((host, port))
 }
 
-impl Config {
-    /// The listen port `-discover` announces with, or `None` when discovery
-    /// is off or the node does not listen (Core's `fListen` gate).
-    pub fn discover_port(&self) -> Option<u16> {
-        (self.discover && self.listen).then_some(self.port)
-    }
-}
-
 /// Boolean options Core negates with a `-no` prefix, which [`normalize_args`]
 /// rewrites to an explicit value.
 const NEGATABLE_BOOL_FLAGS: &[&str] = &[
@@ -15776,26 +15768,20 @@ mcpallowedhost=node.local
 
     // ---- discover ----
 
-    /// `-discover` is off unless asked for (Core's is on), Core's spellings
-    /// all turn it on, and a node that does not listen announces nothing.
+    /// `-discover` is off unless asked for (Core's is on), and Core's
+    /// spellings turn it on and off.
     #[test]
-    fn discover_is_off_by_default_and_needs_a_listener() {
+    fn discover_is_off_by_default() {
         let cfg = Config::from_cli(parse_cli(["satd", "--regtest"]).unwrap()).unwrap();
-        assert!(!cfg.discover && cfg.discover_port().is_none(), "discover defaults off");
+        assert!(!cfg.discover, "discover defaults off");
         for argv in [vec!["satd", "--regtest", "-discover"], vec!["satd", "--regtest", "-discover=1"]] {
             let argv = normalize_args(argv.iter().map(|s| s.to_string()).collect());
-            let cfg = Config::from_cli(parse_cli(argv).unwrap()).unwrap();
-            assert_eq!(cfg.discover_port(), Some(cfg.port));
+            assert!(Config::from_cli(parse_cli(argv).unwrap()).unwrap().discover);
         }
         let argv = normalize_args(
             ["satd", "--regtest", "-discover", "-nodiscover"].iter().map(|s| s.to_string()).collect(),
         );
         assert!(!Config::from_cli(parse_cli(argv).unwrap()).unwrap().discover);
-        let argv = normalize_args(
-            ["satd", "--regtest", "-discover", "-listen=0"].iter().map(|s| s.to_string()).collect(),
-        );
-        let cfg = Config::from_cli(parse_cli(argv).unwrap()).unwrap();
-        assert!(cfg.discover && cfg.discover_port().is_none(), "no listener, nothing to announce");
         assert!(is_known_config_key("discover"));
         assert_eq!(classify_unsupported_key("discover"), None);
     }

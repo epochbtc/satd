@@ -80,6 +80,10 @@ const PING_TIMEOUT: Duration = Duration::from_secs(20 * 60);
 /// an honest competing-chain announcement.
 const GETHEADERS_MIN_INTERVAL: Duration = Duration::from_secs(2);
 
+/// Cap on the peer-reported addresses `-discover` remembers as our own.
+/// Each outbound peer reports one; an honest set holds one per IP family.
+const MAX_DISCOVERED_IPS: usize = 8;
+
 /// Cap on onion peer addresses discovered via `addrv2` gossip and kept in
 /// `connect_peer_addrs` for the reconnect loop to dial. Unlike clearnet
 /// addresses (persisted in the addrman / peers.dat), onion peers live only in
@@ -1276,12 +1280,18 @@ pub struct PeerManager {
     /// `-externalip` onion, advertised or not. `getaddr` replies never
     /// carry one.
     own_onions: RwLock<std::collections::HashSet<String>>,
-    /// `-discover`: the listen port to announce with the address an outbound
-    /// peer says it sees us at, or 0 when discovery is off (the default).
-    discover_port: std::sync::atomic::AtomicU16,
-    /// Every IP this node announced as its own after a peer reported it
-    /// (`-discover`). `getaddr` replies never carry one, as for `-externalip`.
-    discovered_ips: RwLock<std::collections::HashSet<IpAddr>>,
+    /// The P2P listen port, or 0 when the node does not listen. Set once at
+    /// startup: `-listen` and `-port` need a restart, so a reload of
+    /// `-discover` announces the port actually bound.
+    listen_port: std::sync::atomic::AtomicU16,
+    /// `-discover`: announce the address an outbound peer says it sees us
+    /// at. Off by default.
+    discover: std::sync::atomic::AtomicBool,
+    /// The latest IPs (at most [`MAX_DISCOVERED_IPS`]) this node announced
+    /// as its own after a peer reported them. `getaddr` replies never carry
+    /// one, as for `-externalip`. A report comes from the peer, so the set is
+    /// bounded and cleared when `-discover` is turned off.
+    discovered_ips: RwLock<std::collections::VecDeque<IpAddr>>,
     /// `-whitelist` permission entries (by source subnet). Set once at
     /// startup; consulted on every peer connect to compute permissions.
     whitelist: RwLock<Vec<crate::net::permissions::WhitelistEntry>>,
@@ -1683,8 +1693,9 @@ impl PeerManager {
             external_addrs: RwLock::new(Vec::new()),
             advertised_onion: RwLock::new(None),
             own_onions: RwLock::new(std::collections::HashSet::new()),
-            discover_port: std::sync::atomic::AtomicU16::new(0),
-            discovered_ips: RwLock::new(std::collections::HashSet::new()),
+            listen_port: std::sync::atomic::AtomicU16::new(0),
+            discover: std::sync::atomic::AtomicBool::new(false),
+            discovered_ips: RwLock::new(std::collections::VecDeque::new()),
             whitelist: RwLock::new(Vec::new()),
             // Core's rule off regtest: routable addresses only. Regtest keeps
             // private ones, which lab networks run on.
@@ -2097,12 +2108,34 @@ impl PeerManager {
         self.own_onions.write().extend(hosts.into_iter().map(|h| h.to_ascii_lowercase()));
     }
 
+    /// The P2P listen port, `None` when the node does not listen (Core's
+    /// `fListen`, which `-discover` needs). Set once at startup.
+    pub fn set_listen_port(&self, port: Option<u16>) {
+        self.listen_port.store(port.unwrap_or(0), Ordering::Relaxed);
+    }
+
     /// Core's `-discover`: announce, to an outbound peer, the address it
-    /// reports seeing us at, with our listen `port`. `None` turns it off.
-    /// satd's default is off, where Core's is on: the operator chooses
-    /// whether the clearnet IP is announced.
-    pub fn set_discover(&self, port: Option<u16>) {
-        self.discover_port.store(port.unwrap_or(0), Ordering::Relaxed);
+    /// reports seeing us at, with our listen port. satd's default is off,
+    /// where Core's is on: the operator chooses whether the clearnet IP is
+    /// announced. Turning it off forgets the addresses it announced.
+    pub fn set_discover(&self, on: bool) {
+        self.discover.store(on, Ordering::Relaxed);
+        if !on {
+            self.discovered_ips.write().clear();
+        }
+    }
+
+    /// Record `ip` as one `-discover` announced, keeping the latest
+    /// [`MAX_DISCOVERED_IPS`].
+    fn note_discovered_ip(&self, ip: IpAddr) {
+        let mut ips = self.discovered_ips.write();
+        if ips.contains(&ip) {
+            return;
+        }
+        if ips.len() == MAX_DISCOVERED_IPS {
+            ips.pop_front();
+        }
+        ips.push_back(ip);
     }
 
     /// Core's `IsPeerAddrLocalGood` with `GetLocalAddrForPeer`'s outbound
@@ -2111,8 +2144,8 @@ impl PeerManager {
     /// Never on a link that hides our IP: a proxied peer sees the proxy's
     /// exit, and announcing anything there ties the link to an IP.
     fn peer_reported_local(&self, info: &PeerInfo) -> Option<SocketAddr> {
-        let port = self.discover_port.load(Ordering::Relaxed);
-        if port == 0 || self.link_hides_our_ip(info) || !crate::net::is_routable(info.addr.ip()) {
+        let port = self.listen_port.load(Ordering::Relaxed);
+        if !self.discover.load(Ordering::Relaxed) || port == 0 || self.link_hides_our_ip(info) || !crate::net::is_routable(info.addr.ip()) {
             return None;
         }
         let ip = info.version.as_ref()?.receiver.socket_addr().ok()?.ip().to_canonical();
@@ -2353,7 +2386,7 @@ impl PeerManager {
             && let Some(sa) = reported
             && sa.is_ipv4() == peer_v4
         {
-            self.discovered_ips.write().insert(sa.ip());
+            self.note_discovered_ip(sa.ip());
             tracing::debug!("Advertising address {sa} to peer={id}");
             vec![GetAddrEntry { addr: PeerAddr::Socket(sa), time, services }]
         } else {

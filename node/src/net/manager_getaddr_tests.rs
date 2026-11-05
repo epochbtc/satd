@@ -419,16 +419,18 @@ fn reporting_peer(pm: &PeerManager, id: PeerId, addr: SocketAddr, seen: SocketAd
 /// reports seeing us at, with our listen port rather than the port it saw
 /// (Core's `GetLocalAddrForPeer`), and the address joins our own, so
 /// `getaddr` never hands it out. Off, nothing is announced. Perturbation:
-/// drop the `discover_port` check and the first assertion fails; drop the
-/// `discovered_ips` insert and the `getaddr` one does.
+/// drop the `discover` check and the first assertion fails; drop the
+/// `discovered_ips` insert and the `getaddr` one does; keep the set when
+/// turned off and the last one does. Not listening, nothing is announced.
 #[test]
 fn discover_announces_the_address_an_outbound_peer_sees_us_at() {
     let (pm, _dir) = mk_pm();
     let seen = SocketAddr::from(([81, 2, 3, 4], 51234));
     let _r = add_peer(&pm, reporting_peer(&pm, 1, SocketAddr::from(([44, 1, 1, 1], 8333)), seen));
+    pm.set_listen_port(Some(18444));
     assert!(pm.self_advertise_externals(1).is_none(), "off by default");
 
-    pm.set_discover(Some(18444));
+    pm.set_discover(true);
     let Some(NetworkMessage::Addr(a)) = pm.self_advertise_externals(1) else { panic!("a legacy addr") };
     let got: Vec<SocketAddr> = a.iter().filter_map(|(_, x)| x.socket_addr().ok()).collect();
     assert_eq!(got, vec![SocketAddr::from(([81, 2, 3, 4], 18444))]);
@@ -443,8 +445,34 @@ fn discover_announces_the_address_an_outbound_peer_sees_us_at() {
     let got: Vec<PeerAddr> = pm.getaddr_reply(key, false).into_iter().map(|e| e.addr).collect();
     assert_eq!(got, vec![stranger], "the discovered address is ours and stays out of getaddr");
 
-    pm.set_discover(None);
+    pm.set_discover(false);
     assert!(pm.self_advertise_externals(1).is_none(), "turned off again");
+    assert!(pm.discovered_ips.read().is_empty(), "turning it off forgets what it announced");
+
+    pm.set_discover(true);
+    pm.set_listen_port(None);
+    assert!(pm.self_advertise_externals(1).is_none(), "a node that does not listen announces nothing");
+}
+
+/// A report is the peer's word, so the addresses kept as ours are the
+/// latest [`MAX_DISCOVERED_IPS`]: peers each claiming another IP cannot
+/// grow the set. Perturbation: drop the cap and it grows past it.
+#[test]
+fn discovered_addresses_are_bounded() {
+    let (pm, _dir) = mk_pm();
+    pm.set_listen_port(Some(18444));
+    pm.set_discover(true);
+    let n = MAX_DISCOVERED_IPS as u8 + 3;
+    for i in 0..n {
+        let seen = SocketAddr::from(([81, 2, 3, i + 1], 51234));
+        let id = PeerId::from(i + 1);
+        let _r = add_peer(&pm, reporting_peer(&pm, id, SocketAddr::from(([44, 1, 2, i + 1], 8333)), seen));
+        assert!(pm.self_advertise_externals(id).is_some());
+    }
+    let kept: Vec<IpAddr> = pm.discovered_ips.read().iter().copied().collect();
+    assert_eq!(kept.len(), MAX_DISCOVERED_IPS);
+    assert_eq!(kept.last(), Some(&IpAddr::from([81, 2, 3, n])), "the latest is kept");
+    assert!(!pm.is_own_address(&PeerAddr::Socket(SocketAddr::from(([81, 2, 3, 1], 8333)))), "the oldest is dropped");
 }
 
 /// A report is used only where Core's `IsPeerAddrLocalGood` would, and
@@ -455,12 +483,14 @@ fn discover_announces_the_address_an_outbound_peer_sees_us_at() {
 fn discover_skips_hidden_links_bad_reports_and_yields_to_externalip() {
     let seen = SocketAddr::from(([81, 2, 3, 4], 51234));
     let (proxied, _d) = mk_pm_with_proxy(Some("127.0.0.1:9050".to_string()));
-    proxied.set_discover(Some(18444));
+    proxied.set_listen_port(Some(18444));
+    proxied.set_discover(true);
     let _p = add_peer(&proxied, reporting_peer(&proxied, 1, SocketAddr::from(([44, 1, 1, 2], 8333)), seen));
     assert!(proxied.self_advertise_externals(1).is_none(), "a proxied peer sees the exit, not us");
 
     let (pm, _dir) = mk_pm();
-    pm.set_discover(Some(18444));
+    pm.set_listen_port(Some(18444));
+    pm.set_discover(true);
     let public = SocketAddr::from(([44, 1, 1, 3], 8333));
     let _a = add_peer(&pm, reporting_peer(&pm, 1, public, SocketAddr::from(([10, 0, 0, 5], 51234))));
     let _b = add_peer(&pm, reporting_peer(&pm, 2, SocketAddr::from(([192, 168, 1, 5], 8333)), seen));
