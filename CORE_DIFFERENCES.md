@@ -106,9 +106,12 @@ under a random key kept in `peers.dat`. Its new table is a flat map with a
 per-group cap, so a new entry's slot is *derived* from `GetNewBucket` and
 `GetBucketPosition`, and a collision there moves to the next free slot
 rather than evicting an entry. The key is random rather than
-`-test=addrman`'s fixed one, so no slot matches Core's for the same address. `getnodeaddresses`,
-`getaddrmaninfo` and `getrawaddrman` report IPv4 and IPv6 only: onion
-candidates learned from `addrv2` gossip are held outside the address book.
+`-test=addrman`'s fixed one, so no slot matches Core's for the same address.
+The book holds IPv4, IPv6 and Tor v3 onion addresses, grouped as Core
+groups them (an onion by the first four bits of its key). On top of the
+per-group cap, one source's network group holds at most 64 onion entries in
+the new table: onions are free to make in every group, and the flat new
+table has no source-group buckets to bound them as Core's does.
 
 **On private addresses in the address book.** Core's address manager takes
 publicly routable addresses only (`AddrManImpl::AddSingle`), on every chain,

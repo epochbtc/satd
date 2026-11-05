@@ -568,7 +568,7 @@ fn a_tried_collision_tests_the_incumbent() {
             .expect("a colliding address");
         book.add(new, now);
         assert!(!book.mark_good(new, now - 3600), "fixture: the slot is taken");
-        assert_eq!(book.select_tried_collision(), Some(old).map(PeerAddr::from));
+        assert_eq!(book.select_tried_collision(), Some(PeerAddr::from(old)));
         (new, bucket)
     };
     learn(&pm, &[new]);

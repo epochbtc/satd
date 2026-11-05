@@ -1323,7 +1323,7 @@ mod tests {
         let mut a = AddrMan::new();
         assert_eq!(a.select(), None);
         a.add(sa("1.2.3.4:8333"), 1);
-        assert_eq!(a.select(), Some(sa("1.2.3.4:8333")).map(PeerAddr::from));
+        assert_eq!(a.select(), Some(PeerAddr::from(sa("1.2.3.4:8333"))));
         a.mark_good(sa("5.6.7.8:8333"), 2);
         // With both pools non-empty, select returns one of them.
         for _ in 0..20 {
@@ -1749,7 +1749,7 @@ mod tests {
         let t = 1_000;
         assert!(!a.mark_good(new, t), "the slot is taken");
         assert!(!a.is_tried(&new.into()) && a.is_tried(&old.into()));
-        assert_eq!(a.select_tried_collision(), Some(old).map(PeerAddr::from));
+        assert_eq!(a.select_tried_collision(), Some(PeerAddr::from(old)));
 
         // Alive within four hours: the newcomer stays new.
         assert!(a.resolve_collisions(t + 60).is_empty());
