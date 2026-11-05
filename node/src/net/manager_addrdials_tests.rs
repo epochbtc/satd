@@ -760,10 +760,23 @@ fn an_address_book_of_unreachable_addresses_does_not_count() {
 /// handshake against a remote that states `services`. Returns the
 /// handshake's result and the book's services for the address afterwards.
 async fn handshake_stating(services: ServiceFlags) -> (Result<VersionMessage, String>, u64) {
+    let (pm, _dir) = mk_pm();
+    let (result, target) = handshake_as(&pm, ConnType::OutboundFullRelay, services).await;
+    let book = pm.addrman.read().iter().find(|e| e.addr == target.into()).map(|e| e.services).unwrap();
+    (result, book)
+}
+
+/// [`handshake_stating`] for a connection of type `conn_type`, on `pm`,
+/// whose book holds the listener's address as a new entry. Returns the
+/// handshake's result and the address.
+async fn handshake_as(
+    pm: &PeerManager,
+    conn_type: ConnType,
+    services: ServiceFlags,
+) -> (Result<VersionMessage, String>, SocketAddr) {
     use bitcoin::p2p::Magic;
     use bitcoin::p2p::address::Address;
 
-    let (pm, _dir) = mk_pm();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let target = listener.local_addr().unwrap();
     pm.addrman.write().add_from(target, now_unix_secs(), 1 | 8, "198.51.100.7".parse::<IpAddr>().unwrap());
@@ -771,8 +784,8 @@ async fn handshake_stating(services: ServiceFlags) -> (Result<VersionMessage, St
     let (dialed, (accepted, _)) = (dialed.unwrap(), accepted.unwrap());
     let mut info = peer(1, target, Direction::Outbound);
     info.state = PeerState::Connecting;
-    info.conn_type = ConnType::OutboundFullRelay;
-    add_peer(&pm, info);
+    info.conn_type = conn_type;
+    add_peer(pm, info);
     let mut ours = Connection::with_magic(dialed, Magic::REGTEST);
     let mut theirs = Connection::with_magic(accepted, Magic::REGTEST);
 
@@ -806,8 +819,7 @@ async fn handshake_stating(services: ServiceFlags) -> (Result<VersionMessage, St
         }
     };
     let (result, ()) = tokio::join!(handshake, remote);
-    let book = pm.addrman.read().iter().find(|e| e.addr == target.into()).map(|e| e.services).unwrap();
-    (result, book)
+    (result, target)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1136,4 +1148,142 @@ async fn an_onion_dropped_mid_dial_leaves_no_backoff() {
     pm.reconnect_tick();
     let key = format!("{listed}:9333");
     wait_for(&pm, || pm.onion_reconnect_backoff.read().contains_key(&key), "the listed onion backs off").await;
+}
+
+// ---- Feelers (#1149) ----
+
+/// Make the feeler timer due.
+fn feeler_due(pm: &PeerManager) {
+    *pm.next_feeler.lock() = Instant::now() - Duration::from_secs(1);
+}
+
+/// The address a feeler would test now, the timer made due first. The
+/// grant goes back at the end of this call.
+fn feeler_target(pm: &Arc<PeerManager>) -> Option<PeerAddr> {
+    feeler_due(pm);
+    pm.reserve_feeler(Instant::now()).map(|(target, _grant)| target)
+}
+
+/// #1149: Core opens a feeler only once the outbound targets are met, its
+/// timer checked in the `else if` after them. One short of the target, the
+/// slot goes to a full-relay dial and the timer is left as it is.
+#[test]
+fn no_feeler_while_the_automatic_target_is_unmet() {
+    let (pm, _dir) = mk_pm();
+    leave_ibd(&pm);
+    learn(&pm, SocketAddr::from(([44, 1, 2, 3], 8333)));
+    fill_automatic(&pm, 7);
+    feeler_due(&pm);
+    let due = *pm.next_feeler.lock();
+    assert_eq!(pm.reserve_feeler(Instant::now()).map(|(t, _)| t), None);
+    assert_eq!(*pm.next_feeler.lock(), due, "the timer waits for the target");
+
+    fill_automatic(&pm, 8);
+    assert_eq!(feeler_target(&pm), Some(SocketAddr::from(([44, 1, 2, 3], 8333)).into()));
+}
+
+/// The timer is set again by each feeler, to a time drawn around Core's
+/// two-minute mean: the next pass opens none.
+#[test]
+fn a_feeler_sets_the_timer_again() {
+    let (pm, _dir) = mk_pm();
+    leave_ibd(&pm);
+    learn(&pm, SocketAddr::from(([44, 1, 2, 3], 8333)));
+    fill_automatic(&pm, 8);
+    assert!(feeler_target(&pm).is_some());
+    let now = Instant::now();
+    assert!(*pm.next_feeler.lock() > now - Duration::from_millis(100));
+    assert!(pm.reserve_feeler(now).is_none(), "not due again yet");
+}
+
+/// A feeler draws from the new table alone (Core's `Select(true)`), and
+/// the network group of a peer the node already holds is no reason to skip
+/// one, as it is for every other automatic dial.
+#[test]
+fn a_feeler_tests_a_new_entry_in_any_group() {
+    let (pm, _dir) = mk_pm();
+    leave_ibd(&pm);
+    fill_automatic(&pm, 7);
+    add_peer(&pm, peer(1, SocketAddr::from(([44, 1, 0, 1], 8333)), Direction::Outbound));
+    let tried = SocketAddr::from(([45, 1, 2, 3], 8333));
+    // In the group of a peer the node holds, 44.1.0.0/16.
+    let fresh = SocketAddr::from(([44, 1, 9, 9], 8333));
+    {
+        let mut book = pm.addrman.write();
+        assert!(book.mark_good(tried, now_unix_secs()));
+        assert!(book.add(fresh, now_unix_secs()));
+    }
+    assert!(pm.reserve_automatic_dials(Instant::now()).is_empty(), "fixture: the target is met");
+    for _ in 0..20 {
+        assert_eq!(feeler_target(&pm), Some(fresh.into()));
+    }
+}
+
+/// A feeler needs only the services that make a peer's address book worth
+/// having: `NODE_NETWORK` or `NODE_NETWORK_LIMITED` (Core's
+/// `MayHaveUsefulAddressDB`), not every desirable one.
+#[test]
+fn a_feeler_needs_only_a_useful_address_book() {
+    let source: IpAddr = "198.51.100.7".parse().unwrap();
+    let limited = SocketAddr::from(([44, 1, 2, 3], 8333));
+    let neither = SocketAddr::from(([45, 1, 2, 3], 8333));
+    let (pm, _dir) = mk_pm();
+    leave_ibd(&pm);
+    fill_automatic(&pm, 8);
+    let now = now_unix_secs();
+    assert!(pm.addrman.write().add_from(neither, now, ServiceFlags::WITNESS.to_u64(), source));
+    assert_eq!(feeler_target(&pm), None, "no address book worth testing");
+    let services = (ServiceFlags::NETWORK_LIMITED | ServiceFlags::WITNESS).to_u64();
+    assert!(pm.addrman.write().add_from(limited, now, services, source));
+    assert_eq!(feeler_target(&pm), Some(limited.into()));
+}
+
+/// A feeler takes no slot of the automatic target: Core sizes `semOutbound`
+/// with one place for it. With a feeler open, a dropped full-relay peer is
+/// still replaced.
+#[test]
+fn a_feeler_takes_no_automatic_slot() {
+    let (pm, _dir) = mk_pm();
+    leave_ibd(&pm);
+    fill_automatic(&pm, 7);
+    let mut feeler = peer(1, SocketAddr::from(([44, 1, 2, 3], 8333)), Direction::Outbound);
+    feeler.conn_type = ConnType::Feeler;
+    feeler.state = PeerState::Connecting;
+    add_peer(&pm, feeler);
+    pm.pending_typed_dials.write().push(ConnType::Feeler);
+    assert!(pm.reserve_dial(DialBudget::Automatic).is_ok());
+}
+
+/// A feeler's `version` moves its address to tried (Core's `Good`, before
+/// the feeler is dropped), and the connection closes without a verack.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_feeler_moves_a_new_entry_to_tried() {
+    let (pm, _dir) = mk_pm();
+    let (result, target) = handshake_as(&pm, ConnType::Feeler, ServiceFlags::NETWORK | ServiceFlags::WITNESS).await;
+    assert!(result.unwrap_err().contains("feeler"), "closed after version");
+    assert!(pm.addrman.read().is_tried(&target.into()));
+    assert!(pm.peers.read().is_empty(), "the feeler is gone");
+}
+
+/// The reconnect loop opens the feeler, and one that finds nothing
+/// listening counts an attempt against the address, as a failed automatic
+/// dial does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_feeler_counts_an_attempt() {
+    let (pm, _dir) = mk_pm();
+    leave_ibd(&pm);
+    fill_automatic(&pm, 8);
+    let closed = {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        l.local_addr().unwrap()
+    };
+    learn(&pm, closed);
+    feeler_due(&pm);
+    pm.reconnect_tick();
+    let tried = || pm.reconnect_backoff.read().contains_key(&closed);
+    wait_for(&pm, tried, "the feeler dials").await;
+    let entry = pm.addrman.read().get(&closed.into()).cloned().expect("still in the book");
+    assert_eq!(entry.attempts, 1);
+    assert!(!pm.addrman.read().is_tried(&closed.into()));
+    assert!(pm.pending_typed_dials.read().is_empty(), "the grant went back");
 }

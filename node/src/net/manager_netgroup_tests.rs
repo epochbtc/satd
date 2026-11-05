@@ -547,9 +547,10 @@ fn tried_dials_draw_a_bucket_before_an_entry() {
 }
 
 /// Test-before-evict, end to end: a promotion into a taken tried slot puts
-/// the incumbent first on the next dial order, and an incumbent the node is
-/// connected to is marked good on the reconnect tick, so the newcomer stays
-/// new.
+/// the incumbent first on the next feeler's order, not the full-relay
+/// dials' (#1149, as Core tests it over a feeler), and an incumbent the
+/// node is connected to is marked good on the reconnect tick, so the
+/// newcomer stays new.
 #[test]
 fn a_tried_collision_tests_the_incumbent() {
     use rand::SeedableRng as _;
@@ -573,7 +574,10 @@ fn a_tried_collision_tests_the_incumbent() {
     };
     learn(&pm, &[new]);
     let mut rng = rand::rngs::StdRng::seed_from_u64(3);
-    assert_eq!(dial_order(&pm, &mut rng)[0], old, "the incumbent is tested first");
+    let feeler: Vec<SocketAddr> = pm.feeler_dial_order(&mut rng).map(|c| socket(c.addr)).collect();
+    assert_eq!(feeler[0], old, "the feeler tests the incumbent first");
+    let first = (0..64).filter(|_| dial_order(&pm, &mut rng)[0] == old).count();
+    assert!(first < 64, "a full-relay dial draws it as any other entry");
 
     add_peer(&pm, outbound(1, old, ConnType::OutboundFullRelay));
     pm.resolve_tried_collisions();
