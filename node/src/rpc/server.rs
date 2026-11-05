@@ -3537,7 +3537,7 @@ pub async fn start(
             .addrman_snapshot()
             .into_iter()
             .filter(|e| {
-                network.is_none_or(|n| crate::net::addrman::network_name(e.addr.ip()) == n)
+                network.is_none_or(|n| crate::net::addrman::peer_network_name(&e.addr) == n)
             })
             .collect();
         {
@@ -3553,9 +3553,9 @@ pub async fn start(
                 serde_json::json!({
                     "time": e.last_seen,
                     "services": e.services,
-                    "address": crate::net::addrman::addr_string(e.addr.ip()),
+                    "address": crate::net::addrman::peer_addr_string(&e.addr),
                     "port": e.addr.port(),
-                    "network": crate::net::addrman::network_name(e.addr.ip()),
+                    "network": crate::net::addrman::peer_network_name(&e.addr),
                 })
             })
             .collect();
@@ -3595,15 +3595,19 @@ pub async fn start(
         // is a bare `std::runtime_error` (-1).
         let port = u16::try_from(port)
             .map_err(|_| ErrorObjectOwned::owned(-1, "JSON integer out of range", None::<()>))?;
-        // `LookupHost(addr, /*fAllowLookup=*/false)`: a literal IP only.
-        let ip: std::net::IpAddr = address.parse().map_err(|_| {
-            ErrorObjectOwned::owned(-30, "Invalid IP address", None::<()>)
-        })?;
-        let mut out = serde_json::Map::new();
-        let success = match ctx
-            .peer_manager
-            .addrman_add_manual(std::net::SocketAddr::new(ip, port), tried)
+        // `LookupHost(addr, /*fAllowLookup=*/false)`: a literal IP, or a
+        // v3 onion (`CNetAddr::SetSpecial`), never a name lookup.
+        let addr = if let Ok(ip) = address.parse::<std::net::IpAddr>() {
+            crate::net::peer::PeerAddr::Socket(std::net::SocketAddr::new(ip, port))
+        } else if address.to_ascii_lowercase().ends_with(".onion")
+            && crate::net::peer::onion_host_to_torv3_pubkey(&address.to_ascii_lowercase()).is_some()
         {
+            crate::net::peer::PeerAddr::Onion { host: address.to_ascii_lowercase(), port }
+        } else {
+            return Err(ErrorObjectOwned::owned(-30, "Invalid IP address", None::<()>));
+        };
+        let mut out = serde_json::Map::new();
+        let success = match ctx.peer_manager.addrman_add_manual(addr, tried) {
             Ok(()) => true,
             Err(e) => {
                 out.insert("error".to_string(), serde_json::json!(e));
@@ -3621,13 +3625,13 @@ pub async fn start(
         let mut tried = serde_json::Map::new();
         for (slot, e) in ctx.peer_manager.addrman_positions() {
             let entry = serde_json::json!({
-                "address": crate::net::addrman::addr_string(e.addr.ip()),
+                "address": crate::net::addrman::peer_addr_string(&e.addr),
                 "port": e.addr.port(),
                 "services": e.services,
                 "time": e.last_seen,
-                "network": crate::net::addrman::network_name(e.addr.ip()),
-                "source": crate::net::addrman::addr_string(e.source),
-                "source_network": crate::net::addrman::network_name(e.source),
+                "network": crate::net::addrman::peer_network_name(&e.addr),
+                "source": e.source.addr_string(),
+                "source_network": e.source.network_name(),
             });
             let key = format!("{}/{}", slot.bucket, slot.position);
             if slot.tried {
