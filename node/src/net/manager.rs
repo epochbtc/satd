@@ -194,6 +194,33 @@ fn next_feeler_after(now: Instant) -> Instant {
     now + Duration::from_micros(crate::net::tx_relay::exp_delay(mean))
 }
 
+/// The mean time between two extra full-relay peers opened to reach a
+/// reachable network the node has no outbound peer on: Core's
+/// `EXTRA_NETWORK_PEER_INTERVAL` (v31.1 `src/net.cpp:91`), the mean of an
+/// exponential timer.
+const EXTRA_NETWORK_PEER_INTERVAL: Duration = Duration::from_secs(5 * 60);
+
+/// When the next extra-network peer is due, from `now`: an exponentially
+/// distributed wait with mean [`EXTRA_NETWORK_PEER_INTERVAL`].
+fn next_extra_network_peer_after(now: Instant) -> Instant {
+    let mean = EXTRA_NETWORK_PEER_INTERVAL.as_micros() as u64;
+    now + Duration::from_micros(crate::net::tx_relay::exp_delay(mean))
+}
+
+/// The network of an address-book entry or an outbound peer's address, as
+/// Core's `CNetAddr::GetNetwork`: `None` for an address that is not
+/// publicly routable (Core's `NET_UNROUTABLE`), which belongs to no network
+/// a node tries to reach.
+fn addr_network(
+    reachable: &crate::net::reachable::ReachableNets,
+    addr: &PeerAddr,
+) -> Option<crate::net::reachable::Network> {
+    match addr {
+        PeerAddr::Onion { .. } => Some(crate::net::reachable::Network::Onion),
+        PeerAddr::Socket(sa) => crate::net::is_routable(sa.ip()).then(|| reachable.network_of(sa)),
+    }
+}
+
 /// A peer the operator named (`-addnode`, `addnode add`, or a `-connect`
 /// host name), with the address it currently resolves to.
 #[derive(Debug, Clone)]
@@ -699,6 +726,13 @@ enum DialBudget {
     /// No limit: the other manual connections (`-connect`, `-seednode`),
     /// which Core opens without a grant.
     Unlimited,
+    /// The extra full-relay peer the node opens to reach a network it has
+    /// no outbound peer on ([`PeerManager::reserve_extra_network_peer`]):
+    /// one at a time, and only while the full-relay target is met exactly.
+    /// It takes a place outside the automatic target, as in Core, where the
+    /// peer is a ninth full-relay connection until eviction drops one on
+    /// another network.
+    ExtraNetwork,
 }
 
 /// Outbound dials in flight, per [`DialBudget`].
@@ -706,6 +740,7 @@ enum DialBudget {
 struct DialsInFlight {
     automatic: usize,
     added_node: usize,
+    extra_network: usize,
 }
 
 /// A dial's place in its [`DialBudget`], given back when dropped. Owned, so
@@ -722,6 +757,9 @@ impl Drop for DialSlot {
         match self.budget {
             DialBudget::Automatic => in_flight.automatic = in_flight.automatic.saturating_sub(1),
             DialBudget::AddedNode => in_flight.added_node = in_flight.added_node.saturating_sub(1),
+            DialBudget::ExtraNetwork => {
+                in_flight.extra_network = in_flight.extra_network.saturating_sub(1)
+            }
             DialBudget::Unlimited => {}
         }
     }
@@ -1232,6 +1270,9 @@ pub struct PeerManager {
     /// When the reconnect loop may open its next feeler
     /// ([`PeerManager::reserve_feeler`]): Core's `next_feeler`.
     next_feeler: parking_lot::Mutex<Instant>,
+    /// When the next extra full-relay peer to a network with none is due
+    /// ([`Self::reserve_extra_network_peer`]).
+    next_extra_network_peer: parking_lot::Mutex<Instant>,
     /// The peers the operator named: every `-addnode` / `addnode add`
     /// entry, plus each `-connect` entry given as a host name. Keeps the
     /// string the operator typed (what `getaddednodeinfo` reports, matching
@@ -1679,6 +1720,12 @@ impl PeerManager {
                 Instant::now() + Duration::from_secs(365 * 24 * 3600)
             } else {
                 next_feeler_after(Instant::now())
+            }),
+            // Likewise for the extra-network peer.
+            next_extra_network_peer: parking_lot::Mutex::new(if cfg!(test) {
+                Instant::now() + Duration::from_secs(365 * 24 * 3600)
+            } else {
+                next_extra_network_peer_after(Instant::now())
             }),
             addnode_entries: RwLock::new(Vec::new()),
             refreshing_manual_targets: std::sync::atomic::AtomicBool::new(false),
@@ -3536,6 +3583,21 @@ impl PeerManager {
             + self.pending_typed_dials.read().iter().filter(|t| **t != ConnType::Feeler).count()
     }
 
+    /// The full-relay connections open or being opened: Core's
+    /// `nOutboundFullRelay`, with satd's dials in flight counted. Every
+    /// automatic dial is one (`spawn_peer` types it full-relay), as is an
+    /// `addconnection` reservation of that type.
+    fn full_relay_open(&self, in_flight: &DialsInFlight) -> usize {
+        let peers = self
+            .peers
+            .read()
+            .values()
+            .filter(|h| h.info.conn_type == ConnType::OutboundFullRelay && h.info.state != PeerState::Disconnected)
+            .count();
+        let typed = self.pending_typed_dials.read().iter().filter(|t| **t == ConnType::OutboundFullRelay).count();
+        peers + in_flight.automatic + in_flight.extra_network + typed
+    }
+
     /// The added nodes the operator listed, at the addresses they resolve to.
     fn added_node_addrs(&self) -> Vec<PeerAddr> {
         self.addnode_entries
@@ -3620,6 +3682,15 @@ impl PeerManager {
                     ));
                 }
                 in_flight.added_node += 1;
+            }
+            DialBudget::ExtraNetwork => {
+                if in_flight.extra_network > 0 {
+                    return Err("an extra network peer is already being dialled".to_string());
+                }
+                if self.full_relay_open(&in_flight) != MAX_OUTBOUND {
+                    return Err("the full-relay target is not met exactly".to_string());
+                }
+                in_flight.extra_network += 1;
             }
             DialBudget::Unlimited => {}
         }
@@ -5011,6 +5082,7 @@ impl PeerManager {
         self.resolve_tried_collisions();
         self.dial_automatic_peers(now);
         self.open_feeler(now);
+        self.open_extra_network_peer(now);
     }
 
     /// Open a feeler if one is due: [`Self::reserve_feeler`], then the dial,
@@ -5108,6 +5180,120 @@ impl PeerManager {
             Err(())
         });
         chosen.map(|target| (target, grant))
+    }
+
+    /// Open an extra full-relay peer if one is due: [`Self::reserve_extra_network_peer`],
+    /// then the dial, as an automatic one. The peer it reaches is a
+    /// full-relay peer like any other; it stays because the surplus
+    /// eviction keeps the only manual or full-relay peer on its network
+    /// ([`Self::evict_extra_outbound_peer`]) and drops one on another.
+    fn open_extra_network_peer(self: &Arc<Self>, now: Instant) {
+        let Some((target, net, slot)) = self.reserve_extra_network_peer(now) else {
+            return;
+        };
+        tracing::debug!(%target, network = ?net, "Making network specific connection");
+        self.spawn_redial(target, slot, AUTOMATIC_RECONNECT_MAX_BACKOFF);
+    }
+
+    /// The address an extra full-relay peer is dialled at this pass, the
+    /// network it was drawn for, and its place in the dial limit, or `None`
+    /// if none is due: Core's extra-network branch of
+    /// `ThreadOpenConnections` (v31.1 `src/net.cpp:2756`), which tries to
+    /// hold at least one outbound peer on every reachable network.
+    ///
+    /// One is due only when the full-relay connections, dials in flight
+    /// counted, are exactly at the target of 8, and only when
+    /// `-maxconnections` leaves that target where it is, as in Core; nor
+    /// during initial block download, when satd's target is 64 and the node
+    /// is still filling it. One extra dial at a time
+    /// ([`DialBudget::ExtraNetwork`]). Not under `-connect`.
+    ///
+    /// Then the timer, [`EXTRA_NETWORK_PEER_INTERVAL`] on average, and a
+    /// network ([`Self::pick_network_without_peer`]). The timer is set again
+    /// only when a network is picked, as Core's `MaybePickPreferredNetwork`
+    /// sits last in its condition: a node with a peer on every network it can
+    /// reach tries as soon as it loses one.
+    ///
+    /// The address is drawn as every automatic one is
+    /// ([`Self::automatic_dial_order`], [`Self::automatic_dial_may_take`],
+    /// and one peer per network group), from that network's entries alone,
+    /// as Core's `Select(false, {*preferred_net})`.
+    fn reserve_extra_network_peer(
+        self: &Arc<Self>,
+        now: Instant,
+    ) -> Option<(PeerAddr, crate::net::reachable::Network, DialSlot)> {
+        if !self.automatic_outbound.load(Ordering::Relaxed) || self.automatic_outbound_target() != MAX_OUTBOUND {
+            return None;
+        }
+        if now <= *self.next_extra_network_peer.lock() {
+            return None;
+        }
+        let slot = self.reserve_dial(DialBudget::ExtraNetwork).ok()?;
+        let mut rng = rand::thread_rng();
+        let net = self.pick_network_without_peer(&mut rng)?;
+        *self.next_extra_network_peer.lock() = next_extra_network_peer_after(now);
+
+        let reachable = *self.reachable.read();
+        let recent = now.checked_sub(RECENT_TRY_WINDOW);
+        let tried_recently =
+            |c: &DialCandidate| recent.is_some_and(|since| self.tried_since(&c.addr, since));
+        let (tip_depth, restore_pending) = self.desirable_services_inputs();
+        let groups = self.outbound_netgroups();
+        let candidates =
+            self.automatic_dial_order(&mut rng).filter(|c| addr_network(&reachable, &c.addr) == Some(net));
+        let mut chosen = None;
+        pass_over_recent_tries(candidates, tried_recently, |c, tries| {
+            if !self.automatic_dial_may_take(&c, tries, now, tip_depth, restore_pending) {
+                return Ok(false);
+            }
+            if let PeerAddr::Socket(sa) = &c.addr
+                && self.outbound_netgroup(sa.ip()).is_some_and(|g| groups.contains(&g))
+            {
+                return Ok(false);
+            }
+            chosen = Some(c.addr);
+            Err(())
+        });
+        chosen.map(|target| (target, net, slot))
+    }
+
+    /// A reachable network the node holds no manual or full-relay outbound
+    /// connection on, connected or in the handshake, and the address book
+    /// has an entry on: Core's `MaybePickPreferredNetwork` (v31.1
+    /// `src/net.cpp:2512`), the networks tried in a random order. IPv4,
+    /// IPv6 and onion only: satd has no I2P or CJDNS transport, and dials
+    /// neither automatically.
+    fn pick_network_without_peer(&self, rng: &mut impl rand::Rng) -> Option<crate::net::reachable::Network> {
+        use crate::net::reachable::Network;
+        use rand::seq::SliceRandom as _;
+        let reachable = *self.reachable.read();
+        let held: HashSet<Network> = self
+            .peers
+            .read()
+            .values()
+            .filter(|h| {
+                matches!(h.info.conn_type, ConnType::Manual | ConnType::OutboundFullRelay)
+                    && h.info.state != PeerState::Disconnected
+            })
+            .filter_map(|h| {
+                let addr = match &h.info.onion_host {
+                    Some(host) => PeerAddr::Onion { host: host.clone(), port: h.info.addr.port() },
+                    None => PeerAddr::Socket(h.info.addr),
+                };
+                addr_network(&reachable, &addr)
+            })
+            .collect();
+        let mut nets = [Network::Ipv4, Network::Ipv6, Network::Onion];
+        nets.shuffle(rng);
+        let wanted: Vec<Network> =
+            nets.into_iter().filter(|n| !held.contains(n) && self.network_reachable(*n)).collect();
+        if wanted.is_empty() {
+            return None;
+        }
+        let book = self.addrman.read();
+        wanted
+            .into_iter()
+            .find(|n| book.iter().any(|e| addr_network(&reachable, &e.addr) == Some(*n)))
     }
 
     /// Settle the promotions waiting on a taken tried slot, as Core's
@@ -5298,25 +5484,42 @@ impl PeerManager {
             self.automatic_dial_order(&mut rng),
             tried_recently,
             |c, tries| {
-                let target = c.addr;
-                if self.is_manual_target(&target)
-                    || !self.may_dial(&target)
-                    || self.is_peer_addr_banned(&target)
-                    || !self.redial_due(&target, now)
-                {
+                if !self.automatic_dial_may_take(&c, tries, now, tip_depth, restore_pending) {
                     return Ok(false);
                 }
-                let services = ServiceFlags::from(c.services);
-                if missing_desirable_services(services, tip_depth, restore_pending).is_some() {
-                    return Ok(false);
-                }
-                if tries < BAD_PORT_SKIPS && crate::net::is_bad_port(target.port()) {
-                    return Ok(false);
-                }
-                take(target)
+                take(c.addr)
             },
         );
         dials
+    }
+
+    /// Whether an automatic full-relay dial may take `c`, the `tries`-th
+    /// candidate its pass has looked at since its last dial: what
+    /// [`Self::reserve_automatic_dials`] checks before the network group.
+    /// Not a peer the operator named, an address it may not dial, a banned
+    /// one, or one connected, being dialled or backing off; the desirable
+    /// services; and a bad port until [`BAD_PORT_SKIPS`] candidates.
+    fn automatic_dial_may_take(
+        &self,
+        c: &DialCandidate,
+        tries: usize,
+        now: Instant,
+        tip_depth: u64,
+        restore_pending: bool,
+    ) -> bool {
+        let target = &c.addr;
+        if self.is_manual_target(target)
+            || !self.may_dial(target)
+            || self.is_peer_addr_banned(target)
+            || !self.redial_due(target, now)
+        {
+            return false;
+        }
+        let services = ServiceFlags::from(c.services);
+        if missing_desirable_services(services, tip_depth, restore_pending).is_some() {
+            return false;
+        }
+        !(tries < BAD_PORT_SKIPS && crate::net::is_bad_port(target.port()))
     }
 
     /// The address book's entries in the order an automatic pass tries

@@ -203,7 +203,7 @@ async fn settle(pm: &PeerManager) {
     loop {
         let in_flight = {
             let d = pm.dials_in_flight.lock();
-            d.automatic + d.added_node
+            d.automatic + d.added_node + d.extra_network
         };
         if in_flight == 0 && pm.pending_connections.read().is_empty() && pm.pending_onion_dials.read().is_empty() {
             break;
@@ -1286,4 +1286,168 @@ async fn a_failed_feeler_counts_an_attempt() {
     assert_eq!(entry.attempts, 1);
     assert!(!pm.addrman.read().is_tried(&closed.into()));
     assert!(pm.pending_typed_dials.read().is_empty(), "the grant went back");
+}
+
+// ---- An extra peer for a network with none (#1156) ----
+
+/// Make the extra-network timer due.
+fn extra_network_due(pm: &PeerManager) {
+    *pm.next_extra_network_peer.lock() = Instant::now() - Duration::from_secs(1);
+}
+
+/// The address an extra-network peer would be dialled at now, the timer
+/// made due first. The slot goes back at the end of this call.
+fn extra_network_target(pm: &Arc<PeerManager>) -> Option<PeerAddr> {
+    extra_network_due(pm);
+    pm.reserve_extra_network_peer(Instant::now()).map(|(target, _net, _slot)| target)
+}
+
+/// `n` connected full-relay IPv4 peers, each in a public /16 of its own
+/// (`fill_automatic`'s documentation range is on no network), ids from 2000.
+fn fill_ipv4(pm: &PeerManager, n: usize) {
+    for i in 0..n {
+        let addr = SocketAddr::from(([60 + i as u8, 1, 0, 1], 8333));
+        add_peer(pm, peer(2000 + i as PeerId, addr, Direction::Outbound));
+    }
+}
+
+/// #1156: with IPv4 and onion reachable, eight IPv4 peers and both kinds
+/// of address in the book, the extra peer goes to an onion, every time, as
+/// Core's `MaybePickPreferredNetwork` picks the network without a peer.
+#[test]
+fn an_extra_peer_goes_to_the_reachable_network_with_none() {
+    let (pm, _dir) = mk_pm_tor();
+    leave_ibd(&pm);
+    fill_ipv4(&pm, MAX_OUTBOUND);
+    learn(&pm, SocketAddr::from(([44, 1, 2, 3], 8333)));
+    learn(&pm, SocketAddr::from(([45, 1, 2, 3], 8333)));
+    let host = onion_host(1);
+    learn_onion(&pm, &host, 8333);
+    for _ in 0..20 {
+        assert_eq!(extra_network_target(&pm), Some(PeerAddr::Onion { host: host.clone(), port: 8333 }));
+    }
+    let now = Instant::now();
+    assert!(*pm.next_extra_network_peer.lock() > now - Duration::from_millis(100), "the timer is set again");
+    assert!(pm.reserve_extra_network_peer(now).is_none(), "not due again yet");
+}
+
+/// No network lacks a peer, or the book has nothing on the one that does:
+/// no extra peer, and the timer is left due, as Core checks
+/// `MaybePickPreferredNetwork` last.
+#[test]
+fn no_extra_peer_without_a_network_to_reach() {
+    let (pm, _dir) = mk_pm_tor();
+    leave_ibd(&pm);
+    fill_ipv4(&pm, MAX_OUTBOUND);
+    learn(&pm, SocketAddr::from(([44, 1, 2, 3], 8333)));
+    extra_network_due(&pm);
+    let due = *pm.next_extra_network_peer.lock();
+    assert_eq!(pm.reserve_extra_network_peer(Instant::now()).map(|(t, _, _)| t), None, "no onion or IPv6 in the book");
+    assert_eq!(*pm.next_extra_network_peer.lock(), due, "the timer stays due");
+
+    // An onion peer held, and an onion in the book: every network has one.
+    let mut onion = peer(3000, SocketAddr::from(([0, 0, 0, 0], 8333)), Direction::Outbound);
+    onion.onion_host = Some(onion_host(2));
+    add_peer(&pm, onion);
+    learn_onion(&pm, &onion_host(3), 8333);
+    assert_eq!(extra_network_target(&pm), None, "an onion peer is already held");
+}
+
+/// Without a proxy, onions are not reachable, and an onion in the book
+/// draws no extra peer.
+#[test]
+fn an_unreachable_network_draws_no_extra_peer() {
+    let (pm, _dir) = mk_pm();
+    leave_ibd(&pm);
+    fill_ipv4(&pm, MAX_OUTBOUND);
+    learn_onion(&pm, &onion_host(1), 8333);
+    assert_eq!(extra_network_target(&pm), None);
+}
+
+/// Nothing extra below the full-relay target, above it (an extra peer
+/// already open), during IBD, or with `-maxconnections` below 8, as Core
+/// opens one only at `MAX_OUTBOUND_FULL_RELAY_CONNECTIONS` exactly.
+#[test]
+fn no_extra_peer_off_the_full_relay_target() {
+    let (pm, _dir) = mk_pm_tor();
+    leave_ibd(&pm);
+    learn_onion(&pm, &onion_host(1), 8333);
+    fill_ipv4(&pm, MAX_OUTBOUND - 1);
+    assert_eq!(extra_network_target(&pm), None, "below the target");
+    // A dial in flight brings the count to the target.
+    let slot = pm.reserve_dial(DialBudget::Automatic).unwrap();
+    assert!(extra_network_target(&pm).is_some(), "at the target, the dial in flight counted");
+    drop(slot);
+
+    fill_ipv4(&pm, MAX_OUTBOUND + 1);
+    assert_eq!(extra_network_target(&pm), None, "above the target");
+
+    let (pm, _dir) = mk_pm_tor();
+    learn_onion(&pm, &onion_host(1), 8333);
+    fill_ipv4(&pm, MAX_OUTBOUND);
+    pm.headers_tip.store(1000, Ordering::Relaxed);
+    assert!(pm.is_ibd(), "fixture: in IBD");
+    assert_eq!(extra_network_target(&pm), None, "during IBD");
+
+    let (pm, _dir) = mk_pm_tor();
+    leave_ibd(&pm);
+    learn_onion(&pm, &onion_host(1), 8333);
+    fill_ipv4(&pm, 6);
+    pm.set_max_connections(6);
+    assert_eq!(extra_network_target(&pm), None, "-maxconnections below 8");
+}
+
+/// One extra dial at a time: a second waits for the first to end.
+#[test]
+fn one_extra_network_dial_at_a_time() {
+    let (pm, _dir) = mk_pm_tor();
+    leave_ibd(&pm);
+    fill_ipv4(&pm, MAX_OUTBOUND);
+    learn_onion(&pm, &onion_host(1), 8333);
+    learn_onion(&pm, &onion_host(2), 8333);
+    extra_network_due(&pm);
+    let first = pm.reserve_extra_network_peer(Instant::now()).expect("the first extra dial");
+    assert_eq!(extra_network_target(&pm), None, "the first is in flight");
+    drop(first);
+    assert!(extra_network_target(&pm).is_some());
+}
+
+/// The extra peer, once connected, is the only one on its network and
+/// survives the surplus eviction; an IPv4 peer goes instead, though the new
+/// peer has announced no block.
+#[test]
+fn the_extra_peer_survives_eviction_as_the_only_one_on_its_network() {
+    let (pm, _dir) = mk_pm_tor();
+    leave_ibd(&pm);
+    for i in 0..MAX_OUTBOUND {
+        let mut info = peer(2000 + i as PeerId, SocketAddr::from(([60 + i as u8, 1, 0, 1], 8333)), Direction::Outbound);
+        info.last_block_announcement = 1000 + i as u64;
+        info.conn_time -= Duration::from_secs(60);
+        add_peer(&pm, info);
+    }
+    let mut onion = peer(3000, SocketAddr::from(([0, 0, 0, 0], 8333)), Direction::Outbound);
+    onion.onion_host = Some(onion_host(1));
+    onion.last_block_announcement = 0;
+    onion.conn_time -= Duration::from_secs(60);
+    add_peer(&pm, onion);
+    assert_eq!(pm.evict_extra_outbound_peer(), Some(2000), "the oldest IPv4 announcement");
+    assert!(pm.peers.read().contains_key(&3000));
+    assert_eq!(pm.evict_extra_outbound_peer(), None, "back at the target");
+}
+
+/// The reconnect loop opens the extra peer: an onion dial, which fails at
+/// once here and leaves its backoff, the trace of a dial attempted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_reconnect_loop_dials_the_extra_peer() {
+    let (pm, _dir) = mk_pm_tor();
+    leave_ibd(&pm);
+    fill_ipv4(&pm, MAX_OUTBOUND);
+    let host = onion_host(1);
+    learn_onion(&pm, &host, 8333);
+    extra_network_due(&pm);
+    pm.reconnect_tick();
+    let key = format!("{host}:8333");
+    wait_for(&pm, || pm.onion_reconnect_backoff.read().contains_key(&key), "the onion is dialled").await;
+    settle(&pm).await;
+    assert_eq!(pm.dials_in_flight.lock().extra_network, 0, "the slot went back");
 }
