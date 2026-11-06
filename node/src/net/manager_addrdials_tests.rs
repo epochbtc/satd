@@ -1353,8 +1353,8 @@ fn no_extra_peer_without_a_network_to_reach() {
     assert_eq!(extra_network_target(&pm), None, "an onion peer is already held");
 }
 
-/// Without a proxy, onions are not reachable, and an onion in the book
-/// draws no extra peer.
+/// Without a proxy, onions are not reachable: an onion in the book is not
+/// picked, and never takes the turn of a reachable network without a peer.
 #[test]
 fn an_unreachable_network_draws_no_extra_peer() {
     let (pm, _dir) = mk_pm();
@@ -1362,6 +1362,11 @@ fn an_unreachable_network_draws_no_extra_peer() {
     fill_ipv4(&pm, MAX_OUTBOUND);
     learn_onion(&pm, &onion_host(1), 8333);
     assert_eq!(extra_network_target(&pm), None);
+    let v6: SocketAddr = "[2001:4860::1]:8333".parse().unwrap();
+    learn(&pm, v6);
+    for _ in 0..20 {
+        assert_eq!(extra_network_target(&pm), Some(v6.into()));
+    }
 }
 
 /// Nothing extra below the full-relay target, above it (an extra peer

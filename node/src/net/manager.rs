@@ -3684,9 +3684,7 @@ impl PeerManager {
                 in_flight.added_node += 1;
             }
             DialBudget::ExtraNetwork => {
-                if in_flight.extra_network > 0 {
-                    return Err("an extra network peer is already being dialled".to_string());
-                }
+                // A dial in flight counts, so this also keeps it to one.
                 if self.full_relay_open(&in_flight) != MAX_OUTBOUND {
                     return Err("the full-relay target is not met exactly".to_string());
                 }
