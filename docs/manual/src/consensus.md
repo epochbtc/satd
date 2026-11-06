@@ -38,8 +38,8 @@ signet and testnet4 for months, again with no divergence.
 The two engines verify at about the same speed. Signature checks dominate the
 cost, and both use libsecp256k1 for them. On the benchmarks in
 `consensus/benches`, which verify the same inputs with both engines on one
-thread, they are within a few percent of each other on real mainnet inputs,
-legacy, SegWit v0 and Taproot alike.
+thread, they are within a few percent of each other on every input of
+mainnet block 300,000 and on the SegWit v0 and Taproot cases.
 
 Both engines hash a transaction's signature data once and reuse it for every
 input, as Core's own `CheckInputScripts` does. (Up to 0.7.x the C++ engine was
