@@ -16,6 +16,7 @@ written up in full in the in-development
 [`docs/release-notes/0.8.0-pre.md`](docs/release-notes/0.8.0-pre.md).
 It includes every fix shipped in 0.7.1:
 
+- Consensus: `-consensus` defaults to `cpp-shadow`, the Rust engine deciding and Core's interpreter checking it; `rust-shadow` keeps the old order.
 - RPC: any request `Content-Type` is read as JSON, as in Core (#824).
 - RPC: `getrawtransaction`'s not-found message matches the node's `-txindex` state (#1066).
 - RPC: `testmempoolaccept` forgives a standardness failure an `allow` policy rule forgives, as `sendrawtransaction` does (#999).

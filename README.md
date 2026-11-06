@@ -50,7 +50,7 @@ satd is built with these priorities in mind:
 ## Features
 
 ### Consensus & Network
-*   **Dual Consensus Engine:** A complete, independently written Rust consensus engine that passes the full Bitcoin Core test suite, with Bitcoin Core's own C++ script interpreter (through `libbitcoinkernel`) as the conservative primary and runtime script-level shadow validation between the two. Shadow verification has zero wall clock cost in most cases because it's performed async and non-blocking on the critical path. Validated from genesis to tip on mainnet, signet and testnet4 to date.
+*   **Dual Consensus Engine:** A complete, independently written Rust consensus engine that passes the full Bitcoin Core test suite, and Bitcoin Core's own C++ script interpreter (through `libbitcoinkernel`), with runtime script-level shadow validation between the two. The Rust engine decides by default and the C++ engine checks it; `-consensus=rust-shadow` puts Core's interpreter first. Shadow verification has zero wall clock cost in most cases because it's performed async and non-blocking on the critical path. Validated from genesis to tip on mainnet, signet and testnet4 to date.
 *   **Differential Block-Acceptance Testing:** Beyond script verification, the full block-acceptance pipeline (PoW, merkle/witness commitments, sigops, BIP 34, value conservation, maturity, timestamps, locktime/BIP 68) is checked against Core by static fixtures ported from Core's own tests and a generative fuzzer that dual-submits adversarial blocks to `satd` and a live `bitcoind`.
 *   **Swarm-Style IBD:** BitTorrent-like parallel block downloading and speculative verification pipeline for heavily optimized Initial Block Download.
 *   **Full P2P:** BIP 152 compact blocks, ban scoring, addrv2, BIP 324 v2 encrypted transport (`-v2transport`, on by default; opt-in `-v2only` anti-surveillance mode), Tor v3 (hardcoded `.onion` seeds), SOCKS5 `-proxy`.
@@ -183,7 +183,7 @@ esplora-handlers/             Native Esplora-compatible REST
 electrum-proto/               Native Electrum protocol server (vendored from electrs)
 events/                       Event-bus sinks (gRPC + ZMQ)
 mcp/                          MCP tools over the ops-surface RPCs
-consensus/                    Rust script-verifier shadow
+consensus/                    Rust script verifier (the default primary engine)
 block-analyzer/               Standalone tool for offline block analysis
 docs/                         API + integration docs
 ```

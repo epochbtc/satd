@@ -59,8 +59,9 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 rocksdb = { version = "0.24", default-features = false, features = ["zstd", "lz4"] }
 hex = "0.4"
 bincode = "1"
-# Bitcoin Core's script interpreter through libbitcoinkernel's C API, the
-# authoritative engine under the default `-consensus=rust-shadow`. Pinned
+# Bitcoin Core's script interpreter through libbitcoinkernel's C API: the
+# shadow engine under the default `-consensus=cpp-shadow`, authoritative under
+# `rust-shadow` and `cpp`. Pinned
 # exactly: the bindings are 0.x and change their API between minor versions,
 # and the sys crate's bundled Core source is the consensus code we run.
 # Building it needs cmake and the Boost headers (>= 1.74).

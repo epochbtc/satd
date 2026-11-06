@@ -507,7 +507,7 @@ The check has two tiers:
   BIP 34 height, lock times and sequence locks, the coinbase value, the witness
   commitment, and inputs that are missing or already spent.
 - **Full**, which adds the scripts, run through the same verifier the node
-  connects blocks with (under `-consensus=cpp-shadow`, the shadow comparison
+  connects blocks with (under the default `-consensus=cpp-shadow`, the shadow comparison
   included). It runs in the background, never delaying work: for each new tip,
   and at most every two minutes while the tip stands still. It costs about as
   much as connecting a block, since satd has no script-execution cache: a few
