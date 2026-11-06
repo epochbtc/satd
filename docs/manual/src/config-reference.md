@@ -380,7 +380,7 @@ startup error.
 | `compactionintervalsecs` | 1800 (`0` disables) | restart | satd | Periodic forced-compaction interval in seconds. |
 | `compactionl0at` | 16 | restart | satd | Force chainstate compaction when L0 SST count ≥ N. |
 | `ibdl0pauseat` | 64 (`0` disables) | restart | satd | Pause the IBD connector when chainstate L0 SST count ≥ N. |
-| `stallwatchdogsecs` | 300 (`0` disables) | restart | satd | Stall-watchdog forensic-dump threshold (seconds without tip advance). |
+| `stallwatchdogsecs` | 300 (`0` disables) | restart | satd | Stall-watchdog forensic-dump threshold (seconds without tip advance, connector progress or script inputs verified). |
 | `stallabortsecs` | 300 | restart | satd | Additional grace after the forensics dump before `abort()`. |
 | `shadowqueuesize` | 4194304 | restart | satd | Shadow-verification queue capacity. |
 | `shadowqueuemb` | 128 (`0` disables) | restart | satd | Memory the shadow-verification queue may hold, in MiB; work past it is dropped. |
