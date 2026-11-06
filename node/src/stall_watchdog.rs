@@ -69,10 +69,11 @@ use std::time::{Duration, Instant};
 ///   independent of whether a block was processed on this tick.
 ///
 /// A third, process-wide counter,
-/// [`crate::validation::script::script_inputs_verified`], counts script
-/// inputs verified. It keeps moving while one heavy block holds the
-/// connector in script verification and blocks the manager loop with it
-/// (#1216).
+/// [`crate::validation::script::script_inputs_verified`], counts the
+/// script inputs the connect path has verified. It keeps moving while
+/// one heavy block holds the connector in script verification and blocks
+/// the manager loop with it (#1216). Mempool admission, prefetch and the
+/// shadow engine do not count, so they cannot hide a wedged connector.
 ///
 /// The watchdog resets its stall timer whenever *any* counter advances,
 /// so a stall is only reported when **all** have been silent for the
@@ -580,9 +581,10 @@ mod tests {
         };
         let spent = [TxOut { value: Amount::from_sat(5000), script_pubkey: op_true }];
         let before = progress(&cs);
-        ConsensusVerifier::new(bitcoin::Network::Regtest)
-            .verify_transaction(&tx, &spent, 200)
-            .expect("anyone-can-spend input verifies");
+        crate::validation::script::counting_progress(|| {
+            ConsensusVerifier::new(bitcoin::Network::Regtest).verify_transaction(&tx, &spent, 200)
+        })
+        .expect("anyone-can-spend input verifies");
         let after = progress(&cs);
         assert_eq!(after[..2], before[..2], "no block connected, manager loop idle");
         assert_ne!(after, before, "the verified input is progress");

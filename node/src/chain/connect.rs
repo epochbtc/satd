@@ -1185,8 +1185,9 @@ fn connect_block_inner(params: &ConnectParams) -> Result<StoreBatch, ConnectErro
                 if i.is_multiple_of(INTERRUPT_EVERY) && interrupted() {
                     return Err(ConnectError::Interrupted);
                 }
-                script_verifier
-                    .verify_transaction(tx, prev_outputs, height)
+                crate::validation::script::counting_progress(|| {
+                    script_verifier.verify_transaction(tx, prev_outputs, height)
+                })
                     // `reason()`, not the whole error: Core's
                     // `block-script-verify-flag-failed (...)` carries the
                     // bare script error, and the input it failed on is
@@ -1210,9 +1211,9 @@ fn connect_block_inner(params: &ConnectParams) -> Result<StoreBatch, ConnectErro
                                     errs.push(ConnectError::Interrupted);
                                     break;
                                 }
-                                if let Err(e) = script_verifier
-                                    .verify_transaction(tx, prev_outputs, height)
-                                {
+                                if let Err(e) = crate::validation::script::counting_progress(|| {
+                                    script_verifier.verify_transaction(tx, prev_outputs, height)
+                                }) {
                                     errs.push(ConnectError::ScriptFailed(
                                         e.reason().to_string(),
                                     ));
