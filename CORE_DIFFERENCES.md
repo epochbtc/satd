@@ -101,7 +101,8 @@ expect Core's peer set to carry over.
 a fixed `bucket/position` slot of its new or tried table, and
 `getrawaddrman` reports those slots. satd's tried table is Core's: each
 tried entry is stored at the slot Core's formulas give it (`GetTriedBucket`,
-`GetBucketPosition`), with Core's collision handling and test-before-evict,
+`GetBucketPosition`), with Core's collision handling and test-before-evict
+(the incumbent tested by a feeler, as in Core),
 under a random key kept in `peers.dat`. Its new table is a flat map with a
 per-group cap, so a new entry's slot is *derived* from `GetNewBucket` and
 `GetBucketPosition`, and a collision there moves to the next free slot

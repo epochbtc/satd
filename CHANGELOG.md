@@ -33,6 +33,7 @@ It includes every fix shipped in 0.7.1:
 - P2P: a `headers` message is accepted on a thread of its own, so a batch waiting for a block connect no longer stops peer handling (#1187).
 - P2P: automatic outbound dials draw from the whole address book with Core's odds, and skip a candidate on a bad port or without the needed services before dialling it (#1148).
 - P2P: onion addresses learned from gossip go in the address book with the rest, so `peers.dat` keeps them across a restart and they are tried and evicted like any address; `peers.dat` moves to format version 3 (#1157).
+- P2P: the node opens feeler connections, as Core does, about every two minutes once its outbound slots are full, to test new addresses and the tried-table incumbent a newcomer would evict (#1149).
 - P2P: `.onion` fixed seeds for testnet4 and testnet3, and refreshed ones for mainnet and signet, from Core v31.2's lists, so a Tor-only node can bootstrap on every network (#1162).
 - Config: `reindex=1` and `reindexchainstate=1` in `bitcoin.conf` are honoured, as in Core, instead of accepted and ignored (#840).
 - Operator: the shadow verification queue is bounded by memory, `-shadowqueuemb` (default 128 MiB), as well as by entry count (#1145).

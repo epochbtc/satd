@@ -178,6 +178,22 @@ fn pass_over_recent_tries<T>(
 /// bad port ([`crate::net::is_bad_port`]): Core's 50.
 const BAD_PORT_SKIPS: usize = 50;
 
+/// The mean time between two feeler connections: Core's `FEELER_INTERVAL`
+/// (v31.1 `src/net.h:61`), the mean of an exponential timer.
+const FEELER_INTERVAL: Duration = Duration::from_secs(2 * 60);
+
+/// The longest a feeler waits before it dials, a random time up to this:
+/// Core's `FEELER_SLEEP_WINDOW` (`src/net.cpp:88`), so that nodes do not
+/// fall in step.
+const FEELER_SLEEP_WINDOW: Duration = Duration::from_secs(1);
+
+/// When the next feeler is due, from `now`: an exponentially distributed
+/// wait with mean [`FEELER_INTERVAL`], as Core's `rand_exp_duration`.
+fn next_feeler_after(now: Instant) -> Instant {
+    let mean = FEELER_INTERVAL.as_micros() as u64;
+    now + Duration::from_micros(crate::net::tx_relay::exp_delay(mean))
+}
+
 /// A peer the operator named (`-addnode`, `addnode add`, or a `-connect`
 /// host name), with the address it currently resolves to.
 #[derive(Debug, Clone)]
@@ -1213,6 +1229,9 @@ pub struct PeerManager {
     /// transport handshake so the per-type limits are limits rather than
     /// suggestions; see `check_outbound_limit_for`.
     pending_typed_dials: RwLock<Vec<ConnType>>,
+    /// When the reconnect loop may open its next feeler
+    /// ([`PeerManager::reserve_feeler`]): Core's `next_feeler`.
+    next_feeler: parking_lot::Mutex<Instant>,
     /// The peers the operator named: every `-addnode` / `addnode add`
     /// entry, plus each `-connect` entry given as a host name. Keeps the
     /// string the operator typed (what `getaddednodeinfo` reports, matching
@@ -1653,6 +1672,14 @@ impl PeerManager {
             manual_addrs: RwLock::new(HashSet::new()),
             manual_onion_hosts: RwLock::new(HashSet::new()),
             pending_typed_dials: RwLock::new(Vec::new()),
+            // A unit test ticks the reconnect loop at will and must not
+            // meet a feeler it did not ask for; the feeler tests set the
+            // timer themselves.
+            next_feeler: parking_lot::Mutex::new(if cfg!(test) {
+                Instant::now() + Duration::from_secs(365 * 24 * 3600)
+            } else {
+                next_feeler_after(Instant::now())
+            }),
             addnode_entries: RwLock::new(Vec::new()),
             refreshing_manual_targets: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
@@ -3484,18 +3511,29 @@ impl PeerManager {
 
     /// Outbound peers that count against the automatic target: every one
     /// but the manual connections, which Core counts apart (`semAddnode`,
-    /// or no limit at all), and NAP pulls, which take no outbound slot;
-    /// connected or still in the handshake.
+    /// or no limit at all), NAP pulls, which take no outbound slot, and
+    /// feelers, which have a slot of their own (Core's `m_max_feeler` in the
+    /// size of `semOutbound`); connected or still in the handshake.
     fn automatic_outbound_peers(&self) -> usize {
         self.peers
             .read()
             .values()
             .filter(|h| {
                 h.info.direction == Direction::Outbound
-                    && !matches!(h.info.conn_type, ConnType::Manual | ConnType::NapPull)
+                    && !matches!(h.info.conn_type, ConnType::Manual | ConnType::NapPull | ConnType::Feeler)
                     && h.info.state != PeerState::Disconnected
             })
             .count()
+    }
+
+    /// The automatic connections open or being opened, against the
+    /// automatic target: the peers [`Self::automatic_outbound_peers`]
+    /// counts, the reconnect loop's dials in flight, and `addconnection`'s
+    /// reservations but a feeler's.
+    fn automatic_open(&self, in_flight: &DialsInFlight) -> usize {
+        self.automatic_outbound_peers()
+            + in_flight.automatic
+            + self.pending_typed_dials.read().iter().filter(|t| **t != ConnType::Feeler).count()
     }
 
     /// The added nodes the operator listed, at the addresses they resolve to.
@@ -3570,10 +3608,7 @@ impl PeerManager {
         match budget {
             DialBudget::Automatic => {
                 // `addconnection`'s reservations take automatic slots too.
-                let open = self.automatic_outbound_peers()
-                    + in_flight.automatic
-                    + self.pending_typed_dials.read().len();
-                if open >= self.automatic_outbound_target() {
+                if self.automatic_open(&in_flight) >= self.automatic_outbound_target() {
                     return Err("max outbound connections reached".to_string());
                 }
                 in_flight.automatic += 1;
@@ -4975,6 +5010,104 @@ impl PeerManager {
         self.evict_extra_outbound_peer();
         self.resolve_tried_collisions();
         self.dial_automatic_peers(now);
+        self.open_feeler(now);
+    }
+
+    /// Open a feeler if one is due: [`Self::reserve_feeler`], then the dial,
+    /// after a random wait of up to [`FEELER_SLEEP_WINDOW`] as Core's. A
+    /// feeler that answers with its `version` is marked good there and
+    /// closed (`perform_handshake`); one that does not counts an attempt,
+    /// as every failed automatic dial does.
+    fn open_feeler(self: &Arc<Self>, now: Instant) {
+        let Some((target, grant)) = self.reserve_feeler(now) else {
+            return;
+        };
+        use rand::Rng as _;
+        let wait = rand::thread_rng().gen_range(Duration::ZERO..FEELER_SLEEP_WINDOW);
+        let pm = Arc::clone(self);
+        tokio::spawn(async move {
+            let _grant = grant;
+            tokio::time::sleep(wait).await;
+            tracing::debug!(%target, "Making feeler connection");
+            pm.dial_book_target(&target, Some(ConnType::Feeler), AUTOMATIC_RECONNECT_MAX_BACKOFF).await;
+        });
+    }
+
+    /// The address a feeler tests this pass, with its outbound grant, or
+    /// `None` if no feeler is due: Core's `FEELER` branch of
+    /// `ThreadOpenConnections` (v31.1 `src/net.cpp:2751`).
+    ///
+    /// A feeler is due only once the automatic target is met, dials in
+    /// flight counted, as Core checks its timer only after the full-relay
+    /// and block-relay-only targets (satd opens no automatic
+    /// block-relay-only peers, so the full-relay target is the one). Then
+    /// the timer, [`FEELER_INTERVAL`] on average, is set again whether or
+    /// not an address is found, as in Core. Not under `-connect`.
+    ///
+    /// The address is the incumbent of a promotion waiting on its tried
+    /// slot, if there is one (Core's `SelectTriedCollision`), or else one
+    /// drawn from the new table (`Select(true)`), with the odds
+    /// [`AddrEntry::chance`] gives it. A feeler skips what an automatic dial
+    /// skips (a peer the operator named, an unreachable or banned address,
+    /// one connected or being dialled, a recent try, a bad port) but for
+    /// two rules, as in Core: the network group of a peer already held is no
+    /// reason to skip, and it needs only the services that make the peer's
+    /// address book worth having, `NODE_NETWORK` or `NODE_NETWORK_LIMITED`
+    /// (`MayHaveUsefulAddressDB`), rather than every desirable one.
+    ///
+    /// The grant is a feeler's place in the outbound limit
+    /// ([`Self::check_outbound_limit_for`]), Core's `semOutbound` grant,
+    /// which takes no slot of the automatic target.
+    ///
+    /// [`AddrEntry::chance`]: crate::net::addrman::AddrEntry::chance
+    fn reserve_feeler(self: &Arc<Self>, now: Instant) -> Option<(PeerAddr, OwnedTypedDialGuard)> {
+        if !self.automatic_outbound.load(Ordering::Relaxed) {
+            return None;
+        }
+        if self.automatic_open(&self.dials_in_flight.lock()) < self.automatic_outbound_target() {
+            return None;
+        }
+        {
+            let mut next = self.next_feeler.lock();
+            if now <= *next {
+                return None;
+            }
+            *next = next_feeler_after(now);
+        }
+        {
+            let mut pending = self.pending_typed_dials.write();
+            if let Err(e) = self.check_outbound_limit_for(ConnType::Feeler, &pending) {
+                tracing::debug!("feeler not opened: {e}");
+                return None;
+            }
+            pending.push(ConnType::Feeler);
+        }
+        let grant = OwnedTypedDialGuard { pm: Arc::clone(self), conn_type: ConnType::Feeler };
+        let recent = now.checked_sub(RECENT_TRY_WINDOW);
+        let tried_recently =
+            |c: &DialCandidate| recent.is_some_and(|since| self.tried_since(&c.addr, since));
+        let useful = ServiceFlags::NETWORK | ServiceFlags::NETWORK_LIMITED;
+        let mut chosen = None;
+        let mut rng = rand::thread_rng();
+        pass_over_recent_tries(self.feeler_dial_order(&mut rng), tried_recently, |c, tries| {
+            let target = c.addr;
+            if self.is_manual_target(&target)
+                || !self.may_dial(&target)
+                || self.is_peer_addr_banned(&target)
+                || !self.redial_due(&target, now)
+            {
+                return Ok(false);
+            }
+            if c.services & useful.to_u64() == 0 {
+                return Ok(false);
+            }
+            if tries < BAD_PORT_SKIPS && crate::net::is_bad_port(target.port()) {
+                return Ok(false);
+            }
+            chosen = Some(target);
+            Err(())
+        });
+        chosen.map(|target| (target, grant))
     }
 
     /// Settle the promotions waiting on a taken tried slot, as Core's
@@ -5205,9 +5338,9 @@ impl PeerManager {
     /// group's entries share at most eight buckets, so its share of the
     /// tried draws is bounded by its buckets, not by how many entries it has.
     ///
-    /// The incumbent of a promotion waiting on its tried slot comes first,
-    /// for the dial to test it (Core's `SelectTriedCollision`, which Core
-    /// tests over a feeler; satd opens no feelers of its own).
+    /// The incumbent of a promotion waiting on its tried slot is drawn as
+    /// any other tried entry: a feeler tests it ([`Self::feeler_dial_order`]),
+    /// as in Core. Until satd opened feelers, it came first here.
     ///
     /// The book is read once, up front; the draws run on a copy.
     ///
@@ -5216,13 +5349,34 @@ impl PeerManager {
         &self,
         rng: &'r mut impl rand::Rng,
     ) -> impl Iterator<Item = DialCandidate> + 'r {
+        self.dial_order(false, rng)
+    }
+
+    /// The address book's entries in the order a feeler tries them: the
+    /// incumbent of a promotion waiting on its tried slot first (Core's
+    /// `SelectTriedCollision`), then the new table alone, drawn as
+    /// [`Self::automatic_dial_order`] draws from it (Core's `Select(true)`).
+    fn feeler_dial_order<'r>(
+        &self,
+        rng: &'r mut impl rand::Rng,
+    ) -> impl Iterator<Item = DialCandidate> + 'r {
+        self.dial_order(true, rng)
+    }
+
+    /// [`Self::automatic_dial_order`], or with `feeler` set
+    /// [`Self::feeler_dial_order`].
+    fn dial_order<'r>(
+        &self,
+        feeler: bool,
+        rng: &'r mut impl rand::Rng,
+    ) -> impl Iterator<Item = DialCandidate> + 'r {
         let now = now_unix_secs();
         let mut buckets: std::collections::BTreeMap<u64, Vec<(DialCandidate, f64)>> = Default::default();
         let mut new = Vec::new();
         let mut first = None;
         {
             let book = self.addrman.read();
-            let incumbent = book.select_tried_collision();
+            let incumbent = if feeler { book.select_tried_collision() } else { None };
             for e in book.iter() {
                 let candidate = DialCandidate { addr: e.addr.clone(), services: e.services };
                 if incumbent.as_ref() == Some(&e.addr) {
@@ -5231,6 +5385,7 @@ impl PeerManager {
                 }
                 let chance = e.chance(now);
                 match book.tried_bucket(&e.addr) {
+                    Some(_) if feeler => {}
                     Some(b) => buckets.entry(b).or_default().push((candidate, chance)),
                     None => new.push((candidate, chance)),
                 }
@@ -5474,51 +5629,58 @@ impl PeerManager {
         let pm = Arc::clone(self);
         tokio::spawn(async move {
             let _slot = slot;
-            let result = match &target {
-                PeerAddr::Socket(sa) => pm.connect_outbound_inner(*sa, None, None, false).await,
-                PeerAddr::Onion { host, port } => {
-                    pm.connect_outbound_onion_inner(host, *port, None, false).await
-                }
-            };
-            if let Err(e) = &result {
-                tracing::debug!(%target, "Reconnect failed: {e}");
-                // What makes an address terrible, and so replaceable once
-                // the book is full (Core's `Attempt`).
-                pm.addrman.write().mark_attempt(&target, now_unix_secs());
-            }
-            let connected = result.is_ok();
-            let update = |state: &mut ReconnectState| {
-                state.last_try = Some(Instant::now());
-                if connected {
-                    state.reset();
-                } else {
-                    state.record_failure(max_backoff);
-                }
-            };
-            match &target {
-                // Not for an address that left both the book and the manual
-                // list while the dial ran (the book replaced it): its state
-                // would never go. Checked with the backoff map locked, so a
-                // replacement that removes the address's state either sees
-                // this entry (and removes it after) or has already taken the
-                // address out of the book (and this adds nothing). The
-                // replacement lets go of the book before it takes the
-                // backoff map, so this order cannot deadlock with it.
-                PeerAddr::Socket(sa) => {
-                    let mut backoff = pm.reconnect_backoff.write();
-                    if pm.addrman.read().contains(&target) || pm.manual_addrs.read().contains(sa) {
-                        update(backoff.entry(*sa).or_insert_with(ReconnectState::new));
-                    }
-                }
-                // Likewise for an onion, in the same order.
-                PeerAddr::Onion { .. } => {
-                    let mut backoff = pm.onion_reconnect_backoff.write();
-                    if pm.addrman.read().contains(&target) || pm.manual_onion_addrs.read().contains(&target) {
-                        update(backoff.entry(target.to_string()).or_insert_with(ReconnectState::new));
-                    }
-                }
-            }
+            pm.dial_book_target(&target, None, max_backoff).await;
         });
+    }
+
+    /// The dial behind [`Self::spawn_redial`], and a feeler's: `conn_type`
+    /// is `None` for a dial `spawn_peer` types, `Some(Feeler)` for a
+    /// feeler. The caller holds the dial's place in its limit.
+    async fn dial_book_target(self: &Arc<Self>, target: &PeerAddr, conn_type: Option<ConnType>, max_backoff: Duration) {
+        let result = match target {
+            PeerAddr::Socket(sa) => self.connect_outbound_inner(*sa, conn_type, None, false).await,
+            PeerAddr::Onion { host, port } => {
+                self.connect_outbound_onion_inner(host, *port, conn_type, false).await
+            }
+        };
+        if let Err(e) = &result {
+            tracing::debug!(%target, "Reconnect failed: {e}");
+            // What makes an address terrible, and so replaceable once
+            // the book is full (Core's `Attempt`).
+            self.addrman.write().mark_attempt(target, now_unix_secs());
+        }
+        let connected = result.is_ok();
+        let update = |state: &mut ReconnectState| {
+            state.last_try = Some(Instant::now());
+            if connected {
+                state.reset();
+            } else {
+                state.record_failure(max_backoff);
+            }
+        };
+        match target {
+            // Not for an address that left both the book and the manual
+            // list while the dial ran (the book replaced it): its state
+            // would never go. Checked with the backoff map locked, so a
+            // replacement that removes the address's state either sees
+            // this entry (and removes it after) or has already taken the
+            // address out of the book (and this adds nothing). The
+            // replacement lets go of the book before it takes the
+            // backoff map, so this order cannot deadlock with it.
+            PeerAddr::Socket(sa) => {
+                let mut backoff = self.reconnect_backoff.write();
+                if self.addrman.read().contains(target) || self.manual_addrs.read().contains(sa) {
+                    update(backoff.entry(*sa).or_insert_with(ReconnectState::new));
+                }
+            }
+            // Likewise for an onion, in the same order.
+            PeerAddr::Onion { .. } => {
+                let mut backoff = self.onion_reconnect_backoff.write();
+                if self.addrman.read().contains(target) || self.manual_onion_addrs.read().contains(target) {
+                    update(backoff.entry(target.to_string()).or_insert_with(ReconnectState::new));
+                }
+            }
+        }
     }
 
     /// Whether the node holds a connection to the book entry `addr` itself.
@@ -14772,6 +14934,15 @@ impl PeerManager {
                 // the handshake"), so the peer never enters the connected set
                 // and never reaches `getpeerinfo`.
                 if conn_type == ConnType::Feeler {
+                    // The answer moves the address to tried: Core marks every
+                    // outbound peer good on its `version` (`Good`, v31.1
+                    // `net_processing.cpp:3785`), a feeler before it is
+                    // dropped. The handle goes below, before the
+                    // `PeerConnected` that marks the others.
+                    let dialled = self.peers.read().get(&id).and_then(|h| Self::dialled_book_addr(&h.info));
+                    if let Some(addr) = dialled {
+                        self.addrman.write().mark_good(addr, now_unix_secs());
+                    }
                     tracing::debug!("feeler connection completed, disconnecting peer={id}");
                     // Drop the handle here rather than leaving it for the
                     // manager's next event drain. `is_addr_connected` counts
