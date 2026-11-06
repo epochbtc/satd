@@ -68,9 +68,15 @@ use std::time::{Duration, Instant};
 ///   the P2P manager's main loop (~500 ms). Tracks "the loop is alive"
 ///   independent of whether a block was processed on this tick.
 ///
-/// The watchdog resets its stall timer whenever *either* counter
-/// advances, so a stall is only reported when **both** have been silent
-/// for the full threshold. This keeps the 300 s default valid at
+/// A third, process-wide counter,
+/// [`crate::validation::script::script_inputs_verified`], counts script
+/// inputs verified. It keeps moving while one heavy block holds the
+/// connector in script verification and blocks the manager loop with it
+/// (#1216).
+///
+/// The watchdog resets its stall timer whenever *any* counter advances,
+/// so a stall is only reported when **all** have been silent for the
+/// full threshold. This keeps the 300 s default valid at
 /// mainnet tip (where `connect_heartbeat` is naturally idle between
 /// blocks) while still catching true wedges: a real lockup parks the
 /// manager loop and the connector together, so neither counter moves.
@@ -106,8 +112,7 @@ pub fn spawn_stall_watchdog(
                 "Stall watchdog started"
             );
             let poll = Duration::from_secs(15);
-            let mut last_seen_connect = chain_state.connect_heartbeat();
-            let mut last_seen_manager = chain_state.manager_heartbeat();
+            let mut last_seen = progress(&chain_state);
             let mut last_advance = Instant::now();
             let mut dumped_for_this_stall = false;
             let mut sigterm_sent = false;
@@ -116,18 +121,19 @@ pub fn spawn_stall_watchdog(
                     tracing::info!("Stall watchdog shutting down");
                     return;
                 }
-                let connect_hb = chain_state.connect_heartbeat();
-                let manager_hb = chain_state.manager_heartbeat();
-                // Reset the stall timer if *either* heartbeat advanced.
+                let now_seen = progress(&chain_state);
+                let [connect_hb, manager_hb, _] = now_seen;
+                // Reset the stall timer if *any* progress signal advanced.
                 // At mainnet tip `connect_hb` can stay flat for >10 min
                 // between blocks; `manager_hb` keeps ticking as long as
-                // the P2P loop and tokio runtime are alive. A true
-                // wedge parks both, which is what we want to detect.
-                let advanced =
-                    connect_hb != last_seen_connect || manager_hb != last_seen_manager;
-                if advanced {
-                    last_seen_connect = connect_hb;
-                    last_seen_manager = manager_hb;
+                // the P2P loop and tokio runtime are alive. Script inputs
+                // keep counting while one heavy block is verified: block
+                // 51,540 on testnet4 held the connector in `verify_join`
+                // for over 300 s with both heartbeats silent, and every
+                // restart came back to the same block (#1216). A true
+                // wedge parks all three, which is what we want to detect.
+                if now_seen != last_seen {
+                    last_seen = now_seen;
                     last_advance = Instant::now();
                     if dumped_for_this_stall {
                         tracing::info!(
@@ -185,6 +191,17 @@ pub fn spawn_stall_watchdog(
         })
         .expect("failed to spawn stall-watchdog thread");
     Some(handle)
+}
+
+/// The stall watchdog's progress signals: the connect heartbeat, the
+/// manager heartbeat and the script inputs verified. Any change in any of
+/// them is progress.
+fn progress(chain_state: &ChainState) -> [u64; 3] {
+    [
+        chain_state.connect_heartbeat(),
+        chain_state.manager_heartbeat(),
+        crate::validation::script::script_inputs_verified(),
+    ]
 }
 
 /// Raise `SIGTERM` to our own process so the main shutdown path (which
@@ -535,6 +552,40 @@ mod tests {
             1,
             "the joined threads must have released the chainstate"
         );
+        drop(cs);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Verifying script inputs counts as progress, so one heavy block that
+    /// holds the connector and the manager loop for minutes is not taken
+    /// for a wedge (#1216).
+    /// Perturbation: drop the inputs counter from `progress` and this fails.
+    #[test]
+    fn verifying_script_inputs_counts_as_progress() {
+        use bitcoin::hashes::Hash as _;
+        use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, TxIn, TxOut, Witness, absolute::LockTime, transaction};
+        use crate::validation::script::{ConsensusVerifier, ScriptVerifier};
+        let (cs, dir) = crate::chain::state::tests::make_chain_state();
+        let op_true = ScriptBuf::from_bytes(vec![0x51]);
+        let tx = bitcoin::Transaction {
+            version: transaction::Version(2),
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint { txid: bitcoin::Txid::from_byte_array([3; 32]), vout: 0 },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut { value: Amount::from_sat(1000), script_pubkey: op_true.clone() }],
+        };
+        let spent = [TxOut { value: Amount::from_sat(5000), script_pubkey: op_true }];
+        let before = progress(&cs);
+        ConsensusVerifier::new(bitcoin::Network::Regtest)
+            .verify_transaction(&tx, &spent, 200)
+            .expect("anyone-can-spend input verifies");
+        let after = progress(&cs);
+        assert_eq!(after[..2], before[..2], "no block connected, manager loop idle");
+        assert_ne!(after, before, "the verified input is progress");
         drop(cs);
         let _ = std::fs::remove_dir_all(&dir);
     }

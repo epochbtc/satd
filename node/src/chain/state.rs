@@ -76,12 +76,22 @@ pub fn default_assumevalid(network: Network, custom_signet: bool) -> AssumeValid
             )
         }
         Network::Testnet => {
-            // Testnet3 — no default yet
-            AssumeValid::Disabled
+            // Bitcoin Core's testnet3 default (height 4,842,348)
+            AssumeValid::Hash(
+                "000000007a61e4230b28ac5cb6b5e5a0130de37ac1faf2f8987d2fa6505b67f4"
+                    .parse()
+                    .unwrap(),
+            )
         }
         Network::Testnet4 => {
-            // Testnet4 — no default yet; validate everything
-            AssumeValid::Disabled
+            // Bitcoin Core's testnet4 default (height 123,613). Past block
+            // 51,540, whose 14,200 inputs a full script check could not
+            // get through without tripping the stall watchdog (#1216).
+            AssumeValid::Hash(
+                "0000000002368b1e4ee27e2e85676ae6f9f9e69579b29093e9a82c170bf7cf8a"
+                    .parse()
+                    .unwrap(),
+            )
         }
         Network::Regtest => {
             // Regtest has no meaningful default
@@ -23610,6 +23620,25 @@ pub(crate) mod tests {
         assert!(matches!(default_assumevalid(Network::Signet, true), AssumeValid::Disabled));
         // Only signet has a challenge to customise.
         assert!(matches!(default_assumevalid(Network::Bitcoin, true), AssumeValid::Hash(_)));
+    }
+
+    /// The testnets take Bitcoin Core's defaults. Without one, a fresh
+    /// testnet4 sync checks every script of block 51,540 and stalls (#1216).
+    #[test]
+    fn the_testnets_default_to_cores_assumevalid() {
+        let hash = |network| match default_assumevalid(network, false) {
+            AssumeValid::Hash(h) => h.to_string(),
+            other => panic!("{network:?}: expected a default hash, got {other:?}"),
+        };
+        assert_eq!(
+            hash(Network::Testnet4),
+            "0000000002368b1e4ee27e2e85676ae6f9f9e69579b29093e9a82c170bf7cf8a"
+        );
+        assert_eq!(
+            hash(Network::Testnet),
+            "000000007a61e4230b28ac5cb6b5e5a0130de37ac1faf2f8987d2fa6505b67f4"
+        );
+        assert!(matches!(default_assumevalid(Network::Regtest, false), AssumeValid::Disabled));
     }
 
     /// A default-signet `ChainState` with an empty database over `dir`'s
