@@ -11,9 +11,7 @@ layout) per [`STABILITY_POLICY.md`](STABILITY_POLICY.md).
 
 ## [Unreleased]
 
-Nothing yet — 0.7.1 was cut on 2026-11-03. On `release/0.7.x`, add a one-line bullet
-here for every user-facing change, and the full write-up to the next
-`docs/release-notes/<version>-pre.md` (bound for 0.7.2).
+- A fresh testnet4 sync no longer stops for good at block 51,540: testnet4 and testnet3 get Bitcoin Core's default `-assumevalid`, and the stall watchdog counts script inputs verified as progress, so one very large block is no longer taken for a wedge (#1216).
 
 ## Releases
 
