@@ -69,6 +69,7 @@ It includes every fix shipped in 0.7.1:
   hashing for every input. About 27x faster on a 3,373-input signet block,
   2.3x on a typical mainnet block (#874). Building from source now needs cmake
   and the Boost headers.
+- IBD: testnet4 and testnet3 get Bitcoin Core's default `-assumevalid`, and the stall watchdog counts the script inputs the connect path verifies as progress, so one very large block is no longer taken for a wedge; in 0.7.1 a fresh testnet4 sync stopped for good at block 51,540 (#1216).
 
 ## Releases
 

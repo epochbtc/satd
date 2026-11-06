@@ -1,4 +1,5 @@
 use bitcoin::{Network, Transaction, TxOut};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ScriptError {
@@ -355,6 +356,58 @@ pub fn verify_policy_scripts(tx: &Transaction, prev_outputs: &[TxOut]) -> Result
         .map_err(|(idx, e)| ScriptError::VerifyFailed { input: idx, reason: e.to_string() })
 }
 
+/// Script inputs the connect path has verified since startup.
+///
+/// The stall watchdog reads it as a progress signal (#1216). One
+/// transaction with thousands of inputs can keep the connector inside a
+/// single block's verification for minutes, with no block connected in
+/// the meantime, and the watchdog must not mistake that for a wedge.
+///
+/// Only verification run inside [`counting_progress`] is counted, which
+/// the connect path does for its own block. Mempool admission, block
+/// prefetch and the shadow engine verify outside it: a steady stream of
+/// relayed or submitted transactions must not keep a wedged connector
+/// looking alive.
+static SCRIPT_INPUTS_VERIFIED: AtomicU64 = AtomicU64::new(0);
+
+std::thread_local! {
+    /// Where this thread counts the inputs it verifies, if anywhere.
+    static PROGRESS_COUNTER: std::cell::Cell<Option<&'static AtomicU64>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Read [`SCRIPT_INPUTS_VERIFIED`]. Only its change over time matters.
+pub fn script_inputs_verified() -> u64 {
+    SCRIPT_INPUTS_VERIFIED.load(Ordering::Relaxed)
+}
+
+/// Run `f`, counting the script inputs it verifies on this thread into
+/// [`SCRIPT_INPUTS_VERIFIED`].
+pub fn counting_progress<R>(f: impl FnOnce() -> R) -> R {
+    counting_into(&SCRIPT_INPUTS_VERIFIED, f)
+}
+
+fn counting_into<R>(counter: &'static AtomicU64, f: impl FnOnce() -> R) -> R {
+    // Restores the previous target on drop, so a panic in `f` cannot leave
+    // this thread counting.
+    struct Restore(Option<&'static AtomicU64>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            PROGRESS_COUNTER.with(|c| c.set(self.0));
+        }
+    }
+    let _restore = Restore(PROGRESS_COUNTER.with(|c| c.replace(Some(counter))));
+    f()
+}
+
+fn count_inputs_verified(n: usize) {
+    PROGRESS_COUNTER.with(|c| {
+        if let Some(counter) = c.get() {
+            counter.fetch_add(n as u64, Ordering::Relaxed);
+        }
+    });
+}
+
 /// Script verifier backed by Bitcoin Core's script interpreter through
 /// libbitcoinkernel's C API. Supports all consensus rules including taproot.
 ///
@@ -449,7 +502,9 @@ impl ScriptVerifier for ConsensusVerifier {
         }
 
         let flags = script_verify_flags(self.network, height);
-        kernel_verify_transaction(tx, prev_outputs, flags)
+        kernel_verify_transaction(tx, prev_outputs, flags)?;
+        count_inputs_verified(tx.input.len());
+        Ok(())
     }
 
     fn name_failure(
@@ -567,7 +622,9 @@ impl ScriptVerifier for RustVerifier {
         // input, and shares a single SighashCache across inputs (BIP143
         // hashPrevouts / hashSequence / hashOutputs are tx-wide).
         consensus::verify_transaction(tx, prev_outputs, flags)
-            .map_err(|(idx, e)| ScriptError::VerifyFailed { input: idx, reason: e.to_string() })
+            .map_err(|(idx, e)| ScriptError::VerifyFailed { input: idx, reason: e.to_string() })?;
+        count_inputs_verified(tx.input.len());
+        Ok(())
     }
 
     fn primary_engine(&self) -> PrimaryEngine {
@@ -983,6 +1040,46 @@ mod tests {
         assert!(cpp.verify_transaction(&tx, std::slice::from_ref(&spent), 200).is_err(), "one short");
         assert!(cpp.verify_transaction(&tx, &[], 200).is_err(), "none at all");
         assert!(cpp.verify_transaction(&tx, &[spent.clone(), spent.clone(), spent], 200).is_err(), "one extra");
+    }
+
+    /// Both engines count every input they verify inside
+    /// `counting_progress`, which the stall watchdog reads as progress inside
+    /// a long block (#1216), and nothing outside it: mempool admission must
+    /// not keep a wedged connector looking alive. Each case counts into a
+    /// counter of its own, which no concurrent test touches.
+    /// Perturbation: drop either engine's count, or leave the scope set
+    /// after it ends, and an assertion fails.
+    #[test]
+    fn both_engines_count_the_inputs_they_verify() {
+        use bitcoin::hashes::Hash as _;
+        use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, TxIn, Witness, absolute::LockTime, transaction};
+        let op_true = ScriptBuf::from_bytes(vec![0x51]);
+        let input = |vout| TxIn {
+            previous_output: OutPoint { txid: bitcoin::Txid::from_byte_array([9; 32]), vout },
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::MAX,
+            witness: Witness::new(),
+        };
+        let tx = Transaction {
+            version: transaction::Version(2),
+            lock_time: LockTime::ZERO,
+            input: vec![input(0), input(1), input(2)],
+            output: vec![TxOut { value: Amount::from_sat(1000), script_pubkey: op_true.clone() }],
+        };
+        let spent = vec![TxOut { value: Amount::from_sat(5000), script_pubkey: op_true }; 3];
+        let engines: [(&str, Box<dyn ScriptVerifier>); 2] = [
+            ("cpp", Box::new(ConsensusVerifier::new(Network::Regtest))),
+            ("rust", Box::new(RustVerifier::new(Network::Regtest))),
+        ];
+        for (name, engine) in engines {
+            let counter: &'static AtomicU64 = Box::leak(Box::new(AtomicU64::new(0)));
+            counting_into(counter, || engine.verify_transaction(&tx, &spent, 200))
+                .expect("anyone-can-spend inputs verify");
+            assert_eq!(counter.load(Ordering::Relaxed), 3, "{name}: three inputs verified");
+            engine.verify_transaction(&tx, &spent, 200).expect("verifies again");
+            assert_eq!(counter.load(Ordering::Relaxed), 3, "{name}: outside the scope, nothing counts");
+            assert!(PROGRESS_COUNTER.with(|c| c.get()).is_none(), "{name}: the scope is restored");
+        }
     }
 
     // PrimaryEngine identifies the authoritative engine so prefetch can

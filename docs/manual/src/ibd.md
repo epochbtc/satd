@@ -126,7 +126,7 @@ accepts three forms. The third is a satd extension.
 
 | Value | Meaning | Compat |
 |---|---|---|
-| `-assumevalid=<blockhash>` | Skip script verification for that block's ancestors, under Core's conditions (below). A per-network default ships in the binary (for example, mainnet height 840,000), as in Core. | Core |
+| `-assumevalid=<blockhash>` | Skip script verification for that block's ancestors, under Core's conditions (below). A per-network default ships in the binary, as in Core: mainnet height 840,000, signet 218,000, and Core's own defaults for testnet4 (123,613) and testnet3 (4,842,348). | Core |
 | `-assumevalid=0` | Verify everything; no skipping. | Core |
 | `-assumevalid=all` | Skip script verification for blocks older than a cutoff age; verify recent and new blocks in full. The cutoff is `-assumevalidage` (default 86400 s, 24 h). | satd extension |
 
@@ -183,7 +183,7 @@ These flags bound or accelerate IBD. Full defaults and semantics are in the
 | `-rocksdbbackgroundjobs` / `-rocksdbsubcompactions` / `-rocksdbwalmb` | from profile | (satd) Advanced RocksDB overrides. |
 | `-compactionl0at=<n>` / `-ibdl0pauseat=<n>` | 16 / 64 | (satd) Force chainstate compaction at N L0 SST files; pause the IBD connector at N L0 files so compaction can catch up. |
 | `-compactionintervalsecs` / `-compactiondiagintervalsecs` | 1800 / 60 | (satd) Periodic forced compaction and pending-compaction diagnostics (`0` disables). |
-| `-stallwatchdogsecs` / `-stallabortsecs` | 300 / 300 | (satd) If the tip does not advance for N seconds, dump forensics, then abort after a further grace period. A silent IBD wedge becomes a loud, debuggable failure. |
+| `-stallwatchdogsecs` / `-stallabortsecs` | 300 / 300 | (satd) If the tip does not advance for N seconds, dump forensics, then abort after a further grace period. A silent IBD wedge becomes a loud, debuggable failure. Script verification that is still checking inputs counts as progress, so one very large block is not mistaken for a wedge. |
 
 `-dbcache`, `-prune`, `-txindex`, `-assumevalid`, and `-reindex` keep Core's
 names and meanings. The rest of the table is satd-specific tuning with no Core
