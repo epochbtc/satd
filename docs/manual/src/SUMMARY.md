@@ -11,6 +11,7 @@
 - [Observability & Metrics](observability.md)
 - [Configuration, Tuning & Reload](configuration.md)
 - [Transaction-Filtering Policy](policy.md)
+- [Consensus Engines & Shadow Verification](consensus.md)
 - [Initial Block Download & Fast Sync](ibd.md)
 - [Disk Footprint & Indices](disk-footprint.md)
 - [API Scaling & Runtimes](api-scaling.md)

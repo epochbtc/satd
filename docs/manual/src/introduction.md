@@ -31,6 +31,14 @@ standalone external index. See [Disk Footprint & Indices](disk-footprint.md)
 for the byte-level accounting, and [API Scaling & Runtimes](api-scaling.md) for
 the scale-out trade-off.
 
+## Two script engines
+
+satd carries two independently written script-verification engines: a Rust
+engine and Bitcoin Core's own C++ interpreter, through `libbitcoinkernel`. By
+default every script is verified by both. The Rust engine decides and the C++
+engine re-checks it in the background, logging any disagreement. See
+[Consensus Engines & Shadow Verification](consensus.md).
+
 ## How this manual is organized
 
 - **Getting Started**: [installing satd](installing.md) from the Umbrel
@@ -38,7 +46,8 @@ the scale-out trade-off.
   image or a release tarball.
 - **Operating**: the day-to-day surfaces. [Observability and
   metrics](observability.md); [configuration, tuning, and live
-  reload](configuration.md); [initial block download and AssumeUTXO fast
+  reload](configuration.md); the [two consensus engines](consensus.md) and
+  how they check each other; [initial block download and AssumeUTXO fast
   sync](ibd.md); [API scaling and the two-runtime model](api-scaling.md);
   [authentication and authorization](authentication.md), covering
   Core-compatible credentials and the unified bearer-token layer; the

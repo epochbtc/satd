@@ -160,67 +160,12 @@ never looser.
 
 ## Consensus engine & shadow verification
 
-satd ships two independent script-verification engines: Bitcoin Core's C++
-script interpreter, built from Core's source through `libbitcoinkernel`, and a
-from-scratch Rust verifier. It can run both
-together and verify every script twice. Bitcoin Core has no equivalent.
-
-Read a mode name as "which engine is the shadow". In `<engine>-shadow`, the
-named engine is the shadow, the non-authoritative one. The other engine is
-primary; its verdict is what the node acts on. The shadow re-verifies in the
-background and logs any disagreement. So:
-
-- `rust-shadow`: the Rust engine is the shadow; C++ is primary.
-- `cpp-shadow`: the C++ engine is the shadow; Rust is primary.
-
-`-consensus=<mode>`:
-
-| Mode | Primary (authoritative) | Shadow |
-|---|---|---|
-| `rust-shadow` (default) | C++ (`libbitcoinkernel`) | Rust (logs mismatches) |
-| `cpp-shadow` | Rust | C++ (logs mismatches) |
-| `cpp` | C++ (`libbitcoinkernel`) | none (single engine) |
-| `rust` | Rust | none (single engine) |
-
-The Rust engine passes Bitcoin Core's script test suite. Shadow verification
-against Core's C++ interpreter (then `libbitcoinconsensus`) across the whole
-mainnet chain, genesis to about height 945,000, found zero divergence. Both
-engines hash a transaction's signature data once and reuse it for every input,
-as Core's own `CheckInputScripts` does. (Up to 0.7.x the C++ engine was
-`libbitcoinconsensus`, whose API made it redo that work for every input, so a
-transaction with many inputs cost time quadratic in their number.)
-
-`rust-shadow` (C++ primary) stays the default out of conservatism. Running two
-independently written engines against each other is satd's core safety
-property, and Core's interpreter is the most widely deployed implementation.
-The plan is to promote the Rust engine to primary as it accumulates production
-mileage; `cpp-shadow` is that step. Treat the single-engine `rust` mode with
-care. The engine itself is proven, but either single-engine mode gives up the
-dual-engine cross-verification. satd prints a caution at startup when the
-single-engine `rust` mode is selected.
-
-The shadow engine runs on a bounded background worker pool, so it consumes
-spare CPU without slowing block connection. Three flags tune it:
-
-- `-shadowworkers=<n>` (default 4): background shadow-verification threads.
-- `-shadowqueuesize=<n>` (default 4194304): the most transactions the shadow
-  work queue holds.
-- `-shadowqueuemb=<n>` (default 128): the most memory, in MiB, the queued
-  work may hold. Each queued transaction holds its serialized bytes and a copy
-  of every output it spends. On a host with few cores the shadow engine can
-  fall behind the primary for hours during IBD, and this budget, not the
-  entry count, is what keeps the queue from growing into the process's memory
-  limit. `0` removes the byte bound and leaves only `-shadowqueuesize`.
-
-When either bound is reached, shadow work is dropped, and an aggregated WARN
-is logged at most once per 5 s with the queue's depth and bytes. The primary
-engine still verifies every script, so correctness is unaffected. Frequent
-drops mean the shadow engine cannot keep up on this host; `-consensus=rust` or
-`-consensus=cpp` runs a single engine.
-
-> **Difference from Bitcoin Core.** Core has a single C++ engine and no shadow
-> mode. satd's default runs both engines at once. `-consensus`,
-> `-shadowworkers`, `-shadowqueuesize` and `-shadowqueuemb` are satd-specific.
+satd verifies every script with two independent engines by default, the Rust
+engine deciding and Bitcoin Core's C++ interpreter checking it in the
+background. `-consensus` selects the engines, and `-shadowworkers`,
+`-shadowqueuesize` and `-shadowqueuemb` bound the background checker, which
+can fall behind on a host with few cores during IBD. See [Consensus Engines &
+Shadow Verification](consensus.md).
 
 ## IBD performance & storage tuning
 
@@ -525,7 +470,8 @@ at height H can only be spent at or above H.
 - `assumevalid=all` with `assumevalidage`: verify-recent-only mode. Core takes
   a hash or `0`.
 - Dual-engine shadow verification (`-consensus`, `-shadowworkers`,
-  `-shadowqueuesize`, `-shadowqueuemb`): the default runs the C++ and Rust engines together.
+  `-shadowqueuesize`, `-shadowqueuemb`): the default runs the Rust and C++ engines together
+  ([Consensus Engines](consensus.md)).
   Core has one engine.
 - `--fast-start` / `--fast-start-sha256`: one-flag AssumeUTXO
   download-verify-load. Core requires a manual `loadtxoutset`.

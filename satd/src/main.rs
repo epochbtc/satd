@@ -1301,7 +1301,7 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
     let verifier: Box<dyn ScriptVerifier> = match config.consensus {
         ConsensusEngine::Cpp => {
             tracing::warn!(
-                "Consensus: cpp (single engine, no shadow cross-check). Default 'rust-shadow' \
+                "Consensus: cpp (single engine, no shadow cross-check). Default 'cpp-shadow' \
                  runs two independent engines and is recommended."
             );
             Box::new(ConsensusVerifier::new(config.network))
@@ -1311,7 +1311,7 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
                 "Consensus: rust (single engine, no shadow cross-check). The Rust engine passes \
                  Bitcoin Core's script test suite and is shadow-validated against Core's C++ \
                  interpreter across mainnet history with zero divergence — but running \
-                 either engine alone forgoes the dual-engine cross-check. Default 'rust-shadow' \
+                 either engine alone forgoes the dual-engine cross-check. Default 'cpp-shadow' \
                  is recommended."
             );
             Box::new(RustVerifier::new(config.network))

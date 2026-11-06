@@ -99,10 +99,10 @@ fn default_auto_max_mb() -> usize {
 /// Consensus engine selection.
 ///
 /// Controls which script verification engine is used. The default,
-/// `rust-shadow`, runs two independent engines and cross-checks every script;
+/// `cpp-shadow`, runs two independent engines and cross-checks every script;
 /// the single-engine modes forgo that cross-check.
-/// - `rust-shadow` *(default)*: both engines, cpp authoritative, rust shadow
-/// - `cpp-shadow`: both engines, rust authoritative, cpp shadow
+/// - `cpp-shadow` *(default)*: both engines, rust authoritative, cpp shadow
+/// - `rust-shadow`: both engines, cpp authoritative, rust shadow
 /// - `cpp`: Bitcoin Core's C++ interpreter (libbitcoinkernel FFI) only (single engine)
 /// - `rust`: pure Rust consensus engine only (single engine)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -115,9 +115,9 @@ pub enum ConsensusEngine {
     /// against Bitcoin Core's C++ interpreter across mainnet history; the caution here is
     /// only that single-engine mode forgoes the dual-engine cross-check.
     Rust,
-    /// Both engines: cpp is authoritative, rust runs in shadow, mismatches logged (default).
+    /// Both engines: cpp is authoritative, rust runs in shadow, mismatches logged.
     RustShadow,
-    /// Both engines: rust is authoritative, cpp runs in shadow, mismatches logged.
+    /// Both engines: rust is authoritative, cpp runs in shadow, mismatches logged (default).
     CppShadow,
 }
 
@@ -4598,13 +4598,13 @@ impl Config {
                 let raw = cli
                     .consensus
                     .or_else(|| file_get("consensus"))
-                    .unwrap_or_else(|| "rust-shadow".to_string());
+                    .unwrap_or_else(|| "cpp-shadow".to_string());
                 ConsensusEngine::from_str(&raw).unwrap_or_else(|| {
                     eprintln!(
-                        "Warning: unknown consensus engine '{}', using default 'rust-shadow'",
+                        "Warning: unknown consensus engine '{}', using default 'cpp-shadow'",
                         raw
                     );
-                    ConsensusEngine::RustShadow
+                    ConsensusEngine::CppShadow
                 })
             },
             shadow_queue_size: cli
@@ -6561,7 +6561,7 @@ pub struct CliArgs {
     #[arg(
         long,
         value_name = "ENGINE",
-        help = "Consensus engine: cpp, rust, rust-shadow, cpp-shadow (default: rust-shadow)"
+        help = "Consensus engine: cpp-shadow, rust-shadow, rust, cpp (default: cpp-shadow)"
     )]
     pub consensus: Option<String>,
 
@@ -10688,6 +10688,10 @@ mod listmerge_tests;
 #[cfg(test)]
 #[path = "config_externalip_tests.rs"]
 mod externalip_tests;
+
+#[cfg(test)]
+#[path = "config_consensus_tests.rs"]
+mod consensus_tests;
 
 #[cfg(test)]
 mod tests {

@@ -80,7 +80,7 @@ artifacts, signing stack) but no protocol consequences.
 | Surface | Bitcoin Core | satd |
 |---|---|---|
 | **Implementation language** | C++ | Rust (edition 2024) |
-| **Script verification** | `CheckInputScripts` (C++), one `PrecomputedTransactionData` per transaction | Core's interpreter through `libbitcoinkernel` (same per-transaction precomputed data) primary + native Rust verifier as parity-validated shadow |
+| **Script verification** | `CheckInputScripts` (C++), one `PrecomputedTransactionData` per transaction | Native Rust verifier primary + Core's interpreter through `libbitcoinkernel` (same per-transaction precomputed data) as shadow, by default; `-consensus=rust-shadow` swaps them |
 | **Storage backend** | LevelDB (chainstate, indices) + flat block files | RocksDB (chainstate + all indices, single instance, zstd + lz4) + flat block files; jemalloc allocator |
 | **Async runtime** | `boost::asio` + `std::thread` mix | `tokio` for all I/O |
 | **JSON-RPC server** | bespoke HTTP / SSL stack | `jsonrpsee` over `tower` middleware (with native TLS support) |
