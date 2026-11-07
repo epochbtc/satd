@@ -64,6 +64,8 @@ pub enum AddrV2DecodeError {
     BadAddressLength { network: u8, len: u64 },
     #[error("v1 checksum mismatch")]
     BadChecksum,
+    #[error("unsupported address disk format version {0:#x}")]
+    DiskVersion(u32),
 }
 
 struct Reader<'a> {
@@ -133,6 +135,50 @@ pub fn decode_v1_payload(
         return Err(AddrV2DecodeError::BadChecksum);
     }
     decode_payload(payload)
+}
+
+/// Core's `CAddress::DISK_VERSION_INIT` (`src/protocol.h:406`): the low
+/// bits of a disk entry's version field, written and ignored on read.
+const DISK_VERSION_INIT: u32 = 220_000;
+/// `CAddress::DISK_VERSION_IGNORE_MASK`.
+const DISK_VERSION_IGNORE_MASK: u32 = 0b0000_0000_0000_0111_1111_1111_1111_1111;
+/// `CAddress::DISK_VERSION_ADDRV2`: the high bits that mark an entry as
+/// BIP 155 encoded.
+const DISK_VERSION_ADDRV2: u32 = 1 << 29;
+
+/// Decode a vector of addresses as Core's `CAddress::V2_DISK` serializes
+/// one (`src/protocol.h:433`): a CompactSize count, then per entry a
+/// version field and the entry as `addrv2` carries it. Returns the entries
+/// and the bytes read, so a caller can find what follows them.
+///
+/// An entry whose version field is not `DISK_VERSION_ADDRV2` is refused.
+/// Core would also read the pre-BIP 155 form (version 0), which no
+/// `anchors.dat` holds: both Core and satd write every entry in the
+/// BIP 155 form.
+pub fn decode_disk_vector(buf: &[u8]) -> Result<(Vec<AddrV2Message>, usize), AddrV2DecodeError> {
+    let mut r = Reader { buf };
+    let count = r.compact_size(true)?;
+    let mut out = Vec::with_capacity((count as usize).min(buf.len() / (MIN_ENTRY_LEN + 4)));
+    for _ in 0..count {
+        let version = u32::from_le_bytes(r.take(4)?.try_into().unwrap());
+        if version & !DISK_VERSION_IGNORE_MASK != DISK_VERSION_ADDRV2 {
+            return Err(AddrV2DecodeError::DiskVersion(version));
+        }
+        out.push(decode_entry(&mut r)?);
+    }
+    Ok((out, buf.len() - r.buf.len()))
+}
+
+/// Encode `entries` as [`decode_disk_vector`] reads them, as Core writes
+/// them.
+pub fn encode_disk_vector(entries: &[AddrV2Message]) -> Vec<u8> {
+    use bitcoin::consensus::encode::{serialize, VarInt};
+    let mut out = serialize(&VarInt(entries.len() as u64));
+    for e in entries {
+        out.extend_from_slice(&(DISK_VERSION_INIT | DISK_VERSION_ADDRV2).to_le_bytes());
+        out.extend(serialize(e));
+    }
+    out
 }
 
 fn decode_entry(r: &mut Reader<'_>) -> Result<AddrV2Message, AddrV2DecodeError> {

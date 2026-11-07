@@ -57,6 +57,7 @@ $DATADIR/                         # default: $HOME/.bitcoin (Core-compat)
     │   ├── CURRENT, MANIFEST-*   # RocksDB metadata
     │   └── ...
     ├── .cookie                   # RPC cookie auth (auto-generated, mode 0600)
+    ├── anchors.dat               # block-relay-only peers at the last clean stop (Core's format; read and deleted at start)
     ├── mempool_history.log       # rolling mempool snapshot (state, derived-OK)
     ├── reorg.log                 # persistent reorg ledger (state, append-only)
     ├── bitcoin.conf              # optional config file (Core-compat name)
@@ -71,6 +72,12 @@ The derived files are safe to delete. Everything inside `chainstate/`
 index marker files inside `chainstate/` regenerate from `blocks/` with
 `--reindex` or `--reindex-chainstate`. There is no `debug.log`: satd
 logs to stdout.
+
+`anchors.dat` holds up to two block-relay-only peers, written on a clean
+stop. The next start reads it, deletes it, and dials those peers first, so
+a node keeps peers an attacker did not choose across a restart. A crash
+leaves none; `-connect` neither reads nor writes it. The format is Core's,
+so the file carries over when a data directory moves between the two.
 
 > **Difference from Bitcoin Core.** satd does not keep separate
 > databases for the txindex, address index, or BIP 158 filter index.
