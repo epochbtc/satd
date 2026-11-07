@@ -10,7 +10,7 @@
 use std::net::{IpAddr, SocketAddr};
 
 /// A network `-onlynet` can name: Core's `ParseNetwork`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Network {
     Ipv4,
     Ipv6,
