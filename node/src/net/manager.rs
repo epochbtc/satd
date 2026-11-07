@@ -3598,6 +3598,24 @@ impl PeerManager {
         peers + in_flight.automatic + in_flight.extra_network + typed
     }
 
+    /// The outbound sockets Core's `semOutbound` holds a grant for: every
+    /// outbound peer but the manual ones and NAP pulls (as
+    /// [`Self::check_outbound_limit_for`] counts them), `addconnection`'s
+    /// reservations, and the reconnect loop's dials in flight.
+    fn automatic_sockets_open(&self, in_flight: &DialsInFlight) -> usize {
+        let peers = self
+            .peers
+            .read()
+            .values()
+            .filter(|h| {
+                h.info.direction == Direction::Outbound
+                    && !matches!(h.info.conn_type, ConnType::Manual | ConnType::NapPull)
+                    && h.info.state != PeerState::Disconnected
+            })
+            .count();
+        peers + self.pending_typed_dials.read().len() + in_flight.automatic + in_flight.extra_network
+    }
+
     /// The added nodes the operator listed, at the addresses they resolve to.
     fn added_node_addrs(&self) -> Vec<PeerAddr> {
         self.addnode_entries
@@ -3684,9 +3702,18 @@ impl PeerManager {
                 in_flight.added_node += 1;
             }
             DialBudget::ExtraNetwork => {
-                // A dial in flight counts, so this also keeps it to one.
+                // One at a time: the target check alone lets a second
+                // through if a full-relay peer drops while the first dials.
+                if in_flight.extra_network > 0 {
+                    return Err("an extra network peer is already being dialled".to_string());
+                }
                 if self.full_relay_open(&in_flight) != MAX_OUTBOUND {
                     return Err("the full-relay target is not met exactly".to_string());
+                }
+                // Core's extra peer takes a `semOutbound` grant, so it is
+                // never opened past that bound (`-maxconnections` 8, say).
+                if self.automatic_sockets_open(&in_flight) >= Self::max_automatic_outbound(&self.max_connections) {
+                    return Err("no outbound grant free".to_string());
                 }
                 in_flight.extra_network += 1;
             }
@@ -5256,8 +5283,8 @@ impl PeerManager {
     }
 
     /// A reachable network the node holds no manual or full-relay outbound
-    /// connection on, connected or in the handshake, and the address book
-    /// has an entry on: Core's `MaybePickPreferredNetwork` (v31.1
+    /// connection on, connected or in the handshake, nor is dialling, and the
+    /// address book has an entry on: Core's `MaybePickPreferredNetwork` (v31.1
     /// `src/net.cpp:2512`), the networks tried in a random order. IPv4,
     /// IPv6 and onion only: satd has no I2P or CJDNS transport, and dials
     /// neither automatically.
@@ -5265,7 +5292,7 @@ impl PeerManager {
         use crate::net::reachable::Network;
         use rand::seq::SliceRandom as _;
         let reachable = *self.reachable.read();
-        let held: HashSet<Network> = self
+        let mut held: HashSet<Network> = self
             .peers
             .read()
             .values()
@@ -5281,6 +5308,19 @@ impl PeerManager {
                 addr_network(&reachable, &addr)
             })
             .collect();
+        // Core dials one peer at a time and sees it in `m_nodes` on its next
+        // pass; satd's dials run in parallel, an onion's for seconds, so a
+        // network being dialled counts as held, as in
+        // [`Self::outbound_netgroups`].
+        held.extend(
+            self.pending_connections
+                .read()
+                .iter()
+                .filter_map(|sa| addr_network(&reachable, &PeerAddr::Socket(*sa))),
+        );
+        if !self.pending_onion_dials.read().is_empty() {
+            held.insert(Network::Onion);
+        }
         let mut nets = [Network::Ipv4, Network::Ipv6, Network::Onion];
         nets.shuffle(rng);
         let wanted: Vec<Network> =

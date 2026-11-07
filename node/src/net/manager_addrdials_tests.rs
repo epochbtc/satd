@@ -1413,7 +1413,44 @@ fn one_extra_network_dial_at_a_time() {
     extra_network_due(&pm);
     let first = pm.reserve_extra_network_peer(Instant::now()).expect("the first extra dial");
     assert_eq!(extra_network_target(&pm), None, "the first is in flight");
+    // A full-relay peer drops while the first dials: the count is back at
+    // the target, and still no second dial.
+    pm.peers.write().remove(&2000);
+    assert_eq!(extra_network_target(&pm), None, "the first is still in flight");
     drop(first);
+    fill_ipv4(&pm, MAX_OUTBOUND);
+    assert!(extra_network_target(&pm).is_some());
+}
+
+/// A network being dialled counts as held: no extra peer goes to it.
+#[test]
+fn a_network_being_dialled_draws_no_extra_peer() {
+    let (pm, _dir) = mk_pm_tor();
+    leave_ibd(&pm);
+    fill_ipv4(&pm, MAX_OUTBOUND);
+    learn_onion(&pm, &onion_host(1), 8333);
+    pm.pending_onion_dials.write().insert(onion_host(2));
+    assert_eq!(extra_network_target(&pm), None, "an onion dial in flight");
+    pm.pending_onion_dials.write().clear();
+    let v6: SocketAddr = "[2001:4860::1]:8333".parse().unwrap();
+    learn(&pm, v6);
+    pm.pending_connections.write().insert("[2001:4860::2]:8333".parse().unwrap());
+    for _ in 0..20 {
+        assert_eq!(extra_network_target(&pm), Some(PeerAddr::Onion { host: onion_host(1), port: 8333 }));
+    }
+}
+
+/// The extra peer takes an outbound grant, Core's `semOutbound`: with
+/// `-maxconnections` 8 the eight full-relay peers hold every one.
+#[test]
+fn no_extra_peer_without_an_outbound_grant() {
+    let (pm, _dir) = mk_pm_tor();
+    leave_ibd(&pm);
+    fill_ipv4(&pm, MAX_OUTBOUND);
+    learn_onion(&pm, &onion_host(1), 8333);
+    pm.set_max_connections(MAX_OUTBOUND);
+    assert_eq!(extra_network_target(&pm), None);
+    pm.set_max_connections(125);
     assert!(extra_network_target(&pm).is_some());
 }
 
