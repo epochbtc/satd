@@ -3472,10 +3472,14 @@ impl PeerManager {
     /// `pending` is the in-flight dial list, passed in rather than read here
     /// so the caller can hold it across the check *and* its own reservation:
     /// two acquisitions would leave the window this check exists to close.
+    /// `in_flight` is the reconnect loop's dials, which hold outbound grants
+    /// too; the caller locks it before `pending`, the order `reserve_dial`
+    /// takes them in.
     fn check_outbound_limit_for(
         &self,
         conn_type: ConnType,
         pending: &[ConnType],
+        in_flight: &DialsInFlight,
     ) -> Result<(), String> {
         // `None` = no *individual* limit. Core leaves addr-fetch and feeler
         // uncapped per type deliberately, because `semOutbound` below holds
@@ -3509,7 +3513,11 @@ impl PeerManager {
                 .values()
                 .filter(|h| h.info.conn_type == conn_type)
                 .count()
-                + pending.iter().filter(|t| **t == conn_type).count();
+                + pending.iter().filter(|t| **t == conn_type).count()
+                + match conn_type {
+                    ConnType::BlockRelay => in_flight.block_relay,
+                    _ => 0,
+                };
             if existing >= max {
                 return Err(
                     "Error: Already at capacity for specified connection type.".to_string()
@@ -3533,7 +3541,11 @@ impl PeerManager {
             // NAP pull, which the aggregator bounds itself.
             .filter(|h| !matches!(h.info.conn_type, ConnType::Manual | ConnType::NapPull))
             .count()
-            + pending.len();
+            + pending.len()
+            // The reconnect loop's dials in flight hold grants too.
+            + in_flight.automatic
+            + in_flight.extra_network
+            + in_flight.block_relay;
         if total_outbound >= Self::max_automatic_outbound(&self.max_connections) {
             return Err("Error: Already at capacity for specified connection type.".to_string());
         }
@@ -3858,8 +3870,10 @@ impl PeerManager {
             ));
         }
         {
+            // The dials in flight are locked first, as `reserve_dial` takes them.
+            let in_flight = self.dials_in_flight.lock();
             let mut pending = self.pending_typed_dials.write();
-            self.check_outbound_limit_for(conn_type, &pending)?;
+            self.check_outbound_limit_for(conn_type, &pending, &in_flight)?;
             pending.push(conn_type);
         }
         let pm = self.clone();
@@ -3913,8 +3927,10 @@ impl PeerManager {
             return;
         };
         {
+            // The dials in flight are locked first, as `reserve_dial` takes them.
+            let in_flight = self.dials_in_flight.lock();
             let mut pending = self.pending_typed_dials.write();
-            if let Err(e) = self.check_outbound_limit_for(ConnType::AddrFetch, &pending) {
+            if let Err(e) = self.check_outbound_limit_for(ConnType::AddrFetch, &pending, &in_flight) {
                 tracing::debug!(%host, port, "addr-fetch by name not opened: {e}");
                 return;
             }
@@ -3996,8 +4012,10 @@ impl PeerManager {
         let _typed_slot = match conn_type {
             None | Some(ConnType::Manual) => None,
             Some(t) if reserve => {
+                // The dials in flight are locked first, as `reserve_dial` takes them.
+                let in_flight = self.dials_in_flight.lock();
                 let mut pending = self.pending_typed_dials.write();
-                self.check_outbound_limit_for(t, &pending)?;
+                self.check_outbound_limit_for(t, &pending, &in_flight)?;
                 pending.push(t);
                 drop(pending);
                 Some(TypedDialGuard { set: &self.pending_typed_dials, conn_type: t })
@@ -5293,8 +5311,10 @@ impl PeerManager {
             *next = next_feeler_after(now);
         }
         {
+            // The dials in flight are locked first, as `reserve_dial` takes them.
+            let in_flight = self.dials_in_flight.lock();
             let mut pending = self.pending_typed_dials.write();
-            if let Err(e) = self.check_outbound_limit_for(ConnType::Feeler, &pending) {
+            if let Err(e) = self.check_outbound_limit_for(ConnType::Feeler, &pending, &in_flight) {
                 tracing::debug!("feeler not opened: {e}");
                 return None;
             }

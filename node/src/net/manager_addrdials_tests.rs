@@ -1580,16 +1580,17 @@ fn the_block_relay_limit_follows_maxconnections() {
     }
     pm.set_max_connections(MAX_OUTBOUND);
     assert_eq!(block_relay_target(&pm), None, "-maxconnections=8");
-    assert!(pm.check_outbound_limit_for(ConnType::BlockRelay, &[]).is_err());
+    assert!(pm.check_outbound_limit_for(ConnType::BlockRelay, &[], &DialsInFlight::default()).is_err());
     pm.set_max_connections(9);
     assert!(block_relay_target(&pm).is_some(), "-maxconnections=9");
     fill_block_relay(&pm, 1);
     assert_eq!(block_relay_target(&pm), None, "the one at 9 is open");
-    assert!(pm.check_outbound_limit_for(ConnType::BlockRelay, &[]).is_err());
+    assert!(pm.check_outbound_limit_for(ConnType::BlockRelay, &[], &DialsInFlight::default()).is_err());
 }
 
 /// A block-relay-only peer takes an outbound grant, Core's `semOutbound`:
-/// with a feeler holding the last one at `-maxconnections` 10, none opens.
+/// with a feeler holding the last one at `-maxconnections` 10, none opens;
+/// and a block-relay-only dial in flight holding it, no feeler opens.
 #[test]
 fn no_block_relay_peer_without_an_outbound_grant() {
     let (pm, _dir) = mk_pm();
@@ -1601,7 +1602,11 @@ fn no_block_relay_peer_without_an_outbound_grant() {
     pm.pending_typed_dials.write().push(ConnType::Feeler);
     assert_eq!(block_relay_target(&pm), None);
     pm.pending_typed_dials.write().clear();
-    assert!(block_relay_target(&pm).is_some());
+    let block_relay = pm.reserve_block_relay_peer(Instant::now()).expect("the last grant");
+    // The dial in flight holds the last grant: no feeler.
+    feeler_due(&pm);
+    assert!(pm.reserve_feeler(Instant::now()).is_none(), "the block-relay-only dial holds the grant");
+    drop(block_relay);
 }
 
 /// A block-relay-only peer, automatic or `addconnection`'s, takes no slot
@@ -1696,4 +1701,17 @@ async fn the_reconnect_loop_dials_a_block_relay_peer() {
         "typed block-relay-only"
     );
     assert_eq!(pm.dials_in_flight.lock().block_relay, 0, "the slot went back");
+}
+
+/// None under `-connect`, which turns the node's own dials off.
+#[test]
+fn no_block_relay_peer_under_connect() {
+    let (pm, _dir) = mk_pm();
+    leave_ibd(&pm);
+    learn(&pm, SocketAddr::from(([44, 1, 2, 3], 8333)));
+    fill_automatic(&pm, MAX_OUTBOUND);
+    pm.set_automatic_outbound(false);
+    assert_eq!(block_relay_target(&pm), None);
+    pm.set_automatic_outbound(true);
+    assert!(block_relay_target(&pm).is_some());
 }
