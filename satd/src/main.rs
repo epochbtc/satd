@@ -2784,6 +2784,16 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
     // every restart.
     peer_manager.load_addrman(&net_datadir.join("peers.dat"));
 
+    // `-connect` (any form) means: dial these and nothing else. Recorded on
+    // the manager so gossiped addresses are learned but never dialled, and
+    // before the anchors, which `-connect` leaves unread.
+    peer_manager.set_automatic_outbound(config.automatic_outbound);
+
+    // The block-relay-only peers held at the last clean shutdown, dialled
+    // first (#1150). Read before RPC answers, as Core reads them before its
+    // warmup ends: the file is gone by the time a client can see the node.
+    peer_manager.load_anchors(&net_datadir.join(node::net::anchors::ANCHORS_FILE));
+
     // Load the persistent ban list (banlist.json). A file that cannot be read
     // or parsed is recreated, as Core's `BanMan::LoadBanlist` does — never a
     // reason to stop persisting, which is what leaves `setban` silently inert.
@@ -4669,9 +4679,6 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
         tracing::info!(%bind_addr, "whitebind P2P listening");
     }
 
-    // `-connect` (any form) means: dial these and nothing else. Recorded on
-    // the manager so gossiped addresses are learned but never dialled.
-    peer_manager.set_automatic_outbound(config.automatic_outbound);
     peer_manager.set_reachable(config.reachable);
     peer_manager.set_onion_disabled(config.noonion);
 
@@ -5350,6 +5357,11 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
 
     // Persist the address book so learned peers survive a restart.
     peer_manager.dump_addrman(&net_datadir.join("peers.dat"));
+
+    // The block-relay-only peers held now, for the next start to dial first
+    // (#1150). Core writes them with the address book, in `StopNodes`, and
+    // only there: a node that crashes, or is killed, leaves no anchors.
+    peer_manager.dump_anchors(&net_datadir.join(node::net::anchors::ANCHORS_FILE));
 
     // Core dumps the ban list in `~BanMan()`. Every mutator flushes inline, so
     // the only state that can still be pending here is a re-armed dirty flag

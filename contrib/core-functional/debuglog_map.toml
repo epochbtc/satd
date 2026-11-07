@@ -19,4 +19,7 @@
 # Rules are added in the PR that flips the test needing them, so this file
 # starts small and grows with evidence.
 
-# (no rules yet -- the first flips are tests that do not grep debug.log)
+[[rule]]
+match = 'Flush (\d+) outbound block-relay-only peer addresses to anchors\.dat'
+rewrite = 'DumpAnchors: Flush \1 outbound block-relay-only peer addresses to anchors.dat'
+why = "feature_anchors.py: Core logs the write from DumpAnchors, with the function name"
