@@ -733,6 +733,12 @@ enum DialBudget {
     /// peer is a ninth full-relay connection until eviction drops one on
     /// another network.
     ExtraNetwork,
+    /// An automatic block-relay-only peer
+    /// ([`PeerManager::reserve_block_relay_peer`]): opened once the
+    /// full-relay target is met, up to
+    /// [`PeerManager::max_outbound_block_relay`], each with an outbound
+    /// grant. Core's `BLOCK_RELAY` branch of `ThreadOpenConnections`.
+    BlockRelay,
 }
 
 /// Outbound dials in flight, per [`DialBudget`].
@@ -741,6 +747,7 @@ struct DialsInFlight {
     automatic: usize,
     added_node: usize,
     extra_network: usize,
+    block_relay: usize,
 }
 
 /// A dial's place in its [`DialBudget`], given back when dropped. Owned, so
@@ -760,6 +767,7 @@ impl Drop for DialSlot {
             DialBudget::ExtraNetwork => {
                 in_flight.extra_network = in_flight.extra_network.saturating_sub(1)
             }
+            DialBudget::BlockRelay => in_flight.block_relay = in_flight.block_relay.saturating_sub(1),
             DialBudget::Unlimited => {}
         }
     }
@@ -3477,7 +3485,7 @@ impl PeerManager {
             ConnType::OutboundFullRelay => {
                 Some(self.max_connections.load(Ordering::Relaxed).min(MAX_OUTBOUND))
             }
-            ConnType::BlockRelay => Some(MAX_OUTBOUND_BLOCK_RELAY),
+            ConnType::BlockRelay => Some(self.max_outbound_block_relay()),
             ConnType::AddrFetch | ConnType::Feeler => None,
             // Core returns false rather than opening one of these. A NAP pull
             // is satd's own, and opened only by the aggregator.
@@ -3546,6 +3554,14 @@ impl PeerManager {
             .min(max_connections.load(Ordering::Relaxed))
     }
 
+    /// Core's `m_max_outbound_block_relay`: 2, or what `-maxconnections`
+    /// leaves past the full-relay target of 8, whichever is fewer (v31.1
+    /// `src/net.h:1116`). None at 8 or fewer, 1 at 9.
+    fn max_outbound_block_relay(&self) -> usize {
+        let max_connections = self.max_connections.load(Ordering::Relaxed);
+        MAX_OUTBOUND_BLOCK_RELAY.min(max_connections.saturating_sub(max_connections.min(MAX_OUTBOUND)))
+    }
+
     /// The automatic outbound target: 8, capped by `-maxconnections`, or 64
     /// during IBD.
     fn automatic_outbound_target(&self) -> usize {
@@ -3559,15 +3575,19 @@ impl PeerManager {
     /// Outbound peers that count against the automatic target: every one
     /// but the manual connections, which Core counts apart (`semAddnode`,
     /// or no limit at all), NAP pulls, which take no outbound slot, and
-    /// feelers, which have a slot of their own (Core's `m_max_feeler` in the
-    /// size of `semOutbound`); connected or still in the handshake.
+    /// feelers and block-relay-only peers, which have slots of their own
+    /// (Core's `m_max_feeler` and `m_max_outbound_block_relay`); connected
+    /// or still in the handshake.
     fn automatic_outbound_peers(&self) -> usize {
         self.peers
             .read()
             .values()
             .filter(|h| {
                 h.info.direction == Direction::Outbound
-                    && !matches!(h.info.conn_type, ConnType::Manual | ConnType::NapPull | ConnType::Feeler)
+                    && !matches!(
+                        h.info.conn_type,
+                        ConnType::Manual | ConnType::NapPull | ConnType::Feeler | ConnType::BlockRelay
+                    )
                     && h.info.state != PeerState::Disconnected
             })
             .count()
@@ -3576,17 +3596,45 @@ impl PeerManager {
     /// The automatic connections open or being opened, against the
     /// automatic target: the peers [`Self::automatic_outbound_peers`]
     /// counts, the reconnect loop's dials in flight, and `addconnection`'s
-    /// reservations but a feeler's.
+    /// reservations but a feeler's or a block-relay-only one's.
     fn automatic_open(&self, in_flight: &DialsInFlight) -> usize {
         self.automatic_outbound_peers()
             + in_flight.automatic
-            + self.pending_typed_dials.read().iter().filter(|t| **t != ConnType::Feeler).count()
+            + self
+                .pending_typed_dials
+                .read()
+                .iter()
+                .filter(|t| !matches!(**t, ConnType::Feeler | ConnType::BlockRelay))
+                .count()
+    }
+
+    /// The block-relay-only connections open or being opened: Core's
+    /// `nOutboundBlockRelay`, with the reconnect loop's dials in flight and
+    /// `addconnection`'s reservations counted.
+    fn block_relay_open(&self, in_flight: &DialsInFlight) -> usize {
+        let peers = self
+            .peers
+            .read()
+            .values()
+            .filter(|h| h.info.conn_type == ConnType::BlockRelay && h.info.state != PeerState::Disconnected)
+            .count();
+        let typed = self.pending_typed_dials.read().iter().filter(|t| **t == ConnType::BlockRelay).count();
+        peers + in_flight.block_relay + typed
+    }
+
+    /// Whether the automatic full-relay and block-relay-only targets are
+    /// both met, dials in flight counted: Core checks its feeler and
+    /// extra-network timers only past both, at the end of its `else if`
+    /// chain.
+    fn outbound_targets_met(&self, in_flight: &DialsInFlight) -> bool {
+        self.automatic_open(in_flight) >= self.automatic_outbound_target()
+            && self.block_relay_open(in_flight) >= self.max_outbound_block_relay()
     }
 
     /// The full-relay connections open or being opened: Core's
     /// `nOutboundFullRelay`, with satd's dials in flight counted. Every
-    /// automatic dial is one (`spawn_peer` types it full-relay), as is an
-    /// `addconnection` reservation of that type.
+    /// automatic dial but a typed one is one (`spawn_peer` types it
+    /// full-relay), as is an `addconnection` reservation of that type.
     fn full_relay_open(&self, in_flight: &DialsInFlight) -> usize {
         let peers = self
             .peers
@@ -3613,7 +3661,11 @@ impl PeerManager {
                     && h.info.state != PeerState::Disconnected
             })
             .count();
-        peers + self.pending_typed_dials.read().len() + in_flight.automatic + in_flight.extra_network
+        peers
+            + self.pending_typed_dials.read().len()
+            + in_flight.automatic
+            + in_flight.extra_network
+            + in_flight.block_relay
     }
 
     /// The added nodes the operator listed, at the addresses they resolve to.
@@ -3710,12 +3762,28 @@ impl PeerManager {
                 if self.full_relay_open(&in_flight) != MAX_OUTBOUND {
                     return Err("the full-relay target is not met exactly".to_string());
                 }
+                if self.block_relay_open(&in_flight) < self.max_outbound_block_relay() {
+                    return Err("the block-relay-only target is not met".to_string());
+                }
                 // Core's extra peer takes a `semOutbound` grant, so it is
                 // never opened past that bound (`-maxconnections` 8, say).
                 if self.automatic_sockets_open(&in_flight) >= Self::max_automatic_outbound(&self.max_connections) {
                     return Err("no outbound grant free".to_string());
                 }
                 in_flight.extra_network += 1;
+            }
+            DialBudget::BlockRelay => {
+                // Core's chain opens full-relay peers first.
+                if self.automatic_open(&in_flight) < self.automatic_outbound_target() {
+                    return Err("the full-relay target is not met".to_string());
+                }
+                if self.block_relay_open(&in_flight) >= self.max_outbound_block_relay() {
+                    return Err("block-relay-only target reached".to_string());
+                }
+                if self.automatic_sockets_open(&in_flight) >= Self::max_automatic_outbound(&self.max_connections) {
+                    return Err("no outbound grant free".to_string());
+                }
+                in_flight.block_relay += 1;
             }
             DialBudget::Unlimited => {}
         }
@@ -5106,8 +5174,62 @@ impl PeerManager {
         self.evict_extra_outbound_peer();
         self.resolve_tried_collisions();
         self.dial_automatic_peers(now);
+        self.open_block_relay_peer(now);
         self.open_feeler(now);
         self.open_extra_network_peer(now);
+    }
+
+    /// Open a block-relay-only peer if one is wanted:
+    /// [`Self::reserve_block_relay_peer`], then the dial.
+    fn open_block_relay_peer(self: &Arc<Self>, now: Instant) {
+        let Some((target, slot)) = self.reserve_block_relay_peer(now) else {
+            return;
+        };
+        tracing::debug!(%target, "Making block-relay-only connection");
+        let pm = Arc::clone(self);
+        tokio::spawn(async move {
+            let _slot = slot;
+            pm.dial_book_target(&target, Some(ConnType::BlockRelay), AUTOMATIC_RECONNECT_MAX_BACKOFF).await;
+        });
+    }
+
+    /// The address a block-relay-only peer is dialled at this pass, with its
+    /// place in the dial limit, or `None` if none is wanted: Core's
+    /// `BLOCK_RELAY` branch of `ThreadOpenConnections` (v31.1
+    /// `src/net.cpp:2742`). One is wanted once the full-relay target is met
+    /// and while fewer than [`Self::max_outbound_block_relay`] are open,
+    /// dials in flight counted ([`DialBudget::BlockRelay`]). One per pass.
+    /// Not under `-connect`.
+    ///
+    /// The address is drawn as every automatic one is
+    /// ([`Self::automatic_dial_order`], [`Self::automatic_dial_may_take`],
+    /// and one peer per network group, which these peers count toward, as
+    /// in Core).
+    fn reserve_block_relay_peer(self: &Arc<Self>, now: Instant) -> Option<(PeerAddr, DialSlot)> {
+        if !self.automatic_outbound.load(Ordering::Relaxed) {
+            return None;
+        }
+        let slot = self.reserve_dial(DialBudget::BlockRelay).ok()?;
+        let recent = now.checked_sub(RECENT_TRY_WINDOW);
+        let tried_recently =
+            |c: &DialCandidate| recent.is_some_and(|since| self.tried_since(&c.addr, since));
+        let (tip_depth, restore_pending) = self.desirable_services_inputs();
+        let groups = self.outbound_netgroups();
+        let mut rng = rand::thread_rng();
+        let mut chosen = None;
+        pass_over_recent_tries(self.automatic_dial_order(&mut rng), tried_recently, |c, tries| {
+            if !self.automatic_dial_may_take(&c, tries, now, tip_depth, restore_pending) {
+                return Ok(false);
+            }
+            if let PeerAddr::Socket(sa) = &c.addr
+                && self.outbound_netgroup(sa.ip()).is_some_and(|g| groups.contains(&g))
+            {
+                return Ok(false);
+            }
+            chosen = Some(c.addr);
+            Err(())
+        });
+        chosen.map(|target| (target, slot))
     }
 
     /// Open a feeler if one is due: [`Self::reserve_feeler`], then the dial,
@@ -5134,10 +5256,9 @@ impl PeerManager {
     /// `None` if no feeler is due: Core's `FEELER` branch of
     /// `ThreadOpenConnections` (v31.1 `src/net.cpp:2751`).
     ///
-    /// A feeler is due only once the automatic target is met, dials in
-    /// flight counted, as Core checks its timer only after the full-relay
-    /// and block-relay-only targets (satd opens no automatic
-    /// block-relay-only peers, so the full-relay target is the one). Then
+    /// A feeler is due only once the full-relay and block-relay-only targets
+    /// are met, dials in flight counted ([`Self::outbound_targets_met`]), as
+    /// Core checks its timer only after both. Then
     /// the timer, [`FEELER_INTERVAL`] on average, is set again whether or
     /// not an address is found, as in Core. Not under `-connect`.
     ///
@@ -5161,7 +5282,7 @@ impl PeerManager {
         if !self.automatic_outbound.load(Ordering::Relaxed) {
             return None;
         }
-        if self.automatic_open(&self.dials_in_flight.lock()) < self.automatic_outbound_target() {
+        if !self.outbound_targets_met(&self.dials_in_flight.lock()) {
             return None;
         }
         {
@@ -5230,8 +5351,9 @@ impl PeerManager {
     /// counted, are exactly at the target of 8, and only when
     /// `-maxconnections` leaves that target where it is, as in Core; nor
     /// during initial block download, when satd's target is 64 and the node
-    /// is still filling it. One extra dial at a time
-    /// ([`DialBudget::ExtraNetwork`]). Not under `-connect`.
+    /// is still filling it; and only once the block-relay-only target is met
+    /// too, as Core reaches this branch past that one. One extra dial at a
+    /// time ([`DialBudget::ExtraNetwork`]). Not under `-connect`.
     ///
     /// Then the timer, [`EXTRA_NETWORK_PEER_INTERVAL`] on average, and a
     /// network ([`Self::pick_network_without_peer`]). The timer is set again
