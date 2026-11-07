@@ -35,6 +35,7 @@ It includes every fix shipped in 0.7.1:
 - P2P: onion addresses learned from gossip go in the address book with the rest, so `peers.dat` keeps them across a restart and they are tried and evicted like any address; `peers.dat` moves to format version 3 (#1157).
 - P2P: the node opens feeler connections, as Core does, about every two minutes once its outbound slots are full, to test new addresses and the tried-table incumbent a newcomer would evict (#1149).
 - P2P: `anchors.dat`. A clean stop writes the node's block-relay-only peers there, in Core's format, and the next start dials them first, as block-relay-only, then deletes the file (#1150).
+- RPC: `addconnection` opens typed connections to onion addresses through the proxy; it refused them (#1150).
 - P2P: the node opens Core's two automatic block-relay-only outbound connections once its eight full-relay peers are up; it opened none, and an `addconnection` block-relay-only peer took a full-relay slot (#1225).
 - P2P: a node with no outbound peer on a network it can reach (IPv4, IPv6 or onion) opens an extra full-relay connection to that network about every five minutes, as Core does, and keeps it as the only peer there (#1156).
 - P2P: `.onion` fixed seeds for testnet4 and testnet3, and refreshed ones for mainnet and signet, from Core v31.2's lists, so a Tor-only node can bootstrap on every network (#1162).
