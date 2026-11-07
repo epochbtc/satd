@@ -1529,7 +1529,7 @@ fn fill_block_relay(pm: &PeerManager, n: usize) {
 /// The address a block-relay-only peer would be dialled at now. The slot
 /// goes back at the end of this call.
 fn block_relay_target(pm: &Arc<PeerManager>) -> Option<PeerAddr> {
-    pm.reserve_block_relay_peer(Instant::now()).map(|(target, _slot)| target)
+    pm.reserve_block_relay_peer(Instant::now(), &[]).map(|(target, _slot)| target)
 }
 
 /// #1225: Core opens block-relay-only peers once the full-relay target is
@@ -1557,8 +1557,11 @@ fn block_relay_peers_stop_at_two() {
     learn(&pm, SocketAddr::from(([45, 1, 2, 3], 8333)));
     fill_automatic(&pm, MAX_OUTBOUND);
     fill_block_relay(&pm, 1);
-    let in_flight = pm.reserve_block_relay_peer(Instant::now()).expect("the second");
+    let in_flight = pm.reserve_block_relay_peer(Instant::now(), &[]).expect("the second");
     assert_eq!(block_relay_target(&pm), None, "one connected, one being dialled");
+    let held = pm.dials_in_flight.lock();
+    assert!(pm.check_outbound_limit_for(ConnType::BlockRelay, &[], &held).is_err(), "nor by addconnection");
+    drop(held);
     drop(in_flight);
     assert!(block_relay_target(&pm).is_some());
     fill_block_relay(&pm, 2);
@@ -1602,7 +1605,7 @@ fn no_block_relay_peer_without_an_outbound_grant() {
     pm.pending_typed_dials.write().push(ConnType::Feeler);
     assert_eq!(block_relay_target(&pm), None);
     pm.pending_typed_dials.write().clear();
-    let block_relay = pm.reserve_block_relay_peer(Instant::now()).expect("the last grant");
+    let block_relay = pm.reserve_block_relay_peer(Instant::now(), &[]).expect("the last grant");
     // The dial in flight holds the last grant: no feeler.
     feeler_due(&pm);
     assert!(pm.reserve_feeler(Instant::now()).is_none(), "the block-relay-only dial holds the grant");
@@ -1714,4 +1717,34 @@ fn no_block_relay_peer_under_connect() {
     assert_eq!(block_relay_target(&pm), None);
     pm.set_automatic_outbound(true);
     assert!(block_relay_target(&pm).is_some());
+}
+
+/// A block-relay-only dial passes over what the full-relay half of the same
+/// pass just started, by address and by network group: those dials' tasks
+/// may not have claimed their addresses yet.
+#[test]
+fn a_block_relay_peer_passes_over_this_passes_dials() {
+    let (pm, _dir) = mk_pm();
+    leave_ibd(&pm);
+    fill_automatic(&pm, MAX_OUTBOUND);
+    let same = SocketAddr::from(([44, 1, 2, 3], 8333));
+    let same_group = SocketAddr::from(([45, 1, 2, 3], 8333));
+    let fresh = SocketAddr::from(([46, 1, 2, 3], 8333));
+    learn(&pm, same);
+    learn(&pm, same_group);
+    let dialled = [PeerAddr::from(same), SocketAddr::from(([45, 1, 9, 9], 8333)).into()];
+    assert_eq!(pm.reserve_block_relay_peer(Instant::now(), &dialled).map(|(t, _)| t), None);
+    learn(&pm, fresh);
+    for _ in 0..20 {
+        assert_eq!(pm.reserve_block_relay_peer(Instant::now(), &dialled).map(|(t, _)| t), Some(fresh.into()));
+    }
+
+    // A regtest address in no network group: passed over by address.
+    let (pm, _dir) = mk_pm();
+    leave_ibd(&pm);
+    fill_automatic(&pm, MAX_OUTBOUND);
+    let local = SocketAddr::from(([127, 0, 0, 1], 18444));
+    learn(&pm, local);
+    assert_eq!(pm.reserve_block_relay_peer(Instant::now(), &[local.into()]).map(|(t, _)| t), None);
+    assert_eq!(pm.reserve_block_relay_peer(Instant::now(), &[]).map(|(t, _)| t), Some(local.into()));
 }

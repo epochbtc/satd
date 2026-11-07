@@ -5191,16 +5191,17 @@ impl PeerManager {
         self.redial_manual_peers(now);
         self.evict_extra_outbound_peer();
         self.resolve_tried_collisions();
-        self.dial_automatic_peers(now);
-        self.open_block_relay_peer(now);
+        let dialled = self.dial_automatic_peers(now);
+        self.open_block_relay_peer(now, &dialled);
         self.open_feeler(now);
         self.open_extra_network_peer(now);
     }
 
     /// Open a block-relay-only peer if one is wanted:
-    /// [`Self::reserve_block_relay_peer`], then the dial.
-    fn open_block_relay_peer(self: &Arc<Self>, now: Instant) {
-        let Some((target, slot)) = self.reserve_block_relay_peer(now) else {
+    /// [`Self::reserve_block_relay_peer`], then the dial. `dialled` is what
+    /// the full-relay half of this pass just started.
+    fn open_block_relay_peer(self: &Arc<Self>, now: Instant, dialled: &[PeerAddr]) {
+        let Some((target, slot)) = self.reserve_block_relay_peer(now, dialled) else {
             return;
         };
         tracing::debug!(%target, "Making block-relay-only connection");
@@ -5222,21 +5223,29 @@ impl PeerManager {
     /// The address is drawn as every automatic one is
     /// ([`Self::automatic_dial_order`], [`Self::automatic_dial_may_take`],
     /// and one peer per network group, which these peers count toward, as
-    /// in Core).
-    fn reserve_block_relay_peer(self: &Arc<Self>, now: Instant) -> Option<(PeerAddr, DialSlot)> {
-        if !self.automatic_outbound.load(Ordering::Relaxed) {
-            return None;
-        }
+    /// in Core). `dialled` are the dials this pass started: their tasks may
+    /// not have claimed their addresses yet, so their addresses and groups
+    /// are passed over here. Under `-connect` [`Self::may_dial`] refuses
+    /// every learned address.
+    fn reserve_block_relay_peer(
+        self: &Arc<Self>,
+        now: Instant,
+        dialled: &[PeerAddr],
+    ) -> Option<(PeerAddr, DialSlot)> {
         let slot = self.reserve_dial(DialBudget::BlockRelay).ok()?;
         let recent = now.checked_sub(RECENT_TRY_WINDOW);
         let tried_recently =
             |c: &DialCandidate| recent.is_some_and(|since| self.tried_since(&c.addr, since));
         let (tip_depth, restore_pending) = self.desirable_services_inputs();
-        let groups = self.outbound_netgroups();
+        let mut groups = self.outbound_netgroups();
+        groups.extend(dialled.iter().filter_map(|a| match a {
+            PeerAddr::Socket(sa) => self.outbound_netgroup(sa.ip()),
+            PeerAddr::Onion { .. } => None,
+        }));
         let mut rng = rand::thread_rng();
         let mut chosen = None;
         pass_over_recent_tries(self.automatic_dial_order(&mut rng), tried_recently, |c, tries| {
-            if !self.automatic_dial_may_take(&c, tries, now, tip_depth, restore_pending) {
+            if dialled.contains(&c.addr) || !self.automatic_dial_may_take(&c, tries, now, tip_depth, restore_pending) {
                 return Ok(false);
             }
             if let PeerAddr::Socket(sa) = &c.addr
@@ -5559,10 +5568,13 @@ impl PeerManager {
     /// [`Self::may_dial`]. A banned address is skipped, an onion host
     /// included (`setban <host>.onion`, or a ban for misbehaviour), as Core
     /// skips a banned address for an automatic connection.
-    fn dial_automatic_peers(self: &Arc<Self>, now: Instant) {
+    fn dial_automatic_peers(self: &Arc<Self>, now: Instant) -> Vec<PeerAddr> {
+        let mut dialled = Vec::new();
         for (target, slot) in self.reserve_automatic_dials(now) {
+            dialled.push(target.clone());
             self.spawn_redial(target, slot, AUTOMATIC_RECONNECT_MAX_BACKOFF);
         }
+        dialled
     }
 
     /// Whether the reconnect loop should dial `target` now: it is neither
