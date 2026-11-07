@@ -1131,7 +1131,7 @@ mod nap_aggregator {
     #[test]
     fn a_pull_connection_cannot_be_opened_through_addconnection() {
         let (pm, _dir) = mk_pm();
-        assert!(pm.check_outbound_limit_for(ConnType::NapPull, &[]).is_err());
+        assert!(pm.check_outbound_limit_for(ConnType::NapPull, &[], &DialsInFlight::default()).is_err());
         assert_eq!(ConnType::from_addconnection_str("nap-pull"), None);
     }
 

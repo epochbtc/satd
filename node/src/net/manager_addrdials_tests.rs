@@ -203,7 +203,7 @@ async fn settle(pm: &PeerManager) {
     loop {
         let in_flight = {
             let d = pm.dials_in_flight.lock();
-            d.automatic + d.added_node + d.extra_network
+            d.automatic + d.added_node + d.extra_network + d.block_relay
         };
         if in_flight == 0 && pm.pending_connections.read().is_empty() && pm.pending_onion_dials.read().is_empty() {
             break;
@@ -299,16 +299,21 @@ async fn a_reconnect_tick_starts_no_more_automatic_dials_than_free_slots() {
         learn(&pm, l.addr);
     }
 
+    // Five full-relay dials, and with the target met by those in flight,
+    // a block-relay-only one: one a pass.
     pm.reconnect_tick();
-    wait_for(&pm, || total_accepts(&ls) >= 5, "five dials reach a listener").await;
+    wait_for(&pm, || total_accepts(&ls) >= 6, "six dials reach a listener").await;
     settle(&pm).await;
-    assert_eq!(total_accepts(&ls), 5, "five free slots, five dials");
+    assert_eq!(total_accepts(&ls), 6, "five free slots, five dials, and a block-relay-only one");
     assert_eq!(pm.automatic_outbound_peers(), 8, "the target is reached");
 
-    // Full now: the next tick starts nothing.
+    // The second block-relay-only peer, then nothing.
     pm.reconnect_tick();
     settle(&pm).await;
-    assert_eq!(total_accepts(&ls), 5);
+    assert_eq!(total_accepts(&ls), 7);
+    pm.reconnect_tick();
+    settle(&pm).await;
+    assert_eq!(total_accepts(&ls), 7);
 }
 
 /// Manual connections are outside the automatic target, as in Core, where
@@ -1171,6 +1176,7 @@ fn feeler_target(pm: &Arc<PeerManager>) -> Option<PeerAddr> {
 fn no_feeler_while_the_automatic_target_is_unmet() {
     let (pm, _dir) = mk_pm();
     leave_ibd(&pm);
+    fill_block_relay(&pm, MAX_OUTBOUND_BLOCK_RELAY);
     learn(&pm, SocketAddr::from(([44, 1, 2, 3], 8333)));
     fill_automatic(&pm, 7);
     feeler_due(&pm);
@@ -1188,6 +1194,7 @@ fn no_feeler_while_the_automatic_target_is_unmet() {
 fn a_feeler_sets_the_timer_again() {
     let (pm, _dir) = mk_pm();
     leave_ibd(&pm);
+    fill_block_relay(&pm, MAX_OUTBOUND_BLOCK_RELAY);
     learn(&pm, SocketAddr::from(([44, 1, 2, 3], 8333)));
     fill_automatic(&pm, 8);
     assert!(feeler_target(&pm).is_some());
@@ -1203,6 +1210,7 @@ fn a_feeler_sets_the_timer_again() {
 fn a_feeler_tests_a_new_entry_in_any_group() {
     let (pm, _dir) = mk_pm();
     leave_ibd(&pm);
+    fill_block_relay(&pm, MAX_OUTBOUND_BLOCK_RELAY);
     fill_automatic(&pm, 7);
     add_peer(&pm, peer(1, SocketAddr::from(([44, 1, 0, 1], 8333)), Direction::Outbound));
     let tried = SocketAddr::from(([45, 1, 2, 3], 8333));
@@ -1229,6 +1237,7 @@ fn a_feeler_needs_only_a_useful_address_book() {
     let neither = SocketAddr::from(([45, 1, 2, 3], 8333));
     let (pm, _dir) = mk_pm();
     leave_ibd(&pm);
+    fill_block_relay(&pm, MAX_OUTBOUND_BLOCK_RELAY);
     fill_automatic(&pm, 8);
     let now = now_unix_secs();
     assert!(pm.addrman.write().add_from(neither, now, ServiceFlags::WITNESS.to_u64(), source));
@@ -1272,6 +1281,7 @@ async fn a_feeler_moves_a_new_entry_to_tried() {
 async fn a_failed_feeler_counts_an_attempt() {
     let (pm, _dir) = mk_pm();
     leave_ibd(&pm);
+    fill_block_relay(&pm, MAX_OUTBOUND_BLOCK_RELAY);
     fill_automatic(&pm, 8);
     let closed = {
         let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1318,6 +1328,7 @@ fn fill_ipv4(pm: &PeerManager, n: usize) {
 fn an_extra_peer_goes_to_the_reachable_network_with_none() {
     let (pm, _dir) = mk_pm_tor();
     leave_ibd(&pm);
+    fill_block_relay(&pm, MAX_OUTBOUND_BLOCK_RELAY);
     fill_ipv4(&pm, MAX_OUTBOUND);
     learn(&pm, SocketAddr::from(([44, 1, 2, 3], 8333)));
     learn(&pm, SocketAddr::from(([45, 1, 2, 3], 8333)));
@@ -1338,6 +1349,7 @@ fn an_extra_peer_goes_to_the_reachable_network_with_none() {
 fn no_extra_peer_without_a_network_to_reach() {
     let (pm, _dir) = mk_pm_tor();
     leave_ibd(&pm);
+    fill_block_relay(&pm, MAX_OUTBOUND_BLOCK_RELAY);
     fill_ipv4(&pm, MAX_OUTBOUND);
     learn(&pm, SocketAddr::from(([44, 1, 2, 3], 8333)));
     extra_network_due(&pm);
@@ -1359,6 +1371,7 @@ fn no_extra_peer_without_a_network_to_reach() {
 fn an_unreachable_network_draws_no_extra_peer() {
     let (pm, _dir) = mk_pm();
     leave_ibd(&pm);
+    fill_block_relay(&pm, MAX_OUTBOUND_BLOCK_RELAY);
     fill_ipv4(&pm, MAX_OUTBOUND);
     learn_onion(&pm, &onion_host(1), 8333);
     assert_eq!(extra_network_target(&pm), None);
@@ -1375,6 +1388,7 @@ fn an_unreachable_network_draws_no_extra_peer() {
 #[test]
 fn no_extra_peer_off_the_full_relay_target() {
     let (pm, _dir) = mk_pm_tor();
+    fill_block_relay(&pm, MAX_OUTBOUND_BLOCK_RELAY);
     leave_ibd(&pm);
     learn_onion(&pm, &onion_host(1), 8333);
     fill_ipv4(&pm, MAX_OUTBOUND - 1);
@@ -1388,6 +1402,7 @@ fn no_extra_peer_off_the_full_relay_target() {
     assert_eq!(extra_network_target(&pm), None, "above the target");
 
     let (pm, _dir) = mk_pm_tor();
+    fill_block_relay(&pm, MAX_OUTBOUND_BLOCK_RELAY);
     learn_onion(&pm, &onion_host(1), 8333);
     fill_ipv4(&pm, MAX_OUTBOUND);
     pm.headers_tip.store(1000, Ordering::Relaxed);
@@ -1395,6 +1410,7 @@ fn no_extra_peer_off_the_full_relay_target() {
     assert_eq!(extra_network_target(&pm), None, "during IBD");
 
     let (pm, _dir) = mk_pm_tor();
+    fill_block_relay(&pm, MAX_OUTBOUND_BLOCK_RELAY);
     leave_ibd(&pm);
     learn_onion(&pm, &onion_host(1), 8333);
     fill_ipv4(&pm, 6);
@@ -1407,6 +1423,7 @@ fn no_extra_peer_off_the_full_relay_target() {
 fn one_extra_network_dial_at_a_time() {
     let (pm, _dir) = mk_pm_tor();
     leave_ibd(&pm);
+    fill_block_relay(&pm, MAX_OUTBOUND_BLOCK_RELAY);
     fill_ipv4(&pm, MAX_OUTBOUND);
     learn_onion(&pm, &onion_host(1), 8333);
     learn_onion(&pm, &onion_host(2), 8333);
@@ -1427,6 +1444,7 @@ fn one_extra_network_dial_at_a_time() {
 fn a_network_being_dialled_draws_no_extra_peer() {
     let (pm, _dir) = mk_pm_tor();
     leave_ibd(&pm);
+    fill_block_relay(&pm, MAX_OUTBOUND_BLOCK_RELAY);
     fill_ipv4(&pm, MAX_OUTBOUND);
     learn_onion(&pm, &onion_host(1), 8333);
     pm.pending_onion_dials.write().insert(onion_host(2));
@@ -1446,6 +1464,7 @@ fn a_network_being_dialled_draws_no_extra_peer() {
 fn no_extra_peer_without_an_outbound_grant() {
     let (pm, _dir) = mk_pm_tor();
     leave_ibd(&pm);
+    fill_block_relay(&pm, MAX_OUTBOUND_BLOCK_RELAY);
     fill_ipv4(&pm, MAX_OUTBOUND);
     learn_onion(&pm, &onion_host(1), 8333);
     pm.set_max_connections(MAX_OUTBOUND);
@@ -1483,6 +1502,7 @@ fn the_extra_peer_survives_eviction_as_the_only_one_on_its_network() {
 async fn the_reconnect_loop_dials_the_extra_peer() {
     let (pm, _dir) = mk_pm_tor();
     leave_ibd(&pm);
+    fill_block_relay(&pm, MAX_OUTBOUND_BLOCK_RELAY);
     fill_ipv4(&pm, MAX_OUTBOUND);
     let host = onion_host(1);
     learn_onion(&pm, &host, 8333);
@@ -1492,4 +1512,239 @@ async fn the_reconnect_loop_dials_the_extra_peer() {
     wait_for(&pm, || pm.onion_reconnect_backoff.read().contains_key(&key), "the onion is dialled").await;
     settle(&pm).await;
     assert_eq!(pm.dials_in_flight.lock().extra_network, 0, "the slot went back");
+}
+
+// ---- Automatic block-relay-only peers (#1225) ----
+
+/// `n` connected block-relay-only peers, each in a public /16 of its own,
+/// ids from 4000.
+fn fill_block_relay(pm: &PeerManager, n: usize) {
+    for i in 0..n {
+        let mut info = peer(4000 + i as PeerId, SocketAddr::from(([80 + i as u8, 1, 0, 1], 8333)), Direction::Outbound);
+        info.conn_type = ConnType::BlockRelay;
+        add_peer(pm, info);
+    }
+}
+
+/// The address a block-relay-only peer would be dialled at now. The slot
+/// goes back at the end of this call.
+fn block_relay_target(pm: &Arc<PeerManager>) -> Option<PeerAddr> {
+    pm.reserve_block_relay_peer(Instant::now(), &[]).map(|(target, _slot)| target)
+}
+
+/// #1225: Core opens block-relay-only peers once the full-relay target is
+/// met, in the `else if` after it. One short, the slot goes to a full-relay
+/// dial.
+#[test]
+fn no_block_relay_peer_off_the_full_relay_target() {
+    let (pm, _dir) = mk_pm();
+    leave_ibd(&pm);
+    let addr = SocketAddr::from(([44, 1, 2, 3], 8333));
+    learn(&pm, addr);
+    fill_automatic(&pm, MAX_OUTBOUND - 1);
+    assert_eq!(block_relay_target(&pm), None);
+    fill_automatic(&pm, MAX_OUTBOUND);
+    assert_eq!(block_relay_target(&pm), Some(addr.into()));
+}
+
+/// Two at most, Core's `MAX_BLOCK_RELAY_ONLY_CONNECTIONS`, dials in flight
+/// counted.
+#[test]
+fn block_relay_peers_stop_at_two() {
+    let (pm, _dir) = mk_pm();
+    leave_ibd(&pm);
+    learn(&pm, SocketAddr::from(([44, 1, 2, 3], 8333)));
+    learn(&pm, SocketAddr::from(([45, 1, 2, 3], 8333)));
+    fill_automatic(&pm, MAX_OUTBOUND);
+    fill_block_relay(&pm, 1);
+    let in_flight = pm.reserve_block_relay_peer(Instant::now(), &[]).expect("the second");
+    assert_eq!(block_relay_target(&pm), None, "one connected, one being dialled");
+    let held = pm.dials_in_flight.lock();
+    assert!(pm.check_outbound_limit_for(ConnType::BlockRelay, &[], &held).is_err(), "nor by addconnection");
+    drop(held);
+    drop(in_flight);
+    assert!(block_relay_target(&pm).is_some());
+    fill_block_relay(&pm, 2);
+    assert_eq!(block_relay_target(&pm), None, "two connected");
+}
+
+/// The limit is Core's `min(2, maxconnections - min(8, maxconnections))`:
+/// none at `-maxconnections` 8, one at 9. `addconnection` takes the same
+/// limit.
+#[test]
+fn the_block_relay_limit_follows_maxconnections() {
+    let (pm, _dir) = mk_pm();
+    leave_ibd(&pm);
+    learn(&pm, SocketAddr::from(([44, 1, 2, 3], 8333)));
+    fill_automatic(&pm, MAX_OUTBOUND);
+    for (max, want) in [(4, 0), (8, 0), (9, 1), (10, 2), (125, 2)] {
+        pm.set_max_connections(max);
+        assert_eq!(pm.max_outbound_block_relay(), want, "-maxconnections={max}");
+    }
+    pm.set_max_connections(MAX_OUTBOUND);
+    assert_eq!(block_relay_target(&pm), None, "-maxconnections=8");
+    assert!(pm.check_outbound_limit_for(ConnType::BlockRelay, &[], &DialsInFlight::default()).is_err());
+    pm.set_max_connections(9);
+    assert!(block_relay_target(&pm).is_some(), "-maxconnections=9");
+    fill_block_relay(&pm, 1);
+    assert_eq!(block_relay_target(&pm), None, "the one at 9 is open");
+    assert!(pm.check_outbound_limit_for(ConnType::BlockRelay, &[], &DialsInFlight::default()).is_err());
+}
+
+/// A block-relay-only peer takes an outbound grant, Core's `semOutbound`:
+/// with a feeler holding the last one at `-maxconnections` 10, none opens;
+/// and a block-relay-only dial in flight holding it, no feeler opens.
+#[test]
+fn no_block_relay_peer_without_an_outbound_grant() {
+    let (pm, _dir) = mk_pm();
+    leave_ibd(&pm);
+    learn(&pm, SocketAddr::from(([44, 1, 2, 3], 8333)));
+    fill_automatic(&pm, MAX_OUTBOUND);
+    fill_block_relay(&pm, 1);
+    pm.set_max_connections(10);
+    pm.pending_typed_dials.write().push(ConnType::Feeler);
+    assert_eq!(block_relay_target(&pm), None);
+    pm.pending_typed_dials.write().clear();
+    let block_relay = pm.reserve_block_relay_peer(Instant::now(), &[]).expect("the last grant");
+    // The dial in flight holds the last grant: no feeler.
+    feeler_due(&pm);
+    assert!(pm.reserve_feeler(Instant::now()).is_none(), "the block-relay-only dial holds the grant");
+    drop(block_relay);
+}
+
+/// A block-relay-only peer, automatic or `addconnection`'s, takes no slot
+/// of the full-relay target: Core counts `nOutboundFullRelay` and
+/// `nOutboundBlockRelay` apart. With two open, a dropped full-relay peer is
+/// still replaced.
+#[test]
+fn a_block_relay_peer_takes_no_full_relay_slot() {
+    let (pm, _dir) = mk_pm();
+    leave_ibd(&pm);
+    fill_automatic(&pm, MAX_OUTBOUND - 1);
+    fill_block_relay(&pm, 1);
+    pm.pending_typed_dials.write().push(ConnType::BlockRelay);
+    let slot = pm.reserve_dial(DialBudget::Automatic).expect("the eighth full-relay slot");
+    assert!(pm.reserve_dial(DialBudget::Automatic).is_err(), "the target is met");
+    drop(slot);
+}
+
+/// One peer per network group, as for every automatic peer: a candidate in
+/// the group of a block-relay-only peer is skipped by either kind of dial,
+/// and a block-relay-only dial skips one in the group of a full-relay peer.
+#[test]
+fn block_relay_peers_keep_the_netgroup_rule() {
+    let (pm, _dir) = mk_pm();
+    leave_ibd(&pm);
+    fill_automatic(&pm, MAX_OUTBOUND - 1);
+    add_peer(&pm, peer(1, SocketAddr::from(([44, 1, 0, 1], 8333)), Direction::Outbound));
+    fill_block_relay(&pm, 1); // 80.1.0.1
+    learn(&pm, SocketAddr::from(([44, 1, 9, 9], 8333)));
+    learn(&pm, SocketAddr::from(([80, 1, 9, 9], 8333)));
+    assert_eq!(block_relay_target(&pm), None, "both candidates share a held group");
+    let fresh = SocketAddr::from(([45, 1, 2, 3], 8333));
+    learn(&pm, fresh);
+    for _ in 0..20 {
+        assert_eq!(block_relay_target(&pm), Some(fresh.into()));
+    }
+    // Three full-relay slots free, and two candidates to take them.
+    for id in [1, 1000, 1001] {
+        pm.peers.write().remove(&id);
+    }
+    let mut dials: Vec<PeerAddr> = pm.reserve_automatic_dials(Instant::now()).into_iter().map(|(a, _)| a).collect();
+    dials.sort();
+    let mut want: Vec<PeerAddr> = vec![SocketAddr::from(([44, 1, 9, 9], 8333)).into(), fresh.into()];
+    want.sort();
+    assert_eq!(dials, want, "not 80.1.9.9, in the block-relay-only peer's group");
+}
+
+/// The feeler and the extra-network peer wait for the block-relay-only
+/// target too, as Core checks their timers past it.
+#[test]
+fn the_feeler_and_the_extra_peer_wait_for_the_block_relay_target() {
+    let (pm, _dir) = mk_pm_tor();
+    leave_ibd(&pm);
+    learn(&pm, SocketAddr::from(([44, 1, 2, 3], 8333)));
+    learn_onion(&pm, &onion_host(1), 8333);
+    fill_ipv4(&pm, MAX_OUTBOUND);
+    fill_block_relay(&pm, 1);
+    assert_eq!(feeler_target(&pm), None);
+    assert_eq!(extra_network_target(&pm), None);
+    fill_block_relay(&pm, 2);
+    assert!(feeler_target(&pm).is_some());
+    assert!(extra_network_target(&pm).is_some());
+}
+
+/// The reconnect loop opens the peer as block-relay-only: its `version`
+/// asks for no transactions (`relay` false), and it is typed so.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_reconnect_loop_dials_a_block_relay_peer() {
+    use bitcoin::p2p::Magic;
+    let (pm, _dir) = mk_pm();
+    leave_ibd(&pm);
+    fill_automatic(&pm, MAX_OUTBOUND);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let target = listener.local_addr().unwrap();
+    learn(&pm, target);
+    pm.reconnect_tick();
+    let (accepted, _) = tokio::time::timeout(Duration::from_secs(10), listener.accept())
+        .await
+        .expect("the node dials")
+        .unwrap();
+    let mut theirs = Connection::with_magic(accepted, Magic::REGTEST);
+    let version = loop {
+        match tokio::time::timeout(Duration::from_secs(10), theirs.recv()).await {
+            Ok(Ok(NetworkMessage::Version(v))) => break v,
+            Ok(Ok(_)) => continue,
+            other => panic!("no version: {other:?}"),
+        }
+    };
+    assert!(!version.relay, "a block-relay-only link asks for no transactions");
+    assert!(
+        pm.peers.read().values().any(|h| h.info.addr == target && h.info.conn_type == ConnType::BlockRelay),
+        "typed block-relay-only"
+    );
+    assert_eq!(pm.dials_in_flight.lock().block_relay, 0, "the slot went back");
+}
+
+/// None under `-connect`, which turns the node's own dials off.
+#[test]
+fn no_block_relay_peer_under_connect() {
+    let (pm, _dir) = mk_pm();
+    leave_ibd(&pm);
+    learn(&pm, SocketAddr::from(([44, 1, 2, 3], 8333)));
+    fill_automatic(&pm, MAX_OUTBOUND);
+    pm.set_automatic_outbound(false);
+    assert_eq!(block_relay_target(&pm), None);
+    pm.set_automatic_outbound(true);
+    assert!(block_relay_target(&pm).is_some());
+}
+
+/// A block-relay-only dial passes over what the full-relay half of the same
+/// pass just started, by address and by network group: those dials' tasks
+/// may not have claimed their addresses yet.
+#[test]
+fn a_block_relay_peer_passes_over_this_passes_dials() {
+    let (pm, _dir) = mk_pm();
+    leave_ibd(&pm);
+    fill_automatic(&pm, MAX_OUTBOUND);
+    let same = SocketAddr::from(([44, 1, 2, 3], 8333));
+    let same_group = SocketAddr::from(([45, 1, 2, 3], 8333));
+    let fresh = SocketAddr::from(([46, 1, 2, 3], 8333));
+    learn(&pm, same);
+    learn(&pm, same_group);
+    let dialled = [PeerAddr::from(same), SocketAddr::from(([45, 1, 9, 9], 8333)).into()];
+    assert_eq!(pm.reserve_block_relay_peer(Instant::now(), &dialled).map(|(t, _)| t), None);
+    learn(&pm, fresh);
+    for _ in 0..20 {
+        assert_eq!(pm.reserve_block_relay_peer(Instant::now(), &dialled).map(|(t, _)| t), Some(fresh.into()));
+    }
+
+    // A regtest address in no network group: passed over by address.
+    let (pm, _dir) = mk_pm();
+    leave_ibd(&pm);
+    fill_automatic(&pm, MAX_OUTBOUND);
+    let local = SocketAddr::from(([127, 0, 0, 1], 18444));
+    learn(&pm, local);
+    assert_eq!(pm.reserve_block_relay_peer(Instant::now(), &[local.into()]).map(|(t, _)| t), None);
+    assert_eq!(pm.reserve_block_relay_peer(Instant::now(), &[]).map(|(t, _)| t), Some(local.into()));
 }
