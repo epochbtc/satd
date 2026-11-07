@@ -739,6 +739,11 @@ enum DialBudget {
     /// [`PeerManager::max_outbound_block_relay`], each with an outbound
     /// grant. Core's `BLOCK_RELAY` branch of `ThreadOpenConnections`.
     BlockRelay,
+    /// A block-relay-only peer dialled at an anchor
+    /// ([`PeerManager::open_anchor_peers`]): as [`Self::BlockRelay`], and
+    /// counted with it, but ahead of the full-relay peers, as Core dials
+    /// its anchors first.
+    Anchor,
 }
 
 /// Outbound dials in flight, per [`DialBudget`].
@@ -767,7 +772,9 @@ impl Drop for DialSlot {
             DialBudget::ExtraNetwork => {
                 in_flight.extra_network = in_flight.extra_network.saturating_sub(1)
             }
-            DialBudget::BlockRelay => in_flight.block_relay = in_flight.block_relay.saturating_sub(1),
+            DialBudget::BlockRelay | DialBudget::Anchor => {
+                in_flight.block_relay = in_flight.block_relay.saturating_sub(1)
+            }
             DialBudget::Unlimited => {}
         }
     }
@@ -1246,6 +1253,9 @@ pub struct PeerManager {
     unreadable_refetch_at: parking_lot::Mutex<HashMap<bitcoin::BlockHash, Instant>>,
     /// Bitcoin Core's `m_use_addrman_outgoing`. False under `-connect`.
     automatic_outbound: std::sync::atomic::AtomicBool,
+    /// The anchors read from `anchors.dat` at startup and not yet tried,
+    /// the next one last: Core's `m_anchors`. See [`Self::open_anchor_peers`].
+    anchors: parking_lot::Mutex<Vec<crate::net::anchors::Anchor>>,
     /// The networks automatic outbound connections may use, and gossiped
     /// addresses are kept from (Core's `g_reachable_nets`, from `-onlynet`).
     /// See [`crate::net::reachable`].
@@ -1713,6 +1723,7 @@ impl PeerManager {
             block_refetch: RwLock::new(HashMap::new()),
             unreadable_refetch_at: parking_lot::Mutex::new(HashMap::new()),
             automatic_outbound: std::sync::atomic::AtomicBool::new(true),
+            anchors: parking_lot::Mutex::new(Vec::new()),
             reachable: RwLock::new(Default::default()),
             onion_disabled: std::sync::atomic::AtomicBool::new(false),
             addr_response_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
@@ -2919,6 +2930,63 @@ impl PeerManager {
         }
     }
 
+    /// Read the anchors in `path` (`anchors.dat`) and delete the file, as
+    /// Core's `CConnman::Start` does (v31.1 `src/net.cpp:3520`): at most
+    /// [`MAX_BLOCK_RELAY_ONLY_ANCHORS`], the reconnect loop's first dials
+    /// ([`Self::open_anchor_peers`]). Not under `-connect`, which leaves
+    /// the file where it is: call it after [`Self::set_automatic_outbound`].
+    ///
+    /// [`MAX_BLOCK_RELAY_ONLY_ANCHORS`]: crate::net::anchors::MAX_BLOCK_RELAY_ONLY_ANCHORS
+    pub fn load_anchors(&self, path: &std::path::Path) {
+        use crate::net::anchors;
+        if !self.automatic_outbound.load(Ordering::Relaxed) {
+            return;
+        }
+        let mut read = anchors::read(path, self.chain_state.p2p_magic().to_bytes()).unwrap_or_else(|e| {
+            tracing::warn!("Could not read the anchors: {e}");
+            Vec::new()
+        });
+        read.truncate(anchors::MAX_BLOCK_RELAY_ONLY_ANCHORS);
+        tracing::info!("{} block-relay-only anchors will be tried for connections.", read.len());
+        *self.anchors.lock() = read;
+    }
+
+    /// Write the block-relay-only peers held now to `path` (`anchors.dat`),
+    /// at most [`MAX_BLOCK_RELAY_ONLY_ANCHORS`], oldest connection first:
+    /// Core's `StopNodes` (v31.1 `src/net.cpp:3675`), on a clean shutdown
+    /// only. Nothing is written under `-connect`.
+    ///
+    /// An onion anchor is written with its port; one whose `version` has
+    /// not arrived, with no services, as in Core.
+    ///
+    /// [`MAX_BLOCK_RELAY_ONLY_ANCHORS`]: crate::net::anchors::MAX_BLOCK_RELAY_ONLY_ANCHORS
+    pub fn dump_anchors(&self, path: &std::path::Path) {
+        use crate::net::anchors::{self, Anchor};
+        if !self.automatic_outbound.load(Ordering::Relaxed) {
+            return;
+        }
+        let mut held: Vec<(PeerId, Anchor)> = self
+            .peers
+            .read()
+            .values()
+            .filter(|h| h.info.conn_type == ConnType::BlockRelay && h.info.state != PeerState::Disconnected)
+            .map(|h| {
+                let addr = match &h.info.onion_host {
+                    Some(host) => PeerAddr::Onion { host: host.clone(), port: h.info.addr.port() },
+                    None => PeerAddr::Socket(h.info.addr),
+                };
+                (h.info.id, Anchor { addr, services: h.info.services })
+            })
+            .collect();
+        held.sort_by_key(|(id, _)| *id);
+        held.truncate(anchors::MAX_BLOCK_RELAY_ONLY_ANCHORS);
+        let held: Vec<Anchor> = held.into_iter().map(|(_, a)| a).collect();
+        tracing::info!("Flush {} outbound block-relay-only peer addresses to anchors.dat", held.len());
+        if let Err(e) = anchors::write(path, self.chain_state.p2p_magic().to_bytes(), &held) {
+            tracing::warn!("Could not write the anchors: {e}");
+        }
+    }
+
     /// Whether the address book is empty (used to gate DNS seeding /
     /// fixed-seed fallback).
     pub fn addrman_is_empty(&self) -> bool {
@@ -3797,6 +3865,16 @@ impl PeerManager {
                 }
                 in_flight.block_relay += 1;
             }
+            DialBudget::Anchor => {
+                // Core's first branch: no full-relay target to meet.
+                if self.block_relay_open(&in_flight) >= self.max_outbound_block_relay() {
+                    return Err("block-relay-only target reached".to_string());
+                }
+                if self.automatic_sockets_open(&in_flight) >= Self::max_automatic_outbound(&self.max_connections) {
+                    return Err("no outbound grant free".to_string());
+                }
+                in_flight.block_relay += 1;
+            }
             DialBudget::Unlimited => {}
         }
         Ok(DialSlot { pm: Arc::clone(self), budget })
@@ -3856,19 +3934,6 @@ impl PeerManager {
         if !self.is_network_active() {
             return Err("networking disabled (networkactive=false)".to_string());
         }
-        // satd types a connection at `spawn_peer`, which is reached from the
-        // socket dial path; the onion dial has its own path and no way to
-        // carry a requested type through it yet. Refuse by name rather than
-        // open an untyped connection the caller would then see reported as
-        // something else. This is a satd limitation Core does not have, so it
-        // stays a synchronous, named refusal instead of a line in the log —
-        // and recognising an onion target needs no resolver.
-        if crate::net::dns::is_onion_target(target) {
-            let host = target.rsplit_once(':').map_or(target, |(h, _)| h);
-            return Err(format!(
-                "addconnection cannot open a typed connection to an onion address ({host}) yet"
-            ));
-        }
         {
             // The dials in flight are locked first, as `reserve_dial` takes them.
             let in_flight = self.dials_in_flight.lock();
@@ -3884,9 +3949,17 @@ impl PeerManager {
             let _grant = OwnedTypedDialGuard { pm: pm.clone(), conn_type };
             let addr = match pm.resolve_peer_target(&target, default_port).await {
                 Ok(PeerAddr::Socket(sa)) => sa,
-                // Refused synchronously above; `resolve_peer_target` cannot
-                // return this for a target that got past that check.
-                Ok(PeerAddr::Onion { .. }) => return,
+                // Through the proxy, typed as asked (#1150: Core's
+                // `feature_anchors.py` opens a block-relay-only onion).
+                Ok(PeerAddr::Onion { host, port }) => {
+                    if let Err(e) = pm
+                        .connect_outbound_onion_inner(&host, port, Some(conn_type), Some(use_v2), false)
+                        .await
+                    {
+                        tracing::debug!(%host, port, ?conn_type, "addconnection dial failed: {e}");
+                    }
+                    return;
+                }
                 Err(e) => {
                     tracing::debug!(
                         %target,
@@ -4102,7 +4175,7 @@ impl PeerManager {
         port: u16,
         conn_type: Option<ConnType>,
     ) -> Result<(), String> {
-        self.connect_outbound_onion_inner(host, port, conn_type, true).await
+        self.connect_outbound_onion_inner(host, port, conn_type, None, true).await
     }
 
     /// `connect_outbound_onion`, with the [`DialSlot`] optional, as in
@@ -4112,6 +4185,7 @@ impl PeerManager {
         host: &str,
         port: u16,
         conn_type: Option<ConnType>,
+        use_v2: Option<bool>,
         reserve: bool,
     ) -> Result<(), String> {
         if !self.is_network_active() {
@@ -4167,7 +4241,7 @@ impl PeerManager {
         tracing::info!(onion = host, id, "Connecting to .onion peer via proxy");
 
         let (conn, id) = self
-            .establish_outbound(id, stream, OutboundDial::Onion(host.to_string(), port), None)
+            .establish_outbound(id, stream, OutboundDial::Onion(host.to_string(), port), use_v2)
             .await?;
 
         // Re-check after the dial + handshake awaits (see connect_outbound):
@@ -4245,7 +4319,7 @@ impl PeerManager {
                 self.connect_outbound_inner(*sa, Some(ConnType::Manual), use_v2, false).await
             }
             PeerAddr::Onion { host, port } => {
-                self.connect_outbound_onion_inner(host, *port, Some(ConnType::Manual), false).await
+                self.connect_outbound_onion_inner(host, *port, Some(ConnType::Manual), None, false).await
             }
         }
     }
@@ -5191,10 +5265,103 @@ impl PeerManager {
         self.redial_manual_peers(now);
         self.evict_extra_outbound_peer();
         self.resolve_tried_collisions();
-        let dialled = self.dial_automatic_peers(now);
+        let mut dialled = self.open_anchor_peers(now);
+        dialled.extend(self.dial_automatic_peers(now, &dialled));
         self.open_block_relay_peer(now, &dialled);
         self.open_feeler(now);
         self.open_extra_network_peer(now);
+    }
+
+    /// Dial the anchors read at startup ([`Self::load_anchors`]) as
+    /// block-relay-only peers, ahead of every other automatic dial: Core's
+    /// first branch of `ThreadOpenConnections` (v31.1 `src/net.cpp:2737`).
+    /// Returns the addresses dialled.
+    ///
+    /// Each takes a block-relay-only place and an outbound grant
+    /// ([`DialBudget::Anchor`]); none is dialled once
+    /// [`Self::max_outbound_block_relay`] are open. Each anchor is taken off
+    /// the list whether it is dialled or not, so it is tried at most once.
+    /// One is passed over, as in Core (`src/net.cpp:2799`), if it is not a
+    /// valid address, is one of the node's own, or lacks the desirable
+    /// services, or if its network group already holds an outbound peer
+    /// (an earlier anchor's included). Also as any automatic dial: an
+    /// address the operator named, an unreachable or banned one, or one
+    /// connected or being dialled.
+    ///
+    /// Core dials one connection per turn of its loop, and an anchor turn
+    /// that passes over every anchor goes on to draw a block-relay-only peer
+    /// from the address book, full-relay target or not. satd dials its
+    /// anchors in one pass and then fills the full-relay target first, as
+    /// on every later pass.
+    fn open_anchor_peers(self: &Arc<Self>, now: Instant) -> Vec<PeerAddr> {
+        let mut dialled = Vec::new();
+        for (target, slot) in self.reserve_anchor_dials(now) {
+            tracing::debug!("Trying to make an anchor connection to {target}");
+            dialled.push(target.clone());
+            let pm = Arc::clone(self);
+            tokio::spawn(async move {
+                let _slot = slot;
+                pm.dial_book_target(&target, Some(ConnType::BlockRelay), AUTOMATIC_RECONNECT_MAX_BACKOFF).await;
+            });
+        }
+        dialled
+    }
+
+    /// The anchors [`Self::open_anchor_peers`] dials this pass, each with
+    /// its place in the dial limit.
+    fn reserve_anchor_dials(self: &Arc<Self>, now: Instant) -> Vec<(PeerAddr, DialSlot)> {
+        let mut dials: Vec<(PeerAddr, DialSlot)> = Vec::new();
+        while !self.anchors.lock().is_empty() {
+            let Ok(slot) = self.reserve_dial(DialBudget::Anchor) else {
+                break;
+            };
+            let taken: Vec<PeerAddr> = dials.iter().map(|(a, _)| a.clone()).collect();
+            let Some(target) = self.next_anchor(now, &taken) else {
+                break;
+            };
+            dials.push((target, slot));
+        }
+        dials
+    }
+
+    /// Take anchors off the list until one may be dialled, and return it
+    /// (see [`Self::open_anchor_peers`]). `dialled` are the anchors this
+    /// pass already took, whose groups count as held.
+    fn next_anchor(&self, now: Instant, dialled: &[PeerAddr]) -> Option<PeerAddr> {
+        let (tip_depth, restore_pending) = self.desirable_services_inputs();
+        let mut groups = self.outbound_netgroups();
+        groups.extend(dialled.iter().filter_map(|a| match a {
+            PeerAddr::Socket(sa) => self.outbound_netgroup(sa.ip()),
+            PeerAddr::Onion { .. } => None,
+        }));
+        let local = self.local_addresses();
+        loop {
+            let anchor = self.anchors.lock().pop()?;
+            let valid = match &anchor.addr {
+                PeerAddr::Socket(sa) => crate::net::is_valid(sa.ip()) && sa.port() != 0,
+                PeerAddr::Onion { host, port } => *port != 0 && crate::net::peer::onion_host_to_torv3_pubkey(host).is_some(),
+            };
+            let host = match &anchor.addr {
+                PeerAddr::Socket(sa) => sa.ip().to_string(),
+                PeerAddr::Onion { host, .. } => host.clone(),
+            };
+            let own = local.iter().any(|(h, p, _)| *h == host && *p == anchor.addr.port());
+            let candidate = DialCandidate { addr: anchor.addr, services: anchor.services.to_u64() };
+            // A bad port is no reason to pass over an anchor, in Core.
+            if !valid
+                || own
+                || dialled.contains(&candidate.addr)
+                || !self.automatic_dial_may_take(&candidate, usize::MAX, now, tip_depth, restore_pending)
+            {
+                continue;
+            }
+            if let PeerAddr::Socket(sa) = &candidate.addr
+                && self.outbound_netgroup(sa.ip()).is_some_and(|g| groups.contains(&g))
+            {
+                continue;
+            }
+            return Some(candidate.addr);
+        }
     }
 
     /// Open a block-relay-only peer if one is wanted:
@@ -5554,10 +5721,12 @@ impl PeerManager {
     /// every other automatic dial (the outbound target and one peer per
     /// network group), as Core adds a seed's answers to its address book
     /// and leaves the dialling to `ThreadOpenConnections`. Nothing while
-    /// networking is paused.
+    /// networking is paused. Anchors not yet dialled go first, as on a pass.
     pub fn dial_learned_peers(self: &Arc<Self>) {
         if self.is_network_active() {
-            self.dial_automatic_peers(Instant::now());
+            let now = Instant::now();
+            let anchors = self.open_anchor_peers(now);
+            self.dial_automatic_peers(now, &anchors);
         }
     }
 
@@ -5568,9 +5737,9 @@ impl PeerManager {
     /// [`Self::may_dial`]. A banned address is skipped, an onion host
     /// included (`setban <host>.onion`, or a ban for misbehaviour), as Core
     /// skips a banned address for an automatic connection.
-    fn dial_automatic_peers(self: &Arc<Self>, now: Instant) -> Vec<PeerAddr> {
+    fn dial_automatic_peers(self: &Arc<Self>, now: Instant, taken: &[PeerAddr]) -> Vec<PeerAddr> {
         let mut dialled = Vec::new();
-        for (target, slot) in self.reserve_automatic_dials(now) {
+        for (target, slot) in self.reserve_automatic_dials(now, taken) {
             dialled.push(target.clone());
             self.spawn_redial(target, slot, AUTOMATIC_RECONNECT_MAX_BACKOFF);
         }
@@ -5633,7 +5802,7 @@ impl PeerManager {
     /// circuit through the one proxy, so a pass starts at most
     /// [`MAX_ONION_DIALS_PER_TICK`] of them; the one-per-group rule leaves
     /// them alone ([`Self::outbound_netgroup`]).
-    fn reserve_automatic_dials(self: &Arc<Self>, now: Instant) -> Vec<(PeerAddr, DialSlot)> {
+    fn reserve_automatic_dials(self: &Arc<Self>, now: Instant, taken: &[PeerAddr]) -> Vec<(PeerAddr, DialSlot)> {
         if !self.automatic_outbound.load(Ordering::Relaxed) {
             return Vec::new();
         }
@@ -5642,6 +5811,10 @@ impl PeerManager {
             |c: &DialCandidate| recent.is_some_and(|since| self.tried_since(&c.addr, since));
         let (tip_depth, restore_pending) = self.desirable_services_inputs();
         let mut groups = self.outbound_netgroups();
+        groups.extend(taken.iter().filter_map(|a| match a {
+            PeerAddr::Socket(sa) => self.outbound_netgroup(sa.ip()),
+            PeerAddr::Onion { .. } => None,
+        }));
         let mut dials = Vec::new();
         // One automatic outbound peer per network group, as Core requires
         // (v31.1 `src/net.cpp:2829`): a candidate in a group the node
@@ -5676,7 +5849,7 @@ impl PeerManager {
             self.automatic_dial_order(&mut rng),
             tried_recently,
             |c, tries| {
-                if !self.automatic_dial_may_take(&c, tries, now, tip_depth, restore_pending) {
+                if taken.contains(&c.addr) || !self.automatic_dial_may_take(&c, tries, now, tip_depth, restore_pending) {
                     return Ok(false);
                 }
                 take(c.addr)
@@ -6035,7 +6208,7 @@ impl PeerManager {
         let result = match target {
             PeerAddr::Socket(sa) => self.connect_outbound_inner(*sa, conn_type, None, false).await,
             PeerAddr::Onion { host, port } => {
-                self.connect_outbound_onion_inner(host, *port, conn_type, false).await
+                self.connect_outbound_onion_inner(host, *port, conn_type, None, false).await
             }
         };
         if let Err(e) = &result {
@@ -6584,6 +6757,13 @@ impl PeerManager {
             }
             if ticks.is_multiple_of(20) && self.is_network_active() {
                 self.reconnect_tick();
+            } else if self.is_network_active() && !self.anchors.lock().is_empty() {
+                // Anchors go out on the first tick, not on the first
+                // reconnect pass ten seconds in: Core tries them on the
+                // first turn of `ThreadOpenConnections`, which waits 500 ms.
+                // Until the list is empty, as an anchor that finds no
+                // block-relay-only place stays on it in Core.
+                self.open_anchor_peers(Instant::now());
             }
 
             // Drop addr-fetch connections whose peer never sent a usable
@@ -17331,7 +17511,7 @@ mod tests {
         let other: SocketAddr = "127.0.0.1:18464".parse().unwrap();
         pm.add_learned_peer_addr(&PeerAddr::Socket(other));
         assert!(pm.addrman.read().contains(&other.into()));
-        assert!(pm.reserve_automatic_dials(Instant::now()).is_empty());
+        assert!(pm.reserve_automatic_dials(Instant::now(), &[]).is_empty());
     }
 
     /// Every socket dial refuses an address that names no host, manual or

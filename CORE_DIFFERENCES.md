@@ -86,7 +86,7 @@ artifacts, signing stack) but no protocol consequences.
 | **JSON-RPC server** | bespoke HTTP / SSL stack | `jsonrpsee` over `tower` middleware (with native TLS support) |
 | **Reproducible builds** | Guix | Nix flake (Guix may follow if a downstream packager needs it) |
 | **Release signing** | GPG (PGP) | minisign (artifacts) + cosign keyless (containers) + SSH sigs (git tags). No GPG. |
-| **Peer address store** | `peers.dat` (Core bucketed addrman serialization) | `peers.dat` with a satd-native versioned format (magic `SADR`) — **not** byte-compatible with Core's file |
+| **Peer address store** | `peers.dat` (Core bucketed addrman serialization) | `peers.dat` with a satd-native versioned format (magic `SADR`) — **not** byte-compatible with Core's file. `anchors.dat` (the block-relay-only peers kept across a restart) **is** Core's format, and the two read each other's. |
 | **Log destination** | `debug.log` file in the datadir (plus optional console); internal rotation; `SIGHUP` reopens the file | **stdout only**; no `debug.log`. Rotation/retention is delegated to systemd-journald or the container runtime. `SIGHUP` is therefore free for config reload (see Operator-facing additions). |
 
 **On `peers.dat` compatibility.** satd persists its address manager to

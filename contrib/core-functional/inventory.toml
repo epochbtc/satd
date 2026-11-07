@@ -25,9 +25,7 @@ note = "measured 2026-09-15: L65 assert_debug_log 'Loaded 0 addresses from peers
 
 [[test]]
 file = "feature_anchors.py"
-status = "skip"
-reason = "core-net-policy"
-note = "measured 2026-09-15: L66 opens node0/regtest/anchors.dat, which satd never writes. Core persists its block-relay-only peers there on shutdown and re-dials them at startup. Follow-up: anchors.dat"
+status = "run"
 
 [[test]]
 file = "feature_asmap.py"

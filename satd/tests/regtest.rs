@@ -19927,16 +19927,12 @@ fn addconnection_reports_success_when_the_target_does_not_resolve() {
     assert!(info["error"].is_null(), "{info}");
 }
 
-/// The one refusal that is satd's own, and stays synchronous.
-///
-/// satd types a connection at `spawn_peer`, on the socket dial path; the onion
-/// dial has no way to carry a requested type yet. Core has no such limitation,
-/// so this is a divergence — and a named error is the honest way to report a
-/// call that cannot do what it says, rather than a silent success and a log
-/// line the caller never sees. Recognising an onion target needs no resolver,
-/// which is why moving resolution to the dial task did not move this.
+/// An onion target is accepted, as Core accepts it: the dial goes through
+/// the proxy on the dial task, and a dial that fails (here, with no proxy)
+/// is a line in the log, not an error. satd refused a typed onion
+/// connection until its onion dial could carry the type (#1150).
 #[test]
-fn addconnection_refuses_an_onion_target_by_name() {
+fn addconnection_accepts_an_onion_target() {
     use serde_json::json;
 
     let node = TestNode::start(&["-dns=0"]);
@@ -19944,18 +19940,13 @@ fn addconnection_refuses_an_onion_target_by_name() {
         .rpc_call_with_params(
             "addconnection",
             vec![
-                json!("abcdefghijklmnop.onion:8333"),
-                json!("outbound-full-relay"),
+                json!("pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.onion:8333"),
+                json!("block-relay-only"),
                 json!(false),
             ],
         )
         .unwrap();
-    assert_eq!(out["error"]["code"].as_i64(), Some(-1), "{out}");
-    let msg = out["error"]["message"].as_str().unwrap_or_default();
-    assert!(
-        msg.contains("cannot open a typed connection to an onion address"),
-        "the refusal must name the reason: {out}"
-    );
+    assert!(out["error"].is_null(), "{out}");
 }
 
 /// Core sizes `semOutbound` at `min(m_max_automatic_outbound,

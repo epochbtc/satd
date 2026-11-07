@@ -911,7 +911,7 @@ fn onion_addrv2(onions: &[(String, u16)]) -> NetworkMessage {
 
 /// The onions a reconnect pass would dial now.
 fn onions_dialled(pm: &Arc<PeerManager>) -> Vec<PeerAddr> {
-    pm.reserve_automatic_dials(Instant::now())
+    pm.reserve_automatic_dials(Instant::now(), &[])
         .into_iter()
         .map(|(a, _slot)| a)
         .filter(PeerAddr::is_onion)
@@ -1057,7 +1057,7 @@ fn onlynet_onion_draws_only_onion_entries() {
         learn_onion(&pm, &onion_host(i * 16), 9333);
     }
     let all: Vec<PeerAddr> =
-        pm.reserve_automatic_dials(Instant::now()).into_iter().map(|(a, _slot)| a).collect();
+        pm.reserve_automatic_dials(Instant::now(), &[]).into_iter().map(|(a, _slot)| a).collect();
     assert_eq!(all.len(), 3, "{all:?}");
     assert!(all.iter().all(PeerAddr::is_onion), "only onions: {all:?}");
 }
@@ -1221,7 +1221,7 @@ fn a_feeler_tests_a_new_entry_in_any_group() {
         assert!(book.mark_good(tried, now_unix_secs()));
         assert!(book.add(fresh, now_unix_secs()));
     }
-    assert!(pm.reserve_automatic_dials(Instant::now()).is_empty(), "fixture: the target is met");
+    assert!(pm.reserve_automatic_dials(Instant::now(), &[]).is_empty(), "fixture: the target is met");
     for _ in 0..20 {
         assert_eq!(feeler_target(&pm), Some(fresh.into()));
     }
@@ -1650,7 +1650,7 @@ fn block_relay_peers_keep_the_netgroup_rule() {
     for id in [1, 1000, 1001] {
         pm.peers.write().remove(&id);
     }
-    let mut dials: Vec<PeerAddr> = pm.reserve_automatic_dials(Instant::now()).into_iter().map(|(a, _)| a).collect();
+    let mut dials: Vec<PeerAddr> = pm.reserve_automatic_dials(Instant::now(), &[]).into_iter().map(|(a, _)| a).collect();
     dials.sort();
     let mut want: Vec<PeerAddr> = vec![SocketAddr::from(([44, 1, 9, 9], 8333)).into(), fresh.into()];
     want.sort();
@@ -1747,4 +1747,397 @@ fn a_block_relay_peer_passes_over_this_passes_dials() {
     learn(&pm, local);
     assert_eq!(pm.reserve_block_relay_peer(Instant::now(), &[local.into()]).map(|(t, _)| t), None);
     assert_eq!(pm.reserve_block_relay_peer(Instant::now(), &[]).map(|(t, _)| t), Some(local.into()));
+}
+
+// ---- Anchors (#1150) ----
+
+use crate::net::anchors::{self, Anchor, ANCHORS_FILE};
+
+fn anchor(addr: SocketAddr) -> Anchor {
+    Anchor { addr: addr.into(), services: ServiceFlags::NETWORK | ServiceFlags::WITNESS }
+}
+
+/// The anchors a pass would dial now, in order. The slots go back at the
+/// end of this call; the anchors taken stay taken.
+fn anchor_targets(pm: &Arc<PeerManager>) -> Vec<PeerAddr> {
+    pm.reserve_anchor_dials(Instant::now()).into_iter().map(|(t, _slot)| t).collect()
+}
+
+/// Core dials its anchors before any full-relay peer, in the first branch
+/// of its `else if` chain: no full-relay target to meet. The last anchor
+/// goes first, as Core pops them off the back.
+#[test]
+fn anchors_are_dialled_before_the_full_relay_target_is_met() {
+    let (pm, _dir) = mk_pm();
+    leave_ibd(&pm);
+    let (a, b) = (SocketAddr::from(([44, 1, 2, 3], 8333)), SocketAddr::from(([45, 1, 2, 3], 8333)));
+    *pm.anchors.lock() = vec![anchor(a), anchor(b)];
+    assert!(pm.automatic_open(&pm.dials_in_flight.lock()) < pm.automatic_outbound_target(), "fixture");
+    let dials = pm.reserve_anchor_dials(Instant::now());
+    assert_eq!(dials.iter().map(|(t, _)| t.clone()).collect::<Vec<_>>(), vec![b.into(), a.into()]);
+    assert_eq!(pm.dials_in_flight.lock().block_relay, 2, "each holds a block-relay-only place");
+    drop(dials);
+    assert_eq!(pm.dials_in_flight.lock().block_relay, 0);
+}
+
+/// An anchor is taken off the list when it is dialled, so it is tried once,
+/// however the dial goes.
+#[test]
+fn an_anchor_is_tried_once() {
+    let (pm, _dir) = mk_pm();
+    leave_ibd(&pm);
+    let a = SocketAddr::from(([44, 1, 2, 3], 8333));
+    *pm.anchors.lock() = vec![anchor(a)];
+    assert_eq!(anchor_targets(&pm), vec![PeerAddr::from(a)]);
+    assert!(pm.anchors.lock().is_empty());
+    assert_eq!(anchor_targets(&pm), Vec::<PeerAddr>::new());
+}
+
+/// Anchors are block-relay-only peers: none once
+/// `max_outbound_block_relay` are open (dials in flight counted), none at
+/// `-maxconnections` 8, and one at 9. An anchor not dialled stays on the
+/// list, as in Core, where the anchor branch is not taken.
+#[test]
+fn anchors_keep_the_block_relay_limit() {
+    let (pm, _dir) = mk_pm();
+    leave_ibd(&pm);
+    let (a, b) = (SocketAddr::from(([44, 1, 2, 3], 8333)), SocketAddr::from(([45, 1, 2, 3], 8333)));
+    fill_block_relay(&pm, 1);
+    *pm.anchors.lock() = vec![anchor(a), anchor(b)];
+    assert_eq!(anchor_targets(&pm), vec![PeerAddr::from(b)]);
+    assert_eq!(pm.anchors.lock().len(), 1);
+
+    let (pm, _dir) = mk_pm();
+    leave_ibd(&pm);
+    *pm.anchors.lock() = vec![anchor(a), anchor(b)];
+    pm.set_max_connections(MAX_OUTBOUND);
+    assert_eq!(anchor_targets(&pm), Vec::<PeerAddr>::new(), "-maxconnections=8");
+    pm.set_max_connections(9);
+    assert_eq!(anchor_targets(&pm), vec![PeerAddr::from(b)], "-maxconnections=9");
+}
+
+/// An anchor takes an outbound grant, Core's `semOutbound`.
+#[test]
+fn no_anchor_without_an_outbound_grant() {
+    let (pm, _dir) = mk_pm();
+    leave_ibd(&pm);
+    pm.set_max_connections(10);
+    fill_automatic(&pm, 10);
+    *pm.anchors.lock() = vec![anchor(SocketAddr::from(([44, 1, 2, 3], 8333)))];
+    assert_eq!(anchor_targets(&pm), Vec::<PeerAddr>::new());
+    assert_eq!(pm.anchors.lock().len(), 1);
+}
+
+/// A case of [`anchors_are_passed_over_as_in_core`]: why, the anchor to
+/// pass over, and what makes it one.
+type SkipCase = (&'static str, Anchor, Box<dyn Fn(&PeerManager)>);
+
+/// Core's skip rules (v31.1 `src/net.cpp:2799`), and an automatic dial's:
+/// each case puts the anchor to pass over last, so it is looked at first,
+/// and the good one after it is dialled.
+#[test]
+fn anchors_are_passed_over_as_in_core() {
+    let good = SocketAddr::from(([46, 1, 2, 3], 8333));
+    let cases: Vec<SkipCase> = vec![
+        ("an invalid address", anchor(SocketAddr::from(([0, 0, 0, 0], 8333))), Box::new(|_| {})),
+        ("port 0", anchor(SocketAddr::from(([47, 1, 2, 3], 0))), Box::new(|_| {})),
+        (
+            "the node's own address",
+            anchor(SocketAddr::from(([47, 1, 2, 3], 8333))),
+            Box::new(|pm| pm.set_external_addrs(vec![SocketAddr::from(([47, 1, 2, 3], 8333))])),
+        ),
+        (
+            "no desirable services",
+            Anchor { addr: SocketAddr::from(([47, 1, 2, 3], 8333)).into(), services: ServiceFlags::NONE },
+            Box::new(|_| {}),
+        ),
+        (
+            "a network group held",
+            anchor(SocketAddr::from(([80, 1, 9, 9], 8333))),
+            Box::new(|pm| fill_block_relay(pm, 1)),
+        ),
+        (
+            "a banned address",
+            anchor(SocketAddr::from(([47, 1, 2, 3], 8333))),
+            Box::new(|pm| ban(pm, crate::net::ban::BanTarget::Net(ipnet::IpNet::from(IpAddr::from([47, 1, 2, 3]))))),
+        ),
+        (
+            "an unreachable network",
+            anchor("[2001:4860::1]:8333".parse().unwrap()),
+            Box::new(|pm| {
+                pm.set_reachable(crate::net::reachable::ReachableNets { ipv6: false, ..Default::default() })
+            }),
+        ),
+    ];
+    for (why, skipped, setup) in cases {
+        let (pm, _dir) = mk_pm();
+        leave_ibd(&pm);
+        setup(&pm);
+        *pm.anchors.lock() = vec![anchor(good), skipped];
+        assert_eq!(anchor_targets(&pm), vec![PeerAddr::from(good)], "{why}");
+        assert!(pm.anchors.lock().is_empty(), "{why}: tried once");
+    }
+}
+
+/// Two anchors in one network group: the second is passed over, as the
+/// first anchor's dial holds the group (it may not have claimed it yet).
+#[test]
+fn a_second_anchor_in_one_group_is_passed_over() {
+    let (pm, _dir) = mk_pm();
+    leave_ibd(&pm);
+    let (a, b) = (SocketAddr::from(([44, 1, 2, 3], 8333)), SocketAddr::from(([44, 1, 9, 9], 8333)));
+    *pm.anchors.lock() = vec![anchor(a), anchor(b)];
+    assert_eq!(anchor_targets(&pm), vec![PeerAddr::from(b)]);
+
+    // The same address twice, in no network group: passed over by address.
+    let (pm, _dir) = mk_pm();
+    leave_ibd(&pm);
+    let local = SocketAddr::from(([127, 0, 0, 1], 18444));
+    *pm.anchors.lock() = vec![anchor(local), anchor(local)];
+    assert_eq!(anchor_targets(&pm), vec![PeerAddr::from(local)]);
+}
+
+/// The full-relay half of the pass passes over what the anchors just took,
+/// by address and by network group.
+#[test]
+fn the_full_relay_draw_passes_over_the_anchors() {
+    let (pm, _dir) = mk_pm();
+    leave_ibd(&pm);
+    let a = SocketAddr::from(([44, 1, 2, 3], 8333));
+    let same_group = SocketAddr::from(([44, 1, 9, 9], 8333));
+    let other = SocketAddr::from(([46, 1, 2, 3], 8333));
+    learn(&pm, a);
+    learn(&pm, same_group);
+    let taken = [PeerAddr::from(a)];
+    let drawn: Vec<PeerAddr> = pm.reserve_automatic_dials(Instant::now(), &taken).into_iter().map(|(t, _)| t).collect();
+    assert_eq!(drawn, Vec::<PeerAddr>::new());
+    learn(&pm, other);
+    let drawn: Vec<PeerAddr> = pm.reserve_automatic_dials(Instant::now(), &taken).into_iter().map(|(t, _)| t).collect();
+    assert_eq!(drawn, vec![PeerAddr::from(other)]);
+
+    // A regtest address in no network group: passed over by address.
+    let (pm, _dir) = mk_pm();
+    leave_ibd(&pm);
+    let local = SocketAddr::from(([127, 0, 0, 1], 18444));
+    learn(&pm, local);
+    let drawn = pm.reserve_automatic_dials(Instant::now(), &[local.into()]);
+    assert!(drawn.is_empty(), "{:?}", drawn.iter().map(|(t, _)| t).collect::<Vec<_>>());
+}
+
+/// The seed path dials learned addresses at once; anchors not yet dialled
+/// go ahead of them there too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_seed_dial_takes_the_anchors_first() {
+    let (pm, _dir) = mk_pm();
+    leave_ibd(&pm);
+    *pm.anchors.lock() = vec![anchor(SocketAddr::from(([44, 1, 2, 3], 8333)))];
+    pm.dial_learned_peers();
+    assert!(pm.anchors.lock().is_empty());
+}
+
+/// A clean stop writes the outbound block-relay-only peers, oldest first
+/// and at most two, and nothing else; the next start reads them and
+/// deletes the file.
+#[test]
+fn anchors_are_written_at_a_stop_and_read_once_at_a_start() {
+    let (pm, dir) = mk_pm();
+    let path = dir.path().join(ANCHORS_FILE);
+    fill_automatic(&pm, 2);
+    add_peer(&pm, peer(10, SocketAddr::from(([9, 9, 9, 9], 8333)), Direction::Inbound));
+    for (id, ip) in [(4002, [83, 1, 0, 1]), (4000, [81, 1, 0, 1]), (4001, [82, 1, 0, 1])] {
+        let mut info = peer(id, SocketAddr::from((ip, 8333)), Direction::Outbound);
+        info.conn_type = ConnType::BlockRelay;
+        info.services = ServiceFlags::NETWORK | ServiceFlags::WITNESS;
+        add_peer(&pm, info);
+    }
+    pm.dump_anchors(&path);
+    let written = anchors::read(&path, pm.chain_state.p2p_magic().to_bytes()).unwrap();
+    assert_eq!(written, vec![anchor(SocketAddr::from(([81, 1, 0, 1], 8333))), anchor(SocketAddr::from(([82, 1, 0, 1], 8333)))]);
+
+    anchors::write(&path, pm.chain_state.p2p_magic().to_bytes(), &[
+        anchor(SocketAddr::from(([44, 1, 2, 3], 8333))),
+        anchor(SocketAddr::from(([45, 1, 2, 3], 8333))),
+        anchor(SocketAddr::from(([46, 1, 2, 3], 8333))),
+    ])
+    .unwrap();
+    let (pm, _dir2) = mk_pm();
+    pm.load_anchors(&path);
+    assert!(!path.exists(), "deleted on read");
+    assert_eq!(*pm.anchors.lock(), vec![anchor(SocketAddr::from(([44, 1, 2, 3], 8333))), anchor(SocketAddr::from(([45, 1, 2, 3], 8333)))]);
+}
+
+/// An onion block-relay-only peer is written with its port, and one that
+/// never sent its `version` with no services, as Core writes it.
+#[test]
+fn an_onion_anchor_keeps_its_port() {
+    let (pm, dir) = mk_pm();
+    let path = dir.path().join(ANCHORS_FILE);
+    let host = "pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.onion";
+    let mut info = peer(4000, SocketAddr::from(([0, 0, 0, 0], 8333)), Direction::Outbound);
+    info.conn_type = ConnType::BlockRelay;
+    info.onion_host = Some(host.to_string());
+    add_peer(&pm, info);
+    pm.dump_anchors(&path);
+    assert_eq!(
+        anchors::read(&path, pm.chain_state.p2p_magic().to_bytes()).unwrap(),
+        vec![Anchor { addr: PeerAddr::Onion { host: host.to_string(), port: 8333 }, services: ServiceFlags::NONE }]
+    );
+}
+
+/// `-connect` neither reads the file nor writes it: Core loads and dumps
+/// anchors only with `m_use_addrman_outgoing`.
+#[test]
+fn connect_neither_reads_nor_writes_anchors() {
+    let (pm, dir) = mk_pm();
+    let path = dir.path().join(ANCHORS_FILE);
+    pm.set_automatic_outbound(false);
+    fill_block_relay(&pm, 1);
+    pm.dump_anchors(&path);
+    assert!(!path.exists(), "nothing written");
+    anchors::write(&path, pm.chain_state.p2p_magic().to_bytes(), &[anchor(SocketAddr::from(([44, 1, 2, 3], 8333)))]).unwrap();
+    pm.load_anchors(&path);
+    assert!(path.exists(), "left where it is");
+    assert!(pm.anchors.lock().is_empty());
+    pm.set_automatic_outbound(true);
+    pm.load_anchors(&path);
+    assert!(!path.exists());
+    assert_eq!(pm.anchors.lock().len(), 1);
+}
+
+/// A restart dials its anchors as block-relay-only peers on the first pass,
+/// with the full-relay target unmet.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_restart_dials_its_anchors_first_as_block_relay_only() {
+    use bitcoin::p2p::Magic;
+    let (pm, dir) = mk_pm();
+    leave_ibd(&pm);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let target = listener.local_addr().unwrap();
+    let path = dir.path().join(ANCHORS_FILE);
+    anchors::write(&path, pm.chain_state.p2p_magic().to_bytes(), &[anchor(target)]).unwrap();
+    pm.load_anchors(&path);
+    assert!(!path.exists());
+    pm.reconnect_tick();
+    let (accepted, _) = tokio::time::timeout(Duration::from_secs(10), listener.accept())
+        .await
+        .expect("the node dials its anchor")
+        .unwrap();
+    let mut theirs = Connection::with_magic(accepted, Magic::REGTEST);
+    let version = loop {
+        match tokio::time::timeout(Duration::from_secs(10), theirs.recv()).await {
+            Ok(Ok(NetworkMessage::Version(v))) => break v,
+            Ok(Ok(_)) => continue,
+            other => panic!("no version: {other:?}"),
+        }
+    };
+    assert!(!version.relay, "a block-relay-only link asks for no transactions");
+    assert!(
+        pm.peers.read().values().any(|h| h.info.addr == target && h.info.conn_type == ConnType::BlockRelay),
+        "typed block-relay-only"
+    );
+    assert!(pm.anchors.lock().is_empty());
+}
+
+/// A SOCKS5 proxy that accepts one CONNECT, with or without a user name
+/// and password, answers success and then holds the stream without
+/// speaking, as the keep-alive proxy in Core's `feature_anchors.py` does.
+/// Returns the host the node asked for.
+async fn mute_socks5(listener: tokio::net::TcpListener) -> (tokio::net::TcpStream, String) {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    let (mut s, _) = listener.accept().await.unwrap();
+    let mut head = [0u8; 2];
+    s.read_exact(&mut head).await.unwrap();
+    let mut methods = vec![0u8; head[1] as usize];
+    s.read_exact(&mut methods).await.unwrap();
+    if methods.contains(&2) {
+        s.write_all(&[5, 2]).await.unwrap();
+        let mut ver_len = [0u8; 2];
+        s.read_exact(&mut ver_len).await.unwrap();
+        let mut user = vec![0u8; ver_len[1] as usize];
+        s.read_exact(&mut user).await.unwrap();
+        let mut plen = [0u8; 1];
+        s.read_exact(&mut plen).await.unwrap();
+        let mut pass = vec![0u8; plen[0] as usize];
+        s.read_exact(&mut pass).await.unwrap();
+        s.write_all(&[1, 0]).await.unwrap();
+    } else {
+        s.write_all(&[5, 0]).await.unwrap();
+    }
+    let mut req = [0u8; 5];
+    s.read_exact(&mut req).await.unwrap();
+    assert_eq!(req[3], 3, "the onion goes to the proxy by name");
+    let mut host = vec![0u8; req[4] as usize];
+    s.read_exact(&mut host).await.unwrap();
+    let mut port = [0u8; 2];
+    s.read_exact(&mut port).await.unwrap();
+    s.write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0]).await.unwrap();
+    (s, String::from_utf8(host).unwrap())
+}
+
+/// `addconnection` opens a block-relay-only connection to an onion through
+/// the proxy, typed as asked, and a stop writes it as an anchor with its
+/// port and, its `version` never having come, no services: what Core's
+/// `feature_anchors.py` does with a keep-alive proxy that never answers.
+/// satd refused a typed onion connection until the onion dial could carry
+/// a type.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn addconnection_opens_a_block_relay_only_onion_and_it_is_anchored() {
+    let (base, dir) = mk_pm();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy = listener.local_addr().unwrap().to_string();
+    let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let pm = PeerManager::with_config(
+        Arc::clone(&base.chain_state),
+        Arc::new(Mempool::new(1_000_000, 0)),
+        Arc::new(FeeEstimator::new()),
+        Network::Regtest,
+        shutdown_rx,
+        0,
+        125,
+        DEFAULT_MAX_INBOUND_PER_IP,
+        86400,
+        None,
+        Some(proxy),
+        1,
+        50_000,
+        0,
+        None,
+    );
+    let host = "pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.onion";
+    let socks = tokio::spawn(mute_socks5(listener));
+    pm.add_connection(&format!("{host}:8333"), 18444, ConnType::BlockRelay, false).expect("accepted");
+    let (_held, asked) = tokio::time::timeout(Duration::from_secs(10), socks).await.expect("proxied").unwrap();
+    assert_eq!(asked, host);
+    let typed = || {
+        pm.peers.read().values().any(|h| {
+            h.info.onion_host.as_deref() == Some(host) && h.info.conn_type == ConnType::BlockRelay
+        })
+    };
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !typed() {
+        assert!(Instant::now() < deadline, "no block-relay-only onion peer");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let path = dir.path().join(ANCHORS_FILE);
+    pm.dump_anchors(&path);
+    assert_eq!(
+        anchors::read(&path, pm.chain_state.p2p_magic().to_bytes()).unwrap(),
+        vec![Anchor { addr: PeerAddr::Onion { host: host.to_string(), port: 8333 }, services: ServiceFlags::NONE }]
+    );
+}
+
+/// The manager loop dials the anchors on its first tick, not on the first
+/// reconnect pass ten seconds in: Core tries them on the first turn of
+/// `ThreadOpenConnections`, and `feature_anchors.py` waits two seconds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_loop_dials_its_anchors_at_once() {
+    let (pm, _dir) = mk_pm();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    *pm.anchors.lock() = vec![anchor(listener.local_addr().unwrap())];
+    let pm_run = pm.clone();
+    let run = tokio::spawn(async move { pm_run.run().await });
+    let accepted = tokio::time::timeout(Duration::from_secs(3), listener.accept()).await;
+    run.abort();
+    assert!(accepted.is_ok(), "the anchor is dialled within the first ticks");
+    assert!(pm.anchors.lock().is_empty());
 }

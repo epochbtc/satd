@@ -113,7 +113,7 @@ fn dial_order(pm: &PeerManager, rng: &mut impl rand::Rng) -> Vec<SocketAddr> {
 
 fn dialled(pm: &Arc<PeerManager>) -> Vec<SocketAddr> {
     // The slots go back when the reservations drop at the end of this call.
-    pm.reserve_automatic_dials(Instant::now()).into_iter().map(|(a, _slot)| socket(a)).collect()
+    pm.reserve_automatic_dials(Instant::now(), &[]).into_iter().map(|(a, _slot)| socket(a)).collect()
 }
 
 /// The socket of a clearnet entry: these tests put no onion in the book.
