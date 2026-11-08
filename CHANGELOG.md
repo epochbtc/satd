@@ -12,6 +12,7 @@ layout) per [`STABILITY_POLICY.md`](STABILITY_POLICY.md).
 ## [Unreleased]
 
 - Initial sync no longer waits for the P2P loop's 500 ms tick between blocks: an arriving block or `headers` message is handled at once, which lifts the early part of a sync from about 25 blocks a second per peer to about 250 from one peer on local storage (#1228).
+- Header sync no longer downloads the header chain many times over: a new request goes out only when header sync has stalled, and a full batch asks only the peer that sent it for more. A fresh mainnet sync from one peer took 5.6 GB of `headers` for the 78 MB chain (#1229).
 - A fresh testnet4 sync no longer stops for good at block 51,540: testnet4 and testnet3 get Bitcoin Core's default `-assumevalid`, and the stall watchdog counts script inputs verified as progress, so one very large block is no longer taken for a wedge (#1216).
 
 ## Releases
