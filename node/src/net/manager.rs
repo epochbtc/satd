@@ -1352,12 +1352,12 @@ pub struct PeerManager {
     nap_puller: RwLock<Option<Arc<crate::nap::pull::Puller>>>,
     /// Wakes the manager loop's event drain before its next 500 ms tick.
     ///
-    /// The drain cadence is deliberate everywhere else, but a peer whose
-    /// pong is parked behind queued work would otherwise pay up to a full
-    /// tick of it — and that lands in the round-trip time the *peer*
-    /// measures. Notifying here collapses the wait to the actual processing
-    /// time without speeding up the loop's periodic maintenance, which is
-    /// still driven by the interval alone.
+    /// Each peer's socket task notifies it for every message it forwards,
+    /// so a message is handled when it arrives, not at the next tick
+    /// (#1228); a pong parked behind queued work notifies it too, since
+    /// the wait otherwise lands in the round-trip time the *peer* measures.
+    /// The loop's periodic maintenance is still driven by the interval
+    /// alone.
     drain_now: Arc<tokio::sync::Notify>,
     /// Channel to send received blocks to the processing thread.
     block_tx: mpsc::UnboundedSender<IncomingBlock>,
@@ -15183,10 +15183,7 @@ impl PeerManager {
                                 flow.queued();
                             }
                             // Nothing more is read until the manager has
-                            // served this request (`reading_paused`), so it
-                            // is served now rather than at the manager's next
-                            // tick: a peer fetching blocks sends one `getdata`
-                            // after another.
+                            // served a `getdata` (`reading_paused`).
                             let getdata = matches!(msg, NetworkMessage::GetData(_));
                             if let (true, Some(q)) = (getdata, &send_queue) {
                                 q.note_getdata_forwarded();
@@ -15195,7 +15192,14 @@ impl PeerManager {
                                 .send(NetEvent::MessageReceived { id, msg })
                                 .await
                                 .map_err(|e| e.to_string())?;
-                            if let (true, Some(wake)) = (getdata, &drain_now) {
+                            // Every message is handled now rather than at the
+                            // manager's next tick. Waking it for `getdata`
+                            // alone left an inbound `block` or `headers` to
+                            // wait up to 500 ms: each tick took the blocks in
+                            // flight and asked for more, so IBD ran at ~25
+                            // blocks a second per peer whatever their size,
+                            // and header sync at one batch per tick (#1228).
+                            if let Some(wake) = &drain_now {
                                 wake.notify_one();
                             }
                         }
