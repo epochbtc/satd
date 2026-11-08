@@ -648,9 +648,11 @@ impl CoinCache {
             }
         };
         let mut batch = std::mem::take(&mut *pending);
-        // The rows leave the batch; a failed write puts them back and
-        // re-adds their hashes (`restore_after_failed_flush`).
-        self.pending_bi_hashes.lock().clear();
+        // The taken rows' hashes stay in `pending_bi_hashes` until the write
+        // has returned. A reader whose hash is there takes the batch lock,
+        // which this flush holds across the write, and so sees the row either
+        // pending or written, never neither: cleared here, it would read the
+        // backing store's pre-flush status while the row was in flight.
 
         // Pre-allocate batch vectors based on dirty map size
         batch.coin_puts.reserve(dirty.len());
@@ -780,7 +782,10 @@ impl CoinCache {
                 return Err(e);
             }
         }
-        // The rows are in the backing store now; readers may look again.
+        // The rows are in the backing store now; readers may look again. The
+        // batch is empty and nothing can have entered it while the lock was
+        // held, so no hash in the set still has a pending row.
+        self.pending_bi_hashes.lock().clear();
         drop(pending);
 
         // Move flushed coins to clean LRU (cache warming) — unless a batch
@@ -5889,6 +5894,49 @@ mod tests {
             cache.get_coin(&op).is_none(),
             "a coin spent during the batched read-through window must not survive in the clean LRU"
         );
+    }
+
+    /// A block-index row in flight in a flush is read as written or as
+    /// pending, never as the backing store's pre-flush status. The flush
+    /// holds the batch lock across its write so readers wait it out; a reader
+    /// only takes that lock for a hash in `pending_bi_hashes`, so the taken
+    /// rows' hashes must stay there until the write has returned.
+    #[test]
+    fn a_row_in_flight_in_a_flush_is_not_read_as_its_old_status() {
+        let op = make_outpoint(0xD4, 0);
+        let (cache, _rg, write_gate) = gated_cache_with_coin(op);
+        let hash = BlockHash::from_byte_array([0x6B; 32]);
+        let mut stored = make_test_entry(9);
+        stored.status = BlockStatus::DataStored;
+        let mut valid = stored.clone();
+        valid.status = BlockStatus::Valid;
+
+        // The backing store has the stored row; a connect buffers `Valid`.
+        let mut store_row = StoreBatch::default();
+        store_row.block_index_puts.push((hash, stored));
+        cache.write_batch(store_row).unwrap();
+        let mut connect = StoreBatch::default();
+        connect.coin_puts.push((make_outpoint(0xD5, 0), make_coin(1_000, 9)));
+        connect.block_index_puts.push((hash, valid));
+        cache.write_batch(connect).unwrap();
+
+        write_gate.arm();
+        let flusher = {
+            let cache = cache.clone();
+            std::thread::spawn(move || cache.flush().unwrap())
+        };
+        let reader = std::sync::Mutex::new(None);
+        write_gate.open_after(|| {
+            // The flush is parked inside its write. The LRU has lost the row.
+            cache.block_index_cache.lock().clear();
+            let cache = cache.clone();
+            *reader.lock().unwrap() =
+                Some(std::thread::spawn(move || cache.get_block_index(&hash).map(|e| e.status)));
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        });
+        flusher.join().unwrap();
+        let read = reader.lock().unwrap().take().unwrap().join().unwrap();
+        assert_eq!(read, Some(BlockStatus::Valid), "the in-flight row was read as its pre-flush status");
     }
 
     #[test]
