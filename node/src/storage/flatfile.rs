@@ -177,6 +177,10 @@ impl Drop for PendingRecord {
 pub struct SyncHandle {
     file: File,
     writes: u64,
+    /// The append file and its length when the handle was taken: what the
+    /// sync is sure to cover.
+    file_number: u32,
+    len: u64,
 }
 
 impl SyncHandle {
@@ -202,6 +206,10 @@ pub struct FlatFileManager {
     /// compares it to the count a [`SyncHandle`] was taken at, so a write that
     /// lands while the handle syncs outside the lock keeps the file dirty.
     writes: u64,
+    /// How much of the current append file is known to be on disk: its
+    /// length at the last sync that completed. Every earlier file is synced
+    /// whole when the append moves past it. See [`Self::synced_through`].
+    synced_len: u64,
     /// Cached read handles keyed by file number (small LRU).
     read_cache: std::collections::HashMap<u32, File>,
     /// Blocks-dir obfuscation key from `xor.dat` (Core v28+). The zero key
@@ -330,6 +338,7 @@ impl FlatFileManager {
             write_handle: None,
             dirty: false,
             writes: 0,
+            synced_len: current_pos,
             read_cache: std::collections::HashMap::new(),
             xor_key,
             total_bytes,
@@ -558,6 +567,7 @@ impl FlatFileManager {
             f.sync_data()?;
         }
         self.current_pos = len;
+        self.synced_len = len;
         Ok(())
     }
 
@@ -579,6 +589,7 @@ impl FlatFileManager {
         }
         self.dirty = false;
         self.write_handle = None;
+        self.synced_len = self.current_pos;
         Ok(())
     }
 
@@ -614,6 +625,10 @@ impl FlatFileManager {
             0
         };
         self.current_pos = len;
+        // What is in the file now is what the disk holds: it was read back,
+        // and this process wrote nothing to it unsynced (the handle was just
+        // released, syncing it).
+        self.synced_len = len;
         // The reason this method exists is that the file on disk disagreed
         // with what we believed about it — a truncation, or rotating into a
         // file that pruning left behind. `total_bytes` was derived from the
@@ -642,6 +657,29 @@ impl FlatFileManager {
             f.sync_data()?;
             self.dirty = false;
         }
+        self.synced_len = self.current_pos;
+        Ok(())
+    }
+
+    /// The current append file and how much of it is known to be on disk.
+    /// A record in an earlier file, or ending within that length, survives a
+    /// power loss; one past it may not.
+    pub fn synced_through(&self) -> (u32, u64) {
+        (self.current_file, self.synced_len)
+    }
+
+    /// Test-only: what a power loss does to the block files. The current
+    /// file loses everything past what was last synced.
+    #[cfg(test)]
+    pub fn drop_unsynced_tail(&mut self) -> std::io::Result<()> {
+        self.write_handle = None;
+        self.dirty = false;
+        let path = self.file_path(self.current_file);
+        if path.exists() {
+            OpenOptions::new().write(true).open(&path)?.set_len(self.synced_len)?;
+        }
+        self.current_pos = self.synced_len;
+        self.read_cache.clear();
         Ok(())
     }
 
@@ -661,7 +699,12 @@ impl FlatFileManager {
             return Ok(None);
         }
         match &self.write_handle {
-            Some(f) => Ok(Some(SyncHandle { file: f.try_clone()?, writes: self.writes })),
+            Some(f) => Ok(Some(SyncHandle {
+                file: f.try_clone()?,
+                writes: self.writes,
+                file_number: self.current_file,
+                len: self.current_pos,
+            })),
             None => Ok(None),
         }
     }
@@ -671,6 +714,9 @@ impl FlatFileManager {
     pub fn mark_synced(&mut self, handle: SyncHandle) {
         if handle.writes == self.writes {
             self.dirty = false;
+        }
+        if handle.file_number == self.current_file {
+            self.synced_len = self.synced_len.max(handle.len);
         }
     }
 
