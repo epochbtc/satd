@@ -9336,11 +9336,6 @@ impl PeerManager {
         self.punish_block_source(&failed, &e.to_string());
     }
 
-    /// Forget the sender of a block that connected.
-    fn forget_block_source(&self, hash: &bitcoin::BlockHash) {
-        self.block_sources.lock().take(hash);
-    }
-
     /// A block's data was stored — clear it from the background download
     /// tracker (no-op for forward-range heights) and wake the background
     /// connect loop so it can attempt the next in-order connect.
@@ -10870,7 +10865,7 @@ impl PeerManager {
                         // would otherwise block on.
                         chain_state.bump_connect_heartbeat();
                         if let Some(pm) = peer_manager.upgrade() {
-                            pm.forget_block_source(&hash);
+                            pm.ibd_block_connected(&hash);
                         }
                         // Clear any prior connect-failure warnings now that
                         // we've made forward progress.
@@ -13145,10 +13140,33 @@ impl PeerManager {
     /// (`BlockChecked` → `MaybeSetPeerAsAnnouncingHeaderAndIDs`).
     fn block_became_tip(&self, from: PeerId, block: &bitcoin::Block, height: u32) {
         let _ = (block, height);
-        if self.ibd.read().is_some() || self.is_ibd() {
+        self.tip_delivered_by(from);
+    }
+
+    /// Core's condition in `BlockChecked`: out of initial block download,
+    /// and the block was the only one in flight
+    /// (`mapBlocksInFlight.count(hash) == mapBlocksInFlight.size()`). An IBD
+    /// scheduler that is still winding down with nothing in flight is not a
+    /// download in progress: a new block announced in that window extends
+    /// it, is fetched and connected through it, and must still promote its
+    /// sender, or the node picks no high-bandwidth peer until the next block.
+    fn tip_delivered_by(&self, from: PeerId) {
+        if self.is_ibd() || self.ibd.read().as_ref().is_some_and(|s| s.progress().1 > 0) {
             return;
         }
         self.maybe_set_peer_as_hb(from);
+    }
+
+    /// The IBD connector connected a stored block: forget its sender, and if
+    /// it is now the tip, let its sender be promoted as for a block the
+    /// block processor connects ([`Self::block_became_tip`]).
+    fn ibd_block_connected(&self, hash: &bitcoin::BlockHash) {
+        let from = self.block_sources.lock().take(hash);
+        if let Some(from) = from
+            && self.chain_state.tip_hash() == *hash
+        {
+            self.tip_delivered_by(from);
+        }
     }
 
     /// Bitcoin Core's `NewPoWValidBlock`: announce a block that extends our
@@ -20080,6 +20098,33 @@ mod tests {
         pm.hb_peers.lock().clear();
         pm.maybe_set_peer_as_hb(2);
         assert!(deque(&pm).is_empty());
+    }
+
+    /// A block the IBD connector connects promotes its sender as one the
+    /// block processor connects does, once out of IBD with nothing else in
+    /// flight, even while the scheduler is still winding down: a new block
+    /// announced in that window is fetched and connected through it (#1228).
+    /// In IBD it promotes no one.
+    #[test]
+    fn an_ibd_connected_tip_promotes_its_sender_out_of_ibd() {
+        let pm = empty_peer_manager();
+        let mut rx = hb_peer(&pm, 1, Direction::Outbound);
+        let tip = pm.chain_state.tip_hash();
+        *pm.ibd.write() = Some(crate::net::ibd::IbdScheduler::new(0, 0, &pm.chain_state, 1000));
+
+        // Headers far ahead: initial block download.
+        pm.headers_tip.store(1000, Ordering::Relaxed);
+        pm.block_sources.lock().record(tip, 1);
+        pm.ibd_block_connected(&tip);
+        assert!(pm.hb_peers.lock().is_empty(), "no high-bandwidth peer is chosen during IBD");
+        assert!(pm.block_sources.lock().take(&tip).is_none(), "the source is forgotten either way");
+
+        // Caught up, the scheduler still present with nothing in flight.
+        pm.headers_tip.store(1, Ordering::Relaxed);
+        pm.block_sources.lock().record(tip, 1);
+        pm.ibd_block_connected(&tip);
+        assert_eq!(pm.hb_peers.lock().iter().copied().collect::<Vec<_>>(), vec![1]);
+        assert_eq!(sendcmpct_flags(&mut rx), vec![true]);
     }
 
     /// A disconnected peer leaves the high-bandwidth set.
