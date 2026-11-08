@@ -11,6 +11,19 @@ use super::undo::UndoData;
 use super::flatfile::PendingRecord;
 use super::{Store, StoreBatch, StoreError, WriteMode};
 
+/// The dirty-coin count at which the cache flushes: the whole clean-coin
+/// budget, as Bitcoin Core lets its coins cache fill `-dbcache` before it
+/// writes. The cache flushed at a quarter of it, which during initial sync
+/// came to a flush every few hundred blocks: each one wrote coins a later
+/// block would have spent (the fresh-elision Core gets from a full cache)
+/// and synced the block files, and stack samples put the connector in a
+/// flush more than half the time. The cost is memory, up to the clean budget
+/// again for dirty coins, and replay after a crash, which reconnects the
+/// blocks since the last flush (user decision, 2026-11-08).
+fn dirty_flush_threshold(clean_cap: usize) -> u32 {
+    u32::try_from(clean_cap).unwrap_or(u32::MAX).max(1)
+}
+
 /// How many `block_index` rows `store_block` may hand over before their
 /// block-file bytes are synced and the rows written in one batch.
 pub const HELD_ROWS_MAX: usize = 64;
@@ -305,7 +318,7 @@ impl CoinCache {
         let undo_cap = 1_000; // fixed — recent blocks only
         let tx_index_cap = (budget * 5 / 100) / 64; // 5% at ~64 bytes/entry
         let chain_tx_cap = 8_192; // fixed — only the unflushed-block window
-        let flush_threshold = (clean_cap / 4) as u32; // 25% of clean cap
+        let flush_threshold = dirty_flush_threshold(clean_cap);
 
         Self {
             clean_cap_bytes,
@@ -958,7 +971,7 @@ impl CoinCache {
         }
         // Track the new threshold on the same shrink so dirty accumulation
         // honors the new clean cap. Never below 1 to keep `flush` reachable.
-        let new_threshold = ((new_cap / 4) as u32).max(1);
+        let new_threshold = dirty_flush_threshold(new_cap);
         self.flush_threshold.store(new_threshold, Ordering::Relaxed);
     }
 
@@ -3935,9 +3948,9 @@ mod tests {
     #[test]
     fn test_default_uses_450mb() {
         let cache = CoinCache::default(Box::new(InMemoryStore::new()));
-        // 450 MB budget: clean_cap = (450_000_000 * 80 / 100) / 200 = 1_800_000
-        // flush_threshold = 1_800_000 / 4 = 450_000
-        assert_eq!(cache.flush_threshold(), 450_000);
+        // 450 MB budget: clean_cap = (450_000_000 * 80 / 100) / 200 = 1_800_000,
+        // and dirty coins may fill the same budget before a flush.
+        assert_eq!(cache.flush_threshold(), 1_800_000);
     }
 
     // ---------------------------------------------------------------
@@ -3964,18 +3977,18 @@ mod tests {
         let initial_threshold = cache.flush_threshold();
         assert!(initial_threshold > 0);
 
-        // Shrink to 100_000 entries: new threshold should be 25_000.
+        // Shrink to 100_000 entries: the threshold shrinks with it.
         cache.resize_clean(100_000);
         assert_eq!(cache.clean_cap(), 100_000);
         assert_eq!(
             cache.flush_threshold(),
-            25_000,
+            100_000,
             "threshold should shrink with clean LRU"
         );
 
         // Grow back: threshold tracks the new cap.
         cache.resize_clean(2_000_000);
-        assert_eq!(cache.flush_threshold(), 500_000);
+        assert_eq!(cache.flush_threshold(), 2_000_000);
 
         // Shrink to 0 clamps to minimum 1 (never lose reachability of flush).
         cache.resize_clean(0);

@@ -11015,6 +11015,17 @@ impl ChainState {
         if prune_below >= tip_height {
             return 0;
         }
+        // Make the chainstate durable before any block it may still need goes.
+        // The coin cache is flushed when it fills, not every few blocks, so
+        // after a crash the node reconnects every block since the last flush,
+        // from its stored data; a prune that deleted those blocks first would
+        // leave nothing to reconnect them from. Core prunes inside
+        // `FlushStateToDisk` for the same reason (`fFlushForPrune`). A failed
+        // flush prunes nothing.
+        if let Err(e) = self.flush_coin_cache().and_then(|()| self.flush_durable()) {
+            tracing::error!(error = %e, "not pruning: the chainstate could not be flushed first");
+            return 0;
+        }
         // The scan below misses a record whose index entry is committed after
         // it reads the index. Every writer holds its record pending from the
         // write until that commit (`PendingRecord`), so such a record was
@@ -12429,6 +12440,24 @@ pub(crate) mod tests {
             let entry = cs.get_block_index(&b.block_hash()).unwrap();
             assert!(cs.is_connectable(&entry).unwrap(), "height {}: the walk agrees", entry.height);
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A prune makes the chainstate durable before it deletes anything. The
+    /// coin cache flushes only when it fills, so after a crash the node
+    /// reconnects every block since the last flush; a prune that ran ahead of
+    /// a flush could delete blocks that replay needs. Core prunes inside
+    /// `FlushStateToDisk` (`fFlushForPrune`).
+    #[test]
+    fn a_prune_flushes_the_chainstate_first() {
+        let (cs, dir) = make_chain_state();
+        build_and_connect_chain(&cs, 5);
+        assert!(cs.store.dirty_count() > 0, "connected blocks leave dirty coins");
+        assert_ne!(cs.store.inner_for_test().get_tip(), Some(cs.tip_hash()));
+
+        cs.prune_up_to(2);
+        assert_eq!(cs.store.dirty_count(), 0, "the prune flushed the coin cache");
+        assert_eq!(cs.store.inner_for_test().get_tip(), Some(cs.tip_hash()), "and the tip with it");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -14624,7 +14653,11 @@ pub(crate) mod tests {
         // below the planned tip, so the height rows the plan was computed
         // from no longer describe heights 6..=8. (The in-memory tip snapshot
         // `prune_blocks` takes still says height 8 — exactly the stale pair
-        // the revalidation must catch.)
+        // the revalidation must catch.) The cache is flushed first: the
+        // removes below are written straight through it, and the prune's own
+        // flush would otherwise write the connects' still-buffered puts for
+        // those heights after them. A real reorg goes through the buffer.
+        cs.flush_coin_cache().unwrap();
         let mut batch = crate::storage::StoreBatch::default();
         batch.height_hash_removes.extend([6u32, 7, 8]);
         cs.store.write_batch(batch).unwrap();
@@ -15196,11 +15229,9 @@ pub(crate) mod tests {
         assert_eq!(deleted, 0, "the fork block's record was pending in file 1 when the prune planned");
         assert_eq!(cs.get_block(&fork.block_hash()).as_ref(), Some(&fork));
 
-        // The fork block's row is held until a group commit syncs its bytes,
-        // and its record stays pending until then; once committed, the file
-        // can go.
-        assert_eq!(cs.prune_up_to(6), 0, "still pending while its row is held");
-        cs.store.commit_held_rows().unwrap();
+        // The fork block's row is held until a group commit syncs its bytes.
+        // The prune flushes the chainstate first, which commits it, so the
+        // file can go.
         assert_eq!(cs.prune_up_to(6), 1, "file 1 goes");
         assert!(cs.is_pruned(&fork.block_hash()));
 
