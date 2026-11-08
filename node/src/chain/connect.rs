@@ -1077,7 +1077,7 @@ fn connect_block_inner(params: &ConnectParams) -> Result<StoreBatch, ConnectErro
                 .map(|set| set.contains(&tx_idx))
                 .unwrap_or(false);
             let unverifiable = script_skip_txs.is_some_and(|set| set.contains(&tx_idx));
-            if unverifiable {
+            if unverifiable || script_verifier.checks_nothing() {
                 // Neither queue: there is no signature to check.
             } else if !already_verified {
                 verify_queue.push((tx, prev_outputs));
@@ -1985,9 +1985,82 @@ mod tests {
     ///
     /// Perturbation: drop any one poll and the count, or the stop at it,
     /// fails.
+    /// A verifier that checks nothing (`NoopVerifier`, below `-assumevalid`)
+    /// is never handed a transaction: no queue, no verification threads. A
+    /// scope of threads created per block to run no-op checks was most of an
+    /// early block's connect time during initial sync.
+    #[test]
+    fn a_verifier_that_checks_nothing_is_never_called() {
+        struct ChecksNothing;
+        impl crate::validation::script::ScriptVerifier for ChecksNothing {
+            fn checks_nothing(&self) -> bool {
+                true
+            }
+            fn verify_transaction(
+                &self,
+                _tx: &Transaction,
+                _prev_outputs: &[TxOut],
+                _height: u32,
+            ) -> Result<(), crate::validation::script::ScriptError> {
+                panic!("a verifier that checks nothing was handed a transaction")
+            }
+            fn verify_policy(
+                &self,
+                _tx: &Transaction,
+                _prev_outputs: &[TxOut],
+            ) -> Result<(), crate::validation::script::ScriptError> {
+                Ok(())
+            }
+        }
+        let (store, outpoint, _) = make_test_store_with_coin(50, false);
+        let block = make_block_spending(outpoint, 60, 2, 10, 0);
+        let batch = connect_block(&ConnectParams {
+            replay_plan: None,
+            store: &store,
+            block: &block,
+            height: 60,
+            parent_chainwork: &[0u8; 32],
+            flat_pos: default_pos(),
+            script_verifier: &ChecksNothing,
+            median_time_past: 0,
+            network: Network::Regtest,
+            pre_verified_txs: None,
+            num_threads: 4,
+            precomputed_txids: None,
+            script_skip_txs: None,
+            address_index: &Default::default(),
+            sp_index: &Default::default(),
+            #[cfg(feature = "block-filter-index")]
+            filter_index: &Default::default(),
+            phase_tracker: None,
+            interrupt: None,
+        });
+        assert!(batch.is_ok(), "{:?}", batch.err());
+    }
+
     #[test]
     fn an_interrupted_connect_stops_with_no_batch() {
         use std::sync::atomic::{AtomicU32, Ordering};
+        /// Accepts every script but is not a no-op to `connect_block`, so the
+        /// verification step, and its interrupt poll, still runs.
+        struct AcceptsAll;
+        impl crate::validation::script::ScriptVerifier for AcceptsAll {
+            fn verify_transaction(
+                &self,
+                _tx: &Transaction,
+                _prev_outputs: &[TxOut],
+                _height: u32,
+            ) -> Result<(), crate::validation::script::ScriptError> {
+                Ok(())
+            }
+            fn verify_policy(
+                &self,
+                _tx: &Transaction,
+                _prev_outputs: &[TxOut],
+            ) -> Result<(), crate::validation::script::ScriptError> {
+                Ok(())
+            }
+        }
         let (store, outpoint, _) = make_test_store_with_coin(50, false);
         let block = make_block_spending(outpoint, 60, 2, 10, 0);
         let run = |stop_on: u32| {
@@ -2000,7 +2073,7 @@ mod tests {
                 height: 60,
                 parent_chainwork: &[0u8; 32],
                 flat_pos: default_pos(),
-                script_verifier: &NoopVerifier,
+                script_verifier: &AcceptsAll,
                 median_time_past: 0,
                 network: Network::Regtest,
                 pre_verified_txs: None,
