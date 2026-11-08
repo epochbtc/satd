@@ -310,7 +310,7 @@ fn the_source_of_a_block_that_fails_to_connect_is_charged() {
     pm.block_sources.lock().record(bad, 1);
     pm.block_sources.lock().record(good, 2);
 
-    pm.forget_block_source(&good);
+    pm.ibd_block_connected(&good);
     pm.punish_block_source(&good, "bad-txns-inputs-missingorspent");
     assert!(pm.peers.read().contains_key(&2), "a connected block's sender is not charged");
 
