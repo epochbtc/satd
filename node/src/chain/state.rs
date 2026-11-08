@@ -5701,13 +5701,16 @@ impl ChainState {
             // synced its bytes. Held before the height row is written, so a
             // reader that finds the height finds the entry.
             let fresh = self.store.get_block_index(&block_hash).is_none();
-            self.store
-                .hold_block_row(block_hash, entry.clone(), pending)
-                .map_err(ChainError::Storage)?;
+            self.store.hold_block_row(block_hash, entry.clone(), pending);
+            if let Err(e) = self.write_chain_batch(batch) {
+                // The store failed: leave the block unindexed, as a failed
+                // batch did when the entry was part of it.
+                self.store.unhold_block_row(&block_hash);
+                return Err(e.into());
+            }
             if fresh {
                 self.note_indexed_block(block_hash, entry.header.prev_blockhash);
             }
-            self.write_chain_batch(batch)?;
             if had_record {
                 self.forget_strip_summary();
             }
@@ -12293,6 +12296,56 @@ pub(crate) mod tests {
             assert!(read.is_ok(), "the pruner's read waited on a flush that waited on the pruner");
         });
         assert_eq!(cs.store.held_row_count(), 0, "the flush committed the held row");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A `HeaderOnly` row arriving for a block whose store row is held does
+    /// not replace it, even once the LRU has evicted the held entry (the
+    /// dominance filter's view): committing it would index the block as
+    /// having no data over a record that holds it.
+    #[test]
+    fn a_header_only_row_does_not_replace_a_held_store_row() {
+        let (cs, dir) = make_chain_state();
+        let genesis = bitcoin::constants::genesis_block(Network::Regtest);
+        let b1 = build_test_block(genesis.block_hash(), 1, 1_300_000_001);
+        let hash = b1.block_hash();
+        cs.accept_header(&b1.header).unwrap();
+        let header_only = cs.store.get_block_index(&hash).unwrap();
+        assert_eq!(header_only.status, BlockStatus::HeaderOnly);
+        cs.store_block(&b1).unwrap();
+
+        cs.store.drop_read_overlays();
+        let mut batch = crate::storage::StoreBatch::default();
+        batch.block_index_puts.push((hash, header_only));
+        cs.store.write_batch(batch).unwrap();
+        assert_eq!(cs.store.get_block_index(&hash).unwrap().status, BlockStatus::DataStored);
+
+        cs.store.commit_held_rows().unwrap();
+        assert_eq!(cs.store.inner_for_test().get_block_index(&hash).unwrap().status, BlockStatus::DataStored);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A store whose own batch fails leaves the block unindexed, as it did
+    /// when the entry was part of that batch: the held row is dropped, not
+    /// committed later behind the caller's back.
+    #[test]
+    fn a_failed_store_leaves_no_held_row_behind() {
+        let store = crate::storage::test_store::ControllableStore::new();
+        let controls = store.controls();
+        let (cs, dir) = make_chain_state_with_store(Box::new(store));
+        let genesis = bitcoin::constants::genesis_block(Network::Regtest);
+        let b1 = build_test_block(genesis.block_hash(), 1, 1_300_000_001);
+        let hash = b1.block_hash();
+        cs.accept_header(&b1.header).unwrap();
+
+        controls.fail_next_write();
+        assert!(cs.store_block(&b1).is_err());
+        assert_eq!(cs.store.held_row_count(), 0);
+        assert_eq!(cs.store.get_block_index(&hash).unwrap().status, BlockStatus::HeaderOnly);
+
+        // And it can be stored again.
+        cs.store_block(&b1).unwrap();
+        assert_eq!(cs.store.get_block_index(&hash).unwrap().status, BlockStatus::DataStored);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

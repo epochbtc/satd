@@ -429,35 +429,32 @@ impl CoinCache {
     /// Take a stored block's `block_index` row, which names a block-file
     /// record that may not be synced yet. It is readable at once and
     /// reaches the inner store with the next group commit; see
-    /// `held_rows`. Commits now if the batch is full.
-    pub fn hold_block_row(
-        &self,
-        hash: BlockHash,
-        entry: BlockIndexEntry,
-        pending: PendingRecord,
-    ) -> Result<(), StoreError> {
+    /// `held_rows`. The commit never runs here: the caller holds the accept
+    /// lock, and an fsync under it would put the disk's flush latency back
+    /// on the store path (#547). The commit thread takes the batch once it
+    /// is full or old enough ([`Self::commit_held_rows_if_due`]).
+    pub fn hold_block_row(&self, hash: BlockHash, entry: BlockIndexEntry, pending: PendingRecord) {
         self.block_index_cache.lock().put(hash, entry.clone());
-        let full = {
-            let mut held = self.held_rows.lock();
-            held.push(HeldRow { hash, entry, at: std::time::Instant::now(), _pending: pending });
-            held.len() >= HELD_ROWS_MAX
-        };
-        // The row is held and readable whatever the commit does. A failed
-        // commit leaves it held, and the next timed commit or flush retries;
-        // the block was stored either way, so the caller is told so.
-        if full && let Err(e) = self.commit_held_rows() {
-            tracing::warn!(error = %e, "group commit of stored blocks' index rows failed; retrying later");
-        }
-        Ok(())
+        self.held_rows.lock().push(HeldRow { hash, entry, at: std::time::Instant::now(), _pending: pending });
     }
 
-    /// Commit the held rows if the oldest has waited [`HELD_ROWS_MAX_AGE`].
+    /// Drop a held row whose store did not complete: the caller's own write
+    /// failed after holding it, and the block is to stay unindexed, as a
+    /// failed store left it before rows were held. Its record stays in the
+    /// block file, unreferenced.
+    pub fn unhold_block_row(&self, hash: &BlockHash) {
+        let _commit = self.held_commit.lock();
+        self.held_rows.lock().retain(|r| r.hash != *hash);
+        self.block_index_cache.lock().pop(hash);
+    }
+
+    /// Commit the held rows if [`HELD_ROWS_MAX`] have gathered or the oldest
+    /// has waited [`HELD_ROWS_MAX_AGE`].
     pub fn commit_held_rows_if_due(&self) -> Result<(), StoreError> {
-        let due = self
-            .held_rows
-            .lock()
-            .first()
-            .is_some_and(|r| r.at.elapsed() >= HELD_ROWS_MAX_AGE);
+        let due = {
+            let held = self.held_rows.lock();
+            held.len() >= HELD_ROWS_MAX || held.first().is_some_and(|r| r.at.elapsed() >= HELD_ROWS_MAX_AGE)
+        };
         if due { self.commit_held_rows() } else { Ok(()) }
     }
 
@@ -1452,6 +1449,16 @@ impl CoinCache {
                     let mut lru = self.block_index_cache.lock();
                     pass_through.block_index_puts.retain(|(h, e)| {
                         match held.iter_mut().rev().find(|r| r.hash == *h) {
+                            // A `HeaderOnly` row never replaces one that holds
+                            // data: the dominance rule above, which misses
+                            // when the LRU has evicted the held entry.
+                            Some(row)
+                                if e.status == BlockStatus::HeaderOnly
+                                    && matches!(row.entry.status, BlockStatus::DataStored | BlockStatus::Valid) =>
+                            {
+                                lru.put(*h, row.entry.clone());
+                                false
+                            }
                             Some(row) => {
                                 row.entry = e.clone();
                                 lru.put(*h, e.clone());
