@@ -442,7 +442,13 @@ impl CoinCache {
             held.push(HeldRow { hash, entry, at: std::time::Instant::now(), _pending: pending });
             held.len() >= HELD_ROWS_MAX
         };
-        if full { self.commit_held_rows() } else { Ok(()) }
+        // The row is held and readable whatever the commit does. A failed
+        // commit leaves it held, and the next timed commit or flush retries;
+        // the block was stored either way, so the caller is told so.
+        if full && let Err(e) = self.commit_held_rows() {
+            tracing::warn!(error = %e, "group commit of stored blocks' index rows failed; retrying later");
+        }
+        Ok(())
     }
 
     /// Commit the held rows if the oldest has waited [`HELD_ROWS_MAX_AGE`].
@@ -476,12 +482,17 @@ impl CoinCache {
         if let Some(sync) = self.flat_sync.get() {
             sync()?;
         }
-        let batch = StoreBatch {
-            block_index_puts: self.held_rows.lock()[..n].iter().map(|r| (r.hash, r.entry.clone())).collect(),
-            ..StoreBatch::default()
+        let batch = {
+            let held = self.held_rows.lock();
+            StoreBatch {
+                block_index_puts: held[..n.min(held.len())].iter().map(|r| (r.hash, r.entry.clone())).collect(),
+                ..StoreBatch::default()
+            }
         };
         self.inner.write_batch_mode(batch, self.current_write_mode())?;
-        self.held_rows.lock().drain(..n);
+        let mut held = self.held_rows.lock();
+        let n = n.min(held.len());
+        held.drain(..n);
         Ok(())
     }
 
@@ -591,15 +602,31 @@ impl CoinCache {
     /// `pending_tip` are taken again, so the failure path does not invert
     /// the order either.
     fn flush_inner(&self) -> Result<(), StoreError> {
-        let mut dirty = self.dirty.write();
-        let mut pending = self.pending_batch.lock();
-        // Held store rows go first, under the batch lock: a block whose
-        // `Valid` row is in this batch had its store row held before it
-        // connected, so it is committed (its bytes synced) before the
-        // `Valid` row is written, and the store row can never land on top
-        // of the `Valid` one later. No connect can add to the batch while
-        // the lock is held.
-        self.commit_held_rows()?;
+        // Held store rows go first. A block whose `Valid` row is in the batch
+        // below had its store row held before it connected; that row must be
+        // committed (its bytes synced) before the `Valid` row is written, or
+        // the store row, committed later, would land on top of it.
+        //
+        // The commit syncs the block files, which takes the block-file lock,
+        // and the pruner holds that lock while it reads entries through the
+        // batch lock. So commit with no lock held, then check under the batch
+        // lock that no held row belongs to a block the batch carries a row
+        // for; a connect in between can add one, and then commit again. No
+        // connect can add to the batch while the lock is held, so the check
+        // holds until the batch is written.
+        let (mut dirty, mut pending) = loop {
+            self.commit_held_rows()?;
+            let dirty = self.dirty.write();
+            let pending = self.pending_batch.lock();
+            let needs_commit = {
+                let held = self.held_rows.lock();
+                !held.is_empty()
+                    && pending.block_index_puts.iter().any(|(h, _)| held.iter().any(|r| r.hash == *h))
+            };
+            if !needs_commit {
+                break (dirty, pending);
+            }
+        };
         let mut batch = std::mem::take(&mut *pending);
 
         // Pre-allocate batch vectors based on dirty map size
@@ -2111,8 +2138,12 @@ impl Store for CoinCache {
         self.undo_cache.lock().clear();
         self.tx_loc_cache.lock().clear();
         self.chain_tx_cache.lock().clear();
-        // Wiping the store wipes the rows waiting to be written to it.
-        self.held_rows.lock().clear();
+        // Wiping the store wipes the rows waiting to be written to it. Under
+        // the commit lock, so a commit in progress cannot write them back.
+        {
+            let _commit = self.held_commit.lock();
+            self.held_rows.lock().clear();
+        }
         self.inner.clear_all()
     }
 

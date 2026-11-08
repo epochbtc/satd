@@ -1302,10 +1302,16 @@ impl ChainState {
         let store = Arc::downgrade(&self.store);
         let spawned = std::thread::Builder::new().name("block-row-commit".into()).spawn(move || {
             let tick = crate::storage::coin_cache::HELD_ROWS_MAX_AGE / 4;
+            // A disk that keeps failing would otherwise log this 40 times a
+            // second until it recovers.
+            let mut last_logged: Option<std::time::Instant> = None;
             loop {
                 std::thread::sleep(tick);
                 let Some(store) = store.upgrade() else { return };
-                if let Err(e) = store.commit_held_rows_if_due() {
+                if let Err(e) = store.commit_held_rows_if_due()
+                    && last_logged.is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(10))
+                {
+                    last_logged = Some(std::time::Instant::now());
                     tracing::error!(error = %e, "committing stored blocks' index rows failed; retrying");
                 }
             }
@@ -12249,6 +12255,44 @@ pub(crate) mod tests {
             .unwrap();
         assert!(kept > 0, "some rows reached the backing store");
         drop(flat);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A coin-cache flush and a prune at once do not deadlock. The flush
+    /// commits held rows, which syncs the block files and so takes the
+    /// block-file lock; the pruner holds that lock while it reads entries,
+    /// which takes the cache's batch lock. A flush that took the batch lock
+    /// first and then waited for the block files closed the cycle. Here the
+    /// test thread holds the block-file lock as the pruner does, a flush
+    /// starts with a stored block's row held, and the pruner's read must
+    /// still finish.
+    #[test]
+    fn a_flush_and_a_prune_at_once_do_not_deadlock() {
+        let (cs, dir) = make_chain_state();
+        let genesis = bitcoin::constants::genesis_block(Network::Regtest);
+        let b1 = build_test_block(genesis.block_hash(), 1, 1_300_000_001);
+        cs.accept_header(&b1.header).unwrap();
+        cs.store_block(&b1).unwrap();
+        assert_eq!(cs.store.held_row_count(), 1);
+        let probe = genesis.block_hash();
+
+        std::thread::scope(|scope| {
+            let flat = cs.flat_files.lock();
+            let flush = scope.spawn(|| cs.store.flush());
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            let (tx, rx) = std::sync::mpsc::channel();
+            let cs = &cs;
+            scope.spawn(move || {
+                cs.store.drop_read_overlays();
+                let _ = cs.store.get_block_index(&probe);
+                let _ = tx.send(());
+            });
+            let read = rx.recv_timeout(std::time::Duration::from_secs(2));
+            drop(flat);
+            flush.join().unwrap().unwrap();
+            assert!(read.is_ok(), "the pruner's read waited on a flush that waited on the pruner");
+        });
+        assert_eq!(cs.store.held_row_count(), 0, "the flush committed the held row");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
