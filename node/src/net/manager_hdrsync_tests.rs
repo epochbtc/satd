@@ -231,19 +231,28 @@ fn a_full_batch_asks_only_its_own_peer_for_more() {
     }
 }
 
-/// The periodic IBD header probe goes out only when the header tip has not
-/// moved since the last one. While a request chain advances the tip, a probe
-/// would only start a second chain fetching the same headers (#1229).
+/// The periodic IBD header probe goes out only once the header tip has stood
+/// still for `HEADER_PROBE_STALL`, and at most once per that interval. While
+/// a request chain advances the tip, or a slow peer's answer is still on its
+/// way, a probe would only start a second chain fetching the same headers
+/// (#1229).
 #[test]
 fn the_periodic_header_probe_waits_for_a_stall() {
     let (pm, _dir) = mk_pm();
     let chain = header_chain(2000, 1_500_000_000);
     let _rx = add_peer(&pm, 1);
+    let t0 = Instant::now();
+    let at = |secs: u64| t0 + Duration::from_secs(secs);
 
-    assert!(!pm.ibd_header_probe_due(), "the first tick records the tip; the handshake's request is in flight");
-    assert!(pm.ibd_header_probe_due(), "a tip that has not moved since the last tick is a stall");
+    assert!(!pm.ibd_header_probe_due_at(at(0)), "the first check records the tip");
+    assert!(!pm.ibd_header_probe_due_at(at(2)), "a tip still for 2 s may be a request in flight");
+    assert!(!pm.ibd_header_probe_due_at(at(9)), "still under the stall time");
+    assert!(pm.ibd_header_probe_due_at(at(10)), "still for the stall time: a stall");
+    assert!(!pm.ibd_header_probe_due_at(at(12)), "one probe per interval, however long the stall");
+    assert!(pm.ibd_header_probe_due_at(at(20)), "the next interval");
 
     pm.handle_headers(1, chain[..1000].to_vec());
-    assert!(!pm.ibd_header_probe_due(), "the tip moved: header sync is progressing");
-    assert!(pm.ibd_header_probe_due(), "and then stopped");
+    assert!(!pm.ibd_header_probe_due_at(at(22)), "the tip moved: header sync is progressing");
+    assert!(!pm.ibd_header_probe_due_at(at(31)), "still under the stall time since it moved");
+    assert!(pm.ibd_header_probe_due_at(at(32)), "and then stopped");
 }
