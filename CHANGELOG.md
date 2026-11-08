@@ -73,6 +73,8 @@ It includes every fix shipped in 0.7.1:
   hashing for every input. About 27x faster on a 3,373-input signet block,
   2.3x on a typical mainnet block (#874). Building from source now needs cmake
   and the Boost headers.
+- IBD: an arriving block or `headers` message is handled at once instead of at the P2P loop's next 500 ms tick, which lifts the early part of a sync from about 25 blocks a second per peer to about 250 from one peer on local storage (#1228).
+- IBD: header sync no longer downloads the header chain many times over; a new request goes out only after the header tip has stood still for 10 seconds, and a full batch asks only the peer that sent it for more. A fresh mainnet sync from one peer took 5.6 GB of `headers` for the 78 MB chain (#1229).
 - IBD: testnet4 and testnet3 get Bitcoin Core's default `-assumevalid`, and the stall watchdog counts the script inputs the connect path verifies as progress, so one very large block is no longer taken for a wedge; in 0.7.1 a fresh testnet4 sync stopped for good at block 51,540 (#1216).
 
 ## Releases
