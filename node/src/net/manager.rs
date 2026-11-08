@@ -1359,6 +1359,9 @@ pub struct PeerManager {
     /// The loop's periodic maintenance is still driven by the interval
     /// alone.
     drain_now: Arc<tokio::sync::Notify>,
+    /// The header tip at the last periodic IBD header probe, `u64::MAX`
+    /// before the first: see [`Self::ibd_header_probe_due`].
+    ibd_header_probe_tip: AtomicU64,
     /// Channel to send received blocks to the processing thread.
     block_tx: mpsc::UnboundedSender<IncomingBlock>,
     /// Compact block reconstructions awaiting a `blocktxn`, at most one per
@@ -1768,6 +1771,7 @@ impl PeerManager {
             nap_limits: parking_lot::Mutex::new(Default::default()),
             nap_puller: RwLock::new(None),
             drain_now: Arc::new(tokio::sync::Notify::new()),
+            ibd_header_probe_tip: AtomicU64::new(u64::MAX),
             block_tx,
             pending_compact: RwLock::new(HashMap::new()),
             extra_txns: Arc::new(parking_lot::Mutex::new(compact::ExtraTxnCache::new(
@@ -5205,6 +5209,20 @@ impl PeerManager {
         self.headers_tip.store(htip, Ordering::Relaxed);
     }
 
+    /// Whether the periodic IBD header probe should go out: only when the
+    /// header tip has not moved since the last probe. A full `headers` batch
+    /// already asks its peer for the next one (`handle_headers`), so while
+    /// that chain of requests advances the tip, a probe only starts a second
+    /// chain behind it that fetches the same headers again; one per probe,
+    /// for as long as header sync runs, came to 5.6 GB of `headers` for a
+    /// 78 MB mainnet header chain (#1229). The first call only records the
+    /// tip: the connection's own `getheaders` is still in flight.
+    fn ibd_header_probe_due(&self) -> bool {
+        let tip = u64::from(self.chain_state.headers_tip_height());
+        let last = self.ibd_header_probe_tip.swap(tip, Ordering::Relaxed);
+        last == tip
+    }
+
     fn is_ibd(&self) -> bool {
         let tip = self.chain_state.tip_height();
         // The best header is at least our own tip. `headers_tip` only moves
@@ -6687,9 +6705,10 @@ impl PeerManager {
                 }
             }
 
-            // Request headers: during IBD, request every 4 ticks (2s) from a few peers.
-            // Requesting from ALL peers floods them and triggers rate limits.
-            if self.is_ibd() && ticks.is_multiple_of(4) {
+            // Request headers: during IBD, every 4 ticks (2s), from a few
+            // peers, when header sync has stalled. Requesting from ALL peers
+            // floods them and triggers rate limits.
+            if self.is_ibd() && ticks.is_multiple_of(4) && self.ibd_header_probe_due() {
                 let peer_ids: Vec<PeerId> = {
                     let peers = self.peers.read();
                     peers.iter()
@@ -8204,21 +8223,12 @@ impl PeerManager {
 
             tracing::debug!(id, accepted, headers_tip = htip, "Headers accepted");
 
-            // Peer sent a full batch: the getheaders to it went out above.
-            if headers.len() >= 2000 {
-                // During header download, request from other peers too for redundancy
-                let peer_ids: Vec<PeerId> = {
-                    let peers = self.peers.read();
-                    peers.iter()
-                        .filter(|(pid, h)| **pid != id && h.info.state == PeerState::Connected)
-                        .map(|(pid, _)| *pid)
-                        .take(3)
-                        .collect()
-                };
-                for pid in peer_ids {
-                    self.send_to_peer(pid, sync::make_getheaders(&self.chain_state));
-                }
-            }
+            // A full batch asked its own peer for the next one above, and
+            // that is the only request it makes. Asking three other peers
+            // as well, on every batch, started three more request chains
+            // per batch, each fetching the same headers to the tip (#1229).
+            // If this peer stops answering, the periodic probe in the
+            // maintenance loop asks others once the header tip stalls.
 
             // Start or extend IBD scheduler when headers are ahead of blocks.
             //
