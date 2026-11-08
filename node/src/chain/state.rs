@@ -10336,7 +10336,12 @@ impl ChainState {
     /// completed the path for. Called after the block's index entry commits.
     fn note_block_data_arrived(&self, hash: BlockHash, entry: &BlockIndexEntry) -> Vec<BlockHash> {
         self.blocks_indexed.fetch_add(1, Ordering::AcqRel);
-        match self.is_connectable(entry) {
+        let connectable = if self.parent_known_connectable(entry) {
+            Ok(true)
+        } else {
+            self.is_connectable(entry)
+        };
+        match connectable {
             Ok(true) => self.assign_sequence_ids(hash),
             Ok(false) => {
                 self.park_unlinked(entry.header.prev_blockhash, hash);
@@ -10350,6 +10355,28 @@ impl ChainState {
                 Vec::new()
             }
         }
+    }
+
+    /// Core's test in `ReceivedBlockTransactions`: a block whose parent is
+    /// connectable is connectable once its own data is in
+    /// (`pprev->HaveNumChainTxs()`). The parent is known to be when it is on
+    /// the active chain or already holds a sequence id from this run, which
+    /// a block gets exactly when it becomes connectable.
+    ///
+    /// [`Self::is_connectable`] walks down to the active chain instead, one
+    /// index read per block. During initial sync the store runs up to tens of
+    /// thousands of blocks ahead of the connected tip, so every store walked
+    /// that far, under the accept lock the connector needs: on mainnet,
+    /// stack samples put the store thread in that walk 10 times in 12, and
+    /// its CPU climbed with the distance ahead. `false` here means "not
+    /// known", and the walk decides.
+    fn parent_known_connectable(&self, entry: &BlockIndexEntry) -> bool {
+        let Some(parent_height) = entry.height.checked_sub(1) else {
+            return true;
+        };
+        let prev = entry.header.prev_blockhash;
+        self.active_chain_hash_at_height(parent_height) == Some(prev)
+            || self.sequence_ids.lock().ids.contains_key(&prev)
     }
 
     fn is_connectable(&self, entry: &BlockIndexEntry) -> Result<bool, ChainError> {
@@ -12365,6 +12392,43 @@ pub(crate) mod tests {
         assert_eq!(cs.store.held_row_count(), 0);
         cs.store.commit_held_rows().unwrap();
         assert!(cs.store.inner_for_test().get_block_index(&hash).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Blocks stored ahead of the connected tip get their sequence ids in
+    /// connectable order whether the parent is found connectable by its id
+    /// (`parent_known_connectable`) or by the walk down to the active chain:
+    /// in order, a child stored before its parent waits and is numbered
+    /// right after it, and the walk and the shortcut agree on every block.
+    #[test]
+    fn stored_blocks_get_sequence_ids_in_connectable_order() {
+        let (cs, dir) = make_chain_state();
+        let genesis = bitcoin::constants::genesis_block(Network::Regtest);
+        let mut blocks = Vec::new();
+        let mut parent = genesis.block_hash();
+        for h in 1..=40u32 {
+            let b = build_test_block(parent, h, 1_300_000_000 + h);
+            parent = b.block_hash();
+            cs.accept_header(&b.header).unwrap();
+            blocks.push(b);
+        }
+        // 1..=30 in order; then 32 before 31, then the rest.
+        for b in &blocks[..30] {
+            cs.store_block(b).unwrap();
+        }
+        cs.store_block(&blocks[31]).unwrap();
+        assert!(!cs.sequence_ids.lock().ids.contains_key(&blocks[31].block_hash()), "32 waits for 31");
+        cs.store_block(&blocks[30]).unwrap();
+        for b in &blocks[32..] {
+            cs.store_block(b).unwrap();
+        }
+
+        let ids: Vec<i32> = blocks.iter().map(|b| cs.sequence_ids.lock().ids[&b.block_hash()]).collect();
+        assert!(ids.windows(2).all(|w| w[0] < w[1]), "ids run in chain order: {ids:?}");
+        for b in &blocks {
+            let entry = cs.get_block_index(&b.block_hash()).unwrap();
+            assert!(cs.is_connectable(&entry).unwrap(), "height {}: the walk agrees", entry.height);
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
