@@ -109,6 +109,15 @@ pub struct CoinCache {
     count_delta: AtomicI64,
     amount_delta: AtomicI64,
     pending_batch: Mutex<StoreBatch>,
+    /// Every hash that may have a row in `pending_batch.block_index_puts`
+    /// (a superset: a superseded row can leave its hash behind).
+    /// `get_block_index` scans those rows only for a hash in here. The scan
+    /// is linear, and the pending rows grow with every block connected since
+    /// the last flush, so header acceptance, which looks up hashes that are
+    /// mostly nowhere in the cache, paid for the whole vector on each.
+    /// Added to wherever rows go into the batch, emptied only where the
+    /// batch is taken or reset; taken after `pending_batch` when both are.
+    pending_bi_hashes: Mutex<std::collections::HashSet<BlockHash>>,
     block_index_cache: Mutex<LruCache<BlockHash, BlockIndexEntry>>,
     /// Group commit for stored blocks' `block_index` rows (D3).
     ///
@@ -309,6 +318,7 @@ impl CoinCache {
             count_delta: AtomicI64::new(0),
             amount_delta: AtomicI64::new(0),
             pending_batch: Mutex::new(StoreBatch::default()),
+            pending_bi_hashes: Mutex::new(std::collections::HashSet::new()),
             block_index_cache: Mutex::new(lru(block_index_cap.max(1))),
             height_hash_cache: Mutex::new(lru(height_hash_cap)),
             undo_cache: Mutex::new(lru(undo_cap)),
@@ -625,6 +635,9 @@ impl CoinCache {
             }
         };
         let mut batch = std::mem::take(&mut *pending);
+        // The rows leave the batch; a failed write puts them back and
+        // re-adds their hashes (`restore_after_failed_flush`).
+        self.pending_bi_hashes.lock().clear();
 
         // Pre-allocate batch vectors based on dirty map size
         batch.coin_puts.reserve(dirty.len());
@@ -843,6 +856,7 @@ impl CoinCache {
         // the failure path must not take them in the other order.
         let newer = std::mem::take(&mut *pending);
         batch.merge(newer);
+        self.pending_bi_hashes.lock().extend(batch.block_index_puts.iter().map(|(h, _)| *h));
         *pending = batch;
         drop(pending);
 
@@ -1015,6 +1029,7 @@ impl CoinCache {
         self.amount_delta.store(0, Ordering::Relaxed);
         *self.pending_tip.lock() = None;
         *self.pending_batch.lock() = StoreBatch::default();
+        self.pending_bi_hashes.lock().clear();
         // The non-coin overlays receive reorg-tentative values
         // unconditionally in `write_batch_mode` (the side-chain blocks'
         // index/height/undo/tx/chain-tx rows), so they MUST be cleared —
@@ -1493,6 +1508,7 @@ impl CoinCache {
                 self.write_pass_through(pass_through, mode)?;
             } else {
                 let mut pending = self.pending_batch.lock();
+                self.pending_bi_hashes.lock().extend(batch.block_index_puts.iter().map(|(h, _)| *h));
                 pending.block_index_puts.extend(batch.block_index_puts);
                 pending.undo_puts.extend(batch.undo_puts);
                 pending.chain_tx_puts.extend(batch.chain_tx_puts);
@@ -1804,13 +1820,14 @@ impl Store for CoinCache {
         // holds one entry per connect/disconnect since the last flush. The
         // scan runs backwards because the buffer is append-only and the last
         // write for a hash wins, matching how `flush_inner` replays it.
-        if let Some((_, entry)) = self
-            .pending_batch
-            .lock()
-            .block_index_puts
-            .iter()
-            .rev()
-            .find(|(h, _)| h == hash)
+        if self.pending_bi_hashes.lock().contains(hash)
+            && let Some((_, entry)) = self
+                .pending_batch
+                .lock()
+                .block_index_puts
+                .iter()
+                .rev()
+                .find(|(h, _)| h == hash)
         {
             return Some(entry.clone());
         }
@@ -2123,6 +2140,7 @@ impl Store for CoinCache {
         self.amount_delta.store(0, Ordering::Relaxed);
         *self.pending_tip.lock() = None;
         *self.pending_batch.lock() = StoreBatch::default();
+        self.pending_bi_hashes.lock().clear();
         self.block_index_cache.lock().clear();
         self.height_hash_cache.lock().clear();
         self.undo_cache.lock().clear();
@@ -2140,6 +2158,7 @@ impl Store for CoinCache {
         self.amount_delta.store(0, Ordering::Relaxed);
         *self.pending_tip.lock() = None;
         *self.pending_batch.lock() = StoreBatch::default();
+        self.pending_bi_hashes.lock().clear();
         self.block_index_cache.lock().clear();
         self.height_hash_cache.lock().clear();
         self.undo_cache.lock().clear();
@@ -5067,6 +5086,30 @@ mod tests {
         assert_eq!(cache.coin_count(), 1);
         assert_eq!(cache.coin_total_amount(), 8_000);
         assert_eq!(cache.get_coin(&z).unwrap().height, 4);
+    }
+
+    /// A block-index row a failed flush hands back to the pending batch is
+    /// still found once the LRU has lost it: the restore puts its hash back
+    /// among those `get_block_index` scans the pending rows for
+    /// (`pending_bi_hashes`), which the flush emptied when it took the batch.
+    #[test]
+    fn a_row_a_failed_flush_hands_back_is_still_read() {
+        use crate::storage::test_store::ControllableStore;
+
+        let store = ControllableStore::new();
+        let controls = store.controls();
+        let cache = CoinCache::new(Box::new(store), 10);
+
+        let hash = BlockHash::from_byte_array([0x5C; 32]);
+        let mut connect = StoreBatch::default();
+        connect.coin_puts.push((make_outpoint(0xF5, 0), make_coin(1_000, 7)));
+        connect.block_index_puts.push((hash, make_test_entry(7)));
+        cache.write_batch(connect).unwrap();
+
+        controls.fail_next_write();
+        assert!(cache.flush().is_err());
+        cache.block_index_cache.lock().clear();
+        assert_eq!(cache.get_block_index(&hash).map(|e| e.height), Some(7), "the handed-back row is read");
     }
 
     /// The restore must not overwrite a write that arrived while the failed
