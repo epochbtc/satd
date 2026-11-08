@@ -206,3 +206,44 @@ fn branch_locator_follows_the_branch_then_the_rows() {
     );
     assert!(sync::build_locator_for_branch(cs, bitcoin::BlockHash::all_zeros()).is_none());
 }
+
+/// A full batch of new headers asks only the peer that sent it for more.
+/// Asking three other peers too, on every batch, started three more request
+/// chains per batch, each fetching the same headers to the tip: 5.6 GB of
+/// `headers` for a 78 MB mainnet header chain (#1229).
+#[test]
+fn a_full_batch_asks_only_its_own_peer_for_more() {
+    let (pm, _dir) = mk_pm();
+    let chain = header_chain(2000, 1_500_000_000);
+    let mut rx1 = add_peer(&pm, 1);
+    let mut others: Vec<_> = (2..=4).map(|id| add_peer(&pm, id)).collect();
+
+    pm.handle_headers(1, chain.clone());
+    assert_eq!(pm.chain_state.headers_tip_height(), 2000, "the batch was new");
+
+    let asked = drain(&mut rx1).iter().filter(|m| matches!(m, NetworkMessage::GetHeaders(_))).count();
+    assert_eq!(asked, 1, "the sending peer is asked for the next batch");
+    for rx in &mut others {
+        assert!(
+            !drain(rx).iter().any(|m| matches!(m, NetworkMessage::GetHeaders(_))),
+            "no other peer is asked for headers on a batch"
+        );
+    }
+}
+
+/// The periodic IBD header probe goes out only when the header tip has not
+/// moved since the last one. While a request chain advances the tip, a probe
+/// would only start a second chain fetching the same headers (#1229).
+#[test]
+fn the_periodic_header_probe_waits_for_a_stall() {
+    let (pm, _dir) = mk_pm();
+    let chain = header_chain(2000, 1_500_000_000);
+    let _rx = add_peer(&pm, 1);
+
+    assert!(!pm.ibd_header_probe_due(), "the first tick records the tip; the handshake's request is in flight");
+    assert!(pm.ibd_header_probe_due(), "a tip that has not moved since the last tick is a stall");
+
+    pm.handle_headers(1, chain[..1000].to_vec());
+    assert!(!pm.ibd_header_probe_due(), "the tip moved: header sync is progressing");
+    assert!(pm.ibd_header_probe_due(), "and then stopped");
+}
