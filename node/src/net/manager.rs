@@ -423,6 +423,21 @@ impl DrainPacer {
     }
 }
 
+/// How long the header tip must stand still during IBD before the periodic
+/// header probe asks other peers, and the least time between two probes.
+/// Longer than any reasonable `getheaders` round trip, so a request still
+/// in flight is not taken for a stall (#1229).
+const HEADER_PROBE_STALL: Duration = Duration::from_secs(10);
+
+/// The periodic IBD header probe's state.
+#[derive(Default)]
+struct HeaderProbe {
+    /// The header tip when last seen, and since when it has stood there.
+    tip: Option<(u32, Instant)>,
+    /// When the last probe went out.
+    last_sent: Option<Instant>,
+}
+
 /// Token-bucket cap for the promotion-INV drain (§8): at most this many
 /// reloaded-and-promoted transactions are announced per drain tick, so a
 /// worst-case mass promotion spreads over minutes instead of bursting peers.
@@ -1359,9 +1374,9 @@ pub struct PeerManager {
     /// The loop's periodic maintenance is still driven by the interval
     /// alone.
     drain_now: Arc<tokio::sync::Notify>,
-    /// The header tip at the last periodic IBD header probe, `u64::MAX`
-    /// before the first: see [`Self::ibd_header_probe_due`].
-    ibd_header_probe_tip: AtomicU64,
+    /// The periodic IBD header probe's state: see
+    /// [`Self::ibd_header_probe_due`].
+    ibd_header_probe: parking_lot::Mutex<HeaderProbe>,
     /// Channel to send received blocks to the processing thread.
     block_tx: mpsc::UnboundedSender<IncomingBlock>,
     /// Compact block reconstructions awaiting a `blocktxn`, at most one per
@@ -1771,7 +1786,7 @@ impl PeerManager {
             nap_limits: parking_lot::Mutex::new(Default::default()),
             nap_puller: RwLock::new(None),
             drain_now: Arc::new(tokio::sync::Notify::new()),
-            ibd_header_probe_tip: AtomicU64::new(u64::MAX),
+            ibd_header_probe: parking_lot::Mutex::new(HeaderProbe::default()),
             block_tx,
             pending_compact: RwLock::new(HashMap::new()),
             extra_txns: Arc::new(parking_lot::Mutex::new(compact::ExtraTxnCache::new(
@@ -5209,18 +5224,37 @@ impl PeerManager {
         self.headers_tip.store(htip, Ordering::Relaxed);
     }
 
-    /// Whether the periodic IBD header probe should go out: only when the
-    /// header tip has not moved since the last probe. A full `headers` batch
-    /// already asks its peer for the next one (`handle_headers`), so while
-    /// that chain of requests advances the tip, a probe only starts a second
-    /// chain behind it that fetches the same headers again; one per probe,
-    /// for as long as header sync runs, came to 5.6 GB of `headers` for a
-    /// 78 MB mainnet header chain (#1229). The first call only records the
-    /// tip: the connection's own `getheaders` is still in flight.
+    /// Whether the periodic IBD header probe should go out: only once the
+    /// header tip has not moved for [`HEADER_PROBE_STALL`], and at most once
+    /// per that interval. A full `headers` batch already asks its peer for
+    /// the next one (`handle_headers`), so while that chain of requests
+    /// advances the tip, a probe only starts a second chain behind it that
+    /// fetches the same headers again; one per probe, for as long as header
+    /// sync ran, came to 5.6 GB of `headers` for a 78 MB mainnet header
+    /// chain (#1229). The wait is longer than a slow peer's round trip, so a
+    /// request still in flight, the connection's own first `getheaders`
+    /// among them, is not taken for a stall.
     fn ibd_header_probe_due(&self) -> bool {
-        let tip = u64::from(self.chain_state.headers_tip_height());
-        let last = self.ibd_header_probe_tip.swap(tip, Ordering::Relaxed);
-        last == tip
+        self.ibd_header_probe_due_at(Instant::now())
+    }
+
+    fn ibd_header_probe_due_at(&self, now: Instant) -> bool {
+        let tip = self.chain_state.headers_tip_height();
+        let mut probe = self.ibd_header_probe.lock();
+        match probe.tip {
+            Some((last, _)) if last == tip => {}
+            _ => {
+                probe.tip = Some((tip, now));
+                return false;
+            }
+        }
+        let still_since = probe.tip.map_or(now, |(_, at)| at);
+        let quiet = |t: Instant| now.saturating_duration_since(t) >= HEADER_PROBE_STALL;
+        if !quiet(still_since) || probe.last_sent.is_some_and(|t| !quiet(t)) {
+            return false;
+        }
+        probe.last_sent = Some(now);
+        true
     }
 
     fn is_ibd(&self) -> bool {
