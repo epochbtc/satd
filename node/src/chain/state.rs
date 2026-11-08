@@ -12349,6 +12349,25 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Wiping the store drops the rows held for it: none is committed into
+    /// the wiped store afterwards.
+    #[test]
+    fn clear_all_drops_held_rows() {
+        let (cs, dir) = make_chain_state();
+        let genesis = bitcoin::constants::genesis_block(Network::Regtest);
+        let b1 = build_test_block(genesis.block_hash(), 1, 1_300_000_001);
+        let hash = b1.block_hash();
+        cs.accept_header(&b1.header).unwrap();
+        cs.store_block(&b1).unwrap();
+        assert_eq!(cs.store.held_row_count(), 1);
+
+        cs.store.clear_all().unwrap();
+        assert_eq!(cs.store.held_row_count(), 0);
+        cs.store.commit_held_rows().unwrap();
+        assert!(cs.store.inner_for_test().get_block_index(&hash).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A newer row for a block whose store row is still held replaces the
     /// held one and goes out with the same commit. Written straight through
     /// instead, it would reach disk ahead of the record's bytes, and the held

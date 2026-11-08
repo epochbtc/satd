@@ -2145,13 +2145,14 @@ impl Store for CoinCache {
         self.undo_cache.lock().clear();
         self.tx_loc_cache.lock().clear();
         self.chain_tx_cache.lock().clear();
-        // Wiping the store wipes the rows waiting to be written to it. Under
-        // the commit lock, so a commit in progress cannot write them back.
-        {
-            let _commit = self.held_commit.lock();
-            self.held_rows.lock().clear();
-        }
-        self.inner.clear_all()
+        // Wiping the store wipes the rows waiting to be written to it. The
+        // commit lock is held across the wipe, so no commit writes a row into
+        // the wiped store, and the rows are cleared after it, so one held
+        // while the wipe ran is dropped too.
+        let _commit = self.held_commit.lock();
+        let wiped = self.inner.clear_all();
+        self.held_rows.lock().clear();
+        wiped
     }
 
     fn get_coins_batch(&self, outpoints: &[OutPoint]) -> Vec<Option<Coin>> {
