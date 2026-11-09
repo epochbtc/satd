@@ -6,7 +6,7 @@ pub use context::McpContext;
 use context::McpContext as Ctx;
 use rmcp::handler::server::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{Implementation, ServerCapabilities, ServerInfo};
+use rmcp::model::{Implementation, ServerCapabilities, ServerConfig};
 use rmcp::{ServerHandler, tool, tool_handler, tool_router};
 use rmcp::schemars;
 use serde::Deserialize;
@@ -482,8 +482,8 @@ impl SatdMcpServer {
 
 #[tool_handler]
 impl ServerHandler for SatdMcpServer {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("satd-mcp", env!("CARGO_PKG_VERSION")))
             .with_instructions(
                 "MCP server for satd, a Bitcoin Core-compatible node. \
@@ -697,7 +697,7 @@ pub async fn serve_http(
 
     let cancel = CancellationToken::new();
     let mut config = StreamableHttpServerConfig::default();
-    config.stateful_mode = true;
+    config.legacy_session_mode = true;
     config.cancellation_token = cancel.clone();
     config.allowed_hosts = allowed_hosts(extra_allowed_hosts);
     if !extra_allowed_hosts.is_empty() {
