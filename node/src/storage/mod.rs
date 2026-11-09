@@ -301,7 +301,8 @@ impl StoreBatch {
     /// transaction, output or input) dominate it.
     pub fn index_row_count(&self) -> usize {
         #[cfg(feature = "block-filter-index")]
-        let filter_rows = self.filter_puts.len() + self.filter_header_puts.len();
+        let filter_rows =
+            self.filter_puts.len() + self.filter_header_puts.len() + self.filter_removes.len();
         #[cfg(not(feature = "block-filter-index"))]
         let filter_rows = 0;
         self.block_index_puts.len()
@@ -318,6 +319,14 @@ impl StoreBatch {
             + self.spent_puts.len()
             + self.spent_removes.len()
             + self.sp_tweak_puts.len()
+            + self.height_hash_removes.len()
+            + self.tx_loc_removes.len()
+            + self.txseq_txid_removes.len()
+            + self.txseq_block_removes.len()
+            + self.sp_tweak_removes.len()
+            + self.addr_backfill_temp_puts.len()
+            + self.opreturn_strip_puts.len()
+            + self.opreturn_strip_removes.len()
             + filter_rows
     }
 
