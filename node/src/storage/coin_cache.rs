@@ -11,6 +11,19 @@ use super::undo::UndoData;
 use super::flatfile::PendingRecord;
 use super::{Store, StoreBatch, StoreError, WriteMode};
 
+/// The dirty-coin count at which the cache flushes: the whole clean-coin
+/// budget, as Bitcoin Core lets its coins cache fill `-dbcache` before it
+/// writes. The cache flushed at a quarter of it, which during initial sync
+/// came to a flush every few hundred blocks: each one wrote coins a later
+/// block would have spent (the fresh-elision Core gets from a full cache)
+/// and synced the block files, and stack samples put the connector in a
+/// flush more than half the time. The cost is memory, up to the clean budget
+/// again for dirty coins, and replay after a crash, which reconnects the
+/// blocks since the last flush (user decision, 2026-11-08).
+fn dirty_flush_threshold(clean_cap: usize) -> u32 {
+    u32::try_from(clean_cap).unwrap_or(u32::MAX).max(1)
+}
+
 /// How many `block_index` rows `store_block` may hand over before their
 /// block-file bytes are synced and the rows written in one batch.
 pub const HELD_ROWS_MAX: usize = 64;
@@ -109,6 +122,15 @@ pub struct CoinCache {
     count_delta: AtomicI64,
     amount_delta: AtomicI64,
     pending_batch: Mutex<StoreBatch>,
+    /// Every hash that may have a row in `pending_batch.block_index_puts`
+    /// (a superset: a superseded row can leave its hash behind).
+    /// `get_block_index` scans those rows only for a hash in here. The scan
+    /// is linear, and the pending rows grow with every block connected since
+    /// the last flush, so header acceptance, which looks up hashes that are
+    /// mostly nowhere in the cache, paid for the whole vector on each.
+    /// Added to wherever rows go into the batch, emptied only where the
+    /// batch is taken or reset; taken after `pending_batch` when both are.
+    pending_bi_hashes: Mutex<std::collections::HashSet<BlockHash>>,
     block_index_cache: Mutex<LruCache<BlockHash, BlockIndexEntry>>,
     /// Group commit for stored blocks' `block_index` rows (D3).
     ///
@@ -296,7 +318,7 @@ impl CoinCache {
         let undo_cap = 1_000; // fixed — recent blocks only
         let tx_index_cap = (budget * 5 / 100) / 64; // 5% at ~64 bytes/entry
         let chain_tx_cap = 8_192; // fixed — only the unflushed-block window
-        let flush_threshold = (clean_cap / 4) as u32; // 25% of clean cap
+        let flush_threshold = dirty_flush_threshold(clean_cap);
 
         Self {
             clean_cap_bytes,
@@ -309,6 +331,7 @@ impl CoinCache {
             count_delta: AtomicI64::new(0),
             amount_delta: AtomicI64::new(0),
             pending_batch: Mutex::new(StoreBatch::default()),
+            pending_bi_hashes: Mutex::new(std::collections::HashSet::new()),
             block_index_cache: Mutex::new(lru(block_index_cap.max(1))),
             height_hash_cache: Mutex::new(lru(height_hash_cap)),
             undo_cache: Mutex::new(lru(undo_cap)),
@@ -625,6 +648,11 @@ impl CoinCache {
             }
         };
         let mut batch = std::mem::take(&mut *pending);
+        // The taken rows' hashes stay in `pending_bi_hashes` until the write
+        // has returned. A reader whose hash is there takes the batch lock,
+        // which this flush holds across the write, and so sees the row either
+        // pending or written, never neither: cleared here, it would read the
+        // backing store's pre-flush status while the row was in flight.
 
         // Pre-allocate batch vectors based on dirty map size
         batch.coin_puts.reserve(dirty.len());
@@ -754,7 +782,10 @@ impl CoinCache {
                 return Err(e);
             }
         }
-        // The rows are in the backing store now; readers may look again.
+        // The rows are in the backing store now; readers may look again. The
+        // batch is empty and nothing can have entered it while the lock was
+        // held, so no hash in the set still has a pending row.
+        self.pending_bi_hashes.lock().clear();
         drop(pending);
 
         // Move flushed coins to clean LRU (cache warming) — unless a batch
@@ -843,6 +874,7 @@ impl CoinCache {
         // the failure path must not take them in the other order.
         let newer = std::mem::take(&mut *pending);
         batch.merge(newer);
+        self.pending_bi_hashes.lock().extend(batch.block_index_puts.iter().map(|(h, _)| *h));
         *pending = batch;
         drop(pending);
 
@@ -944,7 +976,7 @@ impl CoinCache {
         }
         // Track the new threshold on the same shrink so dirty accumulation
         // honors the new clean cap. Never below 1 to keep `flush` reachable.
-        let new_threshold = ((new_cap / 4) as u32).max(1);
+        let new_threshold = dirty_flush_threshold(new_cap);
         self.flush_threshold.store(new_threshold, Ordering::Relaxed);
     }
 
@@ -1015,6 +1047,7 @@ impl CoinCache {
         self.amount_delta.store(0, Ordering::Relaxed);
         *self.pending_tip.lock() = None;
         *self.pending_batch.lock() = StoreBatch::default();
+        self.pending_bi_hashes.lock().clear();
         // The non-coin overlays receive reorg-tentative values
         // unconditionally in `write_batch_mode` (the side-chain blocks'
         // index/height/undo/tx/chain-tx rows), so they MUST be cleared —
@@ -1493,6 +1526,7 @@ impl CoinCache {
                 self.write_pass_through(pass_through, mode)?;
             } else {
                 let mut pending = self.pending_batch.lock();
+                self.pending_bi_hashes.lock().extend(batch.block_index_puts.iter().map(|(h, _)| *h));
                 pending.block_index_puts.extend(batch.block_index_puts);
                 pending.undo_puts.extend(batch.undo_puts);
                 pending.chain_tx_puts.extend(batch.chain_tx_puts);
@@ -1804,13 +1838,14 @@ impl Store for CoinCache {
         // holds one entry per connect/disconnect since the last flush. The
         // scan runs backwards because the buffer is append-only and the last
         // write for a hash wins, matching how `flush_inner` replays it.
-        if let Some((_, entry)) = self
-            .pending_batch
-            .lock()
-            .block_index_puts
-            .iter()
-            .rev()
-            .find(|(h, _)| h == hash)
+        if self.pending_bi_hashes.lock().contains(hash)
+            && let Some((_, entry)) = self
+                .pending_batch
+                .lock()
+                .block_index_puts
+                .iter()
+                .rev()
+                .find(|(h, _)| h == hash)
         {
             return Some(entry.clone());
         }
@@ -2123,6 +2158,7 @@ impl Store for CoinCache {
         self.amount_delta.store(0, Ordering::Relaxed);
         *self.pending_tip.lock() = None;
         *self.pending_batch.lock() = StoreBatch::default();
+        self.pending_bi_hashes.lock().clear();
         self.block_index_cache.lock().clear();
         self.height_hash_cache.lock().clear();
         self.undo_cache.lock().clear();
@@ -2140,6 +2176,7 @@ impl Store for CoinCache {
         self.amount_delta.store(0, Ordering::Relaxed);
         *self.pending_tip.lock() = None;
         *self.pending_batch.lock() = StoreBatch::default();
+        self.pending_bi_hashes.lock().clear();
         self.block_index_cache.lock().clear();
         self.height_hash_cache.lock().clear();
         self.undo_cache.lock().clear();
@@ -3916,9 +3953,9 @@ mod tests {
     #[test]
     fn test_default_uses_450mb() {
         let cache = CoinCache::default(Box::new(InMemoryStore::new()));
-        // 450 MB budget: clean_cap = (450_000_000 * 80 / 100) / 200 = 1_800_000
-        // flush_threshold = 1_800_000 / 4 = 450_000
-        assert_eq!(cache.flush_threshold(), 450_000);
+        // 450 MB budget: clean_cap = (450_000_000 * 80 / 100) / 200 = 1_800_000,
+        // and dirty coins may fill the same budget before a flush.
+        assert_eq!(cache.flush_threshold(), 1_800_000);
     }
 
     // ---------------------------------------------------------------
@@ -3945,18 +3982,18 @@ mod tests {
         let initial_threshold = cache.flush_threshold();
         assert!(initial_threshold > 0);
 
-        // Shrink to 100_000 entries: new threshold should be 25_000.
+        // Shrink to 100_000 entries: the threshold shrinks with it.
         cache.resize_clean(100_000);
         assert_eq!(cache.clean_cap(), 100_000);
         assert_eq!(
             cache.flush_threshold(),
-            25_000,
+            100_000,
             "threshold should shrink with clean LRU"
         );
 
         // Grow back: threshold tracks the new cap.
         cache.resize_clean(2_000_000);
-        assert_eq!(cache.flush_threshold(), 500_000);
+        assert_eq!(cache.flush_threshold(), 2_000_000);
 
         // Shrink to 0 clamps to minimum 1 (never lose reachability of flush).
         cache.resize_clean(0);
@@ -5069,6 +5106,30 @@ mod tests {
         assert_eq!(cache.get_coin(&z).unwrap().height, 4);
     }
 
+    /// A block-index row a failed flush hands back to the pending batch is
+    /// still found once the LRU has lost it: the restore puts its hash back
+    /// among those `get_block_index` scans the pending rows for
+    /// (`pending_bi_hashes`), which the flush emptied when it took the batch.
+    #[test]
+    fn a_row_a_failed_flush_hands_back_is_still_read() {
+        use crate::storage::test_store::ControllableStore;
+
+        let store = ControllableStore::new();
+        let controls = store.controls();
+        let cache = CoinCache::new(Box::new(store), 10);
+
+        let hash = BlockHash::from_byte_array([0x5C; 32]);
+        let mut connect = StoreBatch::default();
+        connect.coin_puts.push((make_outpoint(0xF5, 0), make_coin(1_000, 7)));
+        connect.block_index_puts.push((hash, make_test_entry(7)));
+        cache.write_batch(connect).unwrap();
+
+        controls.fail_next_write();
+        assert!(cache.flush().is_err());
+        cache.block_index_cache.lock().clear();
+        assert_eq!(cache.get_block_index(&hash).map(|e| e.height), Some(7), "the handed-back row is read");
+    }
+
     /// The restore must not overwrite a write that arrived while the failed
     /// flush was in flight — that write is newer, and the whole reason the
     /// dirty lock is dropped before the inner call is to let it happen.
@@ -5833,6 +5894,49 @@ mod tests {
             cache.get_coin(&op).is_none(),
             "a coin spent during the batched read-through window must not survive in the clean LRU"
         );
+    }
+
+    /// A block-index row in flight in a flush is read as written or as
+    /// pending, never as the backing store's pre-flush status. The flush
+    /// holds the batch lock across its write so readers wait it out; a reader
+    /// only takes that lock for a hash in `pending_bi_hashes`, so the taken
+    /// rows' hashes must stay there until the write has returned.
+    #[test]
+    fn a_row_in_flight_in_a_flush_is_not_read_as_its_old_status() {
+        let op = make_outpoint(0xD4, 0);
+        let (cache, _rg, write_gate) = gated_cache_with_coin(op);
+        let hash = BlockHash::from_byte_array([0x6B; 32]);
+        let mut stored = make_test_entry(9);
+        stored.status = BlockStatus::DataStored;
+        let mut valid = stored.clone();
+        valid.status = BlockStatus::Valid;
+
+        // The backing store has the stored row; a connect buffers `Valid`.
+        let mut store_row = StoreBatch::default();
+        store_row.block_index_puts.push((hash, stored));
+        cache.write_batch(store_row).unwrap();
+        let mut connect = StoreBatch::default();
+        connect.coin_puts.push((make_outpoint(0xD5, 0), make_coin(1_000, 9)));
+        connect.block_index_puts.push((hash, valid));
+        cache.write_batch(connect).unwrap();
+
+        write_gate.arm();
+        let flusher = {
+            let cache = cache.clone();
+            std::thread::spawn(move || cache.flush().unwrap())
+        };
+        let reader = std::sync::Mutex::new(None);
+        write_gate.open_after(|| {
+            // The flush is parked inside its write. The LRU has lost the row.
+            cache.block_index_cache.lock().clear();
+            let cache = cache.clone();
+            *reader.lock().unwrap() =
+                Some(std::thread::spawn(move || cache.get_block_index(&hash).map(|e| e.status)));
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        });
+        flusher.join().unwrap();
+        let read = reader.lock().unwrap().take().unwrap().join().unwrap();
+        assert_eq!(read, Some(BlockStatus::Valid), "the in-flight row was read as its pre-flush status");
     }
 
     #[test]

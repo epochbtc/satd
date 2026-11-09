@@ -90,6 +90,15 @@ pub trait ScriptVerifier: Send + Sync {
         self.verify_transaction(tx, prev_outputs, height)
     }
 
+    /// Whether this verifier accepts every script without looking at it, as
+    /// [`NoopVerifier`] does below `-assumevalid`. `connect_block` then
+    /// queues nothing for it and starts no verification threads: dispatching
+    /// a block's transactions to a scope of threads, each created for the
+    /// block, cost more than the rest of an early block's connect.
+    fn checks_nothing(&self) -> bool {
+        false
+    }
+
     /// Give a failure from
     /// [`verify_transaction_unnamed`](Self::verify_transaction_unnamed) its
     /// specific reason. The verdict never changes; only the reason can.
@@ -580,6 +589,10 @@ fn kernel_error_name(e: &bitcoinkernel::KernelError) -> &'static str {
 pub struct NoopVerifier;
 
 impl ScriptVerifier for NoopVerifier {
+    fn checks_nothing(&self) -> bool {
+        true
+    }
+
     fn verify_transaction(
         &self,
         _tx: &Transaction,

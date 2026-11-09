@@ -10702,7 +10702,7 @@ impl PeerManager {
         let _bulk_guard = if use_bulkload_for_catchup(blocks_behind) {
             tracing::info!(
                 blocks_behind,
-                "IBD write mode: BulkLoad (WAL disabled, flush every 1000 blocks)"
+                "IBD write mode: BulkLoad (WAL disabled, flush when the coin cache fills)"
             );
             Some(BulkLoadGuard::new(chain_state))
         } else {
@@ -11010,35 +11010,13 @@ impl PeerManager {
                             );
                             *last_log_height = next_height;
 
-                            // Flush UTXO cache to disk every 1000 blocks, then
-                            // force a durable checkpoint. With BulkLoad mode
-                            // (WAL disabled) this bounds crash-recovery replay
-                            // work to the last ~1000 blocks.
-                            chain_state.connect_phases().enter(ConnectPhase::FlushingCoinCache);
-                            if let Err(e) = chain_state.flush_coin_cache() {
-                                tracing::error!("Failed to flush UTXO cache: {}", e);
-                                chain_state.warnings().record(
-                                    "storage.flush_coin_cache_failed",
-                                    crate::warnings::Severity::Error,
-                                    format!("UTXO cache flush failed: {}", e),
-                                    serde_json::json!({ "height": next_height, "error": e.to_string() }),
-                                );
-                            } else {
-                                chain_state.warnings().clear("storage.flush_coin_cache_failed");
-                            }
-                            chain_state.connect_phases().enter(ConnectPhase::FlushDurable);
-                            if let Err(e) = chain_state.flush_durable() {
-                                tracing::error!("Failed durable checkpoint: {}", e);
-                                chain_state.warnings().record(
-                                    "storage.flush_durable_failed",
-                                    crate::warnings::Severity::Error,
-                                    format!("durable checkpoint failed: {}", e),
-                                    serde_json::json!({ "height": next_height, "error": e.to_string() }),
-                                );
-                            } else {
-                                chain_state.warnings().clear("storage.flush_durable_failed");
-                            }
-                            chain_state.connect_phases().enter(ConnectPhase::Idle);
+                            // No flush here. The coin cache flushes when its
+                            // dirty coins fill the dbcache budget, as Core's
+                            // does: a flush every 1000 blocks wrote coins a
+                            // later block would have spent and synced the
+                            // files each time (user decision, 2026-11-08). A
+                            // prune flushes first (`prune_up_to`), so a crash
+                            // always has the blocks it must reconnect.
                         }
                         // Periodic pruning
                         if keep_blocks > 0 && next_height > keep_blocks
