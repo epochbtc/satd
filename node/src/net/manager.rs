@@ -449,6 +449,9 @@ struct HeaderSync {
     /// this peer has already brought a `getheaders` before its header sync
     /// started.
     inv_getheaders_before_sync: bool,
+    /// How often the stall probe has asked this peer, so that once every
+    /// peer has started it goes round them rather than back to one.
+    probes: u32,
 }
 
 /// The periodic IBD header probe's state.
@@ -5310,20 +5313,25 @@ impl PeerManager {
         let recent = self.best_header_is_recent();
         let mut peers = self.peers.write();
         let preferred = |info: &PeerInfo| {
-            info.serves_blocks() && Self::tx_announcer_info(info).preferred
+            Self::syncs_headers(info) && Self::tx_announcer_info(info).preferred
         };
         let Some(h) = peers.get(&id) else {
             return false;
         };
-        if h.header_sync.started || !h.info.serves_blocks() {
+        if h.header_sync.started || !Self::syncs_headers(&h.info) {
             return false;
         }
         if !recent {
             let syncing = peers
                 .values()
                 .any(|p| p.header_sync.started && !p.header_sync.done);
-            let any_preferred = peers.values().any(|p| preferred(&p.info));
-            if syncing || (any_preferred && !preferred(&h.info)) {
+            // Only a preferred peer that could still take the slot stands in
+            // a non-preferred one's way: one that has synced already never
+            // takes it again.
+            let preferred_waiting = peers
+                .values()
+                .any(|p| !p.header_sync.started && preferred(&p.info));
+            if syncing || (preferred_waiting && !preferred(&h.info)) {
                 return false;
             }
         }
@@ -5331,6 +5339,13 @@ impl PeerManager {
             h.header_sync.started = true;
         }
         true
+    }
+
+    /// Whether header sync may run with this connection at all: one that
+    /// serves blocks and stays. A feeler is dropped once its handshake is
+    /// done, and would hold the one sync slot meanwhile.
+    fn syncs_headers(info: &PeerInfo) -> bool {
+        info.serves_blocks() && info.conn_type != ConnType::Feeler
     }
 
     /// Start header sync with every connected peer
@@ -5354,16 +5369,18 @@ impl PeerManager {
 
     /// The peer the stall probe asks: one header sync has not started with,
     /// if there is one, so a stalled sync peer is replaced rather than asked
-    /// again. It counts as started from then on.
+    /// again; once every peer has started, the one asked least, so the probe
+    /// goes round them. It counts as started from then on.
     fn header_probe_peer(&self) -> Option<PeerId> {
         let mut peers = self.peers.write();
         let pick = peers
             .iter()
-            .filter(|(_, h)| h.info.state == PeerState::Connected && h.info.serves_blocks())
-            .min_by_key(|(id, h)| (h.header_sync.started, **id))
+            .filter(|(_, h)| h.info.state == PeerState::Connected && Self::syncs_headers(&h.info))
+            .min_by_key(|(id, h)| (h.header_sync.started, h.header_sync.probes, **id))
             .map(|(id, _)| *id)?;
         if let Some(h) = peers.get_mut(&pick) {
             h.header_sync.started = true;
+            h.header_sync.probes += 1;
         }
         Some(pick)
     }

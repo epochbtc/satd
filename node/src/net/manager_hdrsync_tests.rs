@@ -339,6 +339,36 @@ fn an_inbound_peer_is_not_the_sync_peer_while_an_outbound_one_can_be() {
     assert_eq!(getheaders_sent(&mut outbound), 1);
 }
 
+/// A preferred peer that has synced and run out no longer holds back the
+/// non-preferred ones: with only inbound peers left to ask, one starts at
+/// once, not after the stall probe.
+#[test]
+fn an_inbound_peer_syncs_once_the_outbound_one_runs_out() {
+    let (pm, _dir) = mk_pm();
+    let mut inbound = add_inbound_peer(&pm, 1);
+    let mut outbound = add_peer(&pm, 2);
+    pm.start_header_syncs();
+    assert_eq!(getheaders_sent(&mut outbound), 1);
+
+    pm.handle_headers(2, header_chain(100, 1_500_000_000));
+    pm.start_header_syncs();
+    assert_eq!(getheaders_sent(&mut inbound), 1, "the inbound peer takes the slot");
+}
+
+/// A feeler connection is dropped once its handshake is done and never
+/// syncs headers, so it cannot hold the slot.
+#[test]
+fn a_feeler_never_syncs_headers() {
+    let (pm, _dir) = mk_pm();
+    let mut feeler = add_peer(&pm, 1);
+    pm.peers.write().get_mut(&1).unwrap().info.conn_type = ConnType::Feeler;
+    let mut outbound = add_peer(&pm, 2);
+    pm.start_header_syncs();
+    assert_eq!(getheaders_sent(&mut feeler), 0);
+    assert_eq!(getheaders_sent(&mut outbound), 1);
+    assert_ne!(pm.header_probe_peer(), Some(1), "nor does the stall probe ask it");
+}
+
 /// With only inbound peers, one of them syncs.
 #[test]
 fn an_inbound_peer_syncs_when_there_is_no_outbound_one() {
@@ -362,6 +392,13 @@ fn the_stall_probe_asks_a_peer_not_yet_syncing() {
     assert_ne!(probed, first, "the stalled sync peer is not asked again");
     let again = pm.header_probe_peer().expect("a peer to probe");
     assert!(again != first && again != probed, "each probe moves on to a new peer");
+
+    // Every peer has started now: the probe goes round them, not back to
+    // the same one. The sync peer, never probed yet, comes first.
+    assert_eq!(pm.header_probe_peer(), Some(first));
+    let rounds: std::collections::HashSet<PeerId> =
+        (0..3).map(|_| pm.header_probe_peer().expect("a peer to probe")).collect();
+    assert_eq!(rounds.len(), 3, "three probes, three different peers: {rounds:?}");
 }
 
 /// Before header sync has started with a peer, a block `inv` from it brings
