@@ -296,6 +296,40 @@ pub struct SpBackfillCursorWrite {
 }
 
 impl StoreBatch {
+    /// The rows besides coins: what a buffered batch holds in memory until
+    /// it is written. A count, not a size; the large families (one row per
+    /// transaction, output or input) dominate it.
+    pub fn index_row_count(&self) -> usize {
+        #[cfg(feature = "block-filter-index")]
+        let filter_rows =
+            self.filter_puts.len() + self.filter_header_puts.len() + self.filter_removes.len();
+        #[cfg(not(feature = "block-filter-index"))]
+        let filter_rows = 0;
+        self.block_index_puts.len()
+            + self.undo_puts.len()
+            + self.chain_tx_puts.len()
+            + self.height_hash_puts.len()
+            + self.tx_loc_puts.len()
+            + self.txseq_txid_puts.len()
+            + self.txseq_block_puts.len()
+            + self.addr_funding_puts.len()
+            + self.addr_spending_puts.len()
+            + self.addr_funding_removes.len()
+            + self.addr_spending_removes.len()
+            + self.spent_puts.len()
+            + self.spent_removes.len()
+            + self.sp_tweak_puts.len()
+            + self.height_hash_removes.len()
+            + self.tx_loc_removes.len()
+            + self.txseq_txid_removes.len()
+            + self.txseq_block_removes.len()
+            + self.sp_tweak_removes.len()
+            + self.addr_backfill_temp_puts.len()
+            + self.opreturn_strip_puts.len()
+            + self.opreturn_strip_removes.len()
+            + filter_rows
+    }
+
     /// Merge another batch into this one (for atomic multi-block operations).
     ///
     /// Every keyed index's puts and removes are merged with
