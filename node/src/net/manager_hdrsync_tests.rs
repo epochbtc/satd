@@ -50,6 +50,7 @@ fn add_peer(pm: &PeerManager, id: PeerId) -> mpsc::Receiver<NetworkMessage> {
             disconnect: Arc::new(tokio::sync::Notify::new()),
             flow: Arc::new(crate::net::flow::PeerFlow::new()),
             last_getheaders_sent: None,
+            header_sync: Default::default(),
             last_mempool_served: None,
             tx_relay: Default::default(),
             fee_filter_sent: None,
@@ -256,3 +257,188 @@ fn the_periodic_header_probe_waits_for_a_stall() {
     assert!(!pm.ibd_header_probe_due_at(at(31)), "still under the stall time since it moved");
     assert!(pm.ibd_header_probe_due_at(at(32)), "and then stopped");
 }
+
+fn getheaders_sent(rx: &mut mpsc::Receiver<NetworkMessage>) -> usize {
+    drain(rx).iter().filter(|m| matches!(m, NetworkMessage::GetHeaders(_))).count()
+}
+
+fn add_inbound_peer(pm: &PeerManager, id: PeerId) -> mpsc::Receiver<NetworkMessage> {
+    let rx = add_peer(pm, id);
+    let mut peers = pm.peers.write();
+    let info = &mut peers.get_mut(&id).unwrap().info;
+    info.direction = Direction::Inbound;
+    info.conn_type = ConnType::Inbound;
+    rx
+}
+
+/// A node whose best header is more than a day old syncs headers with one
+/// peer, as Core does, not with every peer it connects to: each one would
+/// otherwise send the whole header chain.
+#[test]
+fn a_node_far_behind_syncs_headers_with_one_peer() {
+    let (pm, _dir) = mk_pm();
+    let mut rxs: Vec<_> = (1..=4).map(|id| add_peer(&pm, id)).collect();
+
+    pm.start_header_syncs();
+    let asked: usize = rxs.iter_mut().map(getheaders_sent).sum();
+    assert_eq!(asked, 1, "one sync peer");
+
+    pm.start_header_syncs();
+    let asked: usize = rxs.iter_mut().map(getheaders_sent).sum();
+    assert_eq!(asked, 0, "while it syncs, no other peer starts");
+}
+
+/// A sync peer that answers with less than a full batch has no more headers
+/// past ours (a peer still syncing itself, say), so the next peer starts at
+/// once rather than after the stall probe.
+#[test]
+fn the_next_peer_syncs_when_the_sync_peer_runs_out() {
+    let (pm, _dir) = mk_pm();
+    let chain = header_chain(100, 1_500_000_000);
+    let mut rxs: Vec<_> = (1..=4).map(|id| add_peer(&pm, id)).collect();
+    pm.start_header_syncs();
+    let first = rxs.iter_mut().position(|rx| getheaders_sent(rx) == 1).expect("one sync peer") as PeerId + 1;
+
+    pm.handle_headers(first, chain);
+    assert_eq!(pm.chain_state.headers_tip_height(), 100);
+    pm.start_header_syncs();
+    let asked: Vec<usize> = rxs.iter_mut().map(getheaders_sent).collect();
+    assert_eq!(asked.iter().sum::<usize>(), 1, "exactly one more peer: {asked:?}");
+    assert_eq!(asked[first as usize - 1], 0, "not the peer that ran out");
+}
+
+/// Once the best header is less than a day old, header sync runs with every
+/// peer (Core's `m_best_header->Time() > NodeClock::now() - 24h`).
+#[test]
+fn every_peer_syncs_once_the_best_header_is_recent() {
+    let (pm, _dir) = mk_pm();
+    let now = crate::time::now_secs() as u32;
+    let chain = header_chain(100, now - 3_600);
+    let mut rxs: Vec<_> = (1..=4).map(|id| add_peer(&pm, id)).collect();
+    pm.start_header_syncs();
+    let first = rxs.iter_mut().position(|rx| getheaders_sent(rx) == 1).expect("one sync peer") as PeerId + 1;
+
+    pm.handle_headers(first, chain);
+    pm.start_header_syncs();
+    let asked: Vec<usize> = rxs.iter_mut().map(getheaders_sent).collect();
+    let mut expected = vec![1; 4];
+    expected[first as usize - 1] = 0;
+    assert_eq!(asked, expected, "every other peer starts");
+}
+
+/// The one sync peer is an outbound one while there is one: Core's
+/// `fPreferredDownload`. Inbound peers are anyone who connected to us.
+#[test]
+fn an_inbound_peer_is_not_the_sync_peer_while_an_outbound_one_can_be() {
+    let (pm, _dir) = mk_pm();
+    let mut inbound = add_inbound_peer(&pm, 1);
+    let mut outbound = add_peer(&pm, 2);
+
+    pm.start_header_syncs();
+    assert_eq!(getheaders_sent(&mut inbound), 0);
+    assert_eq!(getheaders_sent(&mut outbound), 1);
+}
+
+/// A preferred peer that has synced and run out no longer holds back the
+/// non-preferred ones: with only inbound peers left to ask, one starts at
+/// once, not after the stall probe.
+#[test]
+fn an_inbound_peer_syncs_once_the_outbound_one_runs_out() {
+    let (pm, _dir) = mk_pm();
+    let mut inbound = add_inbound_peer(&pm, 1);
+    let mut outbound = add_peer(&pm, 2);
+    pm.start_header_syncs();
+    assert_eq!(getheaders_sent(&mut outbound), 1);
+
+    pm.handle_headers(2, header_chain(100, 1_500_000_000));
+    pm.start_header_syncs();
+    assert_eq!(getheaders_sent(&mut inbound), 1, "the inbound peer takes the slot");
+}
+
+/// An outbound peer still in its version handshake does not hold back a
+/// connected inbound one: the handshake may run to its timeout.
+#[test]
+fn a_handshaking_outbound_peer_does_not_hold_back_an_inbound_one() {
+    let (pm, _dir) = mk_pm();
+    let mut inbound = add_inbound_peer(&pm, 1);
+    let _handshaking = add_peer(&pm, 2);
+    pm.peers.write().get_mut(&2).unwrap().info.state = PeerState::Connecting;
+    pm.start_header_syncs();
+    assert_eq!(getheaders_sent(&mut inbound), 1);
+}
+
+/// A feeler connection is dropped once its handshake is done and never
+/// syncs headers, so it cannot hold the slot.
+#[test]
+fn a_feeler_never_syncs_headers() {
+    let (pm, _dir) = mk_pm();
+    let mut feeler = add_peer(&pm, 1);
+    pm.peers.write().get_mut(&1).unwrap().info.conn_type = ConnType::Feeler;
+    let mut outbound = add_peer(&pm, 2);
+    pm.start_header_syncs();
+    assert_eq!(getheaders_sent(&mut feeler), 0);
+    assert_eq!(getheaders_sent(&mut outbound), 1);
+    assert_ne!(pm.header_probe_peer(), Some(1), "nor does the stall probe ask it");
+}
+
+/// With only inbound peers, one of them syncs.
+#[test]
+fn an_inbound_peer_syncs_when_there_is_no_outbound_one() {
+    let (pm, _dir) = mk_pm();
+    let mut rxs: Vec<_> = (1..=2).map(|id| add_inbound_peer(&pm, id)).collect();
+    pm.start_header_syncs();
+    let asked: usize = rxs.iter_mut().map(getheaders_sent).sum();
+    assert_eq!(asked, 1);
+}
+
+/// The stall probe asks a peer header sync has not started with, so a
+/// stalled sync peer is replaced rather than asked again.
+#[test]
+fn the_stall_probe_asks_a_peer_not_yet_syncing() {
+    let (pm, _dir) = mk_pm();
+    let mut rxs: Vec<_> = (1..=3).map(|id| add_peer(&pm, id)).collect();
+    pm.start_header_syncs();
+    let first = rxs.iter_mut().position(|rx| getheaders_sent(rx) == 1).expect("one sync peer") as PeerId + 1;
+
+    let probed = pm.header_probe_peer().expect("a peer to probe");
+    assert_ne!(probed, first, "the stalled sync peer is not asked again");
+    let again = pm.header_probe_peer().expect("a peer to probe");
+    assert!(again != first && again != probed, "each probe moves on to a new peer");
+
+    // Every peer has started now: the probe goes round them, not back to
+    // the same one. The sync peer, never probed yet, comes first.
+    assert_eq!(pm.header_probe_peer(), Some(first));
+    let rounds: std::collections::HashSet<PeerId> =
+        (0..3).map(|_| pm.header_probe_peer().expect("a peer to probe")).collect();
+    assert_eq!(rounds.len(), 3, "three probes, three different peers: {rounds:?}");
+}
+
+/// Before header sync has started with a peer, a block `inv` from it brings
+/// a `getheaders` once per peer and once per block across peers (Core's
+/// `inv` handler), so a newly found block is not answered with a header-chain
+/// download from every peer announcing it.
+#[test]
+fn a_block_inv_brings_one_getheaders_per_block_before_sync() {
+    let (pm, _dir) = mk_pm();
+    let mut sync_rx = add_peer(&pm, 1);
+    pm.start_header_syncs();
+    assert_eq!(getheaders_sent(&mut sync_rx), 1);
+    let mut rx2 = add_peer(&pm, 2);
+    let mut rx3 = add_peer(&pm, 3);
+    let block_a = bitcoin::BlockHash::from_byte_array([0xa1; 32]);
+    let block_b = bitcoin::BlockHash::from_byte_array([0xb2; 32]);
+
+    pm.handle_inv(2, vec![Inventory::Block(block_a)]);
+    assert_eq!(getheaders_sent(&mut rx2), 1, "the first announcer of a block is asked");
+    pm.handle_inv(3, vec![Inventory::Block(block_a)]);
+    assert_eq!(getheaders_sent(&mut rx3), 0, "the same block from another peer is not");
+    pm.handle_inv(2, vec![Inventory::Block(block_b)]);
+    assert_eq!(getheaders_sent(&mut rx2), 0, "once per peer before its sync starts");
+    pm.handle_inv(3, vec![Inventory::Block(block_b)]);
+    assert_eq!(getheaders_sent(&mut rx3), 1, "a new block from a new peer is");
+
+    // The sync peer itself is asked on every new block (throttle aside).
+    pm.handle_inv(1, vec![Inventory::Block(block_b)]);
+    assert_eq!(getheaders_sent(&mut sync_rx), 1);
+}
+

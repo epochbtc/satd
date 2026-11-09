@@ -53,6 +53,7 @@ fn add_peer(pm: &PeerManager, info: PeerInfo) -> mpsc::Receiver<NetworkMessage> 
             disconnect: Arc::new(tokio::sync::Notify::new()),
             flow: Arc::new(crate::net::flow::PeerFlow::new()),
             last_getheaders_sent: None,
+            header_sync: Default::default(),
             last_mempool_served: None,
             tx_relay: Default::default(),
             fee_filter_sent: None,

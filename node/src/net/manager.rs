@@ -429,6 +429,31 @@ impl DrainPacer {
 /// in flight is not taken for a stall (#1229).
 const HEADER_PROBE_STALL: Duration = Duration::from_secs(10);
 
+/// How recent the best header must be for header sync to run with every
+/// peer rather than one: Core's `SendMessages`, `m_best_header->Time() >
+/// NodeClock::now() - 24h`.
+const HEADER_SYNC_ALL_PEERS_WITHIN_SECS: u64 = 24 * 60 * 60;
+
+/// A peer's part in header sync.
+#[derive(Default)]
+struct HeaderSync {
+    /// Core's `fSyncStarted`: the connection's `getheaders` has gone out.
+    started: bool,
+    /// The peer answered with less than a full batch: it has no more
+    /// headers past ours. It no longer holds the one header-sync slot a
+    /// node far behind gives out, so the next peer can take it straight
+    /// away instead of after the stall probe (a peer that is itself still
+    /// syncing is the common case).
+    done: bool,
+    /// Core's `m_inv_triggered_getheaders_before_sync`: a block `inv` from
+    /// this peer has already brought a `getheaders` before its header sync
+    /// started.
+    inv_getheaders_before_sync: bool,
+    /// How often the stall probe has asked this peer, so that once every
+    /// peer has started it goes round them rather than back to one.
+    probes: u32,
+}
+
 /// The periodic IBD header probe's state.
 #[derive(Default)]
 struct HeaderProbe {
@@ -917,6 +942,8 @@ struct PeerHandle {
     /// announcement-triggered header discovery (anti-DoS). `None` until the
     /// first send.
     last_getheaders_sent: Option<Instant>,
+    /// Whether header sync has started with this peer, and how it went.
+    header_sync: HeaderSync,
     /// Last time we served this peer a BIP35 `mempool` dump, for
     /// rate-limiting: each dump is a full mempool scan plus up to multi-MB
     /// of queued `inv` allocations, so even a *permissioned* peer must not
@@ -1377,6 +1404,10 @@ pub struct PeerManager {
     /// The periodic IBD header probe's state: see
     /// [`Self::ibd_header_probe_due`].
     ibd_header_probe: parking_lot::Mutex<HeaderProbe>,
+    /// The block whose `inv` last brought a `getheaders` from a peer whose
+    /// header sync had not started: Core's
+    /// `m_last_block_inv_triggering_headers_sync`.
+    last_block_inv_getheaders: parking_lot::Mutex<Option<bitcoin::BlockHash>>,
     /// Channel to send received blocks to the processing thread.
     block_tx: mpsc::UnboundedSender<IncomingBlock>,
     /// Compact block reconstructions awaiting a `blocktxn`, at most one per
@@ -1787,6 +1818,7 @@ impl PeerManager {
             nap_puller: RwLock::new(None),
             drain_now: Arc::new(tokio::sync::Notify::new()),
             ibd_header_probe: parking_lot::Mutex::new(HeaderProbe::default()),
+            last_block_inv_getheaders: parking_lot::Mutex::new(None),
             block_tx,
             pending_compact: RwLock::new(HashMap::new()),
             extra_txns: Arc::new(parking_lot::Mutex::new(compact::ExtraTxnCache::new(
@@ -4493,6 +4525,7 @@ impl PeerManager {
                     disconnect: Arc::new(tokio::sync::Notify::new()),
                     flow: Arc::new(crate::net::flow::PeerFlow::new()),
                     last_getheaders_sent: None,
+                    header_sync: Default::default(),
                     last_mempool_served: None,
                     tx_relay: Default::default(),
                     fee_filter_sent: None,
@@ -5254,6 +5287,125 @@ impl PeerManager {
             return false;
         }
         probe.last_sent = Some(now);
+        true
+    }
+
+    /// Whether the best header is less than a day old, the point at which
+    /// Core syncs headers with every peer instead of one.
+    fn best_header_is_recent(&self) -> bool {
+        let best = self.chain_state.best_header_hash();
+        let Some(entry) = self.chain_state.get_block_index(&best) else {
+            return false;
+        };
+        u64::from(entry.header.time) + HEADER_SYNC_ALL_PEERS_WITHIN_SECS > crate::time::now_secs()
+    }
+
+    /// Whether to start header sync with `id` now, and if so, mark it
+    /// started; the caller sends the `getheaders`. Core's `SendMessages`:
+    /// while the best header is more than a day old, header sync runs with a
+    /// single peer, preferably a preferred-download one (outbound or
+    /// `noban`), so a fresh node does not fetch the whole header chain once
+    /// from every peer it connects to; past that, every peer. A peer that
+    /// answered with less than a full batch frees the slot
+    /// ([`HeaderSync::done`]), and the stall probe asks another peer when the
+    /// sync peer goes quiet.
+    fn start_header_sync(&self, id: PeerId) -> bool {
+        let recent = self.best_header_is_recent();
+        let mut peers = self.peers.write();
+        let preferred = |info: &PeerInfo| {
+            Self::syncs_headers(info) && Self::tx_announcer_info(info).preferred
+        };
+        let Some(h) = peers.get(&id) else {
+            return false;
+        };
+        if h.header_sync.started || !Self::syncs_headers(&h.info) {
+            return false;
+        }
+        if !recent {
+            let syncing = peers
+                .values()
+                .any(|p| p.header_sync.started && !p.header_sync.done);
+            // Only a preferred peer that could take the slot now stands in a
+            // non-preferred one's way: one that has synced already never
+            // takes it again, and one still in its handshake may never
+            // finish it.
+            let preferred_waiting = peers.values().any(|p| {
+                p.info.state == PeerState::Connected && !p.header_sync.started && preferred(&p.info)
+            });
+            if syncing || (preferred_waiting && !preferred(&h.info)) {
+                return false;
+            }
+        }
+        if let Some(h) = peers.get_mut(&id) {
+            h.header_sync.started = true;
+        }
+        true
+    }
+
+    /// Whether header sync may run with this connection at all: one that
+    /// serves blocks and stays. A feeler is dropped once its handshake is
+    /// done, and would hold the one sync slot meanwhile.
+    fn syncs_headers(info: &PeerInfo) -> bool {
+        info.serves_blocks() && info.conn_type != ConnType::Feeler
+    }
+
+    /// Start header sync with every connected peer
+    /// [`start_header_sync`](Self::start_header_sync) allows: the one sync
+    /// peer after the last one left or ran out, and all of them once the
+    /// best header is recent.
+    fn start_header_syncs(&self) {
+        let waiting: Vec<PeerId> = self
+            .peers
+            .read()
+            .iter()
+            .filter(|(_, h)| h.info.state == PeerState::Connected && !h.header_sync.started)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in waiting {
+            if self.start_header_sync(id) {
+                self.send_to_peer(id, sync::make_initial_getheaders(&self.chain_state));
+            }
+        }
+    }
+
+    /// The peer the stall probe asks: one header sync has not started with,
+    /// if there is one, so a stalled sync peer is replaced rather than asked
+    /// again; once every peer has started, the one asked least, so the probe
+    /// goes round them. It counts as started from then on.
+    fn header_probe_peer(&self) -> Option<PeerId> {
+        let mut peers = self.peers.write();
+        let pick = peers
+            .iter()
+            .filter(|(_, h)| h.info.state == PeerState::Connected && Self::syncs_headers(&h.info))
+            .min_by_key(|(id, h)| (h.header_sync.started, h.header_sync.probes, **id))
+            .map(|(id, _)| *id)?;
+        if let Some(h) = peers.get_mut(&pick) {
+            h.header_sync.started = true;
+            h.header_sync.probes += 1;
+        }
+        Some(pick)
+    }
+
+    /// Whether a block `inv` from `id` naming `block` as its last unknown
+    /// block may bring a `getheaders`. Core's `inv` handler: always once
+    /// header sync has started with the peer; before that, at most once per
+    /// peer and once per new block across peers, so an unresponsive sync
+    /// peer is backed up by one more peer each time a block is found rather
+    /// than by every peer announcing it.
+    fn inv_may_send_getheaders(&self, id: PeerId, block: bitcoin::BlockHash) -> bool {
+        let mut peers = self.peers.write();
+        let Some(h) = peers.get_mut(&id) else {
+            return false;
+        };
+        if h.header_sync.started {
+            return true;
+        }
+        let mut last = self.last_block_inv_getheaders.lock();
+        if h.header_sync.inv_getheaders_before_sync || *last == Some(block) {
+            return false;
+        }
+        h.header_sync.inv_getheaders_before_sync = true;
+        *last = Some(block);
         true
     }
 
@@ -6739,22 +6891,16 @@ impl PeerManager {
                 }
             }
 
-            // Request headers: during IBD, every 4 ticks (2s), from a few
-            // peers, when header sync has stalled. Requesting from ALL peers
-            // floods them and triggers rate limits.
+            // Start header sync with the peers it has not started with, as
+            // far as `start_header_sync` allows.
+            self.start_header_syncs();
+
+            // Request headers: during IBD, every 4 ticks (2s), from one peer,
+            // when header sync has stalled. Requesting from ALL peers floods
+            // them and triggers rate limits.
             if self.is_ibd() && ticks.is_multiple_of(4) && self.ibd_header_probe_due() {
-                let peer_ids: Vec<PeerId> = {
-                    let peers = self.peers.read();
-                    peers.iter()
-                        .filter(|(_, h)| {
-                            h.info.state == PeerState::Connected && h.info.serves_blocks()
-                        })
-                        .map(|(id, _)| *id)
-                        .take(3)
-                        .collect()
-                };
-                for pid in &peer_ids {
-                    self.send_to_peer(*pid, sync::make_getheaders(&self.chain_state));
+                if let Some(pid) = self.header_probe_peer() {
+                    self.send_to_peer(pid, sync::make_getheaders(&self.chain_state));
                 }
             } else if !self.is_ibd() && ticks.is_multiple_of(20) {
                 let peer_ids: Vec<PeerId> = {
@@ -7955,7 +8101,11 @@ impl PeerManager {
             // `request_missing_blocks` can pull its fork blocks and reorg. The
             // throttle stops a peer spamming block invs from making us emit a
             // getheaders per message.
-            self.maybe_send_getheaders(id);
+            if let Some(best) = blocks_to_get.last()
+                && self.inv_may_send_getheaders(id, *best)
+            {
+                self.maybe_send_getheaders(id);
+            }
         }
         if !txs_announced.is_empty() {
             self.add_tx_announcements(id, &txs_announced);
@@ -8168,6 +8318,11 @@ impl PeerManager {
     }
 
     fn handle_headers(&self, id: PeerId, headers: Vec<bitcoin::block::Header>) {
+        if headers.len() < 2000
+            && let Some(h) = self.peers.write().get_mut(&id)
+        {
+            h.header_sync.done = true;
+        }
         if headers.is_empty() {
             return;
         }
@@ -14359,6 +14514,7 @@ impl PeerManager {
             disconnect: Arc::new(tokio::sync::Notify::new()),
             flow: Arc::new(crate::net::flow::PeerFlow::new()),
             last_getheaders_sent: None,
+            header_sync: Default::default(),
             last_mempool_served: None,
             tx_relay: Default::default(),
                     fee_filter_sent: None,
@@ -14770,9 +14926,11 @@ impl PeerManager {
                 .send(NetworkMessage::GetAddr)
                 .await
                 .map_err(|e| format!("send getaddr: {}", e))?;
-        } else if !quiet {
+        } else if !quiet && self.start_header_sync(id) {
             // Request headers to start sync, from one below our best so an
-            // up-to-date peer answers with a header rather than nothing.
+            // up-to-date peer answers with a header rather than nothing. A
+            // node far behind starts with one peer only; the sync loop starts
+            // the rest (`start_header_syncs`).
             let getheaders = sync::make_initial_getheaders(&self.chain_state);
             writer.send(getheaders)
                 .await
@@ -16310,6 +16468,7 @@ mod tests {
             disconnect: Arc::new(tokio::sync::Notify::new()),
             flow: Arc::new(crate::net::flow::PeerFlow::new()),
             last_getheaders_sent: None,
+            header_sync: Default::default(),
             last_mempool_served: None,
             tx_relay: Default::default(),
                     fee_filter_sent: None,
@@ -16525,6 +16684,7 @@ mod tests {
                 disconnect: Arc::new(tokio::sync::Notify::new()),
                 flow: Arc::new(crate::net::flow::PeerFlow::new()),
                 last_getheaders_sent: None,
+                header_sync: Default::default(),
                 last_mempool_served: None,
                 tx_relay,
                     fee_filter_sent: None,
@@ -19016,6 +19176,7 @@ mod tests {
                 disconnect: Arc::new(tokio::sync::Notify::new()),
                 flow: Arc::new(crate::net::flow::PeerFlow::new()),
                 last_getheaders_sent: None,
+                header_sync: Default::default(),
                 last_mempool_served: None,
                 tx_relay: Default::default(),
                     fee_filter_sent: None,
