@@ -742,6 +742,28 @@ async fn reading_waits_for_a_getdata_to_be_served() {
     let _ = l.task.await;
 }
 
+/// An inbound `block` or `headers` wakes the manager, as a `getdata` does.
+/// Left to the 500 ms tick, IBD took in one tick's worth of blocks per peer
+/// per tick: ~25 blocks a second from one peer, whatever their size (#1228).
+#[tokio::test]
+async fn a_block_or_headers_wakes_the_manager() {
+    let mut l = run_loop().await;
+    let block = bitcoin::constants::genesis_block(bitcoin::Network::Regtest);
+    for msg in [NetworkMessage::Block(block.clone()), NetworkMessage::Headers(vec![block.header])] {
+        let woken = l.drain_now.notified();
+        tokio::pin!(woken);
+        woken.as_mut().enable();
+        l.read_tx.send(msg).await.unwrap();
+        let ev = tokio::time::timeout(Duration::from_secs(5), l.event_rx.recv()).await.unwrap();
+        assert!(matches!(ev, Some(NetEvent::MessageReceived { .. })));
+        tokio::time::timeout(Duration::from_secs(1), woken)
+            .await
+            .expect("the manager is woken, not left to its next tick");
+    }
+    l.disconnect.notify_one();
+    let _ = l.task.await;
+}
+
 /// The loop asks the manager to serve more of a `getdata` backlog once the
 /// queue is back under the send buffer, and holds the peer's messages while
 /// it is over.

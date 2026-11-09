@@ -423,6 +423,21 @@ impl DrainPacer {
     }
 }
 
+/// How long the header tip must stand still during IBD before the periodic
+/// header probe asks other peers, and the least time between two probes.
+/// Longer than any reasonable `getheaders` round trip, so a request still
+/// in flight is not taken for a stall (#1229).
+const HEADER_PROBE_STALL: Duration = Duration::from_secs(10);
+
+/// The periodic IBD header probe's state.
+#[derive(Default)]
+struct HeaderProbe {
+    /// The header tip when last seen, and since when it has stood there.
+    tip: Option<(u32, Instant)>,
+    /// When the last probe went out.
+    last_sent: Option<Instant>,
+}
+
 /// Token-bucket cap for the promotion-INV drain (§8): at most this many
 /// reloaded-and-promoted transactions are announced per drain tick, so a
 /// worst-case mass promotion spreads over minutes instead of bursting peers.
@@ -1352,13 +1367,16 @@ pub struct PeerManager {
     nap_puller: RwLock<Option<Arc<crate::nap::pull::Puller>>>,
     /// Wakes the manager loop's event drain before its next 500 ms tick.
     ///
-    /// The drain cadence is deliberate everywhere else, but a peer whose
-    /// pong is parked behind queued work would otherwise pay up to a full
-    /// tick of it — and that lands in the round-trip time the *peer*
-    /// measures. Notifying here collapses the wait to the actual processing
-    /// time without speeding up the loop's periodic maintenance, which is
-    /// still driven by the interval alone.
+    /// Each peer's socket task notifies it for every message it forwards,
+    /// so a message is handled when it arrives, not at the next tick
+    /// (#1228); a pong parked behind queued work notifies it too, since
+    /// the wait otherwise lands in the round-trip time the *peer* measures.
+    /// The loop's periodic maintenance is still driven by the interval
+    /// alone.
     drain_now: Arc<tokio::sync::Notify>,
+    /// The periodic IBD header probe's state: see
+    /// [`Self::ibd_header_probe_due`].
+    ibd_header_probe: parking_lot::Mutex<HeaderProbe>,
     /// Channel to send received blocks to the processing thread.
     block_tx: mpsc::UnboundedSender<IncomingBlock>,
     /// Compact block reconstructions awaiting a `blocktxn`, at most one per
@@ -1768,6 +1786,7 @@ impl PeerManager {
             nap_limits: parking_lot::Mutex::new(Default::default()),
             nap_puller: RwLock::new(None),
             drain_now: Arc::new(tokio::sync::Notify::new()),
+            ibd_header_probe: parking_lot::Mutex::new(HeaderProbe::default()),
             block_tx,
             pending_compact: RwLock::new(HashMap::new()),
             extra_txns: Arc::new(parking_lot::Mutex::new(compact::ExtraTxnCache::new(
@@ -5205,6 +5224,39 @@ impl PeerManager {
         self.headers_tip.store(htip, Ordering::Relaxed);
     }
 
+    /// Whether the periodic IBD header probe should go out: only once the
+    /// header tip has not moved for [`HEADER_PROBE_STALL`], and at most once
+    /// per that interval. A full `headers` batch already asks its peer for
+    /// the next one (`handle_headers`), so while that chain of requests
+    /// advances the tip, a probe only starts a second chain behind it that
+    /// fetches the same headers again; one per probe, for as long as header
+    /// sync ran, came to 5.6 GB of `headers` for a 78 MB mainnet header
+    /// chain (#1229). The wait is longer than a slow peer's round trip, so a
+    /// request still in flight, the connection's own first `getheaders`
+    /// among them, is not taken for a stall.
+    fn ibd_header_probe_due(&self) -> bool {
+        self.ibd_header_probe_due_at(Instant::now())
+    }
+
+    fn ibd_header_probe_due_at(&self, now: Instant) -> bool {
+        let tip = self.chain_state.headers_tip_height();
+        let mut probe = self.ibd_header_probe.lock();
+        match probe.tip {
+            Some((last, _)) if last == tip => {}
+            _ => {
+                probe.tip = Some((tip, now));
+                return false;
+            }
+        }
+        let still_since = probe.tip.map_or(now, |(_, at)| at);
+        let quiet = |t: Instant| now.saturating_duration_since(t) >= HEADER_PROBE_STALL;
+        if !quiet(still_since) || probe.last_sent.is_some_and(|t| !quiet(t)) {
+            return false;
+        }
+        probe.last_sent = Some(now);
+        true
+    }
+
     fn is_ibd(&self) -> bool {
         let tip = self.chain_state.tip_height();
         // The best header is at least our own tip. `headers_tip` only moves
@@ -6687,9 +6739,10 @@ impl PeerManager {
                 }
             }
 
-            // Request headers: during IBD, request every 4 ticks (2s) from a few peers.
-            // Requesting from ALL peers floods them and triggers rate limits.
-            if self.is_ibd() && ticks.is_multiple_of(4) {
+            // Request headers: during IBD, every 4 ticks (2s), from a few
+            // peers, when header sync has stalled. Requesting from ALL peers
+            // floods them and triggers rate limits.
+            if self.is_ibd() && ticks.is_multiple_of(4) && self.ibd_header_probe_due() {
                 let peer_ids: Vec<PeerId> = {
                     let peers = self.peers.read();
                     peers.iter()
@@ -8204,21 +8257,12 @@ impl PeerManager {
 
             tracing::debug!(id, accepted, headers_tip = htip, "Headers accepted");
 
-            // Peer sent a full batch: the getheaders to it went out above.
-            if headers.len() >= 2000 {
-                // During header download, request from other peers too for redundancy
-                let peer_ids: Vec<PeerId> = {
-                    let peers = self.peers.read();
-                    peers.iter()
-                        .filter(|(pid, h)| **pid != id && h.info.state == PeerState::Connected)
-                        .map(|(pid, _)| *pid)
-                        .take(3)
-                        .collect()
-                };
-                for pid in peer_ids {
-                    self.send_to_peer(pid, sync::make_getheaders(&self.chain_state));
-                }
-            }
+            // A full batch asked its own peer for the next one above, and
+            // that is the only request it makes. Asking three other peers
+            // as well, on every batch, started three more request chains
+            // per batch, each fetching the same headers to the tip (#1229).
+            // If this peer stops answering, the periodic probe in the
+            // maintenance loop asks others once the header tip stalls.
 
             // Start or extend IBD scheduler when headers are ahead of blocks.
             //
@@ -9334,11 +9378,6 @@ impl PeerManager {
         }
         tracing::debug!(%hash, %failed, "refused block's ancestor failed; charging the ancestor's sender");
         self.punish_block_source(&failed, &e.to_string());
-    }
-
-    /// Forget the sender of a block that connected.
-    fn forget_block_source(&self, hash: &bitcoin::BlockHash) {
-        self.block_sources.lock().take(hash);
     }
 
     /// A block's data was stored — clear it from the background download
@@ -10870,7 +10909,7 @@ impl PeerManager {
                         // would otherwise block on.
                         chain_state.bump_connect_heartbeat();
                         if let Some(pm) = peer_manager.upgrade() {
-                            pm.forget_block_source(&hash);
+                            pm.ibd_block_connected(&hash);
                         }
                         // Clear any prior connect-failure warnings now that
                         // we've made forward progress.
@@ -13145,10 +13184,33 @@ impl PeerManager {
     /// (`BlockChecked` → `MaybeSetPeerAsAnnouncingHeaderAndIDs`).
     fn block_became_tip(&self, from: PeerId, block: &bitcoin::Block, height: u32) {
         let _ = (block, height);
-        if self.ibd.read().is_some() || self.is_ibd() {
+        self.tip_delivered_by(from);
+    }
+
+    /// Core's condition in `BlockChecked`: out of initial block download,
+    /// and the block was the only one in flight
+    /// (`mapBlocksInFlight.count(hash) == mapBlocksInFlight.size()`). An IBD
+    /// scheduler that is still winding down with nothing in flight is not a
+    /// download in progress: a new block announced in that window extends
+    /// it, is fetched and connected through it, and must still promote its
+    /// sender, or the node picks no high-bandwidth peer until the next block.
+    fn tip_delivered_by(&self, from: PeerId) {
+        if self.is_ibd() || self.ibd.read().as_ref().is_some_and(|s| s.progress().1 > 0) {
             return;
         }
         self.maybe_set_peer_as_hb(from);
+    }
+
+    /// The IBD connector connected a stored block: forget its sender, and if
+    /// it is now the tip, let its sender be promoted as for a block the
+    /// block processor connects ([`Self::block_became_tip`]).
+    fn ibd_block_connected(&self, hash: &bitcoin::BlockHash) {
+        let from = self.block_sources.lock().take(hash);
+        if let Some(from) = from
+            && self.chain_state.tip_hash() == *hash
+        {
+            self.tip_delivered_by(from);
+        }
     }
 
     /// Bitcoin Core's `NewPoWValidBlock`: announce a block that extends our
@@ -15183,10 +15245,7 @@ impl PeerManager {
                                 flow.queued();
                             }
                             // Nothing more is read until the manager has
-                            // served this request (`reading_paused`), so it
-                            // is served now rather than at the manager's next
-                            // tick: a peer fetching blocks sends one `getdata`
-                            // after another.
+                            // served a `getdata` (`reading_paused`).
                             let getdata = matches!(msg, NetworkMessage::GetData(_));
                             if let (true, Some(q)) = (getdata, &send_queue) {
                                 q.note_getdata_forwarded();
@@ -15195,7 +15254,14 @@ impl PeerManager {
                                 .send(NetEvent::MessageReceived { id, msg })
                                 .await
                                 .map_err(|e| e.to_string())?;
-                            if let (true, Some(wake)) = (getdata, &drain_now) {
+                            // Every message is handled now rather than at the
+                            // manager's next tick. Waking it for `getdata`
+                            // alone left an inbound `block` or `headers` to
+                            // wait up to 500 ms: each tick took the blocks in
+                            // flight and asked for more, so IBD ran at ~25
+                            // blocks a second per peer whatever their size,
+                            // and header sync at one batch per tick (#1228).
+                            if let Some(wake) = &drain_now {
                                 wake.notify_one();
                             }
                         }
@@ -20076,6 +20142,33 @@ mod tests {
         pm.hb_peers.lock().clear();
         pm.maybe_set_peer_as_hb(2);
         assert!(deque(&pm).is_empty());
+    }
+
+    /// A block the IBD connector connects promotes its sender as one the
+    /// block processor connects does, once out of IBD with nothing else in
+    /// flight, even while the scheduler is still winding down: a new block
+    /// announced in that window is fetched and connected through it (#1228).
+    /// In IBD it promotes no one.
+    #[test]
+    fn an_ibd_connected_tip_promotes_its_sender_out_of_ibd() {
+        let pm = empty_peer_manager();
+        let mut rx = hb_peer(&pm, 1, Direction::Outbound);
+        let tip = pm.chain_state.tip_hash();
+        *pm.ibd.write() = Some(crate::net::ibd::IbdScheduler::new(0, 0, &pm.chain_state, 1000));
+
+        // Headers far ahead: initial block download.
+        pm.headers_tip.store(1000, Ordering::Relaxed);
+        pm.block_sources.lock().record(tip, 1);
+        pm.ibd_block_connected(&tip);
+        assert!(pm.hb_peers.lock().is_empty(), "no high-bandwidth peer is chosen during IBD");
+        assert!(pm.block_sources.lock().take(&tip).is_none(), "the source is forgotten either way");
+
+        // Caught up, the scheduler still present with nothing in flight.
+        pm.headers_tip.store(1, Ordering::Relaxed);
+        pm.block_sources.lock().record(tip, 1);
+        pm.ibd_block_connected(&tip);
+        assert_eq!(pm.hb_peers.lock().iter().copied().collect::<Vec<_>>(), vec![1]);
+        assert_eq!(sendcmpct_flags(&mut rx), vec![true]);
     }
 
     /// A disconnected peer leaves the high-bandwidth set.
