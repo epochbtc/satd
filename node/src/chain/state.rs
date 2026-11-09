@@ -1134,6 +1134,7 @@ impl ChainState {
                 // Self-heal a tip left durably `Invalid` by a crash mid-
                 // invalidateblock (no-op in the normal case).
                 cs.reconcile_invalid_tip()?;
+                cs.start_group_commit();
                 return Ok(cs);
             }
 
@@ -1217,7 +1218,7 @@ impl ChainState {
         })?;
         store.write_batch(batch)?;
 
-        Ok(Self {
+        let cs = Self {
             store,
             flat_files: Arc::new(Mutex::new(flat_files)),
             blocks_dir,
@@ -1276,7 +1277,49 @@ impl ChainState {
             startup_stop: std::sync::OnceLock::new(),
             bulk_load: std::sync::atomic::AtomicBool::new(false),
             strip: Default::default(),
-        })
+        };
+        cs.start_group_commit();
+        Ok(cs)
+    }
+
+    /// Give the coin cache the block-file sync its group commit of stored
+    /// blocks' rows needs, and a thread that commits rows the stream of
+    /// stored blocks left waiting, so none waits past
+    /// [`crate::storage::coin_cache::HELD_ROWS_MAX_AGE`] by much
+    /// (`CoinCache::held_rows`).
+    fn start_group_commit(&self) {
+        let flat_files = Arc::clone(&self.flat_files);
+        self.store.set_flat_sync(Box::new(move || {
+            // The fsync runs without the block-file lock, so block reads do
+            // not wait behind it (#547).
+            let sync = flat_files.lock().sync_handle()?;
+            if let Some(sync) = sync {
+                sync.sync()?;
+                flat_files.lock().mark_synced(sync);
+            }
+            Ok(())
+        }));
+        let store = Arc::downgrade(&self.store);
+        let spawned = std::thread::Builder::new().name("block-row-commit".into()).spawn(move || {
+            let tick = crate::storage::coin_cache::HELD_ROWS_MAX_AGE / 4;
+            // A disk that keeps failing would otherwise log this 40 times a
+            // second until it recovers.
+            let mut last_logged: Option<std::time::Instant> = None;
+            loop {
+                std::thread::sleep(tick);
+                let Some(store) = store.upgrade() else { return };
+                if let Err(e) = store.commit_held_rows_if_due()
+                    && last_logged.is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(10))
+                {
+                    last_logged = Some(std::time::Instant::now());
+                    tracing::error!(error = %e, "committing stored blocks' index rows failed; retrying");
+                }
+            }
+        });
+        if let Err(e) = spawned {
+            // Rows still commit when 64 gather and at every flush.
+            tracing::warn!(error = %e, "could not start the block-row commit thread");
+        }
     }
 
     /// Install the hook `accept_block` calls for a block that extends the tip
@@ -5557,10 +5600,16 @@ impl ChainState {
         // `WriteBlock`; see `check_block_context_before_write`.
         self.check_block_context_before_write(block, &block_hash, new_height, mtp, false)?;
 
-        // Write raw block to flat file, durably enough that the index entry
-        // below can never outlive the bytes it points at.
+        // Write the raw block to a block file, unsynced. Its index entry is
+        // held until a group commit has synced the file
+        // (`CoinCache::held_rows`), so the entry can never reach disk ahead
+        // of the bytes it points at.
         let block_data = serialize(block);
-        let (flat_pos, pending) = self.write_block_durable(&block_data, new_height)?;
+        let (flat_pos, pending) = self
+            .flat_files
+            .lock()
+            .write_block_pending(&block_data, network_magic(self.network), new_height)
+            .map_err(|e| ChainError::FlatFile(e.to_string()))?;
 
         // Store block index entry as DataStored
         let chainwork = add_u256(&parent.chainwork, &work_for_bits(block.header.bits));
@@ -5583,10 +5632,9 @@ impl ChainState {
     /// `store_block`'s second half: index a staged block under the accept
     /// lock.
     fn commit_block_store(&self, staged: StagedBlockStore) -> Result<(BlockHash, u32), ChainError> {
-        let StagedBlockStore { hash: block_hash, entry, _pending } = staged;
+        let StagedBlockStore { hash: block_hash, entry, _pending: pending } = staged;
         let new_height = entry.height;
         let mut batch = crate::storage::StoreBatch::default();
-        batch.block_index_puts.push((block_hash, entry.clone()));
         // Write height_hash so the forward connect loop can find this block even
         // if accept_headers was never called (e.g. crash-resume or out-of-order
         // sync). Same active-chain rule as header acceptance: only ABOVE the
@@ -5649,7 +5697,20 @@ impl ChainState {
             // could not find, say).
             batch.opreturn_strip_removes.push(block_hash);
             let had_record = self.holds_strip_record(&block_hash);
-            self.write_chain_batch(batch)?;
+            // The entry is held, readable at once, until a group commit has
+            // synced its bytes. Held before the height row is written, so a
+            // reader that finds the height finds the entry.
+            let fresh = self.store.get_block_index(&block_hash).is_none();
+            self.store.hold_block_row(block_hash, entry.clone(), pending);
+            if let Err(e) = self.write_chain_batch(batch) {
+                // The store failed: leave the block unindexed, as a failed
+                // batch did when the entry was part of it.
+                self.store.unhold_block_row(&block_hash);
+                return Err(e.into());
+            }
+            if fresh {
+                self.note_indexed_block(block_hash, entry.header.prev_blockhash);
+            }
             if had_record {
                 self.forget_strip_summary();
             }
@@ -12040,71 +12101,74 @@ pub(crate) mod tests {
         );
     }
 
-    /// The durability invariant behind the mainnet-954866 hole: in `Normal`
-    /// write mode nothing may leave a `block_index` entry referencing block
-    /// bytes that are still only in the page cache. `store_block` and
-    /// `accept_block` must therefore hand back a *synced* flat file.
-    #[test]
-    fn normal_mode_block_writes_are_synced_before_the_index_entry() {
-        let (cs, dir) = make_chain_state();
-        cs.set_write_mode(crate::storage::WriteMode::Normal);
-
-        let genesis = bitcoin::constants::genesis_block(Network::Regtest);
-        let b1 = build_test_block(genesis.block_hash(), 1, 1_300_000_001);
-        cs.accept_header(&b1.header).unwrap();
-        cs.store_block(&b1).unwrap();
-        assert!(
-            !cs.flat_files.lock().has_unsynced_writes(),
-            "store_block must fsync the block record before its index entry \
-             can reach disk"
-        );
-
-        cs.connect_stored_block(&b1.block_hash()).unwrap();
-        let b2 = build_test_block(b1.block_hash(), 2, 1_300_000_002);
-        cs.accept_block(&b2).unwrap();
-        assert!(
-            !cs.flat_files.lock().has_unsynced_writes(),
-            "accept_block must fsync the block record before its index entry \
-             can reach disk"
-        );
-
-        let _ = std::fs::remove_dir_all(&dir);
+    /// The durability rule behind the mainnet-954866 hole: no `block_index`
+    /// row that names a block-file record may reach the backing store before
+    /// that record is synced. `RocksDB` can flush a row to disk on its own,
+    /// WAL or no WAL, so a row in the backing store is a row that can survive
+    /// a power loss. Checks every such row against what the block files have
+    /// synced. Genesis is written by the constructor and left out.
+    fn assert_backing_rows_are_synced(cs: &ChainState, sizes: &std::collections::HashMap<BlockHash, u64>) {
+        let (file, len) = cs.flat_files.lock().synced_through();
+        cs.store
+            .inner_for_test()
+            .for_each_block_index(&mut |hash, entry| {
+                if entry.height == 0 || entry.num_tx == 0 {
+                    return;
+                }
+                if !matches!(entry.status, BlockStatus::DataStored | BlockStatus::Valid) {
+                    return;
+                }
+                let end = entry.data_pos as u64 + 8 + sizes[&hash];
+                assert!(
+                    entry.file_number < file || (entry.file_number == file && end <= len),
+                    "height {}: the row names bytes up to {end} of file {} with only {len} of \
+                     file {file} synced",
+                    entry.height,
+                    entry.file_number,
+                );
+            })
+            .unwrap();
     }
 
-    /// `BulkLoad` gets the same treatment as `Normal` — deliberately, and this
-    /// test exists to stop the exemption from being reintroduced.
-    ///
-    /// An earlier revision skipped the fsync during IBD, reasoning that
-    /// `BulkLoad` disables the WAL so an index entry could only become durable
-    /// through `flush_durable`, which syncs the flat files first. That is
-    /// wrong: disabling the WAL does not stop RocksDB from flushing a memtable
-    /// to an SST on its own, and with `set_atomic_flush(true)` the 64 MB
-    /// `coins` write buffer filling during IBD drags `block_index` to disk with
-    /// it — while the flat files are only fsync'd every ~1000 blocks. IBD was
-    /// the *more* exposed path, not the safe one.
+    /// `store_block` writes its record unsynced and holds the row: readable
+    /// at once, absent from the backing store until a group commit has synced
+    /// the record. In either write mode: WAL-less rows still reach disk on
+    /// their own through automatic memtable flushes, so `BulkLoad` is no
+    /// exemption.
     #[test]
-    fn bulkload_mode_block_writes_are_synced_too() {
-        let (cs, dir) = make_chain_state();
-        cs.set_write_mode(crate::storage::WriteMode::BulkLoad);
+    fn a_stored_blocks_row_waits_for_its_bytes_to_be_synced() {
+        for mode in [crate::storage::WriteMode::Normal, crate::storage::WriteMode::BulkLoad] {
+            let (cs, dir) = make_chain_state();
+            cs.set_write_mode(mode);
+            let genesis = bitcoin::constants::genesis_block(Network::Regtest);
+            let b1 = build_test_block(genesis.block_hash(), 1, 1_300_000_001);
+            let hash = b1.block_hash();
+            cs.accept_header(&b1.header).unwrap();
+            cs.store_block(&b1).unwrap();
 
-        let genesis = bitcoin::constants::genesis_block(Network::Regtest);
-        let b1 = build_test_block(genesis.block_hash(), 1, 1_300_000_001);
-        cs.accept_header(&b1.header).unwrap();
-        cs.store_block(&b1).unwrap();
-        assert!(
-            !cs.flat_files.lock().has_unsynced_writes(),
-            "BulkLoad must fsync the record too: WAL-less index entries still \
-             reach disk on their own via automatic memtable flushes"
-        );
+            assert_eq!(cs.store.get_block_index(&hash).unwrap().status, BlockStatus::DataStored);
+            assert!(cs.flat_files.lock().has_unsynced_writes(), "no fsync per stored block");
+            assert_ne!(
+                cs.store.inner_for_test().get_block_index(&hash).unwrap().status,
+                BlockStatus::DataStored,
+                "{mode:?}: the row is held while its bytes are unsynced"
+            );
 
-        let _ = std::fs::remove_dir_all(&dir);
+            cs.store.commit_held_rows().unwrap();
+            assert!(!cs.flat_files.lock().has_unsynced_writes(), "the commit synced the file");
+            assert_eq!(
+                cs.store.inner_for_test().get_block_index(&hash).unwrap().status,
+                BlockStatus::DataStored
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 
-    /// The per-block fsync runs with the flat-file lock released, so block
-    /// reads do not wait behind it, and the record is still synced when the
-    /// write returns (#547).
+    /// `accept_block` (a block at the tip, connected at once) still syncs its
+    /// record before returning, with the block-file lock released so block
+    /// reads do not wait behind the fsync (#547).
     #[test]
-    fn the_durable_block_fsync_runs_outside_the_flat_file_lock() {
+    fn accept_block_syncs_its_record_outside_the_flat_file_lock() {
         thread_local! {
             // 0: the probe never ran; 1: the lock was free; 2: it was held.
             static SAW: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
@@ -12112,17 +12176,228 @@ pub(crate) mod tests {
         let (cs, dir) = make_chain_state();
         let genesis = bitcoin::constants::genesis_block(Network::Regtest);
         let b1 = build_test_block(genesis.block_hash(), 1, 1_300_000_001);
-        cs.accept_header(&b1.header).unwrap();
 
         DURABLE_SYNC_PROBE.set(Some(|cs| {
             SAW.set(if cs.flat_files.try_lock().is_some() { 1 } else { 2 });
         }));
-        let stored = cs.store_block(&b1);
+        let accepted = cs.accept_block(&b1);
         DURABLE_SYNC_PROBE.set(None);
-        stored.unwrap();
+        accepted.unwrap();
 
         assert_eq!(SAW.get(), 1, "the fsync must run with the flat-file lock free");
         assert!(!cs.flat_files.lock().has_unsynced_writes(), "the record is synced on return");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The group commit across an initial sync: 300 blocks stored and
+    /// connected in the IBD order (stored ahead, connected behind), with the
+    /// coin-cache flushes and timed commits a sync makes. After every step,
+    /// no row in the backing store names unsynced bytes, so a power loss at
+    /// any point leaves no row pointing at a record that is not on disk.
+    /// Then the power loss itself: the unsynced tail of the block file is
+    /// dropped, and every row the backing store kept reads back its block.
+    #[test]
+    fn a_power_loss_never_leaves_a_row_over_missing_bytes() {
+        let (cs, dir) = make_chain_state();
+        let genesis = bitcoin::constants::genesis_block(Network::Regtest);
+        let mut sizes: std::collections::HashMap<BlockHash, u64> = std::collections::HashMap::new();
+        let mut blocks = Vec::new();
+        let mut parent = genesis.block_hash();
+        for h in 1..=300u32 {
+            let b = build_test_block(parent, h, 1_300_000_000 + h);
+            parent = b.block_hash();
+            cs.accept_header(&b.header).unwrap();
+            sizes.insert(b.block_hash(), serialize(&b).len() as u64);
+            blocks.push(b);
+        }
+        let mut connected = 0usize;
+        for (i, b) in blocks.iter().enumerate() {
+            cs.store_block(b).unwrap();
+            assert_backing_rows_are_synced(&cs, &sizes);
+            // The connector runs a few blocks behind the download.
+            while connected + 5 <= i {
+                cs.connect_stored_block(&blocks[connected].block_hash()).unwrap();
+                connected += 1;
+                assert_backing_rows_are_synced(&cs, &sizes);
+            }
+            if i % 37 == 0 {
+                cs.flush_coin_cache().unwrap();
+                assert_backing_rows_are_synced(&cs, &sizes);
+            }
+            if i % 23 == 0 {
+                std::thread::sleep(crate::storage::coin_cache::HELD_ROWS_MAX_AGE);
+                cs.store.commit_held_rows_if_due().unwrap();
+                assert_backing_rows_are_synced(&cs, &sizes);
+            }
+        }
+        cs.flush_coin_cache().unwrap();
+        assert_backing_rows_are_synced(&cs, &sizes);
+        assert!(cs.store.held_row_count() < blocks.len(), "rows were committed along the way");
+
+        // Power loss: the unsynced tail goes. Every row the backing store has
+        // must still read back its block.
+        let mut flat = cs.flat_files.lock();
+        flat.drop_unsynced_tail().unwrap();
+        let mut kept = 0;
+        cs.store
+            .inner_for_test()
+            .for_each_block_index(&mut |hash, entry| {
+                if entry.height == 0
+                    || !matches!(entry.status, BlockStatus::DataStored | BlockStatus::Valid)
+                {
+                    return;
+                }
+                let pos = FlatFilePos { file_number: entry.file_number, data_pos: entry.data_pos };
+                let bytes = flat.read_block(&pos).unwrap_or_else(|e| {
+                    panic!("height {}: the row survived, its bytes did not: {e}", entry.height)
+                });
+                let block: Block = bitcoin::consensus::deserialize(&bytes).unwrap();
+                assert_eq!(block.block_hash(), hash);
+                kept += 1;
+            })
+            .unwrap();
+        assert!(kept > 0, "some rows reached the backing store");
+        drop(flat);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A coin-cache flush and a prune at once do not deadlock. The flush
+    /// commits held rows, which syncs the block files and so takes the
+    /// block-file lock; the pruner holds that lock while it reads entries,
+    /// which takes the cache's batch lock. A flush that took the batch lock
+    /// first and then waited for the block files closed the cycle. Here the
+    /// test thread holds the block-file lock as the pruner does, a flush
+    /// starts with a stored block's row held, and the pruner's read must
+    /// still finish.
+    #[test]
+    fn a_flush_and_a_prune_at_once_do_not_deadlock() {
+        let (cs, dir) = make_chain_state();
+        let genesis = bitcoin::constants::genesis_block(Network::Regtest);
+        let b1 = build_test_block(genesis.block_hash(), 1, 1_300_000_001);
+        cs.accept_header(&b1.header).unwrap();
+        cs.store_block(&b1).unwrap();
+        assert_eq!(cs.store.held_row_count(), 1);
+        let probe = genesis.block_hash();
+
+        std::thread::scope(|scope| {
+            let flat = cs.flat_files.lock();
+            let flush = scope.spawn(|| cs.store.flush());
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            let (tx, rx) = std::sync::mpsc::channel();
+            let cs = &cs;
+            scope.spawn(move || {
+                cs.store.drop_read_overlays();
+                let _ = cs.store.get_block_index(&probe);
+                let _ = tx.send(());
+            });
+            let read = rx.recv_timeout(std::time::Duration::from_secs(2));
+            drop(flat);
+            flush.join().unwrap().unwrap();
+            assert!(read.is_ok(), "the pruner's read waited on a flush that waited on the pruner");
+        });
+        assert_eq!(cs.store.held_row_count(), 0, "the flush committed the held row");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A `HeaderOnly` row arriving for a block whose store row is held does
+    /// not replace it, even once the LRU has evicted the held entry (the
+    /// dominance filter's view): committing it would index the block as
+    /// having no data over a record that holds it.
+    #[test]
+    fn a_header_only_row_does_not_replace_a_held_store_row() {
+        let (cs, dir) = make_chain_state();
+        let genesis = bitcoin::constants::genesis_block(Network::Regtest);
+        let b1 = build_test_block(genesis.block_hash(), 1, 1_300_000_001);
+        let hash = b1.block_hash();
+        cs.accept_header(&b1.header).unwrap();
+        let header_only = cs.store.get_block_index(&hash).unwrap();
+        assert_eq!(header_only.status, BlockStatus::HeaderOnly);
+        cs.store_block(&b1).unwrap();
+
+        cs.store.drop_read_overlays();
+        let mut batch = crate::storage::StoreBatch::default();
+        batch.block_index_puts.push((hash, header_only));
+        cs.store.write_batch(batch).unwrap();
+        assert_eq!(cs.store.get_block_index(&hash).unwrap().status, BlockStatus::DataStored);
+
+        cs.store.commit_held_rows().unwrap();
+        assert_eq!(cs.store.inner_for_test().get_block_index(&hash).unwrap().status, BlockStatus::DataStored);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A store whose own batch fails leaves the block unindexed, as it did
+    /// when the entry was part of that batch: the held row is dropped, not
+    /// committed later behind the caller's back.
+    #[test]
+    fn a_failed_store_leaves_no_held_row_behind() {
+        let store = crate::storage::test_store::ControllableStore::new();
+        let controls = store.controls();
+        let (cs, dir) = make_chain_state_with_store(Box::new(store));
+        let genesis = bitcoin::constants::genesis_block(Network::Regtest);
+        let b1 = build_test_block(genesis.block_hash(), 1, 1_300_000_001);
+        let hash = b1.block_hash();
+        cs.accept_header(&b1.header).unwrap();
+
+        controls.fail_next_write();
+        assert!(cs.store_block(&b1).is_err());
+        assert_eq!(cs.store.held_row_count(), 0);
+        assert_eq!(cs.store.get_block_index(&hash).unwrap().status, BlockStatus::HeaderOnly);
+
+        // And it can be stored again.
+        cs.store_block(&b1).unwrap();
+        assert_eq!(cs.store.get_block_index(&hash).unwrap().status, BlockStatus::DataStored);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Wiping the store drops the rows held for it: none is committed into
+    /// the wiped store afterwards.
+    #[test]
+    fn clear_all_drops_held_rows() {
+        let (cs, dir) = make_chain_state();
+        let genesis = bitcoin::constants::genesis_block(Network::Regtest);
+        let b1 = build_test_block(genesis.block_hash(), 1, 1_300_000_001);
+        let hash = b1.block_hash();
+        cs.accept_header(&b1.header).unwrap();
+        cs.store_block(&b1).unwrap();
+        assert_eq!(cs.store.held_row_count(), 1);
+
+        cs.store.clear_all().unwrap();
+        assert_eq!(cs.store.held_row_count(), 0);
+        cs.store.commit_held_rows().unwrap();
+        assert!(cs.store.inner_for_test().get_block_index(&hash).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A newer row for a block whose store row is still held replaces the
+    /// held one and goes out with the same commit. Written straight through
+    /// instead, it would reach disk ahead of the record's bytes, and the held
+    /// `DataStored` row, committed later, would land on top of it: an
+    /// `invalidateblock` would come back as `DataStored`.
+    #[test]
+    fn a_newer_row_for_a_held_block_is_not_overwritten_by_the_commit() {
+        let (cs, dir) = make_chain_state();
+        let genesis = bitcoin::constants::genesis_block(Network::Regtest);
+        let b1 = build_test_block(genesis.block_hash(), 1, 1_300_000_001);
+        let hash = b1.block_hash();
+        cs.accept_header(&b1.header).unwrap();
+        cs.store_block(&b1).unwrap();
+
+        let mut invalid = cs.store.get_block_index(&hash).unwrap();
+        invalid.status = BlockStatus::Invalid;
+        let mut batch = crate::storage::StoreBatch::default();
+        batch.block_index_puts.push((hash, invalid));
+        cs.store.write_batch(batch).unwrap();
+        assert_eq!(cs.store.get_block_index(&hash).unwrap().status, BlockStatus::Invalid);
+        assert_ne!(
+            cs.store.inner_for_test().get_block_index(&hash).unwrap().status,
+            BlockStatus::Invalid,
+            "the newer row waits for the sync too"
+        );
+
+        cs.store.commit_held_rows().unwrap();
+        assert_eq!(cs.store.inner_for_test().get_block_index(&hash).unwrap().status, BlockStatus::Invalid);
+        cs.store.drop_read_overlays();
+        assert_eq!(cs.store.get_block_index(&hash).unwrap().status, BlockStatus::Invalid);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -14857,6 +15132,11 @@ pub(crate) mod tests {
         assert_eq!(deleted, 0, "the fork block's record was pending in file 1 when the prune planned");
         assert_eq!(cs.get_block(&fork.block_hash()).as_ref(), Some(&fork));
 
+        // The fork block's row is held until a group commit syncs its bytes,
+        // and its record stays pending until then; once committed, the file
+        // can go.
+        assert_eq!(cs.prune_up_to(6), 0, "still pending while its row is held");
+        cs.store.commit_held_rows().unwrap();
         assert_eq!(cs.prune_up_to(6), 1, "file 1 goes");
         assert!(cs.is_pruned(&fork.block_hash()));
 

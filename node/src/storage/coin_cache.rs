@@ -8,7 +8,28 @@ use std::sync::atomic::{AtomicI64, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use super::blockindex::{BlockIndexEntry, BlockStatus};
 use super::coinview::Coin;
 use super::undo::UndoData;
+use super::flatfile::PendingRecord;
 use super::{Store, StoreBatch, StoreError, WriteMode};
+
+/// How many `block_index` rows `store_block` may hand over before their
+/// block-file bytes are synced and the rows written in one batch.
+pub const HELD_ROWS_MAX: usize = 64;
+
+/// How long the oldest held row may wait for that batch.
+pub const HELD_ROWS_MAX_AGE: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Syncs the block files: every byte written to them so far is on disk when
+/// it returns. Set by the chain state, which owns the files.
+pub type FlatSync = Box<dyn Fn() -> std::io::Result<()> + Send + Sync>;
+
+/// A `block_index` row for a stored block whose bytes may not be synced yet.
+struct HeldRow {
+    hash: BlockHash,
+    entry: BlockIndexEntry,
+    at: std::time::Instant,
+    /// Keeps the pruner off the record's file until the row is written.
+    _pending: PendingRecord,
+}
 
 /// Default dbcache size in MB (matches Bitcoin Core).
 const DEFAULT_DBCACHE_MB: u64 = 450;
@@ -89,6 +110,29 @@ pub struct CoinCache {
     amount_delta: AtomicI64,
     pending_batch: Mutex<StoreBatch>,
     block_index_cache: Mutex<LruCache<BlockHash, BlockIndexEntry>>,
+    /// Group commit for stored blocks' `block_index` rows (D3).
+    ///
+    /// A row that names a block-file position must never reach the inner
+    /// store before the bytes it points at are synced: RocksDB can flush a
+    /// row to disk on its own, WAL or no WAL, and after a power loss that
+    /// row would point at bytes that never made it (the mainnet-954866
+    /// hole). `store_block` used to fsync the block file once per block for
+    /// that, which held initial sync to one flush latency per block (~4 ms
+    /// on a SATA SSD, 10-15 ms on a spinning or virtual disk).
+    ///
+    /// Instead its rows wait here, readable through `get_block_index` and
+    /// `for_each_block_index`, until [`HELD_ROWS_MAX`] of them have gathered
+    /// or the oldest is [`HELD_ROWS_MAX_AGE`] old. Then one sync of the block
+    /// files covers them all and they are written in one batch
+    /// ([`Self::commit_held_rows`]). Every flush commits them first, so a
+    /// connect's `Valid` row for a block can never reach the inner store
+    /// ahead of that block's synced bytes either. A crash loses at most the
+    /// held rows; their blocks are downloaded again, as in Core.
+    held_rows: Mutex<Vec<HeldRow>>,
+    /// Serializes commits of `held_rows`.
+    held_commit: Mutex<()>,
+    /// Syncs the block files before held rows are written.
+    flat_sync: std::sync::OnceLock<FlatSync>,
     // Perf counters (atomic, zero overhead)
     pub perf_dirty_hits: AtomicU64,
     pub perf_clean_hits: AtomicU64,
@@ -277,6 +321,9 @@ impl CoinCache {
             write_mode: AtomicU8::new(0),
             flush_count: AtomicU64::new(0),
             flush_guard: Mutex::new(()),
+            held_rows: Mutex::new(Vec::new()),
+            held_commit: Mutex::new(()),
+            flat_sync: std::sync::OnceLock::new(),
             exclusive_owner: Mutex::new(None),
             exclusive_active: std::sync::atomic::AtomicBool::new(false),
             foreign_write_during_exclusion: std::sync::atomic::AtomicBool::new(false),
@@ -370,6 +417,85 @@ impl CoinCache {
     #[cfg(test)]
     pub fn invalidate_block_index_cache(&self, hash: &BlockHash) {
         self.block_index_cache.lock().pop(hash);
+    }
+
+    /// Set the function that syncs the block files. Held rows are written
+    /// only after it returns. Without one (a cache with no block files, as
+    /// in some unit tests) they are written without a sync.
+    pub fn set_flat_sync(&self, sync: FlatSync) {
+        let _ = self.flat_sync.set(sync);
+    }
+
+    /// Take a stored block's `block_index` row, which names a block-file
+    /// record that may not be synced yet. It is readable at once and
+    /// reaches the inner store with the next group commit; see
+    /// `held_rows`. The commit never runs here: the caller holds the accept
+    /// lock, and an fsync under it would put the disk's flush latency back
+    /// on the store path (#547). The commit thread takes the batch once it
+    /// is full or old enough ([`Self::commit_held_rows_if_due`]).
+    pub fn hold_block_row(&self, hash: BlockHash, entry: BlockIndexEntry, pending: PendingRecord) {
+        self.block_index_cache.lock().put(hash, entry.clone());
+        self.held_rows.lock().push(HeldRow { hash, entry, at: std::time::Instant::now(), _pending: pending });
+    }
+
+    /// Drop a held row whose store did not complete: the caller's own write
+    /// failed after holding it, and the block is to stay unindexed, as a
+    /// failed store left it before rows were held. Its record stays in the
+    /// block file, unreferenced.
+    pub fn unhold_block_row(&self, hash: &BlockHash) {
+        let _commit = self.held_commit.lock();
+        self.held_rows.lock().retain(|r| r.hash != *hash);
+        self.block_index_cache.lock().pop(hash);
+    }
+
+    /// Commit the held rows if [`HELD_ROWS_MAX`] have gathered or the oldest
+    /// has waited [`HELD_ROWS_MAX_AGE`].
+    pub fn commit_held_rows_if_due(&self) -> Result<(), StoreError> {
+        let due = {
+            let held = self.held_rows.lock();
+            held.len() >= HELD_ROWS_MAX || held.first().is_some_and(|r| r.at.elapsed() >= HELD_ROWS_MAX_AGE)
+        };
+        if due { self.commit_held_rows() } else { Ok(()) }
+    }
+
+    /// Number of rows waiting for a group commit.
+    pub fn held_row_count(&self) -> usize {
+        self.held_rows.lock().len()
+    }
+
+    /// Sync the block files once, then write every row held when the sync
+    /// started. Rows held during the sync wait for the next commit: their
+    /// bytes may have been written after the sync began.
+    ///
+    /// The rows stay readable from `held_rows` until the write has
+    /// returned, and none of this runs under the block-file lock, so block
+    /// reads do not wait on the fsync (#547).
+    pub fn commit_held_rows(&self) -> Result<(), StoreError> {
+        let _commit = self.held_commit.lock();
+        let n = self.held_rows.lock().len();
+        if n == 0 {
+            return Ok(());
+        }
+        if let Some(sync) = self.flat_sync.get() {
+            sync()?;
+        }
+        let batch = {
+            let held = self.held_rows.lock();
+            StoreBatch {
+                block_index_puts: held[..n.min(held.len())].iter().map(|r| (r.hash, r.entry.clone())).collect(),
+                ..StoreBatch::default()
+            }
+        };
+        self.inner.write_batch_mode(batch, self.current_write_mode())?;
+        let mut held = self.held_rows.lock();
+        let n = n.min(held.len());
+        held.drain(..n);
+        Ok(())
+    }
+
+    /// The held row for `hash`, if any; the last one wins.
+    fn held_row(&self, hash: &BlockHash) -> Option<BlockIndexEntry> {
+        self.held_rows.lock().iter().rev().find(|r| r.hash == *hash).map(|r| r.entry.clone())
     }
 
     /// Flush dirty coins to the backing store.
@@ -473,8 +599,31 @@ impl CoinCache {
     /// `pending_tip` are taken again, so the failure path does not invert
     /// the order either.
     fn flush_inner(&self) -> Result<(), StoreError> {
-        let mut dirty = self.dirty.write();
-        let mut pending = self.pending_batch.lock();
+        // Held store rows go first. A block whose `Valid` row is in the batch
+        // below had its store row held before it connected; that row must be
+        // committed (its bytes synced) before the `Valid` row is written, or
+        // the store row, committed later, would land on top of it.
+        //
+        // The commit syncs the block files, which takes the block-file lock,
+        // and the pruner holds that lock while it reads entries through the
+        // batch lock. So commit with no lock held, then check under the batch
+        // lock that no held row belongs to a block the batch carries a row
+        // for; a connect in between can add one, and then commit again. No
+        // connect can add to the batch while the lock is held, so the check
+        // holds until the batch is written.
+        let (mut dirty, mut pending) = loop {
+            self.commit_held_rows()?;
+            let dirty = self.dirty.write();
+            let pending = self.pending_batch.lock();
+            let needs_commit = {
+                let held = self.held_rows.lock();
+                !held.is_empty()
+                    && pending.block_index_puts.iter().any(|(h, _)| held.iter().any(|r| r.hash == *h))
+            };
+            if !needs_commit {
+                break (dirty, pending);
+            }
+        };
         let mut batch = std::mem::take(&mut *pending);
 
         // Pre-allocate batch vectors based on dirty map size
@@ -1222,7 +1371,7 @@ impl CoinCache {
         // batch always carries the tip, so the tip routes it here instead.
         if has_non_coin {
             if coin_dirty == 0 && !moves_tip {
-                let pass_through = StoreBatch {
+                let mut pass_through = StoreBatch {
                     block_index_puts: batch.block_index_puts,
                     coin_puts: Vec::new(),
                     coin_removes: Vec::new(),
@@ -1284,6 +1433,40 @@ impl CoinCache {
                     pending
                         .block_index_puts
                         .retain(|(h, _)| !superseded.contains(h));
+                }
+                // A newer row for a block whose store row is still held
+                // (`held_rows`) replaces the held one and waits for the same
+                // group commit. Written straight through, it could carry the
+                // record's position to disk ahead of the record's bytes, and
+                // the held row, committed later, would land on top of it: an
+                // `invalidateblock` would come back as `DataStored`. The
+                // commit lock keeps a commit in progress from writing the old
+                // entry and then dropping the new one. Taken with the batch
+                // lock released: `flush_inner` takes them the other way round.
+                if !pass_through.block_index_puts.is_empty() && self.held_row_count() > 0 {
+                    let _commit = self.held_commit.lock();
+                    let mut held = self.held_rows.lock();
+                    let mut lru = self.block_index_cache.lock();
+                    pass_through.block_index_puts.retain(|(h, e)| {
+                        match held.iter_mut().rev().find(|r| r.hash == *h) {
+                            // A `HeaderOnly` row never replaces one that holds
+                            // data: the dominance rule above, which misses
+                            // when the LRU has evicted the held entry.
+                            Some(row)
+                                if e.status == BlockStatus::HeaderOnly
+                                    && matches!(row.entry.status, BlockStatus::DataStored | BlockStatus::Valid) =>
+                            {
+                                lru.put(*h, row.entry.clone());
+                                false
+                            }
+                            Some(row) => {
+                                row.entry = e.clone();
+                                lru.put(*h, e.clone());
+                                false
+                            }
+                            None => true,
+                        }
+                    });
                 }
                 // The same for strip records. A buffered remove left behind
                 // a newer pass-through put would shadow the record in reads
@@ -1631,6 +1814,10 @@ impl Store for CoinCache {
         {
             return Some(entry.clone());
         }
+        // A stored block's row waiting for its group commit (`held_rows`).
+        if let Some(entry) = self.held_row(hash) {
+            return Some(entry);
+        }
         self.inner.get_block_index(hash)
     }
 
@@ -1706,21 +1893,30 @@ impl Store for CoinCache {
         visit: &mut dyn FnMut(BlockHash, BlockIndexEntry),
     ) -> Result<crate::storage::BlockIndexScanStats, StoreError> {
         let overlaid: std::collections::HashMap<BlockHash, BlockIndexEntry> = {
+            // Held store rows first, then the pending batch over them: a
+            // block's connect row is newer than its store row. A Vec of puts
+            // may name the same hash twice; the last write wins, which is
+            // what `collect` into a map gives.
+            let mut rows: std::collections::HashMap<BlockHash, BlockIndexEntry> =
+                self.held_rows.lock().iter().map(|r| (r.hash, r.entry.clone())).collect();
             let pending = self.pending_batch.lock();
-            // A Vec of puts may name the same hash twice; the last write wins,
-            // which is what `collect` into a map gives.
-            pending.block_index_puts.iter().cloned().collect()
+            rows.extend(pending.block_index_puts.iter().cloned());
+            rows
         };
-        let stats = self.inner.for_each_block_index(&mut |h, entry| {
+        // The overlaid rows first: a scan of the inner store can fail
+        // partway, and a caller that keeps what it reached (the connector's
+        // recovery scan) must still have reached these. A stored block's row
+        // waits in `held_rows` for up to `HELD_ROWS_MAX_AGE`, so during
+        // initial sync the block to connect next is often one of them.
+        for (h, entry) in &overlaid {
+            visit(*h, entry.clone());
+        }
+        self.inner.for_each_block_index(&mut |h, entry| {
             if overlaid.contains_key(&h) {
                 return;
             }
             visit(h, entry);
-        })?;
-        for (h, entry) in overlaid {
-            visit(h, entry);
-        }
-        Ok(stats)
+        })
     }
 
     /// Scans the inner store with the pending batch overlaid.
@@ -1949,7 +2145,14 @@ impl Store for CoinCache {
         self.undo_cache.lock().clear();
         self.tx_loc_cache.lock().clear();
         self.chain_tx_cache.lock().clear();
-        self.inner.clear_all()
+        // Wiping the store wipes the rows waiting to be written to it. The
+        // commit lock is held across the wipe, so no commit writes a row into
+        // the wiped store, and the rows are cleared after it, so one held
+        // while the wipe ran is dropped too.
+        let _commit = self.held_commit.lock();
+        let wiped = self.inner.clear_all();
+        self.held_rows.lock().clear();
+        wiped
     }
 
     fn get_coins_batch(&self, outpoints: &[OutPoint]) -> Vec<Option<Coin>> {
