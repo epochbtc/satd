@@ -10776,6 +10776,14 @@ impl PeerManager {
         connected
     }
 
+    /// How far the active tip is behind: to the scheduler's `target` or the
+    /// best header, whichever is higher.
+    fn ibd_catchup_gap(chain_state: &ChainState, target: u32) -> u32 {
+        target
+            .max(chain_state.headers_tip_height())
+            .saturating_sub(chain_state.tip_height())
+    }
+
     /// IBD connect loop: sequentially connect stored blocks from tip forward.
     /// Uses a prefetch pipeline to read and pre-process upcoming blocks in
     /// background threads while the connect thread works on the current block.
@@ -10842,9 +10850,8 @@ impl PeerManager {
         // skip the WAL for the duration of IBD. The guard's Drop impl runs
         // on *every* exit path from this function — normal break, panic,
         // early return — ensuring we never leak WAL-disabled semantics
-        // into steady-state operation. We still call `flush_durable` every
-        // 1000 blocks below so a crash during IBD replays at most ~1000
-        // blocks of work.
+        // into steady-state operation. A crash replays the blocks connected
+        // since the last coin-cache flush.
         //
         // Small catch-ups keep the WAL. BulkLoad's WAL-less writes are
         // volatile until a memtable flush, and its throughput win only
@@ -10853,8 +10860,14 @@ impl PeerManager {
         // inherits the full data-loss exposure — mainnet block 952978's
         // connect delta was lost from exactly this window after a 64-block
         // catch-up.
-        let blocks_behind = target.saturating_sub(chain_state.tip_height());
-        let _bulk_guard = if use_bulkload_for_catchup(blocks_behind) {
+        //
+        // The gap is measured to the best header, not to the scheduler's
+        // first target: a fresh node starts IBD on its first `headers` batch,
+        // 2,000 blocks, and would otherwise keep the WAL on for the whole
+        // chain. Headers still arriving can widen the gap later; the loop
+        // below enters BulkLoad then (`ibd_catchup_gap`).
+        let blocks_behind = Self::ibd_catchup_gap(chain_state, target);
+        let mut bulk_guard = if use_bulkload_for_catchup(blocks_behind) {
             tracing::info!(
                 blocks_behind,
                 "IBD write mode: BulkLoad (WAL disabled, flush when the coin cache fills)"
@@ -10958,6 +10971,17 @@ impl PeerManager {
                     None => break, // Scheduler cleared
                 }
             };
+
+            if bulk_guard.is_none() {
+                let blocks_behind = Self::ibd_catchup_gap(chain_state, target_height);
+                if use_bulkload_for_catchup(blocks_behind) {
+                    tracing::info!(
+                        blocks_behind,
+                        "IBD write mode: BulkLoad (the gap to the best header grew; WAL disabled)"
+                    );
+                    bulk_guard = Some(BulkLoadGuard::new(chain_state));
+                }
+            }
 
             let tip_height = chain_state.tip_height();
             let next_height = tip_height + 1;

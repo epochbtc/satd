@@ -442,3 +442,17 @@ fn a_block_inv_brings_one_getheaders_per_block_before_sync() {
     assert_eq!(getheaders_sent(&mut sync_rx), 1);
 }
 
+/// The IBD connector decides on BulkLoad from the gap to the best header,
+/// not to its scheduler's target: a fresh node starts IBD on its first
+/// `headers` batch, 2,000 blocks, which alone is under the BulkLoad
+/// threshold however long the chain behind it is.
+#[test]
+fn the_catch_up_gap_runs_to_the_best_header() {
+    let (pm, _dir) = mk_pm();
+    let _rx = add_peer(&pm, 1);
+    pm.handle_headers(1, header_chain(2000, 1_500_000_000));
+    pm.handle_headers(1, header_chain(2100, 1_500_000_000)[2000..].to_vec());
+    assert_eq!(pm.chain_state.headers_tip_height(), 2100);
+    assert_eq!(PeerManager::ibd_catchup_gap(&pm.chain_state, 2000), 2100);
+    assert_eq!(PeerManager::ibd_catchup_gap(&pm.chain_state, 2500), 2500, "a target past the headers counts");
+}
