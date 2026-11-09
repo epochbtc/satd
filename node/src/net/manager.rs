@@ -5325,12 +5325,13 @@ impl PeerManager {
             let syncing = peers
                 .values()
                 .any(|p| p.header_sync.started && !p.header_sync.done);
-            // Only a preferred peer that could still take the slot stands in
-            // a non-preferred one's way: one that has synced already never
-            // takes it again.
-            let preferred_waiting = peers
-                .values()
-                .any(|p| !p.header_sync.started && preferred(&p.info));
+            // Only a preferred peer that could take the slot now stands in a
+            // non-preferred one's way: one that has synced already never
+            // takes it again, and one still in its handshake may never
+            // finish it.
+            let preferred_waiting = peers.values().any(|p| {
+                p.info.state == PeerState::Connected && !p.header_sync.started && preferred(&p.info)
+            });
             if syncing || (preferred_waiting && !preferred(&h.info)) {
                 return false;
             }

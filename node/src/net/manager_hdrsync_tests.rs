@@ -355,6 +355,18 @@ fn an_inbound_peer_syncs_once_the_outbound_one_runs_out() {
     assert_eq!(getheaders_sent(&mut inbound), 1, "the inbound peer takes the slot");
 }
 
+/// An outbound peer still in its version handshake does not hold back a
+/// connected inbound one: the handshake may run to its timeout.
+#[test]
+fn a_handshaking_outbound_peer_does_not_hold_back_an_inbound_one() {
+    let (pm, _dir) = mk_pm();
+    let mut inbound = add_inbound_peer(&pm, 1);
+    let _handshaking = add_peer(&pm, 2);
+    pm.peers.write().get_mut(&2).unwrap().info.state = PeerState::Connecting;
+    pm.start_header_syncs();
+    assert_eq!(getheaders_sent(&mut inbound), 1);
+}
+
 /// A feeler connection is dropped once its handshake is done and never
 /// syncs headers, so it cannot hold the slot.
 #[test]
