@@ -287,17 +287,10 @@ impl SignatureChecker for TxSignatureChecker<'_> {
                 sha256d::Hash::hash(&buf).to_byte_array()
             }
             SigVersion::Base => {
-                // Legacy sighash
                 let cache = self.cache.borrow();
-                // Remove OP_CODESEPARATOR from script_code for legacy
-                let script_code_buf = remove_codeseparators(script_code);
-                match cache.legacy.legacy_signature_hash(
-                    self.input_index,
-                    &script_code_buf,
-                    hash_type_byte as u32,
-                ) {
-                    Ok(h) => h.to_byte_array(),
-                    Err(_) => return false,
+                match legacy_sighash_with(&cache.legacy, self.input_index, script_code, hash_type_byte as u32) {
+                    Some(h) => h,
+                    None => return false,
                 }
             }
             _ => return false,
@@ -409,6 +402,67 @@ impl SignatureChecker for TxSignatureChecker<'_> {
 
         true
     }
+}
+
+/// Core's legacy `SignatureHash` (src/script/interpreter.cpp) for any 32-bit
+/// hash type, OP_CODESEPARATOR removal included. `None` when `input_index`
+/// is past the last input.
+pub fn legacy_sighash(tx: &Transaction, input_index: usize, script_code: &[u8], hash_type: u32) -> Option<[u8; 32]> {
+    legacy_sighash_with(&SighashCache::new(tx), input_index, script_code, hash_type)
+}
+
+/// [`legacy_sighash`] over a cache the caller keeps; the signature checker
+/// verifies every legacy ECDSA signature through it.
+fn legacy_sighash_with(
+    cache: &SighashCache<&Transaction>,
+    input_index: usize,
+    script_code: &[u8],
+    hash_type: u32,
+) -> Option<[u8; 32]> {
+    let script_code = remove_codeseparators(script_code);
+    cache
+        .legacy_signature_hash(input_index, &script_code, hash_type)
+        .ok()
+        .map(|h| h.to_byte_array())
+}
+
+/// Core's `SignatureHashSchnorr`, for a caller that has no witness to run:
+/// the key path without `leaf_hash`, the tapscript extension with it.
+/// `annex` includes its leading 0x50 byte. `None` where Core returns false
+/// (an undefined hash type, SIGHASH_SINGLE with no output at the input's
+/// index), and when `input_index` or `spent_outputs` does not fit `tx`.
+/// The signature checker computes every Schnorr signature hash with the
+/// same code.
+pub fn taproot_sighash(
+    tx: &Transaction,
+    input_index: usize,
+    spent_outputs: &[TxOut],
+    hash_type: u8,
+    annex: Option<&[u8]>,
+    leaf_hash: Option<[u8; 32]>,
+    codeseparator_pos: u32,
+) -> Option<[u8; 32]> {
+    if input_index >= tx.input.len() || spent_outputs.len() != tx.input.len() {
+        return None;
+    }
+    let checker = TxSignatureChecker::new(tx, input_index, spent_outputs[input_index].value, spent_outputs);
+    let mut exec_data = ExecData::new();
+    if let Some(annex) = annex {
+        exec_data.annex_present = true;
+        exec_data.annex_hash = crate::witness::annex_hash(annex);
+    }
+    exec_data.annex_init = true;
+    let sig_version = match leaf_hash {
+        Some(h) => {
+            exec_data.tapleaf_hash = h;
+            exec_data.tapleaf_hash_init = true;
+            exec_data.codeseparator_pos = codeseparator_pos;
+            exec_data.codeseparator_pos_init = true;
+            SigVersion::Tapscript
+        }
+        None => SigVersion::Taproot,
+    };
+    checker.taproot_sighash(hash_type, sig_version, &exec_data)
 }
 
 /// Remove OP_CODESEPARATOR (0xab) opcodes from a script for legacy sighash.

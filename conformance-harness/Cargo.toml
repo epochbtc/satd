@@ -1,0 +1,19 @@
+[package]
+name = "conformance-harness"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+repository.workspace = true
+description = "Answers the bitcoin-consensus-spec conformance protocol from satd's own consensus code"
+
+[[bin]]
+name = "satd-conformance-harness"
+path = "src/main.rs"
+
+[dependencies]
+bitcoin = { workspace = true }
+consensus = { path = "../consensus" }
+node = { path = "../node", default-features = false }
+serde_json = { workspace = true }
+hex = { workspace = true }

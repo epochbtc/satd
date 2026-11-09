@@ -1,0 +1,93 @@
+name: Consensus conformance (nightly)
+
+# Runs the conformance suites of bitcoin-consensus-spec
+# (https://github.com/coreyphillips/bitcoin-consensus-spec), an executable
+# specification of Bitcoin consensus pinned to Bitcoin Core v32.1, against
+# satd's own consensus code through `satd-conformance-harness`. The script
+# suites exercise the Rust engine (`consensus`), not libbitcoinkernel: the
+# kernel is Core's own code and would only be checked against itself.
+#
+# The specification is pinned to one commit. Moving the pin is a deliberate
+# change: read what changed in the spec's suites before taking it. Hosted
+# runners only, like every satd job.
+#
+# NOT a PR gate yet. The specification is new (first published 2026-11-08)
+# and maintained outside this project; it runs nightly and on demand until
+# it has a track record. A failure is a disagreement to settle against
+# Bitcoin Core's source and the live block differential, not a verdict on
+# its own: where Core and the spec differ, Core wins and the spec gets a
+# report.
+
+on:
+  schedule:
+    - cron: '50 3 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: conformance-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  BCS_REPOSITORY: coreyphillips/bitcoin-consensus-spec
+  BCS_REF: 30c6d3fc807236a36b890a48c2d296e1149f971f
+
+jobs:
+  vectors:
+    name: "Conformance (vector suites)"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v7
+
+      - name: Checkout bitcoin-consensus-spec
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ env.BCS_REPOSITORY }}
+          ref: ${{ env.BCS_REF }}
+          path: bcs
+          persist-credentials: false
+
+      - name: Install Linux build deps
+        uses: ./.github/actions/build-deps
+
+      - name: Set up Rust toolchain
+        uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: 1.93
+          override: true
+
+      # Restores the dependency cache `ci.yml`'s `seed-cache` job keeps on
+      # master (the `tests` key); saves nothing, so this job never competes
+      # with it for the repository's cache space.
+      - name: Restore Rust dependencies & target dir
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: tests
+          save-if: false
+
+      - name: Build satd-conformance-harness
+        run: cargo build --locked -p conformance-harness
+
+      - name: Build bcs-conformance
+        run: cargo build --locked --release -p conformance-runner --manifest-path bcs/Cargo.toml
+
+      # Every default suite except `corpus`, which needs the chain
+      # operations. A verdict or sighash that differs from Core fails the
+      # run. A matching verdict with a different script error or reject
+      # reason (level 2) is printed but does not fail it: one is known,
+      # the ten-byte transaction `version | 00 00 | lock_time`, which
+      # rust-bitcoin refuses to decode (`tx-decode`) and Core decodes to a
+      # transaction with no inputs (`bad-txns-vin-empty`); see #1242.
+      - name: Run the vector suites
+        working-directory: bcs
+        run: |
+          ./target/release/bcs-conformance \
+            --impl "$GITHUB_WORKSPACE/target/debug/satd-conformance-harness" \
+            --exclude corpus \
+            --verbose

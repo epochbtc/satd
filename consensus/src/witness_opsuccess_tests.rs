@@ -64,6 +64,32 @@ fn op_success_prescan_skips_push_data() {
     }
 }
 
+#[test]
+fn op_success_prescan_reports_an_unreadable_push_as_bad_opcode() {
+    // Core's prescan returns SCRIPT_ERR_BAD_OPCODE when GetOp fails: the
+    // length field or the data of a push runs past the end of the leaf.
+    let truncated: [&[u8]; 8] = [
+        &[0x02, 0x00],
+        &[0x4c],
+        &[0x4c, 0x02, 0x00],
+        &[0x4d, 0x02],
+        &[0x4d, 0x02, 0x00, 0x00],
+        &[0x4e, 0x02, 0x00, 0x00],
+        &[0x4e, 0x02, 0x00, 0x00, 0x00, 0x00],
+        // OP_RETURN, then an OP_PUSHDATA4 whose length is 0x61616161:
+        // qa-assets' alwaysvalid/notsuccessx failure witness. Execution
+        // would stop at OP_RETURN, but the prescan reads the leaf first.
+        &[0x6a, 0x4e, 0x61, 0x61, 0x61, 0x61, 0x61],
+    ];
+    for leaf in truncated {
+        assert_eq!(scan_for_op_success(leaf, 0), Some(Err(ScriptError::BadOpcode)), "leaf {leaf:02x?}");
+    }
+    // An OP_SUCCESSx ahead of the unreadable push ends the scan first.
+    assert_eq!(scan_for_op_success(&[0x50, 0x4c], 0), Some(Ok(())));
+    // A push that ends exactly at the end of the leaf is readable.
+    assert_eq!(scan_for_op_success(&[0x4c, 0x01, 0x00], 0), None);
+}
+
 const P2A_PROGRAM: [u8; 2] = [0x4e, 0x73];
 
 fn discourage() -> u32 {
