@@ -2484,6 +2484,12 @@ impl ChainState {
         self.store.dirty_count()
     }
 
+    /// Whether the coin cache's buffered delta should be flushed now
+    /// ([`crate::storage::coin_cache::CoinCache::needs_flush`]).
+    pub fn coin_cache_needs_flush(&self) -> bool {
+        self.store.needs_flush()
+    }
+
     /// Dirty coin flush threshold derived from the dbcache budget.
     pub fn flush_threshold(&self) -> u32 {
         self.store.flush_threshold()
@@ -6502,7 +6508,7 @@ impl ChainState {
                 // Bound memory: drain the in-memory dirty set to RocksDB when
                 // it crosses the threshold (a full reindex once hit 122 GiB
                 // RSS at ~block 430k before the OOM killer fired).
-                if self.store.dirty_count() > self.store.flush_threshold() {
+                if self.store.needs_flush() {
                     self.store.flush()?;
                 }
 
@@ -7772,7 +7778,7 @@ impl ChainState {
             });
 
             // Same memory + durability discipline as `reindex_chainstate`.
-            if self.store.dirty_count() > self.store.flush_threshold() {
+            if self.store.needs_flush() {
                 self.store.flush()?;
             }
             if height.is_multiple_of(DURABLE_FLUSH_EVERY) {

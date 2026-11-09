@@ -940,6 +940,16 @@ impl CoinCache {
         self.dirty_count.load(Ordering::Relaxed)
     }
 
+    /// Whether the buffered delta has reached the flush threshold: the dirty
+    /// coins and the index rows buffered with them, which wait in memory for
+    /// the same flush. Counting coins alone let the rows grow without bound
+    /// once spent fresh coins stopped counting (an IBD with the address
+    /// index on held millions of them, gigabytes, between flushes).
+    pub fn needs_flush(&self) -> bool {
+        let held = self.dirty_count() as usize + self.pending_batch.lock().index_row_count();
+        held > self.flush_threshold() as usize
+    }
+
     /// Approximate total cache size (dirty + clean coins).
     pub fn cache_size(&self) -> usize {
         self.dirty_count.load(Ordering::Relaxed) as usize + self.clean.lock().len()
@@ -5168,6 +5178,34 @@ mod tests {
         cache.flush().unwrap();
         assert!(cache.get_coin(&y).is_none());
         assert!(cache.inner.get_coin(&y).is_none(), "nothing reached the store");
+    }
+
+    /// The index rows buffered with the coins count toward the flush, so
+    /// they cannot pile up in memory while the coins alone stay under it.
+    #[test]
+    fn buffered_index_rows_count_toward_the_flush() {
+        let cache = make_cache(10);
+        let threshold = cache.flush_threshold() as usize;
+        let mut small = StoreBatch::default();
+        small.coin_puts.push((make_outpoint(0xE4, 0), make_coin(1_000, 1)));
+        small.tx_loc_puts.push((bitcoin::Txid::from_byte_array([0xE4; 32]), 1));
+        cache.write_batch(small).unwrap();
+        assert!(!cache.needs_flush(), "two rows are under the threshold");
+
+        let mut rows = StoreBatch::default();
+        rows.coin_puts.push((make_outpoint(0xE5, 0), make_coin(1_000, 1)));
+        rows.tx_loc_puts = (0..threshold as u64)
+            .map(|i| {
+                let mut txid = [0u8; 32];
+                txid[..8].copy_from_slice(&i.to_le_bytes());
+                (bitcoin::Txid::from_byte_array(txid), i)
+            })
+            .collect();
+        cache.write_batch(rows).unwrap();
+        assert_eq!(cache.dirty_count(), 2, "two coins");
+        assert!(cache.needs_flush(), "the buffered rows reach the threshold");
+        cache.flush().unwrap();
+        assert!(!cache.needs_flush());
     }
 
     /// `dirty_count` is the dirty map's population. A spend of a stored coin

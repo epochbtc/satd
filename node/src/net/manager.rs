@@ -11117,8 +11117,8 @@ impl PeerManager {
                         // spent so get_coin returns None for every input, and fee
                         // data from old blocks is useless for estimation anyway.
 
-                        // Flush if dirty map is getting large (caps memory usage)
-                        if chain_state.cache_dirty_count() > chain_state.flush_threshold() {
+                        // Flush when the buffered delta reaches the budget (caps memory usage)
+                        if chain_state.coin_cache_needs_flush() {
                             chain_state.connect_phases().enter(ConnectPhase::FlushingCoinCache);
                             if let Err(e) = chain_state.flush_coin_cache() {
                                 tracing::error!("Failed to flush cache: {}", e);
