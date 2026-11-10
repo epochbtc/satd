@@ -7,6 +7,8 @@ struct FakeChain {
     blocks: Vec<(BlockHash, Option<u64>)>,
     missing_below: u32,
     ibd: bool,
+    /// The block at this height has no parent in the index.
+    broken_parent: Option<u32>,
 }
 
 fn hash(height: u32, salt: u8) -> BlockHash {
@@ -19,7 +21,7 @@ fn hash(height: u32, salt: u8) -> BlockHash {
 impl FakeChain {
     fn new(hurdles: &[u64]) -> Self {
         let blocks = hurdles.iter().enumerate().map(|(h, &r)| (hash(h as u32, 0), Some(r))).collect();
-        Self { blocks, missing_below: 0, ibd: false }
+        Self { blocks, missing_below: 0, ibd: false, broken_parent: None }
     }
     fn push(&mut self, hurdle: u64, salt: u8) {
         let h = self.blocks.len() as u32;
@@ -47,6 +49,9 @@ impl HurdleSource for FakeChain {
     }
     fn parent(&self, hash: &BlockHash) -> Option<BlockHash> {
         let h = self.height_of(hash)?;
+        if self.broken_parent == Some(h) {
+            return None;
+        }
         (h > 0).then(|| self.blocks[h as usize - 1].0)
     }
     fn hurdle(&self, hash: &BlockHash, _min_relay: u64) -> Result<Option<u64>, Unreadable> {
@@ -506,4 +511,22 @@ fn the_file_is_saved_every_144_blocks_and_after_a_backfill() {
     assert!(save_due(Some(101), Some(100), true, false), "a backfill just finished");
     assert!(!save_due(Some(400), Some(100), true, true), "a backfill still runs");
     assert!(!save_due(None, None, false, false));
+}
+
+/// A walk that meets a block with no parent in the index starts again at
+/// the tip rather than joining the new blocks to rows it cannot connect
+/// them to.
+#[test]
+fn a_walk_that_loses_the_parent_starts_again_at_the_tip() {
+    let mut chain = FakeChain::new(&calm(100, 1));
+    let mut hist = HurdleHistory::new();
+    sync_full(&mut hist, &chain);
+    for _ in 0..5 {
+        chain.push(3_000, 0);
+    }
+    chain.broken_parent = Some(102);
+    sync_full(&mut hist, &chain);
+    assert_eq!(hist.newest().unwrap(), (104, chain.tip().0));
+    assert!(hist.rows.iter().zip(hist.rows.iter().skip(1)).all(|(a, b)| b.height == a.height + 1));
+    assert_eq!(hist.rows.front().unwrap().height, 102);
 }

@@ -249,12 +249,10 @@ impl HurdleHistory {
             while self.rows.back().is_some_and(|r| r.height > height) {
                 self.rows.pop_back();
             }
-            match self.rows.back() {
-                Some(r) if r.height == height && r.hash == hash => break,
-                Some(r) if r.height == height => {
-                    self.rows.pop_back();
-                }
-                _ => {}
+            // A row at this height on another branch is popped by the
+            // line above once the walk steps below it.
+            if self.rows.back().is_some_and(|r| r.height == height && r.hash == hash) {
+                break;
             }
             walked.push((height, hash));
             // An empty store takes the tip alone; the backfill reads on.
@@ -421,7 +419,7 @@ fn log_quantile(v: &[u64], q: f64) -> u64 {
     } else {
         ((a as f64).ln() + frac * ((b as f64).ln() - (a as f64).ln())).exp()
     };
-    (r.round() as u64).clamp(a, b)
+    r.round() as u64
 }
 
 impl HurdleSource for ChainState {
