@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 use parking_lot::{Mutex, RwLock};
 
 use crate::mempool::estimate::{MAX_SIM_DEPTH, MempoolEstimate, estimate_from_mempool};
+use crate::mempool::fee_history::HurdleHistory;
 use crate::mempool::pool::Mempool;
 
 /// TTL for the cached mempool fee simulation. The simulation (a full mempool
@@ -26,6 +27,11 @@ pub struct FeeEstimator {
     /// fee surface (they all hold the same `Arc<FeeEstimator>`). See
     /// [`FeeEstimator::cached_mempool_estimate`].
     sim_cache: Mutex<Option<(Instant, Arc<MempoolEstimate>)>>,
+    /// Per-block hurdles of the active chain and the analog-window estimate
+    /// read from them (fee plan F3). Kept current by
+    /// [`crate::mempool::fee_history::spawn_fee_history`]; answers
+    /// `fee_rate_estimator=block_policy`.
+    history: Arc<RwLock<HurdleHistory>>,
 }
 
 impl Default for FeeEstimator {
@@ -40,7 +46,22 @@ impl FeeEstimator {
             recent_rates: RwLock::new(Vec::new()),
             max_samples: 100_000,
             sim_cache: Mutex::new(None),
+            history: Arc::new(RwLock::new(HurdleHistory::new())),
         }
+    }
+
+    /// The hurdle store, for the task that keeps it current.
+    pub fn history(&self) -> Arc<RwLock<HurdleHistory>> {
+        self.history.clone()
+    }
+
+    /// The chain-history estimate for `target` blocks, in sat/kvB, from
+    /// the hurdle store: analog windows once the target has enough of
+    /// them, a plain quantile while the store fills, `None` with no
+    /// complete window (callers then fall back to [`Self::estimate_fee`]).
+    pub fn history_estimate(&self, target: u32, conservative: bool) -> Option<u64> {
+        let e = self.history.read().estimate(target)?;
+        Some(if conservative { e.conservative } else { e.economical })
     }
 
     /// The mempool block simulation, memoized with [`FEE_SIM_CACHE_TTL`].
