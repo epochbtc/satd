@@ -52,7 +52,7 @@ pub const OPS: &[&str] = &[
 /// The child process holding the chain of the last `chain_reset`.
 pub struct Worker {
     child: Child,
-    stdin: ChildStdin,
+    stdin: Option<ChildStdin>,
     stdout: BufReader<ChildStdout>,
 }
 
@@ -68,13 +68,14 @@ impl Worker {
             .map_err(|e| internal(format!("starting the chain worker: {e}")))?;
         let stdin = child.stdin.take().expect("piped stdin");
         let stdout = BufReader::new(child.stdout.take().expect("piped stdout"));
-        Ok(Worker { child, stdin, stdout })
+        Ok(Worker { child, stdin: Some(stdin), stdout })
     }
 
     /// Pass one request line on and return the worker's response line.
     pub fn call(&mut self, line: &str) -> Result<Value, Fail> {
-        writeln!(self.stdin, "{line}")
-            .and_then(|()| self.stdin.flush())
+        let stdin = self.stdin.as_mut().expect("open until drop");
+        writeln!(stdin, "{line}")
+            .and_then(|()| stdin.flush())
             .map_err(|e| internal(format!("writing to the chain worker: {e}")))?;
         let mut answer = String::new();
         match self.stdout.read_line(&mut answer) {
@@ -87,7 +88,17 @@ impl Worker {
 }
 
 impl Drop for Worker {
+    /// End of input lets the worker exit on its own and remove its data
+    /// directory; it is killed only if it has not exited within a few seconds.
     fn drop(&mut self) {
+        drop(self.stdin.take());
+        let deadline = Instant::now() + std::time::Duration::from_secs(10);
+        while Instant::now() < deadline {
+            if let Ok(Some(_)) = self.child.try_wait() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
@@ -380,6 +391,11 @@ impl Chain {
                 deserialize(&bytes).map_err(|e| bad_request(format!("header: {e}")))?;
             headers.push(header);
         }
+        // `accept_headers` skips a header it already knows without counting
+        // it, so the refused header's position comes from what was known
+        // before the call.
+        let known_before: Vec<bool> =
+            headers.iter().map(|h| self.cs.get_block_index(&h.block_hash()).is_some()).collect();
         let mut fields = Fields::new();
         let (accepted, refused) = if p2p {
             // `PeerManager::handle_headers`.
@@ -401,9 +417,15 @@ impl Chain {
         let outcome = match refused {
             None | Some(ChainError::Duplicate) => Outcome::Accepted,
             Some(e) => {
-                let hash = headers[accepted as usize].block_hash();
-                fields.insert("index".into(), json!(accepted));
-                refusal(&self.cs, &hash, e)?
+                let index = known_before
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, known)| !**known)
+                    .nth(accepted as usize)
+                    .map(|(i, _)| i)
+                    .ok_or_else(|| internal("refused header not found in the request"))?;
+                fields.insert("index".into(), json!(index));
+                refusal(&self.cs, &headers[index].block_hash(), e)?
             }
         };
         self.activate();
