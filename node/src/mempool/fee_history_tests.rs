@@ -65,7 +65,12 @@ impl HurdleSource for FakeChain {
 
 /// Sync until the backfill has nothing left to read.
 fn sync_full(hist: &mut HurdleHistory, chain: &FakeChain) {
-    while hist.sync(chain, 0, 1_000) {}
+    for _ in 0..100 {
+        if !hist.sync(chain, 0, 1_000) {
+            return;
+        }
+    }
+    panic!("the backfill never ends");
 }
 
 /// A calm market around 1,000 sat/kvB, with a little variation so that
@@ -481,7 +486,11 @@ fn the_chain_state_source_prices_blocks_from_undo_data() {
     assert!(live.is_empty());
 
     let mut hist = HurdleHistory::new();
-    while hist.sync(&Synced(&cs), 0, 1_000) {}
+    for _ in 0..100 {
+        if !hist.sync(&Synced(&cs), 0, 1_000) {
+            break;
+        }
+    }
     assert_eq!(hist.len(), 104);
     assert_eq!(hist.newest(), Some((103, blocks[102].block_hash())));
     let hurdles: Vec<(u32, Option<u64>)> = hist.rows.iter().map(|r| (r.height, r.hurdle)).collect();
@@ -529,4 +538,14 @@ fn a_walk_that_loses_the_parent_starts_again_at_the_tip() {
     assert_eq!(hist.newest().unwrap(), (104, chain.tip().0));
     assert!(hist.rows.iter().zip(hist.rows.iter().skip(1)).all(|(a, b)| b.height == a.height + 1));
     assert_eq!(hist.rows.front().unwrap().height, 102);
+}
+
+/// The clamp lowers a longer target that answered more than a shorter one,
+/// and passes over targets with no answer.
+#[test]
+fn a_longer_target_is_lowered_to_the_shorter_ones_answer() {
+    let e = |economical, conservative| Some(HistoryEstimate { economical, conservative, source: HistorySource::Analog });
+    let mut table = [e(5_000, 9_000), None, e(6_000, 8_000), e(2_000, 9_500)];
+    clamp_monotone(&mut table);
+    assert_eq!(table, [e(5_000, 9_000), None, e(5_000, 8_000), e(2_000, 8_000)]);
 }

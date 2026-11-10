@@ -295,16 +295,21 @@ impl HurdleHistory {
         for (i, &target) in LADDER.iter().enumerate() {
             table[i] = estimate_from_hurdles(&hurdles, target);
         }
-        // Monotone: a longer target never answers more than a shorter one.
-        let mut ceiling: Option<(u64, u64)> = None;
-        for e in table.iter_mut().flatten() {
-            if let Some((econ, cons)) = ceiling {
-                e.economical = e.economical.min(econ);
-                e.conservative = e.conservative.min(cons);
-            }
-            ceiling = Some((e.economical, e.conservative));
-        }
+        clamp_monotone(&mut table);
         self.table = table;
+    }
+}
+
+/// A longer target never answers more than a shorter one: each entry is
+/// lowered to the one before it.
+fn clamp_monotone(table: &mut [Option<HistoryEstimate>]) {
+    let mut ceiling: Option<(u64, u64)> = None;
+    for e in table.iter_mut().flatten() {
+        if let Some((econ, cons)) = ceiling {
+            e.economical = e.economical.min(econ);
+            e.conservative = e.conservative.min(cons);
+        }
+        ceiling = Some((e.economical, e.conservative));
     }
 }
 
