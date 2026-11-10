@@ -2400,3 +2400,20 @@ fn the_reconnect_loop_drops_the_surplus_block_relay_peer() {
     assert!(!pm.peers.read().contains_key(&3));
     assert_eq!(pm.peers.read().len(), 2);
 }
+
+/// In one pass, the extra block-relay-only draw passes over the address the
+/// regular block-relay-only dial just took: with one address in the book,
+/// one dial, not two to the same peer.
+#[tokio::test(flavor = "current_thread")]
+async fn the_extra_block_relay_peer_skips_this_passes_block_relay_dial() {
+    let (pm, _dir) = mk_pm_tor();
+    recent_tip(&pm);
+    fill_ipv4(&pm, MAX_OUTBOUND);
+    fill_block_relay(&pm, MAX_OUTBOUND_BLOCK_RELAY - 1);
+    learn_onion(&pm, &onion_host(8), 8333);
+    extra_block_relay_due(&pm);
+    pm.reconnect_tick();
+    let in_flight = pm.dials_in_flight.lock();
+    assert_eq!(in_flight.block_relay, 1, "the regular dial");
+    assert_eq!(in_flight.extra_block_relay, 0, "no second dial to the same address");
+}

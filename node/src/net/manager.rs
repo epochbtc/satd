@@ -5526,7 +5526,7 @@ impl PeerManager {
         self.resolve_tried_collisions();
         let mut dialled = self.open_anchor_peers(now);
         dialled.extend(self.dial_automatic_peers(now, &dialled));
-        self.open_block_relay_peer(now, &dialled);
+        dialled.extend(self.open_block_relay_peer(now, &dialled));
         self.open_extra_block_relay_peer(now, &dialled);
         self.open_feeler(now);
         self.open_extra_network_peer(now);
@@ -5626,17 +5626,19 @@ impl PeerManager {
 
     /// Open a block-relay-only peer if one is wanted:
     /// [`Self::reserve_block_relay_peer`], then the dial. `dialled` is what
-    /// the full-relay half of this pass just started.
-    fn open_block_relay_peer(self: &Arc<Self>, now: Instant, dialled: &[PeerAddr]) {
-        let Some((target, slot)) = self.reserve_block_relay_peer(now, dialled) else {
-            return;
-        };
+    /// the full-relay half of this pass just started. Returns the address
+    /// dialled, which the extra block-relay-only draw later in the pass then
+    /// passes over, with its group.
+    fn open_block_relay_peer(self: &Arc<Self>, now: Instant, dialled: &[PeerAddr]) -> Option<PeerAddr> {
+        let (target, slot) = self.reserve_block_relay_peer(now, dialled)?;
         tracing::debug!(%target, "Making block-relay-only connection");
         let pm = Arc::clone(self);
+        let dialled = target.clone();
         tokio::spawn(async move {
             let _slot = slot;
             pm.dial_book_target(&target, Some(ConnType::BlockRelay), AUTOMATIC_RECONNECT_MAX_BACKOFF).await;
         });
+        Some(dialled)
     }
 
     /// The address a block-relay-only peer is dialled at this pass, with its
