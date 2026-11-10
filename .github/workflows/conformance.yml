@@ -5,7 +5,9 @@ name: Consensus conformance (nightly)
 # specification of Bitcoin consensus pinned to Bitcoin Core v32.1, against
 # satd's own consensus code through `satd-conformance-harness`. The script
 # suites exercise the Rust engine (`consensus`), not libbitcoinkernel: the
-# kernel is Core's own code and would only be checked against itself.
+# kernel is Core's own code and would only be checked against itself. The
+# block corpus replays Core's functional tests through the node's
+# `ChainState`, with the Rust engine verifying scripts.
 #
 # The specification is pinned to one commit. Moving the pin is a deliberate
 # change: read what changed in the spec's suites before taking it. Hosted
@@ -77,8 +79,8 @@ jobs:
       - name: Build bcs-conformance
         run: cargo build --locked --release -p conformance-runner --manifest-path bcs/Cargo.toml
 
-      # Every default suite except `corpus`, which needs the chain
-      # operations. A verdict or sighash that differs from Core fails the
+      # Every default suite except `corpus`, which runs in its own job
+      # below. A verdict or sighash that differs from Core fails the
       # run. A matching verdict with a different script error or reject
       # reason (level 2) is printed but does not fail it: one is known,
       # the ten-byte transaction `version | 00 00 | lock_time`, which
@@ -90,4 +92,59 @@ jobs:
           ./target/release/bcs-conformance \
             --impl "$GITHUB_WORKSPACE/target/debug/satd-conformance-harness" \
             --exclude corpus \
+            --verbose
+
+  corpus:
+    name: "Conformance (block corpus)"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v7
+
+      - name: Checkout bitcoin-consensus-spec
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ env.BCS_REPOSITORY }}
+          ref: ${{ env.BCS_REF }}
+          path: bcs
+          persist-credentials: false
+
+      - name: Install Linux build deps
+        uses: ./.github/actions/build-deps
+
+      - name: Set up Rust toolchain
+        uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: 1.93
+          override: true
+
+      # A release build: the corpus connects about 17,000 blocks, several
+      # times over across its restarts, and a debug build takes far longer.
+      - name: Build satd-conformance-harness
+        run: cargo build --locked --release -p conformance-harness
+
+      - name: Build bcs-conformance
+        run: cargo build --locked --release -p conformance-runner --manifest-path bcs/Cargo.toml
+
+      # Every block, header and invalidation goes through what the node does
+      # with it (see `conformance-harness/src/chain.rs`); the harness adds no
+      # rule of Core's that satd lacks, so a difference here is satd's. The
+      # run fails on a normative tip or height that differs from Core's.
+      # Known, each with its issue: -test=bip94 on regtest (#1245), and
+      # the script flags under -testactivationheight=segwit (#1244).
+      # Chain-tip (level 1) differences are printed only: blocks that fail
+      # contextual checks are not remembered (#1246), and there is no
+      # low-work drop (#1247) or header-only rule for unrequested
+      # blocks (#1248).
+      - name: Run the block corpus
+        working-directory: bcs
+        env:
+          TMPDIR: ${{ runner.temp }}
+        run: |
+          ./target/release/bcs-conformance \
+            --impl "$GITHUB_WORKSPACE/target/release/satd-conformance-harness" \
+            --suite corpus \
             --verbose

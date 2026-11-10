@@ -1069,6 +1069,7 @@ dependencies = [
  "hex",
  "node",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]
