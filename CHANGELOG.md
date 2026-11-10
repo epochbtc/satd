@@ -40,6 +40,7 @@ It includes every fix shipped in 0.7.1:
 - RPC: `addconnection` opens typed connections to onion addresses through the proxy; it refused them (#1150).
 - P2P: the node opens Core's two automatic block-relay-only outbound connections once its eight full-relay peers are up; it opened none, and an `addconnection` block-relay-only peer took a full-relay slot (#1225).
 - P2P: a node with no outbound peer on a network it can reach (IPv4, IPv6 or onion) opens an extra full-relay connection to that network about every five minutes, as Core does, and keeps it as the only peer there (#1156).
+- P2P: once initial sync is over, the node opens an extra block-relay-only connection about every five minutes to check its tip, and then drops whichever of its two youngest block-relay-only peers gave it a block least recently, as Core does (#1155).
 - P2P: `.onion` fixed seeds for testnet4 and testnet3, and refreshed ones for mainnet and signet, from Core v31.2's lists, so a Tor-only node can bootstrap on every network (#1162).
 - Config: `reindex=1` and `reindexchainstate=1` in `bitcoin.conf` are honoured, as in Core, instead of accepted and ignored (#840).
 - Operator: the shadow verification queue is bounded by memory, `-shadowqueuemb` (default 128 MiB), as well as by entry count (#1145).

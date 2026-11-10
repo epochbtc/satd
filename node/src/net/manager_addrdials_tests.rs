@@ -2142,3 +2142,261 @@ async fn the_loop_dials_its_anchors_at_once() {
     assert!(accepted.is_ok(), "the anchor is dialled within the first ticks");
     assert!(pm.anchors.lock().is_empty());
 }
+
+// ---- Extra block-relay-only peer (#1155) ----
+
+/// Connect a block mined now, so the tip is recent enough to fetch blocks
+/// directly (Core's `CanDirectFetch`), and leave IBD.
+fn recent_tip(pm: &PeerManager) {
+    use crate::chain::state::tests::build_test_block;
+    let genesis = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
+    let block = build_test_block(genesis, 1, crate::time::now_secs() as u32);
+    pm.chain_state.accept_block(&block).expect("connect block 1");
+    leave_ibd(pm);
+}
+
+/// A node whose outbound targets are met, past initial sync, with one
+/// address to dial and the extra block-relay-only timer due.
+fn extra_block_relay_fixture() -> (Arc<PeerManager>, tempfile::TempDir, SocketAddr) {
+    let (pm, dir) = mk_pm();
+    recent_tip(&pm);
+    pm.maybe_start_extra_block_relay_peers();
+    fill_automatic(&pm, MAX_OUTBOUND);
+    fill_block_relay(&pm, MAX_OUTBOUND_BLOCK_RELAY);
+    let addr = SocketAddr::from(([44, 1, 2, 3], 8333));
+    learn(&pm, addr);
+    extra_block_relay_due(&pm);
+    (pm, dir, addr)
+}
+
+fn extra_block_relay_due(pm: &PeerManager) {
+    *pm.next_extra_block_relay.lock() = Instant::now() - Duration::from_secs(1);
+}
+
+fn extra_block_relay_target(pm: &Arc<PeerManager>) -> Option<PeerAddr> {
+    pm.reserve_extra_block_relay_peer(Instant::now(), &[]).map(|(target, _slot)| target)
+}
+
+/// #1155: no extra block-relay-only peer before initial sync is over. Core
+/// starts them once `CanDirectFetch` first holds, and never stops: a tip
+/// that goes stale later leaves them on.
+#[test]
+fn no_extra_block_relay_peer_before_the_tip_is_recent() {
+    let (pm, _dir) = mk_pm();
+    leave_ibd(&pm);
+    fill_automatic(&pm, MAX_OUTBOUND);
+    fill_block_relay(&pm, MAX_OUTBOUND_BLOCK_RELAY);
+    learn(&pm, SocketAddr::from(([44, 1, 2, 3], 8333)));
+    extra_block_relay_due(&pm);
+    pm.maybe_start_extra_block_relay_peers();
+    assert!(!pm.start_extra_block_relay_peers.load(Ordering::Relaxed), "the genesis tip is years old");
+    assert_eq!(extra_block_relay_target(&pm), None);
+
+    recent_tip(&pm);
+    pm.maybe_start_extra_block_relay_peers();
+    assert!(pm.start_extra_block_relay_peers.load(Ordering::Relaxed));
+    assert_eq!(extra_block_relay_target(&pm), Some(SocketAddr::from(([44, 1, 2, 3], 8333)).into()));
+}
+
+/// The extra peer waits for both targets, as Core reaches its branch past
+/// them, and for its timer, which each one sets again.
+#[test]
+fn the_extra_block_relay_peer_waits_for_the_targets_and_the_timer() {
+    let (pm, _dir) = mk_pm();
+    recent_tip(&pm);
+    pm.maybe_start_extra_block_relay_peers();
+    let addr = SocketAddr::from(([44, 1, 2, 3], 8333));
+    learn(&pm, addr);
+    fill_automatic(&pm, MAX_OUTBOUND);
+    fill_block_relay(&pm, 1);
+    extra_block_relay_due(&pm);
+    let due = *pm.next_extra_block_relay.lock();
+    assert_eq!(extra_block_relay_target(&pm), None, "one block-relay-only place is open");
+    assert_eq!(*pm.next_extra_block_relay.lock(), due, "the timer waits for the targets");
+
+    fill_block_relay(&pm, MAX_OUTBOUND_BLOCK_RELAY);
+    let now = Instant::now();
+    assert_eq!(extra_block_relay_target(&pm), Some(addr.into()));
+    assert!(*pm.next_extra_block_relay.lock() > now, "set again");
+    assert_eq!(extra_block_relay_target(&pm), None, "not due again yet");
+}
+
+/// One at a time: a second is refused while the first is being dialled,
+/// and the dial in flight counts as a block-relay-only connection.
+#[test]
+fn one_extra_block_relay_peer_at_a_time() {
+    let (pm, _dir, _addr) = extra_block_relay_fixture();
+    learn(&pm, SocketAddr::from(([45, 1, 2, 3], 8333)));
+    let first = pm.reserve_extra_block_relay_peer(Instant::now(), &[]).expect("the first");
+    extra_block_relay_due(&pm);
+    assert_eq!(extra_block_relay_target(&pm), None);
+    assert_eq!(pm.block_relay_open(&pm.dials_in_flight.lock()), MAX_OUTBOUND_BLOCK_RELAY + 1);
+    drop(first);
+    assert!(extra_block_relay_target(&pm).is_some());
+}
+
+/// The extra peer takes an outbound grant, Core's `semOutbound`, which has
+/// room for it only in the feeler's place: none at `-maxconnections` 10,
+/// where 8 full-relay and 2 block-relay-only peers hold every grant.
+#[test]
+fn no_extra_block_relay_peer_without_an_outbound_grant() {
+    let (pm, _dir, _addr) = extra_block_relay_fixture();
+    pm.set_max_connections(10);
+    assert_eq!(extra_block_relay_target(&pm), None);
+    pm.set_max_connections(11);
+    assert!(extra_block_relay_target(&pm).is_some());
+    extra_block_relay_due(&pm);
+    pm.pending_typed_dials.write().push(ConnType::Feeler);
+    assert_eq!(extra_block_relay_target(&pm), None, "a feeler holds the eleventh");
+}
+
+/// Under `-connect` no extra block-relay-only peer is opened.
+#[test]
+fn connect_opens_no_extra_block_relay_peer() {
+    let (pm, _dir, _addr) = extra_block_relay_fixture();
+    pm.automatic_outbound.store(false, Ordering::Relaxed);
+    assert_eq!(extra_block_relay_target(&pm), None);
+    pm.automatic_outbound.store(true, Ordering::Relaxed);
+    assert!(extra_block_relay_target(&pm).is_some());
+}
+
+/// A block-relay-only peer, past the minimum connect time, that last gave
+/// the node a block at `last_block` (0 = never).
+fn aged_block_relay(pm: &PeerManager, id: PeerId, last_block: u64) {
+    let mut info = peer(id, SocketAddr::from(([90 + (id % 100) as u8, 1, 0, 1], 8333)), Direction::Outbound);
+    info.conn_type = ConnType::BlockRelay;
+    info.conn_time -= Duration::from_secs(60);
+    add_peer(pm, info);
+    pm.peers.read().get(&id).unwrap().stats.set_last_block(last_block);
+}
+
+/// #1155, Core's `EvictExtraOutboundPeers`: with a third block-relay-only
+/// peer, the youngest goes unless it gave a block more recently than the
+/// second-youngest, which then goes instead.
+#[test]
+fn the_extra_block_relay_peer_that_brought_nothing_newer_goes() {
+    let (pm, _dir) = mk_pm();
+    leave_ibd(&pm);
+    aged_block_relay(&pm, 1, 500);
+    aged_block_relay(&pm, 2, 400);
+    aged_block_relay(&pm, 3, 0);
+    assert_eq!(pm.evict_extra_block_relay_peer(), Some(3), "the youngest brought no block");
+    assert_eq!(pm.evict_extra_block_relay_peer(), None, "two left");
+
+    aged_block_relay(&pm, 4, 600);
+    assert_eq!(pm.evict_extra_block_relay_peer(), Some(2), "the youngest is newer: the second-youngest goes");
+    assert!(pm.peers.read().contains_key(&4));
+
+    aged_block_relay(&pm, 5, 600);
+    assert_eq!(pm.evict_extra_block_relay_peer(), Some(5), "a tie: the youngest goes");
+}
+
+/// The chosen peer stays this time if it connected less than
+/// `MINIMUM_CONNECT_TIME` ago, as in Core; nothing is evicted while the
+/// count is within the limit.
+#[test]
+fn a_new_extra_block_relay_peer_gets_its_minimum_connect_time() {
+    let (pm, _dir) = mk_pm();
+    leave_ibd(&pm);
+    aged_block_relay(&pm, 1, 500);
+    aged_block_relay(&pm, 2, 400);
+    let mut young = peer(3, SocketAddr::from(([93, 1, 0, 1], 8333)), Direction::Outbound);
+    young.conn_type = ConnType::BlockRelay;
+    add_peer(&pm, young);
+    assert_eq!(pm.evict_extra_block_relay_peer(), None, "connected just now");
+    pm.peers.write().get_mut(&3).unwrap().info.conn_time -= Duration::from_secs(60);
+    assert_eq!(pm.evict_extra_block_relay_peer(), Some(3));
+}
+
+/// The limit follows `-maxconnections`: at 9 one block-relay-only peer is
+/// the limit, so a second is a surplus.
+#[test]
+fn the_block_relay_surplus_follows_the_limit() {
+    let (pm, _dir) = mk_pm();
+    leave_ibd(&pm);
+    aged_block_relay(&pm, 1, 500);
+    aged_block_relay(&pm, 2, 0);
+    assert_eq!(pm.evict_extra_block_relay_peer(), None, "two is the default limit");
+    pm.set_max_connections(9);
+    assert_eq!(pm.evict_extra_block_relay_peer(), Some(2));
+}
+
+/// The reconnect loop opens the extra peer once the timer is due: an onion
+/// dial, which fails at once here and leaves its backoff.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_reconnect_loop_dials_the_extra_block_relay_peer() {
+    let (pm, _dir) = mk_pm_tor();
+    recent_tip(&pm);
+    fill_block_relay(&pm, MAX_OUTBOUND_BLOCK_RELAY);
+    fill_ipv4(&pm, MAX_OUTBOUND);
+    let host = onion_host(7);
+    learn_onion(&pm, &host, 8333);
+    extra_block_relay_due(&pm);
+    pm.reconnect_tick();
+    assert!(pm.start_extra_block_relay_peers.load(Ordering::Relaxed), "the loop starts them");
+    let key = format!("{host}:8333");
+    wait_for(&pm, || pm.onion_reconnect_backoff.read().contains_key(&key), "the onion is dialled").await;
+    settle(&pm).await;
+    assert_eq!(pm.dials_in_flight.lock().extra_block_relay, 0, "the slot went back");
+}
+
+/// The chosen peer stays this time while a block is being downloaded from
+/// it, as in Core.
+#[test]
+fn a_block_relay_peer_with_a_block_in_flight_stays() {
+    let (pm, _dir) = mk_pm();
+    leave_ibd(&pm);
+    aged_block_relay(&pm, 1, 500);
+    aged_block_relay(&pm, 2, 400);
+    aged_block_relay(&pm, 3, 0);
+    pm.record_block_requests(3, &[bitcoin::BlockHash::all_zeros()], false);
+    assert_eq!(pm.evict_extra_block_relay_peer(), None);
+    pm.in_flight_blocks.write().clear();
+    assert_eq!(pm.evict_extra_block_relay_peer(), Some(3));
+}
+
+/// With no second-youngest, Core compares the youngest with a block time
+/// of 0: one that gave a block names no peer, one that gave none goes. At
+/// `-maxconnections` 8 the limit is 0, so an `addconnection`
+/// block-relay-only peer is a surplus.
+#[test]
+fn a_lone_surplus_block_relay_peer_goes_only_if_it_brought_nothing() {
+    let (pm, _dir) = mk_pm();
+    leave_ibd(&pm);
+    pm.set_max_connections(MAX_OUTBOUND);
+    aged_block_relay(&pm, 1, 500);
+    assert_eq!(pm.evict_extra_block_relay_peer(), None);
+    pm.peers.read().get(&1).unwrap().stats.set_last_block(0);
+    assert_eq!(pm.evict_extra_block_relay_peer(), Some(1));
+}
+
+/// An extra block-relay-only dial in flight holds an outbound grant: with
+/// it holding the eleventh at `-maxconnections` 11, no feeler opens and
+/// `addconnection` takes no block-relay-only peer.
+#[test]
+fn the_extra_block_relay_dial_holds_its_grant() {
+    let (pm, _dir, _addr) = extra_block_relay_fixture();
+    pm.set_max_connections(11);
+    learn(&pm, SocketAddr::from(([45, 1, 2, 3], 8333)));
+    let extra = pm.reserve_extra_block_relay_peer(Instant::now(), &[]).expect("the extra peer");
+    feeler_due(&pm);
+    assert!(pm.reserve_feeler(Instant::now()).is_none(), "the extra dial holds the grant");
+    let held = pm.dials_in_flight.lock();
+    assert!(pm.check_outbound_limit_for(ConnType::Feeler, &[], &held).is_err(), "nor by addconnection");
+    drop(held);
+    drop(extra);
+    assert!(feeler_target(&pm).is_some());
+}
+
+/// The reconnect loop drops the surplus block-relay-only peer.
+#[test]
+fn the_reconnect_loop_drops_the_surplus_block_relay_peer() {
+    let (pm, _dir) = mk_pm();
+    leave_ibd(&pm);
+    aged_block_relay(&pm, 1, 500);
+    aged_block_relay(&pm, 2, 400);
+    aged_block_relay(&pm, 3, 0);
+    pm.reconnect_tick();
+    assert!(!pm.peers.read().contains_key(&3));
+    assert_eq!(pm.peers.read().len(), 2);
+}

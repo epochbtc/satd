@@ -200,6 +200,12 @@ impl PeerStats {
         self.last_block.store(now_secs(), Ordering::Relaxed);
     }
 
+    /// Set the time a block was last received from this peer, for tests.
+    #[cfg(test)]
+    pub fn set_last_block(&self, secs: u64) {
+        self.last_block.store(secs, Ordering::Relaxed);
+    }
+
     /// Record that a transaction was received from this peer now.
     pub fn record_transaction(&self) {
         self.last_transaction.store(now_secs(), Ordering::Relaxed);

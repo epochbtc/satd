@@ -207,6 +207,19 @@ fn next_extra_network_peer_after(now: Instant) -> Instant {
     now + Duration::from_micros(crate::net::tx_relay::exp_delay(mean))
 }
 
+/// The mean time between two extra block-relay-only peers, opened to check
+/// that the tip is current: Core's `EXTRA_BLOCK_RELAY_ONLY_PEER_INTERVAL`
+/// (v31.1 `src/net.h:63`), the mean of an exponential timer.
+const EXTRA_BLOCK_RELAY_ONLY_PEER_INTERVAL: Duration = Duration::from_secs(5 * 60);
+
+/// When the next extra block-relay-only peer is due, from `now`: an
+/// exponentially distributed wait with mean
+/// [`EXTRA_BLOCK_RELAY_ONLY_PEER_INTERVAL`].
+fn next_extra_block_relay_after(now: Instant) -> Instant {
+    let mean = EXTRA_BLOCK_RELAY_ONLY_PEER_INTERVAL.as_micros() as u64;
+    now + Duration::from_micros(crate::net::tx_relay::exp_delay(mean))
+}
+
 /// The network of an address-book entry or an outbound peer's address, as
 /// Core's `CNetAddr::GetNetwork`: `None` for an address that is not
 /// publicly routable (Core's `NET_UNROUTABLE`), which belongs to no network
@@ -784,6 +797,12 @@ enum DialBudget {
     /// counted with it, but ahead of the full-relay peers, as Core dials
     /// its anchors first.
     Anchor,
+    /// The extra block-relay-only peer the node opens every few minutes to
+    /// check its tip ([`PeerManager::reserve_extra_block_relay_peer`]): one
+    /// at a time, only once the full-relay and block-relay-only targets are
+    /// met, with an outbound grant. It is a third block-relay-only peer
+    /// until [`PeerManager::evict_extra_block_relay_peer`] drops one.
+    ExtraBlockRelay,
 }
 
 /// Outbound dials in flight, per [`DialBudget`].
@@ -793,6 +812,7 @@ struct DialsInFlight {
     added_node: usize,
     extra_network: usize,
     block_relay: usize,
+    extra_block_relay: usize,
 }
 
 /// A dial's place in its [`DialBudget`], given back when dropped. Owned, so
@@ -814,6 +834,9 @@ impl Drop for DialSlot {
             }
             DialBudget::BlockRelay | DialBudget::Anchor => {
                 in_flight.block_relay = in_flight.block_relay.saturating_sub(1)
+            }
+            DialBudget::ExtraBlockRelay => {
+                in_flight.extra_block_relay = in_flight.extra_block_relay.saturating_sub(1)
             }
             DialBudget::Unlimited => {}
         }
@@ -1333,6 +1356,15 @@ pub struct PeerManager {
     /// When the next extra full-relay peer to a network with none is due
     /// ([`Self::reserve_extra_network_peer`]).
     next_extra_network_peer: parking_lot::Mutex<Instant>,
+    /// When the next extra block-relay-only peer is due
+    /// ([`Self::reserve_extra_block_relay_peer`]): Core's
+    /// `next_extra_block_relay`.
+    next_extra_block_relay: parking_lot::Mutex<Instant>,
+    /// Set once the tip is recent enough to fetch blocks directly, and never
+    /// cleared: Core's `m_start_extra_block_relay_peers`, which
+    /// `StartExtraBlockRelayPeers` sets the first time `CanDirectFetch`
+    /// holds. No extra block-relay-only peer is opened before.
+    start_extra_block_relay_peers: std::sync::atomic::AtomicBool,
     /// The peers the operator named: every `-addnode` / `addnode add`
     /// entry, plus each `-connect` entry given as a host name. Keeps the
     /// string the operator typed (what `getaddednodeinfo` reports, matching
@@ -1795,6 +1827,13 @@ impl PeerManager {
             } else {
                 next_extra_network_peer_after(Instant::now())
             }),
+            // Likewise for the extra block-relay-only peer.
+            next_extra_block_relay: parking_lot::Mutex::new(if cfg!(test) {
+                Instant::now() + Duration::from_secs(365 * 24 * 3600)
+            } else {
+                next_extra_block_relay_after(Instant::now())
+            }),
+            start_extra_block_relay_peers: std::sync::atomic::AtomicBool::new(false),
             addnode_entries: RwLock::new(Vec::new()),
             refreshing_manual_targets: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
@@ -3634,7 +3673,7 @@ impl PeerManager {
                 .count()
                 + pending.iter().filter(|t| **t == conn_type).count()
                 + match conn_type {
-                    ConnType::BlockRelay => in_flight.block_relay,
+                    ConnType::BlockRelay => in_flight.block_relay + in_flight.extra_block_relay,
                     _ => 0,
                 };
             if existing >= max {
@@ -3664,7 +3703,8 @@ impl PeerManager {
             // The reconnect loop's dials in flight hold grants too.
             + in_flight.automatic
             + in_flight.extra_network
-            + in_flight.block_relay;
+            + in_flight.block_relay
+            + in_flight.extra_block_relay;
         if total_outbound >= Self::max_automatic_outbound(&self.max_connections) {
             return Err("Error: Already at capacity for specified connection type.".to_string());
         }
@@ -3750,7 +3790,7 @@ impl PeerManager {
             .filter(|h| h.info.conn_type == ConnType::BlockRelay && h.info.state != PeerState::Disconnected)
             .count();
         let typed = self.pending_typed_dials.read().iter().filter(|t| **t == ConnType::BlockRelay).count();
-        peers + in_flight.block_relay + typed
+        peers + in_flight.block_relay + in_flight.extra_block_relay + typed
     }
 
     /// Whether the automatic full-relay and block-relay-only targets are
@@ -3797,6 +3837,7 @@ impl PeerManager {
             + in_flight.automatic
             + in_flight.extra_network
             + in_flight.block_relay
+            + in_flight.extra_block_relay
     }
 
     /// The added nodes the operator listed, at the addresses they resolve to.
@@ -3925,6 +3966,18 @@ impl PeerManager {
                     return Err("no outbound grant free".to_string());
                 }
                 in_flight.block_relay += 1;
+            }
+            DialBudget::ExtraBlockRelay => {
+                // Core reaches this branch past both targets. The grant
+                // below then leaves room for one at a time: 8 full-relay and
+                // 2 block-relay-only peers hold all but the feeler's place.
+                if !self.outbound_targets_met(&in_flight) {
+                    return Err("the outbound targets are not met".to_string());
+                }
+                if self.automatic_sockets_open(&in_flight) >= Self::max_automatic_outbound(&self.max_connections) {
+                    return Err("no outbound grant free".to_string());
+                }
+                in_flight.extra_block_relay += 1;
             }
             DialBudget::Unlimited => {}
         }
@@ -5467,11 +5520,14 @@ impl PeerManager {
             self.flush_banlist();
         }
         self.redial_manual_peers(now);
+        self.maybe_start_extra_block_relay_peers();
+        self.evict_extra_block_relay_peer();
         self.evict_extra_outbound_peer();
         self.resolve_tried_collisions();
         let mut dialled = self.open_anchor_peers(now);
         dialled.extend(self.dial_automatic_peers(now, &dialled));
         self.open_block_relay_peer(now, &dialled);
+        self.open_extra_block_relay_peer(now, &dialled);
         self.open_feeler(now);
         self.open_extra_network_peer(now);
     }
@@ -5604,6 +5660,12 @@ impl PeerManager {
         dialled: &[PeerAddr],
     ) -> Option<(PeerAddr, DialSlot)> {
         let slot = self.reserve_dial(DialBudget::BlockRelay).ok()?;
+        self.draw_block_relay_target(now, dialled).map(|target| (target, slot))
+    }
+
+    /// The address a block-relay-only peer is dialled at, drawn as every
+    /// automatic one is (see [`Self::reserve_block_relay_peer`]).
+    fn draw_block_relay_target(self: &Arc<Self>, now: Instant, dialled: &[PeerAddr]) -> Option<PeerAddr> {
         let recent = now.checked_sub(RECENT_TRY_WINDOW);
         let tried_recently =
             |c: &DialCandidate| recent.is_some_and(|since| self.tried_since(&c.addr, since));
@@ -5627,7 +5689,72 @@ impl PeerManager {
             chosen = Some(c.addr);
             Err(())
         });
-        chosen.map(|target| (target, slot))
+        chosen
+    }
+
+    /// Set [`Self::start_extra_block_relay_peers`] the first time the tip is
+    /// recent enough to fetch blocks directly: Core's
+    /// `CheckForStaleTipAndEvictPeers` calls `StartExtraBlockRelayPeers`
+    /// once `CanDirectFetch` holds (v31.1 `src/net_processing.cpp:5481`).
+    fn maybe_start_extra_block_relay_peers(&self) {
+        if !self.start_extra_block_relay_peers.load(Ordering::Relaxed) && self.can_direct_fetch() {
+            self.start_extra_block_relay_peers.store(true, Ordering::Relaxed);
+            tracing::debug!("enabling extra block-relay-only peers");
+        }
+    }
+
+    /// Open an extra block-relay-only peer if one is due:
+    /// [`Self::reserve_extra_block_relay_peer`], then the dial. `dialled`
+    /// is what the rest of this pass started.
+    fn open_extra_block_relay_peer(self: &Arc<Self>, now: Instant, dialled: &[PeerAddr]) {
+        let Some((target, slot)) = self.reserve_extra_block_relay_peer(now, dialled) else {
+            return;
+        };
+        tracing::debug!(%target, "Making extra block-relay-only connection");
+        let pm = Arc::clone(self);
+        tokio::spawn(async move {
+            let _slot = slot;
+            pm.dial_book_target(&target, Some(ConnType::BlockRelay), AUTOMATIC_RECONNECT_MAX_BACKOFF).await;
+        });
+    }
+
+    /// The address an extra block-relay-only peer is dialled at this pass,
+    /// with its place in the dial limit, or `None` if none is due: Core's
+    /// extra block-relay-only branch of `ThreadOpenConnections` (v31.1
+    /// `src/net.cpp:2746`), which every few minutes finds a new peer to
+    /// learn headers from, so an attacker must keep up with a fresh one to
+    /// hold an eclipse.
+    ///
+    /// One is due only after [`Self::start_extra_block_relay_peers`] is
+    /// set, once the full-relay and block-relay-only targets are met and an
+    /// outbound grant is free ([`DialBudget::ExtraBlockRelay`]), and then
+    /// when the timer, [`EXTRA_BLOCK_RELAY_ONLY_PEER_INTERVAL`] on average,
+    /// has run out. The timer is set again whether or not an address is
+    /// found, as in Core. Not under `-connect`.
+    ///
+    /// The address is drawn as for any block-relay-only peer
+    /// ([`Self::draw_block_relay_target`]). The peer then stays for as long
+    /// as it delivers blocks more recently than the next-youngest
+    /// block-relay-only peer ([`Self::evict_extra_block_relay_peer`]).
+    fn reserve_extra_block_relay_peer(
+        self: &Arc<Self>,
+        now: Instant,
+        dialled: &[PeerAddr],
+    ) -> Option<(PeerAddr, DialSlot)> {
+        if !self.automatic_outbound.load(Ordering::Relaxed)
+            || !self.start_extra_block_relay_peers.load(Ordering::Relaxed)
+        {
+            return None;
+        }
+        let slot = self.reserve_dial(DialBudget::ExtraBlockRelay).ok()?;
+        {
+            let mut next = self.next_extra_block_relay.lock();
+            if now <= *next {
+                return None;
+            }
+            *next = next_extra_block_relay_after(now);
+        }
+        self.draw_block_relay_target(now, dialled).map(|target| (target, slot))
     }
 
     /// Open a feeler if one is due: [`Self::reserve_feeler`], then the dial,
@@ -6256,6 +6383,71 @@ impl PeerManager {
                 .collect()
         };
         ips.into_iter().filter_map(|ip| self.outbound_netgroup(ip)).collect()
+    }
+
+    /// Disconnect one block-relay-only peer if more are connected than
+    /// [`Self::max_outbound_block_relay`]: the block-relay-only half of
+    /// Core's `EvictExtraOutboundPeers` (v31.1
+    /// `src/net_processing.cpp:5352`). Returns the peer disconnected.
+    ///
+    /// The surplus is normally the extra peer
+    /// [`Self::reserve_extra_block_relay_peer`] opened, the youngest
+    /// (highest id). It goes, unless it delivered a block more recently than
+    /// the second-youngest block-relay-only peer, which then goes instead:
+    /// so a new peer that knew of a block the others did not replaces one.
+    /// The surplus is counted over peers past the handshake (Core's
+    /// `GetExtraBlockRelayCount`); the two youngest are picked from every
+    /// block-relay-only peer not yet disconnected, as in Core.
+    ///
+    /// If the chosen peer has been connected for less than
+    /// [`MINIMUM_CONNECT_TIME_SECS`] or has blocks in flight, nothing is
+    /// disconnected this time, as in Core.
+    fn evict_extra_block_relay_peer(&self) -> Option<PeerId> {
+        let (connected, mut youngest): (usize, Vec<(PeerId, u64, u64)>) = {
+            let peers = self.peers.read();
+            let block_relay =
+                peers.values().filter(|h| h.info.conn_type == ConnType::BlockRelay && h.info.state != PeerState::Disconnected);
+            let connected = block_relay.clone().filter(|h| h.info.state == PeerState::Connected).count();
+            let all = block_relay
+                .map(|h| {
+                    let conn_secs =
+                        h.info.conn_time.duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+                    (h.info.id, h.stats.last_block(), conn_secs)
+                })
+                .collect();
+            (connected, all)
+        };
+        if connected <= self.max_outbound_block_relay() {
+            return None;
+        }
+        youngest.sort_by_key(|&(id, _, _)| std::cmp::Reverse(id));
+        let (first_id, first_block, first_conn) = *youngest.first()?;
+        let (id, last_block, conn_secs) = match youngest.get(1) {
+            Some(&second) if first_block > second.1 => second,
+            // Core compares with a second-youngest of block time 0 when
+            // there is none, and then names no peer.
+            None if first_block > 0 => return None,
+            _ => (first_id, first_block, first_conn),
+        };
+        let now = crate::time::now_secs();
+        let blocks_in_flight = self
+            .in_flight_blocks
+            .read()
+            .get(&id)
+            .is_some_and(|asked| asked.values().any(|r| r.at.elapsed() < BLOCK_IN_FLIGHT_TTL))
+            || self.ibd.read().as_ref().is_some_and(|s| s.peer_inflight_count(id) > 0);
+        if now.saturating_sub(conn_secs) < MINIMUM_CONNECT_TIME_SECS || blocks_in_flight {
+            tracing::debug!(
+                "keeping block-relay-only peer={id} chosen for eviction (connect time: {conn_secs}, blocks in flight: {blocks_in_flight})"
+            );
+            return None;
+        }
+        let handle = self.peers.write().remove(&id)?;
+        handle.disconnect.notify_one();
+        drop(handle);
+        tracing::debug!("disconnecting extra block-relay-only peer={id} (last block received at time {last_block})");
+        self.handle_peer_disconnected(id);
+        Some(id)
     }
 
     /// Disconnect one surplus outbound full-relay peer, if there are more
