@@ -1061,6 +1061,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "conformance-harness"
+version = "0.8.0-pre"
+dependencies = [
+ "bitcoin",
+ "consensus",
+ "hex",
+ "node",
+ "serde_json",
+]
+
+[[package]]
 name = "consensus"
 version = "0.8.0-pre"
 dependencies = [

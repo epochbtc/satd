@@ -77,49 +77,51 @@ pub fn execute_witness_script(
 /// Scan a tapscript for OP_SUCCESSx opcodes. If found, immediately succeed
 /// (or fail if DISCOURAGE_OP_SUCCESS flag is set).
 ///
-/// Matches Bitcoin Core's OP_SUCCESSx pre-scan in ExecuteWitnessScript.
-/// Walks the script using GetOp semantics; if a GetOp fails (truncated push),
-/// returns None (not OP_SUCCESSx — EvalScript will catch the parse error).
+/// Matches Bitcoin Core's OP_SUCCESSx pre-scan in ExecuteWitnessScript
+/// (src/script/interpreter.cpp): walks the script with GetOp semantics and
+/// stops at the first OP_SUCCESSx. An opcode GetOp cannot read before that
+/// (a push whose length field or data runs past the end of the script) is
+/// SCRIPT_ERR_BAD_OPCODE, as in Core. Execution would fail on that push
+/// too, so this decides only which error a failing script reports. `None`
+/// when the whole script parses and has no OP_SUCCESSx.
 fn scan_for_op_success(script: &[u8], script_flags: u32) -> Option<Result<(), ScriptError>> {
     let mut pc = 0;
     while pc < script.len() {
         let opcode = script[pc];
         pc += 1;
 
-        // Advance past push data
-        if opcode <= 75 {
-            pc += opcode as usize;
-        } else if opcode == 0x4c {
-            // OP_PUSHDATA1
-            if pc >= script.len() {
-                return None; // truncated — let EvalScript handle it
+        // The push's data length, after its length field.
+        let len_bytes = match opcode {
+            0x4c => 1, // OP_PUSHDATA1
+            0x4d => 2, // OP_PUSHDATA2
+            0x4e => 4, // OP_PUSHDATA4
+            _ => 0,
+        };
+        let data_len = if opcode <= 75 {
+            opcode as usize
+        } else if len_bytes > 0 {
+            if script.len() - pc < len_bytes {
+                return Some(Err(ScriptError::BadOpcode));
             }
-            let n = script[pc] as usize;
-            pc += 1 + n;
-        } else if opcode == 0x4d {
-            // OP_PUSHDATA2
-            if pc + 1 >= script.len() {
-                return None;
+            let n = script[pc..pc + len_bytes]
+                .iter()
+                .rev()
+                .fold(0usize, |n, &b| (n << 8) | b as usize);
+            pc += len_bytes;
+            n
+        } else {
+            if is_op_success(opcode) {
+                if flags::has_flag(script_flags, flags::VERIFY_DISCOURAGE_OP_SUCCESS) {
+                    return Some(Err(ScriptError::DiscourageOpSuccess));
+                }
+                return Some(Ok(()));
             }
-            let n = script[pc] as usize | ((script[pc + 1] as usize) << 8);
-            pc += 2 + n;
-        } else if opcode == 0x4e {
-            // OP_PUSHDATA4
-            if pc + 3 >= script.len() {
-                return None;
-            }
-            let n = script[pc] as usize
-                | ((script[pc + 1] as usize) << 8)
-                | ((script[pc + 2] as usize) << 16)
-                | ((script[pc + 3] as usize) << 24);
-            pc += 4 + n;
-        } else if is_op_success(opcode) {
-            if flags::has_flag(script_flags, flags::VERIFY_DISCOURAGE_OP_SUCCESS) {
-                return Some(Err(ScriptError::DiscourageOpSuccess));
-            }
-            return Some(Ok(()));
+            0
+        };
+        if script.len() - pc < data_len {
+            return Some(Err(ScriptError::BadOpcode));
         }
-        // else: non-push, non-SUCCESS opcode — just continue
+        pc += data_len;
     }
     None
 }
@@ -214,13 +216,8 @@ pub fn verify_witness_program(
         // Check for annex (last element starts with 0x50)
         if stack.len() >= 2 && !stack.last().unwrap().is_empty() && stack.last().unwrap()[0] == ANNEX_TAG {
             let annex = stack.pop().unwrap();
-            // BIP 341's sha_annex covers the annex with its compact-size
-            // length, as Core's `(HashWriter{} << annex).GetSHA256()`. It is
-            // hashed once here; every signature check of the input reuses it.
-            let mut hasher = Sha256::new();
-            hasher.update(bitcoin::consensus::encode::serialize(&bitcoin::VarInt(annex.len() as u64)));
-            hasher.update(&annex);
-            exec_data.annex_hash = hasher.finalize().into();
+            // Hashed once here; every signature check of the input reuses it.
+            exec_data.annex_hash = annex_hash(&annex);
             exec_data.annex_present = true;
         } else {
             exec_data.annex_present = false;
@@ -240,19 +237,9 @@ pub fn verify_witness_program(
             let control = stack.pop().unwrap();
             let script = stack.pop().unwrap();
 
-            if control.len() < TAPROOT_CONTROL_BASE_SIZE
-                || control.len() > TAPROOT_CONTROL_MAX_SIZE
-                || !(control.len() - TAPROOT_CONTROL_BASE_SIZE).is_multiple_of(TAPROOT_CONTROL_NODE_SIZE)
-            {
-                return Err(ScriptError::TaprootWrongControlSize);
-            }
-
-            let leaf_version = control[0] & TAPROOT_LEAF_MASK;
-            exec_data.tapleaf_hash = compute_tapleaf_hash(leaf_version, &script);
-            if !verify_taproot_commitment(&control, program, &exec_data.tapleaf_hash) {
-                return Err(ScriptError::WitnessProgramMismatch);
-            }
+            exec_data.tapleaf_hash = check_taproot_commitment(&control, &script, program)?;
             exec_data.tapleaf_hash_init = true;
+            let leaf_version = control[0] & TAPROOT_LEAF_MASK;
 
             if leaf_version == TAPROOT_LEAF_TAPSCRIPT {
                 // Tapscript (leaf version 0xc0)
@@ -286,7 +273,34 @@ pub fn verify_witness_program(
     }
 }
 
-/// Compute BIP341 tapleaf hash: SHA256(SHA256("TapLeaf") || SHA256("TapLeaf") || leaf_version || compact_size(script.len()) || script)
+/// The script path commitment check of Core's `VerifyWitnessProgram`: the
+/// control block's size, then that the leaf `script` (at the control
+/// block's leaf version) and the control block's path commit to the
+/// 32-byte witness `program`. Returns the tapleaf hash.
+pub fn check_taproot_commitment(control: &[u8], script: &[u8], program: &[u8]) -> Result<[u8; 32], ScriptError> {
+    if control.len() < TAPROOT_CONTROL_BASE_SIZE
+        || control.len() > TAPROOT_CONTROL_MAX_SIZE
+        || !(control.len() - TAPROOT_CONTROL_BASE_SIZE).is_multiple_of(TAPROOT_CONTROL_NODE_SIZE)
+    {
+        return Err(ScriptError::TaprootWrongControlSize);
+    }
+    let tapleaf_hash = compute_tapleaf_hash(control[0] & TAPROOT_LEAF_MASK, script);
+    if !verify_taproot_commitment(control, program, &tapleaf_hash) {
+        return Err(ScriptError::WitnessProgramMismatch);
+    }
+    Ok(tapleaf_hash)
+}
+
+/// BIP 341's `sha_annex`: the annex with its compact-size length, as Core's
+/// `(HashWriter{} << annex).GetSHA256()`.
+pub fn annex_hash(annex: &[u8]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(bitcoin::consensus::encode::serialize(&bitcoin::VarInt(annex.len() as u64)));
+    hasher.update(annex);
+    hasher.finalize().into()
+}
+
+/// Compute BIP341 tapleaf hash:SHA256(SHA256("TapLeaf") || SHA256("TapLeaf") || leaf_version || compact_size(script.len()) || script)
 fn compute_tapleaf_hash(leaf_version: u8, script: &[u8]) -> [u8; 32] {
     use bitcoin::hashes::{sha256, Hash, HashEngine};
     let tag_hash = sha256::Hash::hash(b"TapLeaf");
