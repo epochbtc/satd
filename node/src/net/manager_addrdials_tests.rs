@@ -1167,7 +1167,7 @@ fn feeler_due(pm: &PeerManager) {
 /// grant goes back at the end of this call.
 fn feeler_target(pm: &Arc<PeerManager>) -> Option<PeerAddr> {
     feeler_due(pm);
-    pm.reserve_feeler(Instant::now()).map(|(target, _grant)| target)
+    pm.reserve_feeler(Instant::now(), &[]).map(|(target, _grant)| target)
 }
 
 /// #1149: Core opens a feeler only once the outbound targets are met, its
@@ -1182,7 +1182,7 @@ fn no_feeler_while_the_automatic_target_is_unmet() {
     fill_automatic(&pm, 7);
     feeler_due(&pm);
     let due = *pm.next_feeler.lock();
-    assert_eq!(pm.reserve_feeler(Instant::now()).map(|(t, _)| t), None);
+    assert_eq!(pm.reserve_feeler(Instant::now(), &[]).map(|(t, _)| t), None);
     assert_eq!(*pm.next_feeler.lock(), due, "the timer waits for the target");
 
     fill_automatic(&pm, 8);
@@ -1201,7 +1201,7 @@ fn a_feeler_sets_the_timer_again() {
     assert!(feeler_target(&pm).is_some());
     let now = Instant::now();
     assert!(*pm.next_feeler.lock() > now - Duration::from_millis(100));
-    assert!(pm.reserve_feeler(now).is_none(), "not due again yet");
+    assert!(pm.reserve_feeler(now, &[]).is_none(), "not due again yet");
 }
 
 /// A feeler draws from the new table alone (Core's `Select(true)`), and
@@ -1310,7 +1310,7 @@ fn extra_network_due(pm: &PeerManager) {
 /// made due first. The slot goes back at the end of this call.
 fn extra_network_target(pm: &Arc<PeerManager>) -> Option<PeerAddr> {
     extra_network_due(pm);
-    pm.reserve_extra_network_peer(Instant::now()).map(|(target, _net, _slot)| target)
+    pm.reserve_extra_network_peer(Instant::now(), &[]).map(|(target, _net, _slot)| target)
 }
 
 /// `n` connected full-relay IPv4 peers, each in a public /16 of its own
@@ -1340,7 +1340,7 @@ fn an_extra_peer_goes_to_the_reachable_network_with_none() {
     }
     let now = Instant::now();
     assert!(*pm.next_extra_network_peer.lock() > now - Duration::from_millis(100), "the timer is set again");
-    assert!(pm.reserve_extra_network_peer(now).is_none(), "not due again yet");
+    assert!(pm.reserve_extra_network_peer(now, &[]).is_none(), "not due again yet");
 }
 
 /// No network lacks a peer, or the book has nothing on the one that does:
@@ -1355,7 +1355,7 @@ fn no_extra_peer_without_a_network_to_reach() {
     learn(&pm, SocketAddr::from(([44, 1, 2, 3], 8333)));
     extra_network_due(&pm);
     let due = *pm.next_extra_network_peer.lock();
-    assert_eq!(pm.reserve_extra_network_peer(Instant::now()).map(|(t, _, _)| t), None, "no onion or IPv6 in the book");
+    assert_eq!(pm.reserve_extra_network_peer(Instant::now(), &[]).map(|(t, _, _)| t), None, "no onion or IPv6 in the book");
     assert_eq!(*pm.next_extra_network_peer.lock(), due, "the timer stays due");
 
     // An onion peer held, and an onion in the book: every network has one.
@@ -1429,7 +1429,7 @@ fn one_extra_network_dial_at_a_time() {
     learn_onion(&pm, &onion_host(1), 8333);
     learn_onion(&pm, &onion_host(2), 8333);
     extra_network_due(&pm);
-    let first = pm.reserve_extra_network_peer(Instant::now()).expect("the first extra dial");
+    let first = pm.reserve_extra_network_peer(Instant::now(), &[]).expect("the first extra dial");
     assert_eq!(extra_network_target(&pm), None, "the first is in flight");
     // A full-relay peer drops while the first dials: the count is back at
     // the target, and still no second dial.
@@ -1609,7 +1609,7 @@ fn no_block_relay_peer_without_an_outbound_grant() {
     let block_relay = pm.reserve_block_relay_peer(Instant::now(), &[]).expect("the last grant");
     // The dial in flight holds the last grant: no feeler.
     feeler_due(&pm);
-    assert!(pm.reserve_feeler(Instant::now()).is_none(), "the block-relay-only dial holds the grant");
+    assert!(pm.reserve_feeler(Instant::now(), &[]).is_none(), "the block-relay-only dial holds the grant");
     drop(block_relay);
 }
 
@@ -2380,7 +2380,7 @@ fn the_extra_block_relay_dial_holds_its_grant() {
     learn(&pm, SocketAddr::from(([45, 1, 2, 3], 8333)));
     let extra = pm.reserve_extra_block_relay_peer(Instant::now(), &[]).expect("the extra peer");
     feeler_due(&pm);
-    assert!(pm.reserve_feeler(Instant::now()).is_none(), "the extra dial holds the grant");
+    assert!(pm.reserve_feeler(Instant::now(), &[]).is_none(), "the extra dial holds the grant");
     let held = pm.dials_in_flight.lock();
     assert!(pm.check_outbound_limit_for(ConnType::Feeler, &[], &held).is_err(), "nor by addconnection");
     drop(held);
@@ -2416,4 +2416,52 @@ async fn the_extra_block_relay_peer_skips_this_passes_block_relay_dial() {
     let in_flight = pm.dials_in_flight.lock();
     assert_eq!(in_flight.block_relay, 1, "the regular dial");
     assert_eq!(in_flight.extra_block_relay, 0, "no second dial to the same address");
+}
+
+/// A feeler passes over an address another dial of the same pass took (the
+/// extra block-relay-only peer's, say), whose task may not have claimed it
+/// yet.
+#[test]
+fn a_feeler_skips_this_passes_dials() {
+    let (pm, _dir) = mk_pm();
+    leave_ibd(&pm);
+    fill_block_relay(&pm, MAX_OUTBOUND_BLOCK_RELAY);
+    fill_automatic(&pm, MAX_OUTBOUND);
+    let addr = SocketAddr::from(([44, 1, 2, 3], 8333));
+    learn(&pm, addr);
+    feeler_due(&pm);
+    assert!(pm.reserve_feeler(Instant::now(), &[addr.into()]).is_none());
+    assert_eq!(feeler_target(&pm), Some(addr.into()));
+}
+
+/// Likewise the extra-network draw.
+#[test]
+fn the_extra_network_peer_skips_this_passes_dials() {
+    let (pm, _dir) = mk_pm_tor();
+    leave_ibd(&pm);
+    fill_block_relay(&pm, MAX_OUTBOUND_BLOCK_RELAY);
+    fill_ipv4(&pm, MAX_OUTBOUND);
+    let host = onion_host(9);
+    learn_onion(&pm, &host, 8333);
+    extra_network_due(&pm);
+    let onion = PeerAddr::Onion { host, port: 8333 };
+    assert!(pm.reserve_extra_network_peer(Instant::now(), std::slice::from_ref(&onion)).is_none());
+    extra_network_due(&pm);
+    assert_eq!(pm.reserve_extra_network_peer(Instant::now(), &[]).map(|(t, _, _)| t), Some(onion));
+}
+
+/// The reconnect loop hands the block-relay-only dial of a pass to the
+/// feeler draw that follows it (both fit: the feeler has a grant of its
+/// own): with one address in the book, one dial.
+#[tokio::test(flavor = "current_thread")]
+async fn the_feeler_skips_this_passes_block_relay_dial() {
+    let (pm, _dir) = mk_pm_tor();
+    leave_ibd(&pm);
+    fill_ipv4(&pm, MAX_OUTBOUND);
+    fill_block_relay(&pm, MAX_OUTBOUND_BLOCK_RELAY - 1);
+    learn_onion(&pm, &onion_host(10), 8333);
+    feeler_due(&pm);
+    pm.reconnect_tick();
+    assert_eq!(pm.dials_in_flight.lock().block_relay, 1, "the block-relay-only dial");
+    assert!(!pm.pending_typed_dials.read().contains(&ConnType::Feeler), "no feeler to the same address");
 }

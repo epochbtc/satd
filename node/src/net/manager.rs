@@ -5527,9 +5527,11 @@ impl PeerManager {
         let mut dialled = self.open_anchor_peers(now);
         dialled.extend(self.dial_automatic_peers(now, &dialled));
         dialled.extend(self.open_block_relay_peer(now, &dialled));
+        // The last three each need the one outbound grant the targets leave
+        // free (the feeler's place), so at most one of them dials per pass.
         self.open_extra_block_relay_peer(now, &dialled);
-        self.open_feeler(now);
-        self.open_extra_network_peer(now);
+        self.open_feeler(now, &dialled);
+        self.open_extra_network_peer(now, &dialled);
     }
 
     /// Dial the anchors read at startup ([`Self::load_anchors`]) as
@@ -5764,8 +5766,8 @@ impl PeerManager {
     /// feeler that answers with its `version` is marked good there and
     /// closed (`perform_handshake`); one that does not counts an attempt,
     /// as every failed automatic dial does.
-    fn open_feeler(self: &Arc<Self>, now: Instant) {
-        let Some((target, grant)) = self.reserve_feeler(now) else {
+    fn open_feeler(self: &Arc<Self>, now: Instant, dialled: &[PeerAddr]) {
+        let Some((target, grant)) = self.reserve_feeler(now, dialled) else {
             return;
         };
         use rand::Rng as _;
@@ -5805,7 +5807,14 @@ impl PeerManager {
     /// which takes no slot of the automatic target.
     ///
     /// [`AddrEntry::chance`]: crate::net::addrman::AddrEntry::chance
-    fn reserve_feeler(self: &Arc<Self>, now: Instant) -> Option<(PeerAddr, OwnedTypedDialGuard)> {
+    ///
+    /// `dialled` are the dials this pass already started, whose tasks may
+    /// not have claimed their addresses yet: they are passed over.
+    fn reserve_feeler(
+        self: &Arc<Self>,
+        now: Instant,
+        dialled: &[PeerAddr],
+    ) -> Option<(PeerAddr, OwnedTypedDialGuard)> {
         if !self.automatic_outbound.load(Ordering::Relaxed) {
             return None;
         }
@@ -5838,7 +5847,8 @@ impl PeerManager {
         let mut rng = rand::thread_rng();
         pass_over_recent_tries(self.feeler_dial_order(&mut rng), tried_recently, |c, tries| {
             let target = c.addr;
-            if self.is_manual_target(&target)
+            if dialled.contains(&target)
+                || self.is_manual_target(&target)
                 || !self.may_dial(&target)
                 || self.is_peer_addr_banned(&target)
                 || !self.redial_due(&target, now)
@@ -5862,8 +5872,8 @@ impl PeerManager {
     /// full-relay peer like any other; it stays because the surplus
     /// eviction keeps the only manual or full-relay peer on its network
     /// ([`Self::evict_extra_outbound_peer`]) and drops one on another.
-    fn open_extra_network_peer(self: &Arc<Self>, now: Instant) {
-        let Some((target, net, slot)) = self.reserve_extra_network_peer(now) else {
+    fn open_extra_network_peer(self: &Arc<Self>, now: Instant, dialled: &[PeerAddr]) {
+        let Some((target, net, slot)) = self.reserve_extra_network_peer(now, dialled) else {
             return;
         };
         tracing::debug!(%target, network = ?net, "Making network specific connection");
@@ -5894,9 +5904,13 @@ impl PeerManager {
     /// ([`Self::automatic_dial_order`], [`Self::automatic_dial_may_take`],
     /// and one peer per network group), from that network's entries alone,
     /// as Core's `Select(false, {*preferred_net})`.
+    ///
+    /// `dialled` are the dials this pass already started: their addresses
+    /// and groups are passed over, as in [`Self::reserve_block_relay_peer`].
     fn reserve_extra_network_peer(
         self: &Arc<Self>,
         now: Instant,
+        dialled: &[PeerAddr],
     ) -> Option<(PeerAddr, crate::net::reachable::Network, DialSlot)> {
         if !self.automatic_outbound.load(Ordering::Relaxed) || self.automatic_outbound_target() != MAX_OUTBOUND {
             return None;
@@ -5914,12 +5928,16 @@ impl PeerManager {
         let tried_recently =
             |c: &DialCandidate| recent.is_some_and(|since| self.tried_since(&c.addr, since));
         let (tip_depth, restore_pending) = self.desirable_services_inputs();
-        let groups = self.outbound_netgroups();
+        let mut groups = self.outbound_netgroups();
+        groups.extend(dialled.iter().filter_map(|a| match a {
+            PeerAddr::Socket(sa) => self.outbound_netgroup(sa.ip()),
+            PeerAddr::Onion { .. } => None,
+        }));
         let candidates =
             self.automatic_dial_order(&mut rng).filter(|c| addr_network(&reachable, &c.addr) == Some(net));
         let mut chosen = None;
         pass_over_recent_tries(candidates, tried_recently, |c, tries| {
-            if !self.automatic_dial_may_take(&c, tries, now, tip_depth, restore_pending) {
+            if dialled.contains(&c.addr) || !self.automatic_dial_may_take(&c, tries, now, tip_depth, restore_pending) {
                 return Ok(false);
             }
             if let PeerAddr::Socket(sa) = &c.addr
