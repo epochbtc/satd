@@ -1,8 +1,7 @@
 //! `/fee-estimates` leaves out every target the node has no estimate for.
 
 use node::mempool::estimate::{
-    EstimateMode, MAX_SIM_DEPTH, MempoolEstimate, SimBlock, estimate_from_mempool,
-    smart_fees_from_estimate,
+    EstimateMode, MAX_SIM_DEPTH, estimate_from_mempool, smart_fees_from_estimate,
 };
 use node::mempool::fee::FeeEstimator;
 
@@ -11,7 +10,14 @@ use super::*;
 fn map_for(fee_estimator: &FeeEstimator) -> serde_json::Map<String, Value> {
     // An empty mempool: no simulated block carries any transaction.
     let est = estimate_from_mempool(Vec::new(), MAX_SIM_DEPTH);
-    let sf = smart_fees_from_estimate(&est, fee_estimator, FEE_TARGETS, EstimateMode::Blend, 1_000);
+    let sf = smart_fees_from_estimate(
+        &est,
+        fee_estimator,
+        None,
+        FEE_TARGETS,
+        EstimateMode::Blend,
+        1_000,
+    );
     fee_estimates_map(&sf)
 }
 
@@ -37,34 +43,19 @@ fn fee_estimates_map_lists_every_target_with_an_estimate() {
     }
 }
 
-/// A mempool that fills one block and part of the next, and no fee history:
-/// targets 1 and 2 have an estimate from the simulation and are listed with
-/// the values every other fee surface reports; every deeper target's window
-/// holds an empty simulated block, so it fell back to the floor and is left
-/// out. The floored targets are the deepest ones, so the clamp never carried
-/// the floor into a listed target.
+/// A healthy mempool side (the template percentile at 20 sat/vB) and no fee
+/// history: targets 1 and 2 have an estimate from the mempool side and are
+/// listed with the values every other fee surface reports; every deeper
+/// target has no history, so it fell back to the floor and is left out. The
+/// floored targets are the deepest ones, so the clamp never carried the floor
+/// into a listed target.
 #[test]
-fn fee_estimates_map_keeps_simulated_targets_and_leaves_out_floored_ones() {
-    let block = |min_feerate_sat_per_kvb, tx_count, weight, filled| SimBlock {
-        min_feerate_sat_per_kvb,
-        tx_count,
-        weight,
-        filled,
-    };
-    let mut sim_blocks = vec![
-        block(20_000, 2_000, 3_990_000, true),
-        block(5_000, 800, 2_500_000, false),
-    ];
-    sim_blocks.resize(MAX_SIM_DEPTH, block(0, 0, 0, false));
-    let est = MempoolEstimate {
-        sim_blocks,
-        histogram: Vec::new(),
-        mempool_weight: 6_490_000,
-        template_percentiles: Default::default(),
-    };
+fn fee_estimates_map_keeps_mempool_targets_and_leaves_out_floored_ones() {
+    let est = estimate_from_mempool(Vec::new(), MAX_SIM_DEPTH);
     let sf = smart_fees_from_estimate(
         &est,
         &FeeEstimator::new(),
+        Some(20_000),
         FEE_TARGETS,
         EstimateMode::Blend,
         1_000,
@@ -72,7 +63,7 @@ fn fee_estimates_map_keeps_simulated_targets_and_leaves_out_floored_ones() {
     let map = fee_estimates_map(&sf);
     assert_eq!(
         Value::Object(map.clone()),
-        serde_json::json!({"1": 20.0, "2": 5.0})
+        serde_json::json!({"1": 20.0, "2": 20.0})
     );
     for tf in &sf.targets {
         if let Some(v) = map.get(&tf.target.to_string()) {

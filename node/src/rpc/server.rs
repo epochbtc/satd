@@ -3029,6 +3029,7 @@ pub async fn start(
             // inflate the fee quote — same view the block template selects from.
             ctx.mempool.get_template_entries(),
             &ctx.fee_estimator,
+            crate::mempool::estimate::near_rate(&ctx.mempool, &ctx.fee_estimator, false),
             &targets,
             mode,
             floor_sat_per_kvb,

@@ -541,6 +541,7 @@ fn fees(ctx: &MetricsContext, sources: &StatusSources) -> Fees {
     let sf = crate::mempool::estimate::smart_fees_from_estimate(
         &est,
         &sources.fee_estimator,
+        crate::mempool::estimate::near_rate(&ctx.mempool, &sources.fee_estimator, false),
         &[1, 3, 6],
         crate::mempool::estimate::EstimateMode::Blend,
         ctx.mempool.fee_estimate_floor(),

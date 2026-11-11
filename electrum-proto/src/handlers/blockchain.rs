@@ -1190,14 +1190,20 @@ pub fn estimatefee(state: &ElectrumState, params: Value) -> Result<Value, JsonRp
     let sf = node::mempool::estimate::smart_fees_from_estimate(
         &est,
         &state.fee_estimator,
+        node::mempool::estimate::near_rate(&state.mempool, &state.fee_estimator, false),
         &[target],
         node::mempool::estimate::EstimateMode::Blend,
         floor_sat_per_kvb,
     );
-    // Electrum convention: `-1` signals "no estimate available". Emit it only
-    // on a cold node — no mempool signal (thin) *and* no historical data.
-    // Otherwise return the blended estimate in BTC/kB.
-    if sf.thin_block && state.fee_estimator.estimate_fee(target).is_none() {
+    // Electrum convention: `-1` signals "no estimate available": the
+    // default had nothing to answer from (no mempool side and no history),
+    // which `resolve_target` reports as `Confidence::Low`. Otherwise return
+    // the estimate in BTC/kB.
+    if sf
+        .targets
+        .first()
+        .is_none_or(|t| t.confidence == node::mempool::estimate::Confidence::Low)
+    {
         return Ok(json!(-1.0));
     }
     let sat_per_kvb = sf
