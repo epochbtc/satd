@@ -16,6 +16,7 @@ fn map_for(fee_estimator: &FeeEstimator) -> serde_json::Map<String, Value> {
         None,
         FEE_TARGETS,
         EstimateMode::Blend,
+        false,
         1_000,
     );
     fee_estimates_map(&sf)
@@ -58,6 +59,7 @@ fn fee_estimates_map_keeps_mempool_targets_and_leaves_out_floored_ones() {
         Some(20_000),
         FEE_TARGETS,
         EstimateMode::Blend,
+        false,
         1_000,
     );
     let map = fee_estimates_map(&sf);

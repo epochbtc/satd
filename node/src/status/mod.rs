@@ -544,6 +544,7 @@ fn fees(ctx: &MetricsContext, sources: &StatusSources) -> Fees {
         crate::mempool::estimate::near_rate(&ctx.mempool, &sources.fee_estimator, false),
         &[1, 3, 6],
         crate::mempool::estimate::EstimateMode::Blend,
+        false,
         ctx.mempool.fee_estimate_floor(),
     );
     let at = |t: u32| {

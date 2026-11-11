@@ -830,8 +830,8 @@ pub fn default_rate(
 /// Resolve one confirmation target against a prebuilt mempool simulation,
 /// applying the mode policy. Returns `(sat/kvB, confidence, used_fallback)`.
 ///
-/// `Blend` is the default ([`default_rate`], economical) with `near` from
-/// [`near_rate`]; `Historical` is the history answer alone; `Mempool` the
+/// `Blend` is the default ([`default_rate`]) with `near` from [`near_rate`]
+/// read with the same `conservative`; `Historical` is the history answer alone; `Mempool` the
 /// simulator alone. With nothing to answer from, the min-relay floor at
 /// `Confidence::Low`.
 pub fn resolve_target(
@@ -840,10 +840,11 @@ pub fn resolve_target(
     near: Option<u64>,
     target: u32,
     mode: EstimateMode,
+    conservative: bool,
     floor_sat_per_kvb: u64,
 ) -> (u64, Confidence, bool) {
     match mode {
-        EstimateMode::Historical => match history_rate(fee_estimator, target, false) {
+        EstimateMode::Historical => match history_rate(fee_estimator, target, conservative) {
             Some(h) => (h.max(floor_sat_per_kvb), Confidence::Medium, false),
             None => (floor_sat_per_kvb, Confidence::Low, true),
         },
@@ -851,7 +852,7 @@ pub fn resolve_target(
             let (r, c) = target_estimate(mempool_est, target, floor_sat_per_kvb);
             (r, c, false)
         }
-        EstimateMode::Blend => match default_rate(near, fee_estimator, target, false) {
+        EstimateMode::Blend => match default_rate(near, fee_estimator, target, conservative) {
             Some((r, EstimateSource::MempoolPolicy)) => {
                 (r.max(floor_sat_per_kvb), Confidence::High, false)
             }
@@ -1146,8 +1147,9 @@ pub fn estimate_smart_fee(
 ///
 /// `snapshot` is an owned mempool snapshot (callers take it via
 /// `Mempool::get_all_entries()` so no lock is held during simulation).
-/// `near` is the mempool side of the default ([`near_rate`], economical),
-/// `None` while the health gate fails.
+/// `near` is the mempool side of the default ([`near_rate`], read with the
+/// same `conservative`), `None` while the health gate fails. `conservative`
+/// is Core's estimate mode: only the `estimatefees` RPC sets it.
 /// `floor_sat_per_kvb` is the min-relay floor (`min_fee_rate`, ≥ 1000).
 pub fn smart_fees(
     snapshot: Vec<(Txid, MempoolEntry)>,
@@ -1155,12 +1157,13 @@ pub fn smart_fees(
     near: Option<u64>,
     targets: &[u32],
     mode: EstimateMode,
+    conservative: bool,
     floor_sat_per_kvb: u64,
 ) -> SmartFees {
     let max_target = targets.iter().copied().max().unwrap_or(24).max(1);
     let sim_depth = (max_target as usize).min(MAX_SIM_DEPTH);
     let mempool_est = estimate_from_mempool(snapshot, sim_depth);
-    smart_fees_from_estimate(&mempool_est, fee_estimator, near, targets, mode, floor_sat_per_kvb)
+    smart_fees_from_estimate(&mempool_est, fee_estimator, near, targets, mode, conservative, floor_sat_per_kvb)
 }
 
 /// `smart_fees` against a *prebuilt* mempool simulation, so callers on hot
@@ -1177,6 +1180,7 @@ pub fn smart_fees_from_estimate(
     near: Option<u64>,
     targets: &[u32],
     mode: EstimateMode,
+    conservative: bool,
     floor_sat_per_kvb: u64,
 ) -> SmartFees {
     let max_target = targets.iter().copied().max().unwrap_or(24).max(1);
@@ -1185,7 +1189,7 @@ pub fn smart_fees_from_estimate(
     let mut rows: Vec<(u32, u64, Confidence)> = Vec::with_capacity(targets.len());
     for &t in targets {
         let (rate, conf, fb) =
-            resolve_target(mempool_est, fee_estimator, near, t, mode, floor_sat_per_kvb);
+            resolve_target(mempool_est, fee_estimator, near, t, mode, conservative, floor_sat_per_kvb);
         fallback |= fb;
         rows.push((t, rate, conf));
     }
@@ -1698,7 +1702,7 @@ mod tests {
         // (and economy) collapses to the floor, monotone, with `fallback`.
         let est = FeeEstimator::new();
         let floor = 1_000;
-        let sf = smart_fees(Vec::new(), &est, None, &[1, 3, 6, 12, 24], EstimateMode::Blend, floor);
+        let sf = smart_fees(Vec::new(), &est, None, &[1, 3, 6, 12, 24], EstimateMode::Blend, false, floor);
         assert_eq!(sf.targets.len(), 5);
         assert!(sf.thin_block);
         assert!(sf.fallback);
@@ -1717,7 +1721,7 @@ mod tests {
         let rates: Vec<u64> = (1..=100).collect();
         est.record_block(&rates);
         let floor = 1; // keep the floor out of the way of the percentile values
-        let sf = smart_fees(Vec::new(), &est, None, &[1, 3, 6, 12, 24], EstimateMode::Historical, floor);
+        let sf = smart_fees(Vec::new(), &est, None, &[1, 3, 6, 12, 24], EstimateMode::Historical, false, floor);
         let vals: Vec<u64> = sf.targets.iter().map(|t| t.feerate_sat_per_kvb).collect();
         for w in vals.windows(2) {
             assert!(w[0] >= w[1], "historical ladder must be non-increasing: {vals:?}");
@@ -1737,7 +1741,7 @@ mod tests {
         // Empty mempool → every target is thin/Low → blend falls to historical
         // (5_000) for all. That is flat (monotone) and a useful regression that
         // sources agree; assert non-increasing + economy cap.
-        let sf = smart_fees(Vec::new(), &est, None, &[1, 3, 6], EstimateMode::Blend, floor);
+        let sf = smart_fees(Vec::new(), &est, None, &[1, 3, 6], EstimateMode::Blend, false, floor);
         let vals: Vec<u64> = sf.targets.iter().map(|t| t.feerate_sat_per_kvb).collect();
         for w in vals.windows(2) {
             assert!(w[0] >= w[1], "blend ladder must be non-increasing: {vals:?}");
@@ -1827,7 +1831,7 @@ mod tests {
         // A very deep target must not blow up the sim; depth is capped and
         // deeper targets resolve through the (monotone) fallback path.
         let est = FeeEstimator::new();
-        let sf = smart_fees(Vec::new(), &est, None, &[1, 1008], EstimateMode::Blend, 1_000);
+        let sf = smart_fees(Vec::new(), &est, None, &[1, 1008], EstimateMode::Blend, false, 1_000);
         assert_eq!(sf.targets.len(), 2);
         assert!(sf.targets[0].feerate_sat_per_kvb >= sf.targets[1].feerate_sat_per_kvb);
     }
@@ -2325,6 +2329,7 @@ mod tests {
             Some(500),
             &[1, 2],
             EstimateMode::Blend,
+            false,
             1_000,
         );
         for tf in &sf.targets {
@@ -2337,20 +2342,28 @@ mod tests {
     /// economical default, healthy or not.
     #[test]
     fn every_surface_reads_the_default() {
-        for pool in [healthy_pool_at(10), healthy_pool_at(100), empty_pool()] {
-            let est = spread_history();
-            let floor = pool.fee_estimate_floor();
-            let targets = [2, 3, 6, 24, 144];
-            let sf = smart_fees_from_estimate(
-                &est.cached_mempool_estimate(&pool),
-                &est,
-                near_rate(&pool, &est, false),
-                &targets,
-                EstimateMode::Blend,
-                floor,
-            );
-            for tf in &sf.targets {
-                assert_eq!(tf.feerate_sat_per_kvb, auto(&pool, &est, tf.target, false).feerate_sat_per_kvb, "target {}", tf.target);
+        for conservative in [false, true] {
+            for pool in [healthy_pool_at(10), healthy_pool_at(100), empty_pool()] {
+                let est = spread_history();
+                let floor = pool.fee_estimate_floor();
+                let targets = [2, 3, 6, 24, 144];
+                let sf = smart_fees_from_estimate(
+                    &est.cached_mempool_estimate(&pool),
+                    &est,
+                    near_rate(&pool, &est, conservative),
+                    &targets,
+                    EstimateMode::Blend,
+                    conservative,
+                    floor,
+                );
+                for tf in &sf.targets {
+                    assert_eq!(
+                        tf.feerate_sat_per_kvb,
+                        auto(&pool, &est, tf.target, conservative).feerate_sat_per_kvb,
+                        "target {}, conservative {conservative}",
+                        tf.target
+                    );
+                }
             }
         }
     }

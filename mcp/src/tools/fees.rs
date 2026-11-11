@@ -20,6 +20,7 @@ pub fn estimate_fee(ctx: &McpContext, targets: &[u32]) -> String {
         near_rate(&ctx.mempool, &ctx.fee_estimator, false),
         targets,
         EstimateMode::Blend,
+        false,
         floor_sat_per_kvb,
     );
 

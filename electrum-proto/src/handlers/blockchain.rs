@@ -1193,6 +1193,7 @@ pub fn estimatefee(state: &ElectrumState, params: Value) -> Result<Value, JsonRp
         node::mempool::estimate::near_rate(&state.mempool, &state.fee_estimator, false),
         &[target],
         node::mempool::estimate::EstimateMode::Blend,
+        false,
         floor_sat_per_kvb,
     );
     Ok(json!(estimatefee_answer(&sf)))
@@ -1358,6 +1359,7 @@ mod tests {
             near,
             &[target],
             EstimateMode::Blend,
+            false,
             1_000,
         ))
     }

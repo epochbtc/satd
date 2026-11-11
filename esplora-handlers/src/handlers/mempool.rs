@@ -185,6 +185,7 @@ pub async fn fee_estimates(
         node::mempool::estimate::near_rate(&state.mempool, &state.fee_estimator, false),
         FEE_TARGETS,
         node::mempool::estimate::EstimateMode::Blend,
+        false,
         floor_sat_per_kvb,
     );
     Ok(Json(Value::Object(fee_estimates_map(&sf))))
