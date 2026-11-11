@@ -582,7 +582,7 @@ mod tests {
         let spent = [TxOut { value: Amount::from_sat(5000), script_pubkey: op_true }];
         let before = progress(&cs);
         crate::validation::script::counting_progress(|| {
-            ConsensusVerifier::new(bitcoin::Network::Regtest).verify_transaction(&tx, &spent, 200)
+            ConsensusVerifier::new(bitcoin::Network::Regtest).verify_transaction(&tx, &spent, crate::validation::script::ScriptContext::unmined(200))
         })
         .expect("anyone-can-spend input verifies");
         let after = progress(&cs);

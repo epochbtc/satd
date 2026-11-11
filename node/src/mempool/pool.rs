@@ -3849,11 +3849,12 @@ impl Mempool {
         // relayer is penalised, from a merely non-standard one, at no cost
         // beyond the two passes an accepted transaction takes anyway.
         // Use tip_height + 1 since the tx will be mined in the next block
-        if let Err(e) = script_verifier.verify_transaction_unnamed(&tx, &prev_outputs, tip_height + 1) {
+        let at = crate::validation::script::ScriptContext::unmined(tip_height + 1);
+        if let Err(e) = script_verifier.verify_transaction_unnamed(&tx, &prev_outputs, at) {
             // Naming the script error can mean running the second engine over
             // the input. Nothing has changed in the pool, so release it first.
             drop(inner);
-            let e = script_verifier.name_failure(&tx, &prev_outputs, tip_height + 1, e);
+            let e = script_verifier.name_failure(&tx, &prev_outputs, at, e);
             return Err(MempoolError::Script(e.reason().to_string(), e.core_debug_string(&tx)));
         }
         if let Err(e) = script_verifier.verify_policy(&tx, &prev_outputs) {
@@ -6713,8 +6714,9 @@ impl Mempool {
         // Script verification, consensus then policy, as on admission
         // (tip + 1 = next block height).
         let tip_height = chain_state.tip_height();
+        let at = crate::validation::script::ScriptContext::unmined(tip_height + 1);
         script_verifier
-            .verify_transaction(tx, &prev_outputs, tip_height + 1)
+            .verify_transaction(tx, &prev_outputs, at)
             .map_err(|e| {
                 MempoolError::Script(e.reason().to_string(), e.core_debug_string(tx))
             })?;

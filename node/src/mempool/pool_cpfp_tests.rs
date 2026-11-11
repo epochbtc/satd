@@ -390,7 +390,7 @@ impl ScriptVerifier for RacesThenFails {
         &self,
         tx: &Transaction,
         _prev_outputs: &[TxOut],
-        _height: u32,
+        _at: crate::validation::script::ScriptContext,
     ) -> Result<(), crate::validation::script::ScriptError> {
         if tx.compute_txid() != self.fail {
             return Ok(());

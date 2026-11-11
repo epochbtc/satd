@@ -169,8 +169,11 @@ fn the_block_sigop_cost_of_a_p2wsh_spend_follows_cores_count() {
         value: Amount::from_sat(COIN_VALUE),
         script_pubkey: ScriptBuf::new_p2wsh(&ws.wscript_hash()),
     }];
-    assert_eq!(transaction_sigop_cost(&block.txdata[1], Network::Regtest, 1, &prevouts), 21);
-    // Below the P2SH gate only legacy sigops count (issue #724 tracks that
-    // gate), and this transaction has none.
-    assert_eq!(transaction_sigop_cost(&block.txdata[1], Network::Bitcoin, 1, &prevouts), 0);
+    let flags = |net| crate::validation::script::script_verify_flags(net, 1);
+    assert_eq!(transaction_sigop_cost(&block.txdata[1], flags(Network::Regtest), &prevouts), 21);
+    // Mainnet counts it the same at height 1: Core's flags have P2SH and
+    // WITNESS on every block (#1244). Only an exception block's flags,
+    // none at all here, leave legacy sigops alone, and this transaction has none.
+    assert_eq!(transaction_sigop_cost(&block.txdata[1], flags(Network::Bitcoin), &prevouts), 21);
+    assert_eq!(transaction_sigop_cost(&block.txdata[1], 0, &prevouts), 0);
 }

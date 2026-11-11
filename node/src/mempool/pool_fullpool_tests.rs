@@ -110,7 +110,7 @@ impl ScriptVerifier for Refuses {
         &self,
         _tx: &Transaction,
         _prev_outputs: &[TxOut],
-        _height: u32,
+        _at: crate::validation::script::ScriptContext,
     ) -> Result<(), ScriptError> {
         Err(ScriptError::VerifyFailed { input: 0, reason: "Invalid Schnorr signature".into() })
     }
@@ -379,7 +379,7 @@ impl ScriptVerifier for NamesWhenAsked<'_> {
         &self,
         _tx: &Transaction,
         _prev_outputs: &[TxOut],
-        _height: u32,
+        _at: crate::validation::script::ScriptContext,
     ) -> Result<(), ScriptError> {
         Err(ScriptError::VerifyFailed { input: 0, reason: "ERR_SCRIPT".into() })
     }
@@ -388,7 +388,7 @@ impl ScriptVerifier for NamesWhenAsked<'_> {
         &self,
         _tx: &Transaction,
         _prev_outputs: &[TxOut],
-        _height: u32,
+        _at: crate::validation::script::ScriptContext,
         err: ScriptError,
     ) -> ScriptError {
         *self.pool_free.lock() = Some(self.mp.inner.try_write().is_some());
