@@ -7,7 +7,10 @@ name: Consensus conformance (nightly)
 # suites exercise the Rust engine (`consensus`), not libbitcoinkernel: the
 # kernel is Core's own code and would only be checked against itself. The
 # block corpus replays Core's functional tests through the node's
-# `ChainState`, with the Rust engine verifying scripts.
+# `ChainState`, with the Rust engine verifying scripts. The interop suite
+# runs a real `satd -consensus=rust` syncing over P2P from Bitcoin Core
+# v32.1, and headers-live feeds mainnet's header chain from a live peer
+# through the node's header acceptance.
 #
 # The specification is pinned to one commit. Moving the pin is a deliberate
 # change: read what changed in the spec's suites before taking it. Hosted
@@ -147,4 +150,116 @@ jobs:
           ./target/release/bcs-conformance \
             --impl "$GITHUB_WORKSPACE/target/release/satd-conformance-harness" \
             --suite corpus \
+            --verbose
+
+  interop:
+    name: "Conformance (interop with Bitcoin Core)"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v7
+
+      - name: Checkout bitcoin-consensus-spec
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ env.BCS_REPOSITORY }}
+          ref: ${{ env.BCS_REF }}
+          path: bcs
+          persist-credentials: false
+
+      - name: Install Linux build deps
+        uses: ./.github/actions/build-deps
+
+      - name: Set up Rust toolchain
+        uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: 1.93
+          override: true
+
+      - name: Build satd and satd-conformance-harness
+        run: cargo build --locked --release -p satd -p conformance-harness
+
+      - name: Build bcs-conformance
+        run: cargo build --locked --release -p conformance-runner --manifest-path bcs/Cargo.toml
+
+      # The bitcoind of the canaries' pinned image (CORE_IMAGE in
+      # scripts/canary/PINS), Bitcoin Core v32.1 like the specification.
+      - name: Extract bitcoind from the pinned Bitcoin Core image
+        run: |
+          set -euo pipefail
+          . scripts/canary/PINS
+          for i in 1 2 3; do docker pull "$CORE_IMAGE" && break || sleep $((i * 2)); done
+          id=$(docker create "$CORE_IMAGE")
+          # Where the image installs it changes with the version.
+          path=$(docker run --rm --entrypoint sh "$CORE_IMAGE" -c 'readlink -f "$(command -v bitcoind)"')
+          docker cp "$id:$path" "$RUNNER_TEMP/bitcoind"
+          docker rm "$id"
+          "$RUNNER_TEMP/bitcoind" -version | head -1
+
+      # For each chain the runner loads a fresh `bitcoind -regtest`, then
+      # starts a real satd (`-consensus=rust`, through the harness's
+      # `--interop-node` wrapper, see `conformance-harness/src/interop.rs`)
+      # that syncs from it over P2P and stops at Core's tip; tip, height and
+      # UTXO set hash must match Core's, and Core must log no `Misbehaving`
+      # against satd. A scenario's network options become satd's flags; the
+      # one satd has none for, -test=bip94 (#1245), fails its chains.
+      - name: Run the interop suite
+        working-directory: bcs
+        env:
+          TMPDIR: ${{ runner.temp }}
+        run: |
+          ./target/release/bcs-conformance interop \
+            --bitcoind "$RUNNER_TEMP/bitcoind" \
+            --node "$GITHUB_WORKSPACE/target/release/satd-conformance-harness --interop-node --satd $GITHUB_WORKSPACE/target/release/satd --network {network} --datadir {datadir} --peer {peer} --stop-at {stop_at} --options {options}" \
+            --verbose
+
+  headers-live:
+    name: "Conformance (mainnet headers from a live peer)"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v7
+
+      - name: Checkout bitcoin-consensus-spec
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ env.BCS_REPOSITORY }}
+          ref: ${{ env.BCS_REF }}
+          path: bcs
+          persist-credentials: false
+
+      - name: Install Linux build deps
+        uses: ./.github/actions/build-deps
+
+      - name: Set up Rust toolchain
+        uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: 1.93
+          override: true
+
+      - name: Build satd-conformance-harness
+        run: cargo build --locked --release -p conformance-harness
+
+      - name: Build bcs-conformance
+        run: cargo build --locked --release -p conformance-runner --manifest-path bcs/Cargo.toml
+
+      # The runner downloads mainnet's whole header chain from a peer the
+      # DNS seed names and passes each `headers` message to the node's
+      # header acceptance (`chain_process_headers`, via p2p); every message
+      # must be accepted and the best header must be the peer's last.
+      - name: Run headers-live
+        working-directory: bcs
+        env:
+          TMPDIR: ${{ runner.temp }}
+        run: |
+          ./target/release/bcs-conformance headers-live \
+            --impl "$GITHUB_WORKSPACE/target/release/satd-conformance-harness" \
+            --network main \
+            --peer seed.bitcoin.sipa.be \
             --verbose
