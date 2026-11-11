@@ -285,9 +285,9 @@ fn the_log_quantile_interpolates_between_neighbours() {
 }
 
 /// `fee_rate_estimator=block_policy` answers from the chain history once it
-/// has a window; `auto` keeps the flat percentile until F8 switches it.
+/// has a window, and so does `auto` with no mempool side (the default, F8).
 #[test]
-fn block_policy_reads_the_chain_history_and_auto_does_not() {
+fn block_policy_and_auto_read_the_chain_history() {
     use crate::mempool::estimate::{EstimateMode, FeeRateEstimator, estimate_smart_fee};
     let est = crate::mempool::fee::FeeEstimator::new();
     est.record_block(&[5_000; 50]); // the flat percentile says 5,000
@@ -301,7 +301,7 @@ fn block_policy_reads_the_chain_history_and_auto_does_not() {
     let chain = FakeChain::new(&[2_000; 100]);
     sync_full(&mut est.history().write(), &chain);
     assert_eq!(ask(FeeRateEstimator::BlockPolicy), 2_000);
-    assert_eq!(ask(FeeRateEstimator::Auto), 5_000);
+    assert_eq!(ask(FeeRateEstimator::Auto), 2_000);
 }
 
 const MAGIC: [u8; 4] = [0x1c, 0x16, 0x3f, 0x28];
