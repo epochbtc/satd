@@ -8,8 +8,13 @@
 //! in order. Run it under the spec's runner:
 //!
 //! ```sh
-//! bcs-conformance --impl target/release/satd-conformance-harness --exclude corpus
+//! bcs-conformance --impl target/release/satd-conformance-harness --corpus <spec>/conformance/vectors/blocks
 //! ```
+//!
+//! The chain operations run in a child process per `chain_reset`; see
+//! [`chain`].
+
+mod chain;
 
 use std::io::{self, BufRead, Write};
 use std::panic::{self, AssertUnwindSafe};
@@ -45,6 +50,9 @@ fn bad_request(message: impl Into<String>) -> Fail {
 type Fields = Map<String, Value>;
 
 fn main() {
+    let worker_mode = std::env::args().nth(1).as_deref() == Some("--chain-worker");
+    let mut chain: Option<chain::Chain> = None;
+    let mut worker: Option<chain::Worker> = None;
     let stdin = io::stdin();
     let mut stdout = io::stdout().lock();
     for line in stdin.lock().lines() {
@@ -58,7 +66,11 @@ fn main() {
         if line.trim().is_empty() {
             continue;
         }
-        let response = respond(&line);
+        let response = if worker_mode {
+            respond(&line, |op, req| chain::dispatch(&mut chain, op, req))
+        } else {
+            route(&line, &mut worker)
+        };
         let written = serde_json::to_writer(&mut stdout, &response)
             .map_err(io::Error::from)
             .and_then(|()| stdout.write_all(b"\n"))
@@ -70,8 +82,31 @@ fn main() {
     }
 }
 
+/// One response line for one request line, in the main process: a chain
+/// operation goes to the chain worker (a new one on every `chain_reset`),
+/// everything else is answered here.
+fn route(line: &str, worker: &mut Option<chain::Worker>) -> Value {
+    let request = serde_json::from_str::<Value>(line).ok();
+    let op = request.as_ref().and_then(|r| r.get("op")).and_then(Value::as_str);
+    let Some(op) = op.filter(|op| chain::OPS.contains(op)) else {
+        return respond(line, dispatch);
+    };
+    let id = request.as_ref().and_then(|r| r.get("id")).cloned().unwrap_or(Value::Null);
+    if op == "chain_reset" {
+        *worker = None;
+        match chain::Worker::spawn() {
+            Ok(w) => *worker = Some(w),
+            Err(fail) => return failure(id, fail),
+        }
+    }
+    match worker.as_mut() {
+        None => failure(id, bad_request("no chain_reset yet")),
+        Some(w) => w.call(line).unwrap_or_else(|fail| failure(id, fail)),
+    }
+}
+
 /// One response line for one request line.
-fn respond(line: &str) -> Value {
+fn respond(line: &str, mut dispatch: impl FnMut(&str, &Fields) -> Result<Fields, Fail>) -> Value {
     let request = match serde_json::from_str::<Value>(line) {
         Ok(Value::Object(request)) => request,
         _ => return failure(Value::Null, bad_request("not a JSON object")),
@@ -117,7 +152,8 @@ fn info() -> Fields {
     fields.insert("name".into(), json!("satd"));
     fields.insert("version".into(), json!(env!("CARGO_PKG_VERSION")));
     fields.insert("spec_version".into(), json!(SPEC_VERSION));
-    fields.insert("ops".into(), json!(OPS));
+    let ops: Vec<&str> = OPS.iter().chain(chain::OPS).copied().collect();
+    fields.insert("ops".into(), json!(ops));
     fields
 }
 

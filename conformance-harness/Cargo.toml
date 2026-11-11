@@ -17,3 +17,4 @@ consensus = { path = "../consensus" }
 node = { path = "../node", default-features = false }
 serde_json = { workspace = true }
 hex = { workspace = true }
+tempfile = "3"
