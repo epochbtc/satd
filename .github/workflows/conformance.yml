@@ -193,7 +193,9 @@ jobs:
           . scripts/canary/PINS
           for i in 1 2 3; do docker pull "$CORE_IMAGE" && break || sleep $((i * 2)); done
           id=$(docker create "$CORE_IMAGE")
-          docker cp "$id:/opt/bitcoin-32.1/bin/bitcoind" "$RUNNER_TEMP/bitcoind"
+          # Where the image installs it changes with the version.
+          path=$(docker run --rm --entrypoint sh "$CORE_IMAGE" -c 'readlink -f "$(command -v bitcoind)"')
+          docker cp "$id:$path" "$RUNNER_TEMP/bitcoind"
           docker rm "$id"
           "$RUNNER_TEMP/bitcoind" -version | head -1
 

@@ -31,6 +31,9 @@ const DEFAULT_STALL_SECS: u64 = 120;
 /// How long a clean shutdown may take.
 const STOP_TIMEOUT: Duration = Duration::from_secs(120);
 const POLL: Duration = Duration::from_millis(250);
+/// How many times satd is started when it exits before its RPC answers:
+/// the RPC port is chosen free but can be taken before satd binds it.
+const START_ATTEMPTS: u32 = 3;
 
 struct Args {
     satd: PathBuf,
@@ -168,7 +171,6 @@ fn run(args: &Args) -> Result<Value, Error> {
     let (network_flag, subdir) = network(&args.network)?;
     let mut flags: Vec<String> = network_flag.into_iter().map(String::from).collect();
     flags.extend(option_flags(&args.options)?);
-    let rpc_port = free_port()?;
     flags.extend([
         format!("-datadir={}", args.datadir.display()),
         format!("-connect={}", args.peer),
@@ -176,7 +178,6 @@ fn run(args: &Args) -> Result<Value, Error> {
         "-v2transport=0".into(),
         "-listen=0".into(),
         "-consensus=rust".into(),
-        format!("-rpcport={rpc_port}"),
         "-rpcbind=127.0.0.1".into(),
         "-rpcallowip=127.0.0.1".into(),
     ]);
@@ -185,17 +186,18 @@ fn run(args: &Args) -> Result<Value, Error> {
         None => args.datadir.clone(),
     };
 
-    // satd's standard output goes to standard error: only the protocol's
-    // lines may appear on ours.
-    let stderr = std::io::stderr().as_fd().try_clone_to_owned().map_err(|e| format!("duplicating stderr: {e}"))?;
-    let child = Command::new(&args.satd)
-        .args(&flags)
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(stderr))
-        .stderr(Stdio::inherit())
-        .spawn()
-        .map_err(|e| format!("starting {}: {e}", args.satd.display()))?;
-    let mut node = Node { child: Some(child), rpc_port, cookie: net_dir.join(".cookie") };
+    let mut attempt = 1;
+    let mut node = loop {
+        let mut node = start(&args.satd, &flags, &net_dir)?;
+        match node.wait_ready(args.stall) {
+            Ok(()) => break node,
+            Err(e) if node.child.is_none() && attempt < START_ATTEMPTS => {
+                eprintln!("satd-conformance-harness: {}; starting satd again on another RPC port", e.message);
+                attempt += 1;
+            }
+            Err(e) => return Err(e),
+        }
+    };
 
     let stop_at = args.stop_at.to_string();
     let height = node.sync_to(&stop_at, args.stall)?;
@@ -209,6 +211,23 @@ fn run(args: &Args) -> Result<Value, Error> {
         });
     }
     Ok(json!({"event": "stopped", "tip": stop_at, "height": height, "hash_serialized_3": hash}))
+}
+
+/// Starts satd with its RPC on a port nothing listens on.
+fn start(satd: &Path, flags: &[String], net_dir: &Path) -> Result<Node, Error> {
+    let rpc_port = free_port()?;
+    // satd's standard output goes to standard error: only the protocol's
+    // lines may appear on ours.
+    let stderr = std::io::stderr().as_fd().try_clone_to_owned().map_err(|e| format!("duplicating stderr: {e}"))?;
+    let child = Command::new(satd)
+        .args(flags)
+        .arg(format!("-rpcport={rpc_port}"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(stderr))
+        .stderr(Stdio::inherit())
+        .spawn()
+        .map_err(|e| format!("starting {}: {e}", satd.display()))?;
+    Ok(Node { child: Some(child), rpc_port, cookie: net_dir.join(".cookie") })
 }
 
 /// A port nothing listens on, for satd's RPC.
@@ -225,6 +244,24 @@ struct Node {
 }
 
 impl Node {
+    /// Waits until satd's RPC answers. Errors while satd starts (no cookie
+    /// yet, RPC warming up) are waited out for at most `stall`.
+    fn wait_ready(&mut self, stall: Duration) -> Result<(), Error> {
+        let started = Instant::now();
+        loop {
+            if let Some(status) = self.exited() {
+                return Err(format!("satd exited ({status}) before its RPC answered").into());
+            }
+            if self.call("getbestblockhash", json!([])).is_ok() {
+                return Ok(());
+            }
+            if started.elapsed() >= stall {
+                return Err(format!("satd's RPC did not answer within {} s", stall.as_secs()).into());
+            }
+            std::thread::sleep(POLL);
+        }
+    }
+
     /// Waits until satd's active tip is `stop_at` and returns its height.
     /// Fails when satd exits, marks a block invalid, or keeps the same tip
     /// for `stall`.
@@ -235,21 +272,16 @@ impl Node {
             if let Some(status) = self.exited() {
                 return Err(Error { message: format!("satd exited ({status})"), tip: last });
             }
-            // Errors while satd starts (no cookie yet, RPC warming up) are
-            // waited out; the stall timer bounds them.
-            if let Ok(tip) = self.call("getbestblockhash", json!([])) {
-                let tip = tip.as_str().unwrap_or_default().to_string();
-                if last.as_ref().map(|(t, _)| t) != Some(&tip) {
-                    let height = self.call("getblockcount", json!([]))?.as_u64().unwrap_or_default();
-                    println!("{}", json!({"event": "tip", "tip": tip, "height": height}));
-                    last = Some((tip.clone(), height));
-                    changed = Instant::now();
-                }
-                if tip == stop_at {
-                    return Ok(last.map(|(_, h)| h).unwrap_or_default());
-                }
-                if let Some(invalid) = self.invalid_tip()? {
-                    return Err(Error { message: format!("satd marked block {invalid} invalid"), tip: last });
+            // A failed call is tried again at the next poll; the stall timer
+            // bounds a node that keeps failing them.
+            if let Some(tip) = self.poll_tip(&mut last, &mut changed) {
+                match self.invalid_tip() {
+                    Ok(Some(invalid)) => {
+                        return Err(Error { message: format!("satd marked block {invalid} invalid"), tip: last });
+                    }
+                    // Only after a chain tips check that saw no invalid tip.
+                    Ok(None) if tip == stop_at => return Ok(last.map(|(_, h)| h).unwrap_or_default()),
+                    _ => {}
                 }
             }
             if changed.elapsed() >= stall {
@@ -262,6 +294,20 @@ impl Node {
         }
     }
 
+    /// satd's active tip, writing a progress line when it moved. `None`
+    /// when an RPC call failed.
+    fn poll_tip(&mut self, last: &mut Option<(String, u64)>, changed: &mut Instant) -> Option<String> {
+        let tip = self.call("getbestblockhash", json!([])).ok()?;
+        let tip = tip.as_str().unwrap_or_default().to_string();
+        if last.as_ref().map(|(t, _)| t) != Some(&tip) {
+            let height = self.call("getblockcount", json!([])).ok()?.as_u64().unwrap_or_default();
+            println!("{}", json!({"event": "tip", "tip": tip, "height": height}));
+            *last = Some((tip.clone(), height));
+            *changed = Instant::now();
+        }
+        Some(tip)
+    }
+
     /// A chain tip satd holds as invalid. The peer is a Core node that only
     /// serves blocks it accepted, so any such tip is a disagreement.
     fn invalid_tip(&mut self) -> Result<Option<String>, Error> {
@@ -272,9 +318,13 @@ impl Node {
         }))
     }
 
-    /// Asks satd to stop and waits for it to exit cleanly.
+    /// Asks satd to stop and waits for it to exit cleanly. A `stop` call
+    /// that gets no answer (satd may close the connection as it shuts
+    /// down) is not a failure; the exit status decides.
     fn stop(&mut self) -> Result<(), String> {
-        self.call("stop", json!([])).map_err(|e| format!("stopping satd: {}", e.message))?;
+        if let Err(e) = self.call("stop", json!([])) {
+            eprintln!("satd-conformance-harness: stop: {}; waiting for satd to exit", e.message);
+        }
         let deadline = Instant::now() + STOP_TIMEOUT;
         loop {
             if let Some(status) = self.exited() {
