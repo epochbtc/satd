@@ -2246,6 +2246,40 @@ mod tests {
         }
     }
 
+    /// A full, dear queue the health gate distrusts (the last six blocks
+    /// were full and this pool held none of their weight) leaves the
+    /// default on history at 2 blocks.
+    #[test]
+    fn an_unhealthy_dear_mempool_leaves_the_default_on_history() {
+        let pool = empty_pool();
+        pool.set_load_tried(true);
+        fill_health(&pool, 1_000_000, 0);
+        let mut next = 0;
+        fill_to(&pool, &mut next, 100, 80);
+        let est = FeeEstimator::new();
+        est.record_block(&[2_000; 50]);
+        assert!(near_rate(&pool, &est, false).is_none());
+        let a = auto(&pool, &est, 2, false);
+        assert_eq!((a.feerate_sat_per_kvb, a.estimator), (2_000, EstimateSource::BlockPolicy));
+    }
+
+    /// A mempool side below the floor reads the floor on every surface.
+    #[test]
+    fn a_mempool_side_below_the_floor_is_floored_on_the_surfaces() {
+        let est = FeeEstimator::new();
+        let sf = smart_fees_from_estimate(
+            &estimate_from_mempool(Vec::new(), MAX_SIM_DEPTH),
+            &est,
+            Some(500),
+            &[1, 2],
+            EstimateMode::Blend,
+            1_000,
+        );
+        for tf in &sf.targets {
+            assert_eq!(tf.feerate_sat_per_kvb, 1_000, "target {}", tf.target);
+        }
+    }
+
     /// `estimatefees`, Esplora, Electrum, MCP and the status page (blend
     /// mode with `near_rate`) read the same numbers as `estimatesmartfee`'s
     /// economical default, healthy or not.
