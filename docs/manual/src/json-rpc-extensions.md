@@ -95,11 +95,14 @@ Under `auto` with Core's `economical` / `conservative` / `unset`, or satd's
 `blend`, the answer combines the two estimators:
 
 - **1 and 2 blocks**, while the health gate passes: the `mempool_policy`
-  answer, the template percentile. It follows the queue as it is now.
+  answer, the template percentile, or the floor when the queue does not fill
+  that much of a block. It follows the queue as it is now.
 - **Every other target**, and every target while the gate fails: the
   `block_policy` answer, held at or below the 2-block answer, so a longer wait
   never costs more.
 - **`conservative`** never answers below `block_policy` at the same target.
+- A target with no history while the mempool side answers gets the floor,
+  where Core answers its block policy error.
 
 `block_policy` is satd's chain-history estimator. For each block it keeps the
 **hurdle**, the feerate at the 10th percentile of the block's weight over

@@ -69,15 +69,12 @@ impl Confidence {
 /// Which data source `estimatesmartfee` / `estimatefees` (and every other
 /// fee surface) draws from.
 ///
-/// - `Historical` (Core's `unset` / `economical` / `conservative`): the
-///   chain-history estimate ([`crate::mempool::fee_history`]), the flat
-///   percentile of recent confirmed feerates while that has no window for
-///   the target. In `estimatesmartfee` with `fee_rate_estimator=auto` these
-///   modes answer [`default_rate`].
+/// - `Historical` (satd's `historical`): the chain-history estimate
+///   ([`history_rate`]) alone.
 /// - `Mempool`: simulate the next N block templates from the live mempool
 ///   and use the lowest admitted feerate. Responds faster to congestion.
-/// - `Blend` (the default on `estimatefees`, Esplora, Electrum, MCP and the
-///   status page): [`default_rate`], economical.
+/// - `Blend` (satd's `blend` and Core's `unset` / `economical` /
+///   `conservative`; the default everywhere): [`default_rate`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EstimateMode {
     Historical,
@@ -88,9 +85,11 @@ pub enum EstimateMode {
 impl EstimateMode {
     pub fn parse(s: Option<&str>) -> Option<Self> {
         match s?.trim().to_ascii_lowercase().as_str() {
-            "historical" | "conservative" | "economical" | "unset" => Some(Self::Historical),
+            "historical" => Some(Self::Historical),
             "mempool" => Some(Self::Mempool),
-            "blend" => Some(Self::Blend),
+            // Core's modes are the default; `conservative` is passed to the
+            // estimators separately.
+            "blend" | "conservative" | "economical" | "unset" => Some(Self::Blend),
             _ => None,
         }
     }
@@ -762,7 +761,9 @@ pub fn history_rate(fee_estimator: &FeeEstimator, target: u32, conservative: boo
 /// The mempool side of the default: Core 32's template percentile (the 50%
 /// point when conservative, else the 75% point) from the shared simulation
 /// cache, or `None` while Core's mempool estimator would refuse (startup
-/// load not over, or the health gate failing). sat/kvB, unfloored.
+/// load not over, or the health gate failing). sat/kvB, unfloored: a
+/// template too thin to reach the percentile reads 0, so the caller's floor
+/// sets it, as Core's mempool estimator falls back to its floor.
 pub fn near_rate(
     mempool: &crate::mempool::pool::Mempool,
     fee_estimator: &FeeEstimator,
@@ -771,7 +772,7 @@ pub fn near_rate(
     if mempool_policy_refusal(mempool).is_some() {
         return None;
     }
-    template_percentile(&fee_estimator.cached_mempool_estimate(mempool), conservative)
+    Some(template_percentile(&fee_estimator.cached_mempool_estimate(mempool), conservative).unwrap_or(0))
 }
 
 /// The deepest target the mempool side answers: Core 32.1's
@@ -1046,8 +1047,9 @@ fn template_percentile(est: &MempoolEstimate, conservative: bool) -> Option<u64>
 ///   Core 32's template percentile. `auto` with Core's `unset` /
 ///   `economical` / `conservative`, or satd's `blend`, is the default
 ///   ([`default_rate`]): the template percentile at 1-2 blocks while the
-///   health gate passes, the history answer otherwise. satd's own `mempool`
-///   mode is the ungated simulator, as before.
+///   health gate passes, the history answer otherwise. satd's own
+///   `historical` mode is the history answer alone and `mempool` the
+///   ungated simulator, as before.
 /// - `blocks`: target 1 is served as 2, as Core's block policy estimator
 ///   does, and `mempool_policy` always answers for 2 blocks, as Core's
 ///   mempool estimator does.
@@ -1100,14 +1102,16 @@ pub fn estimate_smart_fee(
     // answer is read with a zero floor so that "the queue says nothing" (an
     // empty or thin block) reads as 0 and is attributed to the floor below.
     let (raw, source) = match (fee_rate_estimator, mode) {
-        (FeeRateEstimator::BlockPolicy, _) => history_rate(fee_estimator, target, conservative)
-            .map(|h| (h, EstimateSource::BlockPolicy))
-            .ok_or_else(insufficient)?,
+        (FeeRateEstimator::BlockPolicy, _) | (_, EstimateMode::Historical) => {
+            history_rate(fee_estimator, target, conservative)
+                .map(|h| (h, EstimateSource::BlockPolicy))
+                .ok_or_else(insufficient)?
+        }
         (_, EstimateMode::Mempool) => {
             let est = fee_estimator.cached_mempool_estimate(mempool);
             (target_estimate(&est, target, 0).0, EstimateSource::MempoolPolicy)
         }
-        (_, EstimateMode::Historical | EstimateMode::Blend) => default_rate(
+        (_, EstimateMode::Blend) => default_rate(
             near_rate(mempool, fee_estimator, conservative),
             fee_estimator,
             target,
@@ -2166,7 +2170,7 @@ mod tests {
     }
 
     fn auto(pool: &crate::mempool::pool::Mempool, est: &FeeEstimator, target: u32, conservative: bool) -> SmartFeeAnswer {
-        estimate_smart_fee(pool, est, target, EstimateMode::Historical, FeeRateEstimator::Auto, conservative)
+        estimate_smart_fee(pool, est, target, EstimateMode::Blend, FeeRateEstimator::Auto, conservative)
             .expect("the default answers")
     }
 
@@ -2261,6 +2265,44 @@ mod tests {
         assert!(near_rate(&pool, &est, false).is_none());
         let a = auto(&pool, &est, 2, false);
         assert_eq!((a.feerate_sat_per_kvb, a.estimator), (2_000, EstimateSource::BlockPolicy));
+    }
+
+    /// A healthy mempool too thin to reach 75% of a block (here 60%, at 10
+    /// sat/vB): economical answers the floor at every target, as Core 32's
+    /// mempool estimator falls back to its floor, and conservative reads
+    /// the 50% point, which the queue does reach.
+    #[test]
+    fn a_healthy_quiet_mempool_floors_economical() {
+        let pool = empty_pool();
+        pool.set_load_tried(true);
+        fill_health(&pool, 0, 0);
+        let mut next = 0;
+        fill_to(&pool, &mut next, 10, 60);
+        let est = FeeEstimator::new();
+        est.record_block(&[2_000; 50]);
+        assert_eq!(near_rate(&pool, &est, false), Some(0));
+        let floor = pool.fee_estimate_floor();
+        for t in LADDER {
+            let a = auto(&pool, &est, t, false);
+            assert_eq!((a.feerate_sat_per_kvb, a.estimator), (floor, EstimateSource::Floor), "target {t}");
+        }
+        let c = auto(&pool, &est, 2, true);
+        assert_eq!((c.feerate_sat_per_kvb, c.estimator), (10_000, EstimateSource::MempoolPolicy));
+    }
+
+    /// satd's `historical` mode is the history answer alone, healthy
+    /// mempool or not; Core's modes are the default.
+    #[test]
+    fn historical_mode_is_history_alone_and_core_modes_are_the_default() {
+        assert_eq!(EstimateMode::parse(Some("historical")), Some(EstimateMode::Historical));
+        for m in ["unset", "economical", "conservative", "blend", "ECONOMICAL"] {
+            assert_eq!(EstimateMode::parse(Some(m)), Some(EstimateMode::Blend), "{m}");
+        }
+        let pool = healthy_pool_at(10);
+        let est = spread_history();
+        let h = estimate_smart_fee(&pool, &est, 6, EstimateMode::Historical, FeeRateEstimator::Auto, false).unwrap();
+        assert_eq!((h.feerate_sat_per_kvb, h.estimator), (51_000, EstimateSource::BlockPolicy));
+        assert_eq!(auto(&pool, &est, 6, false).feerate_sat_per_kvb, 10_000);
     }
 
     /// A mempool side below the floor reads the floor on every surface.

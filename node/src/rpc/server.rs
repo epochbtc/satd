@@ -2841,7 +2841,7 @@ pub async fn start(
         }
 
         let options = parse_estimatesmartfee_options(args.get(2))?;
-        let mode = EstimateMode::parse(mode_str.as_deref()).unwrap_or(EstimateMode::Historical);
+        let mode = EstimateMode::parse(mode_str.as_deref()).unwrap_or(EstimateMode::Blend);
 
         let unit = default_unit();
         let estimate = crate::mempool::estimate::estimate_smart_fee(
@@ -3029,7 +3029,10 @@ pub async fn start(
             // inflate the fee quote — same view the block template selects from.
             ctx.mempool.get_template_entries(),
             &ctx.fee_estimator,
-            crate::mempool::estimate::near_rate(&ctx.mempool, &ctx.fee_estimator, false),
+            // The mempool side is read only by `blend`.
+            (mode == EstimateMode::Blend)
+                .then(|| crate::mempool::estimate::near_rate(&ctx.mempool, &ctx.fee_estimator, false))
+                .flatten(),
             &targets,
             mode,
             floor_sat_per_kvb,
