@@ -580,6 +580,11 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
             .expect("vbparams override installed twice");
     }
 
+    // Same for `-test=bip94` (regtest only).
+    if config.regtest_bip94 {
+        node::validation::pow::set_regtest_bip94().expect("regtest BIP 94 installed twice");
+    }
+
     // `-mocktime=N`: install the mock clock at startup (regtest only).
     if let Some(t) = config.mocktime
         && t > 0

@@ -19214,6 +19214,50 @@ fn getdeploymentinfo_reports_cores_deployment_set_and_honours_blockhash() {
     assert_eq!(missing["error"]["message"], "Block not found", "{missing}");
 }
 
+/// Core's `-test=bip94` (#1245) gives regtest BIP 94's timewarp rule: the
+/// first block of a 2,016-block period may not be stamped more than 600 s
+/// before its parent. satd had no such option. The same block is accepted
+/// by a node started without it, so the refusal is the rule's and not the
+/// block's. `-test` is refused off regtest, as in Core.
+#[test]
+fn test_bip94_refuses_a_timewarp_block_on_regtest_only_when_asked() {
+    let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+    let submit_timewarp = |args: &[&str]| -> serde_json::Value {
+        let mut node = TestNode::start(args);
+        node.mine_blocks(2014, addr);
+        let tip: bitcoin::BlockHash =
+            node.rpc_call("getbestblockhash").unwrap()["result"].as_str().unwrap().parse().unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as u32;
+        // The period's last block an hour ahead, so the next one can sit
+        // 601 s before it and still be past the median time.
+        let last = build_regtest_block(tip, 2015, now + 3600, vec![]);
+        let submit = |block: &bitcoin::Block| {
+            let hex = hex::encode(bitcoin::consensus::serialize(block));
+            node.rpc_call_with_params("submitblock", vec![serde_json::json!(hex)]).unwrap()
+        };
+        let res = submit(&last);
+        assert!(res["result"].is_null() && res["error"].is_null(), "{res}");
+        let first = build_regtest_block(last.block_hash(), 2016, now + 3600 - 601, vec![]);
+        submit(&first)
+    };
+
+    let res = submit_timewarp(&["-test=bip94"]);
+    assert_eq!(res["result"], serde_json::json!("time-timewarp-attack"), "{res}");
+    let res = submit_timewarp(&[]);
+    assert!(res["result"].is_null() && res["error"].is_null(), "{res}");
+
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_satd"))
+        .args(["--signet", "-test=bip94"])
+        .output()
+        .expect("spawn satd");
+    assert!(!out.status.success(), "satd should refuse -test off regtest");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("-test=<option> can only be used with regtest"), "{err}");
+}
+
 /// Core's `-vbparams=deployment:start:end[:min_activation_height]` moves the
 /// BIP 9 window. satd had no such option, so a test framework that sets one
 /// got a node whose reported deployment did not match what it asked for.

@@ -668,6 +668,10 @@ pub struct Config {
     /// refused rather than accepted and ignored. `None` off regtest (the
     /// option is warned about and dropped there, as Core never reads it).
     pub vbparams_testdummy: Option<node::validation::versionbits::Bip9Deployment>,
+    /// Core's `-test=bip94` (regtest only): enforce BIP 94's timewarp guard
+    /// on regtest, as testnet4 does. `main` installs it into the validation
+    /// layer before any block is validated.
+    pub regtest_bip94: bool,
     /// `-mocktime=N`: set the mock clock at startup (regtest only).
     pub mocktime: Option<u64>,
     // Mempool policy
@@ -2912,6 +2916,35 @@ impl Config {
             }
         };
 
+        // `-test=<option>` (Core-compatible, regtest only). Core refuses to
+        // start when it is given on another chain, and warns about a name
+        // it does not know. satd has `bip94` only: Core's other options
+        // (`addrman`, `reindex_after_failure_noninteractive_yes`) are refused
+        // by name, since accepting and ignoring them would run the node
+        // differently from what the caller asked for.
+        let regtest_bip94 = {
+            let mut values: Vec<String> = cli.test.clone();
+            values.extend(file_get_all("test"));
+            if !values.is_empty() && network != Network::Regtest {
+                return Err("-test=<option> can only be used with regtest".to_string());
+            }
+            let mut bip94 = false;
+            for v in &values {
+                match v.as_str() {
+                    "bip94" => bip94 = true,
+                    "addrman" | "reindex_after_failure_noninteractive_yes" => {
+                        return Err(format!(
+                            "satd does not support -test={v}; it supports -test=bip94 only."
+                        ));
+                    }
+                    _ => eprintln!(
+                        "Warning: Unrecognised option \"{v}\" provided in -test=<option>."
+                    ),
+                }
+            }
+            bip94
+        };
+
         // `-vbparams=deployment:start:end[:min_activation_height]`
         // (Core-compatible, regtest only). Core reads it in
         // `ReadRegTestArgs`, which runs only on the regtest branch, so off
@@ -4228,6 +4261,7 @@ impl Config {
             stopatheight,
             test_activation_overrides,
             vbparams_testdummy,
+            regtest_bip94,
             mocktime,
             mempoolfullrbf,
             maxmempool,
@@ -5596,6 +5630,14 @@ pub struct CliArgs {
         help = "Regtest only: override a buried softfork deployment's activation height (repeatable; names: bip34, dersig, cltv, csv, segwit; matches Core's -testactivationheight)"
     )]
     pub testactivationheight: Vec<String>,
+
+    /// Core's `-test=<option>` (regtest only, repeatable).
+    #[arg(
+        long,
+        value_name = "OPTION",
+        help = "Regtest only: pass a test-only option (repeatable). satd supports bip94 (enforce BIP94 consensus rules); matches Core's -test"
+    )]
+    pub test: Vec<String>,
 
     /// Core's `-vbparams=deployment:start:end[:min_activation_height]`
     /// (regtest only, repeatable).
@@ -8886,6 +8928,7 @@ pub fn normalize_args(args: Vec<String>) -> Vec<String> {
         "assumevalid",
         "assumevalidage",
         "stopatheight",
+        "test",
         "testactivationheight",
         "vbparams",
         "mempoolfullrbf",
@@ -9697,6 +9740,7 @@ pub const KNOWN_CONFIG_KEYS: &[&str] = &[
     "assumevalid",
     "assumevalidage",
     "stopatheight",
+    "test",
     "testactivationheight",
     "vbparams",
     "mocktime",
@@ -12694,6 +12738,7 @@ testactivationheight=bip34@2
             assumevalidage: None,
             stopatheight: None,
             testactivationheight: Vec::new(),
+            test: Vec::new(),
             vbparams: Vec::new(),
             mocktime: None,
             mempoolfullrbf: None,
@@ -13016,6 +13061,7 @@ testactivationheight=bip34@2
             assumevalidage: None,
             stopatheight: None,
             testactivationheight: Vec::new(),
+            test: Vec::new(),
             vbparams: Vec::new(),
             mocktime: None,
             mempoolfullrbf: None,

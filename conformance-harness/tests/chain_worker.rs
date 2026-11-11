@@ -62,11 +62,14 @@ fn each_reset_gets_a_fresh_chain_with_its_own_options() {
 }
 
 /// An option satd does not have is reported as unsupported, not ignored.
+/// `-test=bip94`, which satd has, starts a regtest chain.
 #[test]
 fn an_option_satd_lacks_is_unsupported() {
-    let out = run(&[json!({"op": "chain_reset", "network": "regtest", "options": {"test": ["bip94"]}})]);
+    let out = run(&[json!({"op": "chain_reset", "network": "regtest", "options": {"test": ["addrman"]}})]);
     assert_eq!(out[0]["ok"], json!(false));
     assert_eq!(out[0]["error"], json!("unsupported_op"), "{}", out[0]);
+    let out = run(&[json!({"op": "chain_reset", "network": "regtest", "options": {"test": ["bip94"]}})]);
+    assert_eq!(out[0]["ok"], json!(true), "{}", out[0]);
 }
 
 /// A worker removes its data directory when the next reset replaces it and

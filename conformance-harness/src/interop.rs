@@ -153,8 +153,11 @@ fn option_flags(options: &Map<String, Value>) -> Result<Vec<String>, String> {
             }
             "test" => {
                 let names = value.as_array().ok_or("test must be an array")?;
-                if let Some(name) = names.first() {
-                    return Err(format!("satd has no -test={} option", name.as_str().unwrap_or("?")));
+                for name in names {
+                    match name.as_str() {
+                        Some("bip94") => flags.push("-test=bip94".to_string()),
+                        name => return Err(format!("satd has no -test={} option", name.unwrap_or("?"))),
+                    }
                 }
             }
             "signetchallenge" => {
@@ -432,12 +435,13 @@ mod tests {
         assert_eq!(flags, ["-testactivationheight=bip34@2", "-testactivationheight=segwit@432"]);
         assert_eq!(option_flags(&Map::new()).unwrap(), Vec::<String>::new());
         assert_eq!(option_flags(&options(json!({"test": []}))).unwrap(), Vec::<String>::new());
+        assert_eq!(option_flags(&options(json!({"test": ["bip94"]}))).unwrap(), ["-test=bip94"]);
     }
 
     #[test]
     fn an_option_satd_lacks_is_an_error() {
-        let err = option_flags(&options(json!({"test": ["bip94"]}))).unwrap_err();
-        assert_eq!(err, "satd has no -test=bip94 option");
+        let err = option_flags(&options(json!({"test": ["addrman"]}))).unwrap_err();
+        assert_eq!(err, "satd has no -test=addrman option");
         assert!(option_flags(&options(json!({"other": 1}))).is_err());
     }
 

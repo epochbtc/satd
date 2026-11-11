@@ -136,8 +136,8 @@ jobs:
       # with it (see `conformance-harness/src/chain.rs`); the harness adds no
       # rule of Core's that satd lacks, so a difference here is satd's. The
       # run fails on a normative tip or height that differs from Core's.
-      # Known, each with its issue: -test=bip94 on regtest (#1245), and
-      # the script flags under -testactivationheight=segwit (#1244).
+      # Known, with its issue: the script flags under
+      # -testactivationheight=segwit (#1244).
       # Chain-tip (level 1) differences are printed only: blocks that fail
       # contextual checks are not remembered (#1246), and there is no
       # low-work drop (#1247) or header-only rule for unrequested
@@ -204,8 +204,8 @@ jobs:
       # `--interop-node` wrapper, see `conformance-harness/src/interop.rs`)
       # that syncs from it over P2P and stops at Core's tip; tip, height and
       # UTXO set hash must match Core's, and Core must log no `Misbehaving`
-      # against satd. A scenario's network options become satd's flags; the
-      # one satd has none for, -test=bip94 (#1245), fails its chains.
+      # against satd. A scenario's network options become satd's flags; an
+      # option satd has no flag for fails its chains.
       - name: Run the interop suite
         working-directory: bcs
         env:

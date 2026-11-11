@@ -25,12 +25,35 @@ pub const RETARGET_INTERVAL: u32 = 2016;
 const TARGET_TIMESPAN: u32 = 14 * 24 * 60 * 60;
 /// Testnet: allow minimum difficulty if block is >20 minutes after previous.
 const TESTNET_ALLOW_MIN_DIFF_AFTER: u32 = 20 * 60;
-/// BIP 94 (testnet4) timewarp guard: the first block of a retarget period
-/// may not have a timestamp more than this many seconds before its parent.
+/// BIP 94 timewarp guard (testnet4, and regtest under `-test=bip94`): the
+/// first block of a retarget period may not have a timestamp more than this
+/// many seconds before its parent.
 pub const MAX_TIMEWARP: u32 = 600;
 /// Bitcoin Core's `MAX_FUTURE_BLOCK_TIME` (2 hours): a block whose timestamp
 /// is more than this far ahead of the node's current time is rejected.
 pub const MAX_FUTURE_BLOCK_TIME: u64 = 2 * 60 * 60;
+
+static REGTEST_BIP94: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+
+/// Enforce BIP 94 on regtest, Core's `-test=bip94` (`enforce_BIP94`). Called
+/// once at daemon startup, before any validation runs, and only when the
+/// chain is regtest: the config layer refuses the option elsewhere, and
+/// [`enforces_bip94`] only consults it for [`Network::Regtest`]. Returns
+/// `Err` if it was already set.
+pub fn set_regtest_bip94() -> Result<(), &'static str> {
+    REGTEST_BIP94.set(()).map_err(|_| "regtest BIP 94 already set")
+}
+
+/// Whether `network` enforces BIP 94's timewarp guard: testnet4 always,
+/// regtest under `-test=bip94` (Core's `consensus.enforce_BIP94`). Regtest
+/// never retargets, so on regtest the option has no effect on `nBits`.
+pub fn enforces_bip94(network: Network) -> bool {
+    match network {
+        Network::Testnet4 => true,
+        Network::Regtest => REGTEST_BIP94.get().is_some(),
+        _ => false,
+    }
+}
 
 /// Check that the block header hash meets the proof-of-work target.
 pub fn check_proof_of_work(header: &Header) -> Result<(), ValidationError> {
@@ -111,22 +134,35 @@ pub fn check_difficulty<G>(
 where
     G: Fn(&BlockHash) -> Option<BlockIndexEntry>,
 {
+    check_difficulty_with(header, prev, network, enforces_bip94(network), get_by_hash)
+}
+
+/// [`check_difficulty`] with BIP 94 enforcement given, so tests can cover
+/// regtest under `-test=bip94` without installing the process-wide option.
+fn check_difficulty_with<G>(
+    header: &Header,
+    prev: &BlockIndexEntry,
+    network: Network,
+    bip94: bool,
+    get_by_hash: G,
+) -> Result<(), ValidationError>
+where
+    G: Fn(&BlockHash) -> Option<BlockIndexEntry>,
+{
     let height = prev.height + 1;
 
-    match network {
-        // Signet retargets as mainnet does, against its own proof-of-work
-        // limit, with no minimum-difficulty exception. Core checks it like
-        // every chain, and so does satd (#838), on top of the block signature.
-        // Testnet4 adds the BIP 94 timewarp guard: the first block of each
-        // retarget period must not be timestamped more than MAX_TIMEWARP
-        // before its parent. The seeding change lives in `next_bits`.
-        Network::Testnet4
-            if height.is_multiple_of(RETARGET_INTERVAL)
-                && header.time < prev.header.time.saturating_sub(MAX_TIMEWARP) =>
-        {
-            return Err(ValidationError::TimewarpAttack);
-        }
-        _ => {}
+    // Signet retargets as mainnet does, against its own proof-of-work
+    // limit, with no minimum-difficulty exception. Core checks it like
+    // every chain, and so does satd (#838), on top of the block signature.
+    // BIP 94 (testnet4, and regtest under `-test=bip94`) adds the timewarp
+    // guard: the first block of each retarget period must not be
+    // timestamped more than MAX_TIMEWARP before its parent. The seeding
+    // change lives in `next_bits`, and only testnet4 retargets.
+    if bip94
+        && height.is_multiple_of(RETARGET_INTERVAL)
+        && header.time < prev.header.time.saturating_sub(MAX_TIMEWARP)
+    {
+        return Err(ValidationError::TimewarpAttack);
     }
 
     let expected = next_bits(network, prev, header.time, get_by_hash)?;
@@ -597,6 +633,33 @@ mod tests {
         new_header.time = prev_header.time - 600;
         let res = check_difficulty(&new_header, &prev, Network::Testnet4, |_| None);
         assert!(!matches!(res, Err(ValidationError::TimewarpAttack)), "600s must pass timewarp");
+    }
+
+    /// Core's `-test=bip94` gives regtest testnet4's timewarp guard and
+    /// nothing else: regtest never retargets, so `nBits` stays the limit.
+    /// Without the option, regtest accepts the same block.
+    #[test]
+    fn regtest_timewarp_rejected_only_under_test_bip94() {
+        let genesis = bitcoin::constants::genesis_block(Network::Regtest);
+        let mut prev_header = genesis.header;
+        prev_header.time = 1_700_000_000;
+        let prev = entry(prev_header, 2015);
+
+        let mut new_header = genesis.header;
+        new_header.time = prev_header.time - 601;
+        let res = check_difficulty_with(&new_header, &prev, Network::Regtest, true, |_| None);
+        assert!(matches!(res, Err(ValidationError::TimewarpAttack)), "got {res:?}");
+        let res = check_difficulty_with(&new_header, &prev, Network::Regtest, false, |_| None);
+        assert!(res.is_ok(), "regtest without -test=bip94 has no timewarp guard: {res:?}");
+
+        // Only the first block of a period is guarded.
+        let mut mid = prev.clone();
+        mid.height = 2016;
+        let res = check_difficulty_with(&new_header, &mid, Network::Regtest, true, |_| None);
+        assert!(res.is_ok(), "height 2017 is not a period start: {res:?}");
+        new_header.time = prev_header.time - 600;
+        let res = check_difficulty_with(&new_header, &prev, Network::Regtest, true, |_| None);
+        assert!(res.is_ok(), "600s before the parent passes: {res:?}");
     }
 
     /// Regression for the live testnet4 wedge (node stuck at 138567): the
