@@ -14,7 +14,12 @@ path = "src/main.rs"
 [dependencies]
 bitcoin = { workspace = true }
 consensus = { path = "../consensus" }
-node = { path = "../node", default-features = false }
+# `block-filter-index` as satd's default build has it: the interop node
+# reopens the chainstate a stopped satd left, and RocksDB refuses a
+# database whose column families (here the block filter's) are not all
+# named on open.
+node = { path = "../node", default-features = false, features = ["block-filter-index"] }
 serde_json = { workspace = true }
 hex = { workspace = true }
 tempfile = "3"
+base64 = { workspace = true }

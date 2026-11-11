@@ -12,9 +12,11 @@
 //! ```
 //!
 //! The chain operations run in a child process per `chain_reset`; see
-//! [`chain`].
+//! [`chain`]. With `--interop-node`, the binary is instead the live node of
+//! the spec's interop suite, a real satd; see [`interop`].
 
 mod chain;
+mod interop;
 
 use std::io::{self, BufRead, Write};
 use std::panic::{self, AssertUnwindSafe};
@@ -50,7 +52,11 @@ fn bad_request(message: impl Into<String>) -> Fail {
 type Fields = Map<String, Value>;
 
 fn main() {
-    let worker_mode = std::env::args().nth(1).as_deref() == Some("--chain-worker");
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("--interop-node") {
+        interop::main(&args[1..]);
+    }
+    let worker_mode = args.first().map(String::as_str) == Some("--chain-worker");
     let mut chain: Option<chain::Chain> = None;
     let mut worker: Option<chain::Worker> = None;
     let stdin = io::stdin();
