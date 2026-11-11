@@ -3705,6 +3705,42 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
         }
     };
 
+    // Chain-history fee estimate (fee plan F3): each recent block's hurdle,
+    // rebuilt from block and undo data after IBD and kept on the active
+    // chain. It reads blocks on the API runtime's blocking pool, off the
+    // consensus core. It answers `fee_rate_estimator=block_policy`. The
+    // history is saved to `fees/fee_history.dat`; a start loads it and
+    // reads from the blocks only what it lacks.
+    let fee_history_file = (
+        net_datadir.join(node::mempool::fee_history::FEE_HISTORY_FILE),
+        chain_state.p2p_magic().to_bytes(),
+    );
+    {
+        let (path, magic) = &fee_history_file;
+        match fee_estimator.history().write().load(path, *magic) {
+            Ok(0) => {}
+            Ok(n) => tracing::info!(target: "fees", blocks = n, "Loaded fee history from {}", path.display()),
+            Err(e) => tracing::warn!(
+                target: "fees",
+                file = %path.display(),
+                error = %e,
+                "fee history file unusable; rebuilding it from the blocks",
+            ),
+        }
+    }
+    {
+        let _api_guard = api_handle.enter();
+        let mp = mempool.clone();
+        node::mempool::fee_history::spawn_fee_history(
+            chain_state.clone(),
+            fee_estimator.history(),
+            move || mp.min_fee_rate(),
+            Some(fee_history_file.clone()),
+            chain_state.subscribe_chain_events(),
+            shutdown_rx.clone(),
+        );
+    }
+
     // Block-template validity (`mining::validity`). A template that fails its
     // check is a node bug worth paging on, so it goes through the same alert
     // path as the detectors. The background full check runs on the API
@@ -5354,6 +5390,15 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
     // The mempool health window, written whatever `-persistmempool` says;
     // the next start keeps it only if it ends at that start's tip.
     mempool.flush_health();
+
+    // The fee history (fee plan F3), so the next start reads from the
+    // blocks only what it lacks.
+    {
+        let (path, magic) = &fee_history_file;
+        if let Err(e) = fee_estimator.history().read().save(path, *magic) {
+            tracing::warn!(target: "fees", file = %path.display(), error = %e, "cannot save fee history");
+        }
+    }
 
     // Persist the address book so learned peers survive a restart.
     peer_manager.dump_addrman(&net_datadir.join("peers.dat"));

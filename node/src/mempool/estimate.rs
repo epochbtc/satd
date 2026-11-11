@@ -970,8 +970,10 @@ fn template_percentile(est: &MempoolEstimate, conservative: bool) -> Option<u64>
 
 /// `estimatesmartfee`, in Core 32.1's shape.
 ///
-/// - The source: `fee_rate_estimator=block_policy` is the history estimator
-///   and `mempool_policy` the simulator. `auto` follows `mode`, which for
+/// - The source: `fee_rate_estimator=block_policy` is the chain-history
+///   estimator ([`crate::mempool::fee_history`]: analog windows over recent
+///   block hurdles, the flat percentile until it has a window), and
+///   `mempool_policy` the simulator. `auto` follows `mode`, which for
 ///   Core's `unset` / `economical` / `conservative` is the history estimator;
 ///   satd's own `mempool` / `blend` modes keep their meaning.
 /// - `blocks`: target 1 is served as 2, as Core's block policy estimator
@@ -1025,8 +1027,15 @@ pub fn estimate_smart_fee(
     // The raw rate and the side it came from, before the floor. A simulator
     // answer is read with a zero floor so that "the queue says nothing" (an
     // empty or thin block) reads as 0 and is attributed to the floor below.
+    // `block_policy` asked for by name reads the chain-history estimate
+    // (fee plan F3) and falls back to the flat percentile while that has
+    // no window for the target. `auto` keeps the flat percentile until the
+    // default switches (F8).
+    let chain_history = (fee_rate_estimator == FeeRateEstimator::BlockPolicy)
+        .then(|| fee_estimator.history_estimate(target, conservative))
+        .flatten();
     let (raw, source) = match source_mode {
-        EstimateMode::Historical => match fee_estimator.estimate_fee(target) {
+        EstimateMode::Historical => match chain_history.or_else(|| fee_estimator.estimate_fee(target)) {
             Some(h) => (h, EstimateSource::BlockPolicy),
             None => {
                 return Err(SmartFeeError {
