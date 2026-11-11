@@ -752,10 +752,20 @@ pub struct SmartFees {
 /// The chain-history answer for `target`: the analog-window estimate
 /// (fee plan F3), the flat percentile of recent confirmed feerates while
 /// that has no window for the target. sat/kvB, unfloored.
+///
+/// The flat fallback is held at or below the analog answer for the deepest
+/// shorter target that has a window, so the answer never rises with the
+/// target while the store fills (a deep target falls back while a short
+/// one already has windows).
 pub fn history_rate(fee_estimator: &FeeEstimator, target: u32, conservative: bool) -> Option<u64> {
-    fee_estimator
-        .history_estimate(target, conservative)
-        .or_else(|| fee_estimator.estimate_fee(target))
+    if let Some(h) = fee_estimator.history_estimate(target, conservative) {
+        return Some(h);
+    }
+    let flat = fee_estimator.estimate_fee(target)?;
+    Some(match fee_estimator.history_cap(target, conservative) {
+        Some(cap) => flat.min(cap),
+        None => flat,
+    })
 }
 
 /// The mempool side of the default: Core 32's template percentile (the 50%
