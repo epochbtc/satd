@@ -81,7 +81,8 @@ pub struct BlockTemplate {
 /// tip's median time past, raised at the first block of a retarget period to
 /// `MAX_TIMEWARP` seconds before the parent (`parent_time`).
 ///
-/// That floor is BIP 94's timewarp rule, which only testnet4 enforces. Core
+/// That floor is BIP 94's timewarp rule, which testnet4 enforces (and regtest
+/// under `-test=bip94`). Core
 /// applies it on every network, and so does this, so a miner that honours
 /// `mintime` builds a block that passes the rule wherever it is enforced. Without the floor in `mintime`, a testnet4
 /// miner that stamps a retarget block at the advertised `mintime` builds one

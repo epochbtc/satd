@@ -34,8 +34,8 @@ fn a_node_that_exits_at_start_is_started_again_then_reported() {
 
 #[test]
 fn an_option_satd_lacks_ends_the_run_before_satd_starts() {
-    let (status, lines, _) = interop_node("/nonexistent/satd", r#"{"test":["bip94"]}"#);
+    let (status, lines, _) = interop_node("/nonexistent/satd", r#"{"test":["addrman"]}"#);
     assert_eq!(status, 1);
     assert_eq!(lines.len(), 1, "{lines:?}");
-    assert_eq!(lines[0]["message"], "satd has no -test=bip94 option");
+    assert_eq!(lines[0]["message"], "satd has no -test=addrman option");
 }

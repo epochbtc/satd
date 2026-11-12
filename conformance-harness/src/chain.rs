@@ -168,11 +168,19 @@ fn reset(req: &Fields) -> Result<(Chain, BlockHash), Fail> {
             }
             "test" => {
                 let names = value.as_array().ok_or_else(|| bad_request("test must be an array"))?;
-                if let Some(name) = names.first() {
-                    return Err(Fail {
-                        code: "unsupported_op",
-                        message: format!("satd has no -test={} option", name.as_str().unwrap_or("?")),
-                    });
+                for name in names {
+                    match name.as_str() {
+                        Some("bip94") if network == Network::Regtest => {
+                            node::validation::pow::set_regtest_bip94().map_err(internal)?;
+                        }
+                        Some("bip94") => return Err(bad_request("test is regtest-only")),
+                        name => {
+                            return Err(Fail {
+                                code: "unsupported_op",
+                                message: format!("satd has no -test={} option", name.unwrap_or("?")),
+                            });
+                        }
+                    }
                 }
             }
             "signetchallenge" => {
