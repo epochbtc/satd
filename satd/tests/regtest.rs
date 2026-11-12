@@ -2072,7 +2072,7 @@ fn estimatesmartfee_has_cores_32_1_shape() {
         assert_eq!(smartfee_keys(&r), keyset(&["feerate", "estimator", "blocks"]), "{r}");
         assert_eq!(r["blocks"], 2, "{r}");
         assert_eq!(r["estimator"], "floor", "{r}");
-        assert!(r["feerate"].as_f64().unwrap() >= 0.00001, "floored at 1 sat/vB: {r}");
+        assert!(r["feerate"].as_f64().unwrap() >= 0.000001, "floored at the 0.1 sat/vB relay minimum: {r}");
     }
 
     // block_policy with no history: Core's no-data answer.

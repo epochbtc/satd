@@ -2184,7 +2184,7 @@ impl Mempool {
     }
 
     /// The floor every fee estimate is clamped to (sat/kvB): the rolling
-    /// minimum, the relay floor and 1 sat/vB, whichever is highest. See
+    /// minimum or the relay floor, whichever is higher. See
     /// [`crate::mempool::estimate::estimate_floor_sat_per_kvb`].
     pub fn fee_estimate_floor(&self) -> u64 {
         crate::mempool::estimate::estimate_floor_sat_per_kvb(self.min_fee(), self.min_fee_rate())

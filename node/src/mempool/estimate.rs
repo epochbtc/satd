@@ -864,24 +864,16 @@ pub fn resolve_target(
     }
 }
 
-/// The lowest feerate satd's own fee policy lets any estimate quote, in
-/// sat/kvB: 1 sat/vB.
-///
-/// Core floors `estimatesmartfee` at `max(GetMinFee(), minrelaytxfee)` and
-/// has no constant of its own (`rpc/fees.cpp`). satd keeps this one on top
-/// until the estimator rework decides whether to follow Core below 1 sat/vB.
-pub const ESTIMATE_FLOOR_SAT_PER_KVB: u64 = 1_000;
-
 /// The floor every fee estimate is clamped to (sat/kvB): the larger of the
-/// rolling mempool minimum (Core's `GetMinFee`), the relay floor
-/// (`-minrelaytxfee`) and [`ESTIMATE_FLOOR_SAT_PER_KVB`].
+/// rolling mempool minimum (Core's `GetMinFee`) and the relay floor
+/// (`-minrelaytxfee`, 0.1 sat/vB by default), as Core floors
+/// `estimatesmartfee` (`rpc/fees.cpp`).
 ///
 /// Without the rolling minimum a full mempool lets an estimate name a rate
-/// this node would itself refuse to relay.
+/// this node would itself refuse to relay. There is no 1 sat/vB floor on top:
+/// blocks confirm sub-1 sat/vB transactions, and a quiet market quotes them.
 pub fn estimate_floor_sat_per_kvb(rolling_min_fee: u64, min_relay_fee: u64) -> u64 {
-    rolling_min_fee
-        .max(min_relay_fee)
-        .max(ESTIMATE_FLOOR_SAT_PER_KVB)
+    rolling_min_fee.max(min_relay_fee)
 }
 
 /// `estimatesmartfee`'s `options.fee_rate_estimator` (Core 32.1).
@@ -1864,8 +1856,8 @@ mod tests {
     }
 
     #[test]
-    fn estimate_floor_is_the_highest_of_rolling_relay_and_one_sat_per_vb() {
-        assert_eq!(estimate_floor_sat_per_kvb(0, 100), ESTIMATE_FLOOR_SAT_PER_KVB);
+    fn estimate_floor_is_the_higher_of_rolling_and_relay() {
+        assert_eq!(estimate_floor_sat_per_kvb(0, 100), 100);
         assert_eq!(estimate_floor_sat_per_kvb(0, 2_500), 2_500);
         assert_eq!(estimate_floor_sat_per_kvb(7_000, 2_500), 7_000);
     }
@@ -2163,11 +2155,28 @@ mod tests {
     fn a_history_below_the_floor_is_floored_and_says_so() {
         let pool = empty_pool();
         let est = FeeEstimator::new();
-        est.record_block(&[100; 50]); // 0.1 sat/vB, below 1 sat/vB
+        est.record_block(&[100; 50]); // 0.1 sat/vB, below this pool's 1 sat/vB relay floor
         let a = estimate_smart_fee(&pool, &est, 6, EstimateMode::Historical, FeeRateEstimator::Auto, false)
             .unwrap();
-        assert_eq!(a.feerate_sat_per_kvb, ESTIMATE_FLOOR_SAT_PER_KVB);
+        assert_eq!(a.feerate_sat_per_kvb, 1_000);
         assert_eq!(a.estimator, EstimateSource::Floor);
+    }
+
+    /// At the default relay floor (0.1 sat/vB) a history of sub-1 sat/vB
+    /// blocks answers itself: no 1 sat/vB floor sits on top, as in Core.
+    #[test]
+    fn a_sub_one_sat_per_vb_history_is_quoted_at_the_default_relay_floor() {
+        let pool = crate::mempool::pool::Mempool::new(300_000_000, crate::mempool::policy::DEFAULT_MIN_RELAY_FEE_RATE);
+        let est = FeeEstimator::new();
+        for _ in 0..6 {
+            est.record_block(&[120; 50]); // 0.12 sat/vB
+        }
+        for mode in [EstimateMode::Historical, EstimateMode::Blend] {
+            let a = estimate_smart_fee(&pool, &est, 6, mode, FeeRateEstimator::Auto, false).unwrap();
+            assert_eq!(a.feerate_sat_per_kvb, 120, "{mode:?}");
+            assert_eq!(a.estimator, EstimateSource::BlockPolicy, "{mode:?}");
+        }
+        assert_eq!(pool.fee_estimate_floor(), 100);
     }
 
     // ---- the default (fee plan F8) ----

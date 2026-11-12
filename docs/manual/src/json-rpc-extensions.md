@@ -81,8 +81,9 @@ six-block window is kept in `fees/mempool_health.dat` across restarts, and
 cleared when no mempool comes back at startup (`-persistmempool=0`, or no
 `mempool.dat`), so the estimator waits for six new blocks, as Core's does.
 
-Every answer is floored at the rolling mempool minimum, `-minrelaytxfee` and 1
-sat/vB, whichever is highest. Four things differ from Core: an unknown
+Every answer is floored at the rolling mempool minimum or `-minrelaytxfee`
+(0.1 sat/vB by default), whichever is higher, as in Core 32, so a quiet
+market can quote less than 1 sat/vB. Four things differ from Core: an unknown
 `fee_rate_estimator` value means `auto` rather than an error, an unknown key in
 `options` is ignored rather than refused, `estimator` is on every answer and
 can be `floor`, meaning the floor set the number, and `mempool_health` reports

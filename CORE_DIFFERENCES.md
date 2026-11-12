@@ -512,8 +512,8 @@ preserved; the satd extension is opt-in per request or per flag.
     as for unknown values.
   - `estimator` accompanies every `feerate`, not only under `auto`, and can
     be `floor`: the estimate was below the floor (the rolling mempool
-    minimum, `-minrelaytxfee`, and 1 sat/vB, which Core does not have), so
-    the floor set the number. Core names only `block_policy` or
+    minimum or `-minrelaytxfee`, whichever is higher, as in Core), so the
+    floor set the number. Core names only `block_policy` or
     `mempool_policy`.
   - `verbosity` 2 adds `mempool_health` (`healthy`, `insufficient_data` or
     `low_coverage`) beside Core's `mempool_health_statistics`: the verdict
