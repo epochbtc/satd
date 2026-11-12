@@ -832,8 +832,9 @@ pub fn default_rate(
 ///
 /// `Blend` is the default ([`default_rate`]) with `near` from [`near_rate`]
 /// read with the same `conservative`; `Historical` is the history answer alone; `Mempool` the
-/// simulator alone. With nothing to answer from, the min-relay floor at
-/// `Confidence::Low`.
+/// simulator alone. With nothing to answer from, the floor at
+/// `Confidence::Low`, and so is a floored answer of 0 (a zero floor,
+/// `-minrelaytxfee=0`), which Core reports as no estimate.
 pub fn resolve_target(
     mempool_est: &MempoolEstimate,
     fee_estimator: &FeeEstimator,
@@ -843,7 +844,7 @@ pub fn resolve_target(
     conservative: bool,
     floor_sat_per_kvb: u64,
 ) -> (u64, Confidence, bool) {
-    match mode {
+    let answer = match mode {
         EstimateMode::Historical => match history_rate(fee_estimator, target, conservative) {
             Some(h) => (h.max(floor_sat_per_kvb), Confidence::Medium, false),
             None => (floor_sat_per_kvb, Confidence::Low, true),
@@ -861,6 +862,10 @@ pub fn resolve_target(
             }
             Some((_, EstimateSource::Floor)) | None => (floor_sat_per_kvb, Confidence::Low, true),
         },
+    };
+    match answer {
+        (0, _, _) => (0, Confidence::Low, true),
+        a => a,
     }
 }
 
@@ -1089,6 +1094,13 @@ pub fn estimate_smart_fee(
         } else {
             (raw, EstimateSource::MempoolPolicy)
         };
+        // Core answers a floored 0 (`-minrelaytxfee=0`) as no feerate found.
+        if feerate_sat_per_kvb == 0 {
+            return Err(SmartFeeError {
+                blocks: MEMPOOL_POLICY_TARGET,
+                reason: SmartFeeReason::Static(INSUFFICIENT_DATA),
+            });
+        }
         return Ok(SmartFeeAnswer {
             feerate_sat_per_kvb,
             blocks: MEMPOOL_POLICY_TARGET,
@@ -1127,6 +1139,10 @@ pub fn estimate_smart_fee(
     } else {
         (raw, source)
     };
+    // Core answers a floored 0 (`-minrelaytxfee=0`) as no feerate found.
+    if feerate_sat_per_kvb == 0 {
+        return Err(insufficient());
+    }
     Ok(SmartFeeAnswer {
         feerate_sat_per_kvb,
         blocks: target,
@@ -1142,7 +1158,9 @@ pub fn estimate_smart_fee(
 /// `near` is the mempool side of the default ([`near_rate`], read with the
 /// same `conservative`), `None` while the health gate fails. `conservative`
 /// is Core's estimate mode: only the `estimatefees` RPC sets it.
-/// `floor_sat_per_kvb` is the min-relay floor (`min_fee_rate`, ≥ 1000).
+/// `floor_sat_per_kvb` is the estimate floor (`Mempool::fee_estimate_floor`:
+/// the rolling minimum or `-minrelaytxfee`, 0 when both are); a target
+/// whose answer is 0 is `Confidence::Low`, no estimate.
 pub fn smart_fees(
     snapshot: Vec<(Txid, MempoolEntry)>,
     fee_estimator: &FeeEstimator,
@@ -2160,6 +2178,41 @@ mod tests {
             .unwrap();
         assert_eq!(a.feerate_sat_per_kvb, 1_000);
         assert_eq!(a.estimator, EstimateSource::Floor);
+    }
+
+    /// With `-minrelaytxfee=0` the floor is 0, and an estimate of 0 is no
+    /// estimate, as in Core (`rpc/fees.cpp` errors on a zero feerate): an
+    /// error on `estimatesmartfee`, `Confidence::Low` on the other surfaces.
+    #[test]
+    fn a_zero_estimate_under_a_zero_floor_is_no_estimate() {
+        let pool = crate::mempool::pool::Mempool::new(300_000_000, 0);
+        assert_eq!(pool.fee_estimate_floor(), 0);
+        let est = FeeEstimator::new();
+        for _ in 0..6 {
+            est.record_block(&[0; 50]); // free transactions
+        }
+        for (mode, fre) in [
+            (EstimateMode::Historical, FeeRateEstimator::Auto),
+            (EstimateMode::Blend, FeeRateEstimator::Auto),
+            (EstimateMode::Blend, FeeRateEstimator::BlockPolicy),
+            (EstimateMode::Blend, FeeRateEstimator::MempoolPolicy),
+        ] {
+            let e = estimate_smart_fee(&pool, &est, 6, mode, fre, false);
+            assert!(e.is_err(), "{mode:?} {fre:?}: {e:?}");
+        }
+        let snap = est.cached_mempool_estimate(&pool);
+        for mode in [EstimateMode::Historical, EstimateMode::Blend, EstimateMode::Mempool] {
+            let (r, c, _) = resolve_target(&snap, &est, Some(0), 6, mode, false, 0);
+            assert_eq!((r, c), (0, Confidence::Low), "{mode:?}");
+        }
+        // A real answer under the same zero floor is still an answer.
+        let est = FeeEstimator::new();
+        for _ in 0..6 {
+            est.record_block(&[120; 50]);
+        }
+        let a = estimate_smart_fee(&pool, &est, 6, EstimateMode::Historical, FeeRateEstimator::Auto, false)
+            .unwrap();
+        assert_eq!(a.feerate_sat_per_kvb, 120);
     }
 
     /// At the default relay floor (0.1 sat/vB) a history of sub-1 sat/vB
