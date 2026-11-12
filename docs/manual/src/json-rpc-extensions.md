@@ -81,24 +81,60 @@ six-block window is kept in `fees/mempool_health.dat` across restarts, and
 cleared when no mempool comes back at startup (`-persistmempool=0`, or no
 `mempool.dat`), so the estimator waits for six new blocks, as Core's does.
 
-Every answer is floored at the rolling mempool minimum, `-minrelaytxfee` and 1
-sat/vB, whichever is highest. Four things differ from Core: an unknown
+Every answer is floored at the rolling mempool minimum or `-minrelaytxfee`
+(0.1 sat/vB by default), whichever is higher, as in Core 32, so a quiet
+market can quote less than 1 sat/vB. Four things differ from Core: an unknown
 `fee_rate_estimator` value means `auto` rather than an error, an unknown key in
 `options` is ignored rather than refused, `estimator` is on every answer and
 can be `floor`, meaning the floor set the number, and `mempool_health` reports
-the health verdict. See
-`CORE_DIFFERENCES.md`.
+the health verdict. `auto` also combines the two estimators differently, as
+described next. See `CORE_DIFFERENCES.md`.
 
-The mode argument accepts Core's `economical` / `conservative` / `unset`
-vocabulary, all of which use the history estimator. It also accepts satd's
-own `historical` / `mempool` / `blend` values, which select the source when
-`fee_rate_estimator` is `auto`.
+### The default estimate
+
+Under `auto` with Core's `economical` / `conservative` / `unset`, or satd's
+`blend`, the answer combines the two estimators:
+
+- **1 and 2 blocks**, while the health gate passes: the `mempool_policy`
+  answer, the template percentile, or the floor when the queue does not fill
+  that much of a block. It follows the queue as it is now.
+- **Every other target**, and every target while the gate fails: the
+  `block_policy` answer, held at or below the 2-block answer, so a longer wait
+  never costs more.
+- **`conservative`** never answers below `block_policy` at the same target.
+- A target with no history while the mempool side answers gets the floor,
+  where Core answers its block policy error.
+
+`block_policy` is satd's chain-history estimator. For each block it keeps the
+**hurdle**, the feerate at the 10th percentile of the block's weight over
+transactions paying at least the relay floor: roughly what it took to get into
+that block. It keeps the last 3,200 blocks' hurdles, in memory and in
+`fees/fee_history.dat`. For a target of N blocks, each run of N blocks is a
+window whose outcome is its lowest hurdle. The estimate keeps the windows that
+began in a fee market like today's (the median hurdle of the few blocks before
+them within ×1.25 of the recent median, and at least the 200 closest) and takes
+a high quantile of their outcomes: 99.9% at 1 block, then 95% (`economical`)
+or 99% (`conservative`). This is the analog-window method of
+[rbitcoin](https://github.com/reardencode/rbitcoin)'s fee estimator
+(`docs/mempool-fee-estimation.md`), reimplemented. Until a target has 2,000
+windows it takes a plain quantile over the windows it has, and before it has
+one, a fixed percentile of recent confirmed feerates. The health gate and the
+template percentile are Bitcoin Core 32's (`mempool_policy` above).
+
+Core 32.1's `auto` answers the lower of its two estimators at every target, so
+its mempool side can only lower an estimate. satd's sets the 1- and 2-block
+answer, up or down.
+
+satd's `historical` mode is `block_policy` alone and `mempool` is satd's
+ungated mempool simulator, under `auto`.
 
 satd also adds an `estimatefees [targets] [mode]` method (default mode
-`blend`, default targets `[1, 3, 6, 12, 24]`). It simulates the next N
-block templates from the current mempool, with ancestor-feerate
-(CPFP-aware) package sorting. It never hard-errors; it always returns a
-result. The response maps each target to a `{feerate, confidence}` pair,
+`blend`, default targets `[1, 3, 6, 12, 24]`). In `blend` mode it answers the
+default estimate (economical) for every target, the same numbers as Esplora
+`/fee-estimates`, Electrum `blockchain.estimatefee`, the MCP fee tool and the
+status page. In `mempool` mode it simulates the next N block templates from the
+current mempool, with ancestor-feerate (CPFP-aware) package sorting. It never
+hard-errors; it always returns a result. The response maps each target to a `{feerate, confidence}` pair,
 where `confidence` is `high | medium | low`, and includes a feerate
 histogram. This is the basis for Core's
 [#11500](https://github.com/bitcoin/bitcoin/issues/11500).

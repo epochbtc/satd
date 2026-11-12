@@ -1190,22 +1190,26 @@ pub fn estimatefee(state: &ElectrumState, params: Value) -> Result<Value, JsonRp
     let sf = node::mempool::estimate::smart_fees_from_estimate(
         &est,
         &state.fee_estimator,
+        node::mempool::estimate::near_rate(&state.mempool, &state.fee_estimator, false),
         &[target],
         node::mempool::estimate::EstimateMode::Blend,
+        false,
         floor_sat_per_kvb,
     );
-    // Electrum convention: `-1` signals "no estimate available". Emit it only
-    // on a cold node — no mempool signal (thin) *and* no historical data.
-    // Otherwise return the blended estimate in BTC/kB.
-    if sf.thin_block && state.fee_estimator.estimate_fee(target).is_none() {
-        return Ok(json!(-1.0));
+    Ok(json!(estimatefee_answer(&sf)))
+}
+
+/// `blockchain.estimatefee`'s answer in BTC/kB for the one target in `sf`,
+/// or Electrum's `-1` ("no estimate available") when the default had
+/// nothing to answer from (no mempool side and no history), which
+/// `resolve_target` reports as `Confidence::Low`.
+fn estimatefee_answer(sf: &node::mempool::estimate::SmartFees) -> f64 {
+    match sf.targets.first() {
+        Some(t) if t.confidence != node::mempool::estimate::Confidence::Low => {
+            sat_per_kvb_to_btc_per_kb(t.feerate_sat_per_kvb)
+        }
+        _ => -1.0,
     }
-    let sat_per_kvb = sf
-        .targets
-        .first()
-        .map(|t| t.feerate_sat_per_kvb)
-        .unwrap_or(floor_sat_per_kvb);
-    Ok(json!(sat_per_kvb_to_btc_per_kb(sat_per_kvb)))
 }
 
 pub fn relayfee(state: &ElectrumState) -> Result<Value, JsonRpcError> {
@@ -1342,6 +1346,35 @@ mod tests {
     fn fee_histogram_empty_input_yields_empty_output() {
         let buckets = fee_histogram_buckets(&[]);
         assert!(buckets.is_empty());
+    }
+
+    fn answer_for(near: Option<u64>, fee_estimator: &node::mempool::fee::FeeEstimator, target: u32) -> f64 {
+        use node::mempool::estimate::{
+            EstimateMode, MAX_SIM_DEPTH, estimate_from_mempool, smart_fees_from_estimate,
+        };
+        let est = estimate_from_mempool(Vec::new(), MAX_SIM_DEPTH);
+        estimatefee_answer(&smart_fees_from_estimate(
+            &est,
+            fee_estimator,
+            near,
+            &[target],
+            EstimateMode::Blend,
+            false,
+            1_000,
+        ))
+    }
+
+    /// `-1` only when nothing answers: a cold node, or a deep target with no
+    /// history yet. The mempool side or any history gives a rate.
+    #[test]
+    fn estimatefee_is_minus_one_only_without_an_estimate() {
+        let cold = node::mempool::fee::FeeEstimator::new();
+        assert_eq!(answer_for(None, &cold, 2), -1.0);
+        assert_eq!(answer_for(Some(20_000), &cold, 25), -1.0, "no history at 25 blocks");
+        assert!((answer_for(Some(20_000), &cold, 2) - 0.0002).abs() < 1e-12);
+        let warm = node::mempool::fee::FeeEstimator::new();
+        warm.record_block(&[5_000; 50]);
+        assert!((answer_for(None, &warm, 25) - 0.00005).abs() < 1e-12);
     }
 
     #[test]

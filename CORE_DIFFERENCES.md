@@ -491,18 +491,18 @@ preserved; the satd extension is opt-in per request or per flag.
   Default error shape stays Core-compat. Category schema is
   `STABILITY_POLICY.md` Tier 2.
 
-- **`estimatefees` mempool-aware mode** — alongside the historical
-  Core-shape `estimatesmartfee`, the
-  `estimatefees` RPC simulates next-N block templates from the current
-  mempool with CPFP-aware sorting, and never errors — always returns a
-  `confidence: low|medium|high` field. Closes Core's
+- **`estimatefees` multi-target fees** — alongside the Core-shape
+  `estimatesmartfee`, the `estimatefees` RPC answers several targets at once
+  from the default estimate (`blend`), or in `mempool` mode simulates next-N
+  block templates from the current mempool with CPFP-aware sorting, and
+  never errors — always returns a `confidence: low|medium|high` field. Closes Core's
   [#11500](https://github.com/bitcoin/bitcoin/issues/11500).
 
-- **`estimatesmartfee` in Core 32.1's shape, with four departures, and an interim `auto`.** The
+- **`estimatesmartfee` in Core 32.1's shape, with five departures.** The
   arguments, the `options` type checks (`fee_rate_estimator` a string,
   `verbosity` a number), `blocks` (target 1 answered for 2, `mempool_policy`
   always 2), the floors and the no-data `errors` answer follow Core 32.1.
-  Three things do not:
+  Four things do not, and `auto` (below) is the fifth:
   - An unknown `fee_rate_estimator` value, `none` and the empty string
     included, means `auto`. Core refuses it with `-8 Invalid
     fee_rate_estimator parameter`. A client written against another
@@ -512,8 +512,8 @@ preserved; the satd extension is opt-in per request or per flag.
     as for unknown values.
   - `estimator` accompanies every `feerate`, not only under `auto`, and can
     be `floor`: the estimate was below the floor (the rolling mempool
-    minimum, `-minrelaytxfee`, and 1 sat/vB, which Core does not have), so
-    the floor set the number. Core names only `block_policy` or
+    minimum or `-minrelaytxfee`, whichever is higher, as in Core), so the
+    floor set the number. Core names only `block_policy` or
     `mempool_policy`.
   - `verbosity` 2 adds `mempool_health` (`healthy`, `insufficient_data` or
     `low_coverage`) beside Core's `mempool_health_statistics`: the verdict
@@ -529,13 +529,17 @@ preserved; the satd extension is opt-in per request or per flag.
   own format rather than Core's `fees/mempool_policy_estimator.dat`. As in
   Core, the window is cleared when no mempool comes back at startup
   (`-persistmempool=0`, or no `mempool.dat`).
-  `auto` does not yet combine the two as Core's does (Core answers the lower
-  of the two estimates, falling back to block policy). Until satd's estimator
-  rework sets the combination, `auto` with Core's estimate modes is the
-  history estimator alone. It can therefore quote higher than a Core node,
-  never lower, and under `auto` `estimator` is never `mempool_policy`.
+  `auto` combines the two differently from Core. Core answers the lower of
+  the two at every target, so its mempool side can only lower an estimate.
+  satd answers `mempool_policy` for 1 and 2 blocks while the health gate
+  passes, also when it is above `block_policy`, and `block_policy` for every
+  other target (held at or below the 2-block answer) and while the gate
+  fails; `conservative` never goes below `block_policy` at the same target.
+  A deeper target with no history yet answers the floor while the mempool
+  side answers, where Core answers its block policy error.
   satd's own `estimate_mode` values `historical`, `mempool` and `blend` are
-  still accepted, and select the source under `auto`.
+  still accepted, and select the source under `auto` (`blend` is the
+  default above).
 
 - **Structured-JSON logs** — `--log-format=json|text`. Default text for
   humans, json for production. Stable field schema, trace IDs on the

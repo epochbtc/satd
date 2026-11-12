@@ -182,8 +182,10 @@ pub async fn fee_estimates(
     let sf = node::mempool::estimate::smart_fees_from_estimate(
         &est,
         &state.fee_estimator,
+        node::mempool::estimate::near_rate(&state.mempool, &state.fee_estimator, false),
         FEE_TARGETS,
         node::mempool::estimate::EstimateMode::Blend,
+        false,
         floor_sat_per_kvb,
     );
     Ok(Json(Value::Object(fee_estimates_map(&sf))))
@@ -193,11 +195,11 @@ pub async fn fee_estimates(
 /// has an estimate for.
 ///
 /// In blend mode a `Confidence::Low` target is exactly one with no estimate:
-/// the mempool simulation had nothing at that depth and there is no
-/// confirmed-block fee history, so `resolve_target` fell back to the relay
-/// floor. That is the state of a node in IBD or just started, and reporting
-/// the floor there tells a wallet the relay minimum will do for every target
-/// when the node knows nothing. Upstream Esplora leaves out a target
+/// the default had no history for that depth (and, at 1-2 blocks, no
+/// mempool side either, the health gate failing), so `resolve_target` fell
+/// back to the relay floor. That is the state of a node in IBD or just
+/// started, and reporting the floor there tells a wallet the relay minimum
+/// will do for every target when the node knows nothing. Upstream Esplora leaves out a target
 /// bitcoind cannot estimate (`estimatesmartfee` errors) and answers `{}`
 /// when it can estimate none; satd does the same. Without fee history the
 /// floored targets are the deepest ones, so the monotone clamp never

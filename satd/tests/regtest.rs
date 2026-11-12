@@ -2072,16 +2072,22 @@ fn estimatesmartfee_has_cores_32_1_shape() {
         assert_eq!(smartfee_keys(&r), keyset(&["feerate", "estimator", "blocks"]), "{r}");
         assert_eq!(r["blocks"], 2, "{r}");
         assert_eq!(r["estimator"], "floor", "{r}");
-        assert!(r["feerate"].as_f64().unwrap() >= 0.00001, "floored at 1 sat/vB: {r}");
+        assert!(r["feerate"].as_f64().unwrap() >= 0.000001, "floored at the 0.1 sat/vB relay minimum: {r}");
     }
 
     // block_policy with no history: Core's no-data answer.
     let r = call(&mut node, vec![json!(6), json!("conservative"), json!({"fee_rate_estimator": "block_policy"})]);
     assert_eq!(smartfee_keys(&r), keyset(&["errors", "blocks"]), "{r}");
 
+    // The default with a healthy mempool side and no history: the floor
+    // answers a deeper target, where Core answers its block policy error.
+    let r = call(&mut node, vec![json!(6), json!("economical")]);
+    assert_eq!(smartfee_keys(&r), keyset(&["feerate", "estimator", "blocks"]), "{r}");
+    assert_eq!(r["estimator"], "floor", "{r}");
+
     // verbosity 2 adds Core's health statistics, newest first, and satd's
     // verdict over them, on either kind of answer; verbosity 1 does not.
-    let r = call(&mut node, vec![json!(6), json!(null), json!({"verbosity": 2})]);
+    let r = call(&mut node, vec![json!(6), json!(null), json!({"verbosity": 2, "fee_rate_estimator": "block_policy"})]);
     assert_eq!(
         smartfee_keys(&r),
         keyset(&["errors", "blocks", "mempool_health_statistics", "mempool_health"])
@@ -2100,7 +2106,7 @@ fn estimatesmartfee_has_cores_32_1_shape() {
         smartfee_keys(&r),
         keyset(&["feerate", "estimator", "blocks", "mempool_health_statistics", "mempool_health"])
     );
-    let r = call(&mut node, vec![json!(6), json!(null), json!({"verbosity": 1})]);
+    let r = call(&mut node, vec![json!(6), json!(null), json!({"verbosity": 1, "fee_rate_estimator": "block_policy"})]);
     assert_eq!(smartfee_keys(&r), keyset(&["errors", "blocks"]));
 
     // `options` by name, as Core's named-parameter table has it.
@@ -2219,12 +2225,14 @@ fn estimatesmartfee_ignores_an_unknown_options_key() {
         Some(6),
         "verbosity beside it still applies: {r}"
     );
-    // On its own, an unknown key leaves the default answer.
+    // On its own, an unknown key leaves the default answer: with a healthy
+    // mempool side and no history, the floor.
     let resp = node
         .rpc_call_with_params("estimatesmartfee", vec![json!(6), json!(null), json!({"foo": 1})])
         .unwrap();
     assert!(resp["error"].is_null(), "{resp}");
-    assert_eq!(smartfee_keys(&resp["result"]), keyset(&["errors", "blocks"]), "{resp}");
+    assert_eq!(smartfee_keys(&resp["result"]), keyset(&["feerate", "estimator", "blocks"]), "{resp}");
+    assert_eq!(resp["result"]["estimator"], "floor", "{resp}");
     node.stop();
 }
 

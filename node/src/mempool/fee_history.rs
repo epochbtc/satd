@@ -187,6 +187,15 @@ impl HurdleHistory {
         self.table[idx]
     }
 
+    /// The estimate at the deepest target at or below `target` that has a
+    /// window: the lowest the store answers for any target up to `target`
+    /// (the table is monotone). `None` when no target up to it has one.
+    pub fn deepest_estimate_up_to(&self, target: u32) -> Option<HistoryEstimate> {
+        let target = target.clamp(1, MAX_TARGET);
+        let idx = LADDER.iter().rposition(|&t| t <= target)?;
+        self.table[..=idx].iter().rev().find_map(|e| *e)
+    }
+
     /// Bring the rows in line with the active chain, then read up to
     /// `backfill_budget` older blocks below the oldest row. Returns `true`
     /// when there is more backfill to do.
