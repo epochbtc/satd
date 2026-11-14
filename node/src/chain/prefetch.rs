@@ -14,7 +14,7 @@ use crate::storage::flatfile::FlatFilePos;
 use crate::storage::opreturn_strip::{self, StoredBlock};
 use crate::chain::replay_plan::ReplayPlan;
 use crate::storage::Store;
-use crate::validation::script::{ConsensusVerifier, PrimaryEngine, RustVerifier, ScriptVerifier};
+use crate::validation::script::{ConsensusVerifier, PrimaryEngine, RustVerifier, ScriptContext, ScriptVerifier};
 use crate::validation::tx::check_transaction;
 
 /// A block that has been pre-read, deserialized, and partially validated
@@ -246,7 +246,7 @@ pub fn prefetch_block(
             })
             .collect();
 
-        verify_speculatively(&verifiable, primary_engine, network, height, cancel)
+        verify_speculatively(&verifiable, primary_engine, network, ScriptContext::block(height, hash), cancel)
     };
 
     Some(PreprocessedBlock {
@@ -273,7 +273,7 @@ fn verify_speculatively(
     verifiable: &[(usize, &Transaction, Vec<TxOut>)],
     primary_engine: PrimaryEngine,
     network: bitcoin::Network,
-    height: u32,
+    at: ScriptContext,
     cancel: &AtomicBool,
 ) -> HashSet<usize> {
     if verifiable.is_empty() {
@@ -298,10 +298,10 @@ fn verify_speculatively(
                             !cancel.load(Ordering::Relaxed)
                                 && match primary_engine {
                                     PrimaryEngine::Cpp => ConsensusVerifier::new(network)
-                                        .verify_transaction(tx, prev_outputs, height)
+                                        .verify_transaction(tx, prev_outputs, at)
                                         .is_ok(),
                                     PrimaryEngine::Rust => RustVerifier::new(network)
-                                        .verify_transaction(tx, prev_outputs, height)
+                                        .verify_transaction(tx, prev_outputs, at)
                                         .is_ok(),
                                 }
                         })
@@ -560,13 +560,13 @@ mod tests {
 
         let running = AtomicBool::new(false);
         assert_eq!(
-            verify_speculatively(&verifiable, PrimaryEngine::Rust, network, 1, &running),
+            verify_speculatively(&verifiable, PrimaryEngine::Rust, network, ScriptContext::unmined(1), &running),
             HashSet::from([1]),
             "fixture: the transaction must verify when not cancelled"
         );
         let stopped = AtomicBool::new(true);
         assert!(
-            verify_speculatively(&verifiable, PrimaryEngine::Rust, network, 1, &stopped).is_empty(),
+            verify_speculatively(&verifiable, PrimaryEngine::Rust, network, ScriptContext::unmined(1), &stopped).is_empty(),
             "a cancelled verification must verify nothing"
         );
     }

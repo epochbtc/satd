@@ -55,7 +55,7 @@ fn naming_runs_only_the_failing_input() {
     let (tx, prevs) = p2wsh_spend(&[script(OP_0.to_u8()), script(OP_RETURN.to_u8())]);
     let cpp = ConsensusVerifier::new(Network::Regtest);
     let coarse = ScriptError::VerifyFailed { input: 1, reason: "ERR_SCRIPT".into() };
-    let named = cpp.name_failure(&tx, &prevs, HEIGHT, coarse);
+    let named = cpp.name_failure(&tx, &prevs, ScriptContext::unmined(HEIGHT), coarse);
     assert_eq!(named.input(), 1);
     assert_eq!(named.reason(), OP_RETURN_HIT);
 }
@@ -66,19 +66,19 @@ fn naming_runs_only_the_failing_input() {
 fn verify_transaction_names_the_failure() {
     let (tx, prevs) = p2wsh_spend(&[script(OP_PUSHNUM_1.to_u8()), script(OP_RETURN.to_u8())]);
     let err = ConsensusVerifier::new(Network::Regtest)
-        .verify_transaction(&tx, &prevs, HEIGHT)
+        .verify_transaction(&tx, &prevs, ScriptContext::unmined(HEIGHT))
         .expect_err("input 1 fails");
     assert_eq!((err.input(), err.reason()), (1, OP_RETURN_HIT));
 
     let (tx, prevs) = p2wsh_spend(&[script(OP_0.to_u8())]);
     let err = ConsensusVerifier::new(Network::Regtest)
-        .verify_transaction(&tx, &prevs, HEIGHT)
+        .verify_transaction(&tx, &prevs, ScriptContext::unmined(HEIGHT))
         .expect_err("input 0 fails");
     assert_eq!((err.input(), err.reason()), (0, EVAL_FALSE));
 
     let (tx, prevs) = p2wsh_spend(&[script(OP_PUSHNUM_1.to_u8())]);
     ConsensusVerifier::new(Network::Regtest)
-        .verify_transaction(&tx, &prevs, HEIGHT)
+        .verify_transaction(&tx, &prevs, ScriptContext::unmined(HEIGHT))
         .expect("a true script passes");
 }
 
@@ -99,13 +99,13 @@ fn the_unnamed_verify_leaves_the_name_for_later() {
     let verifiers: [(&str, &dyn ScriptVerifier); 2] =
         [("cpp", &ConsensusVerifier::new(Network::Regtest)), ("rust-shadow", &shadow)];
     for (name, v) in verifiers {
-        let err = v.verify_transaction_unnamed(&tx, &prevs, HEIGHT).expect_err("input 1 fails");
+        let err = v.verify_transaction_unnamed(&tx, &prevs, ScriptContext::unmined(HEIGHT)).expect_err("input 1 fails");
         assert_eq!(err.input(), 1, "{name}");
         assert_eq!(err.reason(), "ERR_SCRIPT", "{name}: named under the caller's lock");
-        let named = v.name_failure(&tx, &prevs, HEIGHT, err);
+        let named = v.name_failure(&tx, &prevs, ScriptContext::unmined(HEIGHT), err);
         assert_eq!((named.input(), named.reason()), (1, OP_RETURN_HIT), "{name}");
 
-        v.verify_transaction_unnamed(&p2wsh_spend(&[script(OP_PUSHNUM_1.to_u8())]).0, &prevs[..1], HEIGHT)
+        v.verify_transaction_unnamed(&p2wsh_spend(&[script(OP_PUSHNUM_1.to_u8())]).0, &prevs[..1], ScriptContext::unmined(HEIGHT))
             .expect("a true script passes");
     }
 }

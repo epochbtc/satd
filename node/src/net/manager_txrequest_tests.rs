@@ -479,7 +479,7 @@ impl crate::validation::script::ScriptVerifier for StrippedFails {
         &self,
         tx: &bitcoin::Transaction,
         _prev_outputs: &[bitcoin::TxOut],
-        _height: u32,
+        _at: crate::validation::script::ScriptContext,
     ) -> Result<(), crate::validation::script::ScriptError> {
         Self::check(tx)
     }
