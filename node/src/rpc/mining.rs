@@ -4,7 +4,7 @@ use crate::mining::template::create_template;
 use crate::storage::blockindex::{sub_u256, target_to_difficulty, u256_to_f64};
 use crate::rpc::util::univalue_double;
 use crate::storage::blockindex::BlockStatus;
-use crate::validation::pow::RETARGET_INTERVAL;
+use crate::validation::pow::difficulty_adjustment_interval;
 use serde_json::{json, Value};
 
 /// Core's `RPC_DESERIALIZATION_ERROR`.
@@ -520,18 +520,6 @@ pub fn get_network_hash_ps(
 
     let work = u256_to_f64(&sub_u256(&pb.chainwork, &pb0.chainwork));
     Ok(work / f64::from(max_time - min_time))
-}
-
-/// Core's `DifficultyAdjustmentInterval()`: `nPowTargetTimespan /
-/// nPowTargetSpacing`. Two weeks of ten-minute blocks (2016) everywhere but
-/// regtest, whose timespan is one day (144, `chainparams.cpp`). Regtest never
-/// retargets, but `getnetworkhashps -1` still measures its window in these
-/// units.
-fn difficulty_adjustment_interval(network: bitcoin::Network) -> u32 {
-    match network {
-        bitcoin::Network::Regtest => 144,
-        _ => RETARGET_INTERVAL,
-    }
 }
 
 /// Handle `getblocktemplate` in proposal mode (BIP 22/23).
