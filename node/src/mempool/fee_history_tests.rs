@@ -573,3 +573,15 @@ fn a_flat_fallback_never_rises_above_a_shorter_analog_answer() {
     };
     assert!(ask(144, FeeRateEstimator::Auto) >= ask(144, FeeRateEstimator::BlockPolicy));
 }
+
+/// `conservative` takes 97.5% of the window outcomes, `economical` 95%.
+/// Hurdles 1000, 1001, … make the outcome of each 2-block window its first
+/// hurdle: 1003..=1401 after the 3-block lookback, 399 outcomes. 97.5% sits
+/// at position 388.05 (1391, where 99% would give 1397), 95% at 378.1 (1381).
+#[test]
+fn conservative_takes_the_97_5th_percentile_of_outcomes() {
+    let hurdles: Vec<u64> = (0..403).map(|i| 1_000 + i).collect();
+    let e = estimate_from_hurdles(&hurdles, 2).expect("399 windows");
+    assert_eq!(e.source, HistorySource::Plain);
+    assert_eq!((e.economical, e.conservative), (1_381, 1_391));
+}

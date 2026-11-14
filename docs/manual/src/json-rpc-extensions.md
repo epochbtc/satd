@@ -114,7 +114,7 @@ window whose outcome is its lowest hurdle. The estimate keeps the windows that
 began in a fee market like today's (the median hurdle of the few blocks before
 them within ×1.25 of the recent median, and at least the 200 closest) and takes
 a high quantile of their outcomes: 99.9% at 1 block, then 95% (`economical`)
-or 99% (`conservative`). This is the analog-window method of
+or 97.5% (`conservative`). This is the analog-window method of
 [rbitcoin](https://github.com/reardencode/rbitcoin)'s fee estimator
 (`docs/mempool-fee-estimation.md`), reimplemented. Until a target has 2,000
 windows it takes a plain quantile over the windows it has, and before it has
