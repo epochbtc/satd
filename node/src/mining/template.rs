@@ -78,7 +78,8 @@ pub struct BlockTemplate {
 
 /// The earliest timestamp a template for a block at `height` advertises,
 /// as Core's `GetMinimumTime` (src/node/miner.cpp) computes it: one past the
-/// tip's median time past, raised at the first block of a retarget period to
+/// tip's median time past, raised at the first block of a retarget period
+/// (`interval`, Core's `DifficultyAdjustmentInterval()`: 144 on regtest) to
 /// `MAX_TIMEWARP` seconds before the parent (`parent_time`).
 ///
 /// That floor is BIP 94's timewarp rule, which testnet4 enforces (and regtest
@@ -87,10 +88,10 @@ pub struct BlockTemplate {
 /// `mintime` builds a block that passes the rule wherever it is enforced. Without the floor in `mintime`, a testnet4
 /// miner that stamps a retarget block at the advertised `mintime` builds one
 /// that fails `check_difficulty` as a timewarp.
-fn minimum_time(median_time_past: u32, height: u32, parent_time: u32) -> u32 {
-    use crate::validation::pow::{MAX_TIMEWARP, RETARGET_INTERVAL};
+fn minimum_time(median_time_past: u32, height: u32, parent_time: u32, interval: u32) -> u32 {
+    use crate::validation::pow::MAX_TIMEWARP;
     let min_time = median_time_past + 1;
-    if height.is_multiple_of(RETARGET_INTERVAL) {
+    if height.is_multiple_of(interval) {
         min_time.max(parent_time.saturating_sub(MAX_TIMEWARP))
     } else {
         min_time
@@ -298,7 +299,12 @@ fn assemble_template(
     // Saturating keeps the value in range so the future-block check can do its
     // job on it.
     let now = u32::try_from(crate::time::now_secs()).unwrap_or(u32::MAX);
-    let min_time = minimum_time(template_mtp, height, tip_entry.header.time);
+    let min_time = minimum_time(
+        template_mtp,
+        height,
+        tip_entry.header.time,
+        crate::validation::pow::difficulty_adjustment_interval(chain_state.network),
+    );
     let cur_time = std::cmp::max(now, min_time);
 
     // Difficulty for a block at `cur_time` on this tip — the same computation
@@ -789,8 +795,8 @@ pub(crate) mod tests {
     fn minimum_time_is_one_past_the_median_off_a_retarget_height() {
         // Parent stamped far ahead of the median: only a retarget height
         // brings it into play.
-        assert_eq!(minimum_time(1_700_000_000, 2015, 1_700_010_000), 1_700_000_001);
-        assert_eq!(minimum_time(1_700_000_000, 2017, 1_700_010_000), 1_700_000_001);
+        assert_eq!(minimum_time(1_700_000_000, 2015, 1_700_010_000, 2016), 1_700_000_001);
+        assert_eq!(minimum_time(1_700_000_000, 2017, 1_700_010_000, 2016), 1_700_000_001);
     }
 
     #[test]
@@ -802,12 +808,16 @@ pub(crate) mod tests {
         let mtp = 1_700_000_000;
         let parent_time = mtp + 10_000;
         for height in [2016, 4032] {
-            assert_eq!(minimum_time(mtp, height, parent_time), parent_time - 600);
+            assert_eq!(minimum_time(mtp, height, parent_time, 2016), parent_time - 600);
         }
         // The median already above the floor wins.
-        assert_eq!(minimum_time(mtp, 2016, mtp + 300), mtp + 1);
+        assert_eq!(minimum_time(mtp, 2016, mtp + 300, 2016), mtp + 1);
         // A parent stamped before 600 s past the epoch does not underflow.
-        assert_eq!(minimum_time(0, 2016, 100), 1);
+        assert_eq!(minimum_time(0, 2016, 100, 2016), 1);
+        // Regtest's period is 144 blocks: 144 is a period start there and
+        // not on the other networks.
+        assert_eq!(minimum_time(mtp, 144, parent_time, 144), parent_time - 600);
+        assert_eq!(minimum_time(mtp, 144, parent_time, 2016), mtp + 1);
 
         // On testnet4 a block stamped at the advertised minimum passes BIP 94,
         // where one stamped at the median plus one is a timewarp.
@@ -823,7 +833,7 @@ pub(crate) mod tests {
             chainwork: [0u8; 32],
         };
         let mut header = parent_header;
-        header.time = minimum_time(mtp, 2016, parent_time);
+        header.time = minimum_time(mtp, 2016, parent_time, 2016);
         let res = check_difficulty(&header, &parent, Network::Testnet4, |_| None);
         assert!(!matches!(res, Err(ValidationError::TimewarpAttack)), "got {res:?}");
         header.time = mtp + 1;

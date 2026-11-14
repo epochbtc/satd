@@ -16,11 +16,13 @@ const TESTNET_POWLIMIT_BITS: u32 = 0x1d00ffff;
 /// [`check_proof_of_work_bounded`] read it, and signet `nBits` is checked
 /// against the retarget schedule like every chain's, as in Core.
 const SIGNET_POWLIMIT_BITS: u32 = 0x1e0377ae;
-/// Number of blocks between difficulty retargets.
 /// Bitcoin's difficulty adjustment interval, in blocks (Core's
-/// `Consensus::Params::DifficultyAdjustmentInterval()`). The same on every
-/// network satd supports.
+/// `Consensus::Params::DifficultyAdjustmentInterval()`) on every network but
+/// regtest; see [`difficulty_adjustment_interval`].
 pub const RETARGET_INTERVAL: u32 = 2016;
+/// Regtest's difficulty adjustment interval: its `nPowTargetTimespan` is one
+/// day, so 144 ten-minute blocks (Core v28 and later).
+const REGTEST_RETARGET_INTERVAL: u32 = 144;
 /// Target time span for one retarget period (14 days in seconds).
 const TARGET_TIMESPAN: u32 = 14 * 24 * 60 * 60;
 /// Testnet: allow minimum difficulty if block is >20 minutes after previous.
@@ -122,6 +124,18 @@ pub fn check_proof_of_work_bounded(header: &Header, network: Network) -> Result<
     }
 }
 
+/// Core's `DifficultyAdjustmentInterval()`: `nPowTargetTimespan /
+/// nPowTargetSpacing`. Two weeks of ten-minute blocks (2016) everywhere but
+/// regtest, whose timespan is one day (144, `chainparams.cpp`). Regtest never
+/// retargets, but BIP 94's timewarp rule under `-test=bip94`, a template's
+/// `mintime` and `getnetworkhashps -1` all count periods in these units.
+pub fn difficulty_adjustment_interval(network: Network) -> u32 {
+    match network {
+        Network::Regtest => REGTEST_RETARGET_INTERVAL,
+        _ => RETARGET_INTERVAL,
+    }
+}
+
 /// Check that the block's difficulty bits match the expected value for this network.
 /// `get_by_hash` looks up a block index entry by hash; every ancestor the
 /// rules need is reached through `prev`'s parent links.
@@ -159,7 +173,7 @@ where
     // timestamped more than MAX_TIMEWARP before its parent. The seeding
     // change lives in `next_bits`, and only testnet4 retargets.
     if bip94
-        && height.is_multiple_of(RETARGET_INTERVAL)
+        && height.is_multiple_of(difficulty_adjustment_interval(network))
         && header.time < prev.header.time.saturating_sub(MAX_TIMEWARP)
     {
         return Err(ValidationError::TimewarpAttack);
@@ -643,7 +657,8 @@ mod tests {
         let genesis = bitcoin::constants::genesis_block(Network::Regtest);
         let mut prev_header = genesis.header;
         prev_header.time = 1_700_000_000;
-        let prev = entry(prev_header, 2015);
+        // Regtest's period is 144 blocks, so 144 starts one.
+        let prev = entry(prev_header, 143);
 
         let mut new_header = genesis.header;
         new_header.time = prev_header.time - 601;
@@ -653,10 +668,17 @@ mod tests {
         assert!(res.is_ok(), "regtest without -test=bip94 has no timewarp guard: {res:?}");
 
         // Only the first block of a period is guarded.
-        let mut mid = prev.clone();
-        mid.height = 2016;
-        let res = check_difficulty_with(&new_header, &mid, Network::Regtest, true, |_| None);
-        assert!(res.is_ok(), "height 2017 is not a period start: {res:?}");
+        for mid_height in [144, 2014] {
+            let mut mid = prev.clone();
+            mid.height = mid_height;
+            let res = check_difficulty_with(&new_header, &mid, Network::Regtest, true, |_| None);
+            assert!(res.is_ok(), "height {} is not a period start: {res:?}", mid_height + 1);
+        }
+        // 2016 = 14 x 144 starts a period on regtest too.
+        let mut late = prev.clone();
+        late.height = 2015;
+        let res = check_difficulty_with(&new_header, &late, Network::Regtest, true, |_| None);
+        assert!(matches!(res, Err(ValidationError::TimewarpAttack)), "got {res:?}");
         new_header.time = prev_header.time - 600;
         let res = check_difficulty_with(&new_header, &prev, Network::Regtest, true, |_| None);
         assert!(res.is_ok(), "600s before the parent passes: {res:?}");
