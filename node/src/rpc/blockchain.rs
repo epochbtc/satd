@@ -326,29 +326,27 @@ impl crate::validation::versionbits::BlockView for ChainBlockView<'_> {
 }
 
 /// Core's `GetScriptFlagNames(GetBlockScriptFlags(block))`, for the
-/// `script_flags` array.
-///
-/// Core keeps P2SH, WITNESS and TAPROOT on unconditionally (bar two
-/// historical exception blocks) and adds the rest as their buried deployments
-/// become active *at* this block — `DeploymentActiveAt`, i.e. `height >=
-/// activation`, one lower than the `active` field of a deployment entry,
-/// which is `DeploymentActiveAfter`. The names come out sorted because Core
-/// reads them from a `std::map<std::string, …>`.
-fn block_script_flag_names(network: Network, height: u32) -> Vec<&'static str> {
-    let h = crate::validation::script::activation_heights(network);
-    let mut names = vec!["P2SH", "TAPROOT", "WITNESS"];
-    if height >= h.dersig {
-        names.push("DERSIG");
-    }
-    if height >= h.cltv {
-        names.push("CHECKLOCKTIMEVERIFY");
-    }
-    if height >= h.csv {
-        names.push("CHECKSEQUENCEVERIFY");
-    }
-    if height >= h.segwit {
-        names.push("NULLDUMMY");
-    }
+/// `script_flags` array: the flags the block `hash` is checked under (see
+/// [`crate::validation::script::block_script_flags`]). The buried ones come
+/// on *at* their height (`DeploymentActiveAt`, `height >= activation`), one
+/// lower than the `active` field of a deployment entry, which is
+/// `DeploymentActiveAfter`. The names come out sorted because Core reads
+/// them from a `std::map<std::string, …>`.
+fn block_script_flag_names(network: Network, height: u32, hash: &BlockHash) -> Vec<&'static str> {
+    let flags = crate::validation::script::block_script_flags(network, height, hash);
+    let mut names: Vec<&'static str> = [
+        (consensus::VERIFY_P2SH, "P2SH"),
+        (consensus::VERIFY_TAPROOT, "TAPROOT"),
+        (consensus::VERIFY_WITNESS, "WITNESS"),
+        (consensus::VERIFY_DERSIG, "DERSIG"),
+        (consensus::VERIFY_CHECKLOCKTIMEVERIFY, "CHECKLOCKTIMEVERIFY"),
+        (consensus::VERIFY_CHECKSEQUENCEVERIFY, "CHECKSEQUENCEVERIFY"),
+        (consensus::VERIFY_NULLDUMMY, "NULLDUMMY"),
+    ]
+    .into_iter()
+    .filter(|(bit, _)| flags & bit != 0)
+    .map(|(_, name)| name)
+    .collect();
     names.sort_unstable();
     names
 }
@@ -505,7 +503,7 @@ pub fn get_deployment_info(
     Ok(json!({
         "hash": hash.to_string(),
         "height": height,
-        "script_flags": block_script_flag_names(network, height),
+        "script_flags": block_script_flag_names(network, height, &hash),
         "deployments": map,
     }))
 }

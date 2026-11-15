@@ -535,16 +535,16 @@ fn bip30_exempt(network: Network, height: u32, hash: &BlockHash) -> bool {
 }
 
 /// Block-level signature-operation cost for one transaction: Bitcoin Core's
-/// `GetTransactionSigOpCost` (see [`crate::validation::sigops`]). At and
-/// after P2SH activation it counts with `SCRIPT_VERIFY_P2SH |
-/// SCRIPT_VERIFY_WITNESS`, the flags Core's `GetBlockScriptFlags` gives
-/// every block but its exceptions; below it, legacy sigops only (issue #724
-/// tracks that height gate). `prevouts` holds the output each input spends,
-/// in input order; a coinbase's are not read.
-fn transaction_sigop_cost(tx: &Transaction, network: Network, height: u32, prevouts: &[TxOut]) -> u64 {
+/// `GetTransactionSigOpCost` (see [`crate::validation::sigops`]), under the
+/// block's script flags (`block_flags`, Core's `GetBlockScriptFlags`): P2SH
+/// and WITNESS for every block but Core's exceptions. `prevouts` holds the
+/// output each input spends, in input order; a coinbase's are not read.
+fn transaction_sigop_cost(tx: &Transaction, block_flags: u32, prevouts: &[TxOut]) -> u64 {
     use crate::validation::sigops::{self, SigOpFlags};
-    let flags = if height >= crate::validation::script::activation_heights(network).p2sh {
+    let flags = if block_flags & consensus::VERIFY_WITNESS != 0 {
         SigOpFlags::P2shWitness
+    } else if block_flags & consensus::VERIFY_P2SH != 0 {
+        SigOpFlags::P2sh
     } else {
         SigOpFlags::Legacy
     };
@@ -694,6 +694,10 @@ fn connect_block_inner(params: &ConnectParams) -> Result<StoreBatch, ConnectErro
     };
     let block_hash = block.block_hash();
     let is_genesis = height == 0;
+    // Which script flags this block is checked under: Core's
+    // `GetBlockScriptFlags`, which reads the hash for its exceptions.
+    let script_at = crate::validation::script::ScriptContext::block(height, block_hash);
+    let block_flags = script_at.flags(network);
 
     // `time-too-old` and `bad-version`, for every connect path; see
     // `check_header_time_and_version`. Genesis has no parent to compare with.
@@ -1065,7 +1069,7 @@ fn connect_block_inner(params: &ConnectParams) -> Result<StoreBatch, ConnectErro
             // Block sigop-cost accounting for this (non-coinbase) tx, before
             // `prev_outputs` is moved into the verify queue below.
             block_sigops = block_sigops
-                .saturating_add(transaction_sigop_cost(tx, network, height, &prev_outputs));
+                .saturating_add(transaction_sigop_cost(tx, block_flags, &prev_outputs));
             if block_sigops > MAX_BLOCK_SIGOPS_COST {
                 return Err(ConnectError::BadBlockSigops);
             }
@@ -1089,7 +1093,7 @@ fn connect_block_inner(params: &ConnectParams) -> Result<StoreBatch, ConnectErro
             // legacy-only (scriptSig + output scriptPubkeys) and still counts
             // toward the block-wide limit, matching Core.
             block_sigops = block_sigops
-                .saturating_add(transaction_sigop_cost(tx, network, height, &[]));
+                .saturating_add(transaction_sigop_cost(tx, block_flags, &[]));
             if block_sigops > MAX_BLOCK_SIGOPS_COST {
                 return Err(ConnectError::BadBlockSigops);
             }
@@ -1186,7 +1190,7 @@ fn connect_block_inner(params: &ConnectParams) -> Result<StoreBatch, ConnectErro
                     return Err(ConnectError::Interrupted);
                 }
                 crate::validation::script::counting_progress(|| {
-                    script_verifier.verify_transaction(tx, prev_outputs, height)
+                    script_verifier.verify_transaction(tx, prev_outputs, script_at)
                 })
                     // `reason()`, not the whole error: Core's
                     // `block-script-verify-flag-failed (...)` carries the
@@ -1212,7 +1216,7 @@ fn connect_block_inner(params: &ConnectParams) -> Result<StoreBatch, ConnectErro
                                     break;
                                 }
                                 if let Err(e) = crate::validation::script::counting_progress(|| {
-                                    script_verifier.verify_transaction(tx, prev_outputs, height)
+                                    script_verifier.verify_transaction(tx, prev_outputs, script_at)
                                 }) {
                                     errs.push(ConnectError::ScriptFailed(
                                         e.reason().to_string(),
@@ -1250,7 +1254,7 @@ fn connect_block_inner(params: &ConnectParams) -> Result<StoreBatch, ConnectErro
     // engine still needs to see every tx for mismatch detection.
     mark(crate::chain::connect_phase::ConnectPhase::ShadowDispatch);
     for (tx, prev_outputs) in &shadow_queue {
-        script_verifier.dispatch_shadow(tx, prev_outputs, height);
+        script_verifier.dispatch_shadow(tx, prev_outputs, script_at);
     }
     mark(crate::chain::connect_phase::ConnectPhase::PostVerifyChecks);
 
@@ -1739,13 +1743,12 @@ mod tests {
             output: vec![TxOut { value: Amount::from_sat(0), script_pubkey: script }],
         };
         // 10 OP_CHECKMULTISIG * 20 legacy sigops * 4 (witness scale) = 800.
-        let mainnet_p2sh =
-            crate::validation::script::activation_heights(Network::Bitcoin).p2sh;
-        assert_eq!(transaction_sigop_cost(&cb, Network::Bitcoin, 0, &[]), 800);
-        assert_eq!(transaction_sigop_cost(&cb, Network::Bitcoin, mainnet_p2sh, &[]), 800);
+        use crate::validation::script::script_verify_flags;
+        assert_eq!(transaction_sigop_cost(&cb, 0, &[]), 800);
+        assert_eq!(transaction_sigop_cost(&cb, script_verify_flags(Network::Bitcoin, 0), &[]), 800);
         // Regtest/signet: P2SH active from genesis, so the witness-aware
         // path is taken even at height 0 (same cost here — no P2SH data).
-        assert_eq!(transaction_sigop_cost(&cb, Network::Regtest, 0, &[]), 800);
+        assert_eq!(transaction_sigop_cost(&cb, script_verify_flags(Network::Regtest, 0), &[]), 800);
     }
 
     // ── helpers for connect_block tests ───────────────────────────────
@@ -2000,7 +2003,7 @@ mod tests {
                 &self,
                 _tx: &Transaction,
                 _prev_outputs: &[TxOut],
-                _height: u32,
+                _at: crate::validation::script::ScriptContext,
             ) -> Result<(), crate::validation::script::ScriptError> {
                 panic!("a verifier that checks nothing was handed a transaction")
             }
@@ -2049,7 +2052,7 @@ mod tests {
                 &self,
                 _tx: &Transaction,
                 _prev_outputs: &[TxOut],
-                _height: u32,
+                _at: crate::validation::script::ScriptContext,
             ) -> Result<(), crate::validation::script::ScriptError> {
                 Ok(())
             }

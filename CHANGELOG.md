@@ -18,6 +18,7 @@ It includes every fix shipped in 0.7.1:
 
 - Consensus: `-consensus` defaults to `cpp-shadow`, the Rust engine deciding and Core's interpreter checking it; `rust-shadow` keeps the old order.
 - Consensus: `-test=bip94` enforces BIP 94's timewarp rule on regtest, as in Core (#1245).
+- Consensus: the P2SH, WITNESS and TAPROOT script flags are on for every block except Core's three exception blocks, as in Core; they were gated on activation heights, and `-testactivationheight=segwit` turned them off below its height (#1244, #724). Verdicts on the main chains are unchanged.
 - Consensus: the Rust script engine reports a tapscript push that runs past the end of the script as `BAD_OPCODE` ("Opcode missing or not understood"), as Core does; it gave the error of whatever execution reached first. Verdicts are unchanged.
 - Dependencies: `rmcp` 3.9.0 (RUSTSEC-2026-0457, -0462; client features satd does not build); MCP requests are capped at 4 MiB.
 - RPC: any request `Content-Type` is read as JSON, as in Core (#824).

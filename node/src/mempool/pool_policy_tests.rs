@@ -7,7 +7,7 @@
 use super::*;
 use crate::mining::template::tests::make_funded_template_env_with;
 use crate::storage::coinview::Coin;
-use crate::validation::script::{NoopVerifier, RustVerifier};
+use crate::validation::script::{NoopVerifier, RustVerifier, ScriptContext};
 use bitcoin::hashes::Hash;
 use bitcoin::{Amount, ScriptBuf, Sequence, TxIn, Witness};
 
@@ -63,7 +63,7 @@ fn an_upgrade_hook_spend_is_refused_as_nonstandard() {
     let coins = vec![(prev(1), coin(p2wsh(UPGRADABLE_NOP)))];
     let (cs, mp, dir) = make_funded_template_env_with(&coins, Box::new(NoopVerifier));
     let tx = spend(&[prev(1)], &[UPGRADABLE_NOP]);
-    rust().verify_transaction(&tx, &[TxOut { value: Amount::from_sat(COIN_VALUE), script_pubkey: p2wsh(UPGRADABLE_NOP) }], 1)
+    rust().verify_transaction(&tx, &[TxOut { value: Amount::from_sat(COIN_VALUE), script_pubkey: p2wsh(UPGRADABLE_NOP) }], ScriptContext::unmined(1))
         .expect("valid by consensus");
 
     let want = "mempool-script-verify-flag-failed (NOPx reserved for soft-fork upgrades)";

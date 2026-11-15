@@ -1,4 +1,4 @@
-use bitcoin::{Network, Transaction, TxOut};
+use bitcoin::{BlockHash, Network, Transaction, TxOut};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Debug, thiserror::Error)]
@@ -67,12 +67,13 @@ pub enum PrimaryEngine {
 pub trait ScriptVerifier: Send + Sync {
     /// Verify all inputs of a transaction against their previous outputs.
     /// `prev_outputs` must have one entry per input, in the same order.
-    /// `height` is used to determine which softfork rules are active.
+    /// `at` says which block the transaction is checked for, and so which
+    /// script flags apply.
     fn verify_transaction(
         &self,
         tx: &Transaction,
         prev_outputs: &[TxOut],
-        height: u32,
+        at: ScriptContext,
     ) -> Result<(), ScriptError>;
 
     /// [`verify_transaction`](Self::verify_transaction), except that a
@@ -85,9 +86,9 @@ pub trait ScriptVerifier: Send + Sync {
         &self,
         tx: &Transaction,
         prev_outputs: &[TxOut],
-        height: u32,
+        at: ScriptContext,
     ) -> Result<(), ScriptError> {
-        self.verify_transaction(tx, prev_outputs, height)
+        self.verify_transaction(tx, prev_outputs, at)
     }
 
     /// Whether this verifier accepts every script without looking at it, as
@@ -106,7 +107,7 @@ pub trait ScriptVerifier: Send + Sync {
         &self,
         _tx: &Transaction,
         _prev_outputs: &[TxOut],
-        _height: u32,
+        _at: ScriptContext,
         err: ScriptError,
     ) -> ScriptError {
         err
@@ -123,7 +124,7 @@ pub trait ScriptVerifier: Send + Sync {
     /// verified by the primary engine on a prefetch worker. The shadow
     /// engine still needs to see them for mismatch detection.
     /// Default: no-op (non-shadow verifiers have nothing to dispatch).
-    fn dispatch_shadow(&self, _tx: &Transaction, _prev_outputs: &[TxOut], _height: u32) {}
+    fn dispatch_shadow(&self, _tx: &Transaction, _prev_outputs: &[TxOut], _at: ScriptContext) {}
 
     /// Which concrete engine performs authoritative verification.
     /// Default: `Cpp`. `RustVerifier` overrides; `ShadowVerifier` delegates
@@ -140,13 +141,15 @@ pub trait ScriptVerifier: Send + Sync {
     }
 }
 
-/// Per-network softfork activation heights for script-verification flags.
-/// Verification flags are cumulative: once a fork's height is reached its
-/// flag stays on for all later blocks.
+/// Per-network buried softfork activation heights, Core's `BIP34Height`,
+/// `BIP66Height`, `BIP65Height`, `CSVHeight` and `SegwitHeight`. Once a
+/// fork's height is reached its rule stays on for all later blocks.
+///
+/// P2SH, WITNESS and TAPROOT have no height here: Core's
+/// `GetBlockScriptFlags` turns their script flags on for every block but
+/// its exceptions (see [`block_script_flags`]).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct ActivationHeights {
-    /// BIP 16 (P2SH).
-    pub p2sh: u32,
     /// BIP 34 (height in coinbase).
     pub bip34: u32,
     /// BIP 66 (strict DER signatures).
@@ -155,32 +158,25 @@ pub struct ActivationHeights {
     pub cltv: u32,
     /// BIP 112 (CHECKSEQUENCEVERIFY).
     pub csv: u32,
-    /// BIP 141/143 (segregated witness) + BIP 147 (NULLDUMMY).
+    /// BIP 141's block rules (witness commitment, `unexpected-witness`) and
+    /// BIP 147 (NULLDUMMY). Not the WITNESS script flag, which is on for
+    /// every block.
     pub segwit: u32,
-    /// BIP 341/342 (taproot).
+    /// The height taproot activated at, as `getdeploymentinfo` reports it
+    /// and the silent-payment index starts from. Not a script-flag gate:
+    /// TAPROOT is on for every block.
     pub taproot: u32,
 }
 
 /// Softfork activation heights for `network`, mirroring Bitcoin Core's
 /// buried-deployment heights (`chainparams.cpp`).
 ///
-/// Core's modern `GetBlockScriptFlags` applies P2SH/WITNESS/TAPROOT to every
-/// block on every network and carves out the three historical violators by
-/// hash (`script_flag_exceptions`). The height-gating used here reproduces
-/// that without per-hash carve-outs: each P2SH/taproot gate sits just above
-/// its network's exception block (mainnet BIP16 exception at 170_060 <
-/// 173_805, mainnet taproot exception at 692_261 < 709_632, testnet3 BIP16
-/// exception at 394 < 395), and the canonical chains contain no other
-/// violations below the gates — Core itself validates them flags-on.
-///
 /// Signet, testnet4, and regtest activate everything from genesis (all of
 /// Core's buried heights there are <= 1, and the genesis block is never
-/// script-verified), so a P2WPKH or P2TR output is NEVER anyone-can-spend
-/// on those networks.
+/// script-verified).
 pub fn activation_heights(network: Network) -> ActivationHeights {
     let heights = match network {
         Network::Bitcoin => ActivationHeights {
-            p2sh: 173_805,
             bip34: 227_931,
             dersig: 363_725,
             cltv: 388_381,
@@ -188,11 +184,9 @@ pub fn activation_heights(network: Network) -> ActivationHeights {
             segwit: 481_824,
             taproot: 709_632,
         },
-        // Testnet3. Taproot is gated with segwit rather than at 0: a taproot
-        // spend is a witness spend, so the flag is inert below the witness
-        // gate, and a TAPROOT-without-WITNESS flag set is incoherent.
+        // Testnet3. Taproot is reported from segwit's height (#724 tracks
+        // the real activation height); it gates no script flag.
         Network::Testnet => ActivationHeights {
-            p2sh: 395,
             bip34: 21_111,
             dersig: 330_776,
             cltv: 581_885,
@@ -212,7 +206,6 @@ pub fn activation_heights(network: Network) -> ActivationHeights {
         // flags, so the discrepancy is recorded rather than left to be
         // rediscovered.
         _ => ActivationHeights {
-            p2sh: 0,
             // Height 1, not 0: the height-in-coinbase rule is meaningless
             // for genesis, and this preserves `bip34_activation_height`'s
             // long-standing value for these networks.
@@ -275,11 +268,10 @@ impl ActivationHeights {
             self.csv = h;
         }
         if let Some(h) = o.segwit {
+            // Moves BIP 141's block rules and NULLDUMMY, as in Core. The
+            // WITNESS and TAPROOT script flags stay on (#1244), and taproot
+            // stays always active, as Core's regtest has it.
             self.segwit = h;
-            // A taproot spend is a witness spend, so taproot must never gate
-            // on before segwit (the same reason testnet3 pins them together
-            // above): keep the flag set coherent when segwit is moved up.
-            self.taproot = self.taproot.max(h);
         }
         self
     }
@@ -298,14 +290,55 @@ const _: () = {
     assert!(consensus::VERIFY_TAPROOT == bitcoinkernel::VERIFY_TAPROOT);
 };
 
-/// Script-verification flags for a block at `height` on `network`.
-/// Shared by both engines (flag bit values are identical — pinned above).
+/// Core's `script_flag_exceptions` (`kernel/chainparams.cpp`): the blocks
+/// that broke a rule before it activated, each with the P2SH, WITNESS and
+/// TAPROOT flags it is checked under instead of all three.
+const SCRIPT_FLAG_EXCEPTIONS: &[(Network, &str, u32)] = &[
+    // Mainnet height 170,060: BIP 16 exception.
+    (Network::Bitcoin, "00000000000002dc756eebf4f49723ed8d30cc28a5f108eb94b1ba88ac4f9c22", 0),
+    // Mainnet height 692,261: taproot exception.
+    (
+        Network::Bitcoin,
+        "0000000000000000000f14c35b2d841e986ab5441de8c585d5ffe55ea1e395ad",
+        consensus::VERIFY_P2SH | consensus::VERIFY_WITNESS,
+    ),
+    // Testnet3 height 394: BIP 16 exception.
+    (Network::Testnet, "00000000dd30457c001f4095d208cc1296b0eed002427aa599874af7a432b105", 0),
+];
+
+/// Script-verification flags for the block `hash` at `height` on `network`:
+/// Core's `GetBlockScriptFlags`. P2SH, WITNESS and TAPROOT are on for every
+/// block except those in [`SCRIPT_FLAG_EXCEPTIONS`]; DERSIG, CLTV, CSV and
+/// NULLDUMMY come on at their buried heights. Shared by both engines (flag
+/// bit values are identical, pinned above).
+pub fn block_script_flags(network: Network, height: u32, hash: &BlockHash) -> u32 {
+    static EXCEPTIONS: std::sync::LazyLock<Vec<(Network, BlockHash, u32)>> =
+        std::sync::LazyLock::new(|| {
+            SCRIPT_FLAG_EXCEPTIONS
+                .iter()
+                .map(|(net, hash, flags)| (*net, hash.parse().expect("exception hash"), *flags))
+                .collect()
+        });
+    let base = EXCEPTIONS
+        .iter()
+        .find(|(net, h, _)| *net == network && h == hash)
+        .map_or(ALWAYS_ON_FLAGS, |(_, _, flags)| *flags);
+    base | buried_flags(network, height)
+}
+
+/// [`block_script_flags`] for a block that is not mined yet: the mempool's,
+/// a template's. No exception can apply to it.
 pub fn script_verify_flags(network: Network, height: u32) -> u32 {
+    ALWAYS_ON_FLAGS | buried_flags(network, height)
+}
+
+/// The flags Core gives every block but its exceptions.
+const ALWAYS_ON_FLAGS: u32 = consensus::VERIFY_P2SH | consensus::VERIFY_WITNESS | consensus::VERIFY_TAPROOT;
+
+/// The flags of the buried deployments active at `height`.
+fn buried_flags(network: Network, height: u32) -> u32 {
     let h = activation_heights(network);
     let mut flags = 0u32;
-    if height >= h.p2sh {
-        flags |= consensus::VERIFY_P2SH;
-    }
     if height >= h.dersig {
         flags |= consensus::VERIFY_DERSIG;
     }
@@ -316,12 +349,40 @@ pub fn script_verify_flags(network: Network, height: u32) -> u32 {
         flags |= consensus::VERIFY_CHECKSEQUENCEVERIFY;
     }
     if height >= h.segwit {
-        flags |= consensus::VERIFY_WITNESS | consensus::VERIFY_NULLDUMMY;
-    }
-    if height >= h.taproot {
-        flags |= consensus::VERIFY_TAPROOT;
+        flags |= consensus::VERIFY_NULLDUMMY;
     }
     flags
+}
+
+/// Where a transaction's scripts are checked: the height of the block that
+/// holds it and, once the block exists, its hash, which can make it one of
+/// Core's script-flag exceptions. Each verifier turns it into flags for its
+/// own network.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct ScriptContext {
+    pub height: u32,
+    block: Option<BlockHash>,
+}
+
+impl ScriptContext {
+    /// A transaction in the block `hash` at `height`.
+    pub fn block(height: u32, hash: BlockHash) -> Self {
+        ScriptContext { height, block: Some(hash) }
+    }
+
+    /// A transaction for a block not mined yet, at `height`: the mempool's,
+    /// a template's.
+    pub fn unmined(height: u32) -> Self {
+        ScriptContext { height, block: None }
+    }
+
+    /// The script flags on `network`.
+    pub fn flags(&self, network: Network) -> u32 {
+        match &self.block {
+            Some(hash) => block_script_flags(network, self.height, hash),
+            None => script_verify_flags(network, self.height),
+        }
+    }
 }
 
 /// Core's `STANDARD_SCRIPT_VERIFY_FLAGS` (`src/policy/policy.h`): the
@@ -485,10 +546,10 @@ impl ScriptVerifier for ConsensusVerifier {
         &self,
         tx: &Transaction,
         prev_outputs: &[TxOut],
-        height: u32,
+        at: ScriptContext,
     ) -> Result<(), ScriptError> {
-        self.verify_transaction_unnamed(tx, prev_outputs, height)
-            .map_err(|e| self.name_failure(tx, prev_outputs, height, e))
+        self.verify_transaction_unnamed(tx, prev_outputs, at)
+            .map_err(|e| self.name_failure(tx, prev_outputs, at, e))
     }
 
     /// libbitcoinkernel alone. A failure carries its coarse `ERR_SCRIPT`.
@@ -496,7 +557,7 @@ impl ScriptVerifier for ConsensusVerifier {
         &self,
         tx: &Transaction,
         prev_outputs: &[TxOut],
-        height: u32,
+        at: ScriptContext,
     ) -> Result<(), ScriptError> {
         // One spent output per input, as the Rust engine requires
         // (`ErrSpentOutputsMismatch`) and Core's `PrecomputedTransactionData`
@@ -510,7 +571,7 @@ impl ScriptVerifier for ConsensusVerifier {
             });
         }
 
-        let flags = script_verify_flags(self.network, height);
+        let flags = at.flags(self.network);
         kernel_verify_transaction(tx, prev_outputs, flags)?;
         count_inputs_verified(tx.input.len());
         Ok(())
@@ -520,11 +581,11 @@ impl ScriptVerifier for ConsensusVerifier {
         &self,
         tx: &Transaction,
         prev_outputs: &[TxOut],
-        height: u32,
+        at: ScriptContext,
         err: ScriptError,
     ) -> ScriptError {
         let input = err.input();
-        let flags = script_verify_flags(self.network, height);
+        let flags = at.flags(self.network);
         match name_script_failure(tx, prev_outputs, flags, input) {
             Some(reason) => ScriptError::VerifyFailed { input, reason },
             None => err,
@@ -597,7 +658,7 @@ impl ScriptVerifier for NoopVerifier {
         &self,
         _tx: &Transaction,
         _prev_outputs: &[TxOut],
-        _height: u32,
+        _at: ScriptContext,
     ) -> Result<(), ScriptError> {
         Ok(())
     }
@@ -627,9 +688,9 @@ impl ScriptVerifier for RustVerifier {
         &self,
         tx: &Transaction,
         prev_outputs: &[TxOut],
-        height: u32,
+        at: ScriptContext,
     ) -> Result<(), ScriptError> {
-        let flags = script_verify_flags(self.network, height);
+        let flags = at.flags(self.network);
 
         // Batch API: passes &Transaction so we don't re-deserialize per
         // input, and shares a single SighashCache across inputs (BIP143
@@ -686,18 +747,18 @@ pub const DEFAULT_SHADOW_QUEUE_MB: usize = 128;
 struct ShadowWork {
     tx_bytes: Vec<u8>,
     prev_outputs: Vec<TxOut>,
-    height: u32,
+    at: ScriptContext,
     txid: bitcoin::Txid,
     /// What [`ShadowWork::cost`] charged the byte budget on enqueue.
     charge: usize,
 }
 
 impl ShadowWork {
-    fn new(tx: &Transaction, prev_outputs: &[TxOut], height: u32, charge: usize) -> Self {
+    fn new(tx: &Transaction, prev_outputs: &[TxOut], at: ScriptContext, charge: usize) -> Self {
         ShadowWork {
             tx_bytes: bitcoin::consensus::serialize(tx),
             prev_outputs: prev_outputs.to_vec(),
-            height,
+            at,
             txid: tx.compute_txid(),
             charge,
         }
@@ -762,7 +823,7 @@ impl ShadowVerifier {
                         Ok(t) => t,
                         Err(_) => continue,
                     };
-                    if let Err(e) = w_shadow.verify_transaction(&tx, &work.prev_outputs, work.height) {
+                    if let Err(e) = w_shadow.verify_transaction(&tx, &work.prev_outputs, work.at) {
                         // Identify which input(s) failed and log details
                         let mut failed_inputs = Vec::new();
                         for (idx, prev_out) in work.prev_outputs.iter().enumerate() {
@@ -793,7 +854,7 @@ impl ShadowVerifier {
                              error: {}\n  \
                              inputs: {} total, witnesses: {}\n  \
                              details: [{}]",
-                            work.height,
+                            work.at.height,
                             w_primary_label,
                             w_shadow_label,
                             work.txid,
@@ -848,7 +909,7 @@ impl ShadowVerifier {
     ///
     /// The byte check runs before the item is built, so a full queue costs
     /// the hot path no serialization or prevout copy.
-    fn enqueue(&self, tx: &Transaction, prev_outputs: &[TxOut], height: u32) {
+    fn enqueue(&self, tx: &Transaction, prev_outputs: &[TxOut], at: ScriptContext) {
         use std::sync::atomic::Ordering;
         let Some(shadow_tx) = &self.shadow_tx else {
             return;
@@ -857,14 +918,14 @@ impl ShadowVerifier {
         let before = self.queued_bytes.fetch_add(charge, Ordering::Relaxed);
         if self.queue_bytes != 0 && before != 0 && before.saturating_add(charge) > self.queue_bytes {
             self.queued_bytes.fetch_sub(charge, Ordering::Relaxed);
-            self.report_drop(height);
+            self.report_drop(at.height);
             return;
         }
-        match shadow_tx.try_send(ShadowWork::new(tx, prev_outputs, height, charge)) {
+        match shadow_tx.try_send(ShadowWork::new(tx, prev_outputs, at, charge)) {
             Ok(()) => {}
             Err(crossbeam_channel::TrySendError::Full(_)) => {
                 self.queued_bytes.fetch_sub(charge, Ordering::Relaxed);
-                self.report_drop(height);
+                self.report_drop(at.height);
             }
             Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
                 self.queued_bytes.fetch_sub(charge, Ordering::Relaxed);
@@ -928,14 +989,14 @@ impl ScriptVerifier for ShadowVerifier {
         &self,
         tx: &Transaction,
         prev_outputs: &[TxOut],
-        height: u32,
+        at: ScriptContext,
     ) -> Result<(), ScriptError> {
         // Run primary synchronously — this is the hot path
-        let result = self.primary.verify_transaction(tx, prev_outputs, height);
+        let result = self.primary.verify_transaction(tx, prev_outputs, at);
 
         // On primary success, dispatch shadow verification asynchronously.
         if result.is_ok() {
-            self.enqueue(tx, prev_outputs, height);
+            self.enqueue(tx, prev_outputs, at);
         }
 
         result
@@ -946,11 +1007,11 @@ impl ScriptVerifier for ShadowVerifier {
         &self,
         tx: &Transaction,
         prev_outputs: &[TxOut],
-        height: u32,
+        at: ScriptContext,
     ) -> Result<(), ScriptError> {
-        let result = self.primary.verify_transaction_unnamed(tx, prev_outputs, height);
+        let result = self.primary.verify_transaction_unnamed(tx, prev_outputs, at);
         if result.is_ok() {
-            self.dispatch_shadow(tx, prev_outputs, height);
+            self.dispatch_shadow(tx, prev_outputs, at);
         }
         result
     }
@@ -959,14 +1020,14 @@ impl ScriptVerifier for ShadowVerifier {
         &self,
         tx: &Transaction,
         prev_outputs: &[TxOut],
-        height: u32,
+        at: ScriptContext,
         err: ScriptError,
     ) -> ScriptError {
-        self.primary.name_failure(tx, prev_outputs, height, err)
+        self.primary.name_failure(tx, prev_outputs, at, err)
     }
 
-    fn dispatch_shadow(&self, tx: &Transaction, prev_outputs: &[TxOut], height: u32) {
-        self.enqueue(tx, prev_outputs, height);
+    fn dispatch_shadow(&self, tx: &Transaction, prev_outputs: &[TxOut], at: ScriptContext) {
+        self.enqueue(tx, prev_outputs, at);
     }
 
     fn primary_engine(&self) -> PrimaryEngine {
@@ -1047,12 +1108,12 @@ mod tests {
         let spent = TxOut { value: Amount::from_sat(5000), script_pubkey: op_true };
         let cpp = ConsensusVerifier::new(Network::Regtest);
         assert!(
-            cpp.verify_transaction(&tx, &[spent.clone(), spent.clone()], 200).is_ok(),
+            cpp.verify_transaction(&tx, &[spent.clone(), spent.clone()], ScriptContext::unmined(200)).is_ok(),
             "one spent output per input: anyone-can-spend inputs verify"
         );
-        assert!(cpp.verify_transaction(&tx, std::slice::from_ref(&spent), 200).is_err(), "one short");
-        assert!(cpp.verify_transaction(&tx, &[], 200).is_err(), "none at all");
-        assert!(cpp.verify_transaction(&tx, &[spent.clone(), spent.clone(), spent], 200).is_err(), "one extra");
+        assert!(cpp.verify_transaction(&tx, std::slice::from_ref(&spent), ScriptContext::unmined(200)).is_err(), "one short");
+        assert!(cpp.verify_transaction(&tx, &[], ScriptContext::unmined(200)).is_err(), "none at all");
+        assert!(cpp.verify_transaction(&tx, &[spent.clone(), spent.clone(), spent], ScriptContext::unmined(200)).is_err(), "one extra");
     }
 
     /// Both engines count every input they verify inside
@@ -1086,10 +1147,10 @@ mod tests {
         ];
         for (name, engine) in engines {
             let counter: &'static AtomicU64 = Box::leak(Box::new(AtomicU64::new(0)));
-            counting_into(counter, || engine.verify_transaction(&tx, &spent, 200))
+            counting_into(counter, || engine.verify_transaction(&tx, &spent, ScriptContext::unmined(200)))
                 .expect("anyone-can-spend inputs verify");
             assert_eq!(counter.load(Ordering::Relaxed), 3, "{name}: three inputs verified");
-            engine.verify_transaction(&tx, &spent, 200).expect("verifies again");
+            engine.verify_transaction(&tx, &spent, ScriptContext::unmined(200)).expect("verifies again");
             assert_eq!(counter.load(Ordering::Relaxed), 3, "{name}: outside the scope, nothing counts");
             assert!(PROGRESS_COUNTER.with(|c| c.get()).is_none(), "{name}: the scope is restored");
         }
@@ -1163,10 +1224,10 @@ mod tests {
         let rust = RustVerifier::new(Network::Bitcoin);
         for (tx, prevs) in mainnet_spends() {
             let txid = tx.compute_txid();
-            if let Err(e) = cpp.verify_transaction(&tx, &prevs, 974_146) {
+            if let Err(e) = cpp.verify_transaction(&tx, &prevs, ScriptContext::unmined(974_146)) {
                 panic!("kernel rejects {txid}: {e:?}");
             }
-            if let Err(e) = rust.verify_transaction(&tx, &prevs, 974_146) {
+            if let Err(e) = rust.verify_transaction(&tx, &prevs, ScriptContext::unmined(974_146)) {
                 panic!("rust rejects {txid}: {e:?}");
             }
         }
@@ -1191,7 +1252,7 @@ mod tests {
                 });
                 let mut bad = prevs.clone();
                 bad[k].value += bitcoin::Amount::from_sat(1);
-                let got = cpp.verify_transaction_unnamed(&tx, &bad, 974_146);
+                let got = cpp.verify_transaction_unnamed(&tx, &bad, ScriptContext::unmined(974_146));
                 let txid = tx.compute_txid();
                 if let Some(want) = first_broken {
                     match got {
@@ -1233,21 +1294,18 @@ mod tests {
         assert_eq!(h.csv, 432);
         assert_eq!(h.segwit, base.segwit);
         assert_eq!(h.taproot, base.taproot);
-        assert_eq!(h.p2sh, base.p2sh);
 
-        // Moving segwit up drags taproot with it: a taproot spend is a
-        // witness spend, so taproot active below segwit would be an
-        // incoherent flag set.
+        // Moving segwit moves segwit alone: taproot stays always active,
+        // as Core's regtest has it, and gates no flag (#1244).
         let o = TestActivationOverrides { segwit: Some(300), ..Default::default() };
         let h = base.with_overrides(&o);
         assert_eq!(h.segwit, 300);
-        assert_eq!(h.taproot, 300);
+        assert_eq!(h.taproot, base.taproot);
     }
 
     #[test]
     fn activation_heights_match_core_chainparams() {
         let main = activation_heights(Network::Bitcoin);
-        assert_eq!(main.p2sh, 173_805);
         assert_eq!(main.bip34, 227_931);
         assert_eq!(main.dersig, 363_725);
         assert_eq!(main.cltv, 388_381);
@@ -1260,65 +1318,75 @@ mod tests {
         assert_eq!(t3.cltv, 581_885); // Core BIP65Height
         assert_eq!(t3.csv, 770_112); // Core CSVHeight
         assert_eq!(t3.segwit, 834_624); // Core SegwitHeight
-        // P2SH gate sits just above testnet3's BIP16 exception block
-        // 00000000dd30457c001f4095d208cc1296b0eed002427aa599874af7a432b105
-        // at height 394.
-        assert_eq!(t3.p2sh, 395);
 
         // Core has `SegwitHeight = 1` for signet and testnet4 (0 for regtest);
         // see the note in `activation_heights` for why 0 is equivalent here.
         for net in [Network::Signet, Network::Testnet4, Network::Regtest] {
             assert_eq!(
                 activation_heights(net),
-                ActivationHeights { p2sh: 0, bip34: 1, dersig: 0, cltv: 0, csv: 0, segwit: 0, taproot: 0 },
+                ActivationHeights { bip34: 1, dersig: 0, cltv: 0, csv: 0, segwit: 0, taproot: 0 },
                 "{net}: every softfork must be active from genesis"
             );
         }
     }
 
+    /// Core's `GetBlockScriptFlags`: P2SH, WITNESS and TAPROOT on every
+    /// block from genesis, the buried flags at their heights.
     #[test]
-    fn script_verify_flags_height_gates() {
-        // Mainnet pre-P2SH: nothing on.
-        assert_eq!(script_verify_flags(Network::Bitcoin, 0), 0);
-        // Mainnet at segwit activation: witness + nulldummy join the set.
-        let at_segwit = script_verify_flags(Network::Bitcoin, 481_824);
-        assert_ne!(at_segwit & consensus::VERIFY_WITNESS, 0);
-        assert_ne!(at_segwit & consensus::VERIFY_NULLDUMMY, 0);
-        assert_eq!(at_segwit & consensus::VERIFY_TAPROOT, 0);
-        // Mainnet at taproot activation: everything on.
-        let all = consensus::VERIFY_P2SH
+    fn script_verify_flags_turn_p2sh_witness_taproot_on_from_genesis() {
+        let always = consensus::VERIFY_P2SH | consensus::VERIFY_WITNESS | consensus::VERIFY_TAPROOT;
+        let all = always
             | consensus::VERIFY_DERSIG
             | consensus::VERIFY_CHECKLOCKTIMEVERIFY
             | consensus::VERIFY_CHECKSEQUENCEVERIFY
-            | consensus::VERIFY_WITNESS
-            | consensus::VERIFY_NULLDUMMY
-            | consensus::VERIFY_TAPROOT;
-        assert_eq!(script_verify_flags(Network::Bitcoin, 709_632), all);
-        // Always-active networks: everything on from the first block.
+            | consensus::VERIFY_NULLDUMMY;
+        // Mainnet before every buried deployment: the three alone.
+        assert_eq!(script_verify_flags(Network::Bitcoin, 0), always);
+        assert_eq!(script_verify_flags(Network::Bitcoin, 363_724), always);
+        assert_eq!(
+            script_verify_flags(Network::Bitcoin, 363_725),
+            always | consensus::VERIFY_DERSIG
+        );
+        // NULLDUMMY comes on with segwit's block rules.
+        assert_eq!(script_verify_flags(Network::Bitcoin, 481_823) & consensus::VERIFY_NULLDUMMY, 0);
+        assert_eq!(script_verify_flags(Network::Bitcoin, 481_824), all);
+        assert_eq!(script_verify_flags(Network::Testnet, 0), always);
+        assert_eq!(script_verify_flags(Network::Testnet, 834_624), all);
         for net in [Network::Signet, Network::Testnet4, Network::Regtest] {
             assert_eq!(script_verify_flags(net, 0), all, "{net}");
             assert_eq!(script_verify_flags(net, 1), all, "{net}");
         }
-        // WITNESS implies P2SH and TAPROOT implies WITNESS at every height
-        // on every network. The kernel rejects WITNESS without P2SH, and a
-        // taproot spend is a witness spend, so TAPROOT alone is incoherent.
-        for net in [
-            Network::Bitcoin,
-            Network::Testnet,
-            Network::Testnet4,
-            Network::Signet,
-            Network::Regtest,
-        ] {
-            for height in [0, 394, 395, 400_000, 834_623, 834_624, 1_000_000] {
-                let f = script_verify_flags(net, height);
-                if f & consensus::VERIFY_WITNESS != 0 {
-                    assert_ne!(f & consensus::VERIFY_P2SH, 0, "{net} h={height}");
-                }
-                if f & consensus::VERIFY_TAPROOT != 0 {
-                    assert_ne!(f & consensus::VERIFY_WITNESS, 0, "{net} h={height}");
-                }
-            }
-        }
+    }
+
+    /// Core's `script_flag_exceptions`: the mainnet BIP 16 block (no flags),
+    /// the mainnet taproot block (P2SH and WITNESS) and the testnet3 BIP 16
+    /// block (no flags). Any other block at the same height, and the same
+    /// hash on another network, gets all three.
+    #[test]
+    fn block_script_flags_carve_out_cores_exceptions_by_hash() {
+        let always = consensus::VERIFY_P2SH | consensus::VERIFY_WITNESS | consensus::VERIFY_TAPROOT;
+        let hash = |h: &str| -> BlockHash { h.parse().unwrap() };
+        let bip16 = hash("00000000000002dc756eebf4f49723ed8d30cc28a5f108eb94b1ba88ac4f9c22");
+        let taproot = hash("0000000000000000000f14c35b2d841e986ab5441de8c585d5ffe55ea1e395ad");
+        let t3_bip16 = hash("00000000dd30457c001f4095d208cc1296b0eed002427aa599874af7a432b105");
+        let other = hash("00000000000000000000000000000000000000000000000000000000000000aa");
+
+        assert_eq!(block_script_flags(Network::Bitcoin, 170_060, &bip16), 0);
+        assert_eq!(block_script_flags(Network::Bitcoin, 170_060, &other), always);
+        assert_eq!(
+            block_script_flags(Network::Bitcoin, 692_261, &taproot),
+            script_verify_flags(Network::Bitcoin, 692_261) & !consensus::VERIFY_TAPROOT
+        );
+        assert_eq!(
+            block_script_flags(Network::Bitcoin, 692_261, &other),
+            script_verify_flags(Network::Bitcoin, 692_261)
+        );
+        assert_eq!(block_script_flags(Network::Testnet, 394, &t3_bip16), 0);
+        assert_eq!(block_script_flags(Network::Testnet, 394, &bip16), always);
+        assert_eq!(block_script_flags(Network::Bitcoin, 394, &t3_bip16), always);
+
+        assert_eq!(ScriptContext::block(170_060, bip16).flags(Network::Bitcoin), 0);
+        assert_eq!(ScriptContext::unmined(170_060).flags(Network::Bitcoin), always);
     }
 
     /// Build a tx spending a P2WPKH prevout with an empty scriptSig and an
@@ -1369,29 +1437,36 @@ mod tests {
         for net in [Network::Signet, Network::Testnet4, Network::Regtest] {
             for height in [1, 308_124, 481_824] {
                 assert!(
-                    ConsensusVerifier::new(net).verify_transaction(&tx, &prevs, height).is_err(),
+                    ConsensusVerifier::new(net).verify_transaction(&tx, &prevs, ScriptContext::unmined(height)).is_err(),
                     "cpp engine accepted unsigned P2WPKH spend on {net} at {height}"
                 );
                 assert!(
-                    RustVerifier::new(net).verify_transaction(&tx, &prevs, height).is_err(),
+                    RustVerifier::new(net).verify_transaction(&tx, &prevs, ScriptContext::unmined(height)).is_err(),
                     "rust engine accepted unsigned P2WPKH spend on {net} at {height}"
                 );
             }
         }
-        // Pin the mainnet height-gate, which reproduces Core's historical
-        // acceptance: below the segwit gate witness programs are
-        // anyone-can-spend (this is why mainnet stays height-gated and the
-        // other networks must not be).
-        assert!(
-            ConsensusVerifier::new(Network::Bitcoin)
-                .verify_transaction(&tx, &prevs, 308_124)
-                .is_ok()
-        );
-        assert!(
-            ConsensusVerifier::new(Network::Bitcoin)
-                .verify_transaction(&tx, &prevs, 481_824)
-                .is_err()
-        );
+        // Mainnet and testnet3 too, below their segwit heights: Core checks
+        // WITNESS on every block, so a witness output was never spendable
+        // without its witness (#1244). Only an exception block is spared.
+        for net in [Network::Bitcoin, Network::Testnet] {
+            for height in [1, 308_124, 481_824] {
+                for engine in [&ConsensusVerifier::new(net) as &dyn ScriptVerifier, &RustVerifier::new(net)] {
+                    assert!(
+                        engine.verify_transaction(&tx, &prevs, ScriptContext::unmined(height)).is_err(),
+                        "{net} at {height} accepted an unsigned P2WPKH spend"
+                    );
+                }
+            }
+        }
+        let bip16: BlockHash =
+            "00000000000002dc756eebf4f49723ed8d30cc28a5f108eb94b1ba88ac4f9c22".parse().unwrap();
+        for engine in [
+            &ConsensusVerifier::new(Network::Bitcoin) as &dyn ScriptVerifier,
+            &RustVerifier::new(Network::Bitcoin),
+        ] {
+            assert!(engine.verify_transaction(&tx, &prevs, ScriptContext::block(170_060, bip16)).is_ok());
+        }
     }
 
     /// A shadow engine that takes 200 ms a transaction, counts the
@@ -1406,7 +1481,7 @@ mod tests {
             &self,
             _tx: &Transaction,
             _prev_outputs: &[TxOut],
-            _height: u32,
+            _at: ScriptContext,
         ) -> Result<(), ScriptError> {
             self.started.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             std::thread::sleep(std::time::Duration::from_millis(200));
@@ -1450,7 +1525,7 @@ mod tests {
             output: vec![TxOut::NULL],
         };
         for _ in 0..5 {
-            verifier.verify_transaction(&tx, &[], 1).expect("the primary accepts");
+            verifier.verify_transaction(&tx, &[], ScriptContext::unmined(1)).expect("the primary accepts");
         }
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while started.load(SeqCst) == 0 && std::time::Instant::now() < deadline {
@@ -1478,7 +1553,7 @@ mod tests {
             &self,
             _tx: &Transaction,
             _prev_outputs: &[TxOut],
-            _height: u32,
+            _at: ScriptContext,
         ) -> Result<(), ScriptError> {
             self.started.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             drop(self.gate.lock());
@@ -1529,19 +1604,19 @@ mod tests {
         .with_queue_bytes(3 * cost);
 
         let held = gate.lock();
-        verifier.verify_transaction(&tx, &prevs, 1).expect("the primary accepts");
+        verifier.verify_transaction(&tx, &prevs, ScriptContext::unmined(1)).expect("the primary accepts");
         wait_for("the worker to take the first item", || started.load(SeqCst) == 1);
         assert_eq!(verifier.queued_bytes(), 0, "a dequeued item no longer counts");
 
         for _ in 0..5 {
-            verifier.verify_transaction(&tx, &prevs, 1).expect("the primary accepts");
+            verifier.verify_transaction(&tx, &prevs, ScriptContext::unmined(1)).expect("the primary accepts");
         }
         assert_eq!(verifier.dropped_total(), 2, "two items past the byte budget are dropped");
         assert_eq!(verifier.queued_bytes(), 3 * cost);
 
         drop(held);
         wait_for("the queue to drain", || started.load(SeqCst) == 4 && verifier.queued_bytes() == 0);
-        verifier.verify_transaction(&tx, &prevs, 1).expect("the primary accepts");
+        verifier.verify_transaction(&tx, &prevs, ScriptContext::unmined(1)).expect("the primary accepts");
         wait_for("the drained queue to take work again", || started.load(SeqCst) == 5);
         assert_eq!(verifier.dropped_total(), 2);
     }
@@ -1567,12 +1642,12 @@ mod tests {
         )
         .with_queue_bytes(0);
         let held = gate.lock();
-        verifier.verify_transaction(&tx, &[], 1).expect("the primary accepts");
+        verifier.verify_transaction(&tx, &[], ScriptContext::unmined(1)).expect("the primary accepts");
         wait_for("the worker to take the first item", || {
             started.load(std::sync::atomic::Ordering::SeqCst) == 1
         });
         for _ in 0..6 {
-            verifier.verify_transaction(&tx, &[], 1).expect("the primary accepts");
+            verifier.verify_transaction(&tx, &[], ScriptContext::unmined(1)).expect("the primary accepts");
         }
         assert_eq!(verifier.dropped_total(), 2, "only the entry cap of 4 applies");
         drop(held);

@@ -262,7 +262,7 @@ fn a_zero_fee_truc_parent_replaces_on_its_childs_fee() {
 struct RefusesOne(Txid);
 
 impl ScriptVerifier for RefusesOne {
-    fn verify_transaction(&self, tx: &Transaction, _: &[TxOut], _: u32) -> Result<(), ScriptError> {
+    fn verify_transaction(&self, tx: &Transaction, _: &[TxOut], _: crate::validation::script::ScriptContext) -> Result<(), ScriptError> {
         if tx.compute_txid() == self.0 {
             return Err(ScriptError::VerifyFailed { input: 0, reason: "Invalid Schnorr signature".into() });
         }
