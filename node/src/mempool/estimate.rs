@@ -736,7 +736,9 @@ pub struct SmartFees {
     pub targets: Vec<TargetFee>,
     /// "Cheap but reasonable" economy rate (sat/kvB): the deepest target
     /// clamped into `[floor, 2×floor]` and never above the cheapest tier.
-    pub economy_feerate_sat_per_kvb: u64,
+    /// `None` when that comes to 0 (a zero floor with nothing above it): 0
+    /// is no estimate, as it is for every target.
+    pub economy_feerate_sat_per_kvb: Option<u64>,
     /// Mode actually used.
     pub mode: EstimateMode,
     /// Whether any target fell back off the mempool sim (to historical/floor).
@@ -1234,7 +1236,7 @@ pub fn smart_fees_from_estimate(
                 confidence,
             })
             .collect(),
-        economy_feerate_sat_per_kvb: economy,
+        economy_feerate_sat_per_kvb: (economy > 0).then_some(economy),
         mode,
         fallback,
         thin_block: is_thin_block(mempool_est),
@@ -1719,7 +1721,7 @@ mod tests {
         for tf in &sf.targets {
             assert_eq!(tf.feerate_sat_per_kvb, floor);
         }
-        assert_eq!(sf.economy_feerate_sat_per_kvb, floor);
+        assert_eq!(sf.economy_feerate_sat_per_kvb, Some(floor));
     }
 
     #[test]
@@ -1737,7 +1739,7 @@ mod tests {
             assert!(w[0] >= w[1], "historical ladder must be non-increasing: {vals:?}");
         }
         let lowest = *vals.iter().min().unwrap();
-        assert!(sf.economy_feerate_sat_per_kvb <= lowest);
+        assert!(sf.economy_feerate_sat_per_kvb.unwrap() <= lowest);
     }
 
     #[test]
@@ -1756,7 +1758,7 @@ mod tests {
         for w in vals.windows(2) {
             assert!(w[0] >= w[1], "blend ladder must be non-increasing: {vals:?}");
         }
-        assert!(sf.economy_feerate_sat_per_kvb <= *vals.iter().min().unwrap());
+        assert!(sf.economy_feerate_sat_per_kvb.unwrap() <= *vals.iter().min().unwrap());
     }
 
     #[test]
@@ -2204,6 +2206,8 @@ mod tests {
         for mode in [EstimateMode::Historical, EstimateMode::Blend, EstimateMode::Mempool] {
             let (r, c, _) = resolve_target(&snap, &est, Some(0), 6, mode, false, 0);
             assert_eq!((r, c), (0, Confidence::Low), "{mode:?}");
+            let sf = smart_fees_from_estimate(&snap, &est, Some(0), &[1, 6, 24], mode, false, 0);
+            assert_eq!(sf.economy_feerate_sat_per_kvb, None, "{mode:?}");
         }
         // A real answer under the same zero floor is still an answer.
         let est = FeeEstimator::new();
@@ -2213,6 +2217,12 @@ mod tests {
         let a = estimate_smart_fee(&pool, &est, 6, EstimateMode::Historical, FeeRateEstimator::Auto, false)
             .unwrap();
         assert_eq!(a.feerate_sat_per_kvb, 120);
+        // Economy is capped at twice the floor, so a zero floor has none; at
+        // the default relay floor it is the history rate.
+        let sf = smart_fees(Vec::new(), &est, None, &[1, 6, 24], EstimateMode::Historical, false, 0);
+        assert_eq!(sf.economy_feerate_sat_per_kvb, None);
+        let sf = smart_fees(Vec::new(), &est, None, &[1, 6, 24], EstimateMode::Historical, false, 100);
+        assert_eq!(sf.economy_feerate_sat_per_kvb, Some(120));
     }
 
     /// At the default relay floor (0.1 sat/vB) a history of sub-1 sat/vB

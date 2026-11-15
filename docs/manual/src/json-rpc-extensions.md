@@ -136,7 +136,9 @@ status page. In `mempool` mode it simulates the next N block templates from the
 current mempool, with ancestor-feerate (CPFP-aware) package sorting. It never
 hard-errors; it always returns a result. The response maps each target to a `{feerate, confidence}` pair,
 where `confidence` is `high | medium | low`, and includes a feerate
-histogram. This is the basis for Core's
+histogram and an `economy_feerate`, a cheap rate between the floor and
+twice the floor. Under `-minrelaytxfee=0` with an empty rolling minimum
+that range is 0, which is no estimate, so `economy_feerate` is left out. This is the basis for Core's
 [#11500](https://github.com/bitcoin/bitcoin/issues/11500).
 
 ## Mempool subscription stream

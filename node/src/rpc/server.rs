@@ -3070,9 +3070,12 @@ pub async fn start(
             "mode": sf.mode.as_str(),
             "fallback": sf.fallback,
             "mempool_weight": sf.mempool_weight,
-            "economy_feerate": format_feerate_sat_per_kvb(sf.economy_feerate_sat_per_kvb, unit),
             "thin_block": sf.thin_block,
         });
+        // Left out when there is no economy estimate (0 under a zero floor).
+        if let Some(economy) = sf.economy_feerate_sat_per_kvb {
+            response["economy_feerate"] = format_feerate_sat_per_kvb(economy, unit);
+        }
         annotate_units(&mut response, unit);
         Ok::<_, ErrorObjectOwned>(response)
     })?;
