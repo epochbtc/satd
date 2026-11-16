@@ -22,6 +22,7 @@ It includes every fix shipped in 0.7.1:
 - Consensus: the Rust script engine reports a tapscript push that runs past the end of the script as `BAD_OPCODE` ("Opcode missing or not understood"), as Core does; it gave the error of whatever execution reached first. Verdicts are unchanged.
 - Dependencies: `rmcp` 3.9.0 (RUSTSEC-2026-0457, -0462; client features satd does not build); MCP requests are capped at 4 MiB.
 - RPC: any request `Content-Type` is read as JSON, as in Core (#824).
+- RPC: `invalidateblock`, `reconsiderblock` and `preciousblock` go on to the next-best chain when the best one holds an invalid block, as in Core; they stopped on the first and returned an error (#1261).
 - RPC: `getrawtransaction`'s not-found message matches the node's `-txindex` state (#1066).
 - RPC: `testmempoolaccept` forgives a standardness failure an `allow` policy rule forgives, as `sendrawtransaction` does (#999).
 - RPC: an open JSON-RPC WebSocket stops working when its bearer token is revoked or expires; its frames are answered `-32006` (#821).
