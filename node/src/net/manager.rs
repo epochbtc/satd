@@ -13886,6 +13886,15 @@ impl PeerManager {
             return;
         }
 
+        // 0b. A peer that never sent a version-2 `sendcmpct` has not
+        // negotiated compact blocks, and Core v32 ignores its `cmpctblock`,
+        // the header included (`m_provides_cmpctblocks`,
+        // `net_processing.cpp:4795-4802` at v32.1).
+        if !self.peers.read().get(&id).is_some_and(|h| h.info.compact_blocks) {
+            tracing::debug!("peer={id} sent us a compact block despite never having sent us a SENDCMPCT!");
+            return;
+        }
+
         // 1. Still syncing: take the header, leave the block to the download
         // scheduler. Core: `if (!already_in_flight && !CanDirectFetch()) return`.
         if self.ibd.read().is_some() || self.is_ibd() {
@@ -20271,7 +20280,9 @@ mod tests {
         let addr: SocketAddr = "10.0.0.1:8333".parse().unwrap();
         let (h, mut rx) = mk_handle_rx(1, addr, PeerState::Connected, 0);
         pm.peers.write().insert(1, h);
-        // We asked this peer for high-bandwidth relay, so its push is taken.
+        // The peer speaks BIP 152 version 2, and we asked it for
+        // high-bandwidth relay, so its push is taken.
+        pm.peers.write().get_mut(&1).unwrap().info.compact_blocks = true;
         pm.peers.write().get_mut(&1).unwrap().info.hb_to = true;
 
         let compact = bitcoin::bip152::HeaderAndShortIds::from_block(&block, 42, 2, &[])
@@ -21009,6 +21020,28 @@ mod tests {
         let b2 = coinbase_only_child(&f.tip, 2);
         deliver(&f.pm, 1, NetworkMessage::Headers(vec![b2.header]));
         assert_eq!(block_requests(&drain(&mut f.rx), b2.block_hash()), vec![false]);
+    }
+
+    /// Core's `m_provides_cmpctblocks` on receipt (v32.1
+    /// `net_processing.cpp:4795-4802`): a `cmpctblock` from a peer that never
+    /// sent a version-2 `sendcmpct` is ignored, its header included. Once the
+    /// same peer sends `sendcmpct(0, 2)`, the same `cmpctblock` is taken.
+    #[test]
+    fn a_cmpctblock_from_a_peer_without_version_two_sendcmpct_is_ignored() {
+        use bitcoin::p2p::message_compact_blocks::SendCmpct;
+        let mut f = compact_fetch_fixture_with(crate::time::now_secs() as u32, 1);
+        let b2 = coinbase_only_child(&f.tip, 2);
+        let h2 = b2.block_hash();
+        let tip = f.pm.chain_state.tip_hash();
+
+        deliver(&f.pm, 1, cmpctblock_of(&b2));
+        assert!(f.pm.chain_state.get_block_index(&h2).is_none(), "no header row");
+        assert_eq!(f.pm.chain_state.tip_hash(), tip);
+        assert!(drain(&mut f.rx).is_empty(), "nothing asked of the peer");
+
+        deliver(&f.pm, 1, NetworkMessage::SendCmpct(SendCmpct { send_compact: false, version: 2 }));
+        deliver(&f.pm, 1, cmpctblock_of(&b2));
+        assert!(f.pm.chain_state.get_block_index(&h2).is_some(), "a negotiated peer's header is taken");
     }
 
     /// Core's `!m_opts.ignore_incoming_txs`: under `-blocksonly` the mempool
