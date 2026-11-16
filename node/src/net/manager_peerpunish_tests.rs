@@ -240,6 +240,48 @@ fn an_out_of_range_getblocktxn_from_an_inbound_onion_peer_bans_nothing() {
     assert!(pm.is_addr_banned(&ordinary), "and its address banned");
 }
 
+/// Core #35832: a `getblocktxn` naming no index has no legitimate use, and
+/// answering it costs a block read, or for a block deeper than
+/// `MAX_BLOCKTXN_DEPTH` a whole block upload, for a 33-byte request. Core
+/// disconnects the sender without a misbehaviour score. The must-succeed half:
+/// the same block asked for with one index is answered and the peer stays.
+#[test]
+fn an_empty_getblocktxn_disconnects_without_a_ban_or_a_reply() {
+    let (pm, _dir) = mk_pm();
+    let mempool = Mempool::new(1_000_000, 0);
+    let block = crate::mining::miner::build_block_to_script(
+        &pm.chain_state,
+        &mempool,
+        bitcoin::ScriptBuf::new_op_return([0x2au8; 4]),
+        None,
+    )
+    .expect("mine a regtest block");
+    pm.chain_state.accept_block(&block).expect("accept the block");
+    let request = |indexes: Vec<u64>| {
+        NetworkMessage::GetBlockTxn(bitcoin::p2p::message_compact_blocks::GetBlockTxn {
+            txs_request: bitcoin::bip152::BlockTransactionsRequest {
+                block_hash: block.block_hash(),
+                indexes,
+            },
+        })
+    };
+
+    let mut rx = add_peer(&pm, peer(1, "10.62.0.8:50000", Direction::Inbound));
+    pm.handle_message(1, request(vec![0]), InFlight::adopt(None));
+    assert_eq!(outcome(&pm, 1), Outcome::Kept, "a one-index request keeps the peer");
+    assert!(
+        matches!(rx.try_recv(), Ok(NetworkMessage::BlockTxn(_))),
+        "and is answered with blocktxn"
+    );
+
+    pm.handle_message(1, request(vec![]), InFlight::adopt(None));
+    assert_eq!(outcome(&pm, 1), Outcome::Disconnected, "an empty request disconnects, bans nothing");
+    assert!(
+        !matches!(rx.try_recv(), Ok(NetworkMessage::BlockTxn(_) | NetworkMessage::Block(_))),
+        "and is not answered"
+    );
+}
+
 /// Core's `ConnectedThroughNetwork`: a peer that came in on the onion
 /// listener is on the onion network, whatever its socket address, and
 /// `getpeerinfo.network` says so (`net.cpp`, `rpc/net.cpp`).

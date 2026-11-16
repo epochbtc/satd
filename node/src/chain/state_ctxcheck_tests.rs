@@ -345,3 +345,39 @@ fn connect_refuses_a_stored_block_with_a_stale_version() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ---- Announcement (NewPoWValidBlock) --------------------------------------
+
+/// Core signals `NewPoWValidBlock` from `AcceptBlock` only after `CheckBlock`
+/// and `ContextualCheckBlock` pass, so a tip-extending block with a non-final
+/// transaction is never announced. satd called its hook before the
+/// transaction rules, so such a block went out as a compact announcement and
+/// a Core peer that checks it would disconnect us. Perturbation: move the
+/// hook call back above `check_block_context_before_write` and the count is 1
+/// after the non-final block. The must-succeed half: a valid tip-extending
+/// block fires the hook once.
+#[test]
+fn a_nonfinal_block_extending_the_tip_is_not_announced() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let (cs, dir) = make_chain_state();
+    let blocks = connect_chain(&cs, 3);
+    let fired = std::sync::Arc::new(AtomicUsize::new(0));
+    let counter = fired.clone();
+    cs.set_pow_valid_block_hook(Box::new(move |_, _| {
+        counter.fetch_add(1, Ordering::SeqCst);
+    }));
+
+    let bad = nonfinal_block(blocks[2].block_hash(), 4, BASE + 600 * 4);
+    let err = cs.accept_block(&bad).expect_err("bad-txns-nonfinal");
+    assert!(
+        matches!(err, ChainError::Connect(connect::ConnectError::LocktimeNotFinal)),
+        "got {err:?}"
+    );
+    assert_eq!(fired.load(Ordering::SeqCst), 0, "a non-final block must not be announced");
+
+    let good = build_test_block(blocks[2].block_hash(), 4, BASE + 600 * 4);
+    cs.accept_block(&good).expect("a valid block connects");
+    assert_eq!(fired.load(Ordering::SeqCst), 1, "a valid tip-extending block is announced once");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

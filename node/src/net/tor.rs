@@ -20,6 +20,48 @@ const CONTROL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 /// PROTOCOLINFO/AUTHCHALLENGE reply is a handful of lines, so a port streaming
 /// continuation lines without a terminator is refused rather than read forever.
 const MAX_REPLY_LINES: usize = 256;
+/// Cap on one control-port line, Core's `MAX_LINE_LENGTH`: the control spec
+/// sets no limit, so a port that streams a line with no end must not grow
+/// memory until the read timeout fires.
+const MAX_LINE_LEN: usize = 100_000;
+/// What `ADD_ONION` is given to make a new v3 service (Core's
+/// `PRIVATE_KEY_NEW`).
+const PRIVATE_KEY_NEW: &str = "NEW:ED25519-V3";
+/// The prefix of a v3 service key, saved or returned (Core's
+/// `PRIVATE_KEY_PREFIX`).
+const PRIVATE_KEY_PREFIX: &str = "ED25519-V3:";
+
+/// Core's `IsWellFormedPrivateKey`: a request for a new v3 key, or
+/// `ED25519-V3:` followed by the base64 of 64 bytes (the 32-byte secret
+/// scalar and the 32-byte PRF secret). A key that is not is never sent to
+/// Tor, saved, or adopted: sent unquoted on the `ADD_ONION` line, a key with
+/// a space in it would add arguments of its own to the command.
+pub(crate) fn is_well_formed_private_key(key: &str) -> bool {
+    use base64::Engine as _;
+    if key == PRIVATE_KEY_NEW {
+        return true;
+    }
+    key.strip_prefix(PRIVATE_KEY_PREFIX)
+        .and_then(|b64| base64::engine::general_purpose::STANDARD.decode(b64).ok())
+        .is_some_and(|raw| raw.len() == 64)
+}
+
+/// Read one line into `line`, refusing one longer than [`MAX_LINE_LEN`]
+/// rather than buffering it whole. Returns the bytes read, 0 at EOF.
+async fn read_bounded_line<R: tokio::io::AsyncBufRead + Unpin>(
+    reader: &mut R,
+    line: &mut String,
+) -> std::io::Result<usize> {
+    use tokio::io::AsyncReadExt as _;
+    let n = reader.take(MAX_LINE_LEN as u64 + 1).read_line(line).await?;
+    if n > MAX_LINE_LEN {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("control-port line longer than {MAX_LINE_LEN} bytes"),
+        ));
+    }
+    Ok(n)
+}
 
 /// Auth methods a Tor control port may advertise via `PROTOCOLINFO`.
 #[derive(Debug, Default, Clone)]
@@ -256,9 +298,13 @@ impl TorController {
         target_addr: &str,
         key: Option<&str>,
     ) -> Result<(String, Option<String>), String> {
+        let key = key.unwrap_or(PRIVATE_KEY_NEW);
+        if !is_well_formed_private_key(key) {
+            return Err("Tor ADD_ONION: refusing a malformed private key".to_string());
+        }
         let cmd = format!(
             "ADD_ONION {} Port={},{}\r\n",
-            key.unwrap_or("NEW:ED25519-V3"),
+            key,
             virtual_port,
             target_addr
         );
@@ -287,8 +333,20 @@ impl TorController {
             }
         }
 
+        // Core's `add_onion_cb`: a malformed key is never adopted or saved,
+        // and a service ID that is not a v3 onion address is never
+        // advertised.
+        if let Some(k) = &private_key
+            && !is_well_formed_private_key(k)
+        {
+            return Err("Tor ADD_ONION returned a malformed private key".to_string());
+        }
         let id = service_id.ok_or("Tor ADD_ONION: no ServiceID in response")?;
-        Ok((format!("{}.onion", id), private_key))
+        let onion = format!("{}.onion", id);
+        if crate::net::peer::onion_host_to_torv3_pubkey(&onion).is_none() {
+            return Err("Tor ADD_ONION returned an invalid service ID".to_string());
+        }
+        Ok((onion, private_key))
     }
 
     /// Remove a previously created hidden service.
@@ -319,7 +377,7 @@ impl TorController {
         let mut line = String::new();
         loop {
             line.clear();
-            match self.reader.read_line(&mut line).await {
+            match read_bounded_line(&mut self.reader, &mut line).await {
                 Ok(0) | Err(_) => return,
                 Ok(_) => {}
             }
@@ -331,7 +389,7 @@ impl TorController {
     /// timeout also caps an unterminated slowloris dribble of bytes).
     async fn read_response(&mut self) -> Result<String, String> {
         let mut line = String::new();
-        let n = tokio::time::timeout(CONTROL_TIMEOUT, self.reader.read_line(&mut line))
+        let n = tokio::time::timeout(CONTROL_TIMEOUT, read_bounded_line(&mut self.reader, &mut line))
             .await
             .map_err(|_| "Tor control read timed out".to_string())?
             .map_err(|e| format!("Tor control read failed: {}", e))?;
@@ -607,6 +665,18 @@ impl HiddenService {
             .map_err(|e| format!("Tor control authentication failed: {e}"))?;
         // The key saved last time keeps the node at the same onion address.
         let saved_key = load_onion_key(&self.net_datadir);
+        // Core's `auth_cb`: a malformed saved key is refused, never sent.
+        if let Some(k) = &saved_key
+            && !is_well_formed_private_key(k)
+        {
+            let path = onion_key_path(&self.net_datadir);
+            tracing::warn!(
+                path = %path.display(),
+                "Refusing to use the saved Tor private key because it is malformed; \
+                 remove the file to generate a new key"
+            );
+            return Err(format!("malformed Tor private key in {}", path.display()));
+        }
         let (onion, new_key) = controller
             .create_hidden_service(self.virtual_port, &self.target, saved_key.as_deref())
             .await?;
@@ -799,9 +869,9 @@ mod tests {
         let mut reader = BufReader::new(rh);
         let mut l = String::new();
         reader.read_line(&mut l).await.unwrap();
-        let mut reply = "250-ServiceID=abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqrstuvwx\r\n".to_string();
+        let mut reply = "250-ServiceID=a4dqobyha4dqobyha4dqobyha4dqobyha4dqobyha4dqobyha4dwc6ad\r\n".to_string();
         if l.contains("NEW:ED25519-V3") {
-            reply.push_str("250-PrivateKey=ED25519-V3:a2V5\r\n");
+            reply.push_str("250-PrivateKey=ED25519-V3:AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0+Pw==\r\n");
         }
         reply.push_str("250 OK\r\n");
         wh.write_all(reply.as_bytes()).await.unwrap();
@@ -821,19 +891,128 @@ mod tests {
         let sent = server.await.unwrap();
         assert_eq!(sent, "ADD_ONION NEW:ED25519-V3 Port=8333,127.0.0.1:8334");
         assert!(onion.ends_with(".onion"));
-        assert_eq!(key.as_deref(), Some("ED25519-V3:a2V5"));
+        assert_eq!(key.as_deref(), Some("ED25519-V3:AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0+Pw=="));
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
         let server = tokio::spawn(fake_tor_add_onion(listener));
         let mut ctrl = TorController::connect(&addr).await.unwrap();
         let (again, key) = ctrl
-            .create_hidden_service(8333, "127.0.0.1:8334", Some("ED25519-V3:a2V5"))
+            .create_hidden_service(8333, "127.0.0.1:8334", Some("ED25519-V3:AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0+Pw=="))
             .await
             .unwrap();
-        assert_eq!(server.await.unwrap(), "ADD_ONION ED25519-V3:a2V5 Port=8333,127.0.0.1:8334");
+        assert_eq!(server.await.unwrap(), "ADD_ONION ED25519-V3:AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0+Pw== Port=8333,127.0.0.1:8334");
         assert_eq!(again, onion);
         assert_eq!(key, None, "Tor returns no key for an existing one");
+    }
+
+    /// A control port that answers one `ADD_ONION` with `reply`, verbatim.
+    /// Returns the request line.
+    async fn fake_tor_add_onion_replying(listener: TcpListener, reply: String) -> String {
+        let (stream, _) = listener.accept().await.unwrap();
+        let (rh, mut wh) = tokio::io::split(stream);
+        let mut reader = BufReader::new(rh);
+        let mut l = String::new();
+        reader.read_line(&mut l).await.unwrap();
+        let _ = wh.write_all(reply.as_bytes()).await;
+        l.trim_end().to_string()
+    }
+
+    async fn add_onion_against(reply: String) -> Result<(String, Option<String>), String> {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let server = tokio::spawn(fake_tor_add_onion_replying(listener, reply));
+        let mut ctrl = TorController::connect(&addr).await.unwrap();
+        let out = ctrl.create_hidden_service(8333, "127.0.0.1:8334", None).await;
+        drop(ctrl);
+        let _ = server.await;
+        out
+    }
+
+    const GOOD_ID: &str = "a4dqobyha4dqobyha4dqobyha4dqobyha4dqobyha4dqobyha4dwc6ad";
+    const GOOD_KEY: &str = "ED25519-V3:AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0+Pw==";
+
+    /// Core #36142, `IsWellFormedPrivateKey`: a new-key request, or
+    /// `ED25519-V3:` and the base64 of exactly 64 bytes. A key with a space
+    /// would put arguments of its own on the unquoted `ADD_ONION` line.
+    #[test]
+    fn only_a_well_formed_v3_key_is_accepted() {
+        assert!(is_well_formed_private_key("NEW:ED25519-V3"));
+        assert!(is_well_formed_private_key(GOOD_KEY));
+        for bad in [
+            "",
+            "ED25519-V3:a2V5",
+            "RSA1024:AAAA",
+            "NEW:BEST",
+            format!("{GOOD_KEY} Flags=DiscardPK").as_str(),
+            format!("{GOOD_KEY} Port=1,1.2.3.4:5").as_str(),
+            GOOD_KEY.replace("ED25519-V3:", "ED25519-V3: ").as_str(),
+        ] {
+            assert!(!is_well_formed_private_key(bad), "{bad:?}");
+        }
+    }
+
+    /// Core #36142, `add_onion_cb`: a reply whose key is malformed, or whose
+    /// service ID is not a v3 onion address, adopts nothing. The
+    /// must-succeed half is the well-formed reply, adopted with its key.
+    #[tokio::test]
+    async fn add_onion_refuses_a_malformed_key_or_service_id() {
+        let ok = add_onion_against(format!(
+            "250-ServiceID={GOOD_ID}\r\n250-PrivateKey={GOOD_KEY}\r\n250 OK\r\n"
+        ))
+        .await
+        .expect("a well-formed reply is adopted");
+        assert_eq!(ok, (format!("{GOOD_ID}.onion"), Some(GOOD_KEY.to_string())));
+
+        let err = add_onion_against(format!(
+            "250-ServiceID={GOOD_ID}\r\n250-PrivateKey=ED25519-V3:a2V5 Port=1,6.6.6.6:1\r\n250 OK\r\n"
+        ))
+        .await
+        .expect_err("a malformed key");
+        assert!(err.contains("malformed private key"), "{err}");
+
+        for id in ["abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqrstuvwx", "evil.example", "x"] {
+            let err = add_onion_against(format!(
+                "250-ServiceID={id}\r\n250-PrivateKey={GOOD_KEY}\r\n250 OK\r\n"
+            ))
+            .await
+            .expect_err("an invalid service ID");
+            assert!(err.contains("invalid service ID"), "{id}: {err}");
+        }
+    }
+
+    /// A malformed key handed in (it can only come from the saved file) is
+    /// never written to the control port.
+    #[tokio::test]
+    async fn a_malformed_saved_key_is_never_sent() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let server = tokio::spawn(fake_tor_add_onion_replying(listener, String::new()));
+        let mut ctrl = TorController::connect(&addr).await.unwrap();
+        let err = ctrl
+            .create_hidden_service(8333, "127.0.0.1:8334", Some("ED25519-V3:x Port=1,6.6.6.6:1"))
+            .await
+            .expect_err("a malformed key");
+        assert!(err.contains("malformed private key"), "{err}");
+        drop(ctrl);
+        assert_eq!(server.await.unwrap(), "", "nothing reached the control port");
+    }
+
+    /// Core's `MAX_LINE_LENGTH`: a reply line with no end is refused once it
+    /// passes the cap, not buffered until the read timeout. The must-succeed
+    /// half: a line exactly at the cap is read.
+    #[tokio::test]
+    async fn a_control_line_longer_than_the_cap_is_refused() {
+        let at_cap = format!("{}\n", "a".repeat(MAX_LINE_LEN - 1));
+        let mut r = BufReader::new(at_cap.as_bytes());
+        let mut line = String::new();
+        assert_eq!(read_bounded_line(&mut r, &mut line).await.unwrap(), MAX_LINE_LEN);
+
+        let over = "a".repeat(MAX_LINE_LEN + 10);
+        let mut r = BufReader::new(over.as_bytes());
+        let mut line = String::new();
+        assert!(read_bounded_line(&mut r, &mut line).await.is_err());
+        assert!(line.len() <= MAX_LINE_LEN + 1, "buffered {} bytes", line.len());
     }
 
     /// One control connection of a Tor with null authentication: answers
@@ -856,9 +1035,9 @@ mod tests {
                 "250 OK\r\n".to_string()
             } else if l.starts_with("ADD_ONION") {
                 add_onion = l.trim_end().to_string();
-                let mut r = "250-ServiceID=abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqrstuvwx\r\n".to_string();
+                let mut r = "250-ServiceID=a4dqobyha4dqobyha4dqobyha4dqobyha4dqobyha4dqobyha4dwc6ad\r\n".to_string();
                 if l.contains("NEW:ED25519-V3") {
-                    r.push_str("250-PrivateKey=ED25519-V3:a2V5\r\n");
+                    r.push_str("250-PrivateKey=ED25519-V3:AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0+Pw==\r\n");
                 }
                 r.push_str("250 OK\r\n");
                 r
@@ -904,7 +1083,7 @@ mod tests {
         }
     }
 
-    const FAKE_ONION: &str = "abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqrstuvwx.onion";
+    const FAKE_ONION: &str = "a4dqobyha4dqobyha4dqobyha4dqobyha4dqobyha4dqobyha4dwc6ad.onion";
 
     /// #973: when Tor restarts, the address is withdrawn, and the service is
     /// added again, with the key saved the first time, so it comes back at
@@ -936,7 +1115,7 @@ mod tests {
         assert_eq!(events, [up.clone(), "withdrawn".to_string(), up]);
         let (first, second, _conn) = tor.await.unwrap();
         assert_eq!(first, "ADD_ONION NEW:ED25519-V3 Port=8333,127.0.0.1:8334");
-        assert_eq!(second, "ADD_ONION ED25519-V3:a2V5 Port=8333,127.0.0.1:8334");
+        assert_eq!(second, "ADD_ONION ED25519-V3:AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0+Pw== Port=8333,127.0.0.1:8334");
     }
 
     /// #973: an `-externalip` onion is advertised while the node's own
@@ -971,8 +1150,8 @@ mod tests {
     fn the_saved_key_round_trips_and_only_its_owner_can_read_it() {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(load_onion_key(dir.path()), None);
-        save_onion_key(dir.path(), "ED25519-V3:a2V5").unwrap();
-        assert_eq!(load_onion_key(dir.path()).as_deref(), Some("ED25519-V3:a2V5"));
+        save_onion_key(dir.path(), "ED25519-V3:AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0+Pw==").unwrap();
+        assert_eq!(load_onion_key(dir.path()).as_deref(), Some("ED25519-V3:AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0+Pw=="));
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;

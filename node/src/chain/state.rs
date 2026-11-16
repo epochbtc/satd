@@ -8432,19 +8432,23 @@ impl ChainState {
             return Err(ChainError::CheckpointMismatch(new_height));
         }
 
-        // Everything short of connecting has passed. A block that extends the
-        // tip may be announced now (Core's `NewPoWValidBlock`).
-        if prev_hash == self.tip_hash()
-            && let Some(hook) = self.pow_valid_block_hook.read().as_ref()
-        {
-            hook(block, new_height);
-        }
-
         // The transaction rules Core checks in `AcceptBlock` before
         // `WriteBlock`. Without them a side-chain block that breaks them was
         // written and answered `inconclusive`.
         let mtp = validation::pow::median_time_past_of(&parent, |h| store_ref.get_block_index(h));
         self.check_block_context_before_write(block, &block_hash, new_height, mtp, true)?;
+
+        // Everything short of connecting has passed, the transaction rules
+        // just above included. A block that extends the tip may be announced
+        // now (Core's `NewPoWValidBlock`, which `AcceptBlock` signals only
+        // after `ContextualCheckBlock`): a block with a wrong coinbase height
+        // or a non-final transaction is never announced, so peers that check
+        // before relaying have nothing to punish us for.
+        if prev_hash == self.tip_hash()
+            && let Some(hook) = self.pow_valid_block_hook.read().as_ref()
+        {
+            hook(block, new_height);
+        }
 
         // ---- Connect-time validation passed. Write the block data. ----
         // Write raw block to flat file, durably enough that the index entry
