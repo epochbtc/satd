@@ -94,6 +94,7 @@ It includes every fix shipped in 0.7.1:
 - Tor: the onion address and private key `ADD_ONION` returns, and the saved key, are checked as Core checks them before they are used, and a control-port line over 100,000 bytes is refused. Also in 0.7.2.
 - Electrum: JSON-RPC notifications (requests with no `id`) are no longer run only to drop their reply. Also in 0.7.2.
 - RPC: `addnode` refuses an empty node with Core's `-8` error; `addnode "" add` kept it and retried it forever. Also in 0.7.2.
+- RPC: integer and verbosity arguments are parsed as in Core: a negative `getblock`/`getrawtransaction` verbosity means hex and a too-high one the top level, a fraction or a value outside the argument's C++ type is `-1 JSON integer out of range`, and each method answers Core's range error (#1267).
 
 ## Releases
 
