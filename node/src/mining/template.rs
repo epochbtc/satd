@@ -1762,7 +1762,7 @@ pub(crate) mod tests {
         assert!(txs.contains(&control));
         assert_topological(&template);
         // The pair is (1_000 - 100_000 + 200_000) / 200 vB = 505 sat/vB, ahead
-        // of the control's 25.
+        // of the control's 50.
         assert_eq!(txs, vec![parent, child, control]);
         let fees: Vec<u64> = template.transactions.iter().map(|t| t.fee).collect();
         assert_eq!(fees, vec![1_000, 200_000, 5_000]);
