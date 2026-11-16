@@ -389,6 +389,10 @@ fn normalize_args(args: Vec<String>) -> Vec<String> {
         .collect()
 }
 
+/// Stands in for the RPC method while clap parses a command line whose method
+/// comes from `-stdin`. Not a valid RPC name, so it can never be a real one.
+const STDIN_METHOD_PLACEHOLDER: &str = "\u{0}stdin-method";
+
 /// Remove every `--<name>` from the (normalized) arguments; true if any was
 /// there.
 fn take_flag(args: &mut Vec<String>, name: &str) -> bool {
@@ -800,22 +804,57 @@ async fn main() {
     // stdin.
     let stdin_rpcpass = take_flag(&mut normalized, "stdinrpcpass");
     let stdin_args = take_flag(&mut normalized, "stdin");
-    let rpcpass_from_stdin = if stdin_rpcpass || stdin_args {
+    let (rpcpass_from_stdin, stdin_lines) = if stdin_rpcpass || stdin_args {
         match read_stdin_args(stdin_rpcpass, stdin_args) {
-            Ok((pass, args)) => {
-                normalized.extend(args);
-                pass
-            }
+            Ok(read) => read,
             Err(e) => {
                 eprintln!("error: {e}");
                 std::process::exit(1);
             }
         }
     } else {
-        None
+        (None, Vec::new())
     };
 
-    let cli = match Cli::try_parse_from(normalized) {
+    // Stdin lines are RPC arguments, never options: they are added to the
+    // raw call after clap has parsed the command line, so a line such as
+    // `--named` or `--rpcuser=x` is sent as typed, as in Core.
+    let parsed = Cli::try_parse_from(&normalized).or_else(|e| {
+        use clap::error::ErrorKind;
+        // The method itself comes from stdin: parse the command line with a
+        // placeholder raw method, replaced below.
+        if !stdin_lines.is_empty()
+            && matches!(
+                e.kind(),
+                ErrorKind::MissingSubcommand | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+            )
+        {
+            let mut with_method = normalized.clone();
+            with_method.push(STDIN_METHOD_PLACEHOLDER.to_string());
+            Cli::try_parse_from(with_method)
+        } else {
+            Err(e)
+        }
+    });
+    let parsed = parsed.map(|mut cli| {
+        if !stdin_lines.is_empty() {
+            match &mut cli.command {
+                Cmd::Raw(args) => {
+                    if args.first().map(String::as_str) == Some(STDIN_METHOD_PLACEHOLDER) {
+                        args.clear();
+                    }
+                    args.extend(stdin_lines);
+                }
+                _ => {
+                    eprintln!("error: -stdin supplies arguments to a raw RPC call only");
+                    std::process::exit(1);
+                }
+            }
+        }
+        cli
+    });
+
+    let cli = match parsed {
         Ok(c) => c,
         Err(e) => {
             // `--version` and `--help` come back as `Err` from

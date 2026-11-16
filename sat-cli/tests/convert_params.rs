@@ -128,6 +128,15 @@ fn stdin_lines_are_arguments_and_stdinrpcpass_takes_the_first() {
     let c = capture(&["-rpcpassword=other", "-stdinrpcpass", "-stdin"], "pw\ngetblock\n00ab\n2\n");
     assert_eq!(c.body["method"], "getblock");
     assert_eq!(c.body["params"], serde_json::json!(["00ab", 2]));
+
     // Basic base64("u:pw"): the stdin password replaces -rpcpassword.
     assert_eq!(c.auth, "Basic dTpwdw==");
+
+    // A stdin line that looks like an option is still an argument, the
+    // method included.
+    let c = capture(&["-rpcpassword=p", "-stdin"], "--named\ngetblockcount\n");
+    assert_eq!(c.body["method"], "--named");
+    assert_eq!(c.body["params"], serde_json::json!(["getblockcount"]));
+    let c = capture(&["-rpcpassword=p", "-stdin", "echo"], "--help\n--rpcuser=x\n");
+    assert_eq!(c.body["params"], serde_json::json!(["--help", "--rpcuser=x"]));
 }
