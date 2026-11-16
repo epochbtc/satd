@@ -5239,6 +5239,31 @@ fn addnode_refuses_a_name_under_dns_off() {
     node.stop();
 }
 
+/// Core #35787: an empty or blank node is refused for every command with
+/// `-8 Error: Node address cannot be empty`, and nothing is added; under
+/// `add` it was kept and redialed for the life of the process. An unknown
+/// command is still refused as one, first. The must-succeed half: a real
+/// address is added.
+#[test]
+fn addnode_refuses_an_empty_node() {
+    use serde_json::json;
+    let mut node = TestNode::start(&[]);
+    for command in ["add", "remove", "onetry"] {
+        for blank in ["", " "] {
+            let r = node.rpc_call_with_params("addnode", vec![json!(blank), json!(command)]).unwrap();
+            assert_eq!(r["error"]["code"], -8, "{command} {blank:?}: {r}");
+            assert_eq!(r["error"]["message"], "Error: Node address cannot be empty", "{r}");
+        }
+    }
+    let r = node.rpc_call_with_params("addnode", vec![json!(""), json!("abc")]).unwrap();
+    assert_ne!(r["error"]["code"], -8, "an unknown command is refused as one: {r}");
+    assert_eq!(node.rpc_ok("getaddednodeinfo", vec![]), json!([]));
+
+    node.rpc_ok("addnode", vec![json!("127.0.0.1:18444"), json!("add")]);
+    assert_eq!(node.rpc_ok("getaddednodeinfo", vec![]).as_array().map(Vec::len), Some(1));
+    node.stop();
+}
+
 #[test]
 fn test_getnettotals() {
     let mut node = TestNode::start(&[]);

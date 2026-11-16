@@ -3109,6 +3109,16 @@ pub async fn start(
         let command: String = args.optional_or("command", "onetry".to_string())?;
         let v2transport: Option<bool> = args.optional("v2transport")?;
         args.check()?;
+        // Core #35787 (`rpc/net.cpp`): checked after the command, before
+        // anything else. An empty node never resolves, and under `add` it
+        // was retried for the life of the process.
+        if matches!(command.as_str(), "add" | "remove" | "onetry") && addr_str.trim().is_empty() {
+            return Err(ErrorObjectOwned::owned(
+                -8,
+                "Error: Node address cannot be empty",
+                None::<()>,
+            ));
+        }
         if v2transport == Some(true) && !ctx.peer_manager.v2_transport_enabled() {
             return Err(ErrorObjectOwned::owned(
                 -8,
