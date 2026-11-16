@@ -94,6 +94,7 @@ It includes every fix shipped in 0.7.1:
 - Tor: the onion address and private key `ADD_ONION` returns, and the saved key, are checked as Core checks them before they are used, and a control-port line over 100,000 bytes is refused. Also in 0.7.2.
 - Electrum: JSON-RPC notifications (requests with no `id`) are no longer run only to drop their reply. Also in 0.7.2.
 - RPC: `addnode` refuses an empty node with Core's `-8` error; `addnode "" add` kept it and retried it forever. Also in 0.7.2.
+- CLI: `sat-cli` converts a raw RPC call's arguments by Bitcoin Core's per-method table, as `bitcoin-cli` does, instead of parsing every argument that looks like JSON: `signmessagewithprivkey <key> 123` signs the text `123`. A listed argument that is not valid JSON is refused. Adds `-stdinrpcpass`; `-stdin` keeps empty lines (#1268).
 
 ## Releases
 

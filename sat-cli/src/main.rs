@@ -26,6 +26,7 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 mod conf;
+mod convert;
 mod policylint;
 mod sign;
 mod sign_v2;
@@ -133,7 +134,9 @@ struct Cli {
     output: Option<String>,
 
     /// Bitcoin Core compat: send arguments as named JSON-RPC params.
-    /// `key=value` pairs on the command line become `{"key": value}`.
+    /// `key=value` pairs on the command line become `{"key": value}`, the
+    /// value converted by the same table as a positional argument; arguments
+    /// without `=` go, in order, into `args`.
     #[arg(long, global = true)]
     named: bool,
 
@@ -143,10 +146,16 @@ struct Cli {
     #[arg(long, global = true)]
     nonamed: bool,
 
-    /// Bitcoin Core compat: read RPC arguments from stdin, one per line.
+    /// Bitcoin Core compat: read extra RPC arguments from stdin, one per
+    /// line until EOF. With -stdinrpcpass, the first line is the password.
     /// Handled pre-parse; this flag is consumed before clap sees it.
-    #[arg(long, global = true, hide = true)]
+    #[arg(long, global = true)]
     stdin: bool,
+
+    /// Bitcoin Core compat: read the RPC password from the first line of
+    /// stdin (prompted for without echo on a terminal). Handled pre-parse.
+    #[arg(long, global = true)]
+    stdinrpcpass: bool,
 
     /// Bitcoin Core compat: RPC client timeout in seconds (accepted and
     /// ignored; sat-cli uses a fixed internal timeout).
@@ -249,7 +258,11 @@ enum Cmd {
         allow_dangerous_filters: bool,
     },
     /// Bitcoin-Core-compatible raw RPC passthrough. Captures unknown
-    /// subcommands so `sat-cli getblockchaininfo` still works.
+    /// subcommands so `sat-cli getblockchaininfo` still works. Arguments are
+    /// converted as `bitcoin-cli` converts them: only those Core's table (or
+    /// satd's, for its own RPCs) lists as JSON are parsed; every other one is
+    /// sent as the string typed. For a method neither table knows, each
+    /// argument is parsed as JSON if it can be, else sent as a string.
     #[command(external_subcommand)]
     Raw(Vec<String>),
 }
@@ -356,6 +369,7 @@ fn normalize_args(args: Vec<String>) -> Vec<String> {
         "named",
         "nonamed",
         "stdin",
+        "stdinrpcpass",
         "rpcclienttimeout",
     ];
 
@@ -373,6 +387,59 @@ fn normalize_args(args: Vec<String>) -> Vec<String> {
             }
         })
         .collect()
+}
+
+/// Remove every `--<name>` from the (normalized) arguments; true if any was
+/// there.
+fn take_flag(args: &mut Vec<String>, name: &str) -> bool {
+    let flag = format!("--{name}");
+    let before = args.len();
+    args.retain(|a| *a != flag);
+    args.len() != before
+}
+
+/// Read what `-stdinrpcpass` and `-stdin` take from standard input: the
+/// password (first line) and the extra arguments (every other line).
+fn read_stdin_args(rpcpass: bool, args: bool) -> Result<(Option<String>, Vec<String>), String> {
+    use std::io::{BufRead, IsTerminal};
+    let stdin = std::io::stdin();
+    let mut lines = stdin.lock().lines();
+    let pass = if !rpcpass {
+        None
+    } else if stdin.is_terminal() {
+        Some(
+            rpassword::prompt_password("RPC password> ")
+                .map_err(|_| "-stdinrpcpass specified but failed to read from standard input")?,
+        )
+    } else {
+        match lines.next() {
+            Some(Ok(line)) => Some(line),
+            _ => {
+                return Err("-stdinrpcpass specified but failed to read from standard input".into());
+            }
+        }
+    };
+    let mut extra = Vec::new();
+    if args {
+        for line in lines {
+            extra.push(line.map_err(|e| format!("failed to read stdin: {e}"))?);
+        }
+    }
+    Ok((pass, extra))
+}
+
+/// Turn a raw passthrough call (`<method> [args...]`) into the method name and
+/// its serialized JSON-RPC `params`, converting arguments the way
+/// `bitcoin-cli` does: see `convert.rs`.
+fn convert_raw(args: &[String], named: bool) -> Result<(String, String), String> {
+    let method = args.first().cloned().unwrap_or_default();
+    let rest = args.get(1..).unwrap_or_default();
+    let params = if named {
+        convert::convert_named_values(&method, rest)?
+    } else {
+        convert::convert_values(&method, rest)?.to_string()
+    };
+    Ok((method, params))
 }
 
 /// Translate a structured `Cmd` into a raw `(method, params)` RPC call.
@@ -422,15 +489,8 @@ fn resolve_cmd(cmd: &Cmd) -> (String, Vec<serde_json::Value>) {
         Cmd::Policylint { .. } => {
             unreachable!("policylint is handled locally before RPC dispatch")
         }
-        Cmd::Raw(args) => {
-            let mut it = args.iter();
-            let method = it.next().cloned().unwrap_or_default();
-            let params: Vec<serde_json::Value> = it
-                .map(|p| {
-                    serde_json::from_str(p).unwrap_or_else(|_| serde_json::Value::String(p.clone()))
-                })
-                .collect();
-            (method, params)
+        Cmd::Raw(_) => {
+            unreachable!("raw RPC arguments are converted by convert_raw")
         }
     }
 }
@@ -732,20 +792,28 @@ async fn main() {
     let raw_args: Vec<String> = std::env::args().collect();
     let mut normalized = normalize_args(raw_args);
 
-    // `-stdin`: read method + args from stdin before clap parsing.
-    if normalized.iter().any(|a| a == "--stdin" || a == "-stdin") {
-        use std::io::BufRead;
-        let stdin = std::io::stdin();
-        let mut stdin_args: Vec<String> = Vec::new();
-        for line in stdin.lock().lines() {
-            let line = line.unwrap_or_default();
-            if !line.is_empty() {
-                stdin_args.push(line);
+    // `-stdinrpcpass` and `-stdin`, as Core's `CommandLineRPC`
+    // (src/bitcoin-cli.cpp) reads them: the RPC password is the first line of
+    // standard input (prompted for without echo on a terminal), and `-stdin`
+    // then appends every remaining line as one argument, empty lines
+    // included. Read before clap parses, so the method itself may come from
+    // stdin.
+    let stdin_rpcpass = take_flag(&mut normalized, "stdinrpcpass");
+    let stdin_args = take_flag(&mut normalized, "stdin");
+    let rpcpass_from_stdin = if stdin_rpcpass || stdin_args {
+        match read_stdin_args(stdin_rpcpass, stdin_args) {
+            Ok((pass, args)) => {
+                normalized.extend(args);
+                pass
+            }
+            Err(e) => {
+                eprintln!("error: {e}");
+                std::process::exit(1);
             }
         }
-        normalized.retain(|a| a != "--stdin" && a != "-stdin");
-        normalized.extend(stdin_args);
-    }
+    } else {
+        None
+    };
 
     let cli = match Cli::try_parse_from(normalized) {
         Ok(c) => c,
@@ -831,7 +899,8 @@ async fn main() {
         rpcconnect: cli.rpcconnect.clone(),
         rpcport: cli.rpcport,
         rpcuser: cli.rpcuser.clone(),
-        rpcpassword: cli.rpcpassword.clone(),
+        // Core's `ForceSetArg("-rpcpassword", ...)`: stdin wins.
+        rpcpassword: rpcpass_from_stdin.or_else(|| cli.rpcpassword.clone()),
         rpccookiefile: cli.rpccookiefile.clone(),
     };
     let conn = match conf::resolve(&cli_conn, conf_file.as_ref(), &base_datadir, conf_path) {
@@ -894,55 +963,27 @@ async fn main() {
     let url = tls.endpoint(&conn.host, conn.port);
     let output = OutputFormat::parse(cli.output.as_deref());
 
-    let (method, params) = resolve_cmd(&cli.command);
-
-    let json_params: serde_json::Value = if cli.named {
-        if let Cmd::Raw(_) = &cli.command {
-            // Core's `RPCConvertNamedValues` (src/rpc/client.cpp): an argument
-            // with no `=` is a *positional* one. They are collected in order
-            // into the reserved `args` key, which the server expands into the
-            // leading argument slots. Dropping them instead -- which is what
-            // this did -- silently sent a different call than the operator
-            // typed (#672).
-            let mut obj = serde_json::Map::new();
-            let mut positional: Vec<serde_json::Value> = Vec::new();
-            for p in &params {
-                let Some(s) = p.as_str() else {
-                    positional.push(p.clone());
-                    continue;
-                };
-                match s.split_once('=') {
-                    Some((k, v)) => {
-                        let val: serde_json::Value = serde_json::from_str(v)
-                            .unwrap_or_else(|_| serde_json::Value::String(v.to_string()));
-                        obj.insert(k.to_string(), val);
-                    }
-                    None => {
-                        let val: serde_json::Value = serde_json::from_str(s)
-                            .unwrap_or_else(|_| serde_json::Value::String(s.to_string()));
-                        positional.push(val);
-                    }
-                }
+    let (method, params) = match &cli.command {
+        Cmd::Raw(args) => match convert_raw(args, cli.named) {
+            Ok(call) => call,
+            Err(e) => {
+                eprintln!("error: {e}");
+                std::process::exit(1);
             }
-            if !positional.is_empty() {
-                // `pushKVEnd` in Core: never overwrite an explicit `args=`.
-                obj.entry("args".to_string())
-                    .or_insert(serde_json::Value::Array(positional));
-            }
-            serde_json::Value::Object(obj)
-        } else {
-            serde_json::Value::Array(params)
+        },
+        cmd => {
+            let (method, params) = resolve_cmd(cmd);
+            (method, serde_json::Value::Array(params).to_string())
         }
-    } else {
-        serde_json::Value::Array(params)
     };
 
-    let body = serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": "sat-cli",
-        "method": method,
-        "params": json_params,
-    });
+    // Assembled as text: `params` may carry a key twice (see
+    // `convert::convert_named_values`), which a JSON map cannot hold.
+    let body = format!(
+        r#"{{"jsonrpc":"2.0","id":"sat-cli","method":{},"params":{}}}"#,
+        serde_json::Value::String(method),
+        params
+    );
 
     // A bad flag combination or unreadable PEM is fatal here rather than
     // per-request: every retry would fail identically, and `-rpcwait` would
@@ -973,7 +1014,7 @@ async fn main() {
             .post(&url)
             .header("Content-Type", "application/json")
             .header("Authorization", &auth_header)
-            .json(&body)
+            .body(body.clone())
             .send()
             .await;
 
