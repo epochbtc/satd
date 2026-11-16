@@ -384,6 +384,7 @@ fn as_stripped(mut tx: serde_json::Value, vout: usize, script_len: usize) -> ser
     tx["opreturn_stripped"] = serde_json::json!(true);
     tx["vout"][vout]["scriptPubKey"] = serde_json::json!({
         "asm": "OP_RETURN",
+        "desc": "raw(6a)#4mhr9ur5",
         "hex": "6a",
         "type": "nulldata",
         "stripped_size": script_len,

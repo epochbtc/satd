@@ -255,8 +255,8 @@ The RPCs read such a block through its strip record:
 *   A stripped transaction, in `getblock` 2 and 3 and verbose
     `getrawtransaction`, has its real `txid` and `hash`, no `hex`, and
     `"opreturn_stripped": true`. Each stripped output's `scriptPubKey` reads as
-    the bare `OP_RETURN` it keeps (`asm` `OP_RETURN`, `hex` `6a`, type
-    `nulldata`), plus `"stripped_size"`, the original length. Fees and
+    the bare `OP_RETURN` it keeps (`asm` `OP_RETURN`, `desc` `raw(6a)`, `hex`
+    `6a`, type `nulldata`), plus `"stripped_size"`, the original length. Fees and
     prevouts come from undo data and are unchanged.
 *   `getrawtransaction` hex, and `gettxspendingprevout`'s `spendingtx`, refuse
     a stripped transaction with `-1 Transaction data not available (OP_RETURN

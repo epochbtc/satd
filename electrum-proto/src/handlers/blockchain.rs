@@ -842,6 +842,8 @@ struct TxLocation {
 /// - `scriptSig.asm` / `scriptPubKey.asm` are Bitcoin Core's
 ///   `ScriptToAsmStr`, the scriptSig's with its sighash decode, as
 ///   satd's `getrawtransaction` writes them.
+/// - `scriptPubKey.desc` is the inferred descriptor Core's `ScriptToUniv`
+///   adds.
 /// - `coinbase` variant of `vin[]` omits txid/vout/scriptSig per Core.
 /// - `txinwitness` is omitted (not present in JSON) for non-segwit
 ///   inputs, matching Core.
@@ -904,6 +906,7 @@ fn verbose_transaction_json(
         .map(|(n, output)| {
             let mut spk = json!({
                 "asm": node::rpc::script_asm::script_to_asm_str(output.script_pubkey.as_bytes(), false),
+                "desc": node::rpc::descriptor::infer_descriptor(&output.script_pubkey, network),
                 "hex": hex::encode(output.script_pubkey.as_bytes()),
                 "type": script_type_label(&output.script_pubkey),
             });
@@ -945,6 +948,7 @@ fn verbose_transaction_json(
             if let Some(out) = result["vout"].get_mut(*vout as usize) {
                 out["scriptPubKey"] = json!({
                     "asm": node::rpc::script_asm::script_to_asm_str(bare.as_bytes(), false),
+                    "desc": node::rpc::descriptor::infer_descriptor(&bare, network),
                     "hex": hex::encode(bare.as_bytes()),
                     "type": script_type_label(&bare),
                     "stripped_size": script_len,
