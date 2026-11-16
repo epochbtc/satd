@@ -1290,8 +1290,10 @@ fn can_wrap_in_p2sh(script: &bitcoin::Script) -> bool {
     ) {
         return false;
     }
-    // `!script.HasValidOps() || script.IsUnspendable()`.
-    if !has_valid_ops(script) || script.len() > MAX_SCRIPT_SIZE {
+    // `!script.HasValidOps() || script.IsUnspendable()`. `IsUnspendable` is
+    // a leading `OP_RETURN` whatever follows it, so it also covers the
+    // `OP_RETURN` scripts `Solver` calls nonstandard.
+    if !has_valid_ops(script) || script.is_op_return() || script.len() > MAX_SCRIPT_SIZE {
         return false;
     }
     // `if (op == OP_CHECKSIGADD || IsOpSuccess(op)) return false;`

@@ -351,6 +351,22 @@
     }
    }
   },
+  "op_return_nonpush": {
+   "hex": "6a61",
+   "core": {
+    "asm": "OP_RETURN OP_NOP",
+    "desc": "raw(6a61)#mjny92zq",
+    "type": "nonstandard"
+   }
+  },
+  "op_return_p2pkh": {
+   "hex": "6a76a914751e76e8199196d454941c45d1b3a323f1433bd688ac",
+   "core": {
+    "asm": "OP_RETURN OP_DUP OP_HASH160 751e76e8199196d454941c45d1b3a323f1433bd6 OP_EQUALVERIFY OP_CHECKSIG",
+    "desc": "raw(6a76a914751e76e8199196d454941c45d1b3a323f1433bd688ac)#39ak78y9",
+    "type": "nonstandard"
+   }
+  },
   "core_miniscript_0": {
    "hex": "82012088a914ffffffffffffffffffffffffffffffffffffffff88210250929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac0ad51b2",
    "core": {
