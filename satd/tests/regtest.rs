@@ -8,7 +8,7 @@ mod common;
 use common::{
     DeterministicWallet, TestNode, TokenSpec, find_available_port, fresh_test_datadir,
     get_rpc_str, get_rpc_u64, poll_until, read_chainstate_schema, run_satd_until_exit,
-    stamp_chainstate_schema, test_timeout, write_authfile,
+    run_satd_until_exit_on, stamp_chainstate_schema, test_timeout, write_authfile,
 };
 
 /// #550: test datadirs used to be named after the RPC port, which is redrawn
@@ -20382,6 +20382,111 @@ fn addconnection_is_refused_off_regtest() {
         out["error"]["message"],
         serde_json::json!("addconnection is for regression testing (-regtest mode) only.")
     );
+}
+
+/// Block 1 of an `-signetchallenge=51` (`OP_TRUE`) signet: a coinbase with
+/// a BIP 34 height, a witness commitment and no signet solution, which
+/// `OP_TRUE` accepts and the default challenge does not; its nonce ground
+/// against signet's genesis target.
+const OP_TRUE_SIGNET_BLOCK_1: &str = "00000020f61eee3b63a380a477a063af32b2bbc97c9ff9f01f2c4225e9739881080000000101811a9245cfae75af3f2fb5ebebb35ee25dfee53b74afac6a45be242bbab400f15365ae77031ef3d0140001020000000001010000000000000000000000000000000000000000000000000000000000000000ffffffff025100ffffffff0200f2052a0100000001510000000000000000266a24aa21a9ede2f61c3f71d1defd3fa999dfa36953755c690689799962b48bebd836974e8cf90120000000000000000000000000000000000000000000000000000000000000000000000000";
+
+/// #1271: a custom signet keeps its data in `signet_<message start>`, as in
+/// Core's `GetSignetDataDir`. One that earlier releases kept in `signet/` is
+/// found there by its tip's solution, and startup refuses with the moves to
+/// make, for the datadir and for `-blocksdir`, changing nothing. Made, they
+/// bring the node back on its chain.
+///
+/// Perturbation: drop `check_old_signet_datadir` from `main` and the refused
+/// start instead starts on an empty `signet_54d26fbd/`, so
+/// `run_satd_until_exit_on` times out.
+#[test]
+fn a_custom_signet_in_the_old_signet_directory_is_refused_with_the_moves() {
+    let datadir = fresh_test_datadir("satd-custom-signet-moved");
+    let blocks_root = datadir.join("blocksroot");
+    std::fs::create_dir_all(&blocks_root).unwrap();
+    let blocksdir = format!("--blocksdir={}", blocks_root.display());
+    let args = ["--connect=0", "--dnsseed=0", "--listen=0", "--signetchallenge=51", &blocksdir];
+    let own = "signet_54d26fbd";
+
+    // A fresh custom signet starts in its own directory.
+    let rpcport = find_available_port();
+    let mut node =
+        TestNode::start_with_datadir_on("--signet", own, &datadir, rpcport, &args, &[]);
+    let submitted = node
+        .rpc_call_with_params("submitblock", vec![serde_json::json!(OP_TRUE_SIGNET_BLOCK_1)])
+        .unwrap();
+    assert_eq!(node.rpc_call("getblockcount").unwrap()["result"], 1, "{submitted}");
+    node.stop();
+    node.datadir = PathBuf::new();
+    assert!(!datadir.join("signet").exists());
+    assert!(blocks_root.join(own).join("blocks").is_dir());
+
+    // Where earlier releases kept it.
+    std::fs::rename(datadir.join(own), datadir.join("signet")).unwrap();
+    std::fs::rename(blocks_root.join(own), blocks_root.join("signet")).unwrap();
+
+    let (status, stderr) = run_satd_until_exit_on("--signet", &datadir, &args, test_timeout(60));
+    assert!(!status.success(), "{stderr}");
+    for root in [&datadir, &blocks_root] {
+        let mv = format!(
+            "  mv {} {}\n",
+            root.join("signet").display(),
+            root.join(own).display()
+        );
+        assert!(stderr.contains(&mv), "no `{}` in:\n{stderr}", mv.trim());
+        assert!(!root.join(own).exists(), "the refused start created {own}");
+    }
+    assert!(stderr.contains("Nothing was changed."), "{stderr}");
+
+    std::fs::rename(datadir.join("signet"), datadir.join(own)).unwrap();
+    std::fs::rename(blocks_root.join("signet"), blocks_root.join(own)).unwrap();
+    let mut node =
+        TestNode::start_with_datadir_on("--signet", own, &datadir, rpcport, &args, &[]);
+    assert_eq!(node.rpc_call("getblockcount").unwrap()["result"], 1);
+    node.stop();
+    drop(node);
+    let _ = std::fs::remove_dir_all(&datadir);
+}
+
+/// #1271, the other side: a `signet/` holding the default signet's chain is
+/// not a custom signet's, so a custom signet starts fresh in its own
+/// directory beside it, and the default signet's is left as it was.
+#[test]
+fn a_custom_signet_starts_beside_the_default_signets_directory() {
+    const BLOCKS: &str =
+        include_str!("../../node/src/validation/testdata/default_signet_blocks_1_to_10.hex");
+    let offline = ["--connect=0", "--dnsseed=0", "--listen=0"];
+    let datadir = fresh_test_datadir("satd-custom-signet-beside");
+    let rpcport = find_available_port();
+
+    let mut node =
+        TestNode::start_with_datadir_on("--signet", "signet", &datadir, rpcport, &offline, &[]);
+    for hex in BLOCKS.lines().take(2) {
+        let r = node.rpc_call_with_params("submitblock", vec![serde_json::json!(hex.trim())]);
+        assert_eq!(r.unwrap()["result"], serde_json::Value::Null);
+    }
+    node.stop();
+    node.datadir = PathBuf::new();
+
+    let custom = [&offline[..], &["--signetchallenge=51"]].concat();
+    let mut node = TestNode::start_with_datadir_on(
+        "--signet",
+        "signet_54d26fbd",
+        &datadir,
+        rpcport,
+        &custom,
+        &[],
+    );
+    assert_eq!(node.rpc_call("getblockcount").unwrap()["result"], 0);
+    node.stop();
+    node.datadir = PathBuf::new();
+
+    let mut node =
+        TestNode::start_with_datadir_on("--signet", "signet", &datadir, rpcport, &offline, &[]);
+    assert_eq!(node.rpc_call("getblockcount").unwrap()["result"], 2);
+    node.stop();
+    drop(node);
+    let _ = std::fs::remove_dir_all(&datadir);
 }
 
 /// A default-signet node verifies block solutions on `submitblock`, as Core

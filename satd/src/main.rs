@@ -224,6 +224,106 @@ fn write_rebuild_marker(
     }
 }
 
+/// `path` quoted for a POSIX shell, so the printed command can be pasted.
+fn shell_quote(path: &std::path::Path) -> String {
+    let s = path.display().to_string();
+    if !s.is_empty()
+        && s.bytes().all(|b| b.is_ascii_alphanumeric() || b"/._-+:@,".contains(&b))
+    {
+        s
+    } else {
+        format!("'{}'", s.replace('\'', "'\\''"))
+    }
+}
+
+/// A custom signet's datadir is `signet_<message start>`, as in Core's
+/// `GetSignetDataDir` (#1271). Earlier releases kept every signet in
+/// `signet/`. When this signet's own directory does not exist yet and
+/// `signet/` holds a chainstate, look at its tip: if its solution satisfies
+/// this node's challenge and not the default one, `signet/` is this signet's
+/// chain, and starting in the new directory would sync it again from
+/// genesis. Refuse instead, with the commands that move it. Nothing is moved
+/// or written here; the chainstate is opened read-only.
+///
+/// A `signet/` holding only genesis, the default signet or another signet is
+/// left alone, and the node starts in its own directory. So does one that
+/// cannot be read, with a warning that names the move.
+fn check_old_signet_datadir(config: &Config, net_datadir: &std::path::Path) {
+    let Some(challenge) = config.signet_challenge.as_deref() else {
+        return;
+    };
+    let old_name = "signet";
+    if config.network != bitcoin::Network::Signet
+        || net_datadir.file_name().is_some_and(|n| n == old_name)
+        || net_datadir.exists()
+    {
+        return;
+    }
+    let old_datadir = config.datadir.join(old_name);
+    if !old_datadir.join("chainstate").is_dir() {
+        return;
+    }
+    let old_blocks = config::resolve_blocks_dir(
+        config.blocksdir.as_deref(),
+        &config.datadir,
+        bitcoin::Network::Signet,
+        None,
+    );
+    let mut moves = vec![(old_datadir.clone(), net_datadir.to_path_buf())];
+    if let Some(root) = config.blocksdir.as_deref() {
+        let old_root = root.join(old_name);
+        if old_root != old_datadir && old_root.exists() {
+            let new_name = net_datadir.file_name().map(|n| n.to_os_string()).unwrap_or_default();
+            moves.push((old_root, root.join(new_name)));
+        }
+    }
+    let commands: String = moves
+        .iter()
+        .map(|(from, to)| format!("  mv {} {}\n", shell_quote(from), shell_quote(to)))
+        .collect();
+    use node::chain::signet_datadir::{SignetDirContents, inspect};
+    match inspect(&old_datadir.join("chainstate"), &old_blocks, challenge) {
+        SignetDirContents::ThisSignet { height, hash } => {
+            eprintln!(
+                "Error: a custom signet (-signetchallenge) keeps its data in {}, as in Bitcoin \
+                 Core (bitcoin/bitcoin#34566), but this signet's chain is in {} (its tip, \
+                 block {height} {hash}, carries a solution for this challenge). Stop anything \
+                 else using it, then move it:\n{commands}\
+                 and start again. Nothing was changed.",
+                net_datadir.display(),
+                old_datadir.display(),
+            );
+            node::shutdown::exit_now(1);
+        }
+        SignetDirContents::Genesis | SignetDirContents::DefaultSignet => {
+            tracing::info!(
+                old = %old_datadir.display(),
+                new = %net_datadir.display(),
+                "custom signet: starting in its own datadir; the old signet directory holds no \
+                 chain of this signet and is left as it is"
+            );
+        }
+        SignetDirContents::OtherSignet => {
+            tracing::warn!(
+                old = %old_datadir.display(),
+                new = %net_datadir.display(),
+                "custom signet: starting in its own datadir; the old signet directory holds \
+                 another signet's chain and is left as it is"
+            );
+        }
+        SignetDirContents::Unreadable(e) => {
+            tracing::warn!(
+                old = %old_datadir.display(),
+                new = %net_datadir.display(),
+                error = %e,
+                "custom signet: could not tell which signet the old signet directory holds; \
+                 starting in its own datadir. If it holds this signet's chain, stop satd and \
+                 move it:\n{commands}"
+            );
+        }
+    }
+}
+
 /// The coverage floor a full `-reindex` replay is held to (issue #504): the
 /// highest tip the node is known to have reached before the wipe. Three
 /// places can know it, and any of them can be absent: the chain database's
@@ -736,6 +836,9 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
 
     // Create network-specific data directory
     let net_datadir = config.network_datadir();
+    // A custom signet has a datadir of its own (#1271); one this signet ran
+    // in before, `signet/`, is moved by the operator, never by satd.
+    check_old_signet_datadir(&config, &net_datadir);
     if let Err(e) = std::fs::create_dir_all(&net_datadir) {
         eprintln!(
             "Error creating data directory {}: {}",

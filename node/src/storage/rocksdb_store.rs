@@ -484,6 +484,37 @@ fn resolve_spending_ref(
     })
 }
 
+/// The tip and its block-index row of the chainstate at `chainstate_dir`,
+/// opened read-only: no column family is created, no marker stamped, and
+/// a node running on the directory is not disturbed. `None` when the store
+/// has no tip. For the startup check that looks at another signet's
+/// chainstate before choosing a datadir (#1271).
+pub fn read_tip_read_only(
+    chainstate_dir: &Path,
+) -> Result<Option<(BlockHash, BlockIndexEntry)>, StoreError> {
+    let db_err = |e: rocksdb::Error| StoreError::Database(e.to_string());
+    let opts = Options::default();
+    let cfs = rocksdb::DB::list_cf(&opts, chainstate_dir).map_err(db_err)?;
+    let db = rocksdb::DB::open_cf_for_read_only(&opts, chainstate_dir, &cfs, false)
+        .map_err(db_err)?;
+    let (Some(meta), Some(index)) = (db.cf_handle(CF_METADATA), db.cf_handle(CF_BLOCK_INDEX))
+    else {
+        return Ok(None);
+    };
+    let Some(raw) = db.get_cf(meta, TIP_KEY).map_err(db_err)? else {
+        return Ok(None);
+    };
+    let tip = hash_from_bytes(&raw)
+        .ok_or_else(|| StoreError::Serialization("tip is not a block hash".into()))?;
+    let row = db
+        .get_cf(index, hash_bytes(&tip))
+        .map_err(db_err)?
+        .ok_or_else(|| StoreError::Database(format!("tip {tip} has no block-index row")))?;
+    let entry: BlockIndexEntry =
+        bincode::deserialize(&row).map_err(|e| StoreError::Serialization(e.to_string()))?;
+    Ok(Some((tip, entry)))
+}
+
 pub(crate) fn hash_bytes(hash: &BlockHash) -> &[u8] {
     hash.as_ref()
 }

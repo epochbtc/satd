@@ -208,6 +208,30 @@ impl ConfFile {
     }
 }
 
+/// The default signet's challenge (Core's `CChainParams::SigNet`).
+const DEFAULT_SIGNET_CHALLENGE: &str = "512103ad5e0edad18cb1f0fc0d28a3d4f1f3e445640337489abb10404f2d1e086be430210359ef5021964fe22d6f8e05b2463c9540ce96883fe3b278760f048f5189f2e6c452ae";
+
+/// A signet's data directory name, Bitcoin Core's `GetSignetDataDir`
+/// (`src/chainparamsbase.cpp`), which `bitcoin-cli` uses to find the cookie
+/// too: `signet` without a challenge, for one that is not hex, and for the
+/// default challenge; otherwise `signet_` and the signet's message start
+/// (the first four bytes of the double SHA-256 of the serialized challenge)
+/// in lowercase hex. The daemon's copy is
+/// `node::validation::signet::signet_data_dir`.
+pub fn signet_data_dir(challenge_hex: Option<&str>) -> String {
+    use bitcoin::hashes::hex::FromHex;
+    use bitcoin::hashes::{Hash, sha256d};
+    let Some(bytes) = challenge_hex.and_then(|h| Vec::<u8>::from_hex(h.trim()).ok()) else {
+        return "signet".to_string();
+    };
+    if Vec::<u8>::from_hex(DEFAULT_SIGNET_CHALLENGE).ok().as_deref() == Some(bytes.as_slice()) {
+        return "signet".to_string();
+    }
+    let digest = sha256d::Hash::hash(&bitcoin::consensus::serialize(&bytes));
+    let start = &digest.to_byte_array()[..4];
+    format!("signet_{}", hex::encode(start))
+}
+
 fn is_true(v: &str) -> bool {
     matches!(v, "1" | "true" | "yes")
 }
@@ -225,6 +249,9 @@ pub struct CliConn {
     pub rpcuser: Option<String>,
     pub rpcpassword: Option<String>,
     pub rpccookiefile: Option<PathBuf>,
+    /// `-signetchallenge`: a custom signet's data directory is named after
+    /// it, so the cookie is found there.
+    pub signetchallenge: Option<String>,
 }
 
 impl CliConn {
@@ -306,6 +333,10 @@ pub fn resolve(
     };
 
     let net_datadir = match chain.subdir() {
+        Some(_) if chain == Chain::Signet => {
+            let challenge = cli.signetchallenge.clone().or_else(|| from_file("signetchallenge"));
+            base_datadir.join(signet_data_dir(challenge.as_deref()))
+        }
         Some(sub) => base_datadir.join(sub),
         None => base_datadir.to_path_buf(),
     };
@@ -437,6 +468,61 @@ mod tests {
         assert_eq!(c.creds, Creds::Cookie(PathBuf::from("/d/signet/auth/c")));
         let c = resolve_str(&CliConn::default(), "rpccookiefile=/abs/c\n").unwrap();
         assert_eq!(c.creds, Creds::Cookie(PathBuf::from("/abs/c")));
+    }
+
+    /// #1271: parity with Core's `GetSignetDataDir`, the names computed with
+    /// the `message_start` helper of Core's
+    /// `test/functional/test_framework/signet.py`.
+    #[test]
+    fn signet_data_dir_matches_core() {
+        assert_eq!(signet_data_dir(None), "signet");
+        assert_eq!(signet_data_dir(Some(DEFAULT_SIGNET_CHALLENGE)), "signet");
+        assert_eq!(signet_data_dir(Some("zz")), "signet");
+        assert_eq!(signet_data_dir(Some("51")), "signet_54d26fbd");
+        assert_eq!(signet_data_dir(Some("")), "signet_1406e058");
+        let multisig = format!("512102{}51ae", "11".repeat(32));
+        assert_eq!(signet_data_dir(Some(&multisig)), "signet_93abaa9b");
+        assert_eq!(signet_data_dir(Some(&"6a".repeat(300))), "signet_a9503e92");
+    }
+
+    /// #1271: a custom signet's cookie is in its own directory, with the
+    /// challenge from the command line or from the file's `[signet]`
+    /// section, as `bitcoin-cli` finds it.
+    #[test]
+    fn a_custom_signets_cookie_is_in_its_own_directory() {
+        let cookie = |cli: &CliConn, body: &str| resolve_str(cli, body).unwrap().creds;
+        assert_eq!(
+            cookie(&CliConn::default(), "signet=1
+"),
+            Creds::Cookie(PathBuf::from("/d/signet/.cookie"))
+        );
+        assert_eq!(
+            cookie(&CliConn::default(), "signet=1
+[signet]
+signetchallenge=51
+"),
+            Creds::Cookie(PathBuf::from("/d/signet_54d26fbd/.cookie"))
+        );
+        let cli = CliConn {
+            signet: true,
+            signetchallenge: Some("51".into()),
+            ..Default::default()
+        };
+        assert_eq!(cookie(&cli, ""), Creds::Cookie(PathBuf::from("/d/signet_54d26fbd/.cookie")));
+        // The command line beats the file.
+        assert_eq!(
+            cookie(&cli, "[signet]
+signetchallenge=00
+"),
+            Creds::Cookie(PathBuf::from("/d/signet_54d26fbd/.cookie"))
+        );
+        // Off signet the challenge names nothing.
+        assert_eq!(
+            cookie(&CliConn::default(), "regtest=1
+signetchallenge=51
+"),
+            Creds::Cookie(PathBuf::from("/d/regtest/.cookie"))
+        );
     }
 
     #[test]
