@@ -85,12 +85,17 @@ const LADDER: [u32; 29] = [
 ];
 
 /// Quantiles of the selected outcomes. One block is answered at 99.9%,
-/// the rest at 95% (economical) or 99% (conservative).
+/// the rest at 95% (economical) or 97.5% (conservative).
+///
+/// Conservative was 99% until mainnet showed what that buys while some
+/// miners take sub-1 sat/vB transactions and others want 1 sat/vB: at 6
+/// blocks 96.8% coverage at a median 10× over the cheapest block, against
+/// 91.0% at 5.5× at 97.5%.
 fn quantile(target: u32, conservative: bool) -> f64 {
     match (target, conservative) {
         (1, _) => 0.999,
         (_, false) => 0.95,
-        (_, true) => 0.99,
+        (_, true) => 0.975,
     }
 }
 
@@ -185,6 +190,15 @@ impl HurdleHistory {
         let target = target.clamp(1, MAX_TARGET);
         let idx = LADDER.iter().rposition(|&t| t <= target)?;
         self.table[idx]
+    }
+
+    /// The estimate at the deepest target at or below `target` that has a
+    /// window: the lowest the store answers for any target up to `target`
+    /// (the table is monotone). `None` when no target up to it has one.
+    pub fn deepest_estimate_up_to(&self, target: u32) -> Option<HistoryEstimate> {
+        let target = target.clamp(1, MAX_TARGET);
+        let idx = LADDER.iter().rposition(|&t| t <= target)?;
+        self.table[..=idx].iter().rev().find_map(|e| *e)
     }
 
     /// Bring the rows in line with the active chain, then read up to

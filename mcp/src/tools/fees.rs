@@ -1,10 +1,11 @@
 use crate::context::McpContext;
-use node::mempool::estimate::{EstimateMode, smart_fees};
+use node::mempool::estimate::{EstimateMode, near_rate, smart_fees};
 use serde_json::json;
 
 /// Estimate fee rates for multiple confirmation targets.
 ///
-/// Routes through the shared `smart_fees` resolver in blend mode, so the
+/// Routes through the shared `smart_fees` resolver in blend mode (the
+/// default estimate), so the
 /// numbers agree with the JSON-RPC `estimatefees`, the TUI fee panel, the
 /// Esplora `/fee-estimates` endpoint and Electrum `blockchain.estimatefee`.
 /// Rates are sat/kvB internally; we surface both BTC/kvB and sat/vB.
@@ -16,8 +17,10 @@ pub fn estimate_fee(ctx: &McpContext, targets: &[u32]) -> String {
         // JSON-RPC estimatefees / Electrum / Esplora fee paths.
         ctx.mempool.get_template_entries(),
         &ctx.fee_estimator,
+        near_rate(&ctx.mempool, &ctx.fee_estimator, false),
         targets,
         EstimateMode::Blend,
+        false,
         floor_sat_per_kvb,
     );
 
@@ -34,12 +37,15 @@ pub fn estimate_fee(ctx: &McpContext, targets: &[u32]) -> String {
         })
         .collect();
 
-    let result = json!({
+    let mut result = json!({
         "estimates": estimates,
-        "economy_fee_rate_sat_vb": format!("{:.2}", sf.economy_feerate_sat_per_kvb as f64 / 1000.0),
         "mode": sf.mode.as_str(),
         "mempool_thin": sf.thin_block,
     });
+    // Left out when there is no economy estimate (0 under a zero floor).
+    if let Some(economy) = sf.economy_feerate_sat_per_kvb {
+        result["economy_fee_rate_sat_vb"] = json!(format!("{:.2}", economy as f64 / 1000.0));
+    }
 
     serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string())
 }

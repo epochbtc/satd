@@ -64,6 +64,13 @@ impl FeeEstimator {
         Some(if conservative { e.conservative } else { e.economical })
     }
 
+    /// The analog-window estimate at the deepest target up to `target` that
+    /// has a window, the cap on a flat-percentile fallback at `target`.
+    pub fn history_cap(&self, target: u32, conservative: bool) -> Option<u64> {
+        let e = self.history.read().deepest_estimate_up_to(target)?;
+        Some(if conservative { e.conservative } else { e.economical })
+    }
+
     /// The mempool block simulation, memoized with [`FEE_SIM_CACHE_TTL`].
     ///
     /// On a cache miss this clones the **template-scoped** mempool
