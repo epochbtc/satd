@@ -465,8 +465,13 @@ struct Selection {
 /// candidate rather than only the modified ones.
 #[derive(Clone, Copy)]
 struct Package {
-    /// Modified fee (fee + `fee_delta`, floored at zero per transaction).
-    fee: u64,
+    /// Modified fee (fee + `fee_delta`), signed. A `prioritisetransaction`
+    /// delta below a transaction's fee makes its share negative, and that
+    /// negative share counts against every package it is in, as Core's
+    /// signed `CAmount`/`FeeFrac` chunk fees do (`src/node/miner.cpp`,
+    /// `src/util/feefrac.h`, v32.1). Wide enough that summing a package's
+    /// per-transaction `i64` fees cannot overflow.
+    fee: i128,
     weight: u64,
     sigops: u64,
 }
@@ -475,7 +480,7 @@ struct Package {
 /// matches the candidate's current version only while its package is
 /// unchanged; a stale key is skipped when popped.
 struct Ranked {
-    fee: u64,
+    fee: i128,
     weight: u64,
     txid: bitcoin::Txid,
     idx: usize,
@@ -498,8 +503,10 @@ impl Ord for Ranked {
     /// Core's `CompareTxMemPoolEntryByAncestorFee` (`src/txmempool.h`), so the
     /// result does not depend on hash-map iteration order.
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        let a = self.fee as u128 * other.weight as u128;
-        let b = other.fee as u128 * self.weight as u128;
+        // |fee| < 2^63 per transaction times at most 2^32 of them, times a
+        // weight under 2^32: well inside i128.
+        let a = self.fee * other.weight as i128;
+        let b = other.fee * self.weight as i128;
         a.cmp(&b)
             .then_with(|| other.txid.cmp(&self.txid))
             .then_with(|| other.version.cmp(&self.version))
@@ -644,7 +651,10 @@ fn select_transactions(
     let own = |i: usize| -> Package {
         let e = &entries[i].1;
         Package {
-            fee: (e.fee as i64).saturating_add(e.fee_delta).max(0) as u64,
+            // Signed, like Core's `CTxMemPoolEntry::GetModifiedFee`: flooring
+            // a deprioritised parent at zero let a child that does not cover
+            // its delta pull both into the block (#1274).
+            fee: i128::from(e.fee as i64) + i128::from(e.fee_delta),
             // Core's adjusted weight ranks the package and is what the block
             // limit test adds (`TestChunkBlockLimits`); the block's running
             // total below adds each transaction's own weight, as Core's does.
@@ -657,7 +667,7 @@ fn select_transactions(
             let mut p = own(i);
             for &a in &ancestors[i] {
                 let q = own(a);
-                p.fee = p.fee.saturating_add(q.fee);
+                p.fee += q.fee;
                 p.weight = p.weight.saturating_add(q.weight);
                 p.sigops = p.sigops.saturating_add(q.sigops);
             }
@@ -693,11 +703,14 @@ fn select_transactions(
         }
         let pkg = package[i];
         // `-blockmintxfee`, on the package: a zero-fee parent rides in on its
-        // child's fee, and only a package paying nothing is left out. This is
-        // the best package left, so nothing after it clears the floor either.
-        if block_min_tx_fee > 0
-            && crate::mempool::policy::fee_rate_sat_per_kvb(pkg.fee, pkg.weight) < block_min_tx_fee
-        {
+        // child's fee, and only a package paying less than the floor is left
+        // out. This is the best package left, so nothing after it clears the
+        // floor either. The comparison is Core's signed one (v32.1
+        // `addChunks`: `ByRatio{chunk_feerate_vsize} < ByRatio{block_min_fee_rate}`),
+        // fee/vsize against floor/1000, so a package whose modified fee is
+        // negative stops selection even with the floor at zero.
+        let pkg_vsize = crate::mempool::policy::weight_to_vsize(pkg.weight);
+        if pkg.fee * 1000 < i128::from(block_min_tx_fee) * i128::from(pkg_vsize) {
             break;
         }
         // Both limits refuse a package that would *reach* them, not only one
@@ -751,7 +764,7 @@ fn select_transactions(
                     continue;
                 }
                 let q = &mut package[d];
-                q.fee = q.fee.saturating_sub(p.fee);
+                q.fee -= p.fee;
                 q.weight = q.weight.saturating_sub(p.weight);
                 q.sigops = q.sigops.saturating_sub(p.sigops);
                 version[d] = version[d].wrapping_add(1);
@@ -1693,6 +1706,89 @@ pub(crate) mod tests {
         assert!(txs.contains(&parent));
         assert!(!txs.contains(&child), "the 0.01 sat/WU child displaced a filler");
         assert_eq!(txs.len(), 5);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A `prioritisetransaction` delta below a parent's fee makes the parent's
+    /// modified fee negative, and Core keeps it signed (`GetModifiedFee`,
+    /// summed into a signed `FeeFrac` chunk fee). A child whose fee does not
+    /// cover that delta leaves the pair's package negative, so Core's
+    /// template holds neither, even with `-blockmintxfee=0` (#1274). Flooring
+    /// the parent's share at zero let the child's fee pull both in.
+    #[test]
+    fn a_child_that_does_not_cover_its_parents_negative_delta_leaves_both_out() {
+        let (cs, mp, dir) = make_funded_template_env(&[
+            (confirmed_prev(0xE0), coin_at(0)),
+            (confirmed_prev(0xE1), coin_at(0)),
+        ]);
+        let parent = put(&mp, confirmed_prev(0xE0), 0xE2, 1_000, 400, 0);
+        let child = put(&mp, out0(parent), 0xE3, 50_000, 400, 0);
+        // Must-include control: unrelated and paying.
+        let control = put(&mp, confirmed_prev(0xE1), 0xE4, 5_000, 400, 0);
+        mp.prioritise_transaction(&parent, -100_000).unwrap();
+
+        let subsidy = crate::chain::connect::block_subsidy(Network::Regtest, 1);
+        for floor in [DEFAULT_BLOCK_MIN_TX_FEE, 0] {
+            let template = create_template_with_floor(&cs, &mp, floor);
+            let txs = mined(&template);
+            assert!(!txs.contains(&parent), "floor {floor}: the deprioritised parent was mined");
+            assert!(!txs.contains(&child), "floor {floor}: the child of an uncovered parent was mined");
+            assert_eq!(txs, vec![control], "floor {floor}");
+            assert_eq!(template.coinbase_value, subsidy + 5_000, "floor {floor}");
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The control for the case above: a child that does cover its parent's
+    /// negative delta takes both in. The coinbase claims the transactions'
+    /// actual fees, never the modified ones, and each template entry reports
+    /// its actual fee (Core's `vTxFees` is `entry.GetFee()`).
+    #[test]
+    fn a_child_covering_its_parents_negative_delta_mines_both_at_actual_fees() {
+        let (cs, mp, dir) = make_funded_template_env(&[
+            (confirmed_prev(0xE5), coin_at(0)),
+            (confirmed_prev(0xE6), coin_at(0)),
+        ]);
+        let parent = put(&mp, confirmed_prev(0xE5), 0xE7, 1_000, 400, 0);
+        let child = put(&mp, out0(parent), 0xE8, 200_000, 400, 0);
+        let control = put(&mp, confirmed_prev(0xE6), 0xE9, 5_000, 400, 0);
+        mp.prioritise_transaction(&parent, -100_000).unwrap();
+
+        let template = create_template_with_floor(&cs, &mp, 0);
+        let txs = mined(&template);
+        assert!(txs.contains(&parent) && txs.contains(&child), "the covered pair was left out: {txs:?}");
+        assert!(txs.contains(&control));
+        assert_topological(&template);
+        // The pair is (1_000 - 100_000 + 200_000) / 200 vB = 505 sat/vB, ahead
+        // of the control's 25.
+        assert_eq!(txs, vec![parent, child, control]);
+        let fees: Vec<u64> = template.transactions.iter().map(|t| t.fee).collect();
+        assert_eq!(fees, vec![1_000, 200_000, 5_000]);
+        let subsidy = crate::chain::connect::block_subsidy(Network::Regtest, 1);
+        assert_eq!(template.coinbase_value, subsidy + 1_000 + 200_000 + 5_000);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A lone transaction deprioritised below zero is left out even with the
+    /// floor off: Core's `ByRatio` comparison is signed, so a negative chunk
+    /// feerate is below a zero `-blockmintxfee`. A zero-fee transaction is
+    /// not below it and still goes in.
+    #[test]
+    fn a_negative_modified_fee_is_below_a_zero_floor() {
+        let (cs, mp, dir) = make_funded_template_env(&[
+            (confirmed_prev(0xEA), coin_at(0)),
+            (confirmed_prev(0xEB), coin_at(0)),
+        ]);
+        let negative = put(&mp, confirmed_prev(0xEA), 0xEC, 1_000, 400, 0);
+        let free = put(&mp, confirmed_prev(0xEB), 0xED, 0, 400, 0);
+        mp.prioritise_transaction(&negative, -1_001).unwrap();
+
+        let txs = mined(&create_template_with_floor(&cs, &mp, 0));
+        assert!(!txs.contains(&negative), "a negative modified fee was mined at floor 0");
+        assert!(txs.contains(&free), "a zero-fee transaction was left out at floor 0");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
