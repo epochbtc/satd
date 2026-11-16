@@ -2055,6 +2055,13 @@ fn estimatesmartfee_has_cores_32_1_shape() {
         assert!(resp["error"].is_null(), "{resp}");
         resp["result"].clone()
     };
+    // The mempool load runs in the background at startup; until it ends,
+    // mempool_policy refuses for that reason instead.
+    poll_until(
+        || node.rpc_ok("getmempoolinfo", vec![])["loaded"] == json!(true),
+        test_timeout(30),
+        "getmempoolinfo.loaded never became true",
+    );
 
     // mempool_policy on a node that has connected no blocks: Core's refusal,
     // for 2 blocks.
