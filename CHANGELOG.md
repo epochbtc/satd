@@ -94,6 +94,7 @@ It includes every fix shipped in 0.7.1:
 - Tor: the onion address and private key `ADD_ONION` returns, and the saved key, are checked as Core checks them before they are used, and a control-port line over 100,000 bytes is refused. Also in 0.7.2.
 - Electrum: JSON-RPC notifications (requests with no `id`) are no longer run only to drop their reply. Also in 0.7.2.
 - RPC: `addnode` refuses an empty node with Core's `-8` error; `addnode "" add` kept it and retried it forever. Also in 0.7.2.
+- RPC: every `asm` field is Core's `ScriptToAsmStr`: bare hex pushes, small numbers as numbers, Core's opcode names, and a scriptSig signature's sighash type decoded (`[ALL]`); it was rust-bitcoin's format (`OP_PUSHBYTES_20`, `OP_0`, `OP_CSV`). Electrum's verbose `blockchain.transaction.get` too (#1265).
 
 ## Releases
 
