@@ -2058,6 +2058,17 @@ pub fn run_satd_until_exit(
     extra_args: &[&str],
     timeout: std::time::Duration,
 ) -> (std::process::ExitStatus, String) {
+    run_satd_until_exit_on("--regtest", datadir, extra_args, timeout)
+}
+
+/// [`run_satd_until_exit`] on the network `network_flag` selects
+/// (`--regtest`, `--testnet4`, ...).
+pub fn run_satd_until_exit_on(
+    network_flag: &str,
+    datadir: &std::path::Path,
+    extra_args: &[&str],
+    timeout: std::time::Duration,
+) -> (std::process::ExitStatus, String) {
     let satd_bin = env!("CARGO_BIN_EXE_satd");
     let stderr_path = datadir.join(format!(
         "satd-exit-{}.stderr",
@@ -2068,7 +2079,7 @@ pub fn run_satd_until_exit(
     ));
     let stderr = std::fs::File::create(&stderr_path).expect("create stderr capture");
     let mut child = Command::new(satd_bin)
-        .arg("--regtest")
+        .arg(network_flag)
         .arg(format!("--datadir={}", datadir.display()))
         .arg(format!("--rpcport={}", find_available_port()))
         .arg(format!("--port={}", find_available_port()))

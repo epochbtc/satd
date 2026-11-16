@@ -935,6 +935,18 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
         }
     };
 
+    // A datadir from another network is refused here, before
+    // `-reindex-chainstate` (or `-upgradechainstate`) clears its UTXO set
+    // and before a cookie is written into it (#1270). `ChainState::new`
+    // checks again for every other caller. A full `-reindex` wipes the block
+    // index first, as Core's does, so there is nothing to check.
+    if (!reindex || continue_reindex)
+        && let Err(e) = node::chain::state::check_genesis(&raw_store, config.network)
+    {
+        eprintln!("Error: {e}");
+        node::shutdown::exit_now(1);
+    }
+
     // Beyond this point we're committing to daemon startup. Set up
     // authentication: cookie (always written unless rpcuser is set),
     // plus any --rpcauth lines, plus the optional plain --rpcuser /

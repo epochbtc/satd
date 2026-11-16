@@ -46,6 +46,7 @@ It includes every fix shipped in 0.7.1:
 - P2P: `.onion` fixed seeds for testnet4 and testnet3, and refreshed ones for mainnet and signet, from Core v31.2's lists, so a Tor-only node can bootstrap on every network (#1162).
 - Config: `reindex=1` and `reindexchainstate=1` in `bitcoin.conf` are honoured, as in Core, instead of accepted and ignored (#840).
 - Operator: the shadow verification queue is bounded by memory, `-shadowqueuemb` (default 128 MiB), as well as by entry count (#1145).
+- Operator: a datadir from another network is refused at startup with Core's "Incorrect or no genesis block found. Wrong datadir for network?", before `-reindex-chainstate` clears anything (#1270).
 - Operator: the core runtime has at least two worker threads, so one blocked worker cannot freeze RPC and P2P on a 1-CPU host (#1144).
 - Stack: `conf.d/local.conf` overrides the keys `satd-init` writes (#843).
 - HTTP: a client that stops reading a response, SSE stream or WebSocket is disconnected once a write has stalled for `-rpcservertimeout` on JSON-RPC and 60 s on Esplora and streamws (#823).

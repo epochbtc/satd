@@ -8,7 +8,7 @@ mod common;
 use common::{
     DeterministicWallet, TestNode, TokenSpec, find_available_port, fresh_test_datadir,
     get_rpc_str, get_rpc_u64, poll_until, read_chainstate_schema, run_satd_until_exit,
-    stamp_chainstate_schema, test_timeout, write_authfile,
+    run_satd_until_exit_on, stamp_chainstate_schema, test_timeout, write_authfile,
 };
 
 /// #550: test datadirs used to be named after the RPC port, which is redrawn
@@ -6993,6 +6993,50 @@ fn upgradechainstate_refuses_to_rebuild_a_pruned_datadir() {
     assert!(stderr.contains("The chainstate was not changed"), "{stderr}");
     assert_eq!(read_chainstate_schema(&datadir), Some(prior));
     assert!(!datadir.join("regtest").join(node::rebuild_marker::MARKER_FILENAME).exists());
+    let _ = std::fs::remove_dir_all(&datadir);
+}
+
+/// #1270: a datadir from another network is refused with Core's
+/// `LoadChainstate` message, on a plain start and on `-reindex-chainstate`,
+/// and the refused start changes nothing: moved back, the chain is whole.
+/// The regtest datadir is put where testnet4 looks for its own.
+///
+/// Perturbation: drop the `check_genesis` call in `main` and the
+/// `-reindex-chainstate` start is refused by the replay planner instead, with
+/// advice to run a full `--reindex`, which would wipe the datadir.
+#[test]
+fn a_datadir_from_another_network_is_refused() {
+    let (datadir, rpcport, before) = stopped_indexed_datadir("satd-wrong-network");
+    let regtest = datadir.join("regtest");
+    let testnet4 = datadir.join("testnet4");
+    std::fs::rename(&regtest, &testnet4).unwrap();
+
+    let offline = ["--connect=0", "--dnsseed=0", "--listen=0"];
+    for extra in [&[][..], &["--reindex-chainstate"][..]] {
+        let args: Vec<&str> = offline.iter().chain(extra).copied().collect();
+        let (status, stderr) =
+            run_satd_until_exit_on("--testnet4", &datadir, &args, test_timeout(60));
+        assert!(!status.success(), "{extra:?}: {stderr}");
+        assert!(
+            stderr.contains("Incorrect or no genesis block found. Wrong datadir for network?"),
+            "{extra:?}: {stderr}"
+        );
+        assert!(
+            !testnet4.join(".cookie").exists(),
+            "{extra:?}: the refused start wrote a cookie"
+        );
+        assert!(
+            !testnet4.join(node::rebuild_marker::MARKER_FILENAME).exists(),
+            "{extra:?}: the refused start began a rebuild"
+        );
+    }
+
+    std::fs::rename(&testnet4, &regtest).unwrap();
+    let mut node =
+        TestNode::start_with_datadir(&datadir, rpcport, &["--txindex=1", "--addressindex=1"]);
+    let after = node.rpc_call("gettxoutsetinfo").unwrap()["result"].clone();
+    assert_eq!(utxo_summary(&after), utxo_summary(&before));
+    node.stop();
     let _ = std::fs::remove_dir_all(&datadir);
 }
 

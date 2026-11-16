@@ -175,6 +175,39 @@ pub enum ChainError {
     /// starts the reindex over.
     #[error("the interrupted reindex cannot be continued: {0}")]
     ReindexCannotResume(String),
+    /// The store holds a block index, but not this network's genesis block:
+    /// the datadir belongs to another network (#1270). Core's
+    /// `LoadChainstate` (`src/node/chainstate.cpp`) refuses with this text.
+    #[error("Incorrect or no genesis block found. Wrong datadir for network?")]
+    WrongGenesis,
+}
+
+/// Refuse a store that belongs to another network (#1270).
+///
+/// Core's `LoadChainstate` (`src/node/chainstate.cpp`) fails when the block
+/// index is not empty and does not contain the network's genesis block. A
+/// store with a tip has a block index, so that case needs no scan; a store
+/// without one is either fresh (empty index, which passes) or had its
+/// chainstate cleared by `-reindex-chainstate` (index kept, which is
+/// checked). The scan runs only when genesis is missing, so a node on its
+/// own datadir pays one point lookup.
+///
+/// Every signet shares one genesis block, so this cannot tell two signets
+/// apart.
+pub fn check_genesis(store: &dyn Store, network: Network) -> Result<(), ChainError> {
+    let genesis_hash = bitcoin::constants::genesis_block(network).block_hash();
+    if store.get_block_index(&genesis_hash).is_some() {
+        return Ok(());
+    }
+    if store.get_tip().is_some() {
+        return Err(ChainError::WrongGenesis);
+    }
+    let mut rows = 0u64;
+    let stats = store.for_each_block_index(&mut |_, _| rows += 1)?;
+    if rows > 0 || stats.skipped_bad_key > 0 || stats.skipped_bad_value > 0 {
+        return Err(ChainError::WrongGenesis);
+    }
+    Ok(())
 }
 
 impl ChainError {
@@ -250,7 +283,8 @@ impl ChainError {
             | ChainError::BlockNotFound
             | ChainError::InvalidArgument(_)
             | ChainError::ReactivationFailed(_)
-            | ChainError::ReindexCannotResume(_) => false,
+            | ChainError::ReindexCannotResume(_)
+            | ChainError::WrongGenesis => false,
         }
     }
 }
@@ -1003,6 +1037,10 @@ impl ChainState {
         // (AssumeUTXO) via Arc. Callers still pass a Box; the conversion
         // is free and keeps every existing call site unchanged.
         let script_verifier: Arc<dyn ScriptVerifier> = Arc::from(script_verifier);
+
+        // A datadir from another network is refused before anything is
+        // read from or written to it (#1270).
+        check_genesis(&*store, network)?;
 
         // Wrap the store in a CoinCache for batched UTXO writes
         let store = std::sync::Arc::new(CoinCache::new(store, dbcache_mb));
@@ -13399,9 +13437,13 @@ pub(crate) mod tests {
             arr[0] = h as u8;
             arr[1] = (h >> 8) as u8;
             arr[3] = 0x5A; // distinguish from real hashes
-            let hash = BlockHash::from_raw_hash(
-                bitcoin::hashes::sha256d::Hash::from_byte_array(arr),
-            );
+            // Height 0 is the real genesis hash: `ChainState::new` refuses a
+            // block index without it (#1270).
+            let hash = if h == 0 {
+                base_header.block_hash()
+            } else {
+                BlockHash::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array(arr))
+            };
             let mut header = base_header;
             header.time = 1_500_000_000 + h as u32 * 600;
             header.prev_blockhash = prev_hash;
@@ -16360,6 +16402,82 @@ pub(crate) mod tests {
         let result = cs.accept_block(&genesis);
         assert!(matches!(result, Err(ChainError::Duplicate)));
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1270: a store holding another network's block index is refused, with
+    /// or without a tip (a tip-less one is what `-reindex-chainstate` leaves);
+    /// an empty store is a fresh datadir and passes. Core: `LoadChainstate`.
+    ///
+    /// Perturbation: make `check_genesis` return `Ok(())` and the first
+    /// wrong-network case passes.
+    #[test]
+    fn a_store_from_another_network_is_refused() {
+        use crate::storage::StoreBatch;
+
+        let regtest = bitcoin::constants::genesis_block(Network::Regtest);
+        let seeded = |with_tip: bool| {
+            let store = InMemoryStore::new();
+            let mut batch = StoreBatch::default();
+            batch.block_index_puts.push((
+                regtest.block_hash(),
+                BlockIndexEntry {
+                    header: regtest.header,
+                    height: 0,
+                    status: BlockStatus::Valid,
+                    num_tx: 1,
+                    file_number: 0,
+                    data_pos: 0,
+                    chainwork: [0u8; 32],
+                },
+            ));
+            batch.height_hash_puts.push((0, regtest.block_hash()));
+            if with_tip {
+                batch.tip = Some(regtest.block_hash());
+            }
+            store.write_batch(batch).unwrap();
+            store
+        };
+
+        for with_tip in [true, false] {
+            let store = seeded(with_tip);
+            assert!(check_genesis(&store, Network::Regtest).is_ok());
+            for network in [Network::Testnet4, Network::Signet, Network::Bitcoin] {
+                assert!(
+                    matches!(check_genesis(&store, network), Err(ChainError::WrongGenesis)),
+                    "{network:?}, tip {with_tip}"
+                );
+            }
+        }
+        assert!(check_genesis(&InMemoryStore::new(), Network::Testnet4).is_ok());
+
+        let dir = std::env::temp_dir().join(format!(
+            "satd-wrong-genesis-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        let blocks_dir = dir.join("blocks");
+        std::fs::create_dir_all(&blocks_dir).unwrap();
+        let result = ChainState::new(
+            Box::new(seeded(true)),
+            FlatFileManager::new(&blocks_dir).unwrap(),
+            Network::Testnet4,
+            Box::new(NoopVerifier),
+            AssumeValid::Disabled,
+            450,
+            4,
+            Default::default(),
+            Default::default(),
+            Default::default(),
+        );
+        let err = result.err().expect("a regtest store opened as testnet4 is refused");
+        assert_eq!(
+            err.to_string(),
+            "Incorrect or no genesis block found. Wrong datadir for network?"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
