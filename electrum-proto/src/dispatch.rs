@@ -173,10 +173,8 @@ impl Notification {
 /// [`Response::error`]; an unknown method returns
 /// `method_not_found`.
 ///
-/// Notifications (requests with no `id`) still get dispatched — the
-/// transport drops the synthesized response — but we always return
-/// one here so the caller has uniform success / failure visibility
-/// for logging and metrics.
+/// The transport never hands this a notification (a request with no
+/// `id`): it skips them without dispatching (see `process_request`).
 pub fn dispatch(state: &ElectrumState, req: Request) -> Response {
     let id = req.id.clone().unwrap_or(Value::Null);
     let params = req.params.unwrap_or(Value::Array(Vec::new()));

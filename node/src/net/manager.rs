@@ -14096,12 +14096,19 @@ impl PeerManager {
     /// ignored; one more than [`compact::MAX_BLOCKTXN_DEPTH`] below the tip is
     /// sent in full, so a peer cannot turn cheap requests into disk reads for
     /// a few bytes of reply; an index past the end of the block is
-    /// misbehaviour.
+    /// misbehaviour; a request naming no index at all disconnects the peer
+    /// (Core #35832), since no honest peer sends one and answering it costs
+    /// a block read, or a whole block upload when the block is deep.
     fn handle_get_block_txn(
         &self,
         id: PeerId,
         request: bitcoin::bip152::BlockTransactionsRequest,
     ) {
+        if request.indexes.is_empty() {
+            tracing::debug!(id, hash = %request.block_hash, "getblocktxn received with no transaction indexes; disconnecting");
+            self.disconnect_by_id(id);
+            return;
+        }
         // The tip cache first, as Core does: the block a peer is most likely
         // reconstructing is the one we just announced, and it needs no disk
         // read.
