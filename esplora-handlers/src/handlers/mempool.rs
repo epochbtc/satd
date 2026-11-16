@@ -18,6 +18,7 @@ use std::collections::HashMap;
 
 use axum::Json;
 use axum::extract::State;
+use bitcoin::Txid;
 use serde::Serialize;
 use serde_json::Value;
 
@@ -87,7 +88,7 @@ pub async fn root(
     State(state): State<EsploraState>,
     axum::Extension(pin): axum::Extension<crate::chain_tip::Pin>,
 ) -> Json<RootJson> {
-    let count = state.mempool.get_acting_entries().len() as u64;
+    let count = state.mempool.acting_count() as u64;
     // The pinned tip, which the chain-tip headers name too.
     Json(RootJson {
         chain_tip: ChainTipJson {
@@ -101,13 +102,17 @@ pub async fn root(
 pub async fn mempool_summary(
     State(state): State<EsploraState>,
 ) -> Json<MempoolJson> {
-    let entries = state.mempool.get_acting_entries();
-    let count = entries.len() as u64;
+    // Read in place under the mempool lock: these routes are
+    // unauthenticated, and copying every entry (transaction bodies
+    // included) per request let any client make the node copy the whole
+    // mempool at will.
+    let mut count: u64 = 0;
     let mut vsize_total: u64 = 0;
     let mut fee_total: u64 = 0;
     // Per-tx (feerate_sat_vb, vsize). Used to bucket into histogram.
-    let mut tx_rates: Vec<(f64, u64)> = Vec::with_capacity(entries.len());
-    for (_, entry) in &entries {
+    let mut tx_rates: Vec<(f64, u64)> = Vec::new();
+    state.mempool.for_each_acting(|_, entry| {
+        count += 1;
         let vsize = vsize_of_weight(entry.weight as u64);
         vsize_total = vsize_total.saturating_add(vsize);
         fee_total = fee_total.saturating_add(entry.fee);
@@ -117,7 +122,7 @@ pub async fn mempool_summary(
         // the pre-#355 per-weight-unit value and overreported every rate 4×.)
         let rate_sat_vb = (entry.fee_rate as f64) / 1000.0;
         tx_rates.push((rate_sat_vb, vsize));
-    }
+    });
     let fee_histogram = build_fee_histogram(&tx_rates);
     Json(MempoolJson {
         count,
@@ -130,38 +135,36 @@ pub async fn mempool_summary(
 pub async fn mempool_txids(
     State(state): State<EsploraState>,
 ) -> Json<Vec<String>> {
-    let entries = state.mempool.get_acting_entries();
-    Json(
-        entries
-            .into_iter()
-            .map(|(txid, _)| txid.to_string())
-            .collect(),
-    )
+    let mut txids = Vec::new();
+    state.mempool.for_each_acting(|txid, _| txids.push(*txid));
+    Json(txids.into_iter().map(|txid| txid.to_string()).collect())
 }
 
 pub async fn mempool_recent(
     State(state): State<EsploraState>,
 ) -> Json<Vec<RecentTxJson>> {
-    let mut entries = state.mempool.get_acting_entries();
+    // (time, txid) of every entry, then the RECENT_LIMIT newest rendered
+    // from a second pass: nothing but the chosen few is read in full.
+    let mut stamps: Vec<(u64, Txid)> = Vec::new();
+    state.mempool.for_each_acting(|txid, entry| stamps.push((entry.time, *txid)));
     // Sort by `time` descending (newest first); take up to RECENT_LIMIT.
-    entries.sort_by(|a, b| b.1.time.cmp(&a.1.time));
-    entries.truncate(RECENT_LIMIT);
-    Json(
-        entries
-            .into_iter()
-            .map(|(txid, entry)| RecentTxJson {
+    stamps.sort_by(|a, b| b.0.cmp(&a.0));
+    stamps.truncate(RECENT_LIMIT);
+    let wanted: HashMap<Txid, usize> =
+        stamps.iter().enumerate().map(|(i, (_, txid))| (*txid, i)).collect();
+    let mut out: Vec<Option<RecentTxJson>> = (0..stamps.len()).map(|_| None).collect();
+    state.mempool.for_each_acting(|txid, entry| {
+        if let Some(&i) = wanted.get(txid) {
+            out[i] = Some(RecentTxJson {
                 txid: txid.to_string(),
                 fee: entry.fee,
                 vsize: vsize_of_weight(entry.weight as u64),
-                value: entry
-                    .tx
-                    .output
-                    .iter()
-                    .map(|o| o.value.to_sat())
-                    .sum::<u64>(),
-            })
-            .collect(),
-    )
+                value: entry.tx.output.iter().map(|o| o.value.to_sat()).sum::<u64>(),
+            });
+        }
+    });
+    // An entry evicted between the two passes is left out.
+    Json(out.into_iter().flatten().collect())
 }
 
 pub async fn fee_estimates(

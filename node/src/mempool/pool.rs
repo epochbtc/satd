@@ -4516,6 +4516,45 @@ impl Mempool {
         (Self::acting_mining_order(&inner), inner.sequence)
     }
 
+    /// The number of acting-class transactions, without copying any of
+    /// them. The unauthenticated Esplora root route counts the mempool on
+    /// every request, and [`Self::get_acting_entries`] would deep-copy every
+    /// transaction to do it.
+    pub fn acting_count(&self) -> usize {
+        self.inner.read().entries.values().filter(|v| v.scope.is_acting()).count()
+    }
+
+    /// Visit every acting-class entry under one read lock, without copying
+    /// it. For read surfaces that need a few fields of each entry: `f` runs
+    /// with the lock held, so it must be cheap and must not call back into
+    /// the mempool.
+    pub fn for_each_acting(&self, mut f: impl FnMut(&Txid, &MempoolEntry)) {
+        let inner = self.inner.read();
+        for (txid, entry) in inner.entries.iter().filter(|(_, v)| v.scope.is_acting()) {
+            f(txid, entry);
+        }
+    }
+
+    /// The acting-class spender of each of `txid`'s first `n_outputs`
+    /// outputs that one has, as `vout -> (spending txid, input index)`, read
+    /// under one lock so every output is answered from the same mempool.
+    /// Costs one index lookup per output; nothing is copied but the result.
+    pub fn acting_spenders_of_outputs(&self, txid: &Txid, n_outputs: u32) -> HashMap<u32, (Txid, u32)> {
+        let inner = self.inner.read();
+        let mut out = HashMap::new();
+        for vout in 0..n_outputs {
+            let outpoint = OutPoint { txid: *txid, vout };
+            let Some(spender) = inner.spends.get(&outpoint) else { continue };
+            let Some(entry) = inner.entries.get(spender).filter(|e| e.scope.is_acting()) else {
+                continue;
+            };
+            if let Some(vin) = entry.tx.input.iter().position(|i| i.previous_output == outpoint) {
+                out.insert(vout, (*spender, vin as u32));
+            }
+        }
+        out
+    }
+
     pub fn get_acting_entries(&self) -> Vec<(Txid, MempoolEntry)> {
         self.inner
             .read()
@@ -13264,6 +13303,73 @@ mod tests {
             .collect();
         assert_eq!(acting, vec![a], "only the fully-acting tx is visible");
         assert_eq!(mp.get_all_entries().len(), 4, "all four are physically held");
+    }
+
+    /// The borrowing accessors the unauthenticated Esplora routes use see
+    /// exactly what `get_acting_entries` sees, the acting class only, and
+    /// the per-output spender lookup skips a quarantined spender as
+    /// `spending_tx_acting` does. Each spender is indexed under the output it
+    /// spends; an output nobody spends, and one past the asked range, are
+    /// absent.
+    #[test]
+    fn borrowing_acting_accessors_match_get_acting_entries() {
+        let mp = Mempool::new(300_000_000, 1_000);
+        let funding = mp.insert_scoped_for_test(1, 100, QuarantineScope::acting());
+        mp.insert_scoped_for_test(2, 100, RELAY_ONLY);
+        mp.insert_scoped_for_test(3, 100, TEMPLATE_ONLY);
+        let spend = |vout: u32, nonce: u64, scope: QuarantineScope| -> Txid {
+            let mut tx = Transaction {
+                version: bitcoin::transaction::Version(2),
+                lock_time: bitcoin::absolute::LockTime::ZERO,
+                input: vec![bitcoin::TxIn {
+                    previous_output: OutPoint { txid: funding, vout },
+                    ..Default::default()
+                }],
+                output: vec![bitcoin::TxOut {
+                    value: bitcoin::Amount::from_sat(nonce),
+                    script_pubkey: bitcoin::ScriptBuf::new(),
+                }],
+            };
+            // A second, unrelated input first, so the spender's input index
+            // is 1, not 0.
+            tx.input.insert(
+                0,
+                bitcoin::TxIn {
+                    previous_output: OutPoint { txid: <Txid as bitcoin::hashes::Hash>::all_zeros(), vout: nonce as u32 },
+                    ..Default::default()
+                },
+            );
+            let txid = tx.compute_txid();
+            let mut inner = mp.inner.write();
+            let mut entry = inner.entries.get(&funding).unwrap().clone();
+            entry.tx = tx;
+            entry.scope = scope;
+            inner.entries.insert(txid, entry);
+            inner.spends.insert(OutPoint { txid: funding, vout }, txid);
+            txid
+        };
+        let acting_spender = spend(0, 10, QuarantineScope::acting());
+        spend(1, 11, RELAY_ONLY);
+
+        let mut cloned: Vec<Txid> = mp.get_acting_entries().into_iter().map(|(t, _)| t).collect();
+        cloned.sort();
+        let mut borrowed = Vec::new();
+        mp.for_each_acting(|t, _| borrowed.push(*t));
+        borrowed.sort();
+        assert_eq!(borrowed, cloned);
+        assert_eq!(mp.acting_count(), cloned.len());
+        assert_eq!(mp.acting_count(), 2, "the funding tx and its acting spender");
+
+        let spenders = mp.acting_spenders_of_outputs(&funding, 3);
+        assert_eq!(spenders.get(&0), Some(&(acting_spender, 1)));
+        assert_eq!(spenders.get(&1), None, "a quarantined spender is invisible");
+        assert_eq!(spenders.len(), 1);
+        assert_eq!(
+            spenders.get(&0).copied(),
+            mp.spending_tx_acting(&OutPoint { txid: funding, vout: 0 }),
+            "agrees with the single-output lookup"
+        );
+        assert!(mp.acting_spenders_of_outputs(&funding, 0).is_empty());
     }
 
     #[test]

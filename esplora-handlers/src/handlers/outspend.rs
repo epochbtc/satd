@@ -7,7 +7,7 @@
 //! - `GET /tx/:txid/merkleblock-proof`     → hex-encoded MerkleBlock
 //!
 //! Outspend backed by `SpendIndex::spend_of` for confirmed-side lookups
-//! plus a one-shot mempool scan for unconfirmed spends. Merkle paths
+//! plus the mempool's spends index for unconfirmed spends. Merkle paths
 //! computed directly from block txids using the standard Bitcoin
 //! double-sha256 pairing rule (odd-out duplication).
 
@@ -89,11 +89,12 @@ pub async fn tx_outspends(
     // Either path returns the output count without serializing the body.
     let output_count = output_count_of(&state, &pin, &txid)?;
 
-    // Precompute the mempool's prev_output → (spending_txid, vin)
-    // index once per request so /outspends is O(N) rather than
-    // O(N × mempool_size).
+    // The mempool spender of each output, from the mempool's own spends
+    // index under one lock: O(outputs), with nothing copied. Building a
+    // whole-mempool map here copied every mempool transaction per request,
+    // on a route anyone who can reach Esplora may call.
     let mempool_index = if pin.mempool {
-        build_mempool_spent_index(&state)
+        state.mempool.acting_spenders_of_outputs(&txid, output_count as u32)
     } else {
         HashMap::new()
     };
@@ -109,7 +110,7 @@ pub async fn tx_outspends(
     for vout in 0..output_count as u32 {
         out.push(match confirmed.get(&vout) {
             Some(sref) => confirmed_outspend(&state, &pin, sref),
-            None => build_outspend(&state, &pin, &OutPoint { txid, vout }, &mempool_index)?,
+            None => build_outspend(&state, &pin, &OutPoint { txid, vout }, mempool_index.get(&vout))?,
         });
     }
     Ok(Json(out))
@@ -156,45 +157,20 @@ fn parse_txid(s: &str) -> EsploraResult<Txid> {
         .map_err(|e| EsploraError::BadRequest(format!("bad txid: {e}")))
 }
 
-/// Build the (one-shot) `prev_output → (spending_txid, vin)` map across
-/// the entire mempool. Used to surface mempool spends from /outspend
-/// endpoints in O(1) per lookup. The clone-cost is bounded by mempool
-/// size; for typical Esplora deployments this is well under a millisecond.
-fn build_mempool_spent_index(state: &EsploraState) -> HashMap<OutPoint, (Txid, u32)> {
-    let mut map: HashMap<OutPoint, (Txid, u32)> = HashMap::new();
-    // Standard surface (design §6.1): acting class only — a quarantined spender
-    // must not surface as the spending tx on /outspend, just as it is absent
-    // from getrawmempool. (Infectious propagation means an acting tx can't have
-    // a quarantined ancestor, so this never hides a legitimately-relayed spend.)
-    for (txid, entry) in state.mempool.get_acting_entries() {
-        for (vin, input) in entry.tx.input.iter().enumerate() {
-            if input.previous_output.is_null() {
-                continue;
-            }
-            // First-write-wins: a prevout can only be consumed once
-            // legitimately, but in case of a transient inconsistency we
-            // prefer the earliest-seen mempool entry's claim.
-            map.entry(input.previous_output)
-                .or_insert((txid, vin as u32));
-        }
-    }
-    map
-}
-
-/// Render a single outspend response using the precomputed mempool
-/// map. Used by `/outspends` so the N-output loop runs in O(N) total
-/// instead of O(N × mempool_size).
+/// Render a single outspend response, given the output's acting mempool
+/// spender if it has one. Used by `/outspends`, whose spenders come from
+/// one [`node::mempool::Mempool::acting_spenders_of_outputs`] read.
 fn build_outspend(
     state: &EsploraState,
     pin: &Pin,
     outpoint: &OutPoint,
-    mempool_index: &HashMap<OutPoint, (Txid, u32)>,
+    mempool_spender: Option<&(Txid, u32)>,
 ) -> EsploraResult<OutspendJson> {
     if let Some(sref) = state.spend_index.spend_of(outpoint)? {
         return Ok(confirmed_outspend(state, pin, &sref));
     }
     // Empty as of a block (`?asof=`).
-    if let Some((spend_txid, vin)) = mempool_index.get(outpoint) {
+    if let Some((spend_txid, vin)) = mempool_spender {
         return Ok(mempool_outspend(*spend_txid, *vin));
     }
     Ok(unspent_outspend())
@@ -214,7 +190,7 @@ fn build_outspend_one(
         return Ok(confirmed_outspend(state, pin, &sref));
     }
     // Acting-only (design §6.1): a quarantined spender must not surface here,
-    // matching the batched `/outspends` path (`build_mempool_spent_index`) and
+    // matching the batched `/outspends` path (`acting_spenders_of_outputs`) and
     // `getrawmempool`. The single-output path previously used the unfiltered
     // `spending_tx`, so the two endpoints disagreed for the same outpoint.
     if !pin.mempool {
