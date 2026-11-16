@@ -563,6 +563,13 @@ where
 /// also `None` when a batch contained ONLY notifications. Handles
 /// both single requests and batch arrays per JSON-RPC 2.0 §6.
 ///
+/// A notification is not dispatched at all. Electrum clients never send
+/// one, and running its handler only to drop the reply let a client that
+/// never reads keep the server busy: no reply is ever written, so the
+/// write backpressure that holds back a client that stops reading never
+/// applies, and each batch line could carry `max_batch_requests` handler
+/// calls of work.
+///
 /// `max_batch_requests` rejects oversized batches before dispatching
 /// any element, preventing a single 1 MiB line from forcing the
 /// server through thousands of method calls (review-round-1 M5).
@@ -573,13 +580,10 @@ fn process_request(
 ) -> Option<String> {
     match Requests::parse(line) {
         Ok(Requests::Single(req)) => {
-            let is_notification = req.id.is_none();
+            // A notification: not dispatched, not answered.
+            req.id.as_ref()?;
             let resp = dispatch(req);
-            if is_notification {
-                None
-            } else {
-                serde_json::to_string(&resp).ok()
-            }
+            serde_json::to_string(&resp).ok()
         }
         Ok(Requests::Batch(reqs)) => {
             if reqs.len() > max_batch_requests {
@@ -587,16 +591,15 @@ fn process_request(
                 let resp = Response::error(Value::Null, err);
                 return serde_json::to_string(&resp).ok();
             }
-            // Per spec: dispatch each, suppress responses for
-            // notifications. If the batch contained only
+            // Dispatch each request; a notification gets neither a
+            // response nor a dispatch. If the batch contained only
             // notifications, return None (no response written).
             let mut responses: Vec<Response> = Vec::with_capacity(reqs.len());
             for req in reqs {
-                let is_notification = req.id.is_none();
-                let resp = dispatch(req);
-                if !is_notification {
-                    responses.push(resp);
+                if req.id.is_none() {
+                    continue;
                 }
+                responses.push(dispatch(req));
             }
             if responses.is_empty() {
                 None
@@ -641,6 +644,37 @@ mod electrumbounds_tests;
 mod tests {
     use super::*;
     use serde_json::{Value, json};
+
+    /// A notification (no `id`) is not dispatched, alone or in a batch, and
+    /// gets no reply; the requests beside it in the batch are dispatched and
+    /// answered. Perturbation: dispatch notifications again and the count
+    /// is 4, not 1.
+    #[test]
+    fn notifications_are_not_dispatched() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = calls.clone();
+        let mut dispatch: BoxedDispatch = Box::new(move |req: Request| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            Response::success(req.id.clone().unwrap_or(Value::Null), json!(null))
+        });
+        let note = json!({"jsonrpc":"2.0","method":"blockchain.headers.subscribe","params":[]});
+        let req = json!({"jsonrpc":"2.0","id":7,"method":"server.ping","params":[]});
+
+        assert_eq!(process_request(&mut dispatch, &note.to_string(), 10), None);
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "a lone notification runs nothing");
+
+        let only_notes = json!([note, note]).to_string();
+        assert_eq!(process_request(&mut dispatch, &only_notes, 10), None);
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "a batch of notifications runs nothing");
+
+        let mixed = json!([note, req, note]).to_string();
+        let reply = process_request(&mut dispatch, &mixed, 10).expect("the request is answered");
+        let reply: Value = serde_json::from_str(&reply).unwrap();
+        assert_eq!(reply.as_array().map(Vec::len), Some(1), "{reply}");
+        assert_eq!(reply[0]["id"], 7);
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "only the request ran");
+    }
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;
 
