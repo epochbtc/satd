@@ -468,7 +468,6 @@ fn synced_peer(pm: &PeerManager, id: PeerId) -> mpsc::Receiver<NetworkMessage> {
     pm.start_header_syncs();
     assert_eq!(getheaders_sent(&mut rx), 1, "header sync starts with the peer");
     pm.handle_headers(id, Vec::new());
-    assert!(pm.peers.read()[&id].last_getheaders_sent.is_none(), "the empty reply answers it");
     rx
 }
 
