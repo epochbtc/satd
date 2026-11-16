@@ -88,6 +88,12 @@ It includes every fix shipped in 0.7.1:
 - IBD: header sync runs with one peer, preferably an outbound one, until the best header is less than a day old, as in Bitcoin Core, instead of with every peer the node connects to; a fresh testnet4 node with seven peers received the 13 MB header chain once instead of about six times.
 - IBD: header sync no longer downloads the header chain many times over; a new request goes out only after the header tip has stood still for 10 seconds, and a full batch asks only the peer that sent it for more. A fresh mainnet sync from one peer took 5.6 GB of `headers` for the 78 MB chain (#1229).
 - IBD: testnet4 and testnet3 get Bitcoin Core's default `-assumevalid`, and the stall watchdog counts the script inputs the connect path verifies as progress, so one very large block is no longer taken for a wedge; in 0.7.1 a fresh testnet4 sync stopped for good at block 51,540 (#1216).
+- Esplora: `/`, `/mempool`, `/mempool/txids`, `/mempool/recent` and `/tx/:txid/outspends` no longer copy the whole mempool on every request; any client that could reach Esplora could make the node do so at will. Also in 0.7.2.
+- P2P: a peer that sends a `getblocktxn` naming no transaction is disconnected, as in Bitcoin Core; one 33-byte request could make the node upload a whole block. Also in 0.7.2.
+- P2P: a block that extends the tip is announced to peers only after its BIP 34 coinbase height and transaction finality are checked, as in Core. Also in 0.7.2.
+- Tor: the onion address and private key `ADD_ONION` returns, and the saved key, are checked as Core checks them before they are used, and a control-port line over 100,000 bytes is refused. Also in 0.7.2.
+- Electrum: JSON-RPC notifications (requests with no `id`) are no longer run only to drop their reply. Also in 0.7.2.
+- RPC: `addnode` refuses an empty node with Core's `-8` error; `addnode "" add` kept it and retried it forever. Also in 0.7.2.
 
 ## Releases
 
