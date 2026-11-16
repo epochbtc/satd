@@ -45,6 +45,7 @@ It includes every fix shipped in 0.7.1:
 - P2P: once initial sync is over, the node opens an extra block-relay-only connection about every five minutes to check its tip, and then drops whichever of its two youngest block-relay-only peers gave it a block least recently, as Core does (#1155).
 - P2P: `.onion` fixed seeds for testnet4 and testnet3, and refreshed ones for mainnet and signet, from Core v31.2's lists, so a Tor-only node can bootstrap on every network (#1162).
 - Config: `reindex=1` and `reindexchainstate=1` in `bitcoin.conf` are honoured, as in Core, instead of accepted and ignored (#840).
+- Operator: `-dbcache=auto` sizes from the memory cgroup limit (systemd `MemoryMax=`, Docker `--memory`, cgroup v2 or v1) when it is below host memory; it sized from the host alone (#1272).
 - Operator: the shadow verification queue is bounded by memory, `-shadowqueuemb` (default 128 MiB), as well as by entry count (#1145).
 - Operator: the core runtime has at least two worker threads, so one blocked worker cannot freeze RPC and P2P on a 1-CPU host (#1144).
 - Stack: `conf.d/local.conf` overrides the keys `satd-init` writes (#843).
