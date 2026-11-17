@@ -5,6 +5,8 @@
 
 mod helpers;
 
+mod script_edges;
+
 use bitcoin::consensus::Decodable;
 use bitcoin::{Amount, ScriptBuf, Transaction, TxOut};
 use consensus::error::ScriptError;
@@ -625,4 +627,13 @@ fn test_taproot_wrong_control_size() {
         &checker,
     );
     assert_eq!(result, Err(ScriptError::TaprootWrongControlSize));
+}
+
+/// Taproot: a control block holds at most 128 path nodes (4129 bytes). With
+/// 129 nodes it is the wrong size even though the path commits to the output
+/// (interpreter.h TAPROOT_CONTROL_MAX_SIZE); with 128 it spends.
+#[test]
+fn taproot_control_block_129_nodes_is_wrong_size() {
+    assert_eq!(script_edges::taproot_script_path_with_nodes(129).verify(), Err(ScriptError::TaprootWrongControlSize));
+    assert_eq!(script_edges::taproot_script_path_with_nodes(128).verify(), Ok(()));
 }

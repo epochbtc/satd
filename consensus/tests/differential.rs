@@ -8,6 +8,8 @@ mod kernel_ref;
 
 mod helpers;
 
+mod script_edges;
+
 use bitcoin::absolute::LockTime;
 use bitcoin::consensus::{Decodable, Encodable};
 use bitcoin::hashes::Hash;
@@ -571,4 +573,42 @@ fn differential_p2sh_p2wpkh_nonstandard_sighash() {
         cases.len()
     );
     assert_eq!(mismatched, 0, "{mismatched} mismatches in nonstandard sighash test");
+}
+
+// =========================================================================
+// Differential test: parsing and size edges (script_edges)
+//
+// The cases core_edge_cases.rs and taproot_tests.rs check for their exact
+// error, run through both engines with the verdict each must give. Cases
+// whose flags the kernel API does not take are left out.
+// =========================================================================
+
+#[test]
+fn differential_script_edges() {
+    let cases = [
+        ("truncated PUSHDATA2", script_edges::pushdata2_missing_a_length_byte(), false),
+        ("truncated PUSHDATA2 after CHECKSIG", script_edges::pushdata2_missing_a_length_byte_after_checksig(), false),
+        ("P2SH truncated PUSHDATA2", script_edges::p2sh_redeem_script_with_a_truncated_pushdata2(), false),
+        ("PUSHDATA4 length byte 2", script_edges::pushdata4_length_with_byte_2_set(), false),
+        ("PUSHDATA4 length 1", script_edges::pushdata4_length_of_one(), true),
+        ("P2SH redeemScript in PUSHDATA4", script_edges::p2sh_redeem_script_pushed_with_pushdata4(), true),
+        ("0xab in PUSHDATA1 data", script_edges::checksig_with_codeseparator_bytes_in_pushdata1_data(), true),
+        ("v1 program of 40 bytes", script_edges::witness_v1_program_of_40_bytes(0), true),
+        ("v0 program of 40 bytes", script_edges::witness_v0_program_of_40_bytes(), false),
+        ("control block of 129 nodes", script_edges::taproot_script_path_with_nodes(129), false),
+        ("control block of 128 nodes", script_edges::taproot_script_path_with_nodes(128), true),
+    ];
+    for (name, case, want_ok) in cases {
+        let flags = cpp_safe_flags(case.flags);
+        let prevs = vec![(case.script_pubkey().to_vec(), case.spent.value.to_sat())];
+        let (rust_ok, cpp_ok, _) = verify_both(
+            case.script_pubkey(),
+            case.spent.value.to_sat(),
+            &serialize_tx(&case.tx),
+            0,
+            flags,
+            Some(&prevs),
+        );
+        assert_eq!((rust_ok, cpp_ok), (want_ok, want_ok), "{name}: rust={rust_ok} cpp={cpp_ok} flags=0x{flags:x}");
+    }
 }

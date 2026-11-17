@@ -277,4 +277,15 @@ mod tests {
             assert!(!is_push_only(&script), "push {push:02x?} then OP_CHECKSIG");
         }
     }
+
+    #[test]
+    fn is_push_only_reads_all_four_pushdata4_length_bytes() {
+        // A PUSHDATA4 of 257 bytes (length bytes 0 and 1 set) whose data is
+        // all OP_NOP is push only. Only an opcode after the data makes it not.
+        let mut script = vec![0x4e, 0x01, 0x01, 0x00, 0x00];
+        script.extend([0x61; 257]);
+        assert!(is_push_only(&script));
+        script.push(0xac);
+        assert!(!is_push_only(&script));
+    }
 }
