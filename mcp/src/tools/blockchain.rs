@@ -57,6 +57,10 @@ pub fn get_block_stats(ctx: &McpContext, identifier: &str) -> String {
 /// Get chain analysis: tips, tx rate over a window, and difficulty.
 pub fn get_chain_info(ctx: &McpContext, window: u32) -> String {
     let tips = rpc::get_chain_tips(&ctx.chain_state);
+    // The RPC refuses a window that reaches the final block's height, as
+    // Core does; the tool clamps it instead.
+    let window = window.min(ctx.chain_state.tip_height().saturating_sub(1));
+    let window = i32::try_from(window).unwrap_or(i32::MAX);
     let tx_stats = rpc::get_chain_tx_stats(&ctx.chain_state, Some(window), None);
     let difficulty = rpc::get_difficulty(&ctx.chain_state);
 

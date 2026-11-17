@@ -75,11 +75,13 @@ const PING_INTERVAL: Duration = Duration::from_secs(120);
 /// outstanding for twenty minutes unless the connection is at least that old.
 const PING_TIMEOUT: Duration = Duration::from_secs(20 * 60);
 
-/// Minimum interval between announcement-triggered `getheaders` to a single
-/// peer. Caps the header-discovery work a peer can make us do by spamming
-/// invs / unconnectable headers (anti-DoS), while still reacting promptly to
-/// an honest competing-chain announcement.
-const GETHEADERS_MIN_INTERVAL: Duration = Duration::from_secs(2);
+/// How long a `getheaders` to a peer counts as outstanding: Core's
+/// `HEADERS_RESPONSE_TIME` (`net_processing.cpp`). While one is outstanding
+/// and younger than this, announcements from that peer (block `inv`s,
+/// headers that do not connect, a block or `cmpctblock` with an unknown
+/// parent) bring no further `getheaders`; the peer's `headers` reply clears
+/// it, so the next request can follow the reply at once.
+const HEADERS_RESPONSE_TIME: Duration = Duration::from_secs(2 * 60);
 
 /// Cap on the peer-reported addresses `-discover` remembers as our own.
 /// Each outbound peer reports one; an honest set holds one per IP family.
@@ -266,6 +268,14 @@ const INVALID_TX_BAN_SCORE: u32 = 10;
 /// don't supply a value. Operator-facing path goes through
 /// `Config::maxinboundperip` and the `-maxinboundperip` CLI flag.
 const DEFAULT_MAX_INBOUND_PER_IP: usize = 3;
+/// Bitcoin Core's `DEFAULT_MAX_PEER_CONNECTIONS`, `-maxconnections` (v32.1
+/// `src/net.h:81`). Core v32 raised it from 125 so that the extra inbound
+/// slots go to block-relay-only peers.
+pub const DEFAULT_MAX_PEER_CONNECTIONS: usize = 200;
+/// Bitcoin Core's `DEFAULT_FULL_RELAY_INBOUND_PCT`, `-inboundrelaypercent`
+/// (v32.1 `src/net.h:85`): the share of inbound slots transaction-relaying
+/// peers may hold.
+pub const DEFAULT_INBOUND_RELAY_PERCENT: usize = 50;
 /// Default handshake timeout in milliseconds, matching Bitcoin Core's
 /// `-timeout` default (5000ms).
 const DEFAULT_CONNECT_TIMEOUT_MS: u64 = 5000;
@@ -961,9 +971,12 @@ struct PeerHandle {
     /// The peer's outbound queue. It counts the bytes queued, which Core's
     /// send-buffer limit is measured in; see [`crate::net::send_queue`].
     msg_tx: crate::net::send_queue::PeerSender,
-    /// Last time we sent this peer a `getheaders`, for rate-limiting
-    /// announcement-triggered header discovery (anti-DoS). `None` until the
-    /// first send.
+    /// When the `getheaders` outstanding to this peer went out: Core's
+    /// `m_last_getheaders_timestamp`. Set by every `getheaders` we send;
+    /// cleared by a `headers` reply that is empty or connects to the block
+    /// index, which Core takes as the answer. `None` when nothing is
+    /// outstanding. Gates announcement-triggered requests
+    /// ([`PeerManager::maybe_send_getheaders`]).
     last_getheaders_sent: Option<Instant>,
     /// Whether header sync has started with this peer, and how it went.
     header_sync: HeaderSync,
@@ -1056,6 +1069,10 @@ mod hdrsync_tests;
 #[cfg(test)]
 #[path = "manager_bgcatchup_tests.rs"]
 mod bgcatchup_tests;
+
+#[cfg(test)]
+#[path = "manager_txinbound_tests.rs"]
+mod txinbound_tests;
 
 /// How a transaction is announced to a peer: `MSG_WTX` carrying the wtxid
 /// to a peer that negotiated BIP 339 wtxid relay, the txid to the rest.
@@ -1523,13 +1540,21 @@ pub struct PeerManager {
     /// Prune target in MB (0 = disabled).
     #[allow(dead_code)]
     prune_target_mb: u64,
-    /// Maximum total connections (default: 125). Atomic so SIGHUP config
+    /// Maximum total connections (default: 200). Atomic so SIGHUP config
     /// reload can adjust it live (applies to new connections; existing peers
     /// above a lowered cap are not dropped).
     max_connections: AtomicUsize,
     /// Maximum simultaneous inbound peers from the same source IP
     /// (Core-style flood guard). Atomic for live SIGHUP reload.
     max_inbound_per_ip: AtomicUsize,
+    /// `-inboundrelaypercent`, 0 to 100: the share of the inbound slots
+    /// transaction-relaying peers may hold (Core's
+    /// `m_full_relay_inbound_percent`). Atomic for live SIGHUP reload.
+    inbound_relay_percent: AtomicUsize,
+    /// The secret key a peer's network group is hashed under for inbound
+    /// eviction, so that an attacker cannot tell which groups are protected
+    /// (Core's `CalculateKeyedNetGroup`).
+    netgroup_key: (u64, u64),
     /// Outbound `connect_outbound` calls that have started but haven't
     /// yet finished registering a peer. Used to dedup concurrent dial
     /// attempts against the same addr (e.g. an addr arriving from
@@ -1714,7 +1739,7 @@ impl PeerManager {
         shutdown: tokio::sync::watch::Receiver<bool>,
     ) -> Arc<Self> {
         let workers = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
-        Self::with_config(chain_state, mempool, fee_estimator, network, shutdown, 0, 125, DEFAULT_MAX_INBOUND_PER_IP, 86400, None, None, workers, 50_000, 0, None)
+        Self::with_config(chain_state, mempool, fee_estimator, network, shutdown, 0, DEFAULT_MAX_PEER_CONNECTIONS, DEFAULT_MAX_INBOUND_PER_IP, 86400, None, None, workers, 50_000, 0, None)
     }
 
     pub fn with_prune(
@@ -1726,7 +1751,7 @@ impl PeerManager {
         prune_target_mb: u64,
     ) -> Arc<Self> {
         let workers = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
-        Self::with_config(chain_state, mempool, fee_estimator, network, shutdown, prune_target_mb, 125, DEFAULT_MAX_INBOUND_PER_IP, 86400, None, None, workers, 50_000, 0, None)
+        Self::with_config(chain_state, mempool, fee_estimator, network, shutdown, prune_target_mb, DEFAULT_MAX_PEER_CONNECTIONS, DEFAULT_MAX_INBOUND_PER_IP, 86400, None, None, workers, 50_000, 0, None)
     }
 
     /// `stop_at_height` is `-stopatheight` and the sender on which reaching
@@ -1882,6 +1907,8 @@ impl PeerManager {
             prune_target_mb,
             max_connections: AtomicUsize::new(max_connections),
             max_inbound_per_ip: AtomicUsize::new(max_inbound_per_ip),
+            inbound_relay_percent: AtomicUsize::new(DEFAULT_INBOUND_RELAY_PERCENT),
+            netgroup_key: (rand::random(), rand::random()),
             pending_connections: RwLock::new(HashSet::new()),
             pending_onion_dials: RwLock::new(HashSet::new()),
             addr_fetches: parking_lot::Mutex::new(std::collections::VecDeque::new()),
@@ -2730,6 +2757,14 @@ impl PeerManager {
     /// connections. Used at startup and by SIGHUP config reload.
     pub fn set_max_inbound_per_ip(&self, n: usize) {
         self.max_inbound_per_ip.store(n, Ordering::Relaxed);
+    }
+
+    /// Set `-inboundrelaypercent`, clamped to 0..=100 as Core clamps it
+    /// (`init.cpp`). Applies from the next transaction-relaying inbound
+    /// peer; peers already above a lowered share are not dropped until one
+    /// arrives. Used at startup and by SIGHUP config reload.
+    pub fn set_inbound_relay_percent(&self, pct: usize) {
+        self.inbound_relay_percent.store(pct.min(100), Ordering::Relaxed);
     }
 
     /// Set the `-bantime` duration in seconds. Applies to bans created after
@@ -3723,6 +3758,127 @@ impl PeerManager {
         const MAX_FEELER: usize = 1;
         (MAX_OUTBOUND + MAX_OUTBOUND_BLOCK_RELAY + MAX_FEELER)
             .min(max_connections.load(Ordering::Relaxed))
+    }
+
+    /// Core's `m_max_inbound`: the connection budget past the automatic
+    /// outbound slots, `max(0, max_connections - m_max_automatic_outbound)`
+    /// (v32.1 `src/net.h:1131`).
+    fn max_inbound(&self) -> usize {
+        self.max_connections
+            .load(Ordering::Relaxed)
+            .saturating_sub(Self::max_automatic_outbound(&self.max_connections))
+    }
+
+    /// Core's `m_max_inbound_full_relay`: how many inbound peers may relay
+    /// transactions, `-inboundrelaypercent` of [`Self::max_inbound`] (v32.1
+    /// `src/net.h:1132`). Computed in floating point and truncated, as Core
+    /// does: 29% of 100 slots is 28 there, not 29.
+    fn max_inbound_full_relay(&self) -> usize {
+        let pct = self.inbound_relay_percent.load(Ordering::Relaxed);
+        (pct as f64 / 100.0 * self.max_inbound() as f64) as usize
+    }
+
+    /// Core's `CConnman::EvictTxPeerIfFull` (v32.1 `src/net.cpp:2554`).
+    /// Once more inbound peers relay transactions than
+    /// [`Self::max_inbound_full_relay`] allows, evict one of them by the
+    /// inbound eviction rules ([`crate::net::eviction`]), never
+    /// `protect_peer`. Returns false when that many are connected and every
+    /// one of them is protected, so that the caller drops the newcomer
+    /// instead.
+    ///
+    /// Peers whose `version` turned transaction relay off (Core's
+    /// `-blocksonly`, block-relay-only connections from the other side) are
+    /// neither counted nor evicted: the slots above the cap are theirs.
+    /// `noban` peers count but are never evicted; outbound and manual
+    /// connections are neither.
+    fn evict_tx_peer_if_full(&self, protect_peer: Option<PeerId>) -> bool {
+        struct Seen {
+            id: PeerId,
+            addr: SocketAddr,
+            inbound: bool,
+            inbound_onion: bool,
+            noban: bool,
+            connected: u64,
+            has_all_wanted_services: bool,
+            stats: Arc<PeerStats>,
+        }
+        let seen: Vec<Seen> = {
+            let peers = self.peers.read();
+            let relaying = |h: &&PeerHandle| h.info.state != PeerState::Disconnected && h.info.tx_relay_requested;
+            let tx_inbound_peers = peers
+                .values()
+                .filter(relaying)
+                .filter(|h| h.info.direction == Direction::Inbound)
+                .count();
+            if tx_inbound_peers <= self.max_inbound_full_relay() {
+                return true;
+            }
+            // Core's `AttemptToEvictConnection(evict_tx_relay_peer_only=true)`.
+            peers
+                .values()
+                .filter(relaying)
+                .filter(|h| Some(h.info.id) != protect_peer)
+                .map(|h| Seen {
+                    id: h.info.id,
+                    addr: h.info.addr,
+                    inbound: h.info.conn_type == ConnType::Inbound,
+                    inbound_onion: h.info.inbound_onion,
+                    noban: h.info.permissions.noban,
+                    connected: h
+                        .info
+                        .conn_time
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_or(0, |d| d.as_secs()),
+                    has_all_wanted_services: h.info.has_all_wanted_services,
+                    stats: h.stats.clone(),
+                })
+                .collect()
+        };
+        let candidates: Vec<crate::net::eviction::EvictionCandidate> = {
+            let reachable = self.reachable.read();
+            let addrman = self.addrman.read();
+            seen.into_iter()
+                .map(|p| {
+                    let ip = p.addr.ip();
+                    let routable = crate::net::is_routable(ip);
+                    // Core's `ConnectedThroughNetwork`.
+                    let network = if p.inbound_onion {
+                        Some(crate::net::reachable::Network::Onion)
+                    } else {
+                        routable.then(|| reachable.network_of(&p.addr))
+                    };
+                    // Core's `NetGroupManager::GetGroup`: every address that
+                    // is not publicly routable falls in one group.
+                    let group = if routable { addrman.group_key(ip) } else { Vec::new() };
+                    crate::net::eviction::EvictionCandidate {
+                        id: p.id,
+                        connected: p.connected,
+                        min_ping_us: p.stats.min_ping_us(),
+                        last_block_time: p.stats.last_block(),
+                        last_tx_time: p.stats.last_transaction(),
+                        relevant_services: p.has_all_wanted_services,
+                        relay_txs: true,
+                        bloom_filter: false,
+                        keyed_net_group: bitcoin::hashes::siphash24::Hash::hash_to_u64_with_keys(
+                            self.netgroup_key.0,
+                            self.netgroup_key.1,
+                            &group,
+                        ),
+                        prefer_evict: false,
+                        is_local: crate::net::is_local(ip),
+                        network,
+                        noban: p.noban,
+                        inbound: p.inbound,
+                    }
+                })
+                .collect()
+        };
+        let Some(victim) = crate::net::eviction::select_node_to_evict(candidates) else {
+            return false;
+        };
+        tracing::debug!("selected inbound connection for eviction, disconnecting peer={victim}");
+        self.disconnect_peer(victim, "evicted for an inbound tx-relay slot");
+        true
     }
 
     /// Core's `m_max_outbound_block_relay`: 2, or what `-maxconnections`
@@ -5354,8 +5510,9 @@ impl PeerManager {
     }
 
     /// Whether to start header sync with `id` now, and if so, mark it
-    /// started; the caller sends the `getheaders`. Core's `SendMessages`:
-    /// while the best header is more than a day old, header sync runs with a
+    /// started and its `getheaders` outstanding (Core starts sync through
+    /// `MaybeSendGetHeaders`, which records the request); the caller sends
+    /// it. Core's `SendMessages`: while the best header is more than a day old, header sync runs with a
     /// single peer, preferably a preferred-download one (outbound or
     /// `noban`), so a fresh node does not fetch the whole header chain once
     /// from every peer it connects to; past that, every peer. A peer that
@@ -5391,6 +5548,7 @@ impl PeerManager {
         }
         if let Some(h) = peers.get_mut(&id) {
             h.header_sync.started = true;
+            h.last_getheaders_sent = Some(Instant::now());
         }
         true
     }
@@ -7112,7 +7270,7 @@ impl PeerManager {
             // them and triggers rate limits.
             if self.is_ibd() && ticks.is_multiple_of(4) && self.ibd_header_probe_due() {
                 if let Some(pid) = self.header_probe_peer() {
-                    self.send_to_peer(pid, sync::make_getheaders(&self.chain_state));
+                    self.send_getheaders(pid, sync::make_getheaders(&self.chain_state));
                 }
             } else if !self.is_ibd() && ticks.is_multiple_of(20) {
                 let peer_ids: Vec<PeerId> = {
@@ -7125,7 +7283,7 @@ impl PeerManager {
                         .collect()
                 };
                 for pid in &peer_ids {
-                    self.send_to_peer(*pid, sync::make_getheaders(&self.chain_state));
+                    self.send_getheaders(*pid, sync::make_getheaders(&self.chain_state));
                 }
             }
 
@@ -8530,10 +8688,22 @@ impl PeerManager {
     }
 
     fn handle_headers(&self, id: PeerId, headers: Vec<bitcoin::block::Header>) {
-        if headers.len() < 2000
-            && let Some(h) = self.peers.write().get_mut(&id)
-        {
-            h.header_sync.done = true;
+        // Core's `ProcessHeadersMessage`: an empty `headers` cannot be an
+        // announcement, and headers whose first one connects to the block
+        // index can be the answer to our `getheaders`; either clears the
+        // outstanding request (`m_last_getheaders_timestamp = {}`). Headers
+        // that do not connect cannot be an answer and leave it standing, so
+        // a peer sending them cannot draw a `getheaders` per message.
+        let answers_getheaders = headers
+            .first()
+            .is_none_or(|first| self.chain_state.get_block_index(&first.prev_blockhash).is_some());
+        if let Some(h) = self.peers.write().get_mut(&id) {
+            if headers.len() < 2000 {
+                h.header_sync.done = true;
+            }
+            if answers_getheaders {
+                h.last_getheaders_sent = None;
+            }
         }
         if headers.is_empty() {
             return;
@@ -8554,7 +8724,7 @@ impl PeerManager {
             && headers.len() >= 2000
             && let Some(last) = headers.last()
         {
-            self.send_to_peer(id, sync::make_getheaders_after(&self.chain_state, last.block_hash()));
+            self.send_getheaders(id, sync::make_getheaders_after(&self.chain_state, last.block_hash()));
         }
         // Core's `UpdateBlockAvailability`: the peer has at least the last
         // header it sent, already known or not.
@@ -8588,6 +8758,10 @@ impl PeerManager {
                     // with a batch that no longer connects, and the exchange
                     // ran to 100 points — a ban — in half a second, leaving the
                     // node with no block source and its sync stopped dead.
+                    //
+                    // At most one such `getheaders` is outstanding per peer
+                    // (`HEADERS_RESPONSE_TIME`): these headers did not clear
+                    // the last one, as they cannot be its answer.
                     self.maybe_send_getheaders(id);
                 }
                 // A header more than two hours ahead of our clock may be
@@ -13886,6 +14060,15 @@ impl PeerManager {
             return;
         }
 
+        // 0b. A peer that never sent a version-2 `sendcmpct` has not
+        // negotiated compact blocks, and Core v32 ignores its `cmpctblock`,
+        // the header included (`m_provides_cmpctblocks`,
+        // `net_processing.cpp:4795-4802` at v32.1).
+        if !self.peers.read().get(&id).is_some_and(|h| h.info.compact_blocks) {
+            tracing::debug!("peer={id} sent us a compact block despite never having sent us a SENDCMPCT!");
+            return;
+        }
+
         // 1. Still syncing: take the header, leave the block to the download
         // scheduler. Core: `if (!already_in_flight && !CanDirectFetch()) return`.
         if self.ibd.read().is_some() || self.is_ibd() {
@@ -14228,21 +14411,27 @@ impl PeerManager {
         }
     }
 
-    /// Send `getheaders` to a peer for headers-first chain discovery, but no
-    /// more than once per [`GETHEADERS_MIN_INTERVAL`] per peer. Returns whether
-    /// a message was sent. Used on inv/headers announcements so a flood of
-    /// announcements (or unconnectable headers) can't make us emit a getheaders
-    /// — and the locator-building work behind it — on every message.
+    /// Core's `MaybeSendGetHeaders` (v32.1 `net_processing.cpp`): send
+    /// `getheaders` to a peer for headers-first chain discovery, unless one
+    /// is already outstanding to it and under [`HEADERS_RESPONSE_TIME`] old.
+    /// Returns whether a message was sent. Used on announcements (block
+    /// `inv`s, headers that do not connect, a block or `cmpctblock` with an
+    /// unknown parent), so a flood of them cannot make us emit a
+    /// `getheaders` — and the locator-building work behind it — per message.
+    /// The peer's reply clears the request ([`Self::handle_headers`]).
     fn maybe_send_getheaders(&self, id: PeerId) -> bool {
+        self.maybe_send_getheaders_at(id, Instant::now())
+    }
+
+    fn maybe_send_getheaders_at(&self, id: PeerId, now: Instant) -> bool {
         {
             let mut peers = self.peers.write();
             let Some(handle) = peers.get_mut(&id) else {
                 return false;
             };
-            let now = Instant::now();
             let due = handle
                 .last_getheaders_sent
-                .is_none_or(|t| now.duration_since(t) >= GETHEADERS_MIN_INTERVAL);
+                .is_none_or(|t| now.saturating_duration_since(t) > HEADERS_RESPONSE_TIME);
             if !due {
                 return false;
             }
@@ -14250,6 +14439,18 @@ impl PeerManager {
         }
         self.send_to_peer(id, sync::make_getheaders(&self.chain_state));
         true
+    }
+
+    /// Send a `getheaders` that is not gated on an outstanding one (header
+    /// sync's continuation, the stall probe, the periodic poll; its start is
+    /// recorded by [`Self::start_header_sync`]), and record it as outstanding, as every `getheaders` Core sends
+    /// goes through `MaybeSendGetHeaders`. An announcement arriving before
+    /// its answer then brings no second request: the answer covers it.
+    fn send_getheaders(&self, id: PeerId, msg: NetworkMessage) {
+        if let Some(h) = self.peers.write().get_mut(&id) {
+            h.last_getheaders_sent = Some(Instant::now());
+        }
+        self.send_to_peer(id, msg);
     }
 
     fn request_missing_blocks(&self, id: PeerId) {
@@ -15936,6 +16137,15 @@ impl PeerManager {
             return Err("peer lacks the expected services".to_string());
         }
 
+        // Core's `m_relays_txs` and `m_has_all_wanted_services`, set on the
+        // peer's `version` (`net_processing.cpp`, v32.1).
+        let tx_relay_requested = conn_type.wants_tx_relay() && their_version.relay;
+        let has_all_wanted_services = self.missing_desirable_services(their_version.services).is_none();
+        if let Some(h) = self.peers.write().get_mut(&id) {
+            h.info.tx_relay_requested = tx_relay_requested;
+            h.info.has_all_wanted_services = has_all_wanted_services;
+        }
+
         // The feature negotiation messages go out between the peer's version
         // and our verack, and only at a common version of at least 70016, as
         // Core sends them. BIP 339 negotiates on that version, so the peer's
@@ -15983,6 +16193,16 @@ impl PeerManager {
                     .await
                     .map_err(|e| format!("send version: {}", e))?;
                 self.send_feature_negotiation(conn, wtxid_relay_version).await?;
+                // Core's `MaybeDisconnectForTxRelayCapacity` before its
+                // `verack` (v32.1 `net_processing.cpp:4002`): past the
+                // inbound tx-relay cap, another tx-relaying inbound peer
+                // makes room for this one, or this one goes.
+                if tx_relay_requested && !self.evict_tx_peer_if_full(Some(id)) {
+                    tracing::debug!(
+                        "failed to find a tx-relaying eviction candidate - connection dropped after version message, peer={id}"
+                    );
+                    return Err("no tx-relaying inbound peer to evict".to_string());
+                }
                 conn.send(NetworkMessage::Verack)
                     .await
                     .map_err(|e| format!("send verack: {}", e))?;
@@ -20271,7 +20491,9 @@ mod tests {
         let addr: SocketAddr = "10.0.0.1:8333".parse().unwrap();
         let (h, mut rx) = mk_handle_rx(1, addr, PeerState::Connected, 0);
         pm.peers.write().insert(1, h);
-        // We asked this peer for high-bandwidth relay, so its push is taken.
+        // The peer speaks BIP 152 version 2, and we asked it for
+        // high-bandwidth relay, so its push is taken.
+        pm.peers.write().get_mut(&1).unwrap().info.compact_blocks = true;
         pm.peers.write().get_mut(&1).unwrap().info.hb_to = true;
 
         let compact = bitcoin::bip152::HeaderAndShortIds::from_block(&block, 42, 2, &[])
@@ -21009,6 +21231,28 @@ mod tests {
         let b2 = coinbase_only_child(&f.tip, 2);
         deliver(&f.pm, 1, NetworkMessage::Headers(vec![b2.header]));
         assert_eq!(block_requests(&drain(&mut f.rx), b2.block_hash()), vec![false]);
+    }
+
+    /// Core's `m_provides_cmpctblocks` on receipt (v32.1
+    /// `net_processing.cpp:4795-4802`): a `cmpctblock` from a peer that never
+    /// sent a version-2 `sendcmpct` is ignored, its header included. Once the
+    /// same peer sends `sendcmpct(0, 2)`, the same `cmpctblock` is taken.
+    #[test]
+    fn a_cmpctblock_from_a_peer_without_version_two_sendcmpct_is_ignored() {
+        use bitcoin::p2p::message_compact_blocks::SendCmpct;
+        let mut f = compact_fetch_fixture_with(crate::time::now_secs() as u32, 1);
+        let b2 = coinbase_only_child(&f.tip, 2);
+        let h2 = b2.block_hash();
+        let tip = f.pm.chain_state.tip_hash();
+
+        deliver(&f.pm, 1, cmpctblock_of(&b2));
+        assert!(f.pm.chain_state.get_block_index(&h2).is_none(), "no header row");
+        assert_eq!(f.pm.chain_state.tip_hash(), tip);
+        assert!(drain(&mut f.rx).is_empty(), "nothing asked of the peer");
+
+        deliver(&f.pm, 1, NetworkMessage::SendCmpct(SendCmpct { send_compact: false, version: 2 }));
+        deliver(&f.pm, 1, cmpctblock_of(&b2));
+        assert!(f.pm.chain_state.get_block_index(&h2).is_some(), "a negotiated peer's header is taken");
     }
 
     /// Core's `!m_opts.ignore_incoming_txs`: under `-blocksonly` the mempool

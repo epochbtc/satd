@@ -106,6 +106,11 @@ by version order.
    reordered argument would otherwise bind values to the wrong positions
    silently.
 5. One PR, separate from any flip.
+6. **Moving to v33 or later:** delete `link_custom_signet_cookie` (job 5) from
+   `shims/bitcoind`, and its case in `tests/test_shim_bitcoind.sh`. It is a
+   temporary bridge: satd keeps a custom signet's data in
+   `signet_<message start>/` as Core does from v33 (bitcoin/bitcoin#34566,
+   satd #1271), and v32.1's framework still reads the cookie from `signet/`.
 
 ## Blockers
 

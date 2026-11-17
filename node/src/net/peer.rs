@@ -336,6 +336,15 @@ pub struct PeerInfo {
     /// at least our tip's work: Core's `m_chain_sync.m_protect`. Such a peer
     /// is never disconnected as a surplus outbound peer.
     pub chain_sync_protect: bool,
+    /// The peer's `version` asked for transaction relay on a link that
+    /// carries it: Core's `CNode::m_relays_txs`, set before our `verack`.
+    /// What the inbound transaction-relay cap counts
+    /// (`PeerManager::evict_tx_peer_if_full`).
+    pub tx_relay_requested: bool,
+    /// The peer's `version` offered every service we want from a peer:
+    /// Core's `CNode::m_has_all_wanted_services`, an inbound eviction
+    /// protection.
+    pub has_all_wanted_services: bool,
 }
 
 /// Render a per-message-type byte tally as `getpeerinfo` reports it.
@@ -392,6 +401,8 @@ impl PeerInfo {
             },
             last_block_announcement: 0,
             chain_sync_protect: false,
+            tx_relay_requested: false,
+            has_all_wanted_services: false,
         }
     }
 

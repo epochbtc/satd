@@ -174,7 +174,7 @@ These flags bound or accelerate IBD. Full defaults and semantics are in the
 
 | Flag | Default | Notes |
 |---|---|---|
-| `-dbcache=<MB\|auto>` | 450 | Write-cache size. `auto` (satd) starts a controller that resizes the RocksDB block cache and CoinCache against `/proc/meminfo` pressure. Core's `-dbcache` is a static number only. |
+| `-dbcache=<MB\|auto>` | 450 | Write-cache size. `auto` (satd) starts a controller that resizes the RocksDB block cache and CoinCache against `/proc/meminfo` pressure, clamped to the node's memory cgroup limit. Core's `-dbcache` is a static number only. |
 | `-par=<n>` | unset | Script-verification threads (Core name). satd's connect path manages its own parallelism, so `-par` does not size it directly. When `-shadowworkers` is unset, a positive `-par` value is used as the shadow-verification worker count; otherwise the default of 4 applies. |
 | `-prefetchworkers=<n>` | CPU cores | (satd) IBD block-prefetch worker threads. |
 | `-maxahead=<n\|N%\|all>` | 50000 | (satd) How many blocks IBD may stage ahead of the connect tip. |
@@ -310,6 +310,9 @@ makes them easy to miss when they are the tool you need.
 
 Invalidating drives a reorg away from the named block and everything descended
 from it. `reconsiderblock` clears the mark and re-activates the best chain.
+Either way, a block on the best remaining chain that fails validation is
+marked invalid with its descendants, and the next-best chain is tried, until
+one connects or none is left that beats the current tip.
 
 ### Startup integrity checks
 

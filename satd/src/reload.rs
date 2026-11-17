@@ -813,6 +813,9 @@ fn field_specs() -> Vec<FieldSpec> {
         live!("maxinboundperip", maxinboundperip, |c, h| {
             h.peer_manager.set_max_inbound_per_ip(c.maxinboundperip)
         }),
+        live!("inboundrelaypercent", inboundrelaypercent, |c, h| {
+            h.peer_manager.set_inbound_relay_percent(c.inboundrelaypercent)
+        }),
         // Sizes a ring the peer manager allocates once; a resize would have to
         // decide which of the kept transactions to drop.
         restart!("blockreconstructionextratxn", blockreconstructionextratxn),
