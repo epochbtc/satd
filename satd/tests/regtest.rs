@@ -4392,6 +4392,23 @@ fn test_getchaintxstats() {
     assert_eq!(result["window_tx_count"].as_u64().unwrap(), 3);
     assert_eq!(result["window_final_block_height"].as_u64().unwrap(), 5);
 
+    // No argument: Core's one-month default, clamped to height - 1 = 4.
+    let response = node.rpc_call("getchaintxstats").unwrap();
+    let result = &response["result"];
+    assert_eq!(result["window_block_count"], 4, "{response}");
+    assert_eq!(result["window_tx_count"], 4, "{response}");
+
+    // nblocks = 0: Core returns the totals and leaves out the window fields.
+    let response = node
+        .rpc_call_with_params("getchaintxstats", vec![serde_json::json!(0)])
+        .unwrap();
+    let result = &response["result"];
+    assert_eq!(result["window_block_count"], 0, "{response}");
+    assert_eq!(result["txcount"], 6, "{response}");
+    for key in ["window_interval", "window_tx_count", "txrate"] {
+        assert!(result.get(key).is_none(), "{key} with nblocks=0: {response}");
+    }
+
     // Core's optional `blockhash` arg selects the window's final block.
     // Cumulative through height 3 = genesis + 3 coinbases = 4.
     let h3 = node

@@ -15706,12 +15706,14 @@ pub(crate) mod tests {
         let (cs, dir, hashes) = chain_state_with_seeded_chain(&[1, 2, 3, 4]);
         cs.backfill_chain_tx_counts().unwrap();
 
-        // Default (tip): cumulative through height 3 = 10; window of 30 is
-        // clamped to height 3 → window sums heights 1..=3 = 2+3+4 = 9.
+        // Default (tip): cumulative through height 3 = 10; the one-month
+        // window is clamped to height - 1 = 2 → window sums heights 2..=3 =
+        // 3+4 = 7.
         let tip_stats =
             crate::rpc::blockchain::get_chain_tx_stats(&cs, None, None).unwrap();
         assert_eq!(tip_stats["txcount"], 10);
-        assert_eq!(tip_stats["window_tx_count"], 9);
+        assert_eq!(tip_stats["window_block_count"], 2);
+        assert_eq!(tip_stats["window_tx_count"], 7);
         assert_eq!(tip_stats["window_final_block_height"], 3);
 
         // Explicit historical blockhash (height 2): cumulative = 6, window
@@ -15845,22 +15847,66 @@ pub(crate) mod tests {
         let (cs, dir, _hashes) = chain_state_with_seeded_chain(&[1u32; 13]);
         cs.backfill_chain_tx_counts().unwrap();
 
-        // Default window = min(30, 12) = 12 → start at genesis (height 0).
+        // Default window = min(4320, 12 - 1) = 11 → start at height 1.
         //   MTP(tip=12)   = median of heights [2..=12] = ts[7] = T + 4200
-        //   MTP(start=0)  = median of heights [0..=0]  = ts[0] = T
-        //   window_interval = 4200   (raw header diff would be 12*600 = 7200)
+        //   MTP(start=1)  = median of heights [0..=1]  = ts[1] = T + 600
+        //   window_interval = 3600   (raw header diff would be 11*600 = 6600)
         let stats = crate::rpc::blockchain::get_chain_tx_stats(&cs, None, None).unwrap();
         assert_eq!(stats["window_final_block_height"], 12);
-        assert_eq!(stats["window_interval"].as_u64().unwrap(), 4200);
+        assert_eq!(stats["window_block_count"], 11);
+        assert_eq!(stats["window_interval"].as_u64().unwrap(), 3600);
         assert_ne!(
             stats["window_interval"].as_u64().unwrap(),
-            7200,
+            6600,
             "window_interval must be the MTP difference, not the raw header-time difference"
         );
-        // window_tx_count = cum[12] - cum[0] = 13 - 1 = 12; txrate over MTP interval.
-        assert_eq!(stats["window_tx_count"].as_u64().unwrap(), 12);
+        // window_tx_count = cum[12] - cum[1] = 13 - 2 = 11; txrate over MTP interval.
+        assert_eq!(stats["window_tx_count"].as_u64().unwrap(), 11);
         let txrate = stats["txrate"].as_f64().unwrap();
-        assert!((txrate - 12.0 / 4200.0).abs() < 1e-12, "txrate {txrate}");
+        assert!((txrate - 11.0 / 3600.0).abs() < 1e-12, "txrate {txrate}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn getchaintxstats_default_window_is_one_month_and_zero_is_accepted() {
+        // Core's default is `30 * 24 * 60 * 60 / nPowTargetSpacing` = 4320
+        // blocks, clamped to the final block's height - 1, and an explicit
+        // 0 returns the totals without the window fields
+        // (src/rpc/blockchain.cpp, getchaintxstats).
+        let (cs, dir, hashes) = chain_state_with_seeded_chain(&[1u32; 4401]);
+        cs.backfill_chain_tx_counts().unwrap();
+        let stats = |n: Option<i32>, at: Option<BlockHash>| {
+            crate::rpc::blockchain::get_chain_tx_stats(&cs, n, at).unwrap()
+        };
+
+        // Tip at 4400: a full month.
+        let tip = stats(None, None);
+        assert_eq!(tip["window_block_count"], 4320);
+        assert_eq!(tip["window_tx_count"], 4320);
+        // Header times are 600 s apart, so both MTPs sit five blocks back.
+        assert_eq!(tip["window_interval"], 4320 * 600);
+
+        // The clamp: final block 4321 is the last whose month fits whole,
+        // final block 4320 gets 4319.
+        assert_eq!(stats(None, Some(hashes[4321]))["window_block_count"], 4320);
+        assert_eq!(stats(None, Some(hashes[4320]))["window_block_count"], 4319);
+        // Heights 1 and 0: max(0, min(4320, height - 1)) = 0.
+        for h in [0usize, 1] {
+            let s = stats(None, Some(hashes[h]));
+            assert_eq!(s["window_block_count"], 0, "height {h}: {s}");
+            assert!(s.get("window_interval").is_none(), "height {h}: {s}");
+        }
+
+        // Explicit 0: totals, no window fields.
+        let zero = stats(Some(0), None);
+        assert_eq!(zero["window_block_count"], 0);
+        assert_eq!(zero["txcount"], 4401);
+        assert_eq!(zero["window_final_block_height"], 4400);
+        for key in ["window_interval", "window_tx_count", "txrate"] {
+            assert!(zero.get(key).is_none(), "{key} with nblocks=0: {zero}");
+        }
+        // Explicit 0 at genesis is accepted too.
+        assert_eq!(stats(Some(0), Some(hashes[0]))["window_block_count"], 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

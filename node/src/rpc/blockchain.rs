@@ -1675,6 +1675,12 @@ pub fn get_chain_tips(chain_state: &ChainState) -> Value {
 pub const INVALID_BLOCK_COUNT: &str =
     "Invalid block count: should be between 0 and the block's height - 1";
 
+/// Core's default `getchaintxstats` window, one month of blocks:
+/// `30 * 24 * 60 * 60 / nPowTargetSpacing` (src/rpc/blockchain.cpp,
+/// getchaintxstats). Every network satd serves has a 600 s target spacing,
+/// so this is 4320.
+pub const DEFAULT_CHAIN_TX_STATS_WINDOW: u32 = 30 * 24 * 60 * 60 / 600;
+
 pub fn get_chain_tx_stats(
     chain_state: &ChainState,
     nblocks: Option<i32>,
@@ -1705,16 +1711,35 @@ pub fn get_chain_tx_stats(
     let final_height = final_entry.height;
 
     // Core refuses an explicit count below 0, or above 0 and at least the
-    // final block's height, rather than clamping it.
+    // final block's height, rather than clamping it. An explicit 0 is
+    // accepted. The default is one month of blocks, clamped to the final
+    // block's height - 1 (`std::max(0, std::min(blockcount, nHeight - 1))`).
     let window = match nblocks {
         Some(n) if n < 0 || (n > 0 && n as u32 >= final_height) => {
             return Err(INVALID_BLOCK_COUNT.to_string());
         }
         Some(n) => n as u32,
-        None => 30.min(final_height),
+        None => DEFAULT_CHAIN_TX_STATS_WINDOW.min(final_height.saturating_sub(1)),
     };
+    let final_cum = chain_state.cumulative_tx_count(&final_hash);
+
+    let mut obj = serde_json::Map::new();
+    obj.insert("time".to_string(), json!(final_entry.header.time));
+    if let Some(txcount) = final_cum {
+        obj.insert("txcount".to_string(), json!(txcount));
+    }
+    obj.insert(
+        "window_final_block_hash".to_string(),
+        json!(final_hash.to_string()),
+    );
+    obj.insert(
+        "window_final_block_height".to_string(),
+        json!(final_height),
+    );
+    obj.insert("window_block_count".to_string(), json!(window));
+    // Core emits the window fields only when `blockcount > 0`.
     if window == 0 {
-        return Err("Window must be > 0".to_string());
+        return Ok(Value::Object(obj));
     }
     let start_height = final_height - window;
 
@@ -1725,7 +1750,12 @@ pub fn get_chain_tx_stats(
     // height-index pollution — unlike `get_block_hash_by_height` /
     // `get_median_time_past`, which read that index. We descend to the lowest
     // height either MTP window touches.
+    // Only the eleven heights under each endpoint are kept: the default window
+    // walks a month of blocks.
     let mtp_lowest = start_height.saturating_sub(10);
+    let in_mtp_window = |hh: u32| {
+        hh + 10 >= final_height || (hh <= start_height && hh + 10 >= start_height)
+    };
     let mut ts_by_height: std::collections::HashMap<u32, u32> =
         std::collections::HashMap::new();
     ts_by_height.insert(final_height, final_entry.header.time);
@@ -1737,7 +1767,9 @@ pub fn get_chain_tx_stats(
         let entry = chain_state
             .get_block_index(&cur)
             .ok_or("Block index entry missing while walking the active chain")?;
-        ts_by_height.insert(h, entry.header.time);
+        if in_mtp_window(h) {
+            ts_by_height.insert(h, entry.header.time);
+        }
         if h == start_height {
             start_hash = Some(cur);
         }
@@ -1770,23 +1802,7 @@ pub fn get_chain_tx_stats(
     //   * `txrate`          — omitted unless `window_tx_count` is present and the
     //                         interval (MTP difference, computed above) is positive.
     // `window_interval` is always emitted here (window > 0).
-    let final_cum = chain_state.cumulative_tx_count(&final_hash);
     let start_cum = chain_state.cumulative_tx_count(&start_hash);
-
-    let mut obj = serde_json::Map::new();
-    obj.insert("time".to_string(), json!(final_entry.header.time));
-    if let Some(txcount) = final_cum {
-        obj.insert("txcount".to_string(), json!(txcount));
-    }
-    obj.insert(
-        "window_final_block_hash".to_string(),
-        json!(final_hash.to_string()),
-    );
-    obj.insert(
-        "window_final_block_height".to_string(),
-        json!(final_height),
-    );
-    obj.insert("window_block_count".to_string(), json!(window));
     obj.insert("window_interval".to_string(), json!(time_diff));
     if let (Some(fc), Some(sc)) = (final_cum, start_cum) {
         let window_tx_count = fc.saturating_sub(sc);
