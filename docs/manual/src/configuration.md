@@ -112,8 +112,37 @@ sat-cli -datadir=/path/to/datadir getblockcount
   directory. satd writes no cookie when `rpcuser` and `rpcpassword` are both
   set, so this is how `sat-cli` reaches such a node. With `-rpcwait`, a
   cookie that does not exist yet is read again until the node writes it.
+  `-stdinrpcpass` reads the password from the first line of standard input
+  instead, ahead of any `-stdin` arguments, and overrides `rpcpassword`.
 - **`-generate`** is refused: it mines to a wallet address in `bitcoin-cli`,
   and satd has no wallet. Use `generatetoaddress` or `generatetodescriptor`.
+
+### How `sat-cli` reads RPC arguments
+
+A raw call (`sat-cli <method> [args...]`) converts its arguments the way
+`bitcoin-cli` does. An argument is parsed as JSON only when Bitcoin Core's
+conversion table (`vRPCConvertParams`, carried from Core v32.1) lists it for
+that method, and every other argument is sent as the string typed:
+`sat-cli signmessagewithprivkey <key> 123` signs the text `123`, and
+`sat-cli decodescript 5151` sends the hex as a string. A listed argument that
+is not valid JSON is refused with `error: Error parsing JSON: <arg>`. Quote
+JSON for the shell: `sat-cli logging '["net"]' '[]'`.
+
+satd's own RPCs have rows of their own for their numeric, boolean, array and
+object arguments (`getreorghistory 3600`, `listquarantine <rule> 10 0`,
+`estimatefees '[1,6]'`). A method `sat-cli` does not know at all, such as one
+added to a newer node, falls back to the guess earlier versions made for
+every method: each argument is parsed as JSON if it can be, else sent as a
+string.
+
+With `-named`, `name=value` arguments are converted by the same table, by
+name, and arguments without `=` go, in order, into the `args` array. As in
+`bitcoin-cli`, a `name=value` whose name the method does not declare is taken
+whole as the next positional argument when that slot takes a string, so in
+`sat-cli -named verifybip322 <address> <base64-signature> message=hi` a
+signature ending in `=` stays the signature. `-stdin`
+appends each line of standard input as one more argument, empty lines
+included.
 
 ## Live Config Reload (`SIGHUP`)
 

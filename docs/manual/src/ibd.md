@@ -310,6 +310,9 @@ makes them easy to miss when they are the tool you need.
 
 Invalidating drives a reorg away from the named block and everything descended
 from it. `reconsiderblock` clears the mark and re-activates the best chain.
+Either way, a block on the best remaining chain that fails validation is
+marked invalid with its descendants, and the next-best chain is tried, until
+one connects or none is left that beats the current tip.
 
 ### Startup integrity checks
 

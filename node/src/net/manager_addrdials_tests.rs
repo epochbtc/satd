@@ -609,14 +609,17 @@ fn setban_of_an_onion_host_disconnects_that_peer_only() {
 #[test]
 fn a_full_book_replaces_a_terrible_entry() {
     let (pm, _dir) = mk_pm();
-    let source = IpAddr::from([198, 51, 100, 1]);
     let full = crate::net::addrman::MAX_ENTRIES;
-    // 64 per /16, across enough groups to fill the book.
+    // 64 per /16, across enough groups to fill the book, and each source's
+    // share (#1264) from a /16 of its own.
     let addr_at = |i: usize| SocketAddr::from(([11 + (i / 64 / 256) as u8, ((i / 64) % 256) as u8, 1, (i % 64) as u8 + 1], 8333));
+    let share = crate::net::addrman::MAX_NEW_PER_SOURCE_GROUP;
     for i in 0..full {
-        pm.add_learned_addr_from(addr_at(i), 9, source);
+        pm.add_learned_addr_from(addr_at(i), 9, IpAddr::from([150 + (i / share) as u8, 1, 1, 1]));
     }
     assert_eq!(pm.addrman.read().len(), full, "fixture: the book is full");
+    // A source with nothing in the book: only the book's cap holds it back.
+    let source = IpAddr::from([203, 0, 113, 1]);
 
     let fresh = SocketAddr::from(([99, 1, 1, 1], 8333));
     pm.add_learned_addr_from(fresh, 9, source);
