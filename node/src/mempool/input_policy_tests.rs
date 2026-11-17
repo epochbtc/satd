@@ -109,6 +109,8 @@ fn multisig_counts_up_to_twenty_are_core_multisig() {
         (multisig(&[0x51], 17, &[0x01, 0x12]), "18 keys claimed, 17 given"),
         (multisig(&[0x01, 0x12], 17, &[0x01, 0x11]), "18 required of 17"),
         (multisig(&[0x00], 1, &[0x51]), "0 required"),
+        (multisig(&[0x01, 0x00], 1, &[0x51]), "0 required, pushed as one byte"),
+        (multisig(&[0x51], 1, &[0x01, 0x80]), "negative zero keys"),
     ] {
         assert_eq!(spends(bad), Err("input 0 script unknown".to_string()), "{why}");
     }
@@ -190,6 +192,19 @@ fn the_legacy_sigops_of_all_inputs_are_capped_at_2500() {
     };
     assert_eq!(spend(166), Ok(()));
     assert_eq!(spend(167), Err("non-witness sigops exceed bip54 limit".to_string()));
+}
+
+/// The limit itself is allowed, as in Core (`sigops > MAX_TX_LEGACY_SIGOPS`):
+/// 166 inputs of 15 and one of 10 come to exactly 2500.
+#[test]
+fn the_legacy_sigop_limit_admits_exactly_2500() {
+    let fifteen = checksigs(15);
+    let ten = checksigs(10);
+    let mut redeems: Vec<&[u8]> = vec![&fifteen[..]; 166];
+    redeems.push(&ten[..]);
+    let t = tx(redeems.iter().map(|r| (push(r), Witness::new())).collect());
+    let prevouts: Vec<_> = redeems.iter().map(|r| out(p2sh_of(r))).collect();
+    assert_eq!(validate_inputs_standardness(&t, &prevouts), Ok(()));
 }
 
 fn witness(items: &[&[u8]]) -> Witness {

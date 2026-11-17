@@ -326,6 +326,18 @@ mod tests {
         order.iter().map(|&i| g.txids[i].to_byte_array()[0]).collect()
     }
 
+    /// A cluster past the bitset limit, which only a reorg leaves, is laid
+    /// out topologically: every transaction listed, each after its parent.
+    #[test]
+    fn mining_order_keeps_every_transaction_of_a_cluster_past_sixty_four() {
+        let parents: Vec<[u8; 1]> = (1..=70u8).map(|n| [n - 1]).collect();
+        let txs: Vec<(u8, i64, i64, &[u8])> =
+            (1..=70u8).map(|n| (n, 100, 100, if n == 1 { &[][..] } else { &parents[usize::from(n) - 1][..] })).collect();
+        let g = graph(&txs);
+        assert!(g.txids.len() > MAX_CHUNKED_CLUSTER);
+        assert_eq!(ids(&g, &mining_order(&g)), (1..=70u8).collect::<Vec<_>>());
+    }
+
     /// A child that pays for its parent is mined with it, ahead of a
     /// transaction that pays more than the parent alone.
     #[test]

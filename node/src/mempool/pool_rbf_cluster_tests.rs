@@ -206,3 +206,123 @@ fn a_fee_bump_that_reorders_a_cluster_is_accepted() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Rule 5 on a single transaction: a replacement may evict 100 clusters and
+/// not 101 (Core's `num_clusters > MAX_REPLACEMENT_CANDIDATES`).
+#[test]
+fn a_replacement_of_101_clusters_is_refused_and_of_100_is_not() {
+    let tags: Vec<u8> = (1..=101).collect();
+    let (cs, mp, dir) = env(&tags);
+    for &t in &tags {
+        accept(&mp, &cs, &spend(&[prev(t)], COIN_VALUE, 1_000, 1, t)).expect("one cluster per coin");
+    }
+    let coins: Vec<OutPoint> = tags.iter().map(|&t| prev(t)).collect();
+    let before = pool(&mp);
+
+    let all = spend(&coins, 101 * COIN_VALUE, 200_000, 1, 200);
+    let verdict = accept(&mp, &cs, &all);
+    assert!(
+        matches!(verdict, Err(MempoolError::TooManyReplacements(ref d)) if d.ends_with("too many conflicting clusters (101 > 100)")),
+        "{verdict:?}"
+    );
+    assert_eq!(pool(&mp), before);
+
+    let hundred = spend(&coins[..100], 100 * COIN_VALUE, 200_000, 1, 201);
+    let r = accept(&mp, &cs, &hundred).expect("100 clusters may be replaced");
+    let last = spend(&[prev(101)], COIN_VALUE, 1_000, 1, 101).compute_txid();
+    assert_eq!(pool(&mp), HashSet::from([r, last]));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A conflict whose parent has another child sits in a cluster of three,
+/// which the pair diagrams cannot describe (Core's `CheckConflictTopology`),
+/// so the replacement is judged on the cluster. There it gives up the
+/// conflict's 10 sat/vB for 7.5 and is refused. Paired with the parent alone,
+/// as the pair diagrams would, it looked better.
+#[test]
+fn a_conflict_whose_parent_has_another_child_is_judged_on_the_cluster() {
+    let (cs, mp, dir) = env(&[1, 2]);
+    let parent = sized(spend(&[prev(1)], COIN_VALUE, 210, 2, 1), 210);
+    let p = accept(&mp, &cs, &parent).expect("a cheap parent");
+    let rich = sized(spend(&[out(p, 0)], parent.output[0].value.to_sat(), 5_000, 1, 2), 100);
+    accept(&mp, &cs, &rich).expect("a rich child");
+    let conflict_in = parent.output[1].value.to_sat() + COIN_VALUE;
+    let conflict = sized(spend(&[out(p, 1), prev(2)], conflict_in, 2_000, 1, 3), 200);
+    accept(&mp, &cs, &conflict).expect("a child that also spends a confirmed coin");
+
+    // Spends only the confirmed coin, so it leaves the parent behind.
+    let replacement = sized(spend(&[prev(2)], COIN_VALUE, 2_250, 1, 4), 300);
+    assert!(rate(&replacement, 2_250) < rate(&conflict, 2_000));
+    let with_parent = policy::fee_rate_sat_per_kvb(2_210, parent.weight().to_wu() + conflict.weight().to_wu());
+    assert!(rate(&replacement, 2_250) > with_parent, "fixture: it beats the conflict paired with its parent");
+    let before = pool(&mp);
+    let verdict = accept(&mp, &cs, &replacement);
+    assert!(
+        matches!(verdict, Err(MempoolError::DoesNotImproveFeerateDiagram(ref d)) if d.contains("does not improve")),
+        "{verdict:?}"
+    );
+    assert_eq!(pool(&mp), before);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A cluster of exactly 64, the cluster limit, is still linearized before
+/// and after: a leaf replacement paying more at the same size improves it.
+/// The per-conflict rule kept for larger clusters would have weighed the
+/// replacement with its 1 sat/vB parent against the conflict alone, and
+/// refused it.
+#[test]
+fn a_leaf_replacement_in_a_sixty_four_transaction_cluster_uses_the_diagram() {
+    let (cs, mp, dir) = env(&[1]);
+    let parent = spend(&[prev(1)], COIN_VALUE, 2_000, 63, 1);
+    let p = accept(&mp, &cs, &parent).expect("a parent of 63 outputs");
+    let child = |vout: u32, fee: u64, tag: u8| spend(&[out(p, vout)], parent.output[vout as usize].value.to_sat(), fee, 1, tag);
+    for vout in 0..63 {
+        accept(&mp, &cs, &child(vout, 1_000, 2)).expect("a child");
+    }
+    let before = pool(&mp);
+    assert_eq!(before.len(), crate::mempool::feefrac::MAX_CHUNKED_CLUSTER);
+    let conflict = child(5, 1_000, 2);
+
+    let replacement = child(5, 1_100, 3);
+    let with_parent = policy::fee_rate_sat_per_kvb(3_100, parent.weight().to_wu() + replacement.weight().to_wu());
+    assert!(with_parent < rate(&conflict, 1_000), "fixture: the per-conflict rule refuses it");
+    let r = accept(&mp, &cs, &replacement).expect("the cluster's diagram improves");
+    let mut after = before;
+    after.remove(&conflict.compute_txid());
+    after.insert(r);
+    assert_eq!(pool(&mp), after);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The replacement goes into the old order after every parent it spends,
+/// wherever the conflict sat. Here the conflict follows the root and the
+/// replacement's other parent is two places later; put ahead of that cheap,
+/// heavy parent, the replacement would chunk without it and look like an
+/// improvement it is not.
+#[test]
+fn a_replacement_whose_parent_follows_the_conflict_is_placed_after_it() {
+    let (cs, mp, dir) = env(&[1]);
+    let root = sized(spend(&[prev(1)], COIN_VALUE, 210, 2, 1), 210);
+    let g = accept(&mp, &cs, &root).expect("root");
+    let conflict = sized(spend(&[out(g, 0)], root.output[0].value.to_sat(), 5_000, 1, 2), 100);
+    accept(&mp, &cs, &conflict).expect("a rich child of the root");
+    let middle = sized(spend(&[out(g, 1)], root.output[1].value.to_sat(), 100, 1, 3), 100);
+    let a = accept(&mp, &cs, &middle).expect("a cheap child of the root");
+    let heavy = sized(spend(&[out(a, 0)], middle.output[0].value.to_sat(), 0, 1, 4), 1_000);
+    let h = accept(&mp, &cs, &heavy).expect("a heavy, free grandchild");
+
+    let r_in = root.output[0].value.to_sat() + heavy.output[0].value.to_sat();
+    let replacement = sized(spend(&[out(g, 0), out(h, 0)], r_in, 10_000, 1, 5), 200);
+    let before = pool(&mp);
+    let verdict = accept(&mp, &cs, &replacement);
+    assert!(
+        matches!(verdict, Err(MempoolError::DoesNotImproveFeerateDiagram(ref d)) if d.contains("does not improve")),
+        "{verdict:?}"
+    );
+    assert_eq!(pool(&mp), before);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

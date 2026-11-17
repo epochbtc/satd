@@ -162,6 +162,24 @@ fn the_cluster_limits_cover_the_package() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The cluster size limit holds over the package too: two members that each
+/// fit refuse together when their vsizes add up past it.
+#[test]
+fn the_cluster_vsize_limit_covers_the_package() {
+    let (cs, mp, dir) = env(&[1]);
+    let parent = spend(&[prev(1)], COIN_VALUE, 1_000, 1, 1);
+    let child = spend(&[out(parent.compute_txid(), 0)], parent.output[0].value.to_sat(), 1_000, 1, 2);
+    let vsize = |tx: &Transaction| policy::weight_to_vsize(tx.weight().to_wu());
+    let (each, both) = (vsize(&parent).max(vsize(&child)), vsize(&parent) + vsize(&child));
+    mp.config.write().max_cluster_vsize = both - 1;
+    assert!(each < both - 1, "fixture: each member fits alone");
+    assert_eq!(test(&mp, &cs, &[&parent, &child]).package_error.as_deref(), Some("too-large-cluster"));
+    mp.config.write().max_cluster_vsize = both;
+    assert_eq!(test(&mp, &cs, &[&parent, &child]).package_error, None);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A child must spend every dust output of a parent in the package.
 #[test]
 fn a_child_must_spend_its_parents_dust() {

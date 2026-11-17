@@ -184,6 +184,34 @@ fn a_truc_transaction_has_at_most_one_unconfirmed_ancestor() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Two unconfirmed parents are too many even when neither has a parent of
+/// its own: the parent count alone refuses it, as Core's
+/// `mempool_parents.size() + 1 > TRUC_ANCESTOR_LIMIT` does.
+#[test]
+fn a_truc_child_of_two_lone_mempool_parents_is_refused() {
+    let (cs, mp, dir) = env(&[1, 2]);
+    let parent = v3(spend(&[prev(1)], COIN_VALUE, 1_000, 1, 1));
+    let other = v3(spend(&[prev(2)], COIN_VALUE, 1_000, 1, 2));
+    for tx in [&parent, &other] {
+        accept(&mp, &cs, tx).expect("admitted");
+    }
+
+    let child = v3(spend(
+        &[out(parent.compute_txid(), 0), out(other.compute_txid(), 0)],
+        2 * (COIN_VALUE - 1_000),
+        1_000,
+        1,
+        3,
+    ));
+    assert_eq!(
+        refusal(&mp, &cs, &child),
+        format!("TRUC-violation, tx {} would have too many ancestors", id(&child))
+    );
+    assert_eq!(pool(&mp), txids(&[&parent, &other]));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A second child of a TRUC parent that pays enough evicts the first under
 /// the replacement rules, with no input in common.
 #[test]
@@ -207,6 +235,26 @@ fn a_second_truc_child_evicts_its_sibling_when_it_pays_more() {
         })
         .collect();
     assert_eq!(replaced, vec![(first.compute_txid(), second.compute_txid())]);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A sibling that spends two of the parent's outputs is still the parent's
+/// one descendant, and still evictable: Core offers sibling eviction when
+/// `GetDescendantCount(parent) == 2`, which counts transactions, not spends.
+#[test]
+fn a_sibling_spending_two_of_the_parents_outputs_can_still_be_evicted() {
+    let (cs, mp, dir) = env(&[1]);
+    let parent = v3(spend(&[prev(1)], COIN_VALUE, 1_000, 3, 1));
+    let third = parent.output[2].value.to_sat();
+    let first = v3(spend(&[out(parent.compute_txid(), 0), out(parent.compute_txid(), 1)], 2 * third, 1_000, 1, 2));
+    let second = v3(spend(&[out(parent.compute_txid(), 2)], third, 3_000, 1, 3));
+    for tx in [&parent, &first] {
+        accept(&mp, &cs, tx).expect("admitted");
+    }
+
+    accept(&mp, &cs, &second).expect("the sibling is evicted");
+    assert_eq!(pool(&mp), txids(&[&parent, &second]));
 
     let _ = std::fs::remove_dir_all(&dir);
 }

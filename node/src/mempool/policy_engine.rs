@@ -448,6 +448,26 @@ mod tests {
         assert_eq!(classify_script(&spk(vec![0x51, 0x02, 0x00, 0x00])), ScriptType::WitnessUnknown);
     }
 
+    /// `out.is_dust` judges at `-dustrelayfee`, and at the default rate when
+    /// that is 0, so a rule can still ask for dust with the relay check off.
+    #[test]
+    fn out_is_dust_falls_back_to_the_default_rate_when_dustrelayfee_is_zero() {
+        let mut p2wpkh = vec![0x00, 0x14];
+        p2wpkh.extend_from_slice(&[0u8; 20]);
+        let p2wpkh = spk(p2wpkh);
+        let at = |rate: u64| policy::dust_threshold_with_rate(&p2wpkh, rate);
+        let output = |value: u64| TxOut { value: bitcoin::Amount::from_sat(value), script_pubkey: p2wpkh.clone() };
+        let mut cfg = MempoolConfig { dust_relay_fee: 0, ..Default::default() };
+        assert!(output_is_dust(&output(at(policy::DUST_RELAY_FEE_RATE) - 1), &cfg));
+        assert!(!output_is_dust(&output(at(policy::DUST_RELAY_FEE_RATE)), &cfg));
+
+        // Set, the configured rate is the one used.
+        cfg.dust_relay_fee = 2 * policy::DUST_RELAY_FEE_RATE;
+        assert!(at(2 * policy::DUST_RELAY_FEE_RATE) > at(policy::DUST_RELAY_FEE_RATE));
+        assert!(output_is_dust(&output(at(policy::DUST_RELAY_FEE_RATE)), &cfg));
+        assert!(!output_is_dust(&output(at(2 * policy::DUST_RELAY_FEE_RATE)), &cfg));
+    }
+
     #[test]
     fn op_return_payload_excludes_opcode_overhead() {
         // OP_RETURN OP_PUSHBYTES_3 0xaabbcc ⇒ payload is 3 bytes, not 5.
