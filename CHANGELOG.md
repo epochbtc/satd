@@ -30,6 +30,7 @@ It includes every fix shipped in 0.7.1:
 - RPC: `warnings` in `getblockchaininfo`, `getnetworkinfo` and `getmininginfo` is always an array, `[]` when empty, as in Core v28; `-deprecatedrpc=warnings` brings back the string form (#956).
 - Chain: the node leaves initial block download only once its tip has the network's minimum chain work as well as a recent timestamp, and does not re-enter it when the tip goes stale, as in Core (#1071).
 - Mempool: a transaction version below 1 or above 3 is non-standard, reason `version`, as in Core (#1070).
+- Mining: block templates keep a `prioritisetransaction` delta below a transaction's fee as a negative modified fee, as in Core; a child that does not cover its parent's delta no longer pulls both in, and a package with a negative modified fee is left out even at `-blockmintxfee=0` (#1274).
 - P2P: the node's own disconnects are no longer logged as `reason="rpc_request"` (#1152).
 - P2P: onion peers are logged by their `.onion` address, not `0.0.0.0` (#1165).
 - P2P: during initial sync, blocks are downloaded no more than `-maxahead` above the tip, so a pruned node prunes during IBD instead of filling its disk (#1154).
