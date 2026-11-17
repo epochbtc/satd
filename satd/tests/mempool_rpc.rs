@@ -345,3 +345,29 @@ fn a_reorg_keeps_a_returned_child_over_cheaper_mempool_spenders() {
 
     node.stop();
 }
+
+/// `version | 00 00 | lock_time` decodes, as Core's `DecodeHexTx` decodes
+/// it, to a transaction with no inputs, and each submission RPC refuses it
+/// as `bad-txns-vin-empty`, not "TX decode failed" (#1242). The answers are a
+/// Core v32.1 regtest node's.
+#[test]
+fn a_transaction_with_no_inputs_is_refused_as_core_refuses_it() {
+    const EMPTY: &str = "02000000000000000000";
+    let node = TestNode::start(&[]);
+    assert_eq!(
+        refused(&node, "sendrawtransaction", vec![json!(EMPTY)]),
+        (-26, "bad-txns-vin-empty".to_string())
+    );
+    let tma = node.rpc_ok("testmempoolaccept", vec![json!([EMPTY])]);
+    assert_eq!(tma[0]["allowed"], json!(false), "{tma}");
+    assert_eq!(tma[0]["reject-reason"], json!("bad-txns-vin-empty"), "{tma}");
+    let decoded = node.rpc_ok("decoderawtransaction", vec![json!(EMPTY)]);
+    assert_eq!(decoded["txid"], json!("4ebd325a4b394cff8c57e8317ccf5a8d0e2bdf1b8526f8aad6c8e43d8240621a"));
+    assert_eq!(decoded["vin"], json!([]));
+
+    // A witness flag with no inputs: Core refuses the bytes.
+    assert_eq!(
+        refused(&node, "sendrawtransaction", vec![json!("020000000001000000000000")]).0,
+        -22
+    );
+}
