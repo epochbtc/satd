@@ -265,6 +265,57 @@ fn a_lower_threshold_extends_the_record() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// Raising the threshold again leaves the record alone. Here a recorded
+/// transaction (tx 1) comes before the first one still eligible (tx 2,
+/// vout 2), so the walk over the record must keep tx 1 as it is rather than
+/// take it for tx 2 and give it tx 2's outputs.
+#[test]
+fn a_higher_threshold_restrip_keeps_the_record() {
+    let (cs, dir) = make_chain_state();
+    let mut parent = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
+    let mut blocks = Vec::new();
+    for h in 1..=101 {
+        let b = build_test_block(parent, h, time(h));
+        connect(&cs, &b);
+        parent = b.block_hash();
+        blocks.push(b);
+    }
+    let b = block_on(
+        parent,
+        102,
+        vec![
+            spend(coinbase_of(&blocks[0]), vec![ScriptBuf::new(), op_return(SMALL, 4)]),
+            spend(
+                coinbase_of(&blocks[1]),
+                vec![ScriptBuf::new(), op_return(SMALL, 5), op_return(BIG, 6)],
+            ),
+        ],
+    );
+    connect(&cs, &b);
+    parent = b.block_hash();
+    for h in 103..=105 {
+        let next = build_test_block(parent, h, time(h));
+        connect(&cs, &next);
+        parent = next.block_hash();
+    }
+    assert!(!cs.is_initial_block_download(), "premise: the fixture is out of IBD");
+    let hash = b.block_hash();
+    cs.strip_block(&hash, SMALL as u64).unwrap();
+    let shape = |rec: &StripRecord| -> Vec<(u32, Vec<u32>)> {
+        rec.txs.iter().map(|t| (t.tx_index, t.outputs.iter().map(|o| o.vout).collect())).collect()
+    };
+    let rec = record(&cs, &hash).unwrap();
+    assert_eq!(shape(&rec), vec![(1, vec![1]), (2, vec![1, 2])], "premise: both recorded");
+
+    match cs.strip_block(&hash, THRESHOLD).unwrap() {
+        StripOutcome::Redone(_) => {}
+        other => panic!("expected a redo, got {other:?}"),
+    }
+    assert_eq!(record(&cs, &hash), Some(rec));
+    assert_reads_as(&cs, &b);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 /// Bytes that do not hash to the header's merkle root are never stripped:
 /// the record's txids would be wrong for good once the payload is gone.
 #[test]
@@ -882,6 +933,39 @@ fn a_reindex_indexes_a_stripped_side_chain_block() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// `-reindex` leaves a side-chain block out of the index when it cannot
+/// vouch for it: a header that fails proof of work, a record it cannot
+/// read, and a record that holds another block. One call per case, so each
+/// is the first block the call skips.
+#[test]
+fn a_reindex_does_not_index_side_blocks_it_cannot_vouch_for() {
+    let (cs, dir) = make_chain_state();
+    let blocks = chain(&cs);
+    // A sibling of block 105, never accepted: only the reindex sees it.
+    let mut side = build_test_block(blocks[103].block_hash(), 105, time(105) + 1);
+    grind_test_pow(&mut side);
+    assert_ne!(side.block_hash(), blocks[104].block_hash());
+    let other = cs.store.get_block_index(&blocks[50].block_hash()).unwrap();
+    let elsewhere = FlatFilePos { file_number: other.file_number, data_pos: other.data_pos };
+
+    let mut no_work = side.header;
+    no_work.bits = bitcoin::CompactTarget::from_consensus(0x1d00ffff);
+    assert!(validation::pow::check_proof_of_work_bounded(&no_work, Network::Regtest).is_err());
+    let cases = [
+        ("fails proof of work", no_work, elsewhere),
+        ("unreadable", side.header, FlatFilePos { file_number: 99, data_pos: 0 }),
+        ("holds another block", side.header, elsewhere),
+    ];
+    for (case, header, pos) in cases {
+        let hash = header.block_hash();
+        let headers =
+            std::collections::HashMap::from([(hash, super::super::ReindexHeaderRef { header, pos })]);
+        cs.index_reindex_side_chain(&[(hash, 105, [0u8; 32])], &headers).unwrap();
+        assert!(cs.store.get_block_index(&hash).is_none(), "{case}: indexed");
+    }
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 /// A stripped block whose record was lost is a strip-record error on
 /// replay, not a block that fails validation.
 #[test]
@@ -1463,5 +1547,30 @@ fn the_restore_waits_while_the_tip_is_behind() {
     assert_eq!(cs.opreturn_restore_held_by_tip(), Some("the tip is behind the best header"));
     connect(&cs, &next);
     assert_eq!(cs.opreturn_restore_held_by_tip(), None);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// `blocks_dir_usage` is `(st_size, st_blocks × 512)` summed over the block
+/// files. The restore's disk gate needs `apparent - allocated`, so an
+/// allocated figure that reads low makes it wait for disk it does not need,
+/// and `(0, 0)` makes it never wait.
+#[test]
+fn blocks_dir_usage_reports_st_size_and_st_blocks() {
+    use std::os::unix::fs::MetadataExt;
+    let (cs, dir) = make_chain_state();
+    chain(&cs);
+    let mut expected = (0u64, 0u64);
+    for entry in std::fs::read_dir(cs.blocks_dir()).unwrap() {
+        let entry = entry.unwrap();
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with("blk") && name.ends_with(".dat") {
+            let meta = entry.metadata().unwrap();
+            expected.0 += meta.len();
+            expected.1 += meta.blocks() * 512;
+        }
+    }
+    assert!(expected.0 > 0 && expected.1 > 0, "premise: the block files take space: {expected:?}");
+    cs.forget_strip_summary();
+    assert_eq!(cs.blocks_dir_usage().unwrap(), expected);
     let _ = std::fs::remove_dir_all(dir);
 }

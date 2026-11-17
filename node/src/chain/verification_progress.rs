@@ -153,6 +153,17 @@ mod tests {
         assert!(p < 1e-8, "{p}");
     }
 
+    /// A count at or below the snapshot's is measured against the snapshot
+    /// projected to now, as Core's `GuessVerificationProgress` does.
+    #[test]
+    fn a_block_below_the_snapshot_is_measured_against_the_projected_total() {
+        let data = chain_tx_data(Network::Bitcoin, false);
+        let now = 1789000000;
+        let p = guess_verification_progress(data, at(0, 1231006505, 1), 0, now);
+        let projected = 1315805869.0 + (now - 1772055173) as f64 * 5.40111006496122;
+        assert_eq!(p, 1.0 / projected);
+    }
+
     #[test]
     fn a_recent_tip_is_exactly_one_and_a_newer_header_drops_it() {
         let data = chain_tx_data(Network::Regtest, false);

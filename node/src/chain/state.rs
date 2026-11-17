@@ -21632,6 +21632,27 @@ pub(crate) mod tests {
         assert!(reindex_warning(&re, "reindex.short").is_none());
     }
 
+    /// A framed record too short to hold a header is skipped by the scan,
+    /// like any other record that is not a block; the replay goes on past
+    /// it. The scan hands over at most 80 bytes, so the length check is all
+    /// that keeps a short one from being sliced as a header.
+    #[test]
+    fn a_reindex_skips_a_record_shorter_than_a_header() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let blocks = six_blocks_in_three_files(tmp.path());
+        let mut short = network_magic(Network::Regtest).to_vec();
+        short.extend_from_slice(&40u32.to_le_bytes());
+        short.extend_from_slice(&[0xab; 40]);
+        let file: Vec<u8> = [blk_record(&blocks[0]), short, blk_record(&blocks[1])].concat();
+        std::fs::write(tmp.path().join("blocks").join("blk00000.dat"), file).unwrap();
+
+        let re = reindexing_chain_state_over(tmp.path());
+        re.reindex_from_flat_files(None, None, Some(6)).unwrap();
+        assert_eq!(re.tip_height(), 6);
+        assert_eq!(re.tip_hash(), blocks[5].block_hash());
+        assert!(reindex_warning(&re, "reindex.short").is_none());
+    }
+
     /// Issue #533. A live `block_index` entry whose data is unreadable is local
     /// corruption, not pruning, and must be reported as such.
     #[test]

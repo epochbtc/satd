@@ -10749,6 +10749,55 @@ mod tests {
         );
     }
 
+    /// Core's `trackPackageRemoved` bumps on a strictly higher rate only
+    /// (`txmempool.cpp`). An eviction at the current rate leaves the decay
+    /// running: clearing `block_since_bump` would hold the floor until the
+    /// next block.
+    #[test]
+    fn an_eviction_at_the_current_rate_keeps_the_decay_running() {
+        let mut r = RollingMinFee {
+            rate: 20_000.0,
+            last_update: 0,
+            block_since_bump: true,
+        };
+        r.package_removed(20_000);
+        assert!(r.block_since_bump);
+        r.package_removed(20_001);
+        assert_eq!((r.rate, r.block_since_bump), (20_001.0, false));
+    }
+
+    /// Core's `FormatMoney`: trailing zeros go, but two decimals stay, and
+    /// every satoshi shows.
+    #[test]
+    fn format_btc_keeps_two_decimals_and_every_satoshi() {
+        assert_eq!(format_btc(4_999), "0.00004999");
+        assert_eq!(format_btc(100_000_000), "1.00");
+        assert_eq!(format_btc(150_000_000), "1.50");
+        assert_eq!(format_btc(0), "0.00");
+    }
+
+    /// `relatives_capped` counts in-mempool relatives only: a confirmed
+    /// input is no ancestor.
+    #[test]
+    fn relatives_capped_counts_only_mempool_relatives() {
+        let (a, b, c) = (outpoint(0xD1), outpoint(0xD2), outpoint(0xD3));
+        let (cs, mp, dir) =
+            make_funded_env(&[(a, coin(100_000)), (b, coin(100_000)), (c, coin(100_000))]);
+        let parent = tx_from(&[a, b], &[(190_000, 0xD4)]);
+        let parent_txid = mp
+            .accept_transaction(parent, &cs, &NoopVerifier, TxSource::Rpc, false)
+            .expect("parent admitted");
+        let child = tx_from(&[OutPoint { txid: parent_txid, vout: 0 }, c], &[(280_000, 0xD5)]);
+        let child_txid = mp
+            .accept_transaction(child, &cs, &NoopVerifier, TxSource::Rpc, false)
+            .expect("child admitted");
+        let inner = mp.inner.read();
+        assert_eq!(Mempool::relatives_capped(&inner, &child_txid, 8), (1, 0));
+        assert_eq!(Mempool::relatives_capped(&inner, &parent_txid, 8), (0, 1));
+        drop(inner);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// `remove_for_block` records the block's non-coinbase weight and the
     /// weight this pool held, for the health window, and a second report of
     /// the same block keeps that coverage.

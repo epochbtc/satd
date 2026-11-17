@@ -733,4 +733,11 @@ mod tests {
         }]);
         assert_eq!(chunks, vec![FeeFrac::new(5_000, 250)]);
     }
+
+    /// Two ancestor sets of the same feerate and size go by the lower
+    /// index, so the order does not depend on which one the walk saw last.
+    #[test]
+    fn equal_ancestor_sets_go_by_the_lower_index() {
+        assert_eq!(linearize(&[(ff(100, 100), 0), (ff(100, 100), 0)]), vec![0, 1]);
+    }
 }
