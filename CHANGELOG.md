@@ -46,6 +46,7 @@ It includes every fix shipped in 0.7.1:
 - P2P: a node with no outbound peer on a network it can reach (IPv4, IPv6 or onion) opens an extra full-relay connection to that network about every five minutes, as Core does, and keeps it as the only peer there (#1156).
 - P2P: once initial sync is over, the node opens an extra block-relay-only connection about every five minutes to check its tip, and then drops whichever of its two youngest block-relay-only peers gave it a block least recently, as Core does (#1155).
 - P2P: one source's network group holds at most 1,024 new entries in the address book, a sixteenth of it, as one source group reaches 64 of Core's 1,024 new buckets; a peer announcing addresses across many groups could fill the book (#1264).
+- P2P: a `cmpctblock` from a peer that never sent a version-2 `sendcmpct` is ignored, header included, as in Core v32 (#1275).
 - P2P: `.onion` fixed seeds for testnet4 and testnet3, and refreshed ones for mainnet and signet, from Core v31.2's lists, so a Tor-only node can bootstrap on every network (#1162).
 - Config: `reindex=1` and `reindexchainstate=1` in `bitcoin.conf` are honoured, as in Core, instead of accepted and ignored (#840).
 - Operator: `-dbcache=auto` sizes from the memory cgroup limit (systemd `MemoryMax=`, Docker `--memory`, cgroup v2 or v1) when it is below host memory; it sized from the host alone (#1272).
