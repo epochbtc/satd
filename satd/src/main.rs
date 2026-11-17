@@ -267,13 +267,20 @@ fn check_old_signet_datadir(config: &Config, net_datadir: &std::path::Path) {
     {
         return;
     }
-    let old_datadir = config.datadir.join(old_name);
-    if !old_datadir.join("chainstate").is_dir() {
+    if !config.datadir.join(old_name).join("chainstate").is_dir() {
         return;
     }
+    // The printed commands use canonical paths: they work from any working
+    // directory, and a `-blocksdir` that names the datadir by another
+    // spelling is recognised as the same directory.
+    let canonical = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let datadir = canonical(&config.datadir);
+    let blocksdir = config.blocksdir.as_deref().map(canonical);
+    let old_datadir = datadir.join(old_name);
+    let net_datadir = &datadir.join(&new_name);
     // Where the old directory's blocks can be: under it, or under
     // `-blocksdir`, which may have been added or dropped since it ran.
-    let old_blocks_root = config.blocksdir.as_deref().map(|r| r.join(old_name));
+    let old_blocks_root = blocksdir.as_deref().map(|r| r.join(old_name));
     let mut candidates = vec![old_datadir.join("blocks")];
     if let Some(root) = &old_blocks_root
         && !candidates.contains(&root.join("blocks"))
@@ -285,7 +292,12 @@ fn check_old_signet_datadir(config: &Config, net_datadir: &std::path::Path) {
     // The moves, as commands. A target that already exists (it can only
     // lack a chainstate, see above) is moved aside first, so `mv` renames
     // rather than nesting the source inside it.
-    let new_blocks = config.blocks_dir();
+    let new_blocks = config::resolve_blocks_dir(
+        blocksdir.as_deref(),
+        &datadir,
+        bitcoin::Network::Signet,
+        Some(challenge),
+    );
     let found_blocks = match &contents {
         SignetDirContents::ThisSignet { blocks_dir, .. } => blocks_dir.clone(),
         _ => candidates.iter().rev().find(|d| d.exists()).cloned().unwrap_or_else(|| candidates[0].clone()),
@@ -308,18 +320,27 @@ fn check_old_signet_datadir(config: &Config, net_datadir: &std::path::Path) {
         commands.push(format!("mv {} {}", shell_quote(from), shell_quote(to)));
     };
     mv(&mut commands, &old_datadir, net_datadir);
-    let blocks_after_first_move: PathBuf = match found_blocks.strip_prefix(&old_datadir) {
-        Ok(rel) => net_datadir.join(rel),
-        Err(_) => found_blocks.clone(),
+    // Where a path is once the first move has run: a `-blocksdir` inside the
+    // old directory moves with it.
+    let after_first_move = |p: &Path| -> PathBuf {
+        match p.strip_prefix(&old_datadir) {
+            Ok(rel) => net_datadir.join(rel),
+            Err(_) => p.to_path_buf(),
+        }
     };
+    let blocks_after_first_move = after_first_move(&found_blocks);
     // Blocks that are nowhere (an unreadable directory) get no command: a
     // move of a missing path would stop the script halfway.
     if found_blocks.exists() && blocks_after_first_move != new_blocks {
-        match (&old_blocks_root, config.blocksdir.as_deref()) {
+        match (&old_blocks_root, blocksdir.as_deref()) {
             // The usual `-blocksdir` case: its `signet/` subtree is renamed
             // whole.
             (Some(old_root), Some(root)) if found_blocks == old_root.join("blocks") => {
-                mv(&mut commands, old_root, &root.join(&new_name));
+                mv(
+                    &mut commands,
+                    &after_first_move(old_root),
+                    &after_first_move(root).join(&new_name),
+                );
             }
             _ => {
                 if let Some(parent) = new_blocks.parent()

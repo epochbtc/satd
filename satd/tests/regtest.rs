@@ -20404,7 +20404,9 @@ fn a_custom_signet_in_the_old_signet_directory_is_refused_with_the_moves() {
     let datadir = fresh_test_datadir("satd-custom-signet-moved");
     let blocks_root = datadir.join("blocksroot");
     std::fs::create_dir_all(&blocks_root).unwrap();
-    let blocksdir = format!("--blocksdir={}", blocks_root.display());
+    // Spelled with a `.` component: the printed commands use the canonical
+    // path, so they work from any directory.
+    let blocksdir = format!("--blocksdir={}/./blocksroot", datadir.display());
     let args = ["--connect=0", "--dnsseed=0", "--listen=0", "--signetchallenge=51", &blocksdir];
     let own = "signet_54d26fbd";
 
