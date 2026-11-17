@@ -482,7 +482,10 @@ the silent payment fields are satd's own.
       "previous_txid": "…",
       "previous_vout": 0,
       "sequence": 4294967293,
-      "witness_utxo": { "amount": 0.001, "scriptPubKey": { "hex": "0014…" } },
+      "witness_utxo": {
+        "amount": 0.001,
+        "scriptPubKey": { "asm": "0 …", "desc": "addr(…)#…", "hex": "0014…", "address": "bc1q…", "type": "witness_v0_keyhash" }
+      },
       "has_utxo": true,
       "is_final": false,
       "sp_shares": [
@@ -494,12 +497,12 @@ the silent payment fields are satd's own.
   "outputs": [
     {
       "amount": 0.0009,
-      "script": { "hex": "5120…" },    // absent while it has not been computed
+      "script": { "asm": "1 …", "desc": "rawtr(…)#…", "hex": "5120…", "address": "bc1p…", "type": "witness_v1_taproot" },  // absent while it has not been computed
       "silent_payment": { "scan_key": "02…", "spend_key": "03…", "label": 3 },
       "unknown": { }
     }
   ],
-  "tx": { }, "tx_hex": "…",            // only when every output has a script
+  "tx": { "txid": "…", "vin": [ ], "vout": [ ] }, "tx_hex": "…",  // only when every output has a script; `tx` is decoderawtransaction's shape
   "unique_id": "…",                    // BIP 370's identifier for this PSBT
   "fee": 0.0001                        // as in version 0: null unless every input's UTXO is known
 }

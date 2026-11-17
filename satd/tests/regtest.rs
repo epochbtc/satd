@@ -5581,7 +5581,14 @@ fn test_decodepsbt() {
         .rpc_call_with_params("decodepsbt", vec![serde_json::json!(psbt_b64)])
         .unwrap();
     let result = &response["result"];
-    assert!(result["tx"].is_object());
+    // Core's `TxToUniv`, addresses spelled for the node's own network.
+    assert_eq!(result["tx"]["vin"].as_array().map(Vec::len), Some(1), "{response}");
+    assert_eq!(
+        result["tx"]["vout"][0]["scriptPubKey"]["address"],
+        "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202",
+        "{response}"
+    );
+    assert!(result["tx"].get("hex").is_none(), "{response}");
     assert!(result["inputs"].is_array());
     node.stop();
 }
