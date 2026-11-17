@@ -133,6 +133,32 @@ not_a_print_and_exit() {
 
 not_a_print_and_exit
 
+# TEMPORARY (Core v32.1 pin, remove with the move to v33): a custom signet's
+# cookie lives in signet_<message start>/, and the shim points the
+# signet/.cookie that v32.1's framework reads at it. The default signet gets
+# no link.
+signet_cookie_link() {
+    local datadir="$WORK/signet-custom"
+    mkdir -p "$datadir"
+    SATD_BIN="$LINGER" "$SHIM" "-datadir=$datadir" -signet -signetchallenge=51 >/dev/null 2>&1
+    local target
+    target="$(readlink "$datadir/signet/.cookie")"
+    if [[ "$target" != "../signet_54d26fbd/.cookie" ]]; then
+        fail "custom signet: signet/.cookie should link to ../signet_54d26fbd/.cookie" "got: '$target'"
+        return
+    fi
+    datadir="$WORK/signet-default"
+    mkdir -p "$datadir"
+    SATD_BIN="$LINGER" "$SHIM" "-datadir=$datadir" -signet >/dev/null 2>&1
+    if [[ -e "$datadir/signet/.cookie" || -L "$datadir/signet/.cookie" ]]; then
+        fail "default signet: no cookie link expected"
+        return
+    fi
+    echo "ok:   a custom signet's cookie is linked where v32.1's framework reads it"
+}
+
+signet_cookie_link
+
 if [[ $FAILURES -ne 0 ]]; then
     echo "$FAILURES failure(s)"
     exit 1

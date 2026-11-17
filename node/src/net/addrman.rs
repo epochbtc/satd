@@ -27,9 +27,15 @@
 //! An onion's network group is Core's for Tor (`NetGroupManager::GetGroup`,
 //! v31.1 `src/netgroup.cpp:52`): the network and the first four bits of its
 //! key, so the onion addresses fall into sixteen groups. `-asmap` groups IP
-//! addresses only. Onion addresses are free to make, so one source's onion
-//! entries are held to [`MAX_NEW_PER_GROUP`] of the new table as well; see
-//! [`AddrMan::add_from_replacing`].
+//! addresses only.
+//!
+//! The new table is also held per *source*: the network group of the peer
+//! that told us about an entry holds at most [`MAX_NEW_PER_SOURCE_GROUP`]
+//! new entries, a sixteenth of the book, as one source group reaches 64 of
+//! Core's 1,024 new buckets. Without it one peer announcing addresses
+//! across many groups could fill the book. Onion addresses are free to
+//! make, so one source's onion entries are held to [`MAX_NEW_PER_GROUP`] of
+//! the new table as well; see [`AddrMan::add_from_replacing`].
 //!
 //! The on-disk format is satd-native and versioned (magic `SADR`); it is
 //! NOT byte-compatible with Core's `peers.dat`, and is treated as
@@ -88,6 +94,16 @@ const BUCKET_SIZE: u64 = 64;
 /// group's entries can land in.
 pub const TRIED_BUCKETS_PER_GROUP: u64 = 8;
 const NEW_BUCKETS_PER_SOURCE_GROUP: u64 = 64;
+/// Per-source-group cap in the *new* table: the share of it one source's
+/// network group may hold, IP and onion entries together. Core places a
+/// new entry in a bucket drawn from its own group and its source's
+/// (`AddrInfo::GetNewBucket`, v32.1 `src/addrman.cpp:36`), so one source
+/// group reaches [`NEW_BUCKETS_PER_SOURCE_GROUP`] of the
+/// [`NEW_BUCKET_COUNT`] new buckets, a sixteenth of the table however many
+/// groups its addresses span. satd's new table is not bucketed, so the
+/// share is that sixteenth of the book: 1,024 entries.
+pub const MAX_NEW_PER_SOURCE_GROUP: usize =
+    MAX_ENTRIES / (NEW_BUCKET_COUNT / NEW_BUCKETS_PER_SOURCE_GROUP) as usize;
 
 /// Core's `ADDRMAN_SET_TRIED_COLLISION_SIZE`: promotions waiting on a taken
 /// tried slot.
@@ -219,8 +235,8 @@ pub struct AddrEntry {
     /// persisted: it depends on the active `group_fn` (`-asmap`), so it is
     /// recomputed on load.
     group: Vec<u8>,
-    /// The source's network group, cached as `group` is: the onion share
-    /// per source counts by it.
+    /// The source's network group, cached as `group` is: the share of the
+    /// new table per source counts by it.
     source_group: Vec<u8>,
 }
 
@@ -465,6 +481,13 @@ impl AddrMan {
             .count()
     }
 
+    fn new_count_from_source_group(&self, source_group: &[u8]) -> usize {
+        self.entries
+            .values()
+            .filter(|e| !e.tried && e.source_group == source_group)
+            .count()
+    }
+
     /// Add (or refresh) a gossiped/seeded address. Honors the total and
     /// per-group caps. Returns true if a new entry was inserted. The entry
     /// gets the default service bits and is its own source; use
@@ -510,13 +533,20 @@ impl AddrMan {
     /// Without this a full book refused every address it did not already
     /// hold, for good: nothing ever left it.
     ///
-    /// An onion address also counts against its source's share: one
+    /// Every address also counts against its source's share: one source's
+    /// network group holds at most [`MAX_NEW_PER_SOURCE_GROUP`] entries in
+    /// the new table, and a full share makes room the same way. The
+    /// per-group cap alone let one peer announcing addresses across many
+    /// groups fill the book; Core's new buckets hold a source group to a
+    /// sixteenth of the table (`AddrInfo::GetNewBucket`).
+    ///
+    /// An onion address counts against a smaller share as well: one
     /// source's network group holds at most [`MAX_NEW_PER_GROUP`] onion
-    /// entries in the new table, and a full share makes room the same way.
-    /// Anyone can make onion addresses in every onion group, so the
-    /// per-group cap alone would let one peer's `addrv2` answers fill the
-    /// onion part of the book. The share is the one satd's separate onion
-    /// list kept (an eighth of its 512 places per source).
+    /// entries in the new table. Anyone can make onion addresses in every
+    /// onion group, so the per-group cap alone would let one peer's
+    /// `addrv2` answers fill the onion part of the book. The share is the
+    /// one satd's separate onion list kept (an eighth of its 512 places per
+    /// source).
     pub fn add_from_replacing(
         &mut self,
         addr: impl Into<PeerAddr>,
@@ -551,40 +581,32 @@ impl AddrMan {
         let group = self.group_of(&addr);
         let source_group = self.net_group(&source);
         let mut evicted = None;
-        let onion_share_full = addr.is_onion()
-            && self
-                .entries
-                .values()
-                .filter(|e| !e.tried && e.addr.is_onion() && e.source_group == source_group)
-                .count()
-                >= MAX_NEW_PER_GROUP;
-        let group_full = self.new_count_in_group(&group) >= MAX_NEW_PER_GROUP;
-        if onion_share_full {
-            // The source has its share of onions: make room in it, or
-            // refuse. When the onion's own group is full too, the entry
-            // dropped must be of both, or the group would pass its cap.
+        // One pass for the three new-table counts the address is held to.
+        let (mut in_group, mut from_source, mut onions_from_source) = (0, 0, 0);
+        for e in self.entries.values().filter(|e| !e.tried) {
+            in_group += usize::from(e.group == group);
+            if e.source_group == source_group {
+                from_source += 1;
+                onions_from_source += usize::from(e.addr.is_onion());
+            }
+        }
+        let onion_share_full = addr.is_onion() && onions_from_source >= MAX_NEW_PER_GROUP;
+        let source_share_full = from_source >= MAX_NEW_PER_SOURCE_GROUP;
+        let group_full = in_group >= MAX_NEW_PER_GROUP;
+        if onion_share_full || source_share_full || group_full {
+            // A share or the group is full: make room in it, or refuse. The
+            // entry dropped must be in every one that is full, or one of
+            // them would pass its cap.
             let Some(victim) = self
                 .entries
                 .values()
                 .find(|e| {
                     !e.tried
-                        && e.addr.is_onion()
-                        && e.source_group == source_group
+                        && (!onion_share_full || e.addr.is_onion())
+                        && (!(onion_share_full || source_share_full) || e.source_group == source_group)
                         && (!group_full || e.group == group)
                         && e.is_terrible(now)
                 })
-                .map(|e| e.addr.clone())
-            else {
-                return (false, None);
-            };
-            self.remove_entry(&victim);
-            evicted = Some(victim);
-        } else if group_full {
-            // The group is full: make room in it, or refuse.
-            let Some(victim) = self
-                .entries
-                .values()
-                .find(|e| !e.tried && e.group == group && e.is_terrible(now))
                 .map(|e| e.addr.clone())
             else {
                 return (false, None);
@@ -658,10 +680,12 @@ impl AddrMan {
             // One the book does not hold yet goes in as new and is promoted
             // from there, so it must find room in one table or the other: a
             // taken tried slot would leave it in a new table its group has
-            // already filled.
+            // already filled. It is its own source, so its source group is
+            // its group, and that share must have room too.
             let slot = self.tried_slot_in(&addr, &group);
             if self.tried_slots.contains_key(&(slot.bucket * BUCKET_SIZE + slot.position))
-                && self.new_count_in_group(&group) >= MAX_NEW_PER_GROUP
+                && (self.new_count_in_group(&group) >= MAX_NEW_PER_GROUP
+                    || self.new_count_from_source_group(&group) >= MAX_NEW_PER_SOURCE_GROUP)
             {
                 return false;
             }
@@ -702,10 +726,11 @@ impl AddrMan {
     /// Core's `MakeTried`: put new entry `addr` in its tried slot, moving
     /// the entry there, if any, back to the new table. Returns an address
     /// that left the book for it: the demoted entry goes back to new as
-    /// Core's does, which in satd means its group's new-table cap must have
-    /// room. A terrible new entry of the group gives up its place; if there
-    /// is none, the demoted entry is dropped, where Core's `ClearNew` drops
-    /// whatever held the slot it moves to.
+    /// Core's does, which in satd means its group's new-table cap, and its
+    /// source group's share, must have room. A terrible new entry of the
+    /// group (and source group, when that share is over too) gives up its
+    /// place; if there is none, the demoted entry is dropped, where Core's
+    /// `ClearNew` drops whatever held the slot it moves to.
     fn make_tried(&mut self, addr: PeerAddr, now: u64) -> Option<PeerAddr> {
         let slot = self.tried_slot(&addr);
         let mut dropped = None;
@@ -714,12 +739,21 @@ impl AddrMan {
         {
             o.tried = false;
             let group = o.group.clone();
+            let source_group = o.source_group.clone();
             tracing::debug!(%old, %addr, "Moved a tried entry back to new to make space");
-            if self.new_count_in_group(&group) > MAX_NEW_PER_GROUP {
+            let group_over = self.new_count_in_group(&group) > MAX_NEW_PER_GROUP;
+            let source_over = self.new_count_from_source_group(&source_group) > MAX_NEW_PER_SOURCE_GROUP;
+            if group_over || source_over {
                 let victim = self
                     .entries
                     .values()
-                    .find(|e| !e.tried && e.group == group && e.addr != old && e.is_terrible(now))
+                    .find(|e| {
+                        !e.tried
+                            && (!group_over || e.group == group)
+                            && (!source_over || e.source_group == source_group)
+                            && e.addr != old
+                            && e.is_terrible(now)
+                    })
                     .map_or(old, |e| e.addr.clone());
                 self.remove_entry(&victim);
                 dropped = Some(victim);
@@ -1047,6 +1081,12 @@ impl AddrMan {
         // New entries first, so a tried entry that loses its slot finds its
         // group's new-table count as it will stand.
         read.sort_by_key(|e| e.tried);
+        // New entries per source group, to hold each to its share: a file
+        // written before the share was kept can hold more of one source.
+        let mut from_source: HashMap<Vec<u8>, usize> = HashMap::new();
+        for e in self.entries.values().filter(|e| !e.tried) {
+            *from_source.entry(e.source_group.clone()).or_default() += 1;
+        }
         for mut e in read {
             // A file written before the book refused them can hold
             // addresses it would not take now, `0.0.0.0` learned from a
@@ -1075,12 +1115,21 @@ impl AddrMan {
                     std::collections::hash_map::Entry::Occupied(_) => {
                         let in_group =
                             self.entries.values().filter(|o| !o.tried && o.group == e.group).count();
-                        if in_group >= MAX_NEW_PER_GROUP {
+                        if in_group >= MAX_NEW_PER_GROUP
+                            || from_source.get(&e.source_group).copied().unwrap_or(0) >= MAX_NEW_PER_SOURCE_GROUP
+                        {
                             continue;
                         }
                         e.tried = false;
                     }
                 }
+            }
+            if !e.tried {
+                let n = from_source.entry(e.source_group.clone()).or_default();
+                if *n >= MAX_NEW_PER_SOURCE_GROUP {
+                    continue;
+                }
+                *n += 1;
             }
             self.entries.insert(e.addr.clone(), e);
         }
@@ -2221,6 +2270,131 @@ mod tests {
         let (mut a, shared) = book(true);
         assert_eq!(a.add_from_replacing(newcomer.clone(), now, DEFAULT_SERVICES, source.clone()), (true, Some(shared)));
         assert_eq!(a.new_count_in_group(&a.group_of(&newcomer)), MAX_NEW_PER_GROUP);
+    }
+
+    /// An IP address in a group of its own, for the source-share tests:
+    /// each `i` below 7,000 is a /16 of its own.
+    fn spread(i: usize) -> SocketAddr {
+        sa(&format!("{}.{}.1.1:8333", 20 + i / 200, i % 200))
+    }
+
+    /// One source announcing addresses across many groups, none past its
+    /// group cap, held to [`MAX_NEW_PER_SOURCE_GROUP`] of the new table, as
+    /// Core's `GetNewBucket` holds a source group to 64 of 1,024 buckets
+    /// (#1264). Its /16 is the same source group; another source still gets
+    /// in, and a full share makes room by dropping a terrible entry of the
+    /// source.
+    #[test]
+    fn one_source_cannot_fill_the_new_table_with_ip_addresses() {
+        assert_eq!(MAX_NEW_PER_SOURCE_GROUP, 1024, "a sixteenth of the book, as 64 of Core's 1,024");
+        let mut a = AddrMan::new();
+        let now = 10_000_000;
+        let source = NetAddr::Ip("198.51.100.7".parse().unwrap());
+        for i in 0..3000 {
+            a.add_from(spread(i), now, DEFAULT_SERVICES, source.clone());
+        }
+        assert_eq!(a.len(), MAX_NEW_PER_SOURCE_GROUP, "one source's share of the new table");
+        let neighbour = NetAddr::Ip("198.51.9.9".parse().unwrap());
+        assert!(!a.add_from(spread(5000), now, DEFAULT_SERVICES, neighbour), "the same /16 is the same share");
+        let other = NetAddr::Ip("203.0.113.1".parse().unwrap());
+        for i in 3000..3100 {
+            assert!(a.add_from(spread(i), now, DEFAULT_SERVICES, other.clone()), "another source's address");
+        }
+        assert_eq!(a.len(), MAX_NEW_PER_SOURCE_GROUP + 100);
+
+        let dead = a.iter().find(|e| e.source == source).map(|e| e.addr.clone()).unwrap();
+        for _ in 0..3 {
+            a.mark_attempt(&dead, now - 120);
+        }
+        let fresh: PeerAddr = spread(6000).into();
+        assert_eq!(
+            a.add_from_replacing(fresh.clone(), now, DEFAULT_SERVICES, source.clone()),
+            (true, Some(dead.clone()))
+        );
+        assert!(a.contains(&fresh) && !a.contains(&dead));
+        assert!(!a.add_from(spread(6001), now, DEFAULT_SERVICES, source), "no terrible entry left: refused");
+    }
+
+    /// A full share for an IP source and a full group at once: the entry
+    /// dropped must be of both, as for onions.
+    #[test]
+    fn a_full_source_share_and_a_full_group_drop_an_entry_of_both() {
+        let now = 10_000_000;
+        let source = NetAddr::Ip("198.51.100.7".parse().unwrap());
+        let newcomer = sa("44.9.200.1:8333");
+        let mut a = AddrMan::new();
+        // The newcomer's /16: 63 from other sources, then one of the
+        // source's, which is terrible.
+        for i in 0..MAX_NEW_PER_GROUP - 1 {
+            let other = NetAddr::Ip(IpAddr::from([30 + i as u8, 1, 1, 1]));
+            assert!(a.add_from(sa(&format!("44.9.{i}.1:8333")), now, DEFAULT_SERVICES, other));
+        }
+        let shared: PeerAddr = sa("44.9.100.1:8333").into();
+        assert!(a.add_from(shared.clone(), now, DEFAULT_SERVICES, source.clone()));
+        // The rest of the share, terrible, in other groups.
+        for i in 0..MAX_NEW_PER_SOURCE_GROUP - 1 {
+            let addr: PeerAddr = spread(i).into();
+            assert!(a.add_from(addr.clone(), now, DEFAULT_SERVICES, source.clone()));
+            for _ in 0..3 {
+                a.mark_attempt(&addr, now - 120);
+            }
+        }
+        assert!(!a.add_from_replacing(newcomer, now, DEFAULT_SERVICES, source.clone()).0, "shared is not terrible");
+        for _ in 0..3 {
+            a.mark_attempt(&shared, now - 120);
+        }
+        assert_eq!(a.add_from_replacing(newcomer, now, DEFAULT_SERVICES, source), (true, Some(shared)));
+        assert_eq!(a.new_count_in_group(&a.group_of(&newcomer.into())), MAX_NEW_PER_GROUP);
+    }
+
+    /// The share survives a `peers.dat` round trip (the source is in every
+    /// record since version 2), and a file written before the share was
+    /// kept, holding more of one source, loads with only its share.
+    #[test]
+    fn the_source_share_survives_and_is_kept_on_load() {
+        let now = 10_000_000;
+        let source = NetAddr::Ip("198.51.100.7".parse().unwrap());
+        let other = NetAddr::Ip("203.0.113.1".parse().unwrap());
+        let mut a = AddrMan::new();
+        for i in 0..2000 {
+            a.add_from(spread(i), now, DEFAULT_SERVICES, source.clone());
+        }
+        assert!(a.add_from(spread(3000), now, DEFAULT_SERVICES, other.clone()));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("peers.dat");
+        a.dump(&path).unwrap();
+        let mut b = AddrMan::new();
+        b.load(&path).unwrap();
+        assert_eq!(b.len(), MAX_NEW_PER_SOURCE_GROUP + 1);
+        assert_eq!(b.iter().filter(|e| e.source == source).count(), MAX_NEW_PER_SOURCE_GROUP);
+        assert!(!b.add_from(spread(2500), now, DEFAULT_SERVICES, source.clone()), "still full after the load");
+
+        // An older book, past the share: entries put in by hand.
+        for i in 0..2000 {
+            let addr: PeerAddr = spread(4000 + i).into();
+            let group = b.group_of(&addr);
+            let source_group = b.net_group(&source);
+            b.entries.insert(
+                addr.clone(),
+                AddrEntry {
+                    addr,
+                    tried: false,
+                    last_success: 0,
+                    attempts: 0,
+                    last_try: 0,
+                    last_seen: now,
+                    services: DEFAULT_SERVICES,
+                    source: source.clone(),
+                    group,
+                    source_group,
+                },
+            );
+        }
+        b.dump(&path).unwrap();
+        let mut c = AddrMan::new();
+        c.load(&path).unwrap();
+        assert_eq!(c.iter().filter(|e| e.source == source).count(), MAX_NEW_PER_SOURCE_GROUP);
+        assert_eq!(c.iter().filter(|e| e.source == other).count(), 1, "another source's entry kept");
     }
 
     /// An onion is the address it names in any case, and only a well-formed

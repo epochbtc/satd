@@ -839,9 +839,11 @@ struct TxLocation {
 ///   strings (e.g. `0.00050000`); serde_json renders f64 without
 ///   trailing zeros (`0.0005`). Both parse to the same numeric value;
 ///   wallets that consume `value` numerically are unaffected.
-/// - `scriptSig.asm` / `scriptPubKey.asm` use rust-bitcoin's `Display`
-///   impl on `Script`, which matches Bitcoin Core's `ScriptToAsmStr`
-///   for all standard opcodes.
+/// - `scriptSig.asm` / `scriptPubKey.asm` are Bitcoin Core's
+///   `ScriptToAsmStr`, the scriptSig's with its sighash decode, as
+///   satd's `getrawtransaction` writes them.
+/// - `scriptPubKey.desc` is the inferred descriptor Core's `ScriptToUniv`
+///   adds.
 /// - `coinbase` variant of `vin[]` omits txid/vout/scriptSig per Core.
 /// - `txinwitness` is omitted (not present in JSON) for non-segwit
 ///   inputs, matching Core.
@@ -883,7 +885,7 @@ fn verbose_transaction_json(
                     "txid": input.previous_output.txid.to_string(),
                     "vout": input.previous_output.vout,
                     "scriptSig": {
-                        "asm": format!("{}", input.script_sig),
+                        "asm": node::rpc::script_asm::script_to_asm_str(input.script_sig.as_bytes(), true),
                         "hex": hex::encode(input.script_sig.as_bytes()),
                     },
                     "sequence": input.sequence.0,
@@ -903,7 +905,8 @@ fn verbose_transaction_json(
         .enumerate()
         .map(|(n, output)| {
             let mut spk = json!({
-                "asm": format!("{}", output.script_pubkey),
+                "asm": node::rpc::script_asm::script_to_asm_str(output.script_pubkey.as_bytes(), false),
+                "desc": node::rpc::descriptor::infer_descriptor(&output.script_pubkey, network),
                 "hex": hex::encode(output.script_pubkey.as_bytes()),
                 "type": script_type_label(&output.script_pubkey),
             });
@@ -944,7 +947,8 @@ fn verbose_transaction_json(
         for (vout, script_len) in stripped {
             if let Some(out) = result["vout"].get_mut(*vout as usize) {
                 out["scriptPubKey"] = json!({
-                    "asm": format!("{}", bare),
+                    "asm": node::rpc::script_asm::script_to_asm_str(bare.as_bytes(), false),
+                    "desc": node::rpc::descriptor::infer_descriptor(&bare, network),
                     "hex": hex::encode(bare.as_bytes()),
                     "type": script_type_label(&bare),
                     "stripped_size": script_len,

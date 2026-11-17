@@ -17,6 +17,8 @@ provided here. That is a deliberately short list:
      Core implements is touched.
   4. An empty `wallets/` directory, which Core always has and the cache builder
      removes. satd has no wallet to create it.
+  5. TEMPORARY, until PIN moves to Core v33: a custom signet's cookie where
+     v32.1's framework looks for it. See `link_custom_signet_cookie`.
 
 The tee in (1) is only safe for a node that outlives the framework's first
 look at its stdout, so an invocation that prints and exits is handed straight
@@ -30,6 +32,7 @@ needs an option satd lacks must be an honest `skip` row in inventory.toml, not
 a lie told by the shim.
 """
 
+import hashlib
 import os
 import re
 import sys
@@ -104,6 +107,72 @@ def parse_chain(argv, datadir: Path) -> str:
     return "main"
 
 
+SIGNET_DEFAULT_CHALLENGE = (
+    "512103ad5e0edad18cb1f0fc0d28a3d4f1f3e445640337489abb10404f2d1e086be430"
+    "210359ef5021964fe22d6f8e05b2463c9540ce96883fe3b278760f048f5189f2e6c452ae"
+)
+
+
+def signet_challenge(argv, datadir: Path):
+    """The -signetchallenge satd will use: command line, else bitcoin.conf
+    (its [signet] section, else the top level). None when unset."""
+    for arg in reversed(argv):
+        key, eq, value = arg.lstrip("-").partition("=")
+        if key == "signetchallenge" and eq:
+            return value.strip()
+    conf = datadir / "bitcoin.conf"
+    if not conf.is_file():
+        return None
+    section, found = "", {}
+    for line in conf.read_text().splitlines():
+        line = line.split("#", 1)[0].strip()
+        if line.startswith("["):
+            section = line.strip("[] ")
+            continue
+        key, eq, value = line.partition("=")
+        if eq and key.strip() == "signetchallenge":
+            found.setdefault(section, value.strip())
+    return found.get("signet", found.get(""))
+
+
+def link_custom_signet_cookie(argv, datadir: Path, chain_dir: Path) -> None:
+    """TEMPORARY bridge for Core v32.1's functional-test framework; remove it
+    when contrib/core-functional/PIN moves to Core v33.
+
+    satd keeps a custom signet's data, cookie included, in
+    `signet_<message start>/`, as Core does since bitcoin/bitcoin#34566
+    (`GetSignetDataDir`, first released in v33). v32.1's framework predates
+    that and reads the cookie from `signet/.cookie`, so feature_signet.py
+    finds no credentials. This points `signet/.cookie` at the real one. The
+    link resolves once satd writes the cookie, and stops resolving when satd
+    removes it, so the framework sees what it would see with Core. Nothing
+    about the node changes.
+    """
+    challenge = signet_challenge(argv, datadir)
+    if challenge is None or any(a.lstrip("-").startswith("rpccookiefile") for a in argv):
+        return
+    try:
+        raw = bytes.fromhex(challenge)
+    except ValueError:
+        return  # satd refuses it at startup
+    if raw == bytes.fromhex(SIGNET_DEFAULT_CHALLENGE):
+        return
+    n = len(raw)
+    if n < 253:
+        size = bytes([n])
+    elif n < 0x10000:
+        size = b"\xfd" + n.to_bytes(2, "little")
+    else:
+        size = b"\xfe" + n.to_bytes(4, "little")
+    start = hashlib.sha256(hashlib.sha256(size + raw).digest()).digest()[:4]
+    link = chain_dir / ".cookie"
+    if link.is_symlink():
+        link.unlink()
+    elif link.exists():
+        return
+    link.symlink_to(Path("..") / f"signet_{start.hex()}" / ".cookie")
+
+
 def load_log_rules():
     path = HARNESS / "debuglog_map.toml"
     if not path.is_file():
@@ -157,6 +226,9 @@ def main() -> int:
     #    nothing to create it. This is a property of the *process* layout, not
     #    of node behaviour, which is why it belongs here.
     (chain_dir / "wallets").mkdir(exist_ok=True)
+    # 5. TEMPORARY (Core v32.1 pin): see link_custom_signet_cookie.
+    if chain == "signet":
+        link_custom_signet_cookie(argv, datadir, chain_dir)
     debug_log = chain_dir / "debug.log"
 
     args = [satd_binary()] + argv
