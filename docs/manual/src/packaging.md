@@ -101,6 +101,47 @@ Consequences of the single instance:
 - RocksDB keeps many SST files mmapped. Budget `LimitNOFILE=65536` at
   minimum. The systemd unit and the Docker image both pre-set this.
 
+### File descriptors
+
+At startup satd works out how many descriptors it needs, as Bitcoin Core
+does in `AppInitParameterInteraction`:
+
+```text
+required = 151                              base: stdio, logs, block and undo files,
+                                            RocksDB's WAL/MANIFEST/LOG, runtime
+         + maxopenfiles                     RocksDB table files (when > 0; default 2048)
+         + 8                                addnode peers
+         + max(1, bind + whitebind)         P2P listeners
+         + 1 with listenonion               Tor control
+         + 2 with nap                       attestation pulls
+         + 101 per RPC listener             plain (2 by default), TLS, read-only, read-only TLS
+         + Esplora:     listeners + esploramaxsockets
+         + Electrum:    listeners + electrummaxconns
+         + Stratum:     listeners + stratummaxconns
+         + events gRPC: 1 + eventsgrpcmaxconns
+         + streamws:    1 + streamwsmaxsockets
+         + MCP HTTP:    1 + 128
+         + metrics:     1 + 64, and 1 + 64 for its TLS listener
+         + 1 per ZMQ endpoint
+total    = required + maxconnections
+```
+
+Only enabled surfaces count. A cap that is off (`maxopenfiles=-1`,
+`esploramaxsockets=0`, `streamwsmaxsockets=0`) has no number to budget and
+counts nothing; neither do ZMQ subscribers or an AssumeUTXO background
+chainstate. With the defaults `required` is 3,435.
+
+satd raises the soft `RLIMIT_NOFILE` to `total`, never past the hard limit.
+If the result is below `required` it refuses to start with
+`Not enough file descriptors available. X available, Y required.`; if it is
+below `total`, `maxconnections` is lowered to what is left, with
+`Reducing -maxconnections from X to Y, because of system limitations.` The
+log line `Using at most N automatic connections (M file descriptors
+available)` reports the outcome. A SIGHUP that raises `maxconnections` is
+fitted into the same limit. Unlike Core, satd does not refuse to start
+because a raised listener cap (Core's `-rpcmaxconnections`) is what does
+not fit.
+
 ## Signals
 
 | Signal | Behaviour |

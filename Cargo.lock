@@ -4646,6 +4646,7 @@ dependencies = [
  "futures-util",
  "hex",
  "jsonrpsee",
+ "libc",
  "node",
  "node-filter-index",
  "node-index",

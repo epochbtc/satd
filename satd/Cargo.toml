@@ -76,6 +76,11 @@ parking_lot = { workspace = true }
 sd-notify = { workspace = true }
 tikv-jemallocator = "0.6"
 
+# setrlimit for the file-descriptor budget (src/fd_budget.rs). Already in the
+# graph through `node`.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 reqwest = { version = "0.12", default-features = false, features = ["json", "blocking", "rustls-tls"] }
 serde_json = { workspace = true }

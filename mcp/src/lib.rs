@@ -562,7 +562,7 @@ fn mcp_status_response(status: u16, header: Option<(&str, String)>, msg: &'stati
 /// Max concurrent MCP connections. Mirrors the RPC TLS surface's connection cap
 /// (`node/src/rpc/server.rs`) so a connection / TLS-handshake flood can't spawn
 /// unbounded tasks on the consensus runtime MCP shares.
-const MCP_MAX_CONNECTIONS: usize = 128;
+pub const MCP_MAX_CONNECTIONS: usize = 128;
 
 /// Serve one MCP connection to completion, draining gracefully if the process
 /// shuts down mid-request. `header_read_timeout` bounds how long the client may

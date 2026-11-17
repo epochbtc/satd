@@ -1,6 +1,7 @@
 mod alert;
 mod config;
 mod fast_start;
+mod fd_budget;
 mod notify;
 mod notifyhooks;
 mod logcontrol;
@@ -906,6 +907,36 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
             "Low --maxahead value may cause slow IBD block assignment. Consider >= 1000."
         );
     }
+
+    // File-descriptor budget, Core's `AppInitParameterInteraction`
+    // (`src/init.cpp`): raise the soft limit toward satd's needs plus every
+    // automatic peer, refuse to start if satd's own needs do not fit, and
+    // otherwise lower `-maxconnections` to what is left. Done before the
+    // chainstate opens, since RocksDB's table files are part of the need.
+    // `config.maxconnections` keeps the operator's value so a SIGHUP diffs
+    // against what was configured; the peer manager gets the fitted one.
+    let fd_needs = fd_budget::needs(&config);
+    let fd_required = fd_budget::required(&fd_needs);
+    let fd_available =
+        fd_budget::raise_fd_limit(fd_required.saturating_add(config.maxconnections as u64));
+    let fd_budget = match fd_budget::check(fd_available, fd_required) {
+        Ok(budget) => budget,
+        Err(e) => {
+            tracing::debug!(needs = ?fd_needs, "file-descriptor budget");
+            eprintln!("Error: {e}");
+            node::shutdown::exit_now(1);
+        }
+    };
+    let (max_connections, fd_note) = fd_budget.fit(config.maxconnections);
+    if let Some(note) = fd_note {
+        tracing::warn!("{note}");
+    }
+    tracing::debug!(needs = ?fd_needs, "file-descriptor budget");
+    tracing::info!(
+        "Using at most {} automatic connections ({} file descriptors available)",
+        max_connections,
+        fd_available
+    );
 
     // Create network-specific data directory
     let net_datadir = config.network_datadir();
@@ -2904,7 +2935,7 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
         config.network,
         shutdown_rx.clone(),
         config.prune,
-        config.maxconnections,
+        max_connections,
         config.maxinboundperip,
         config.bantime,
         config.proxy.clone(),
@@ -5278,6 +5309,7 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
         token_store: token_store.clone(),
         alert_thresholds: alert_thresholds.clone(),
         alert_reloader: alert_reloader.clone(),
+        fd_budget,
     };
     loop {
         tokio::select! {

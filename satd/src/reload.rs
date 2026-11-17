@@ -249,6 +249,9 @@ pub struct ReloadHandles {
     /// always configured, even when every threshold is 0), so a threshold
     /// change always has somewhere to land.
     pub alert_thresholds: Arc<node::health::AlertThresholds>,
+    /// The startup file-descriptor budget; a reloaded `maxconnections` is
+    /// fitted into it ([`crate::fd_budget`]).
+    pub fd_budget: crate::fd_budget::FdBudget,
     /// Unified-auth bearer-token store, present only when `authfile=` is set.
     /// Re-read on every SIGHUP independently of the rest of the config so that
     /// removing a `[[token]]` revokes it live; a re-read error keeps the
@@ -807,8 +810,14 @@ fn field_specs() -> Vec<FieldSpec> {
             &h.peer_manager
         )),
         live_delta!("seednode", seednode, dial_added_seednodes),
+        // Fitted into the descriptors left at startup, as the startup value
+        // was: the limit is not raised again on a reload.
         live!("maxconnections", maxconnections, |c, h| {
-            h.peer_manager.set_max_connections(c.maxconnections)
+            let (n, note) = h.fd_budget.fit(c.maxconnections);
+            if let Some(note) = note {
+                tracing::warn!("{note}");
+            }
+            h.peer_manager.set_max_connections(n)
         }),
         live!("maxinboundperip", maxinboundperip, |c, h| {
             h.peer_manager.set_max_inbound_per_ip(c.maxinboundperip)

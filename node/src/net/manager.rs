@@ -102,7 +102,7 @@ const MANUAL_TARGET_RELOOKUP: Duration = Duration::from_secs(60);
 /// Core's `MAX_ADDNODE_CONNECTIONS` (`net.h`): added nodes (`-addnode`,
 /// `addnode add`) connected or being connected at once. Counted apart from
 /// the automatic outbound target (`semAddnode`).
-const MAX_ADDNODE_CONNECTIONS: usize = 8;
+pub const MAX_ADDNODE_CONNECTIONS: usize = 8;
 
 /// The longest a peer the operator named waits between two dials. Core's
 /// `ThreadOpenAddedConnections` tries its added nodes again every 60
