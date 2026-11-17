@@ -2739,6 +2739,8 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
     // Per-connection SOCKS credential randomization (Tor stream isolation).
     peer_manager.set_proxy_randomize(config.proxyrandomize);
     peer_manager.set_dns_enabled(config.dns);
+    // -inboundrelaypercent: the share of inbound slots tx-relaying peers hold.
+    peer_manager.set_inbound_relay_percent(config.inboundrelaypercent);
 
     // -blocksonly: suppress P2P transaction relay.
     peer_manager.set_blocksonly(config.blocksonly);

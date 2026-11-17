@@ -329,6 +329,12 @@ impl PeerStats {
     }
 
     /// Best round trip seen in seconds, or `None` if never measured.
+    /// Best round trip in microseconds, `u64::MAX` when none was measured:
+    /// the inbound eviction's `m_min_ping_time`.
+    pub fn min_ping_us(&self) -> u64 {
+        self.min_ping_us.load(Ordering::Relaxed)
+    }
+
     pub fn min_ping_secs(&self) -> Option<f64> {
         match self.min_ping_us.load(Ordering::Relaxed) {
             u64::MAX => None,
