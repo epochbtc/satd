@@ -72,6 +72,10 @@ scripts = {
     "pkh_cltv": f"0320a107b17576a914{H20}88ac",
     "sig_in_spk": push(DER + "01") + push(G) + "ac",
     "large_push": push("ab" * 80),
+    # OP_RETURN then non-push opcodes: nonstandard to Solver, but
+    # IsUnspendable, so neither p2sh nor segwit.
+    "op_return_nonpush": "6a61",
+    "op_return_p2pkh": f"6a76a914{H20}88ac",
 }
 
 # Core's own decodescript inputs (test/functional/rpc_decodescript.py's

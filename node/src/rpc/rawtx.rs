@@ -479,19 +479,11 @@ pub(crate) fn decode_transaction_verbose_net(
                 v["txinwitness"] = json!(witness);
             }
             if show_prevout && let Some(coin) = undo.map(|u| &u[i]) {
-                let mut spk = json!({
-                    "asm": script_to_asm_str(coin.script_pubkey.as_bytes(), false),
-                    "hex": hex::encode(coin.script_pubkey.as_bytes()),
-                    "type": script_type(&coin.script_pubkey),
-                });
-                if let Some(addr) = script_to_address(&coin.script_pubkey, network) {
-                    spk["address"] = json!(addr);
-                }
                 v["prevout"] = json!({
                     "generated": coin.coinbase,
                     "height": coin.height,
                     "value": format_amount(coin.amount, unit),
-                    "scriptPubKey": spk,
+                    "scriptPubKey": script_pubkey_json(&coin.script_pubkey, network),
                 });
             }
             v
@@ -503,19 +495,10 @@ pub(crate) fn decode_transaction_verbose_net(
         .iter()
         .enumerate()
         .map(|(n, output)| {
-            let value = format_amount(output.value.to_sat(), unit);
-            let mut spk = json!({
-                "asm": script_to_asm_str(output.script_pubkey.as_bytes(), false),
-                "hex": hex::encode(output.script_pubkey.as_bytes()),
-                "type": script_type(&output.script_pubkey),
-            });
-            if let Some(addr) = script_to_address(&output.script_pubkey, network) {
-                spk["address"] = json!(addr);
-            }
             json!({
-                "value": value,
+                "value": format_amount(output.value.to_sat(), unit),
                 "n": n,
-                "scriptPubKey": spk,
+                "scriptPubKey": script_pubkey_json(&output.script_pubkey, network),
             })
         })
         .collect();
@@ -634,20 +617,18 @@ pub(crate) fn stored_tx_verbose(
     let bare = bitcoin::ScriptBuf::from_bytes(vec![bitcoin::opcodes::all::OP_RETURN.to_u8()]);
     for (vout, script_len) in stored.stripped_outputs(i) {
         if let Some(out) = result["vout"].get_mut(vout as usize) {
-            out["scriptPubKey"] = json!({
-                "asm": script_to_asm_str(bare.as_bytes(), false),
-                "hex": hex::encode(bare.as_bytes()),
-                "type": script_type(&bare),
-                "stripped_size": script_len,
-            });
+            let mut spk = script_pubkey_json(&bare, network);
+            spk["stripped_size"] = json!(script_len);
+            out["scriptPubKey"] = spk;
         }
     }
     result
 }
 
 /// A scriptPubKey as Core's `ScriptToUniv(include_hex, include_address)`
-/// writes it for `gettxout`: `asm`, `desc`, `hex`, `address` (when the script
-/// has one) and `type`.
+/// writes it for every transaction output and prevout (`TxToUniv`) and for
+/// `gettxout`: `asm`, `desc`, `hex`, `address` (when the script has one)
+/// and `type`.
 pub(crate) fn script_pubkey_json(script: &bitcoin::Script, network: bitcoin::Network) -> Value {
     let mut spk = json!({
         "asm": script_to_asm_str(script.as_bytes(), false),
@@ -1211,7 +1192,10 @@ pub fn combine_raw_transaction(hex_txs: &[String]) -> Result<Value, (i32, String
     Ok(Value::String(hex::encode(raw)))
 }
 
-/// `decodescript` — decode a hex-encoded script.
+/// `decodescript` — decode a hex-encoded script, as Core's `decodescript`
+/// (`src/rpc/rawtransaction.cpp`) does: `ScriptToUniv` without `hex`
+/// (`asm`, `desc`, `address` when the script has one, `type`), then `p2sh`
+/// and `segwit` for a script that can be wrapped.
 pub fn decode_script(
     hex_script: &str,
     network: bitcoin::Network,
@@ -1219,17 +1203,15 @@ pub fn decode_script(
     let script_bytes = hex::decode(hex_script).map_err(|_| (-22, "Script decode failed".to_string()))?;
     let script = bitcoin::ScriptBuf::from_bytes(script_bytes);
 
-    let script_type = script_type(&script);
-
+    let mut out = script_pubkey_json(&script, network);
+    if let Some(obj) = out.as_object_mut() {
+        obj.remove("hex");
+    }
     // Core emits `p2sh` as the P2SH address that would wrap this script
     // (`GetScriptForDestination(ScriptHash(script))`), omitting it only for a
     // script that cannot be wrapped. An empty string was indistinguishable
     // from "not a valid script", on the field whose whole use is telling you
     // the address to pay.
-    let mut out = json!({
-        "asm": script_to_asm_str(script.as_bytes(), false),
-        "type": script_type,
-    });
     if can_wrap_in_p2sh(&script) {
         // `p2sh_from_hash`, not `Address::p2sh`: the latter refuses a script
         // over 520 bytes (the redeemScript push limit), and Core applies no
@@ -1237,11 +1219,56 @@ pub fn decode_script(
         // through the hash directly keeps a 600-byte script's address, which
         // Core returns and satd used to swallow into an empty string and then
         // drop, leaving the caller no address and no error.
-        let hash = bitcoin::hashes::Hash::hash(script.as_bytes());
-        let p2sh = bitcoin::Address::p2sh_from_hash(bitcoin::ScriptHash::from_raw_hash(hash), network);
-        out["p2sh"] = json!(p2sh.to_string());
+        out["p2sh"] = json!(p2sh_address(&script, network));
+        if let Some(segwit) = segwit_wrapping(&script) {
+            let mut sr = script_pubkey_json(&segwit, network);
+            if segwit.is_p2wsh() {
+                // Core hands `InferDescriptor` a provider holding the
+                // witness script, so a P2WSH wrapping names what it wraps.
+                sr["desc"] = json!(crate::rpc::descriptor::infer_p2wsh_descriptor(&script, network));
+            }
+            sr["p2sh-segwit"] = json!(p2sh_address(&segwit, network));
+            out["segwit"] = sr;
+        }
     }
     Ok(out)
+}
+
+/// The P2SH address paying to `script`, whatever its size.
+fn p2sh_address(script: &bitcoin::Script, network: bitcoin::Network) -> String {
+    let hash = bitcoin::hashes::Hash::hash(script.as_bytes());
+    bitcoin::Address::p2sh_from_hash(bitcoin::ScriptHash::from_raw_hash(hash), network).to_string()
+}
+
+/// The witness output `decodescript` reports under `segwit`, for a script
+/// [`can_wrap_in_p2sh`] already passed: Core's `can_wrap_P2WSH` and the
+/// `segwitScr` it builds. A P2PK or P2PKH script becomes the P2WPKH output
+/// of its key, any other bare multisig or nonstandard script the P2WSH
+/// output of the script itself. `None` for a script holding an uncompressed
+/// key, which segwit's checksig refuses, and for one that is already a
+/// witness program.
+fn segwit_wrapping(script: &bitcoin::Script) -> Option<bitcoin::ScriptBuf> {
+    // `CPubKey(solution).IsCompressed()`: 33 bytes behind 0x02 or 0x03.
+    let compressed = |k: &[u8]| k.len() == 33 && matches!(k[0], 0x02 | 0x03);
+    match script_type(script) {
+        "pubkey" => {
+            let key = crate::rpc::descriptor::p2pk_key(script)?;
+            compressed(key).then(|| {
+                let hash = bitcoin::hashes::hash160::Hash::hash(key);
+                bitcoin::ScriptBuf::new_p2wpkh(&bitcoin::WPubkeyHash::from_raw_hash(hash))
+            })
+        }
+        "pubkeyhash" => {
+            let hash = <bitcoin::hashes::hash160::Hash as Hash>::from_slice(&script.as_bytes()[3..23]).ok()?;
+            Some(bitcoin::ScriptBuf::new_p2wpkh(&bitcoin::WPubkeyHash::from_raw_hash(hash)))
+        }
+        "multisig" => {
+            let (_, keys) = crate::rpc::descriptor::bare_multisig(script)?;
+            keys.iter().all(|k| compressed(k)).then(|| bitcoin::ScriptBuf::new_p2wsh(&script.wscript_hash()))
+        }
+        "nonstandard" => Some(bitcoin::ScriptBuf::new_p2wsh(&script.wscript_hash())),
+        _ => None,
+    }
 }
 
 /// Bitcoin Core's `can_wrap` from `decodescript`
@@ -1254,19 +1281,19 @@ pub fn decode_script(
 /// anchor, an unknown witness program, a truncated push), and it withheld one
 /// for a 521-to-10,000-byte redeemScript that Core happily reports.
 fn can_wrap_in_p2sh(script: &bitcoin::Script) -> bool {
-    // The five `TxoutType`s Core returns false for outright.
-    if script.is_op_return()          // NULL_DATA
-        || script.is_p2sh()           // SCRIPTHASH
-        || script.is_p2tr()           // WITNESS_V1_TAPROOT
-        // WITNESS_UNKNOWN and ANCHOR: any witness program that is not v0.
-        // (v0 keyhash / scripthash are wrappable; Core lists them above the
-        // early return.)
-        || (script.is_witness_program() && !script.is_p2wpkh() && !script.is_p2wsh())
-    {
+    // The five `TxoutType`s Core returns false for outright. A v0 witness
+    // program of the wrong length is `nonstandard` to Core's `Solver`, not
+    // `witness_unknown`, so it can be wrapped.
+    if matches!(
+        script_type(script),
+        "nulldata" | "scripthash" | "witness_unknown" | "witness_v1_taproot" | "anchor"
+    ) {
         return false;
     }
-    // `!script.HasValidOps() || script.IsUnspendable()`.
-    if !has_valid_ops(script) || script.len() > MAX_SCRIPT_SIZE {
+    // `!script.HasValidOps() || script.IsUnspendable()`. `IsUnspendable` is
+    // a leading `OP_RETURN` whatever follows it, so it also covers the
+    // `OP_RETURN` scripts `Solver` calls nonstandard.
+    if !has_valid_ops(script) || script.is_op_return() || script.len() > MAX_SCRIPT_SIZE {
         return false;
     }
     // `if (op == OP_CHECKSIGADD || IsOpSuccess(op)) return false;`

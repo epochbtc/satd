@@ -369,4 +369,63 @@ mod tests {
             assert_eq!(got["asm"], v["core"]["asm"], "decodescript {name}");
         }
     }
+
+    /// `decodescript` answers what Core's does, field for field: `asm`,
+    /// `desc`, `address`, `type`, `p2sh`, and the `segwit` object with its
+    /// own `asm`, `hex`, `type`, `address`, `desc` (`wsh(multi())` or a
+    /// miniscript where the witness script infers, `addr()` otherwise) and
+    /// `p2sh-segwit`. `segwit` is absent for an uncompressed key and for a
+    /// script that is already a witness program, and present for a P2WPKH
+    /// wrapping of a compressed P2PK or a P2PKH. Perturbation: drop `desc`
+    /// from `decode_script`, or report `segwit` for every wrappable script,
+    /// and this fails.
+    #[test]
+    fn decodescript_matches_core() {
+        let core = core();
+        for (name, v) in core["decodescript"].as_object().unwrap() {
+            let got = crate::rpc::rawtx::decode_script(v["hex"].as_str().unwrap(), bitcoin::Network::Regtest).unwrap();
+            assert_eq!(got, v["core"], "decodescript {name}");
+        }
+    }
+
+    /// Every scriptPubKey object a transaction decodes to, vout and prevout,
+    /// is Core's `ScriptToUniv(include_hex, include_address)`, `desc`
+    /// included. Perturbation: drop `desc` from `script_pubkey_json` and
+    /// this fails.
+    #[test]
+    fn tx_script_pubkeys_match_core() {
+        let core = core();
+        let tx = &core["decoderawtransaction"]["tx"];
+        let raw = hex::decode(tx["hex"].as_str().unwrap()).unwrap();
+        let decoded: bitcoin::Transaction = bitcoin::consensus::deserialize(&raw).unwrap();
+        let n_out = decoded.output.len();
+        let undo: Vec<crate::storage::coinview::Coin> = (0..decoded.input.len())
+            .map(|i| crate::storage::coinview::Coin {
+                amount: 1000,
+                script_pubkey: decoded.output[i % n_out].script_pubkey.clone(),
+                height: 1,
+                coinbase: false,
+                txseq: 0,
+            })
+            .collect();
+        let got = crate::rpc::rawtx::decode_transaction_verbose_net(
+            &decoded,
+            None,
+            Some(&undo),
+            true,
+            true,
+            bitcoin::Network::Regtest,
+        );
+        let core_tx = &tx["core"];
+        for i in 0..n_out {
+            assert_eq!(got["vout"][i]["scriptPubKey"], core_tx["vout"][i]["scriptPubKey"], "vout {i}");
+        }
+        for i in 0..decoded.input.len() {
+            assert_eq!(
+                got["vin"][i]["prevout"]["scriptPubKey"],
+                core_tx["vout"][i % n_out]["scriptPubKey"],
+                "prevout {i}"
+            );
+        }
+    }
 }
