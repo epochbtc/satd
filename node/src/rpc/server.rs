@@ -1930,8 +1930,9 @@ pub async fn start(
         // Decode the transaction for pre-submit checks.
         let tx_bytes = hex::decode(&hex_tx)
             .map_err(|_| ErrorObjectOwned::owned(-22, "TX decode failed", None::<()>))?;
-        let tx: bitcoin::Transaction = bitcoin::consensus::deserialize(&tx_bytes)
-            .map_err(|_| ErrorObjectOwned::owned(-22, "TX decode failed", None::<()>))?;
+        // Core's `DecodeHexTx` with both readings allowed (`rawtx::decode_tx`).
+        let tx: bitcoin::Transaction = rawtx::decode_tx(&tx_bytes, true, true)
+            .ok_or_else(|| ErrorObjectOwned::owned(-22, "TX decode failed", None::<()>))?;
 
         // maxburnamount check: Core checks each output individually — any
         // single unspendable output whose value exceeds maxburnamount is
@@ -2289,8 +2290,8 @@ pub async fn start(
         for hex_tx in &rawtxs {
             let tx_bytes = hex::decode(hex_tx)
                 .map_err(|_| ErrorObjectOwned::owned(-22, "TX decode failed", None::<()>))?;
-            let tx: bitcoin::Transaction = bitcoin::consensus::deserialize(&tx_bytes)
-                .map_err(|_| ErrorObjectOwned::owned(-22, "TX decode failed", None::<()>))?;
+            let tx: bitcoin::Transaction = rawtx::decode_tx(&tx_bytes, true, true)
+                .ok_or_else(|| ErrorObjectOwned::owned(-22, "TX decode failed", None::<()>))?;
             decoded.push(tx);
         }
 
@@ -2449,8 +2450,8 @@ pub async fn start(
         for hex_tx in &rawtxs {
             let tx_bytes = hex::decode(hex_tx)
                 .map_err(|_| ErrorObjectOwned::owned(-22, "TX decode failed", None::<()>))?;
-            let tx: bitcoin::Transaction = bitcoin::consensus::deserialize(&tx_bytes)
-                .map_err(|_| ErrorObjectOwned::owned(-22, "TX decode failed", None::<()>))?;
+            let tx: bitcoin::Transaction = rawtx::decode_tx(&tx_bytes, true, true)
+                .ok_or_else(|| ErrorObjectOwned::owned(-22, "TX decode failed", None::<()>))?;
             for out in &tx.output {
                 if rawtx::is_burn_output(out) && out.value.to_sat() > maxburnamount_sat {
                     return Err(ErrorObjectOwned::owned(

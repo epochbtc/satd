@@ -34,10 +34,13 @@ pub fn submit_block(
     // and rejects trailing bytes — a problem for the functional test
     // `interface_http.py`, which sends a 4 MB garbage payload that
     // still starts with a decodable (all-zeros) header + 0 txs.
+    //
+    // The transactions are read as Core's `UnserializeTransaction` reads them
+    // (`validation::decode`). `Block::consensus_decode` read at most
+    // `MAX_VEC_SIZE` bytes; the slice keeps that limit.
     let mut block: bitcoin::Block = {
-        use bitcoin::consensus::Decodable;
-        let mut cursor = std::io::Cursor::new(&block_bytes);
-        bitcoin::Block::consensus_decode(&mut cursor).map_err(|_| decode_failed())?
+        let limit = block_bytes.len().min(bitcoin::consensus::encode::MAX_VEC_SIZE);
+        crate::validation::decode::read_block(&mut &block_bytes[..limit]).map_err(|_| decode_failed())?
     };
 
     // Core runs `UpdateUncommittedBlockStructures` whenever the parent is in
@@ -533,7 +536,7 @@ pub fn get_block_template_proposal(
 ) -> Result<Value, (i32, String)> {
     let block_bytes = hex::decode(hex_data)
         .map_err(|_| (-22, "Block decode failed".to_string()))?;
-    let block: bitcoin::Block = bitcoin::consensus::deserialize(&block_bytes)
+    let block: bitcoin::Block = crate::validation::decode::deserialize_block(&block_bytes)
         .map_err(|_| (-22, "Block decode failed".to_string()))?;
 
     // Core's `BIP22ValidationResult`: a valid proposal is JSON null, an

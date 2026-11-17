@@ -20,6 +20,7 @@ It includes every fix shipped in 0.7.1:
 - Consensus: `-test=bip94` enforces BIP 94's timewarp rule on regtest, as in Core (#1245).
 - Consensus: P2SH, WITNESS and TAPROOT are on for every block except Core's three exception blocks, as in Core, instead of from activation heights; main-chain verdicts are unchanged (#1244, #724).
 - Consensus: the Rust engine reports a tapscript push past the script's end as `BAD_OPCODE`, as Core does; verdicts are unchanged.
+- Consensus: transactions are decoded as Core decodes them: `version | 00 00 | lock_time` is a transaction with no inputs, refused as `bad-txns-vin-empty` where satd refused the bytes, and a witness flag with no inputs is a decode failure; verdicts are unchanged (#1242).
 - Dependencies: `rmcp` 3.9.0 (RUSTSEC-2026-0457, -0462; client features satd does not build); MCP requests are capped at 4 MiB.
 - RPC: any request `Content-Type` is read as JSON, as in Core (#824).
 - RPC: `invalidateblock`, `reconsiderblock` and `preciousblock` go on to the next-best valid chain, as in Core (#1261).

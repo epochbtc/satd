@@ -282,3 +282,28 @@ fn what_rust_bitcoin_writes_reads_back() {
         assert_eq!(decode_v1_frame(&wire).unwrap(), msg);
     }
 }
+
+/// `version | 00 00 | lock_time` is a transaction with no inputs to Core's
+/// `UnserializeTransaction`, which the mempool then refuses as
+/// `bad-txns-vin-empty`; rust-bitcoin refuses the bytes (#1242). A `block`
+/// holding it decodes too, so block validation refuses it.
+#[test]
+fn a_transaction_with_no_inputs_reads_as_core_reads_it() {
+    const EMPTY: [u8; 10] = [2, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    let wire = frame(b"tx", &EMPTY);
+    assert!(deserialize::<RawNetworkMessage>(&wire).is_err(), "rust-bitcoin refuses it");
+    match decode_v1_frame(&wire).unwrap() {
+        NetworkMessage::Tx(tx) => assert!(tx.input.is_empty() && tx.output.is_empty()),
+        other => panic!("not a tx: {other:?}"),
+    }
+
+    let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+    let mut payload = encode::serialize(&genesis.header);
+    payload.push(2);
+    payload.extend(encode::serialize(&genesis.txdata[0]));
+    payload.extend_from_slice(&EMPTY);
+    match decode_payload(cmd("block"), &payload).unwrap() {
+        NetworkMessage::Block(block) => assert!(block.txdata[1].input.is_empty()),
+        other => panic!("not a block: {other:?}"),
+    }
+}

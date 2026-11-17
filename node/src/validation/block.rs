@@ -340,9 +340,13 @@ fn verify_witness_commitment(
     let mut wtxid_hashes: Vec<[u8; 32]> = Vec::new();
     wtxid_hashes.push([0u8; 32]); // coinbase
     for (i, tx) in block.txdata.iter().enumerate().skip(1) {
+        // Core's `GetWitnessHash`, which is the txid for a transaction with
+        // no inputs (`validation::decode::wtxid`). Only an invalid block holds
+        // one, but its commitment must be judged on Core's value: otherwise
+        // a block Core refuses as `bad-txns-vin-empty` reads as mutated.
         let wtxid = match wtxids {
             Some(w) => w[i],
-            None => tx.compute_wtxid(),
+            None => crate::validation::decode::wtxid(tx),
         };
         wtxid_hashes.push(wtxid.to_raw_hash().to_byte_array());
     }
@@ -1537,6 +1541,40 @@ mod tests {
             check(&block, SEGWIT_ON).is_ok(),
             "a committed block with a zero nonce and no witness txs is the \
              common mainnet shape and must pass"
+        );
+    }
+
+    /// A block holding Core's ten-byte transaction with no inputs, its
+    /// commitment over Core's wtxid for it (the txid). Core's
+    /// `IsBlockMutated` passes it and `CheckBlock` refuses it as
+    /// `bad-txns-vin-empty` (#1242); rust-bitcoin's wtxid for it hashes the
+    /// extended form, which would make it a mutated block here.
+    #[test]
+    fn a_commitment_over_an_input_less_transaction_uses_cores_wtxid() {
+        use bitcoin::hashes::Hash as _;
+
+        let empty = crate::validation::decode::deserialize_transaction(&[2, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+            .expect("Core reads it");
+        let mut block = segwit_block_with_commitment();
+        block.txdata.truncate(1);
+        block.txdata.push(empty.clone());
+        let wtxid_hashes = [[0u8; 32], empty.compute_txid().to_raw_hash().to_byte_array()];
+        let witness_root = compute_merkle_root_from_hashes(&wtxid_hashes);
+        let mut preimage = [0u8; 64];
+        preimage[..32].copy_from_slice(&witness_root);
+        let commitment = bitcoin::hashes::sha256d::Hash::hash(&preimage).to_byte_array();
+        let mut script = Vec::with_capacity(38);
+        script.extend_from_slice(&WITNESS_COMMITMENT_HEADER);
+        script.extend_from_slice(&commitment);
+        let last = block.txdata[0].output.len() - 1;
+        block.txdata[0].output[last].script_pubkey = bitcoin::ScriptBuf::from(script);
+        block.header.merkle_root = block.compute_merkle_root().unwrap();
+
+        assert!(!is_block_mutated(&block, true), "Core's IsBlockMutated passes it");
+        assert!(check(&block, SEGWIT_ON).is_ok());
+        assert_eq!(
+            crate::validation::tx::check_transaction(&block.txdata[1]).unwrap_err().to_string(),
+            "bad-txns-vin-empty"
         );
     }
 

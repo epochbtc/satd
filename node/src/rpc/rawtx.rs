@@ -299,8 +299,8 @@ pub(crate) fn decode_tx(
     try_witness: bool,
 ) -> Option<bitcoin::Transaction> {
     let extended = if try_witness {
-        // rust-bitcoin's `deserialize` already requires full consumption.
-        bitcoin::consensus::deserialize::<bitcoin::Transaction>(tx_bytes).ok()
+        // Core's `TX_WITH_WITNESS` reading, which requires full consumption.
+        crate::validation::decode::deserialize_transaction(tx_bytes).ok()
     } else {
         None
     };
