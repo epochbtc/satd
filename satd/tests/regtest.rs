@@ -20425,8 +20425,18 @@ fn a_custom_signet_in_the_old_signet_directory_is_refused_with_the_moves() {
     std::fs::rename(datadir.join(own), datadir.join("signet")).unwrap();
     std::fs::rename(blocks_root.join(own), blocks_root.join("signet")).unwrap();
 
+    // An aborted start can leave the new directory behind, empty: it is no
+    // chainstate, so the check still runs, and it is moved aside first.
+    std::fs::create_dir(datadir.join(own)).unwrap();
+
     let (status, stderr) = run_satd_until_exit_on("--signet", &datadir, &args, test_timeout(60));
     assert!(!status.success(), "{stderr}");
+    let aside = format!(
+        "  mv {} {}.unused\n",
+        datadir.join(own).display(),
+        datadir.join(own).display()
+    );
+    assert!(stderr.contains(&aside), "no `{}` in:\n{stderr}", aside.trim());
     for root in [&datadir, &blocks_root] {
         let mv = format!(
             "  mv {} {}\n",
@@ -20434,12 +20444,19 @@ fn a_custom_signet_in_the_old_signet_directory_is_refused_with_the_moves() {
             root.join(own).display()
         );
         assert!(stderr.contains(&mv), "no `{}` in:\n{stderr}", mv.trim());
-        assert!(!root.join(own).exists(), "the refused start created {own}");
+        assert!(root.join("signet").exists(), "the refused start moved {}", root.display());
     }
+    assert!(!blocks_root.join(own).exists(), "the refused start created {own}");
     assert!(stderr.contains("Nothing was changed."), "{stderr}");
 
-    std::fs::rename(datadir.join("signet"), datadir.join(own)).unwrap();
-    std::fs::rename(blocks_root.join("signet"), blocks_root.join(own)).unwrap();
+    // Run the printed commands as printed.
+    let script: String = stderr
+        .lines()
+        .filter(|l| l.starts_with("  mv ") || l.starts_with("  mkdir "))
+        .map(|l| format!("{}\n", l.trim()))
+        .collect();
+    let ran = Command::new("sh").arg("-ec").arg(&script).status().unwrap();
+    assert!(ran.success(), "{script}");
     let mut node =
         TestNode::start_with_datadir_on("--signet", own, &datadir, rpcport, &args, &[]);
     assert_eq!(node.rpc_call("getblockcount").unwrap()["result"], 1);

@@ -238,24 +238,32 @@ fn shell_quote(path: &std::path::Path) -> String {
 
 /// A custom signet's datadir is `signet_<message start>`, as in Core's
 /// `GetSignetDataDir` (#1271). Earlier releases kept every signet in
-/// `signet/`. When this signet's own directory does not exist yet and
-/// `signet/` holds a chainstate, look at its tip: if its solution satisfies
-/// this node's challenge and not the default one, `signet/` is this signet's
-/// chain, and starting in the new directory would sync it again from
-/// genesis. Refuse instead, with the commands that move it. Nothing is moved
-/// or written here; the chainstate is opened read-only.
+/// `signet/`. When this signet's own directory holds no chainstate yet and
+/// `signet/` does, look at its tip: if its solution satisfies this node's
+/// challenge and not the default one, `signet/` is this signet's chain, and
+/// starting in the new directory would sync it again from genesis. Refuse
+/// instead, with the commands that move it. Nothing is moved or written
+/// here; the chainstate is opened read-only.
 ///
 /// A `signet/` holding only genesis, the default signet or another signet is
 /// left alone, and the node starts in its own directory. So does one that
 /// cannot be read, with a warning that names the move.
 fn check_old_signet_datadir(config: &Config, net_datadir: &std::path::Path) {
+    use node::chain::signet_datadir::{SignetDirContents, inspect};
+    use std::path::{Path, PathBuf};
+
     let Some(challenge) = config.signet_challenge.as_deref() else {
         return;
     };
     let old_name = "signet";
+    let Some(new_name) = net_datadir.file_name().map(|n| n.to_os_string()) else {
+        return;
+    };
     if config.network != bitcoin::Network::Signet
-        || net_datadir.file_name().is_some_and(|n| n == old_name)
-        || net_datadir.exists()
+        || new_name == old_name
+        // A directory left by an aborted start, or made by hand, holds no
+        // chainstate and does not count as this signet's.
+        || net_datadir.join("chainstate").exists()
     {
         return;
     }
@@ -263,27 +271,61 @@ fn check_old_signet_datadir(config: &Config, net_datadir: &std::path::Path) {
     if !old_datadir.join("chainstate").is_dir() {
         return;
     }
-    let old_blocks = config::resolve_blocks_dir(
-        config.blocksdir.as_deref(),
-        &config.datadir,
-        bitcoin::Network::Signet,
-        None,
-    );
-    let mut moves = vec![(old_datadir.clone(), net_datadir.to_path_buf())];
-    if let Some(root) = config.blocksdir.as_deref() {
-        let old_root = root.join(old_name);
-        if old_root != old_datadir && old_root.exists() {
-            let new_name = net_datadir.file_name().map(|n| n.to_os_string()).unwrap_or_default();
-            moves.push((old_root, root.join(new_name)));
+    // Where the old directory's blocks can be: under it, or under
+    // `-blocksdir`, which may have been added or dropped since it ran.
+    let old_blocks_root = config.blocksdir.as_deref().map(|r| r.join(old_name));
+    let mut candidates = vec![old_datadir.join("blocks")];
+    if let Some(root) = &old_blocks_root
+        && !candidates.contains(&root.join("blocks"))
+    {
+        candidates.push(root.join("blocks"));
+    }
+    let contents = inspect(&old_datadir.join("chainstate"), &candidates, challenge);
+
+    // The moves, as commands. A target that already exists (it can only
+    // lack a chainstate, see above) is moved aside first, so `mv` renames
+    // rather than nesting the source inside it.
+    let new_blocks = config.blocks_dir();
+    let found_blocks = match &contents {
+        SignetDirContents::ThisSignet { blocks_dir, .. } => blocks_dir.clone(),
+        _ => candidates.iter().rev().find(|d| d.exists()).cloned().unwrap_or_else(|| candidates[0].clone()),
+    };
+    let mut commands: Vec<String> = Vec::new();
+    let mv = |commands: &mut Vec<String>, from: &Path, to: &Path| {
+        if to.exists() {
+            let mut aside = to.as_os_str().to_os_string();
+            aside.push(".unused");
+            commands.push(format!("mv {} {}", shell_quote(to), shell_quote(Path::new(&aside))));
+        }
+        commands.push(format!("mv {} {}", shell_quote(from), shell_quote(to)));
+    };
+    mv(&mut commands, &old_datadir, net_datadir);
+    let blocks_after_first_move: PathBuf = match found_blocks.strip_prefix(&old_datadir) {
+        Ok(rel) => net_datadir.join(rel),
+        Err(_) => found_blocks.clone(),
+    };
+    if blocks_after_first_move != new_blocks {
+        match (&old_blocks_root, config.blocksdir.as_deref()) {
+            // The usual `-blocksdir` case: its `signet/` subtree is renamed
+            // whole.
+            (Some(old_root), Some(root)) if found_blocks == old_root.join("blocks") => {
+                mv(&mut commands, old_root, &root.join(&new_name));
+            }
+            _ => {
+                if let Some(parent) = new_blocks.parent()
+                    && !parent.exists()
+                    && parent != net_datadir
+                {
+                    commands.push(format!("mkdir -p {}", shell_quote(parent)));
+                }
+                mv(&mut commands, &blocks_after_first_move, &new_blocks);
+            }
         }
     }
-    let commands: String = moves
-        .iter()
-        .map(|(from, to)| format!("  mv {} {}\n", shell_quote(from), shell_quote(to)))
-        .collect();
-    use node::chain::signet_datadir::{SignetDirContents, inspect};
-    match inspect(&old_datadir.join("chainstate"), &old_blocks, challenge) {
-        SignetDirContents::ThisSignet { height, hash } => {
+    let commands: String = commands.iter().map(|c| format!("  {c}\n")).collect();
+
+    match contents {
+        SignetDirContents::ThisSignet { height, hash, .. } => {
             eprintln!(
                 "Error: a custom signet (-signetchallenge) keeps its data in {}, as in Bitcoin \
                  Core (bitcoin/bitcoin#34566), but this signet's chain is in {} (its tip, \

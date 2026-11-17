@@ -122,7 +122,7 @@ cookie_link() { readlink "$1/rpc-cookie"; }
 render "$WORK/new/satd" "$WORK/s1" NETWORK=signet
 if [[ $(cookie_link "$WORK/s1") == signet/.cookie ]]; then ok "default signet: signet/.cookie"; else bad "default signet: $(cookie_link "$WORK/s1")"; fi
 mkdir -p "$WORK/s2/conf.d"
-printf '[signet]\nsignetchallenge=51\n' > "$WORK/s2/conf.d/local.conf"
+printf '[signet]\nsignetchallenge=51  # an OP_TRUE signet\n' > "$WORK/s2/conf.d/local.conf"
 render "$WORK/new/satd" "$WORK/s2" NETWORK=signet
 if [[ $(cookie_link "$WORK/s2") == signet_54d26fbd/.cookie ]]; then ok "custom signet: signet_54d26fbd/.cookie"; else bad "custom signet: $(cookie_link "$WORK/s2")"; fi
 mkdir -p "$WORK/s3/conf.d"

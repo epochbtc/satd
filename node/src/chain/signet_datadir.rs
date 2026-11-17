@@ -12,7 +12,7 @@
 //! Nothing here writes. The chainstate is opened read-only and the tip
 //! block is read straight from its block file.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use bitcoin::{Block, BlockHash, Network};
 
@@ -29,18 +29,29 @@ pub enum SignetDirContents {
     /// challenge.
     DefaultSignet,
     /// This custom signet: the tip's solution fails the default challenge
-    /// and satisfies the configured one.
-    ThisSignet { height: u32, hash: BlockHash },
+    /// and satisfies the configured one. `blocks_dir` is the candidate that
+    /// held the tip block.
+    ThisSignet {
+        height: u32,
+        hash: BlockHash,
+        blocks_dir: PathBuf,
+    },
     /// Some other signet: the tip's solution satisfies neither challenge.
     OtherSignet,
     /// The chainstate or the tip block could not be read.
     Unreadable(String),
 }
 
-/// Read the tip of the chainstate in `chainstate_dir` (its blocks in
-/// `blocks_dir`) and check its signet solution against the default
-/// challenge and `challenge`.
-pub fn inspect(chainstate_dir: &Path, blocks_dir: &Path, challenge: &[u8]) -> SignetDirContents {
+/// Read the tip of the chainstate in `chainstate_dir` and check its signet
+/// solution against the default challenge and `challenge`. The tip block is
+/// looked for in each of `blocks_dirs` in turn: where the blocks were
+/// depends on the `-blocksdir` the old directory ran with, which need not be
+/// this start's.
+pub fn inspect(
+    chainstate_dir: &Path,
+    blocks_dirs: &[PathBuf],
+    challenge: &[u8],
+) -> SignetDirContents {
     let (hash, entry) = match read_tip_read_only(chainstate_dir) {
         Ok(Some(tip)) => tip,
         Ok(None) => return SignetDirContents::Genesis,
@@ -53,19 +64,27 @@ pub fn inspect(chainstate_dir: &Path, blocks_dir: &Path, challenge: &[u8]) -> Si
         file_number: entry.file_number,
         data_pos: entry.data_pos,
     };
-    let block: Block = match read_record_read_only(blocks_dir, &pos)
-        .map_err(|e| e.to_string())
-        .and_then(|raw| bitcoin::consensus::deserialize(&raw).map_err(|e| e.to_string()))
-    {
-        Ok(b) => b,
-        Err(e) => return SignetDirContents::Unreadable(format!("tip block {hash}: {e}")),
-    };
-    if block.block_hash() != hash {
-        return SignetDirContents::Unreadable(format!(
-            "the block file record for tip {hash} holds block {}",
-            block.block_hash()
-        ));
+    let mut errors = Vec::new();
+    let mut found = None;
+    for dir in blocks_dirs {
+        let block: Result<Block, String> = read_record_read_only(dir, &pos)
+            .map_err(|e| e.to_string())
+            .and_then(|raw| bitcoin::consensus::deserialize(&raw).map_err(|e| e.to_string()));
+        match block {
+            Ok(b) if b.block_hash() == hash => {
+                found = Some((b, dir.clone()));
+                break;
+            }
+            Ok(b) => errors.push(format!("{}: holds block {}", dir.display(), b.block_hash())),
+            Err(e) => errors.push(format!("{}: {e}", dir.display())),
+        }
     }
+    let Some((block, blocks_dir)) = found else {
+        return SignetDirContents::Unreadable(format!(
+            "tip block {hash} not found ({})",
+            errors.join("; ")
+        ));
+    };
     let genesis = bitcoin::constants::genesis_block(Network::Signet).block_hash();
     if check_signet_block_solution(&block, &DEFAULT_SIGNET_CHALLENGE, genesis).is_ok() {
         SignetDirContents::DefaultSignet
@@ -73,6 +92,7 @@ pub fn inspect(chainstate_dir: &Path, blocks_dir: &Path, challenge: &[u8]) -> Si
         SignetDirContents::ThisSignet {
             height: entry.height,
             hash,
+            blocks_dir,
         }
     } else {
         SignetDirContents::OtherSignet
@@ -166,7 +186,7 @@ mod tests {
     }
 
     fn look(dir: &tempfile::TempDir, challenge: &[u8]) -> SignetDirContents {
-        inspect(&dir.path().join("chainstate"), &dir.path().join("blocks"), challenge)
+        inspect(&dir.path().join("chainstate"), &[dir.path().join("blocks")], challenge)
     }
 
     /// #1271: the tip's solution tells which signet an old `signet/` holds.
@@ -185,9 +205,21 @@ mod tests {
             look(&dir, &op_true),
             SignetDirContents::ThisSignet {
                 height: 1,
-                hash: custom.block_hash()
+                hash: custom.block_hash(),
+                blocks_dir: dir.path().join("blocks"),
             }
         );
+        // The blocks are found wherever they are among the candidates: a
+        // `-blocksdir` added or dropped since the old directory ran.
+        let elsewhere = tempfile::tempdir().unwrap();
+        assert!(matches!(
+            inspect(
+                &dir.path().join("chainstate"),
+                &[elsewhere.path().to_path_buf(), dir.path().join("blocks")],
+                &op_true
+            ),
+            SignetDirContents::ThisSignet { blocks_dir, .. } if blocks_dir == dir.path().join("blocks")
+        ));
         // OP_FALSE accepts nothing: some other signet's chain.
         assert_eq!(look(&dir, &[0x00]), SignetDirContents::OtherSignet);
 

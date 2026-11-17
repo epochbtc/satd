@@ -443,6 +443,8 @@ mod tests {
         assert_eq!(signet_data_dir(Some(&multisig)), "signet_93abaa9b");
         // A challenge past 252 bytes takes a 3-byte compact-size prefix.
         assert_eq!(signet_data_dir(Some(&[0x6a; 300])), "signet_a9503e92");
+        // Past 65,535 bytes: a 5-byte compact-size prefix.
+        assert_eq!(signet_data_dir(Some(&[0x6a; 70_000])), "signet_3c08542a");
     }
 
     use bitcoin::blockdata::opcodes::all::OP_PUSHNUM_1;

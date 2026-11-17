@@ -303,16 +303,22 @@ signet_dir() { # <challenge hex, or empty for none> <set: 1 when given>
     len=$(( ${#hex} / 2 ))
     if (( len < 253 )); then
         prefix=$(printf '%02x' "$len")
-    else
+    elif (( len < 65536 )); then
         prefix=$(printf 'fd%02x%02x' $(( len & 255 )) $(( len >> 8 )))
+    else
+        prefix=$(printf 'fe%02x%02x%02x%02x' $(( len & 255 )) $(( (len >> 8) & 255 )) \
+            $(( (len >> 16) & 255 )) $(( len >> 24 )))
     fi
     local first
     first=$(hex_bytes "$prefix$hex" | sha256sum | cut -c1-64)
     echo "signet_$(hex_bytes "$first" | sha256sum | cut -c1-8)"
 }
 # The value satd reads: the [signet] section's first, else the top level's.
+# As in satd's parser, `#` anywhere on a line starts a comment. (A challenge
+# set only in an `includeconf` file is not seen here; put it in local.conf.)
 signet_challenge_line() {
     awk '
+        { sub(/#.*/, "") }
         /^[[:space:]]*\[/ { sec = $0; gsub(/[[:space:]]/, "", sec); next }
         /^[[:space:]]*signetchallenge[[:space:]]*=/ {
             v = substr($0, index($0, "=") + 1); gsub(/^[[:space:]]+|[[:space:]]+$/, "", v)

@@ -483,6 +483,7 @@ mod tests {
         let multisig = format!("512102{}51ae", "11".repeat(32));
         assert_eq!(signet_data_dir(Some(&multisig)), "signet_93abaa9b");
         assert_eq!(signet_data_dir(Some(&"6a".repeat(300))), "signet_a9503e92");
+        assert_eq!(signet_data_dir(Some(&"6a".repeat(70_000))), "signet_3c08542a");
     }
 
     /// #1271: a custom signet's cookie is in its own directory, with the
