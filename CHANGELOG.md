@@ -99,6 +99,7 @@ It includes every fix shipped in 0.7.1:
 - RPC: `addnode` refuses an empty node with Core's `-8` error; `addnode "" add` kept it and retried it forever. Also in 0.7.2.
 - RPC: every `asm` field is Core's `ScriptToAsmStr`: bare hex pushes, small numbers as numbers, Core's opcode names, and a scriptSig signature's sighash type decoded (`[ALL]`); it was rust-bitcoin's format (`OP_PUSHBYTES_20`, `OP_0`, `OP_CSV`). Electrum's verbose `blockchain.transaction.get` too (#1265).
 - RPC: every scriptPubKey object (`decoderawtransaction`, `getrawtransaction`, `getblock` 2/3, Electrum's verbose transaction) carries Core's inferred `desc`; `decodescript` adds `desc`, `address` and the `segwit` object, as in Core (#1266).
+- RPC: integer and verbosity arguments are parsed as in Core: a negative `getblock`/`getrawtransaction` verbosity means hex and a too-high one the top level, a fraction or a value outside the argument's C++ type is `-1 JSON integer out of range`, and each method answers Core's range error (#1267).
 
 ## Releases
 

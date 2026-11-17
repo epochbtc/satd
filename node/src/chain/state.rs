@@ -15673,12 +15673,13 @@ pub(crate) mod tests {
         assert_eq!(tip_stats["window_final_block_height"], 3);
 
         // Explicit historical blockhash (height 2): cumulative = 6, window
-        // of 2 sums heights 1..=2 = 2+3 = 5.
+        // of 1 is height 2 alone = 3. (Core refuses a window reaching the
+        // final block's height, so 2 is not a valid count here.)
         let hist =
-            crate::rpc::blockchain::get_chain_tx_stats(&cs, Some(2), Some(hashes[2])).unwrap();
+            crate::rpc::blockchain::get_chain_tx_stats(&cs, Some(1), Some(hashes[2])).unwrap();
         assert_eq!(hist["txcount"], 6);
-        assert_eq!(hist["window_block_count"], 2);
-        assert_eq!(hist["window_tx_count"], 5);
+        assert_eq!(hist["window_block_count"], 1);
+        assert_eq!(hist["window_tx_count"], 3);
         assert_eq!(hist["window_final_block_height"], 2);
 
         // An unknown block hash → error.
@@ -17329,14 +17330,14 @@ pub(crate) mod tests {
 
         // The side block the polluted row names is now accepted: the index is
         // the fast path, and only a writer bug can put a side block in it.
-        let stats = crate::rpc::blockchain::get_chain_tx_stats(&cs, Some(1), Some(b1_hash))
+        let stats = crate::rpc::blockchain::get_chain_tx_stats(&cs, None, Some(b1_hash))
             .expect("the index row is trusted for a positive answer");
         assert_eq!(stats["window_final_block_hash"], b1_hash.to_string());
 
         // The half that still matters, and the one a correct caller depends on:
         // the genuinely-active A1 is accepted even though the height index no
         // longer points at it. Delete the fallback walk and this fails.
-        let ok = crate::rpc::blockchain::get_chain_tx_stats(&cs, Some(1), Some(a1_hash))
+        let ok = crate::rpc::blockchain::get_chain_tx_stats(&cs, None, Some(a1_hash))
             .expect("A1 is on the active chain");
         assert_eq!(ok["window_final_block_height"], 1);
 
