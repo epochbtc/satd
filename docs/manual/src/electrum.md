@@ -15,8 +15,8 @@ the address index for scripthash history (on by default) and
 `--txindex=1` for the confirmed-transaction and merkle-proof methods
 (off by default). Startup fails if either index is disabled.
 
-- Protocol version: `1.4` (`protocol_min` and `protocol_max`), negotiated
-  per connection; see [Protocol version](#protocol-version).
+- Protocol versions: `1.4` (`protocol_min`) to `1.6` (`protocol_max`),
+  negotiated per connection; see [Protocol version](#protocol-version).
 - Transport: line-delimited JSON-RPC over plain TCP (default
   `127.0.0.1:50001`) and/or TLS (default port 50002). Expose the server
   over Tor / `.onion` rather than directly on the LAN.
@@ -34,11 +34,14 @@ the rule in the Electrum protocol spec (spesmilo/electrum-protocol,
 `docs/protocol-methods.rst`, `server.version`): the version is the lower of
 the client's maximum and satd's (`protocol_max`), and there is none in
 common when that is below the higher of the two minimums. A single string
-`v` is the range `[v, v]`. satd speaks `1.4` to `1.4`, so a client offering
-`["1.4", "1.6"]` (Electrum, BDK) or `["1.3", "1.4.2"]` (Sparrow) gets `1.4`.
+`v` is the range `[v, v]`. satd speaks `1.4` to `1.6`, so a client offering
+`["1.4", "1.6"]` (Electrum 4.7 and later, BDK's `electrum-client`) gets
+`1.6`, Sparrow's `["1.3", "1.4.2"]` gets `1.4.2`, and Electrum 4.6 and
+earlier, which ask for `"1.4"`, get `1.4`. `1.5` is a version number the
+protocol skipped; a client that negotiates it is served as at `1.4`.
 
 - **No version in common:** `server.version` answers an error (code 1,
-  `unsupported protocol version; server speaks 1.4`) and satd closes the
+  `unsupported protocol version; server speaks 1.4 to 1.6`) and satd closes the
   connection, as the spec requires and ElectrumX does.
 - **Only the first `server.version` is accepted.** A second one on the same
   connection answers the error `server.version already sent` (code 1); the
@@ -53,7 +56,21 @@ common when that is below the higher of the two minimums. A single string
   [Chain-tip stamps](#chain-tip-stamps).
 
 Every method is served at the versions the spec gives it; a method outside
-the connection's version answers "method not found" (`-32601`). satd's own
+the connection's version answers "method not found" (`-32601`). What 1.6
+changes:
+
+| | Below 1.6 | 1.6 |
+|---|---|---|
+| `blockchain.block.headers` | headers as one concatenated `hex` string | headers as a list, `headers: ["<hex>", ...]` |
+| `blockchain.relayfee` | served | removed: `mempool.get_info`'s `minrelaytxfee` replaces it |
+| `mempool.get_info` | not served | `mempoolminfee`, `minrelaytxfee`, `incrementalrelayfee` in BTC/kvB, as `getmempoolinfo` reports them |
+
+`blockchain.estimatefee`'s `mode` and `broadcast_package`'s `submitpackage`
+semantics (below) apply at every version. The canonical mempool order the
+1.6 spec mandates for the status hash and `get_mempool`, `(-height,
+tx_hash)`, is the order satd has always used.
+
+satd's own
 extensions (`blockchain.headers.get`, `blockchain.scripthash.get_first_use`,
 `blockchain.tweaks.subscribe`, and `blockchain.transaction.broadcast_package`
 below 1.6) and `blockchain.scripthash.unsubscribe` are served at every
@@ -126,8 +143,8 @@ exactly as in the Electrum protocol.
 |---|---|
 | `blockchain.headers.subscribe` | Subscribe to new-tip notifications; returns the current tip header and pushes on each new block. |
 | `blockchain.headers.get` | Fetch a header by height. |
-| `blockchain.block.header` | A block header (with an optional merkle proof to a checkpoint). |
-| `blockchain.block.headers` | A contiguous range of headers (with optional checkpoint proof). |
+| `blockchain.block.header` | A block header. A nonzero `cp_height` (checkpoint proof) is refused. |
+| `blockchain.block.headers` | A contiguous range of headers: one `hex` string below 1.6, a `headers` list from 1.6. A nonzero `cp_height` (checkpoint proof) is refused at every version. |
 
 ### Scripthash (address) queries
 
@@ -149,14 +166,15 @@ exactly as in the Electrum protocol.
 | `blockchain.transaction.get_merkle` | Merkle inclusion proof for a confirmed tx. Needs `--txindex`. |
 | `blockchain.transaction.id_from_pos` | Txid at a `(height, position)`, optionally with a merkle proof. Needs `--txindex`. |
 | `blockchain.transaction.broadcast` | Submit a raw transaction to the network. |
-| `blockchain.transaction.broadcast_package` | Submit a package of transactions (bounded by `--electrummaxbroadcastpackagetxs`). |
+| `blockchain.transaction.broadcast_package` | Submit a package, as `submitpackage` does: one child and its direct parents, sorted, the child last, accepted together so the child can pay for a parent below the minimum feerate. Answers `{"success": bool}` plus `errors: [{"txid", "error"}]` for refused members; with `verbose=true`, `submitpackage`'s own answer. A package of another shape is a JSON-RPC error. At most 25 transactions, and at most `--electrummaxbroadcastpackagetxs`. Served at every version. |
 
 ### Fees
 
 | Method | Description |
 |---|---|
-| `blockchain.estimatefee` | Estimated fee rate (BTC/kB) for a confirmation target. |
-| `blockchain.relayfee` | The node's minimum relay fee rate. |
+| `blockchain.estimatefee` | Estimated fee rate (BTC/kB) for a confirmation target. The optional `mode` is Core's `ECONOMICAL` (the default) or `CONSERVATIVE`, in any case, as `estimatesmartfee` takes it; any other mode is refused with `unknown estimatefee mode: <MODE>`. |
+| `blockchain.relayfee` | The node's minimum relay fee rate. Below 1.6 only. |
+| `mempool.get_info` | `mempoolminfee`, `minrelaytxfee` and `incrementalrelayfee` in BTC/kvB. From 1.6. |
 | `mempool.get_fee_histogram` | Mempool fee-rate histogram (cached; TTL `--electrumfeehistogramttl`). |
 
 ### Silent payments

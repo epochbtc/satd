@@ -72,6 +72,10 @@ impl node::net::manager::TxBroadcaster for NoBroadcast {
     ) -> Result<Txid, node::mempool::pool::MempoolError> {
         unreachable!("no test broadcasts")
     }
+
+    fn announce(&self, _txid: Txid) {
+        unreachable!("no test broadcasts")
+    }
 }
 
 /// An Esplora state over a regtest chainstate holding only genesis.

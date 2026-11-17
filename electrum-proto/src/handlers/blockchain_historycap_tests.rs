@@ -131,6 +131,8 @@ impl node::net::manager::TxBroadcaster for NoBroadcast {
     ) -> Result<Txid, node::mempool::pool::MempoolError> {
         unreachable!("no test broadcasts")
     }
+
+    fn announce(&self, _txid: Txid) {}
 }
 
 /// An Electrum state over an empty regtest chain and [`FixedIndex`], with

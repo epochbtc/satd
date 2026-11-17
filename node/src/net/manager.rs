@@ -16629,6 +16629,10 @@ pub trait TxBroadcaster: Send + Sync {
         source: crate::mempool::pool::TxSource,
         allow_quarantined: bool,
     ) -> Result<bitcoin::Txid, MempoolError>;
+
+    /// Announce `txid`, already accepted into the mempool by the caller (a
+    /// package accept), to peers.
+    fn announce(&self, txid: bitcoin::Txid);
 }
 
 impl TxBroadcaster for PeerManager {
@@ -16639,6 +16643,10 @@ impl TxBroadcaster for PeerManager {
         allow_quarantined: bool,
     ) -> Result<bitcoin::Txid, MempoolError> {
         PeerManager::submit_and_announce(self, tx, source, allow_quarantined)
+    }
+
+    fn announce(&self, txid: bitcoin::Txid) {
+        self.announce_tx(txid);
     }
 }
 

@@ -15661,7 +15661,7 @@ fn test_electrum_server_version_negotiates_once_per_connection() {
     let (mut sock, mut reader) = connect();
     let v = call(&mut sock, &mut reader, serde_json::json!({
         "id": 1, "method": "server.version", "params": ["test", ["1.4", "1.6"], "extra"]}));
-    assert_eq!(v["result"][1], "1.4", "{v}");
+    assert_eq!(v["result"][1], "1.6", "{v}");
     let v = call(&mut sock, &mut reader, serde_json::json!({
         "id": 2, "method": "server.version", "params": ["test", "1.4"]}));
     assert_eq!(v["error"]["message"], "server.version already sent", "{v}");
@@ -15671,15 +15671,16 @@ fn test_electrum_server_version_negotiates_once_per_connection() {
     // No version in common: the error, then the server closes.
     let (mut sock, mut reader) = connect();
     let v = call(&mut sock, &mut reader, serde_json::json!({
-        "id": 1, "method": "server.version", "params": ["test", "1.5"]}));
-    assert_eq!(v["error"]["message"], "unsupported protocol version; server speaks 1.4", "{v}");
+        "id": 1, "method": "server.version", "params": ["test", "1.3"]}));
+    assert_eq!(v["error"]["message"], "unsupported protocol version; server speaks 1.4 to 1.6", "{v}");
     let mut rest = String::new();
     assert_eq!(reader.read_line(&mut rest).unwrap_or(0), 0, "the connection closes: {rest:?}");
 
     // No `server.version` at all: served at 1.4.
     let (mut sock, mut reader) = connect();
     let v = call(&mut sock, &mut reader, serde_json::json!({"id": 1, "method": "server.features"}));
-    assert_eq!(v["result"]["protocol_max"], "1.4", "{v}");
+    assert_eq!(v["result"]["protocol_min"], "1.4", "{v}");
+    assert_eq!(v["result"]["protocol_max"], "1.6", "{v}");
 
     node.stop();
 }

@@ -34,7 +34,7 @@ fn client_status(history: &[electrum_client::GetHistoryRes]) -> Option<[u8; 32]>
 
 /// Sign a P2WPKH spend of `prevout` (worth `prev_value_sat`, paying
 /// `wallet.address`) to `dest`, less `fee_sat`. Returns the raw hex.
-fn sign_p2wpkh_spend(
+pub(super) fn sign_p2wpkh_spend(
     wallet: &DeterministicWallet,
     prevout: bitcoin::OutPoint,
     prev_value_sat: u64,
@@ -77,7 +77,7 @@ fn sign_p2wpkh_spend(
     hex::encode(bitcoin::consensus::serialize(&tx))
 }
 
-fn send(e2e: &E2eNode, raw_hex: &str) -> bitcoin::Txid {
+pub(super) fn send(e2e: &E2eNode, raw_hex: &str) -> bitcoin::Txid {
     let resp = e2e
         .node
         .rpc_call_with_params("sendrawtransaction", vec![serde_json::json!(raw_hex)])

@@ -3,7 +3,7 @@
 use parking_lot::Mutex;
 use std::time::{Duration, Instant};
 
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use crate::error::JsonRpcError;
 use crate::handlers::blockchain::fee_histogram_buckets;
@@ -109,6 +109,20 @@ pub(crate) fn compute_fee_histogram(mempool: &node::mempool::pool::Mempool) -> V
 
     let buckets = fee_histogram_buckets(&pairs);
     serde_json::to_value(&buckets).unwrap()
+}
+
+/// `mempool.get_info()` (protocol 1.6): the feerates `getmempoolinfo`
+/// reports, in BTC/kvB — `mempoolminfee` (the rolling minimum or the relay
+/// floor, whichever is higher), `minrelaytxfee` and `incrementalrelayfee`.
+/// It replaces `blockchain.relayfee`, which 1.6 removed.
+pub fn get_info(state: &ElectrumState) -> Result<Value, JsonRpcError> {
+    let to_btc = crate::handlers::blockchain::sat_per_kvb_to_btc_per_kb;
+    let min_relay = state.mempool.min_fee_rate();
+    Ok(json!({
+        "mempoolminfee": to_btc(state.mempool.min_fee().max(min_relay)),
+        "minrelaytxfee": to_btc(min_relay),
+        "incrementalrelayfee": to_btc(state.mempool.policy().incremental_relay_fee),
+    }))
 }
 
 #[cfg(test)]
