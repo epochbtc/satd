@@ -3,6 +3,9 @@
 //!
 //! Policy — executed every `TICK_INTERVAL`:
 //!
+//! `MemAvailable` below is the host's, clamped to the process's memory
+//! cgroup headroom (see `memstat`).
+//!
 //! - **IBD active** (headers_tip - tip > 1000): target budget = `0.40 *
 //!   MemAvailable`, clamped to [`MIN_BYTES`, `max_bytes`].
 //! - **Near tip**: target budget = `0.25 * MemAvailable`, clamped.

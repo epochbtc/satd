@@ -63,7 +63,7 @@ The `--profile=<preset>` flag replaces manual tuning of `-dbcache`,
 | `--esploratlsbind=<addr:port>` | None | Enables native TLS for the Esplora REST API. Requires `--esploratlscert` and `--esploratlskey`. |
 | `--v2transport=<0\|1>` | `1` | Enables BIP 324 v2 encrypted P2P transport. Offers and accepts the ElligatorSwift + ChaCha20-Poly1305 v2 handshake, and falls back to v1. |
 | `--v2only=<0\|1>` | `0` | satd-specific privacy flag. If `1`, refuses or immediately disconnects any peer not using the v2 encrypted P2P transport. |
-| `--dbcache=auto` | None | Spawns the adaptive dbcache resizing task, which scales the RocksDB block cache and the CoinCache clean-LRU in response to system memory pressure. |
+| `--dbcache=auto` | None | Spawns the adaptive dbcache resizing task, which scales the RocksDB block cache and the CoinCache clean-LRU in response to memory pressure. The starting cap is half of total memory, between 450 and 8192 MB; the controller then sizes from available memory. On Linux both figures are the host's `/proc/meminfo` clamped to the memory cgroup the node runs in (systemd `MemoryMax=`/`MemoryHigh=`, Docker `--memory`, an app-store container limit): the tightest `memory.max` or `memory.high` on the cgroup path, cgroup v2 or v1, and that limit less usage plus reclaimable page cache. Where no cgroup files can be read, the host figures apply. |
 
 ### Mempool Policy Sovereignty
 

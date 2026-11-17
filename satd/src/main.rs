@@ -4961,7 +4961,8 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
 
     // Spawn adaptive-dbcache controller if --dbcache=auto was requested.
     // It resizes the RocksDB block cache and the CoinCache clean LRU every
-    // 30 seconds based on /proc/meminfo MemAvailable.
+    // 30 seconds based on /proc/meminfo MemAvailable, clamped to the
+    // process's memory cgroup headroom.
     if config.dbcache_mode.is_auto() {
         let max_bytes = config.dbcache as u64 * 1_000_000;
         let cs = chain_state.clone();
@@ -4969,7 +4970,7 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
         node::adaptive_cache::spawn_adaptive_cache(cs, max_bytes, rx);
         tracing::info!(
             max_mb = config.dbcache,
-            "Adaptive dbcache enabled — cap set to max budget, adjusted from /proc/meminfo"
+            "Adaptive dbcache enabled — cap set to max budget, adjusted from host and cgroup memory"
         );
     }
 
