@@ -1817,8 +1817,9 @@ pub fn get_mempool_ancestors(
 
     if verbose {
         let mut result = serde_json::Map::new();
+        let mut chunks = crate::mempool::pool::ChunkCache::default();
         for anc_txid in &ancestors {
-            if let Some(entry_json) = mempool.get_entry_verbose(anc_txid) {
+            if let Some(entry_json) = mempool.get_entry_verbose_cached(anc_txid, &mut chunks) {
                 result.insert(anc_txid.to_string(), entry_json);
             }
         }
@@ -1845,8 +1846,9 @@ pub fn get_mempool_descendants(
 
     if verbose {
         let mut result = serde_json::Map::new();
+        let mut chunks = crate::mempool::pool::ChunkCache::default();
         for desc_txid in &descendants {
-            if let Some(entry_json) = mempool.get_entry_verbose(desc_txid) {
+            if let Some(entry_json) = mempool.get_entry_verbose_cached(desc_txid, &mut chunks) {
                 result.insert(desc_txid.to_string(), entry_json);
             }
         }
@@ -1877,9 +1879,10 @@ pub fn get_mempool_entry(
 /// Invalid txid strings produce a `null` entry keyed by the raw input.
 pub fn get_mempool_entries_bulk(mempool: &Mempool, txid_strs: &[String]) -> Value {
     let mut out = serde_json::Map::with_capacity(txid_strs.len());
+    let mut chunks = crate::mempool::pool::ChunkCache::default();
     for s in txid_strs {
         let entry = match s.parse::<bitcoin::Txid>() {
-            Ok(txid) => mempool.get_entry_verbose(&txid).unwrap_or(Value::Null),
+            Ok(txid) => mempool.get_entry_verbose_cached(&txid, &mut chunks).unwrap_or(Value::Null),
             Err(_) => Value::Null,
         };
         out.insert(s.clone(), entry);

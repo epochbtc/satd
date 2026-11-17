@@ -255,6 +255,19 @@ fn entry_reports_the_chunk_it_is_mined_in() {
         assert_eq!(chunk(&txid), (wp + wc + wg, "-0.00009700".to_string()));
     }
     assert_eq!(chunk(&l), (wl, "0.00001000".to_string()));
+
+    // A verbose view asks once per entry. The first member of a cluster
+    // linearizes it for all of them, and the rest are answered from the
+    // cache with the same values.
+    let mut cache = ChunkCache::default();
+    let first = mp.get_entry_verbose_cached(&g, &mut cache).expect("in the pool");
+    assert_eq!(cache.0.len(), 3, "one linearization fills the whole cluster");
+    for txid in [p, c] {
+        let cached = mp.get_entry_verbose_cached(&txid, &mut cache).expect("in the pool");
+        assert_eq!(cached, entry_json(&mp, &txid));
+    }
+    assert_eq!(first, entry_json(&mp, &g));
+    assert_eq!(cache.0.len(), 3);
     let _ = std::fs::remove_dir_all(&dir);
 }
 

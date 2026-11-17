@@ -82,6 +82,11 @@ fn now_unix_secs() -> u64 {
 
 /// The modified fee as Core keeps it (`CTxMemPoolEntry::m_modified_fee`):
 /// signed and unclamped, for the RPC rollups that report it.
+/// The chunks one RPC call has already computed, by txid, so a verbose
+/// view linearizes each cluster once ([`Mempool::get_entry_verbose_cached`]).
+#[derive(Default)]
+pub struct ChunkCache(HashMap<Txid, crate::mempool::feefrac::FeeFrac>);
+
 fn signed_modified_fee(base_fee: u64, delta: i64) -> i64 {
     (base_fee as i64).saturating_add(delta)
 }
@@ -4475,7 +4480,8 @@ impl Mempool {
         Self::acting_mining_order(&self.inner.read())
     }
 
-    /// The fee and sigop-adjusted weight of the chunk `txid` is mined in ([`clusters::chunk_of`]), for `getmempoolentry`'s
+    /// The fee and sigop-adjusted weight of the chunk `txid` is mined in
+    /// ([`clusters::chunk_feerates`]), for `getmempoolentry`'s
     /// `fees.chunk` and `chunkweight`. The cluster is every acting
     /// transaction `txid` reaches through spends either way. Fees are
     /// modified fees, signed as Core's `GetModifiedFee` is: Core v32.1
@@ -4483,10 +4489,22 @@ impl Mempool {
     /// zero with its negative fee, and the chunk then takes in descendants
     /// a clamped zero would leave out. `None` if `txid` is not an acting
     /// entry.
-    fn chunk_feerate(inner: &MempoolInner, txid: &Txid) -> Option<crate::mempool::feefrac::FeeFrac> {
+    ///
+    /// One linearization answers for the whole cluster, so every member's
+    /// chunk goes into `cache`, and a later member of the same call is
+    /// answered from it: the verbose views ask once per entry, and would
+    /// otherwise linearize a cluster once per member.
+    fn chunk_feerate(
+        inner: &MempoolInner,
+        txid: &Txid,
+        cache: &mut ChunkCache,
+    ) -> Option<crate::mempool::feefrac::FeeFrac> {
         let acting = |t: &Txid| inner.entries.get(t).is_some_and(|e| e.scope.is_acting());
         if !acting(txid) {
             return None;
+        }
+        if let Some(ff) = cache.0.get(txid) {
+            return Some(*ff);
         }
         let mut cluster: HashSet<Txid> = HashSet::from([*txid]);
         let mut queue = vec![*txid];
@@ -4504,8 +4522,9 @@ impl Mempool {
         let g = Self::cluster_graph_with(inner, cluster.into_iter().collect(), |e| {
             signed_modified_fee(e.fee, e.fee_delta)
         });
-        let at = g.txids.binary_search(txid).expect("the cluster holds its own transaction");
-        Some(clusters::chunk_of(&g, at))
+        let chunks = clusters::chunk_feerates(&g);
+        cache.0.extend(g.txids.iter().copied().zip(chunks.iter().copied()));
+        Some(cache.0[txid])
     }
 
     /// Core's trim after a reorg (`UpdateTransactionsFromBlock`, then
@@ -6352,6 +6371,13 @@ impl Mempool {
 
     /// Get verbose entry data for a single mempool transaction (for RPC).
     pub fn get_entry_verbose(&self, txid: &Txid) -> Option<serde_json::Value> {
+        self.get_entry_verbose_cached(txid, &mut ChunkCache::default())
+    }
+
+    /// [`Self::get_entry_verbose`] for one of many entries one RPC call
+    /// reports: `cache` carries the chunks of the clusters already
+    /// linearized for the call's earlier entries.
+    pub fn get_entry_verbose_cached(&self, txid: &Txid, cache: &mut ChunkCache) -> Option<serde_json::Value> {
         let inner = self.inner.read();
         let entry = inner.entries.get(txid)?;
         // Standard surface (design §6.1): a quarantined entry is invisible here —
@@ -6382,7 +6408,7 @@ impl Mempool {
         let inner = self.inner.read();
         // Core's `GetMainChunkFeerate`. The entry can have left the pool
         // while the lock was released; it is then not in the mempool.
-        let chunk = Self::chunk_feerate(&inner, txid)?;
+        let chunk = Self::chunk_feerate(&inner, txid, cache)?;
 
         // Invisibility (design §6.1): the ancestor/descendant graph reported on
         // this standard surface must exclude the quarantine class. Infectious

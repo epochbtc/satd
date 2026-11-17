@@ -203,20 +203,23 @@ pub fn mining_order(g: &Graph) -> Vec<usize> {
     chunks.into_iter().flat_map(|(_, _, _, txs)| txs).collect()
 }
 
-/// The chunk `tx` is mined in: the summed fee and sigop-adjusted weight of
-/// its chunk in the linearization of its cluster, which Core's
-/// `getmempoolentry` reports as `fees.chunk` and `chunkweight`
-/// (`TxGraph::GetMainChunkFeerate`, `entryToJSON` in v31 and later
-/// `rpc/mempool.cpp`). `g` must hold exactly `tx`'s cluster, its
-/// transactions in txid order, as [`Graph`]'s builders leave them.
-pub fn chunk_of(g: &Graph, tx: usize) -> FeeFrac {
+/// The chunk each transaction is mined in: for `txids[i]`, the summed fee
+/// and sigop-adjusted weight of its chunk in the linearization of its
+/// cluster, which Core's `getmempoolentry` reports as `fees.chunk` and
+/// `chunkweight` (`TxGraph::GetMainChunkFeerate`, `entryToJSON` in v31
+/// and later `rpc/mempool.cpp`). `g` must hold exactly one cluster, its
+/// transactions in txid order, as [`Graph`]'s builders leave them, so one
+/// linearization answers for every member.
+pub fn chunk_feerates(g: &Graph) -> Vec<FeeFrac> {
     let all: Vec<usize> = (0..g.txids.len()).collect();
     let order = g.linearize_group(&all);
-    g.chunks(&order)
-        .into_iter()
-        .find(|(txs, _)| txs.contains(&tx))
-        .map(|(_, ff)| ff)
-        .expect("every transaction of the cluster is in one of its chunks")
+    let mut out = vec![FeeFrac::default(); g.txids.len()];
+    for (txs, ff) in g.chunks(&order) {
+        for tx in txs {
+            out[tx] = ff;
+        }
+    }
+    out
 }
 
 /// Core's `TxGraph::Trim` after a reorg (v31.1 `txgraph.cpp`), which
@@ -380,9 +383,10 @@ mod tests {
     #[test]
     fn a_child_paying_for_its_parent_shares_its_chunk() {
         let g = graph(&[(1, 100, 437, &[]), (2, 10_000, 437, &[1]), (3, 200, 437, &[2])]);
-        assert_eq!(chunk_of(&g, 0), FeeFrac::new(10_100, 874));
-        assert_eq!(chunk_of(&g, 1), FeeFrac::new(10_100, 874));
-        assert_eq!(chunk_of(&g, 2), FeeFrac::new(200, 437));
+        assert_eq!(
+            chunk_feerates(&g),
+            vec![FeeFrac::new(10_100, 874), FeeFrac::new(10_100, 874), FeeFrac::new(200, 437)]
+        );
     }
 
     /// The same chain after `prioritisetransaction` takes 20 000 sat off
@@ -391,9 +395,7 @@ mod tests {
     #[test]
     fn a_negative_parent_pulls_its_descendants_into_its_chunk() {
         let g = graph(&[(1, -19_900, 437, &[]), (2, 10_000, 437, &[1]), (3, 200, 437, &[2])]);
-        for tx in 0..3 {
-            assert_eq!(chunk_of(&g, tx), FeeFrac::new(-9_700, 1311));
-        }
+        assert_eq!(chunk_feerates(&g), vec![FeeFrac::new(-9_700, 1311); 3]);
     }
 
     /// A cluster within the limits is not touched, whatever it holds.

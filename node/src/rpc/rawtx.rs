@@ -70,8 +70,9 @@ pub fn get_raw_mempool(mempool: &Mempool, verbose: bool) -> Value {
     let entries = mempool.get_acting_entries();
 
     let mut result = serde_json::Map::new();
+    let mut chunks = crate::mempool::pool::ChunkCache::default();
     for (txid, _entry) in &entries {
-        if let Some(verbose) = mempool.get_entry_verbose(txid) {
+        if let Some(verbose) = mempool.get_entry_verbose_cached(txid, &mut chunks) {
             result.insert(txid.to_string(), verbose);
         }
     }
