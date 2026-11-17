@@ -312,6 +312,7 @@ note = "measured 2026-09-15: L12 RemoteDisconnected: stop closes the RPC listene
 [[test]]
 file = "feature_signet.py"
 status = "run"
+note = "runs with a temporary shim bridge while PIN is v32.1: the shim links signet/.cookie to signet_<message start>/.cookie for a custom signet (satd #1271, Core #34566); remove it on the move to v33 (README, Bumping the pin, step 6)"
 
 [[test]]
 file = "feature_startupnotify.py"

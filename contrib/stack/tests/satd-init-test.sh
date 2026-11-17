@@ -115,6 +115,21 @@ fi
 render "$WORK/new/satd" "$WORK/e"
 if [[ $(grep -c '^port=19444' "$conf") -eq 1 ]]; then ok "re-running does not duplicate it"; else bad "duplicated on re-run"; fi
 
+echo "== satd-init: rpc-cookie on a custom signet =="
+# Core's GetSignetDataDir names: signet_<message start> for a custom
+# challenge, signet for none or the default one (#1271).
+cookie_link() { readlink "$1/rpc-cookie"; }
+render "$WORK/new/satd" "$WORK/s1" NETWORK=signet
+if [[ $(cookie_link "$WORK/s1") == signet/.cookie ]]; then ok "default signet: signet/.cookie"; else bad "default signet: $(cookie_link "$WORK/s1")"; fi
+mkdir -p "$WORK/s2/conf.d"
+printf '[signet]\nsignetchallenge=51  # an OP_TRUE signet\n' > "$WORK/s2/conf.d/local.conf"
+render "$WORK/new/satd" "$WORK/s2" NETWORK=signet
+if [[ $(cookie_link "$WORK/s2") == signet_54d26fbd/.cookie ]]; then ok "custom signet: signet_54d26fbd/.cookie"; else bad "custom signet: $(cookie_link "$WORK/s2")"; fi
+mkdir -p "$WORK/s3/conf.d"
+printf 'signetchallenge=512103ad5e0edad18cb1f0fc0d28a3d4f1f3e445640337489abb10404f2d1e086be430210359ef5021964fe22d6f8e05b2463c9540ce96883fe3b278760f048f5189f2e6c452ae\n' > "$WORK/s3/conf.d/local.conf"
+render "$WORK/new/satd" "$WORK/s3" NETWORK=signet
+if [[ $(cookie_link "$WORK/s3") == signet/.cookie ]]; then ok "default challenge given: signet/.cookie"; else bad "default challenge given: $(cookie_link "$WORK/s3")"; fi
+
 echo
 [[ "$fail" -eq 0 ]] || { echo "satd-init-test.sh: FAILED"; exit 1; }
 echo "satd-init-test.sh: all checks passed"

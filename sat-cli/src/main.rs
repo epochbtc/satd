@@ -51,6 +51,11 @@ struct Cli {
     #[arg(long, help = "Use signet network", global = true)]
     signet: bool,
 
+    /// Bitcoin Core's `-signetchallenge=<hex>`: a custom signet keeps its
+    /// data, and so its cookie, in `signet_<message start>`.
+    #[arg(long, value_name = "HEX", help = "Custom signet challenge (locates its cookie)", global = true)]
+    signetchallenge: Option<String>,
+
     /// Bitcoin Core's `-chain=<name>`: main, test, testnet4, signet, regtest.
     #[arg(long, value_name = "NAME", help = "Chain to use", global = true)]
     chain: Option<String>,
@@ -351,6 +356,7 @@ fn normalize_args(args: Vec<String>) -> Vec<String> {
         "testnet",
         "testnet4",
         "signet",
+        "signetchallenge",
         "chain",
         "conf",
         "generate",
@@ -941,6 +947,7 @@ async fn main() {
         // Core's `ForceSetArg("-rpcpassword", ...)`: stdin wins.
         rpcpassword: rpcpass_from_stdin.or_else(|| cli.rpcpassword.clone()),
         rpccookiefile: cli.rpccookiefile.clone(),
+        signetchallenge: cli.signetchallenge.clone(),
     };
     let conn = match conf::resolve(&cli_conn, conf_file.as_ref(), &base_datadir, conf_path) {
         Ok(c) => c,

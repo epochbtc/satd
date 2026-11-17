@@ -29,8 +29,16 @@ struct CliArgs {
     #[arg(long, help = "Use testnet network")]
     testnet: bool,
 
+    #[arg(long, help = "Use testnet4 network")]
+    testnet4: bool,
+
     #[arg(long, help = "Use signet network")]
     signet: bool,
+
+    /// Bitcoin Core's `-signetchallenge=<hex>`: a custom signet keeps its
+    /// data, and so its cookie, in `signet_<message start>`.
+    #[arg(long, value_name = "HEX", help = "Custom signet challenge (locates its cookie)")]
+    signetchallenge: Option<String>,
 
     #[arg(long, default_value = "127.0.0.1", help = "RPC host")]
     rpcconnect: String,
@@ -71,7 +79,7 @@ struct CliArgs {
 /// Convert single-dash flags to double-dash for clap compatibility.
 fn normalize_args(args: Vec<String>) -> Vec<String> {
     let known_flags = [
-        "regtest", "testnet", "signet", "rpcconnect", "rpcport",
+        "regtest", "testnet", "testnet4", "signet", "signetchallenge", "rpcconnect", "rpcport",
         "rpcuser", "rpcpassword", "rpccookiefile", "datadir",
         "rpctls", "rpccacert", "rpcclientcert", "rpcclientkey",
     ];
@@ -91,6 +99,47 @@ fn normalize_args(args: Vec<String>) -> Vec<String> {
         .collect()
 }
 
+/// The chain's data subdirectory under `-datadir`, where the cookie is: none
+/// on mainnet, and for a signet the name Bitcoin Core's `GetSignetDataDir`
+/// gives it (#1271).
+fn net_subdir(cli: &CliArgs) -> Option<String> {
+    if cli.regtest {
+        Some("regtest".into())
+    } else if cli.testnet {
+        Some("testnet3".into())
+    } else if cli.testnet4 {
+        Some("testnet4".into())
+    } else if cli.signet {
+        Some(signet_data_dir(cli.signetchallenge.as_deref()))
+    } else {
+        None
+    }
+}
+
+/// The default signet's challenge (Core's `CChainParams::SigNet`).
+const DEFAULT_SIGNET_CHALLENGE: &str = "512103ad5e0edad18cb1f0fc0d28a3d4f1f3e445640337489abb10404f2d1e086be430210359ef5021964fe22d6f8e05b2463c9540ce96883fe3b278760f048f5189f2e6c452ae";
+
+/// Bitcoin Core's `GetSignetDataDir`: `signet` without a challenge, for one
+/// that is not hex, and for the default one; otherwise `signet_` and the
+/// signet's message start in lowercase hex. Same as sat-cli's
+/// `conf::signet_data_dir` and the daemon's
+/// `node::validation::signet::signet_data_dir`.
+fn signet_data_dir(challenge_hex: Option<&str>) -> String {
+    use bitcoin::hashes::hex::FromHex;
+    use bitcoin::hashes::{sha256d, Hash};
+    let Some(bytes) = challenge_hex.and_then(|h| Vec::<u8>::from_hex(h.trim()).ok()) else {
+        return "signet".to_string();
+    };
+    if Vec::<u8>::from_hex(DEFAULT_SIGNET_CHALLENGE).ok().as_deref() == Some(bytes.as_slice()) {
+        return "signet".to_string();
+    }
+    let digest = sha256d::Hash::hash(&bitcoin::consensus::serialize(&bytes)).to_byte_array();
+    format!(
+        "signet_{:02x}{:02x}{:02x}{:02x}",
+        digest[0], digest[1], digest[2], digest[3]
+    )
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let raw_args: Vec<String> = std::env::args().collect();
     let normalized = normalize_args(raw_args);
@@ -100,6 +149,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         18443
     } else if cli.testnet {
         18332
+    } else if cli.testnet4 {
+        48332
     } else if cli.signet {
         38332
     } else {
@@ -117,21 +168,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let rpc_client = if let (Some(u), Some(p)) = (&cli.rpcuser, &cli.rpcpassword) {
         Arc::new(RpcClient::new(&cli.rpcconnect, rpcport, u, p, &tls)?)
     } else {
-        let cookie_path = cli.rpccookiefile.unwrap_or_else(|| {
+        let cookie_path = cli.rpccookiefile.clone().unwrap_or_else(|| {
             let base = cli.datadir.clone().unwrap_or_else(rpc::default_datadir);
-            let net_subdir = if cli.regtest {
-                "regtest"
-            } else if cli.testnet {
-                "testnet3"
-            } else if cli.signet {
-                "signet"
-            } else {
-                ""
-            };
-            if net_subdir.is_empty() {
-                base.join(".cookie")
-            } else {
-                base.join(net_subdir).join(".cookie")
+            match net_subdir(&cli) {
+                Some(sub) => base.join(sub).join(".cookie"),
+                None => base.join(".cookie"),
             }
         });
         Arc::new(RpcClient::with_cookie(
@@ -681,5 +722,41 @@ mod tests {
         assert_eq!(r.unwrap().0, RpcFailure::AuthFailed);
         // No failure at all stays None.
         assert!(resolve_failure(None, None).is_none());
+    }
+}
+
+#[cfg(test)]
+mod cookie_dir_tests {
+    use super::*;
+
+    fn args(argv: &[&str]) -> CliArgs {
+        let mut v = vec!["sat-tui"];
+        v.extend_from_slice(argv);
+        CliArgs::parse_from(normalize_args(v.into_iter().map(String::from).collect()))
+    }
+
+    /// #1271: the cookie's directory per chain, a custom signet's named as
+    /// Core's `GetSignetDataDir` names it (vectors from the `message_start`
+    /// helper of Core's `test/functional/test_framework/signet.py`).
+    #[test]
+    fn the_cookie_directory_follows_the_chain() {
+        assert_eq!(net_subdir(&args(&[])), None);
+        assert_eq!(net_subdir(&args(&["-regtest"])).as_deref(), Some("regtest"));
+        assert_eq!(net_subdir(&args(&["-testnet"])).as_deref(), Some("testnet3"));
+        assert_eq!(net_subdir(&args(&["-testnet4"])).as_deref(), Some("testnet4"));
+        assert_eq!(net_subdir(&args(&["-signet"])).as_deref(), Some("signet"));
+        assert_eq!(
+            net_subdir(&args(&["-signet", &format!("-signetchallenge={DEFAULT_SIGNET_CHALLENGE}")]))
+                .as_deref(),
+            Some("signet")
+        );
+        assert_eq!(
+            net_subdir(&args(&["-signet", "-signetchallenge=51"])).as_deref(),
+            Some("signet_54d26fbd")
+        );
+        assert_eq!(
+            net_subdir(&args(&["-signet", "-signetchallenge="])).as_deref(),
+            Some("signet_1406e058")
+        );
     }
 }

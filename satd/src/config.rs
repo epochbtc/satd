@@ -2299,11 +2299,11 @@ impl Config {
                              remove it or select signet with --signet / --chain=signet"
                         ));
                     }
+                    // An empty challenge is a custom signet in Core
+                    // (`ReadSigNetArgs` accepts any hex, the empty string
+                    // included), with a datadir of its own.
                     let bytes = <Vec<u8> as bitcoin::hashes::hex::FromHex>::from_hex(hex.trim())
                         .map_err(|_| format!("-signetchallenge must be hex, not '{hex}'."))?;
-                    if bytes.is_empty() {
-                        return Err("signetchallenge must not be empty".to_string());
-                    }
                     Some(bytes)
                 }
                 None => None,
@@ -5071,8 +5071,9 @@ impl Config {
     }
 
     /// Returns the network-specific data directory (e.g. ~/.bitcoin/regtest/).
+    /// A custom signet has one of its own, `signet_<message start>` (#1271).
     pub fn network_datadir(&self) -> PathBuf {
-        match chain_subdir(self.network) {
+        match chain_subdir(self.network, self.signet_challenge.as_deref()) {
             Some(sub) => self.datadir.join(sub),
             None => self.datadir.clone(),
         }
@@ -5082,21 +5083,27 @@ impl Config {
     /// matching Bitcoin Core's `-blocksdir` semantics. See
     /// [`resolve_blocks_dir`] for the path rules.
     pub fn blocks_dir(&self) -> PathBuf {
-        resolve_blocks_dir(self.blocksdir.as_deref(), &self.datadir, self.network)
+        resolve_blocks_dir(
+            self.blocksdir.as_deref(),
+            &self.datadir,
+            self.network,
+            self.signet_challenge.as_deref(),
+        )
     }
 }
 
 /// The chain-specific subdirectory name Bitcoin Core uses under the
 /// data/blocks roots: `None` for mainnet (no subdir), else the Core
 /// directory name. Centralised so `network_datadir` and `blocks_dir`
-/// can't drift apart.
-fn chain_subdir(network: Network) -> Option<&'static str> {
+/// can't drift apart. A signet's name depends on its challenge, as in
+/// Core's `GetSignetDataDir` (#1271).
+pub fn chain_subdir(network: Network, signet_challenge: Option<&[u8]>) -> Option<String> {
     match network {
         Network::Bitcoin => None,
-        Network::Regtest => Some("regtest"),
-        Network::Testnet => Some("testnet3"),
-        Network::Testnet4 => Some("testnet4"),
-        Network::Signet => Some("signet"),
+        Network::Regtest => Some("regtest".to_string()),
+        Network::Testnet => Some("testnet3".to_string()),
+        Network::Testnet4 => Some("testnet4".to_string()),
+        Network::Signet => Some(node::validation::signet::signet_data_dir(signet_challenge)),
     }
 }
 
@@ -5117,12 +5124,13 @@ pub fn resolve_blocks_dir(
     blocksdir: Option<&std::path::Path>,
     datadir: &std::path::Path,
     network: Network,
+    signet_challenge: Option<&[u8]>,
 ) -> PathBuf {
     let mut p = match blocksdir {
         Some(root) => root.to_path_buf(),
         None => datadir.to_path_buf(),
     };
-    if let Some(sub) = chain_subdir(network) {
+    if let Some(sub) = chain_subdir(network, signet_challenge) {
         p.push(sub);
     }
     p.push("blocks");
@@ -12960,34 +12968,34 @@ testactivationheight=bip34@2
         // No -blocksdir: blocks live under the network datadir. Mainnet
         // has no chain subdir; the others do.
         assert_eq!(
-            resolve_blocks_dir(None, data, Network::Bitcoin),
+            resolve_blocks_dir(None, data, Network::Bitcoin, None),
             PathBuf::from("/data/blocks")
         );
         assert_eq!(
-            resolve_blocks_dir(None, data, Network::Regtest),
+            resolve_blocks_dir(None, data, Network::Regtest, None),
             PathBuf::from("/data/regtest/blocks")
         );
         assert_eq!(
-            resolve_blocks_dir(None, data, Network::Signet),
+            resolve_blocks_dir(None, data, Network::Signet, None),
             PathBuf::from("/data/signet/blocks")
         );
         assert_eq!(
-            resolve_blocks_dir(None, data, Network::Testnet),
+            resolve_blocks_dir(None, data, Network::Testnet, None),
             PathBuf::from("/data/testnet3/blocks")
         );
 
         // With -blocksdir: the flag is the ROOT; the chain subdir + blocks
         // are appended so different networks never share a flat-file dir.
         assert_eq!(
-            resolve_blocks_dir(Some(blk), data, Network::Bitcoin),
+            resolve_blocks_dir(Some(blk), data, Network::Bitcoin, None),
             PathBuf::from("/mnt/blocks/blocks")
         );
         assert_eq!(
-            resolve_blocks_dir(Some(blk), data, Network::Regtest),
+            resolve_blocks_dir(Some(blk), data, Network::Regtest, None),
             PathBuf::from("/mnt/blocks/regtest/blocks")
         );
         assert_eq!(
-            resolve_blocks_dir(Some(blk), data, Network::Signet),
+            resolve_blocks_dir(Some(blk), data, Network::Signet, None),
             PathBuf::from("/mnt/blocks/signet/blocks")
         );
     }
@@ -16455,6 +16463,44 @@ mcpallowedhost=node.local
         .unwrap();
         let err = Config::from_cli(cli).unwrap_err();
         assert_eq!(err, "-signetchallenge cannot be multiple values.");
+    }
+
+    /// #1271: a custom signet's datadir and blocks dir are
+    /// `signet_<message start>`, as in Core's `GetSignetDataDir`; the default
+    /// challenge given explicitly keeps `signet`. An empty challenge is a
+    /// custom signet, as in Core's `ReadSigNetArgs`.
+    #[test]
+    fn a_custom_signet_has_a_datadir_of_its_own() {
+        let dirs = |args: &[&str]| {
+            let mut argv = vec!["satd", "--signet", "--datadir=/data"];
+            argv.extend_from_slice(args);
+            let cfg = Config::from_cli(parse_cli(argv).unwrap()).unwrap();
+            (cfg.network_datadir(), cfg.blocks_dir())
+        };
+        assert_eq!(
+            dirs(&[]),
+            (PathBuf::from("/data/signet"), PathBuf::from("/data/signet/blocks"))
+        );
+        let default = "512103ad5e0edad18cb1f0fc0d28a3d4f1f3e445640337489abb10404f2d1e086be430210359ef5021964fe22d6f8e05b2463c9540ce96883fe3b278760f048f5189f2e6c452ae";
+        assert_eq!(
+            dirs(&["--signetchallenge", default]),
+            (PathBuf::from("/data/signet"), PathBuf::from("/data/signet/blocks"))
+        );
+        assert_eq!(
+            dirs(&["--signetchallenge", "51"]),
+            (
+                PathBuf::from("/data/signet_54d26fbd"),
+                PathBuf::from("/data/signet_54d26fbd/blocks")
+            )
+        );
+        assert_eq!(
+            dirs(&["--signetchallenge", "51", "--blocksdir=/mnt"]),
+            (
+                PathBuf::from("/data/signet_54d26fbd"),
+                PathBuf::from("/mnt/signet_54d26fbd/blocks")
+            )
+        );
+        assert_eq!(dirs(&["--signetchallenge="]).0, PathBuf::from("/data/signet_1406e058"));
     }
 
     #[test]

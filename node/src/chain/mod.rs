@@ -13,6 +13,7 @@ pub mod pin;
 pub mod prefetch;
 pub mod reorg_log;
 pub mod replay_plan;
+pub mod signet_datadir;
 pub mod repair;
 pub mod state;
 pub mod tip_ancestry;

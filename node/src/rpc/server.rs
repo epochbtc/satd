@@ -635,7 +635,10 @@ fn net_datadir_from(ctx: &RpcContext) -> Option<std::path::PathBuf> {
         bitcoin::Network::Bitcoin => base,
         bitcoin::Network::Testnet => base.join("testnet3"),
         bitcoin::Network::Testnet4 => base.join("testnet4"),
-        bitcoin::Network::Signet => base.join("signet"),
+        // A custom signet's own directory (#1271), as satd's config names it.
+        bitcoin::Network::Signet => base.join(crate::validation::signet::signet_data_dir(
+            ctx.chain_state.signet_challenge(),
+        )),
         bitcoin::Network::Regtest => base.join("regtest"),
     })
 }

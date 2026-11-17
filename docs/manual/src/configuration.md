@@ -109,7 +109,9 @@ sat-cli -datadir=/path/to/datadir getblockcount
 - **Which credentials.** A non-empty `rpcpassword` from either source means
   user/password authentication, with `rpcuser` looked up the same way;
   otherwise the cookie file, whose relative path is under the chain's data
-  directory. satd writes no cookie when `rpcuser` and `rpcpassword` are both
+  directory. A custom signet's data directory is `signet_<message start>`, so
+  `sat-cli` takes `-signetchallenge` (command line, else the `[signet]`
+  section or the top level of the file) to find it, as `bitcoin-cli` does. satd writes no cookie when `rpcuser` and `rpcpassword` are both
   set, so this is how `sat-cli` reaches such a node. With `-rpcwait`, a
   cookie that does not exist yet is read again until the node writes it.
   `-stdinrpcpass` reads the password from the first line of standard input
