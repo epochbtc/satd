@@ -10497,12 +10497,54 @@ impl ChainState {
     /// Connect the best available valid chain if it differs from the current
     /// tip (Core's ActivateBestChain, scoped to candidates already present
     /// locally). Caller must hold `accept_lock`.
+    ///
+    /// Core's `ActivateBestChain` (`validation.cpp`, v32.1) loops: when
+    /// `ActivateBestChainStep` reports `fInvalidFound` it clears
+    /// `pindexMostWork`, runs `FindMostWorkChain` again and tries the next
+    /// candidate, and it returns failure only for a system error (disk,
+    /// database). This does the same. A `reorg_to` that fails on a verdict on
+    /// a block has marked that block and its descendants `Invalid` and rolled
+    /// back to the tip it started from, so `find_best_valid_tip` is asked
+    /// again; any other failure is returned as it is.
+    ///
+    /// The loop terminates. A candidate is a block whose status is
+    /// `DataStored` or `Valid`, and `find_best_valid_tip` only offers one whose
+    /// every block down to the active chain has such a status. So the block a
+    /// verdict names was a candidate before the attempt, and the check below
+    /// requires that it reads `Invalid` after it. Nothing clears a mark while
+    /// the caller holds `accept_lock` (`reconsider_block` takes it), so every
+    /// iteration that goes round again leaves the finite candidate set at
+    /// least one block smaller. A mark that did not land (its write failed)
+    /// would offer the same candidate again, so that case returns the error
+    /// instead of retrying.
     fn activate_best_chain(&self) -> Result<(), ChainError> {
-        let best = self.find_best_valid_tip()?;
-        if best.header.block_hash() == self.tip_hash() {
-            return Ok(());
+        loop {
+            let best = self.find_best_valid_tip()?;
+            if best.header.block_hash() == self.tip_hash() {
+                return Ok(());
+            }
+            let mut invalid = None;
+            let Err(e) = self.reorg_to_naming_invalid(&best, &mut invalid) else {
+                return Ok(());
+            };
+            let Some(bad) = invalid else {
+                return Err(e);
+            };
+            let marked = self
+                .store
+                .get_block_index(&bad)
+                .is_some_and(|entry| entry.status == BlockStatus::Invalid);
+            if !marked {
+                return Err(e);
+            }
+            tracing::warn!(
+                error = %e,
+                invalid = %bad,
+                target = %best.header.block_hash(),
+                target_height = best.height,
+                "Could not activate the best chain, a block on it is invalid; trying the next-best chain"
+            );
         }
-        self.reorg_to(&best)
     }
 
     /// The highest block on the best-header chain whose whole path down to the
@@ -14075,14 +14117,17 @@ pub(crate) mod tests {
     }
 
     /// #977: `invalidateblock` whose re-activation fails on an invalid block
-    /// of the competing branch ends on the invalidated block's parent, with
-    /// that branch marked invalid, as Core's `InvalidateBlock` does. It used to
-    /// run the truncation and the reconnect as one reorg, and the abort put
-    /// the node back on the pre-invalidation tip -- a block it had just marked
-    /// `Invalid` -- where it refused every block extending the real best chain
-    /// until a restart.
+    /// of the competing branch never ends on the pre-invalidation tip. It used
+    /// to run the truncation and the reconnect as one reorg, and the abort put
+    /// the node back on that tip -- a block it had just marked `Invalid` --
+    /// where it refused every block extending the real best chain until a
+    /// restart.
+    ///
+    /// Since #1261 the activation then tries the next-best chain, as Core's
+    /// `ActivateBestChain` does after `InvalidBlockFound`: here the valid
+    /// prefix b1 of the failed branch, which still out-works the parent.
     #[test]
-    fn invalidateblock_whose_reactivation_fails_ends_on_the_parent() {
+    fn invalidateblock_whose_reactivation_fails_ends_on_the_best_valid_chain() {
         let (cs, dir) = make_chain_state();
         let base = build_and_connect_chain(&cs, 3);
         let base_tip = base[2].block_hash();
@@ -14103,14 +14148,12 @@ pub(crate) mod tests {
             cs.store_block(b).unwrap();
         }
 
-        let err = cs
-            .invalidate_block(a1.block_hash())
-            .expect_err("re-activation fails on b2");
-        assert!(matches!(err, ChainError::ReactivationFailed(_)), "got {err:?}");
+        cs.invalidate_block(a1.block_hash())
+            .expect("b2 failing leaves b1, which out-works the parent");
 
-        assert_eq!(cs.tip_hash(), base_tip, "the tip must fall back to the invalidated block's parent");
-        assert_eq!(cs.tip_height(), 3);
-        assert_eq!(cs.get_block_index(&base_tip).unwrap().status, BlockStatus::Valid);
+        assert_eq!(cs.tip_hash(), b1.block_hash(), "the tip must be the best valid chain left");
+        assert_eq!(cs.tip_height(), 4);
+        assert_eq!(cs.get_block_index(&b1.block_hash()).unwrap().status, BlockStatus::Valid);
         for b in [&a1, &a2, &b2, &b3] {
             assert_eq!(
                 cs.get_block_index(&b.block_hash()).unwrap().status,
@@ -14120,10 +14163,150 @@ pub(crate) mod tests {
             );
         }
 
-        // The node goes on from the parent: a block extending it connects.
-        let c1 = build_test_block(base_tip, 4, 1_600_000_024);
+        // The node goes on from there: a block extending it connects.
+        let c1 = build_test_block(b1.block_hash(), 5, 1_600_000_024);
         cs.accept_block(&c1).unwrap();
         assert_eq!(cs.tip_hash(), c1.block_hash());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1261: two branches compete above the invalidated block, and the
+    /// heavier one holds an invalid block. `invalidateblock` must end on the
+    /// other branch's tip, as Core's `ActivateBestChain` does by running
+    /// `FindMostWorkChain` again after `InvalidBlockFound`. It used to stop
+    /// after the one failed attempt, on the invalidated block's parent, and
+    /// return an error.
+    #[test]
+    fn invalidateblock_tries_the_next_best_branch_after_an_invalid_one() {
+        let (cs, dir) = make_chain_state();
+        let base = build_and_connect_chain(&cs, 3);
+        let base_tip = base[2].block_hash();
+
+        let a1 = build_test_block(base_tip, 4, 1_600_000_004);
+        cs.accept_block(&a1).unwrap();
+
+        // B: the most work, with an invalid block in the middle.
+        let missing = bitcoin::OutPoint { txid: bitcoin::Txid::from_byte_array([7; 32]), vout: 0 };
+        let b1 = build_test_block_spending(base_tip, 4, 1_600_000_014, missing);
+        let b2 = build_test_block(b1.block_hash(), 5, 1_600_000_015);
+        let b3 = build_test_block(b2.block_hash(), 6, 1_600_000_016);
+        // C: less work than B, more than the parent, all valid.
+        let c1 = build_test_block(base_tip, 4, 1_600_000_024);
+        let c2 = build_test_block(c1.block_hash(), 5, 1_600_000_025);
+        for b in [&b1, &b2, &b3, &c1, &c2] {
+            cs.accept_header(&b.header).unwrap();
+            cs.store_block(b).unwrap();
+        }
+        assert_eq!(cs.tip_hash(), a1.block_hash(), "storing the branches activates neither");
+
+        cs.invalidate_block(a1.block_hash())
+            .expect("B fails, and C is activated in its place");
+
+        assert_eq!(cs.tip_hash(), c2.block_hash(), "the node must end on C's tip");
+        assert_eq!(cs.tip_height(), 5);
+        for b in [&a1, &b1, &b2, &b3] {
+            assert_eq!(cs.get_block_index(&b.block_hash()).unwrap().status, BlockStatus::Invalid);
+        }
+        for b in [&c1, &c2] {
+            assert_eq!(cs.get_block_index(&b.block_hash()).unwrap().status, BlockStatus::Valid);
+        }
+        // C's coinbases are coins, and B's are not.
+        let coinbase = |b: &Block| bitcoin::OutPoint { txid: b.txdata[0].compute_txid(), vout: 0 };
+        assert!(cs.get_coin(&coinbase(&c2)).is_some());
+        assert!(cs.get_coin(&coinbase(&b1)).is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1261, `reconsiderblock`: clearing the marks puts a branch back in
+    /// play, but a heavier stored branch that holds an invalid block is tried
+    /// first. The activation must go on to the reconsidered branch rather
+    /// than stop on the parent with an error.
+    #[test]
+    fn reconsiderblock_tries_the_next_best_branch_after_an_invalid_one() {
+        let (cs, dir) = make_chain_state();
+        let base = build_and_connect_chain(&cs, 3);
+        let base_tip = base[2].block_hash();
+
+        let a1 = build_test_block(base_tip, 4, 1_600_000_004);
+        cs.accept_block(&a1).unwrap();
+        let a2 = build_test_block(a1.block_hash(), 5, 1_600_000_005);
+        cs.accept_block(&a2).unwrap();
+        cs.invalidate_block(a1.block_hash()).unwrap();
+        assert_eq!(cs.tip_hash(), base_tip);
+
+        // B: more work than A, with an invalid second block. Stored only.
+        let missing = bitcoin::OutPoint { txid: bitcoin::Txid::from_byte_array([7; 32]), vout: 0 };
+        let b1 = build_test_block(base_tip, 4, 1_600_000_014);
+        let b2 = build_test_block_spending(b1.block_hash(), 5, 1_600_000_015, missing);
+        let b3 = build_test_block(b2.block_hash(), 6, 1_600_000_016);
+        for b in [&b1, &b2, &b3] {
+            cs.accept_header(&b.header).unwrap();
+            cs.store_block(b).unwrap();
+        }
+        assert_eq!(cs.tip_hash(), base_tip);
+
+        cs.reconsider_block(a1.block_hash())
+            .expect("B fails at b2, and A is activated in its place");
+
+        assert_eq!(cs.tip_hash(), a2.block_hash(), "the node must end on the reconsidered branch");
+        for b in [&b2, &b3] {
+            assert_eq!(cs.get_block_index(&b.block_hash()).unwrap().status, BlockStatus::Invalid);
+        }
+        for b in [&a1, &a2] {
+            assert_eq!(cs.get_block_index(&b.block_hash()).unwrap().status, BlockStatus::Valid);
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1261: when every candidate above the invalidated block fails, the
+    /// activation tries each once and ends on the best valid chain, the
+    /// parent, with success. Each failed attempt marks a block invalid, so
+    /// the candidates strictly shrink and the loop cannot come back to one.
+    #[test]
+    fn invalidateblock_ends_on_the_parent_when_every_branch_fails() {
+        let (cs, dir) = make_chain_state();
+        let base = build_and_connect_chain(&cs, 3);
+        let base_tip = base[2].block_hash();
+
+        let a1 = build_test_block(base_tip, 4, 1_600_000_004);
+        cs.accept_block(&a1).unwrap();
+
+        // Three branches, each out-working the parent, each failing at its
+        // first block.
+        let missing = bitcoin::OutPoint { txid: bitcoin::Txid::from_byte_array([7; 32]), vout: 0 };
+        let mut branches: Vec<Vec<Block>> = Vec::new();
+        for (i, len) in [3u32, 2, 1].into_iter().enumerate() {
+            let t = 1_600_000_100 + 100 * i as u32;
+            let mut blocks = vec![build_test_block_spending(base_tip, 4, t, missing)];
+            for h in 5..4 + len {
+                let prev = blocks.last().unwrap().block_hash();
+                blocks.push(build_test_block(prev, h, t + h));
+            }
+            for b in &blocks {
+                cs.accept_header(&b.header).unwrap();
+                cs.store_block(b).unwrap();
+            }
+            branches.push(blocks);
+        }
+
+        cs.invalidate_block(a1.block_hash())
+            .expect("no branch is valid, and the parent is the best valid chain");
+
+        assert_eq!(cs.tip_hash(), base_tip);
+        assert_eq!(cs.tip_height(), 3);
+        for b in branches.iter().flatten() {
+            assert_eq!(
+                cs.get_block_index(&b.block_hash()).unwrap().status,
+                BlockStatus::Invalid,
+                "{} must be marked invalid",
+                b.block_hash()
+            );
+        }
+        // Nothing is left to try.
+        assert_eq!(cs.find_best_valid_tip().unwrap().header.block_hash(), base_tip);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
