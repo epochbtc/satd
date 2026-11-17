@@ -83,6 +83,7 @@ It includes every fix shipped in 0.7.1:
 - P2P: under `-blocksonly`, every `cmpctblock` is ignored, as in Core v32, including one for a block the node requested (#1204).
 - P2P: the node's onion address is announced only to peers that cannot see its IP (in on the onion listener, or out through the proxy), `-externalip` is no longer sent beside it or in the version message's `addr_from`, and `getaddr` replies never carry the node's own addresses (#1209).
 - P2P: `-maxconnections` defaults to 200, as in Core v32, and transaction-relaying inbound peers may hold at most `-inboundrelaypercent` (default 50) of the inbound slots; past it a new one evicts another by Core's inbound eviction rules, or is dropped if all are protected, so the extra slots go to block-relay-only peers (#1263).
+- P2P: `-maxconnections` above 2000 is lowered to 2000 with a warning, as in Core v32.1 (#1295).
 - P2P: `-discover` announces to outbound clearnet peers the address they report seeing the node at, off by default (Core's is on) (#1209).
 - The C++ script engine is Bitcoin Core's interpreter through `libbitcoinkernel`
   instead of `libbitcoinconsensus`, which redid a transaction's signature
