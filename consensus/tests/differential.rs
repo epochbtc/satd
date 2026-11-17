@@ -258,7 +258,7 @@ fn differential_script_tests() {
          ({taproot_rows} taproot rows)"
     );
     assert_eq!(mismatched, 0, "{mismatched} differential mismatches in script_tests");
-    assert_eq!(taproot_rows, 5, "taproot rows run");
+    assert_eq!(taproot_rows, 7, "taproot rows run");
 }
 
 // =========================================================================

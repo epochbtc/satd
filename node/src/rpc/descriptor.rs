@@ -1560,6 +1560,37 @@ pub fn infer_descriptor(script: &bitcoin::Script, network: Network) -> String {
     add_checksum(&format!("raw({})", hex::encode(bytes)))
 }
 
+/// Core's `InferDescriptor` for a P2WSH output whose witness script the
+/// signing provider holds, as `decodescript`'s `segwit` object asks for it
+/// (`InferScript`, `src/script/descriptor.cpp`): `wsh(<inner>)` when the
+/// witness script infers in P2WSH context, and the P2WSH output's `addr()`
+/// otherwise.
+///
+/// In P2WSH context `InferScript` names a bare multisig of compressed keys
+/// `multi()`, and otherwise tries the script as miniscript, keeping it only
+/// when it is sane (`IsSane`). Nothing else infers below the top level: a
+/// key-hash fragment (`pkh()` by hash) has no key in the provider to name,
+/// and a P2PK or P2PKH script never reaches here, since `decodescript` wraps
+/// those in P2WPKH.
+///
+/// rust-miniscript's parser takes a key only when it is on the curve, where
+/// Core's takes any 33-byte key with a 02/03 prefix, so a sane miniscript
+/// with an off-curve key is `addr()` here and `wsh()` in Core.
+pub fn infer_p2wsh_descriptor(witness_script: &bitcoin::Script, network: Network) -> String {
+    let compressed = |k: &[u8]| k.len() == 33 && matches!(k[0], 0x02 | 0x03);
+    if let Some((threshold, keys)) = bare_multisig(witness_script)
+        && keys.iter().all(|k| compressed(k))
+    {
+        let joined: Vec<String> = keys.iter().map(hex::encode).collect();
+        return add_checksum(&format!("wsh(multi({threshold},{}))", joined.join(",")));
+    }
+    if let Ok(ms) = miniscript::Miniscript::<bitcoin::PublicKey, miniscript::Segwitv0>::parse(witness_script) {
+        return add_checksum(&format!("wsh({ms})"));
+    }
+    let address = Address::p2wsh(witness_script, network);
+    add_checksum(&format!("addr({address})"))
+}
+
 /// The pubkey of a bare P2PK output (`<key> OP_CHECKSIG`), by length.
 pub(crate) fn p2pk_key(script: &bitcoin::Script) -> Option<&[u8]> {
     let b = script.as_bytes();

@@ -67,6 +67,37 @@ pub(crate) fn json_type_name(v: &Value) -> &'static str {
 /// read those slots with [`Args::raw`] and validate them by hand.
 pub(crate) trait ArgType: DeserializeOwned {
     const CORE_TYPE: &'static str;
+
+    /// Convert a value whose JSON type already matched [`Self::CORE_TYPE`].
+    fn from_arg(v: Value) -> Result<Self, ArgValueError> {
+        serde_json::from_value(v).map_err(|e| ArgValueError::Domain(e.to_string()))
+    }
+}
+
+/// Why a value of the right JSON type still did not convert.
+pub(crate) enum ArgValueError {
+    /// Core's `UniValue::getInt` failed: `-1 JSON integer out of range`.
+    IntRange,
+    /// Anything else: `-8 Invalid value for argument ...`.
+    Domain(String),
+}
+
+/// Core's message when `UniValue::getInt<T>` cannot convert a number.
+pub(crate) const INT_OUT_OF_RANGE: &str = "JSON integer out of range";
+
+/// Core's `UniValue::getInt<T>` (`src/univalue/include/univalue.h`): the
+/// number's literal text must parse whole, by `std::from_chars`, as a `T`.
+/// A fraction (`1.5`, `1.0`), an exponent (`1e0`), or a value outside `T`
+/// fails, and Core answers the bare `std::runtime_error` as
+/// `RPC_MISC_ERROR` (-1) "JSON integer out of range". The workspace builds
+/// `serde_json` with `arbitrary_precision`, so a `Number` keeps the
+/// caller's text and Rust's integer `parse` sees what `from_chars` sees. The
+/// one exception: `serde_json` reads `-0` as the integer 0, so an unsigned
+/// slot takes `-0` as 0 where Core's `from_chars` refuses the sign.
+pub(crate) fn core_int<T: std::str::FromStr>(n: &serde_json::Number) -> Result<T, ErrorObjectOwned> {
+    n.to_string()
+        .parse::<T>()
+        .map_err(|_| ErrorObjectOwned::owned(-1, INT_OUT_OF_RANGE, None::<()>))
 }
 
 macro_rules! arg_type {
@@ -75,9 +106,27 @@ macro_rules! arg_type {
     };
 }
 
+/// Integer slots convert as Core's `getInt<T>` does; see [`core_int`]. The
+/// Rust type is the one Core's handler names (`int` is `i32`, `uint32_t` is
+/// `u32`, `int64_t` is `i64`), so the accepted range is Core's too.
+macro_rules! int_arg_type {
+    ($($t:ty),+ $(,)?) => {
+        $(impl ArgType for $t {
+            const CORE_TYPE: &'static str = "number";
+            fn from_arg(v: Value) -> Result<Self, ArgValueError> {
+                match &v {
+                    Value::Number(n) => n.to_string().parse().map_err(|_| ArgValueError::IntRange),
+                    _ => Err(ArgValueError::IntRange),
+                }
+            }
+        })+
+    };
+}
+
 arg_type!("string": String);
 arg_type!("bool": bool);
-arg_type!("number": u8, u16, u32, u64, usize, i8, i16, i32, i64, isize, f64);
+arg_type!("number": f64, serde_json::Number);
+int_arg_type!(u8, u16, u32, u64, usize, i8, i16, i32, i64, isize);
 
 impl<T: DeserializeOwned> ArgType for Vec<T> {
     const CORE_TYPE: &'static str = "array";
@@ -184,16 +233,9 @@ impl Args {
             self.record(name, actual, T::CORE_TYPE);
             return Ok(None);
         }
-        match serde_json::from_value::<T>(v) {
+        match T::from_arg(v) {
             Ok(t) => Ok(Some(t)),
-            // Right JSON type, wrong domain: a negative or fractional value
-            // in a `u32` slot, a bad enum string. Core answers -8 for an
-            // out-of-range argument value, naming it.
-            Err(e) => Err(self.value_error(ErrorObjectOwned::owned(
-                -8,
-                format!("Invalid value for argument {name}: {e}"),
-                None::<()>,
-            ))),
+            Err(e) => Err(self.conversion_error(name, e)),
         }
     }
 
@@ -235,29 +277,37 @@ impl Args {
             // handler's `check()`.
             return Err(self.take_mismatch_error().expect("mismatch just recorded"));
         }
-        serde_json::from_value::<T>(v).map_err(|e| {
-            self.value_error(ErrorObjectOwned::owned(
+        T::from_arg(v).map_err(|e| self.conversion_error(name, e))
+    }
+
+    /// The error for a value of the right JSON type that did not convert.
+    /// An integer that is fractional or outside the slot's type is Core's
+    /// `getInt` failure, -1; any other domain error names the argument, -8.
+    fn conversion_error(&mut self, name: &str, e: ArgValueError) -> ErrorObjectOwned {
+        let e = match e {
+            ArgValueError::IntRange => ErrorObjectOwned::owned(-1, INT_OUT_OF_RANGE, None::<()>),
+            ArgValueError::Domain(e) => ErrorObjectOwned::owned(
                 -8,
                 format!("Invalid value for argument {name}: {e}"),
                 None::<()>,
-            ))
-        })
+            ),
+        };
+        self.value_error(e)
     }
 
     /// Core's `ParseVerbosity` (`src/rpc/util.cpp`): a `verbose`/`verbosity`
-    /// slot accepts **either** a bool or a number — `false` is 0, `true` is 1.
-    pub(crate) fn verbosity(
-        &mut self,
-        name: &str,
-        default: u32,
-    ) -> Result<u32, ErrorObjectOwned> {
+    /// slot accepts **either** a bool or a number -- `false` is 0, `true` is
+    /// 1 -- and a number is read with `getInt<int>`, so any `int` is
+    /// returned, negative ones included, for the caller to clamp the way its
+    /// Core handler does. A fraction or a value outside `int` is -1 "JSON
+    /// integer out of range".
+    pub(crate) fn verbosity(&mut self, name: &str, default: i32) -> Result<i32, ErrorObjectOwned> {
         let Some(v) = self.next_value() else { return Ok(default) };
         match &v {
-            Value::Bool(b) => Ok(u32::from(*b)),
-            Value::Number(n) => match n.as_u64().and_then(|n| u32::try_from(n).ok()) {
-                Some(v) => Ok(v),
-                None => Err(self
-                    .value_error(ErrorObjectOwned::owned(-8, "Verbosity out of range", None::<()>))),
+            Value::Bool(b) => Ok(i32::from(*b)),
+            Value::Number(n) => match core_int::<i32>(n) {
+                Ok(v) => Ok(v),
+                Err(e) => Err(self.value_error(e)),
             },
             other => {
                 self.record(name, json_type_name(other), "number");
@@ -267,9 +317,9 @@ impl Args {
     }
 
     /// `ParseVerbosity` with `allow_bool = false`: a number only. A bool is
-    /// refused rather than read as 0 or 1, and any integer is returned for
-    /// the caller to range-check, so the error names the value.
-    pub(crate) fn int_verbosity(&mut self, name: &str, default: i64) -> Result<i64, ErrorObjectOwned> {
+    /// refused rather than read as 0 or 1, and any `int` is returned for the
+    /// caller to range-check, so the error names the value.
+    pub(crate) fn int_verbosity(&mut self, name: &str, default: i32) -> Result<i32, ErrorObjectOwned> {
         let Some(v) = self.next_value() else { return Ok(default) };
         match &v {
             Value::Bool(_) => Err(self.value_error(ErrorObjectOwned::owned(
@@ -277,10 +327,9 @@ impl Args {
                 "Verbosity was boolean but only integer allowed",
                 None::<()>,
             ))),
-            Value::Number(n) => match n.as_i64().filter(|n| i32::try_from(*n).is_ok()) {
-                Some(v) => Ok(v),
-                None => Err(self
-                    .value_error(ErrorObjectOwned::owned(-8, "Verbosity out of range", None::<()>))),
+            Value::Number(n) => match core_int::<i32>(n) {
+                Ok(v) => Ok(v),
+                Err(e) => Err(self.value_error(e)),
             },
             other => {
                 self.record(name, json_type_name(other), "number");
@@ -437,11 +486,15 @@ mod tests {
     #[test]
     fn verbosity_accepts_bool_or_number() {
         for (src, want) in [
-            (r#"["h"]"#, 1u32),
+            (r#"["h"]"#, 1i32),
             (r#"["h",false]"#, 0),
             (r#"["h",true]"#, 1),
             (r#"["h",0]"#, 0),
             (r#"["h",2]"#, 2),
+            // Any `int`: the handler clamps, as Core's does.
+            (r#"["h",-1]"#, -1),
+            (r#"["h",-0]"#, 0),
+            (r#"["h",2147483647]"#, i32::MAX),
         ] {
             let p = params(src);
             let mut a = Args::new(&p);
@@ -478,15 +531,59 @@ mod tests {
         a.check().unwrap();
     }
 
-    /// Right JSON type, wrong domain: Core answers -8 for an out-of-range
-    /// argument value rather than a type error.
+    /// Right JSON type, but not an integer of the slot's type: Core's
+    /// `getInt<T>` fails, and its dispatcher answers the bare
+    /// `std::runtime_error` as -1 "JSON integer out of range".
     #[test]
-    fn a_number_that_does_not_fit_the_slot_is_invalid_parameter() {
-        let p = params("[-1]");
+    fn a_number_that_does_not_fit_the_slot_is_json_integer_out_of_range() {
+        for (src, ok) in [
+            ("[-1]", false),
+            ("[4294967296]", false),
+            ("[1.5]", false),
+            ("[1.0]", false),
+            ("[1e0]", false),
+            ("[99999999999999999999]", false),
+            ("[4294967295]", true),
+            ("[0]", true),
+        ] {
+            let p = params(src);
+            let mut a = Args::new(&p);
+            match a.optional::<u32>("n") {
+                Ok(v) => assert!(ok && v.is_some(), "{src}"),
+                Err(err) => {
+                    assert!(!ok, "{src}: {}", err.message());
+                    assert_eq!((err.code(), err.message()), (-1, INT_OUT_OF_RANGE), "{src}");
+                }
+            }
+        }
+        // `int`: the sign is allowed, `-0` is 0, and the bounds are `i32`'s.
+        for (src, want) in [("[-0]", Some(0)), ("[-2147483648]", Some(i32::MIN)), ("[2147483648]", None)] {
+            let p = params(src);
+            let mut a = Args::new(&p);
+            assert_eq!(a.required::<i32>("height").ok(), want, "{src}");
+        }
+        // Every integer width fails the same way.
+        let p = params(r#"[256]"#);
         let mut a = Args::new(&p);
-        let err = a.optional::<u32>("nblocks").unwrap_err();
-        assert_eq!(err.code(), -8);
-        assert!(err.message().contains("nblocks"), "{}", err.message());
+        let err = a.required::<u8>("x").unwrap_err();
+        assert_eq!(err.code(), -1, "{}", err.message());
+    }
+
+    /// `verbosity` reads with `getInt<int>`: past `int` is the same -1.
+    #[test]
+    fn verbosity_outside_int_is_json_integer_out_of_range() {
+        for src in [r#"["h",2147483648]"#, r#"["h",-2147483649]"#, r#"["h",1.5]"#] {
+            let p = params(src);
+            let mut a = Args::new(&p);
+            let _: String = a.required("blockhash").unwrap();
+            let err = a.verbosity("verbosity", 1).unwrap_err();
+            assert_eq!((err.code(), err.message()), (-1, INT_OUT_OF_RANGE), "{src}");
+            let p = params(src);
+            let mut a = Args::new(&p);
+            let _: String = a.required("blockhash").unwrap();
+            let err = a.int_verbosity("verbosity", 0).unwrap_err();
+            assert_eq!((err.code(), err.message()), (-1, INT_OUT_OF_RANGE), "{src}");
+        }
     }
 
     /// Core forgives an explicit `null` only for an *optional* argument. In a
@@ -587,7 +684,7 @@ mod tests {
     /// `verbosity`'s range error is a value error like any other.
     #[test]
     fn a_pending_mismatch_outranks_a_verbosity_range_error() {
-        let p = params(r#"["a",-5]"#);
+        let p = params(r#"["a",2147483648]"#);
         let mut a = Args::new(&p);
         assert_eq!(a.optional::<u32>("nblocks").unwrap(), None);
         let err = a.verbosity("verbosity", 1).unwrap_err();

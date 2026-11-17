@@ -63,7 +63,7 @@ The `--profile=<preset>` flag replaces manual tuning of `-dbcache`,
 | `--esploratlsbind=<addr:port>` | None | Enables native TLS for the Esplora REST API. Requires `--esploratlscert` and `--esploratlskey`. |
 | `--v2transport=<0\|1>` | `1` | Enables BIP 324 v2 encrypted P2P transport. Offers and accepts the ElligatorSwift + ChaCha20-Poly1305 v2 handshake, and falls back to v1. |
 | `--v2only=<0\|1>` | `0` | satd-specific privacy flag. If `1`, refuses or immediately disconnects any peer not using the v2 encrypted P2P transport. |
-| `--dbcache=auto` | None | Spawns the adaptive dbcache resizing task, which scales the RocksDB block cache and the CoinCache clean-LRU in response to system memory pressure. |
+| `--dbcache=auto` | None | Spawns the adaptive dbcache resizing task, which scales the RocksDB block cache and the CoinCache clean-LRU in response to memory pressure. The starting cap is half of total memory, between 450 and 8192 MB; the controller then sizes from available memory. On Linux both figures are the host's `/proc/meminfo` clamped to the memory cgroup the node runs in (systemd `MemoryMax=`/`MemoryHigh=`, Docker `--memory`, an app-store container limit): the tightest `memory.max` or `memory.high` on the cgroup path, cgroup v2 or v1, and that limit less usage plus reclaimable page cache. Where no cgroup files can be read, the host figures apply. |
 
 ### Mempool Policy Sovereignty
 
@@ -112,8 +112,37 @@ sat-cli -datadir=/path/to/datadir getblockcount
   directory. satd writes no cookie when `rpcuser` and `rpcpassword` are both
   set, so this is how `sat-cli` reaches such a node. With `-rpcwait`, a
   cookie that does not exist yet is read again until the node writes it.
+  `-stdinrpcpass` reads the password from the first line of standard input
+  instead, ahead of any `-stdin` arguments, and overrides `rpcpassword`.
 - **`-generate`** is refused: it mines to a wallet address in `bitcoin-cli`,
   and satd has no wallet. Use `generatetoaddress` or `generatetodescriptor`.
+
+### How `sat-cli` reads RPC arguments
+
+A raw call (`sat-cli <method> [args...]`) converts its arguments the way
+`bitcoin-cli` does. An argument is parsed as JSON only when Bitcoin Core's
+conversion table (`vRPCConvertParams`, carried from Core v32.1) lists it for
+that method, and every other argument is sent as the string typed:
+`sat-cli signmessagewithprivkey <key> 123` signs the text `123`, and
+`sat-cli decodescript 5151` sends the hex as a string. A listed argument that
+is not valid JSON is refused with `error: Error parsing JSON: <arg>`. Quote
+JSON for the shell: `sat-cli logging '["net"]' '[]'`.
+
+satd's own RPCs have rows of their own for their numeric, boolean, array and
+object arguments (`getreorghistory 3600`, `listquarantine <rule> 10 0`,
+`estimatefees '[1,6]'`). A method `sat-cli` does not know at all, such as one
+added to a newer node, falls back to the guess earlier versions made for
+every method: each argument is parsed as JSON if it can be, else sent as a
+string.
+
+With `-named`, `name=value` arguments are converted by the same table, by
+name, and arguments without `=` go, in order, into the `args` array. As in
+`bitcoin-cli`, a `name=value` whose name the method does not declare is taken
+whole as the next positional argument when that slot takes a string, so in
+`sat-cli -named verifybip322 <address> <base64-signature> message=hi` a
+signature ending in `=` stays the signature. `-stdin`
+appends each line of standard input as one more argument, empty lines
+included.
 
 ## Live Config Reload (`SIGHUP`)
 
