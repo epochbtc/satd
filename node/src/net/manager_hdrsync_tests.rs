@@ -568,3 +568,18 @@ fn the_continuation_is_the_outstanding_getheaders() {
     pm.handle_inv(1, vec![Inventory::Block(bitcoin::BlockHash::from_byte_array([0x55; 32]))]);
     assert_eq!(getheaders_sent(&mut rx), 0, "the continuation's answer covers the announcements");
 }
+
+/// Starting header sync records its `getheaders` as outstanding, on both
+/// paths that send it (the connection's own opening request and the sync
+/// loop's): an announcement that arrives before the answer brings no second
+/// request.
+#[test]
+fn the_opening_getheaders_is_outstanding() {
+    let (pm, _dir) = mk_pm();
+    let mut rx = add_peer(&pm, 1);
+    assert!(pm.start_header_sync(1), "the peer takes the sync slot");
+    assert!(pm.peers.read()[&1].last_getheaders_sent.is_some());
+    pm.handle_headers(1, vec![unconnecting_header()]);
+    pm.handle_inv(1, vec![Inventory::Block(bitcoin::BlockHash::from_byte_array([0x33; 32]))]);
+    assert_eq!(getheaders_sent(&mut rx), 0, "the opening request covers the announcements");
+}

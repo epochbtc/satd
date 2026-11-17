@@ -5359,8 +5359,9 @@ impl PeerManager {
     }
 
     /// Whether to start header sync with `id` now, and if so, mark it
-    /// started; the caller sends the `getheaders`. Core's `SendMessages`:
-    /// while the best header is more than a day old, header sync runs with a
+    /// started and its `getheaders` outstanding (Core starts sync through
+    /// `MaybeSendGetHeaders`, which records the request); the caller sends
+    /// it. Core's `SendMessages`: while the best header is more than a day old, header sync runs with a
     /// single peer, preferably a preferred-download one (outbound or
     /// `noban`), so a fresh node does not fetch the whole header chain once
     /// from every peer it connects to; past that, every peer. A peer that
@@ -5396,6 +5397,7 @@ impl PeerManager {
         }
         if let Some(h) = peers.get_mut(&id) {
             h.header_sync.started = true;
+            h.last_getheaders_sent = Some(Instant::now());
         }
         true
     }
@@ -5421,7 +5423,7 @@ impl PeerManager {
             .collect();
         for id in waiting {
             if self.start_header_sync(id) {
-                self.send_getheaders(id, sync::make_initial_getheaders(&self.chain_state));
+                self.send_to_peer(id, sync::make_initial_getheaders(&self.chain_state));
             }
         }
     }
@@ -14280,8 +14282,8 @@ impl PeerManager {
     }
 
     /// Send a `getheaders` that is not gated on an outstanding one (header
-    /// sync's start and continuation, the stall probe, the periodic
-    /// poll), and record it as outstanding, as every `getheaders` Core sends
+    /// sync's continuation, the stall probe, the periodic poll; its start is
+    /// recorded by [`Self::start_header_sync`]), and record it as outstanding, as every `getheaders` Core sends
     /// goes through `MaybeSendGetHeaders`. An announcement arriving before
     /// its answer then brings no second request: the answer covers it.
     fn send_getheaders(&self, id: PeerId, msg: NetworkMessage) {
