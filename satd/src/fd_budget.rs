@@ -23,7 +23,8 @@
 //!          + 2 with -nap                        attestation pulls
 //!          + per RPC listener (plain, TLS,
 //!            read-only, read-only TLS):  1 + RPC_MAX_CONNECTIONS (100)
-//!          + Esplora:   listeners + esploramaxsockets (esploramaxconns if 0)
+//!          + Esplora:   listeners + esploramaxsockets
+//!                       (esploramaxconns + esplorasseconns if 0)
 //!          + Electrum:  listeners + electrummaxconns
 //!          + Stratum:   listeners + stratummaxconns
 //!          + events gRPC: 1 + eventsgrpcmaxconns
@@ -35,8 +36,8 @@
 //! ```
 //!
 //! A surface counts only when it is enabled. A cap that is off
-//! (`maxopenfiles=-1`, an Esplora or streamws socket cap and connection cap
-//! both `0`) has no number to budget and counts nothing; neither do ZMQ subscribers or an
+//! (`maxopenfiles=-1`, an Esplora or streamws socket cap and its
+//! connection caps all `0`) has no number to budget and counts nothing; neither do ZMQ subscribers or an
 //! AssumeUTXO background chainstate, whose RocksDB keeps every file open.
 //!
 //! `MIN_SATD_FDS` is Core's `MIN_CORE_FDS` (150 for LevelDB plus one for
@@ -149,7 +150,12 @@ pub fn needs(config: &Config) -> Vec<(&'static str, u64)> {
     ));
     if config.esplora {
         let listeners = 1 + u64::from(config.esplora_tls_bind.is_some());
-        items.push(("esplora", listeners + socket_cap(config.esplora_max_sockets, config.esplora_max_conns)));
+        // Without a socket cap, requests in flight (`esploramaxconns`) and
+        // open SSE streams (`esplorasseconns`, its own semaphore) both hold
+        // sockets.
+        let held = cap(config.esplora_max_conns).saturating_add(cap(config.esplora_sse_max_conns));
+        let clients = if config.esplora_max_sockets == 0 { held } else { cap(config.esplora_max_sockets) };
+        items.push(("esplora", listeners + clients));
     }
     if config.electrum {
         let listeners = 1 + u64::from(config.electrum_tls_bind.is_some());
@@ -317,11 +323,16 @@ mod tests {
         assert_eq!(item(&items, "metrics"), Some(1 + 64));
         assert_eq!(item(&items, "rpc"), Some(101));
 
-        let items = needs(&config(&["--maxopenfiles=-1", "--esploramaxsockets=0", "--esploramaxconns=7"]));
+        let items = needs(&config(&[
+            "--maxopenfiles=-1",
+            "--esploramaxsockets=0",
+            "--esploramaxconns=7",
+            "--esplorasseconns=3",
+        ]));
         assert_eq!(item(&items, "rocksdb"), None);
-        assert_eq!(item(&items, "esplora"), Some(1 + 7), "socket cap off: the connection cap");
+        assert_eq!(item(&items, "esplora"), Some(1 + 7 + 3), "socket cap off: requests and SSE streams");
 
-        let items = needs(&config(&["--esploramaxsockets=0", "--esploramaxconns=0"]));
+        let items = needs(&config(&["--esploramaxsockets=0", "--esploramaxconns=0", "--esplorasseconns=0"]));
         assert_eq!(item(&items, "esplora"), Some(1), "both caps off: nothing to budget");
 
         let items = needs(&config(&["--esplora=0"]));
