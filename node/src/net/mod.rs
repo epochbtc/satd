@@ -9,6 +9,7 @@ pub mod block_source;
 pub mod compact;
 pub mod connection;
 pub mod dns;
+pub mod eviction;
 pub mod flow;
 pub mod ibd;
 pub mod headers_queue;

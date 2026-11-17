@@ -1079,7 +1079,7 @@ const SPECIFIC_HEIGHT_NEEDS_INDEX: &str = "Querying specific block heights requi
 
 /// Core's `ParseHashOrHeight` (`src/rpc/blockchain.cpp`): a number is a
 /// height on the active chain, anything else is read as a block hash.
-fn parse_hash_or_height(chain_state: &ChainState, param: &Value) -> Result<BlockHash, (i32, String)> {
+pub(crate) fn parse_hash_or_height(chain_state: &ChainState, param: &Value) -> Result<BlockHash, (i32, String)> {
     if let Value::Number(n) = param {
         // `getInt<int>`: a fraction or a value outside `int` is refused.
         let height = n
@@ -1670,9 +1670,14 @@ pub fn get_chain_tips(chain_state: &ChainState) -> Value {
 /// background validation hasn't reached it) the dependent fields are omitted
 /// exactly as Core does: `txcount` (final block uncounted), `window_tx_count`
 /// (either endpoint uncounted), and `txrate` (no `window_tx_count`).
+/// Core's `getchaintxstats` refusal of an explicit window that is negative
+/// or reaches the final block's height (`RPC_INVALID_PARAMETER`).
+pub const INVALID_BLOCK_COUNT: &str =
+    "Invalid block count: should be between 0 and the block's height - 1";
+
 pub fn get_chain_tx_stats(
     chain_state: &ChainState,
-    nblocks: Option<u32>,
+    nblocks: Option<i32>,
     final_blockhash: Option<bitcoin::BlockHash>,
 ) -> Result<Value, String> {
     // Resolve the window's final block (default = tip).
@@ -1699,7 +1704,15 @@ pub fn get_chain_tx_stats(
     };
     let final_height = final_entry.height;
 
-    let window = nblocks.unwrap_or(30).min(final_height);
+    // Core refuses an explicit count below 0, or above 0 and at least the
+    // final block's height, rather than clamping it.
+    let window = match nblocks {
+        Some(n) if n < 0 || (n > 0 && n as u32 >= final_height) => {
+            return Err(INVALID_BLOCK_COUNT.to_string());
+        }
+        Some(n) => n as u32,
+        None => 30.min(final_height),
+    };
     if window == 0 {
         return Err("Window must be > 0".to_string());
     }
@@ -1974,7 +1987,7 @@ fn find_earliest_at_least(chain_state: &ChainState, time: i64) -> Option<u32> {
 pub fn prune_blockchain(
     chain_state: &ChainState,
     prune: PruneMode,
-    height_param: i64,
+    height_param: &serde_json::Number,
 ) -> Result<i64, (i32, String)> {
     if !prune.is_on() {
         return Err((
@@ -1982,6 +1995,10 @@ pub fn prune_blockchain(
             "Cannot prune blocks because node is not in prune mode.".to_string(),
         ));
     }
+    // Core's `getInt<int>` comes after the prune-mode check.
+    let height_param: i64 = crate::rpc::params::core_int::<i32>(height_param)
+        .map_err(|e| (e.code(), e.message().to_string()))?
+        .into();
     if height_param < 0 {
         return Err((-8, "Negative block height.".to_string()));
     }
@@ -2659,11 +2676,11 @@ mod tests {
     fn pruneblockchain_refuses_what_core_refuses() {
         let (cs, dir) = make_cs();
 
-        let e = prune_blockchain(&cs, PruneMode::Off, 100).unwrap_err();
+        let e = prune_blockchain(&cs, PruneMode::Off, &100.into()).unwrap_err();
         assert_eq!(e.0, -1);
         assert_eq!(e.1, "Cannot prune blocks because node is not in prune mode.");
 
-        let e = prune_blockchain(&cs, PruneMode::Manual, -1).unwrap_err();
+        let e = prune_blockchain(&cs, PruneMode::Manual, &(-1).into()).unwrap_err();
         assert_eq!(e.0, -8);
         assert_eq!(e.1, "Negative block height.");
 
@@ -2671,19 +2688,30 @@ mod tests {
         // only, so every height is answered "too short" rather than
         // "shorter than the attempted prune height".
         for h in [0, 100, 10_000] {
-            let e = prune_blockchain(&cs, PruneMode::Manual, h).unwrap_err();
+            let e = prune_blockchain(&cs, PruneMode::Manual, &h.into()).unwrap_err();
             assert_eq!(e.0, -1, "height {h}");
             assert_eq!(e.1, "Blockchain is too short for pruning.", "height {h}");
         }
 
         // A timestamp argument on a chain with no block that old: Core's
         // separate message, not a silent prune of nothing.
-        let e = prune_blockchain(&cs, PruneMode::Manual, 2_000_000_000).unwrap_err();
+        let e = prune_blockchain(&cs, PruneMode::Manual, &2_000_000_000.into()).unwrap_err();
         assert_eq!(e.0, -8);
         assert_eq!(
             e.1,
             "Could not find block with at least the specified timestamp."
         );
+
+        // Core reads the height with `getInt<int>` after the prune-mode
+        // check: past `int`, or a fraction, is "JSON integer out of range"
+        // on a pruning node, and the prune-mode refusal on any other.
+        for text in ["2147483648", "1.5"] {
+            let n: serde_json::Number = serde_json::from_str(text).unwrap();
+            let e = prune_blockchain(&cs, PruneMode::Manual, &n).unwrap_err();
+            assert_eq!(e, (-1, "JSON integer out of range".to_string()), "{text}");
+            let e = prune_blockchain(&cs, PruneMode::Off, &n).unwrap_err();
+            assert_eq!(e.1, "Cannot prune blocks because node is not in prune mode.", "{text}");
+        }
 
         let _ = std::fs::remove_dir_all(&dir);
     }

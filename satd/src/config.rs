@@ -67,7 +67,8 @@ impl DbCacheSize {
 
     /// Parse Bitcoin-Core-compatible string: either a number (MB) or "auto".
     /// When "auto" is given without an explicit max, the cap is chosen based
-    /// on total system memory: 50% of MemTotal, min 450 MB, max 8192 MB.
+    /// on total memory: 50% of MemTotal, or of the process's memory cgroup
+    /// limit when that is lower, min 450 MB, max 8192 MB.
     fn parse(s: &str) -> Option<Self> {
         let trimmed = s.trim();
         if trimmed.eq_ignore_ascii_case("auto") {
@@ -82,7 +83,9 @@ impl DbCacheSize {
 }
 
 fn default_auto_max_mb() -> usize {
-    // Read MemTotal once at config-load time. When unavailable (non-Linux:
+    // Read MemTotal once at config-load time, clamped to the memory cgroup
+    // limit (systemd MemoryMax=, a container's --memory) so a confined node
+    // does not size its cache for the whole host. When unavailable (non-Linux:
     // /proc/meminfo doesn't exist), fall back to Core's default static
     // budget — NOT a larger value. The adaptive controller will separately
     // detect the missing meminfo and stay inactive. Together this keeps
@@ -235,7 +238,7 @@ impl Profile {
                 txindex: None,
                 prune: Some(0),
                 dbcache: Some(2048),
-                maxconnections: Some(125),
+                maxconnections: Some(node::net::manager::DEFAULT_MAX_PEER_CONNECTIONS),
                 minrelaytxfee: None,
                 network_regtest: false,
                 network_signet: false,
@@ -1029,6 +1032,9 @@ pub struct Config {
     /// Maximum simultaneous inbound peers from the same source IP
     /// (Core-style flood guard; default 3).
     pub maxinboundperip: usize,
+    /// Bitcoin Core's `-inboundrelaypercent` (v32): the share of inbound
+    /// slots, 0 to 100, that transaction-relaying peers may hold. Default 50.
+    pub inboundrelaypercent: usize,
     /// Bitcoin Core's `-blockreconstructionextratxn`: how many recently seen
     /// transactions that are not in the mempool (replaced, or refused by
     /// policy) are kept for compact block reconstruction. 0 keeps none.
@@ -2296,11 +2302,11 @@ impl Config {
                              remove it or select signet with --signet / --chain=signet"
                         ));
                     }
+                    // An empty challenge is a custom signet in Core
+                    // (`ReadSigNetArgs` accepts any hex, the empty string
+                    // included), with a datadir of its own.
                     let bytes = <Vec<u8> as bitcoin::hashes::hex::FromHex>::from_hex(hex.trim())
                         .map_err(|_| format!("-signetchallenge must be hex, not '{hex}'."))?;
-                    if bytes.is_empty() {
-                        return Err("signetchallenge must not be empty".to_string());
-                    }
                     Some(bytes)
                 }
                 None => None,
@@ -2742,8 +2748,8 @@ impl Config {
         // and Core's own condition is `-connect OR maxconnections <= 0`.
         // Parsed through `i64` so a negative value lands on Core's `<= 0`
         // branch instead of failing `usize::from_str` and silently falling
-        // through to the 125 default -- which left the node listening and
-        // accepting 125 peers where Core would have taken none.
+        // through to the default -- which left the node listening and
+        // accepting peers where Core would have taken none.
         let maxconnections: usize = cli
             .maxconnections
             .or_else(|| {
@@ -2752,7 +2758,7 @@ impl Config {
                     .map(|n| usize::try_from(n).unwrap_or(0))
             })
             .or(profile_defaults.maxconnections)
-            .unwrap_or(125);
+            .unwrap_or(node::net::manager::DEFAULT_MAX_PEER_CONNECTIONS);
         let binds_requested = !bind_raw.is_empty() || !whitebind_raw.is_empty();
         if !listen_explicit && !binds_requested && (!automatic_outbound || maxconnections == 0)
         {
@@ -4411,6 +4417,12 @@ impl Config {
                 .maxinboundperip
                 .or_else(|| file_get("maxinboundperip").and_then(|v| v.parse().ok()))
                 .unwrap_or(3),
+            // Core: `std::clamp(GetIntArg("-inboundrelaypercent", 50), 0, 100)`
+            // (v32.1 `init.cpp`).
+            inboundrelaypercent: cli
+                .inboundrelaypercent
+                .or_else(|| file_get("inboundrelaypercent").and_then(|v| v.trim().parse::<i64>().ok()))
+                .map_or(node::net::manager::DEFAULT_INBOUND_RELAY_PERCENT, |n| n.clamp(0, 100) as usize),
             blockreconstructionextratxn: match cli
                 .blockreconstructionextratxn
                 .map(|n| n.to_string())
@@ -4952,6 +4964,7 @@ impl Config {
                 "port": self.port,
                 "max_connections": self.maxconnections,
                 "max_inbound_per_ip": self.maxinboundperip,
+                "inbound_relay_percent": self.inboundrelaypercent,
                 "block_reconstruction_extra_txn": self.blockreconstructionextratxn,
                 "cmpct_block_prefill": self.cmpctblockprefill,
                 "cmpct_block_prefill_bytes": self.cmpctblockprefillbytes,
@@ -5068,8 +5081,9 @@ impl Config {
     }
 
     /// Returns the network-specific data directory (e.g. ~/.bitcoin/regtest/).
+    /// A custom signet has one of its own, `signet_<message start>` (#1271).
     pub fn network_datadir(&self) -> PathBuf {
-        match chain_subdir(self.network) {
+        match chain_subdir(self.network, self.signet_challenge.as_deref()) {
             Some(sub) => self.datadir.join(sub),
             None => self.datadir.clone(),
         }
@@ -5079,21 +5093,27 @@ impl Config {
     /// matching Bitcoin Core's `-blocksdir` semantics. See
     /// [`resolve_blocks_dir`] for the path rules.
     pub fn blocks_dir(&self) -> PathBuf {
-        resolve_blocks_dir(self.blocksdir.as_deref(), &self.datadir, self.network)
+        resolve_blocks_dir(
+            self.blocksdir.as_deref(),
+            &self.datadir,
+            self.network,
+            self.signet_challenge.as_deref(),
+        )
     }
 }
 
 /// The chain-specific subdirectory name Bitcoin Core uses under the
 /// data/blocks roots: `None` for mainnet (no subdir), else the Core
 /// directory name. Centralised so `network_datadir` and `blocks_dir`
-/// can't drift apart.
-fn chain_subdir(network: Network) -> Option<&'static str> {
+/// can't drift apart. A signet's name depends on its challenge, as in
+/// Core's `GetSignetDataDir` (#1271).
+pub fn chain_subdir(network: Network, signet_challenge: Option<&[u8]>) -> Option<String> {
     match network {
         Network::Bitcoin => None,
-        Network::Regtest => Some("regtest"),
-        Network::Testnet => Some("testnet3"),
-        Network::Testnet4 => Some("testnet4"),
-        Network::Signet => Some("signet"),
+        Network::Regtest => Some("regtest".to_string()),
+        Network::Testnet => Some("testnet3".to_string()),
+        Network::Testnet4 => Some("testnet4".to_string()),
+        Network::Signet => Some(node::validation::signet::signet_data_dir(signet_challenge)),
     }
 }
 
@@ -5114,12 +5134,13 @@ pub fn resolve_blocks_dir(
     blocksdir: Option<&std::path::Path>,
     datadir: &std::path::Path,
     network: Network,
+    signet_challenge: Option<&[u8]>,
 ) -> PathBuf {
     let mut p = match blocksdir {
         Some(root) => root.to_path_buf(),
         None => datadir.to_path_buf(),
     };
-    if let Some(sub) = chain_subdir(network) {
+    if let Some(sub) = chain_subdir(network, signet_challenge) {
         p.push(sub);
     }
     p.push("blocks");
@@ -6262,9 +6283,17 @@ pub struct CliArgs {
     #[arg(
         long,
         value_name = "N",
-        help = "Maximum total connections (default: 125)"
+        help = "Maximum total connections (default: 200)"
     )]
     pub maxconnections: Option<usize>,
+
+    #[arg(
+        long,
+        value_name = "N",
+        allow_negative_numbers = true,
+        help = "Percent of inbound connections that may relay transactions, 0 to 100 (default: 50)"
+    )]
+    pub inboundrelaypercent: Option<i64>,
 
     #[arg(
         long,
@@ -9024,6 +9053,7 @@ pub fn normalize_args(args: Vec<String>) -> Vec<String> {
         "upgradechainstate",
         "maxconnections",
         "maxinboundperip",
+        "inboundrelaypercent",
         "blockreconstructionextratxn",
         "cmpctblockprefill",
         "cmpctblockprefillbytes",
@@ -9711,6 +9741,7 @@ pub const KNOWN_CONFIG_KEYS: &[&str] = &[
     "seednode",
     "maxconnections",
     "maxinboundperip",
+    "inboundrelaypercent",
     "blockreconstructionextratxn",
     "cmpctblockprefill",
     "cmpctblockprefillbytes",
@@ -12807,6 +12838,7 @@ testactivationheight=bip34@2
             upgradechainstate: None,
             maxconnections: None,
             maxinboundperip: None,
+            inboundrelaypercent: None,
             blockreconstructionextratxn: None,
             compact_prefill_args: CompactPrefillArgs::default(),
             maxuploadtarget: None,
@@ -12957,34 +12989,34 @@ testactivationheight=bip34@2
         // No -blocksdir: blocks live under the network datadir. Mainnet
         // has no chain subdir; the others do.
         assert_eq!(
-            resolve_blocks_dir(None, data, Network::Bitcoin),
+            resolve_blocks_dir(None, data, Network::Bitcoin, None),
             PathBuf::from("/data/blocks")
         );
         assert_eq!(
-            resolve_blocks_dir(None, data, Network::Regtest),
+            resolve_blocks_dir(None, data, Network::Regtest, None),
             PathBuf::from("/data/regtest/blocks")
         );
         assert_eq!(
-            resolve_blocks_dir(None, data, Network::Signet),
+            resolve_blocks_dir(None, data, Network::Signet, None),
             PathBuf::from("/data/signet/blocks")
         );
         assert_eq!(
-            resolve_blocks_dir(None, data, Network::Testnet),
+            resolve_blocks_dir(None, data, Network::Testnet, None),
             PathBuf::from("/data/testnet3/blocks")
         );
 
         // With -blocksdir: the flag is the ROOT; the chain subdir + blocks
         // are appended so different networks never share a flat-file dir.
         assert_eq!(
-            resolve_blocks_dir(Some(blk), data, Network::Bitcoin),
+            resolve_blocks_dir(Some(blk), data, Network::Bitcoin, None),
             PathBuf::from("/mnt/blocks/blocks")
         );
         assert_eq!(
-            resolve_blocks_dir(Some(blk), data, Network::Regtest),
+            resolve_blocks_dir(Some(blk), data, Network::Regtest, None),
             PathBuf::from("/mnt/blocks/regtest/blocks")
         );
         assert_eq!(
-            resolve_blocks_dir(Some(blk), data, Network::Signet),
+            resolve_blocks_dir(Some(blk), data, Network::Signet, None),
             PathBuf::from("/mnt/blocks/signet/blocks")
         );
     }
@@ -13130,6 +13162,7 @@ testactivationheight=bip34@2
             upgradechainstate: None,
             maxconnections: None,
             maxinboundperip: None,
+            inboundrelaypercent: None,
             blockreconstructionextratxn: None,
             compact_prefill_args: CompactPrefillArgs::default(),
             maxuploadtarget: None,
@@ -15457,8 +15490,8 @@ mcpallowedhost=node.local
     }
 
     /// Core's condition is `maxconnections <= 0`. Parsing the file value as
-    /// `usize` made a negative one fail outright and fall through to the 125
-    /// default — so the node listened *and* took 125 peers where Core takes
+    /// `usize` made a negative one fail outright and fall through to the
+    /// default — so the node listened *and* took peers where Core takes
     /// none.
     #[test]
     fn a_negative_maxconnections_lands_on_cores_zero_branch() {
@@ -15468,6 +15501,26 @@ mcpallowedhost=node.local
         let cfg = parse_negation(&["satd", "--regtest", "--datadir", dd]).expect("starts");
         assert_eq!(cfg.maxconnections, 0);
         assert!(!cfg.listen, "maxconnections <= 0 soft-sets listen=0");
+    }
+
+    /// Core v32's connection defaults: `-maxconnections` 200 and
+    /// `-inboundrelaypercent` 50, the percentage clamped to 0..=100 from the
+    /// command line or the file (`init.cpp`). The mining profile takes Core's
+    /// default too.
+    #[test]
+    fn core_v32_connection_defaults() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let dd = tmpdir.path().to_str().unwrap();
+        let cfg = parse_negation(&["satd", "--regtest", "--datadir", dd]).expect("starts");
+        assert_eq!((cfg.maxconnections, cfg.inboundrelaypercent), (200, 50));
+        assert_eq!(Profile::Mining.defaults().maxconnections, Some(200));
+        for (arg, pct) in [("-inboundrelaypercent=100", 100), ("-inboundrelaypercent=-5", 0), ("-inboundrelaypercent=250", 100)] {
+            let cfg = parse_negation(&["satd", "--regtest", "--datadir", dd, arg]).expect("starts");
+            assert_eq!(cfg.inboundrelaypercent, pct, "{arg}");
+        }
+        std::fs::write(tmpdir.path().join("bitcoin.conf"), "inboundrelaypercent=30\n").unwrap();
+        let cfg = parse_negation(&["satd", "--regtest", "--datadir", dd]).expect("starts");
+        assert_eq!(cfg.inboundrelaypercent, 30);
     }
 
     /// Core's `InitParameterInteraction`: `-connect` (set or negated), or
@@ -16454,6 +16507,44 @@ mcpallowedhost=node.local
         assert_eq!(err, "-signetchallenge cannot be multiple values.");
     }
 
+    /// #1271: a custom signet's datadir and blocks dir are
+    /// `signet_<message start>`, as in Core's `GetSignetDataDir`; the default
+    /// challenge given explicitly keeps `signet`. An empty challenge is a
+    /// custom signet, as in Core's `ReadSigNetArgs`.
+    #[test]
+    fn a_custom_signet_has_a_datadir_of_its_own() {
+        let dirs = |args: &[&str]| {
+            let mut argv = vec!["satd", "--signet", "--datadir=/data"];
+            argv.extend_from_slice(args);
+            let cfg = Config::from_cli(parse_cli(argv).unwrap()).unwrap();
+            (cfg.network_datadir(), cfg.blocks_dir())
+        };
+        assert_eq!(
+            dirs(&[]),
+            (PathBuf::from("/data/signet"), PathBuf::from("/data/signet/blocks"))
+        );
+        let default = "512103ad5e0edad18cb1f0fc0d28a3d4f1f3e445640337489abb10404f2d1e086be430210359ef5021964fe22d6f8e05b2463c9540ce96883fe3b278760f048f5189f2e6c452ae";
+        assert_eq!(
+            dirs(&["--signetchallenge", default]),
+            (PathBuf::from("/data/signet"), PathBuf::from("/data/signet/blocks"))
+        );
+        assert_eq!(
+            dirs(&["--signetchallenge", "51"]),
+            (
+                PathBuf::from("/data/signet_54d26fbd"),
+                PathBuf::from("/data/signet_54d26fbd/blocks")
+            )
+        );
+        assert_eq!(
+            dirs(&["--signetchallenge", "51", "--blocksdir=/mnt"]),
+            (
+                PathBuf::from("/data/signet_54d26fbd"),
+                PathBuf::from("/mnt/signet_54d26fbd/blocks")
+            )
+        );
+        assert_eq!(dirs(&["--signetchallenge="]).0, PathBuf::from("/data/signet_1406e058"));
+    }
+
     #[test]
     fn signetchallenge_is_now_recognised() {
         assert_eq!(classify_unsupported_key("signetchallenge"), None);
@@ -16521,7 +16612,7 @@ notarealkey=1
     /// exception: skipping it would broadcast publicly, so it is fatal.
     #[test]
     fn core_v32_keys_load_with_a_warning() {
-        for k in ["prevoutfetchthreads", "inboundrelaypercent", "rpcmaxconnections", "txsendrate"] {
+        for k in ["prevoutfetchthreads", "rpcmaxconnections", "txsendrate"] {
             let cf = ConfigFile::parse(&format!("{k}=1\nserver=1\n"))
                 .unwrap_or_else(|e| panic!("{k} must load: {e}"));
             assert!(cf.ignored.iter().any(|m| m.contains(k)), "{k}: {:?}", cf.ignored);

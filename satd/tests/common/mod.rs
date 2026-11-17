@@ -649,13 +649,27 @@ impl TestNode {
         extra_args: &[&str],
         env: &[(&str, &str)],
     ) -> Self {
+        Self::start_with_datadir_on("--regtest", "regtest", datadir, rpcport, extra_args, env)
+    }
+
+    /// [`Self::start_with_datadir_env`] on the network `chain_flag` selects,
+    /// whose cookie is in `<datadir>/<net_subdir>` (a custom signet's is
+    /// `signet_<message start>`).
+    pub fn start_with_datadir_on(
+        chain_flag: &str,
+        net_subdir: &str,
+        datadir: &std::path::Path,
+        rpcport: u16,
+        extra_args: &[&str],
+        env: &[(&str, &str)],
+    ) -> Self {
         let satd_bin = env!("CARGO_BIN_EXE_satd");
 
         let has_port = extra_args.iter().any(|a| a.starts_with("--port"));
         let p2p_port = if has_port { 0 } else { find_available_port() };
 
         let mut cmd = Command::new(satd_bin);
-        cmd.arg("--regtest")
+        cmd.arg(chain_flag)
             .arg(format!("--datadir={}", datadir.display()))
             .arg(format!("--rpcport={}", rpcport));
         if !has_port {
@@ -695,7 +709,7 @@ impl TestNode {
             .spawn()
             .expect("Failed to start satd");
 
-        let cookie_path = datadir.join("regtest").join(".cookie");
+        let cookie_path = datadir.join(net_subdir).join(".cookie");
         let deadline = Instant::now() + test_timeout(120);
         loop {
             if let Ok(cookie) = std::fs::read_to_string(&cookie_path) {
@@ -2058,6 +2072,17 @@ pub fn run_satd_until_exit(
     extra_args: &[&str],
     timeout: std::time::Duration,
 ) -> (std::process::ExitStatus, String) {
+    run_satd_until_exit_on("--regtest", datadir, extra_args, timeout)
+}
+
+/// [`run_satd_until_exit`] on the network `network_flag` selects
+/// (`--regtest`, `--testnet4`, ...).
+pub fn run_satd_until_exit_on(
+    network_flag: &str,
+    datadir: &std::path::Path,
+    extra_args: &[&str],
+    timeout: std::time::Duration,
+) -> (std::process::ExitStatus, String) {
     let satd_bin = env!("CARGO_BIN_EXE_satd");
     let stderr_path = datadir.join(format!(
         "satd-exit-{}.stderr",
@@ -2068,7 +2093,7 @@ pub fn run_satd_until_exit(
     ));
     let stderr = std::fs::File::create(&stderr_path).expect("create stderr capture");
     let mut child = Command::new(satd_bin)
-        .arg("--regtest")
+        .arg(network_flag)
         .arg(format!("--datadir={}", datadir.display()))
         .arg(format!("--rpcport={}", find_available_port()))
         .arg(format!("--port={}", find_available_port()))

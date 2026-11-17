@@ -3038,13 +3038,11 @@ fn test_e2e_jsonrpc_decodescript_p2wpkh() {
         "P2WPKH must decode as witness_v0_keyhash, got {}",
         v["type"]
     );
-    // asm must mention OP_0 followed by a 40-char hex push.
+    // Core's `ScriptToAsmStr`: the version as a number, then the bare
+    // 20-byte program.
     let asm = v["asm"].as_str().expect("asm string");
-    assert!(
-        asm.starts_with("OP_0 "),
-        "P2WPKH asm starts with OP_0, got: {}",
-        asm
-    );
+    let program = &spk_hex[4..];
+    assert_eq!(asm, format!("0 {program}"), "P2WPKH asm");
 
     e2e.node.stop();
 }
