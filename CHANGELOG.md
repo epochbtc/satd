@@ -21,6 +21,7 @@ layout) per [`STABILITY_POLICY.md`](STABILITY_POLICY.md).
 - The Electrum server no longer runs JSON-RPC notifications (requests with no `id`) whose reply it would drop.
 - `addnode` refuses an empty node with Core's `-8` error; `addnode "" add` kept it and retried it forever.
 - `-dbcache=auto` sizes the cache from the memory cgroup limit (systemd `MemoryMax=`, Docker `--memory`, cgroup v2 or v1) when it is below host memory; it sized from the host alone, so a node in a container could be OOM-killed during initial sync (#1272).
+- `invalidateblock`, `reconsiderblock` and `preciousblock` go on to the next-best chain when the best one holds an invalid block, as in Core; they stopped on the first and returned an error (#1261).
 
 ## Releases
 
