@@ -50,6 +50,7 @@ It includes every fix shipped in 0.7.1:
 - Config: `reindex=1` and `reindexchainstate=1` in `bitcoin.conf` are honoured, as in Core, instead of accepted and ignored (#840).
 - Operator: `-dbcache=auto` sizes from the memory cgroup limit (systemd `MemoryMax=`, Docker `--memory`, cgroup v2 or v1) when it is below host memory; it sized from the host alone (#1272).
 - Operator: the shadow verification queue is bounded by memory, `-shadowqueuemb` (default 128 MiB), as well as by entry count (#1145).
+- Operator: a datadir from another network is refused at startup with Core's "Incorrect or no genesis block found. Wrong datadir for network?", before `-reindex-chainstate` clears anything (#1270).
 - Operator: the core runtime has at least two worker threads, so one blocked worker cannot freeze RPC and P2P on a 1-CPU host (#1144).
 - Stack: `conf.d/local.conf` overrides the keys `satd-init` writes (#843).
 - HTTP: a client that stops reading a response, SSE stream or WebSocket is disconnected once a write has stalled for `-rpcservertimeout` on JSON-RPC and 60 s on Esplora and streamws (#823).
