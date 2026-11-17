@@ -101,9 +101,10 @@ pub struct Negotiated {
 /// The protocol argument is the second parameter; anything after it is
 /// ignored, as the spec requires since 1.6. A missing or null argument is the
 /// spec's default, a single `PROTOCOL_MIN`. A single string `v` is the range
-/// `[v, v]`. In a pair, a missing or non-string end stands for satd's own
-/// bound at that end, and an argument of any other type is treated as
-/// missing, as satd always has.
+/// `[v, v]`. In a pair, a missing or non-string end is that default too,
+/// [`PROTOCOL_MIN`], so a short or malformed range never negotiates more
+/// than a client that sent nothing; an argument of any other type is treated
+/// as missing, as satd always has.
 pub fn negotiate(params: &Value) -> Option<Negotiated> {
     if asks_for_asof(params) {
         return Some(Negotiated {
@@ -116,13 +117,13 @@ pub fn negotiate(params: &Value) -> Option<Negotiated> {
     let (client_min, client_max) = match arg {
         Some(Value::String(v)) => (ProtocolVersion::parse(v), ProtocolVersion::parse(v)),
         Some(Value::Array(range)) => {
-            let end = |i: usize, ours: &ProtocolVersion| {
+            let end = |i: usize| {
                 range
                     .get(i)
                     .and_then(Value::as_str)
-                    .map_or_else(|| ours.clone(), ProtocolVersion::parse)
+                    .map_or_else(protocol_min, ProtocolVersion::parse)
             };
-            (end(0, &server_min), end(1, &server_max))
+            (end(0), end(1))
         }
         _ => (server_min.clone(), server_min.clone()),
     };
@@ -291,7 +292,8 @@ mod tests {
     }
 
     /// The spec default and satd's long-standing leniency: no argument, null,
-    /// a non-string argument, and a pair with a missing end.
+    /// a non-string argument, and a pair with a missing end, which is the
+    /// default too.
     #[test]
     fn missing_arguments_take_the_defaults() {
         assert_eq!(answer(json!([])).as_deref(), Some("1.4"));
@@ -299,6 +301,8 @@ mod tests {
         assert_eq!(answer(json!(["w", null])).as_deref(), Some("1.4"));
         assert_eq!(answer(json!(["w", 14])).as_deref(), Some("1.4"));
         assert_eq!(answer(json!(["w", ["1.3"]])).as_deref(), Some("1.4"));
+        assert_eq!(answer(json!(["w", [null, "1.4"]])).as_deref(), Some("1.4"));
+        assert_eq!(answer(json!(["w", []])).as_deref(), Some("1.4"));
         assert_eq!(answer(json!({"client": "w"})).as_deref(), Some("1.4"));
     }
 
