@@ -15586,6 +15586,60 @@ fn test_electrum_server_version_round_trips() {
     node.stop();
 }
 
+/// `server.version` negotiates once per connection: a second one is refused
+/// and the connection stays at the first version; one with no version in
+/// common is answered and the connection closed; a connection that never
+/// negotiates is served as 1.4.
+#[test]
+fn test_electrum_server_version_negotiates_once_per_connection() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpStream;
+
+    let electrum_port = find_available_port();
+    let bind = format!("--electrumbind=127.0.0.1:{}", electrum_port);
+    let mut node = TestNode::start(&["--electrum=1", &bind]);
+
+    let connect = || {
+        let sock = TcpStream::connect(format!("127.0.0.1:{electrum_port}")).expect("connect");
+        sock.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        let reader = BufReader::new(sock.try_clone().unwrap());
+        (sock, reader)
+    };
+    let call = |sock: &mut TcpStream, reader: &mut BufReader<TcpStream>, req: serde_json::Value| {
+        writeln!(sock, "{req}").unwrap();
+        let mut line = String::new();
+        assert!(reader.read_line(&mut line).unwrap() > 0, "EOF before the response");
+        serde_json::from_str::<serde_json::Value>(&line).unwrap()
+    };
+
+    // Electrum's and BDK's range, extra arguments ignored; then a second
+    // `server.version` is refused and the connection still answers.
+    let (mut sock, mut reader) = connect();
+    let v = call(&mut sock, &mut reader, serde_json::json!({
+        "id": 1, "method": "server.version", "params": ["test", ["1.4", "1.6"], "extra"]}));
+    assert_eq!(v["result"][1], "1.4", "{v}");
+    let v = call(&mut sock, &mut reader, serde_json::json!({
+        "id": 2, "method": "server.version", "params": ["test", "1.4"]}));
+    assert_eq!(v["error"]["message"], "server.version already sent", "{v}");
+    let v = call(&mut sock, &mut reader, serde_json::json!({"id": 3, "method": "server.ping"}));
+    assert!(v.get("error").is_none(), "{v}");
+
+    // No version in common: the error, then the server closes.
+    let (mut sock, mut reader) = connect();
+    let v = call(&mut sock, &mut reader, serde_json::json!({
+        "id": 1, "method": "server.version", "params": ["test", "1.5"]}));
+    assert_eq!(v["error"]["message"], "unsupported protocol version; server speaks 1.4", "{v}");
+    let mut rest = String::new();
+    assert_eq!(reader.read_line(&mut rest).unwrap_or(0), 0, "the connection closes: {rest:?}");
+
+    // No `server.version` at all: served at 1.4.
+    let (mut sock, mut reader) = connect();
+    let v = call(&mut sock, &mut reader, serde_json::json!({"id": 1, "method": "server.features"}));
+    assert_eq!(v["result"]["protocol_max"], "1.4", "{v}");
+
+    node.stop();
+}
+
 /// `blockchain.headers.subscribe` returns the current tip after a
 /// `generatetoaddress` mines new blocks.
 #[test]

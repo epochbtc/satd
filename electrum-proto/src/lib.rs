@@ -45,10 +45,12 @@ pub mod subscribe;
 #[cfg(test)]
 mod test_support;
 pub mod types;
+pub mod version;
 
 pub use config::ElectrumConfig;
 pub use dispatch::{
-    Notification, Request, Requests, Response, dispatch, dispatch_with_subscriptions,
+    Notification, Request, Requests, Response, dispatch, dispatch_session,
+    dispatch_with_subscriptions,
 };
 pub use error::JsonRpcError;
 pub use extras::{ElectrumExtras, RocksElectrumExtras, TxConfirmation, TxMerkleProof};
@@ -59,22 +61,15 @@ pub use server::{
 pub use state::ElectrumState;
 pub use status::compute_status_hash;
 pub use subscribe::{HeadersSource, NOTIFY_CHANNEL_CAP, Subscriptions};
+pub use version::{PROTOCOL_MAX, PROTOCOL_MIN, ProtocolVersion, Session};
 pub use types::{
     BalanceResponse, FeeHistogramEntry, GetMerkleResponse, HeadersResponse, HistoryEntry,
     ListUnspentEntry, ScripthashHex, TxidHex,
 };
 
-/// Electrum protocol version this server reports via `server.version`.
-/// Matches `romanz/electrs` v0.11.1
-/// (commit `35216c6d30148be8e6763d913d437330f431fc03`,
-/// `src/electrum.rs::PROTOCOL_VERSION`). The single-string form means
-/// `server.version` negotiation expects an exact match — the client's
-/// stated version must be `1.4` to be acceptable, just like electrs.
-pub const PROTOCOL_VERSION: &str = "1.4";
-
 /// rbitcoin's Electrum dialect, which `server.version` also accepts and
 /// answers with, so a client written for rbitcoin negotiates as it does
-/// there. Not a dotted version; the protocol spoken is still
-/// [`PROTOCOL_VERSION`]. The `chain_tip` stamps do not depend on it: every
+/// there. Not a dotted version; the protocol spoken is 1.4.2 (see
+/// [`version`]). The `chain_tip` stamps do not depend on it: every
 /// connection gets them, as on rbitcoin.
 pub const PROTOCOL_ASOF: &str = "1.4.2-asof";

@@ -6,73 +6,45 @@
 
 use serde_json::{Value, json};
 
-use crate::{PROTOCOL_ASOF, PROTOCOL_VERSION};
+use crate::PROTOCOL_ASOF;
 use crate::error::JsonRpcError;
 use crate::state::ElectrumState;
+use crate::version::{Negotiated, PROTOCOL_MAX, PROTOCOL_MIN, negotiate};
 
-/// `server.version([client_name, protocol_version])` — returns
-/// `[server_name, protocol_version]`. Per the Electrum spec (and
-/// `romanz/electrs`'s implementation), the client may pass either a
-/// single string for `protocol_version` (interpreted as a single
-/// **exact** target version) or a `[min, max]` pair. The single-string
-/// form is NOT a min-only — electrs's `check_between(version, single,
-/// single)` rejects clients that don't match exactly. We mirror that
-/// to keep the `server.version` contract identical.
+/// `server.version([client_name, protocol_version, ...])` — returns
+/// `[server_name, protocol_version]`, the version agreed on by the spec's
+/// rule (see [`crate::version`]). rbitcoin's dialect [`PROTOCOL_ASOF`] is
+/// accepted too and answered with that string.
 ///
-/// rbitcoin's dialect [`PROTOCOL_ASOF`] is accepted too, as the single
-/// string or either end of the pair, and answered with that string; see
-/// [`asks_for_asof`].
+/// This is the stateless half: the per-connection rules (only the first
+/// `server.version` is accepted, and a failed one closes the connection)
+/// are applied by [`crate::dispatch::dispatch_session`].
 pub fn version(state: &ElectrumState, params: Value) -> Result<Value, JsonRpcError> {
-    if asks_for_asof(&params) {
-        return Ok(json!([server_name(state), PROTOCOL_ASOF]));
-    }
-    // Client name + protocol-version arg are both optional. We do
-    // intersection logic only when we got a useful protocol-version.
-    let arr = match &params {
-        Value::Array(a) => a.clone(),
-        _ => Vec::new(),
-    };
-
-    let _client_name = arr.first().and_then(|v| v.as_str()).unwrap_or("");
-    let proto_arg = arr.get(1).cloned().unwrap_or(Value::Null);
-
-    let supported = PROTOCOL_VERSION;
-    // Spec / electrs:
-    // - missing or null: accept; pick our supported version.
-    // - single string: must match supported EXACTLY.
-    // - [min, max] pair: supported must lie in [min, max].
-    let intersect_ok = match &proto_arg {
-        Value::Null => true,
-        Value::String(exact) => version_in_range(exact, exact, supported),
-        Value::Array(a) => {
-            let min = a.first().and_then(|v| v.as_str()).unwrap_or(supported);
-            let max = a.get(1).and_then(|v| v.as_str()).unwrap_or(supported);
-            version_in_range(min, max, supported)
-        }
-        _ => true,
-    };
-
-    if !intersect_ok {
-        return Err(JsonRpcError::bad_request(format!(
-            "unsupported protocol version; server speaks {supported}"
-        )));
-    }
-
-    Ok(json!([server_name(state), supported]))
+    let negotiated = negotiate(&params).ok_or_else(no_common_version)?;
+    Ok(version_answer(state, &negotiated))
 }
 
-/// Whether `server.version`'s `protocol_version` names [`PROTOCOL_ASOF`]:
-/// the single string, or either end of a `[min, max]` pair, as rbitcoin
-/// negotiates it.
-pub fn asks_for_asof(params: &Value) -> bool {
-    match params.as_array().and_then(|a| a.get(1)) {
-        Some(Value::String(s)) => s == PROTOCOL_ASOF,
-        Some(Value::Array(range)) => range
-            .iter()
-            .take(2)
-            .any(|v| v.as_str() == Some(PROTOCOL_ASOF)),
-        _ => false,
-    }
+/// `server.version`'s result for what was agreed.
+pub fn version_answer(state: &ElectrumState, negotiated: &Negotiated) -> Value {
+    json!([server_name(state), negotiated.answer])
+}
+
+/// The error for a `server.version` with no version in common.
+pub fn no_common_version() -> JsonRpcError {
+    let supported = if PROTOCOL_MIN == PROTOCOL_MAX {
+        PROTOCOL_MAX.to_string()
+    } else {
+        format!("{PROTOCOL_MIN} to {PROTOCOL_MAX}")
+    };
+    JsonRpcError::bad_request(format!(
+        "unsupported protocol version; server speaks {supported}"
+    ))
+}
+
+/// The error for a second `server.version` on a connection, ElectrumX's
+/// (spec 1.4: only the first `server.version` message is accepted).
+pub fn version_already_sent() -> JsonRpcError {
+    JsonRpcError::bad_request("server.version already sent")
 }
 
 /// `server.ping()` — returns `null`.
@@ -99,8 +71,8 @@ pub fn donation_address(state: &ElectrumState) -> Result<Value, JsonRpcError> {
 }
 
 /// `server.features()` — small descriptor dict consumed by some
-/// clients: genesis hash, supported protocol min/max (both = our
-/// PROTOCOL_VERSION since we don't negotiate), server name, and the
+/// clients: genesis hash, supported protocol min/max ([`PROTOCOL_MIN`],
+/// [`PROTOCOL_MAX`]), server name, and the
 /// `hosts` map populated with `tcp_port` (and `ssl_port` when TLS is
 /// bound) so peer-discovery clients can distinguish service ports.
 ///
@@ -131,8 +103,8 @@ pub fn features(state: &ElectrumState) -> Result<Value, JsonRpcError> {
     Ok(json!({
         "genesis_hash": genesis_hash,
         "hosts": hosts,
-        "protocol_max": PROTOCOL_VERSION,
-        "protocol_min": PROTOCOL_VERSION,
+        "protocol_max": PROTOCOL_MAX,
+        "protocol_min": PROTOCOL_MIN,
         "pruning": serde_json::Value::Null,
         "server_version": server_name(state),
         "hash_function": "sha256",
@@ -208,19 +180,6 @@ pub fn peers_subscribe() -> Result<Value, JsonRpcError> {
     Ok(Value::Array(Vec::new()))
 }
 
-/// Dotted-version comparison: `"1.4.5" < "1.5"` etc. Lexicographic on
-/// numeric components.
-fn version_compare(a: &str, b: &str) -> std::cmp::Ordering {
-    let parse =
-        |s: &str| -> Vec<u32> { s.split('.').filter_map(|p| p.parse::<u32>().ok()).collect() };
-    parse(a).cmp(&parse(b))
-}
-
-fn version_in_range(min: &str, max: &str, ours: &str) -> bool {
-    use std::cmp::Ordering::*;
-    !matches!(version_compare(ours, min), Less) && !matches!(version_compare(ours, max), Greater)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -251,47 +210,5 @@ mod tests {
     #[test]
     fn the_default_batch_cap_holds_sparrows_largest_page() {
         const { assert!(crate::config::DEFAULT_MAX_BATCH_REQUESTS >= 250) };
-    }
-
-    #[test]
-    fn version_compare_basic() {
-        assert_eq!(version_compare("1.4.5", "1.4.5"), std::cmp::Ordering::Equal);
-        assert_eq!(version_compare("1.4", "1.4.5"), std::cmp::Ordering::Less);
-        assert_eq!(version_compare("1.5", "1.4.5"), std::cmp::Ordering::Greater);
-        assert_eq!(version_compare("2.0", "1.99"), std::cmp::Ordering::Greater);
-    }
-
-    #[test]
-    fn version_in_range_inclusive() {
-        assert!(version_in_range("1.0", "1.5", "1.4.5"));
-        assert!(version_in_range("1.4.5", "1.4.5", "1.4.5"));
-        assert!(!version_in_range("1.5", "2.0", "1.4.5"));
-        assert!(!version_in_range("1.0", "1.3", "1.4.5"));
-    }
-
-    /// rbitcoin's dialect is asked for as the single string or at either
-    /// end of a range; a dotted version, a missing argument or a range that
-    /// merely spans it is not the dialect.
-    #[test]
-    fn asof_dialect_is_named_not_ranged() {
-        use serde_json::json;
-        assert!(asks_for_asof(&json!(["w", "1.4.2-asof"])));
-        assert!(asks_for_asof(&json!(["w", ["1.4", "1.4.2-asof"]])));
-        assert!(asks_for_asof(&json!(["w", ["1.4.2-asof", "1.6"]])));
-        assert!(!asks_for_asof(&json!(["w", "1.4"])));
-        assert!(!asks_for_asof(&json!(["w", ["1.4", "1.6"]])));
-        assert!(!asks_for_asof(&json!(["w"])));
-        assert!(!asks_for_asof(&json!([])));
-    }
-
-    #[test]
-    fn version_in_range_single_exact_match() {
-        // Per electrs, single-string `protocol_version` is an exact
-        // target — `check_between(ours, single, single)`. Our
-        // PROTOCOL_VERSION is "1.4"; a client sending "1.4" passes,
-        // a client sending "1.4.5" or "1.5" does not.
-        assert!(version_in_range("1.4", "1.4", "1.4"));
-        assert!(!version_in_range("1.4.5", "1.4.5", "1.4"));
-        assert!(!version_in_range("1.5", "1.5", "1.4"));
     }
 }

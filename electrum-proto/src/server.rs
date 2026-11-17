@@ -33,11 +33,12 @@ use tokio::sync::{Semaphore, mpsc, watch};
 use tokio_rustls::TlsAcceptor;
 
 use crate::config::ElectrumConfig;
-use crate::dispatch::{Notification, Request, Requests, Response, dispatch_with_subscriptions};
+use crate::dispatch::{Notification, Request, Requests, Response, dispatch_session};
 use crate::error::JsonRpcError;
 use crate::rpc::{FramingError, MAX_LINE_BYTES, read_line_bounded, write_line};
 use crate::state::ElectrumState;
 use crate::subscribe::{NOTIFY_CHANNEL_CAP, Subscriptions};
+use crate::version::Session;
 use tls_config::{ClientAuthPolicy, TlsConfigError, build_acceptor};
 
 #[derive(Debug, Error)]
@@ -65,17 +66,18 @@ pub type ConnectionFactory =
     Arc<dyn Fn(usize) -> (BoxedDispatch, mpsc::Receiver<String>) + Send + Sync + 'static>;
 
 /// Production [`ConnectionFactory`]: wraps an [`ElectrumState`] in
-/// per-connection [`Subscriptions`] + the subscription-aware
-/// dispatcher.
+/// per-connection [`Subscriptions`] and protocol [`Session`] + the
+/// session-aware dispatcher.
 pub fn state_connection_factory(state: Arc<ElectrumState>) -> ConnectionFactory {
     Arc::new(move |max_subs_per_conn: usize| {
         let (notify_tx, notify_rx) = mpsc::channel(NOTIFY_CHANNEL_CAP);
         let mut subs = Subscriptions::new(notify_tx, max_subs_per_conn);
+        let mut session = Session::new();
         let st = state.clone();
         let chain = state.chain.clone();
         let extras = state.electrum_extras.clone();
         let dispatch: BoxedDispatch = Box::new(move |req: Request| {
-            dispatch_with_subscriptions(&st, &mut subs, chain.as_ref(), extras.clone(), req)
+            dispatch_session(&st, &mut session, &mut subs, chain.as_ref(), extras.clone(), req)
         });
         (dispatch, notify_rx)
     })
@@ -537,7 +539,8 @@ where
                         }
                     }
                 };
-                if let Some(resp_json) = response {
+                let Processed { reply, close } = response;
+                if let Some(resp_json) = reply {
                     match tokio::time::timeout(
                         request_timeout,
                         write_line(&mut write_half, &resp_json),
@@ -553,12 +556,18 @@ where
                         }
                     }
                 }
+                if close {
+                    // `server.version` found no version in common: the spec
+                    // says the server closes the connection.
+                    let _ = tokio::time::timeout(request_timeout, write_half.shutdown()).await;
+                    return Ok(());
+                }
             }
         }
     }
 }
 
-/// Parse + dispatch + serialize. Returns `None` for notifications
+/// Parse + dispatch + serialize. The reply is `None` for notifications
 /// (requests with no `id`) since the spec says we don't reply, and
 /// also `None` when a batch contained ONLY notifications. Handles
 /// both single requests and batch arrays per JSON-RPC 2.0 §6.
@@ -577,41 +586,71 @@ fn process_request(
     dispatch: &mut BoxedDispatch,
     line: &str,
     max_batch_requests: usize,
-) -> Option<String> {
+) -> Processed {
     match Requests::parse(line) {
         Ok(Requests::Single(req)) => {
             // A notification: not dispatched, not answered.
-            req.id.as_ref()?;
+            if req.id.is_none() {
+                return Processed::default();
+            }
             let resp = dispatch(req);
-            serde_json::to_string(&resp).ok()
+            Processed {
+                reply: serde_json::to_string(&resp).ok(),
+                close: resp.close,
+            }
         }
         Ok(Requests::Batch(reqs)) => {
             if reqs.len() > max_batch_requests {
                 let err = JsonRpcError::batch_too_large(reqs.len(), max_batch_requests);
                 let resp = Response::error(Value::Null, err);
-                return serde_json::to_string(&resp).ok();
+                return Processed {
+                    reply: serde_json::to_string(&resp).ok(),
+                    close: false,
+                };
             }
             // Dispatch each request; a notification gets neither a
             // response nor a dispatch. If the batch contained only
-            // notifications, return None (no response written).
+            // notifications, return None (no response written). A
+            // response that closes the connection ends the batch: the
+            // requests after it are not run.
             let mut responses: Vec<Response> = Vec::with_capacity(reqs.len());
+            let mut close = false;
             for req in reqs {
                 if req.id.is_none() {
                     continue;
                 }
-                responses.push(dispatch(req));
+                let resp = dispatch(req);
+                close = resp.close;
+                responses.push(resp);
+                if close {
+                    break;
+                }
             }
-            if responses.is_empty() {
-                None
-            } else {
-                serde_json::to_string(&responses).ok()
+            Processed {
+                reply: if responses.is_empty() {
+                    None
+                } else {
+                    serde_json::to_string(&responses).ok()
+                },
+                close,
             }
         }
         Err(err) => {
             let resp = Response::error(Value::Null, err);
-            serde_json::to_string(&resp).ok()
+            Processed {
+                reply: serde_json::to_string(&resp).ok(),
+                close: false,
+            }
         }
     }
+}
+
+/// What one inbound line produced: the line to write back, if any, and
+/// whether the connection closes after it.
+#[derive(Debug, Default, PartialEq)]
+struct Processed {
+    reply: Option<String>,
+    close: bool,
 }
 
 /// Render a JSON-RPC notification as a writeable line. Used by
@@ -661,15 +700,15 @@ mod tests {
         let note = json!({"jsonrpc":"2.0","method":"blockchain.headers.subscribe","params":[]});
         let req = json!({"jsonrpc":"2.0","id":7,"method":"server.ping","params":[]});
 
-        assert_eq!(process_request(&mut dispatch, &note.to_string(), 10), None);
+        assert_eq!(process_request(&mut dispatch, &note.to_string(), 10).reply, None);
         assert_eq!(calls.load(Ordering::SeqCst), 0, "a lone notification runs nothing");
 
         let only_notes = json!([note, note]).to_string();
-        assert_eq!(process_request(&mut dispatch, &only_notes, 10), None);
+        assert_eq!(process_request(&mut dispatch, &only_notes, 10).reply, None);
         assert_eq!(calls.load(Ordering::SeqCst), 0, "a batch of notifications runs nothing");
 
         let mixed = json!([note, req, note]).to_string();
-        let reply = process_request(&mut dispatch, &mixed, 10).expect("the request is answered");
+        let reply = process_request(&mut dispatch, &mixed, 10).reply.expect("the request is answered");
         let reply: Value = serde_json::from_str(&reply).unwrap();
         assert_eq!(reply.as_array().map(Vec::len), Some(1), "{reply}");
         assert_eq!(reply[0]["id"], 7);
@@ -733,6 +772,73 @@ mod tests {
         let n = reader.read_line(&mut buf).await.unwrap();
         assert!(n > 0, "EOF before response arrived");
         buf.trim_end_matches('\n').to_string()
+    }
+
+    /// Answers `close.me` with a response that closes the connection, and
+    /// echoes every other method.
+    fn closing_factory() -> ConnectionFactory {
+        Arc::new(|_max_subs: usize| {
+            let (_tx, rx) = mpsc::channel(1);
+            let dispatch: BoxedDispatch = Box::new(|req: Request| {
+                let id = req.id.clone().unwrap_or(Value::Null);
+                if req.method == "close.me" {
+                    Response::error(id, JsonRpcError::bad_request("bye")).closing()
+                } else {
+                    Response::success(id, json!(req.method))
+                }
+            });
+            (dispatch, rx)
+        })
+    }
+
+    /// A closing response ends a batch: the requests after it are not run,
+    /// and the reply holds the responses up to and including it.
+    #[test]
+    fn a_closing_response_ends_the_batch() {
+        let mut dispatch = (closing_factory())(1).0;
+        let batch = json!([
+            {"id": 1, "method": "a"},
+            {"id": 2, "method": "close.me"},
+            {"id": 3, "method": "b"},
+        ]);
+        let out = process_request(&mut dispatch, &batch.to_string(), 10);
+        assert!(out.close);
+        let reply: Value = serde_json::from_str(&out.reply.unwrap()).unwrap();
+        assert_eq!(reply.as_array().map(Vec::len), Some(2), "{reply}");
+        assert_eq!(reply[1]["error"]["message"], "bye");
+        let single = process_request(&mut dispatch, r#"{"id":1,"method":"a"}"#, 10);
+        assert!(!single.close);
+    }
+
+    /// The closing response is written, then the server closes the
+    /// connection. Perturbation: ignore `close` and the read after the
+    /// reply times out instead of seeing EOF.
+    #[tokio::test]
+    async fn a_closing_response_is_written_then_the_connection_closes() {
+        let server = ElectrumServer::bind_with_factory(fixed_config(), closing_factory())
+            .await
+            .unwrap();
+        let addr = server.local_addr().unwrap();
+        let (sd_tx, sd_rx) = watch::channel(false);
+        let join = tokio::spawn(server.serve(sd_rx));
+
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        write_request(&mut stream, &json!({"id": 1, "method": "ping.first"})).await;
+        write_request(&mut stream, &json!({"id": 2, "method": "close.me"})).await;
+        let mut reader = tokio::io::BufReader::new(stream);
+        let first: Value = serde_json::from_str(&read_response_line(&mut reader).await).unwrap();
+        assert_eq!(first["result"], "ping.first");
+        let second: Value = serde_json::from_str(&read_response_line(&mut reader).await).unwrap();
+        assert_eq!(second["error"]["message"], "bye");
+        let mut rest = String::new();
+        let n = tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut rest))
+            .await
+            .expect("the server closes the connection")
+            .unwrap_or(0);
+        assert_eq!(n, 0, "nothing after the closing response: {rest:?}");
+
+        sd_tx.send(true).unwrap();
+        let _ = join.await;
     }
 
     #[tokio::test]

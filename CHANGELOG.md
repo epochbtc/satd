@@ -92,6 +92,7 @@ It includes every fix shipped in 0.7.1:
 - P2P: a peer that sends a `getblocktxn` naming no transaction is disconnected, as in Bitcoin Core; one 33-byte request could make the node upload a whole block. Also in 0.7.2.
 - P2P: a block that extends the tip is announced to peers only after its BIP 34 coinbase height and transaction finality are checked, as in Core. Also in 0.7.2.
 - Tor: the onion address and private key `ADD_ONION` returns, and the saved key, are checked as Core checks them before they are used, and a control-port line over 100,000 bytes is refused. Also in 0.7.2.
+- Electrum: `server.version` negotiates the protocol version per connection by the spec's rule and gates each method on it; a second `server.version` is refused, and one with no version in common now closes the connection. Still 1.4 only.
 - Electrum: JSON-RPC notifications (requests with no `id`) are no longer run only to drop their reply. Also in 0.7.2.
 - RPC: `addnode` refuses an empty node with Core's `-8` error; `addnode "" add` kept it and retried it forever. Also in 0.7.2.
 

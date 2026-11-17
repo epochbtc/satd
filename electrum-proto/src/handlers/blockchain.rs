@@ -1311,6 +1311,10 @@ mod historycap_tests;
 mod pin_tests;
 
 #[cfg(test)]
+#[path = "blockchain_session_tests.rs"]
+mod session_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

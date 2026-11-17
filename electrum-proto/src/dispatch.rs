@@ -19,6 +19,7 @@ use crate::state::ElectrumState;
 use crate::status::compute_status_hash;
 use crate::subscribe::{HeadersSource, Subscriptions};
 use crate::types::{ScripthashHex, parse_wire_scripthash};
+use crate::version::{Session, method_served, negotiate};
 
 /// Inbound JSON-RPC 2.0 request.
 ///
@@ -115,6 +116,11 @@ pub struct Response {
     /// That block's height (`chain_tip_height`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chain_tip_height: Option<u32>,
+    /// Close the connection once this response is written. Never on the
+    /// wire. Set on a `server.version` with no version in common, which the
+    /// spec says ends the connection.
+    #[serde(skip)]
+    pub close: bool,
 }
 
 impl Response {
@@ -126,6 +132,7 @@ impl Response {
             error: None,
             chain_tip: None,
             chain_tip_height: None,
+            close: false,
         }
     }
 
@@ -137,7 +144,14 @@ impl Response {
             error: Some(err),
             chain_tip: None,
             chain_tip_height: None,
+            close: false,
         }
+    }
+
+    /// Close the connection after writing this response.
+    pub fn closing(mut self) -> Self {
+        self.close = true;
+        self
     }
 
     /// Name the block the answer was read at.
@@ -358,6 +372,49 @@ fn dispatch_unpinned(state: &ElectrumState, id: Value, method: &str, params: Val
         Ok(result) => Response::success(id, result),
         Err(err) => Response::error(id, err),
     }
+}
+
+/// A connection's dispatch: [`dispatch_with_subscriptions`] behind the
+/// connection's protocol version.
+///
+/// - `server.version` negotiates and records the version (see
+///   [`crate::version`]). Only the first one that succeeds is accepted;
+///   another answers ElectrumX's `server.version already sent`. One with no
+///   version in common answers an error and closes the connection, as the
+///   spec requires.
+/// - Any other method is "method not found" unless it is served at the
+///   connection's version: the negotiated one, or the minimum on a
+///   connection that never sent `server.version`. `server.version` need not
+///   come first.
+pub fn dispatch_session(
+    state: &ElectrumState,
+    session: &mut Session,
+    subs: &mut Subscriptions,
+    headers_source: &dyn HeadersSource,
+    extras: Arc<dyn ElectrumExtras>,
+    req: Request,
+) -> Response {
+    let id = req.id.clone().unwrap_or(Value::Null);
+    if req.method == "server.version" {
+        if session.negotiated().is_some() {
+            return Response::error(id, handlers::server_methods::version_already_sent());
+        }
+        let params = req.params.unwrap_or_default();
+        return match negotiate(&params) {
+            Some(negotiated) => {
+                let answer = handlers::server_methods::version_answer(state, &negotiated);
+                session.set(negotiated);
+                Response::success(id, answer)
+            }
+            None => {
+                Response::error(id, handlers::server_methods::no_common_version()).closing()
+            }
+        };
+    }
+    if !method_served(&req.method, &session.version()) {
+        return Response::error(id, JsonRpcError::method_not_found(&req.method));
+    }
+    dispatch_with_subscriptions(state, subs, headers_source, extras, req)
 }
 
 /// Subscription-aware dispatch. Handles

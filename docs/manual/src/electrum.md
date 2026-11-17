@@ -15,8 +15,8 @@ the address index for scripthash history (on by default) and
 `--txindex=1` for the confirmed-transaction and merkle-proof methods
 (off by default). Startup fails if either index is disabled.
 
-- Protocol version: `1.4`, advertised as both `protocol_min` and
-  `protocol_max`. satd serves a single protocol version.
+- Protocol version: `1.4` (`protocol_min` and `protocol_max`), negotiated
+  per connection; see [Protocol version](#protocol-version).
 - Transport: line-delimited JSON-RPC over plain TCP (default
   `127.0.0.1:50001`) and/or TLS (default port 50002). Expose the server
   over Tor / `.onion` rather than directly on the LAN.
@@ -26,6 +26,38 @@ the address index for scripthash history (on by default) and
 > bearer-token layer does not gate Electrum; client-certificate principals
 > are planned but not yet implemented. See
 > [Authentication & Authorization](authentication.md).
+
+## Protocol version
+
+Each connection negotiates its protocol version with `server.version`, by
+the rule in the Electrum protocol spec (spesmilo/electrum-protocol,
+`docs/protocol-methods.rst`, `server.version`): the version is the lower of
+the client's maximum and satd's (`protocol_max`), and there is none in
+common when that is below the higher of the two minimums. A single string
+`v` is the range `[v, v]`. satd speaks `1.4` to `1.4`, so a client offering
+`["1.4", "1.6"]` (Electrum, BDK) or `["1.3", "1.4.2"]` (Sparrow) gets `1.4`.
+
+- **No version in common:** `server.version` answers an error (code 1,
+  `unsupported protocol version; server speaks 1.4`) and satd closes the
+  connection, as the spec requires and ElectrumX does.
+- **Only the first `server.version` is accepted.** A second one on the same
+  connection answers the error `server.version already sent` (code 1); the
+  connection stays open at the version first agreed.
+- **Arguments after the protocol version are ignored**, as the spec requires
+  since 1.6.
+- **`server.version` need not come first.** Since 1.6 the spec asks clients
+  to send it as the first message, and ElectrumX disconnects one that does
+  not. satd does not require it: a connection that never sends it is served
+  at `1.4`, so a script that skips the handshake keeps working.
+- rbitcoin's dialect `1.4.2-asof` is a 1.4.2 session; see
+  [Chain-tip stamps](#chain-tip-stamps).
+
+Every method is served at the versions the spec gives it; a method outside
+the connection's version answers "method not found" (`-32601`). satd's own
+extensions (`blockchain.headers.get`, `blockchain.scripthash.get_first_use`,
+`blockchain.tweaks.subscribe`, and `blockchain.transaction.broadcast_package`
+below 1.6) and `blockchain.scripthash.unsubscribe` are served at every
+version.
 
 ## Configuration
 
@@ -85,7 +117,7 @@ exactly as in the Electrum protocol.
 | `server.ping` | Keepalive; returns null. |
 | `server.banner` | Server banner text (configurable via `--electrumbanner`). |
 | `server.donation_address` | Configured donation address (empty if unset). |
-| `server.features` | Feature/identity dict: genesis hash, `protocol_min`/`protocol_max` (both `1.4`), hosts, `tweaks` (whether `blockchain.tweaks.subscribe` can be served), `chain_tip` (`true`: answers name the tip they were read at), `asof` / `asof_protocol` ([As of a block](#as-of-a-block)), etc. |
+| `server.features` | Feature/identity dict: genesis hash, `protocol_min`/`protocol_max` ([Protocol version](#protocol-version)), hosts, `tweaks` (whether `blockchain.tweaks.subscribe` can be served), `chain_tip` (`true`: answers name the tip they were read at), `asof` / `asof_protocol` ([As of a block](#as-of-a-block)), etc. |
 | `server.peers.subscribe` | Peer-server discovery list (satd returns an empty set; no peer gossip). |
 
 ### Headers & blocks
@@ -170,8 +202,8 @@ do not describe one chain.
 
 `server.version` also accepts rbitcoin's protocol string `1.4.2-asof`, alone
 or at either end of a `[min, max]` range, and answers with it, so a client
-written for rbitcoin negotiates as it does there. The protocol spoken is
-still 1.4, and the stamps do not depend on it.
+written for rbitcoin negotiates as it does there. The connection is a 1.4.2
+session, and the stamps do not depend on it.
 
 ### As of a block
 
@@ -396,9 +428,8 @@ backend.
   wire carries an ordinal.
 - **Histories over the cap are refused**, not truncated: see
   [History cap](#history-cap).
-- satd advertises a single protocol version (`protocol_min == protocol_max
-  == 1.4`); it does not negotiate a range. The one other string it accepts
-  is rbitcoin's `1.4.2-asof` ([Chain-tip stamps](#chain-tip-stamps)).
+- satd does not require `server.version` to be the first message, as
+  ElectrumX does; see [Protocol version](#protocol-version).
 - `server.peers.subscribe` returns an empty list: satd does not participate
   in Electrum peer gossip.
 - **OP_RETURN-pruned blocks** (`pruneopreturn`, see
