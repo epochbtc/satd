@@ -408,6 +408,19 @@ pub fn dispatch_session(
         let params = req.params.unwrap_or_default();
         return match negotiate(&params) {
             Some(negotiated) => {
+                let client: String = params
+                    .get(0)
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .chars()
+                    .take(100)
+                    .collect();
+                tracing::debug!(
+                    target: "electrum::session",
+                    client = %client,
+                    version = %negotiated.answer,
+                    "negotiated protocol version",
+                );
                 let answer = handlers::server_methods::version_answer(state, &negotiated);
                 session.set(negotiated);
                 Response::success(id, answer)
