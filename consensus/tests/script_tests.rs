@@ -217,8 +217,8 @@ fn test_script_vectors() {
         failed, 0,
         "{failed} script tests failed (see output above)"
     );
-    // The five tapscript rows of Core's file run, not skip.
-    assert_eq!(taproot_rows, 5, "taproot rows run");
+    // The seven tapscript rows of Core's file run, not skip.
+    assert_eq!(taproot_rows, 7, "taproot rows run");
 }
 
 /// Smoke test: verify_script with 1+2=3
