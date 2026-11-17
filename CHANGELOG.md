@@ -28,6 +28,7 @@ It includes every fix shipped in 0.7.1:
 - RPC: an open JSON-RPC WebSocket stops working when its bearer token is revoked or expires; its frames are answered `-32006` (#821).
 - RPC: `getnetworkinfo` reports each network's `reachable` and `limited` from `-onlynet` and the proxies, as Core does, and lists `i2p` and `cjdns` (#1164).
 - RPC: `getmempoolentry`, `getrawmempool true` and `getmempoolancestors`/`getmempooldescendants true` report Core v31's `chunkweight` and `fees.chunk` (#1068).
+- RPC: `getnetworkinfo` reports `version` 320000 (Bitcoin Core v32), up from 280000, so clients with a Core v29 or v31 floor (Bark, Eclair) start (#1068).
 - RPC: `getblockstats` reports `feerate_percentiles`; `minfeerate`, `maxfeerate` and `avgfeerate` are in sat/vB instead of sat/kvB, a thousandth of what 0.7 reported; and `mediantxsize`, `avgtxsize`, `mintxsize`, `maxtxsize`, `total_size`, `total_weight` and `avgfeerate` leave out the header and coinbase, as in Core.
 - RPC: `warnings` in `getblockchaininfo`, `getnetworkinfo` and `getmininginfo` is always an array, `[]` when empty, as in Core v28; `-deprecatedrpc=warnings` brings back the string form (#956).
 - Chain: the node leaves initial block download only once its tip has the network's minimum chain work as well as a recent timestamp, and does not re-enter it when the tip goes stale, as in Core (#1071).

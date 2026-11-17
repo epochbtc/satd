@@ -175,6 +175,11 @@ fn test_regtest_getnetworkinfo() {
     let result = &response["result"];
 
     assert_eq!(result["subversion"], node::USER_AGENT);
+    // Core v32's RPC surface. Bark's captaind and Eclair start only at
+    // 310000 and above (`require_version` in captaind's `bitcoind.rs`,
+    // `Setup.scala`), Bark's client at 290000.
+    assert_eq!(result["version"], 320000);
+    assert!(result["version"].as_u64().unwrap() >= 310000);
     assert_eq!(result["connections"], 0);
     assert_eq!(result["protocolversion"], 70016);
     assert_eq!(result["networkactive"], true);
