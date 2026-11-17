@@ -6,6 +6,7 @@ use bitcoin::secp256k1::Secp256k1;
 use crate::chain::state::ChainState;
 use crate::mempool::pool::Mempool;
 use crate::rpc::amounts::{annotate_units, default_unit, format_amount, format_feerate_sat_per_kvb};
+use crate::rpc::script_asm::script_to_asm_str;
 use crate::storage::Store;
 use crate::storage::opreturn_strip::StoredBlock;
 use serde_json::{json, Value};
@@ -465,7 +466,7 @@ pub(crate) fn decode_transaction_verbose_net(
                     "txid": input.previous_output.txid.to_string(),
                     "vout": input.previous_output.vout,
                     "scriptSig": {
-                        "asm": format!("{}", input.script_sig),
+                        "asm": script_to_asm_str(input.script_sig.as_bytes(), true),
                         "hex": hex::encode(input.script_sig.as_bytes()),
                     },
                     "sequence": input.sequence.0,
@@ -479,7 +480,7 @@ pub(crate) fn decode_transaction_verbose_net(
             }
             if show_prevout && let Some(coin) = undo.map(|u| &u[i]) {
                 let mut spk = json!({
-                    "asm": format!("{}", coin.script_pubkey),
+                    "asm": script_to_asm_str(coin.script_pubkey.as_bytes(), false),
                     "hex": hex::encode(coin.script_pubkey.as_bytes()),
                     "type": script_type(&coin.script_pubkey),
                 });
@@ -504,7 +505,7 @@ pub(crate) fn decode_transaction_verbose_net(
         .map(|(n, output)| {
             let value = format_amount(output.value.to_sat(), unit);
             let mut spk = json!({
-                "asm": format!("{}", output.script_pubkey),
+                "asm": script_to_asm_str(output.script_pubkey.as_bytes(), false),
                 "hex": hex::encode(output.script_pubkey.as_bytes()),
                 "type": script_type(&output.script_pubkey),
             });
@@ -634,7 +635,7 @@ pub(crate) fn stored_tx_verbose(
     for (vout, script_len) in stored.stripped_outputs(i) {
         if let Some(out) = result["vout"].get_mut(vout as usize) {
             out["scriptPubKey"] = json!({
-                "asm": format!("{}", bare),
+                "asm": script_to_asm_str(bare.as_bytes(), false),
                 "hex": hex::encode(bare.as_bytes()),
                 "type": script_type(&bare),
                 "stripped_size": script_len,
@@ -649,7 +650,7 @@ pub(crate) fn stored_tx_verbose(
 /// has one) and `type`.
 pub(crate) fn script_pubkey_json(script: &bitcoin::Script, network: bitcoin::Network) -> Value {
     let mut spk = json!({
-        "asm": format!("{}", script),
+        "asm": script_to_asm_str(script.as_bytes(), false),
         "desc": crate::rpc::descriptor::infer_descriptor(script, network),
         "hex": hex::encode(script.as_bytes()),
         "type": script_type(script),
@@ -1226,7 +1227,7 @@ pub fn decode_script(
     // from "not a valid script", on the field whose whole use is telling you
     // the address to pay.
     let mut out = json!({
-        "asm": format!("{}", script),
+        "asm": script_to_asm_str(script.as_bytes(), false),
         "type": script_type,
     });
     if can_wrap_in_p2sh(&script) {

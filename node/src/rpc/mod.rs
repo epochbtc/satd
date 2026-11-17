@@ -63,6 +63,7 @@ pub mod policy;
 pub mod psbt;
 pub mod psbt_v2;
 pub mod rawtx;
+pub mod script_asm;
 pub mod signmessage;
 pub mod txospender;
 pub mod readonly;
