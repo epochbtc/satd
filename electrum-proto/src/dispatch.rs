@@ -189,6 +189,12 @@ impl Notification {
 ///
 /// The transport never hands this a notification (a request with no
 /// `id`): it skips them without dispatching (see `process_request`).
+///
+/// This has no connection: it serves `server.version` statelessly (the
+/// answer only, no once-per-connection rule, no close on a failed
+/// negotiation) and does not gate methods on a negotiated version. A
+/// connection's requests go through [`dispatch_session`], which applies
+/// both.
 pub fn dispatch(state: &ElectrumState, req: Request) -> Response {
     let id = req.id.clone().unwrap_or(Value::Null);
     let params = req.params.unwrap_or(Value::Array(Vec::new()));
@@ -428,6 +434,12 @@ pub fn dispatch_session(
 /// subscription will read `ChainEvent`s from. It's plumbed in as a
 /// trait object so the connection layer can swap the concrete source
 /// without coupling this module to `ChainState`.
+///
+/// This has no connection: it serves `server.version` statelessly (the
+/// answer only, no once-per-connection rule, no close on a failed
+/// negotiation) and does not gate methods on a negotiated version. A
+/// connection's requests go through [`dispatch_session`], which applies
+/// both.
 pub fn dispatch_with_subscriptions(
     state: &ElectrumState,
     subs: &mut Subscriptions,
