@@ -293,9 +293,17 @@ fn check_old_signet_datadir(config: &Config, net_datadir: &std::path::Path) {
     let mut commands: Vec<String> = Vec::new();
     let mv = |commands: &mut Vec<String>, from: &Path, to: &Path| {
         if to.exists() {
-            let mut aside = to.as_os_str().to_os_string();
-            aside.push(".unused");
-            commands.push(format!("mv {} {}", shell_quote(to), shell_quote(Path::new(&aside))));
+            // A name nothing holds yet: `mv` into an existing directory
+            // would nest instead of renaming.
+            let aside = (1..)
+                .map(|n| {
+                    let mut a = to.as_os_str().to_os_string();
+                    a.push(if n == 1 { ".unused".to_string() } else { format!(".unused.{n}") });
+                    PathBuf::from(a)
+                })
+                .find(|a| !a.exists())
+                .expect("an unused name");
+            commands.push(format!("mv {} {}", shell_quote(to), shell_quote(&aside)));
         }
         commands.push(format!("mv {} {}", shell_quote(from), shell_quote(to)));
     };
@@ -304,7 +312,9 @@ fn check_old_signet_datadir(config: &Config, net_datadir: &std::path::Path) {
         Ok(rel) => net_datadir.join(rel),
         Err(_) => found_blocks.clone(),
     };
-    if blocks_after_first_move != new_blocks {
+    // Blocks that are nowhere (an unreadable directory) get no command: a
+    // move of a missing path would stop the script halfway.
+    if found_blocks.exists() && blocks_after_first_move != new_blocks {
         match (&old_blocks_root, config.blocksdir.as_deref()) {
             // The usual `-blocksdir` case: its `signet/` subtree is renamed
             // whole.

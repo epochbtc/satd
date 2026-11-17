@@ -20426,13 +20426,15 @@ fn a_custom_signet_in_the_old_signet_directory_is_refused_with_the_moves() {
     std::fs::rename(blocks_root.join(own), blocks_root.join("signet")).unwrap();
 
     // An aborted start can leave the new directory behind, empty: it is no
-    // chainstate, so the check still runs, and it is moved aside first.
+    // chainstate, so the check still runs, and it is moved aside first, to a
+    // name nothing holds (`.unused` is taken by an earlier one here).
     std::fs::create_dir(datadir.join(own)).unwrap();
+    std::fs::create_dir(datadir.join(format!("{own}.unused"))).unwrap();
 
     let (status, stderr) = run_satd_until_exit_on("--signet", &datadir, &args, test_timeout(60));
     assert!(!status.success(), "{stderr}");
     let aside = format!(
-        "  mv {} {}.unused\n",
+        "  mv {} {}.unused.2\n",
         datadir.join(own).display(),
         datadir.join(own).display()
     );
