@@ -238,7 +238,7 @@ impl Profile {
                 txindex: None,
                 prune: Some(0),
                 dbcache: Some(2048),
-                maxconnections: Some(125),
+                maxconnections: Some(node::net::manager::DEFAULT_MAX_PEER_CONNECTIONS),
                 minrelaytxfee: None,
                 network_regtest: false,
                 network_signet: false,
@@ -1032,6 +1032,9 @@ pub struct Config {
     /// Maximum simultaneous inbound peers from the same source IP
     /// (Core-style flood guard; default 3).
     pub maxinboundperip: usize,
+    /// Bitcoin Core's `-inboundrelaypercent` (v32): the share of inbound
+    /// slots, 0 to 100, that transaction-relaying peers may hold. Default 50.
+    pub inboundrelaypercent: usize,
     /// Bitcoin Core's `-blockreconstructionextratxn`: how many recently seen
     /// transactions that are not in the mempool (replaced, or refused by
     /// policy) are kept for compact block reconstruction. 0 keeps none.
@@ -2745,8 +2748,8 @@ impl Config {
         // and Core's own condition is `-connect OR maxconnections <= 0`.
         // Parsed through `i64` so a negative value lands on Core's `<= 0`
         // branch instead of failing `usize::from_str` and silently falling
-        // through to the 125 default -- which left the node listening and
-        // accepting 125 peers where Core would have taken none.
+        // through to the default -- which left the node listening and
+        // accepting peers where Core would have taken none.
         let maxconnections: usize = cli
             .maxconnections
             .or_else(|| {
@@ -2755,7 +2758,7 @@ impl Config {
                     .map(|n| usize::try_from(n).unwrap_or(0))
             })
             .or(profile_defaults.maxconnections)
-            .unwrap_or(125);
+            .unwrap_or(node::net::manager::DEFAULT_MAX_PEER_CONNECTIONS);
         let binds_requested = !bind_raw.is_empty() || !whitebind_raw.is_empty();
         if !listen_explicit && !binds_requested && (!automatic_outbound || maxconnections == 0)
         {
@@ -4414,6 +4417,12 @@ impl Config {
                 .maxinboundperip
                 .or_else(|| file_get("maxinboundperip").and_then(|v| v.parse().ok()))
                 .unwrap_or(3),
+            // Core: `std::clamp(GetIntArg("-inboundrelaypercent", 50), 0, 100)`
+            // (v32.1 `init.cpp`).
+            inboundrelaypercent: cli
+                .inboundrelaypercent
+                .or_else(|| file_get("inboundrelaypercent").and_then(|v| v.trim().parse::<i64>().ok()))
+                .map_or(node::net::manager::DEFAULT_INBOUND_RELAY_PERCENT, |n| n.clamp(0, 100) as usize),
             blockreconstructionextratxn: match cli
                 .blockreconstructionextratxn
                 .map(|n| n.to_string())
@@ -4955,6 +4964,7 @@ impl Config {
                 "port": self.port,
                 "max_connections": self.maxconnections,
                 "max_inbound_per_ip": self.maxinboundperip,
+                "inbound_relay_percent": self.inboundrelaypercent,
                 "block_reconstruction_extra_txn": self.blockreconstructionextratxn,
                 "cmpct_block_prefill": self.cmpctblockprefill,
                 "cmpct_block_prefill_bytes": self.cmpctblockprefillbytes,
@@ -6273,9 +6283,17 @@ pub struct CliArgs {
     #[arg(
         long,
         value_name = "N",
-        help = "Maximum total connections (default: 125)"
+        help = "Maximum total connections (default: 200)"
     )]
     pub maxconnections: Option<usize>,
+
+    #[arg(
+        long,
+        value_name = "N",
+        allow_negative_numbers = true,
+        help = "Percent of inbound connections that may relay transactions, 0 to 100 (default: 50)"
+    )]
+    pub inboundrelaypercent: Option<i64>,
 
     #[arg(
         long,
@@ -9035,6 +9053,7 @@ pub fn normalize_args(args: Vec<String>) -> Vec<String> {
         "upgradechainstate",
         "maxconnections",
         "maxinboundperip",
+        "inboundrelaypercent",
         "blockreconstructionextratxn",
         "cmpctblockprefill",
         "cmpctblockprefillbytes",
@@ -9722,6 +9741,7 @@ pub const KNOWN_CONFIG_KEYS: &[&str] = &[
     "seednode",
     "maxconnections",
     "maxinboundperip",
+    "inboundrelaypercent",
     "blockreconstructionextratxn",
     "cmpctblockprefill",
     "cmpctblockprefillbytes",
@@ -12818,6 +12838,7 @@ testactivationheight=bip34@2
             upgradechainstate: None,
             maxconnections: None,
             maxinboundperip: None,
+            inboundrelaypercent: None,
             blockreconstructionextratxn: None,
             compact_prefill_args: CompactPrefillArgs::default(),
             maxuploadtarget: None,
@@ -13141,6 +13162,7 @@ testactivationheight=bip34@2
             upgradechainstate: None,
             maxconnections: None,
             maxinboundperip: None,
+            inboundrelaypercent: None,
             blockreconstructionextratxn: None,
             compact_prefill_args: CompactPrefillArgs::default(),
             maxuploadtarget: None,
@@ -15468,8 +15490,8 @@ mcpallowedhost=node.local
     }
 
     /// Core's condition is `maxconnections <= 0`. Parsing the file value as
-    /// `usize` made a negative one fail outright and fall through to the 125
-    /// default — so the node listened *and* took 125 peers where Core takes
+    /// `usize` made a negative one fail outright and fall through to the
+    /// default — so the node listened *and* took peers where Core takes
     /// none.
     #[test]
     fn a_negative_maxconnections_lands_on_cores_zero_branch() {
@@ -15479,6 +15501,26 @@ mcpallowedhost=node.local
         let cfg = parse_negation(&["satd", "--regtest", "--datadir", dd]).expect("starts");
         assert_eq!(cfg.maxconnections, 0);
         assert!(!cfg.listen, "maxconnections <= 0 soft-sets listen=0");
+    }
+
+    /// Core v32's connection defaults: `-maxconnections` 200 and
+    /// `-inboundrelaypercent` 50, the percentage clamped to 0..=100 from the
+    /// command line or the file (`init.cpp`). The mining profile takes Core's
+    /// default too.
+    #[test]
+    fn core_v32_connection_defaults() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let dd = tmpdir.path().to_str().unwrap();
+        let cfg = parse_negation(&["satd", "--regtest", "--datadir", dd]).expect("starts");
+        assert_eq!((cfg.maxconnections, cfg.inboundrelaypercent), (200, 50));
+        assert_eq!(Profile::Mining.defaults().maxconnections, Some(200));
+        for (arg, pct) in [("-inboundrelaypercent=100", 100), ("-inboundrelaypercent=-5", 0), ("-inboundrelaypercent=250", 100)] {
+            let cfg = parse_negation(&["satd", "--regtest", "--datadir", dd, arg]).expect("starts");
+            assert_eq!(cfg.inboundrelaypercent, pct, "{arg}");
+        }
+        std::fs::write(tmpdir.path().join("bitcoin.conf"), "inboundrelaypercent=30\n").unwrap();
+        let cfg = parse_negation(&["satd", "--regtest", "--datadir", dd]).expect("starts");
+        assert_eq!(cfg.inboundrelaypercent, 30);
     }
 
     /// Core's `InitParameterInteraction`: `-connect` (set or negated), or
@@ -16570,7 +16612,7 @@ notarealkey=1
     /// exception: skipping it would broadcast publicly, so it is fatal.
     #[test]
     fn core_v32_keys_load_with_a_warning() {
-        for k in ["prevoutfetchthreads", "inboundrelaypercent", "rpcmaxconnections", "txsendrate"] {
+        for k in ["prevoutfetchthreads", "rpcmaxconnections", "txsendrate"] {
             let cf = ConfigFile::parse(&format!("{k}=1\nserver=1\n"))
                 .unwrap_or_else(|e| panic!("{k} must load: {e}"));
             assert!(cf.ignored.iter().any(|m| m.contains(k)), "{k}: {:?}", cf.ignored);
