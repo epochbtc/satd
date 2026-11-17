@@ -115,20 +115,22 @@ required = 151                              base: stdio, logs, block and undo fi
          + 1 with listenonion               Tor control
          + 2 with nap                       attestation pulls
          + 101 per RPC listener             plain (2 by default), TLS, read-only, read-only TLS
-         + Esplora:     listeners + esploramaxsockets
+         + Esplora:     listeners + esploramaxsockets (esploramaxconns if 0)
          + Electrum:    listeners + electrummaxconns
          + Stratum:     listeners + stratummaxconns
          + events gRPC: 1 + eventsgrpcmaxconns
-         + streamws:    1 + streamwsmaxsockets
+         + streamws:    1 + streamwsmaxsockets (streamwsmaxconns if 0)
          + MCP HTTP:    1 + 128
          + metrics:     1 + 64, and 1 + 64 for its TLS listener
          + 1 per ZMQ endpoint
 total    = required + maxconnections
 ```
 
-Only enabled surfaces count. A cap that is off (`maxopenfiles=-1`,
-`esploramaxsockets=0`, `streamwsmaxsockets=0`) has no number to budget and
-counts nothing; neither do ZMQ subscribers or an AssumeUTXO background
+Only enabled surfaces count. A cap that is off (`maxopenfiles=-1`, or an
+Esplora or streamws socket cap and connection cap both `0`) has no number to
+budget and counts nothing; a socket cap of `0` alone falls back to the
+connection cap, which bounds the sockets holding a request or stream but not
+idle ones; neither do ZMQ subscribers or an AssumeUTXO background
 chainstate. With the defaults `required` is 3,435.
 
 satd raises the soft `RLIMIT_NOFILE` to `total`, never past the hard limit.

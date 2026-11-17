@@ -23,11 +23,11 @@
 //!          + 2 with -nap                        attestation pulls
 //!          + per RPC listener (plain, TLS,
 //!            read-only, read-only TLS):  1 + RPC_MAX_CONNECTIONS (100)
-//!          + Esplora:   listeners + esploramaxsockets
+//!          + Esplora:   listeners + esploramaxsockets (esploramaxconns if 0)
 //!          + Electrum:  listeners + electrummaxconns
 //!          + Stratum:   listeners + stratummaxconns
 //!          + events gRPC: 1 + eventsgrpcmaxconns
-//!          + streamws:  1 + streamwsmaxsockets
+//!          + streamws:  1 + streamwsmaxsockets (streamwsmaxconns if 0)
 //!          + MCP HTTP:  1 + 128
 //!          + metrics:   1 + 64, and 1 + 64 for its TLS listener
 //!          + 1 per ZMQ endpoint
@@ -35,8 +35,8 @@
 //! ```
 //!
 //! A surface counts only when it is enabled. A cap that is off
-//! (`maxopenfiles=-1`, `esploramaxsockets=0`, `streamwsmaxsockets=0`) has no
-//! number to budget and counts nothing; neither do ZMQ subscribers or an
+//! (`maxopenfiles=-1`, an Esplora or streamws socket cap and connection cap
+//! both `0`) has no number to budget and counts nothing; neither do ZMQ subscribers or an
 //! AssumeUTXO background chainstate, whose RocksDB keeps every file open.
 //!
 //! `MIN_SATD_FDS` is Core's `MIN_CORE_FDS` (150 for LevelDB plus one for
@@ -114,6 +114,14 @@ fn cap(n: usize) -> u64 {
     node::http_serve::clamp_cap(n) as u64
 }
 
+/// A surface with a socket cap and a connection cap taken inside its
+/// handlers: the socket cap, or, when that is off, the connection cap,
+/// which bounds the sockets that hold a request or a stream (idle sockets
+/// stay unbounded).
+fn socket_cap(sockets: usize, conns: usize) -> u64 {
+    if sockets == 0 { cap(conns) } else { cap(sockets) }
+}
+
 /// satd's needs apart from the automatic peers, itemized. See the module
 /// docs for the formula.
 pub fn needs(config: &Config) -> Vec<(&'static str, u64)> {
@@ -141,7 +149,7 @@ pub fn needs(config: &Config) -> Vec<(&'static str, u64)> {
     ));
     if config.esplora {
         let listeners = 1 + u64::from(config.esplora_tls_bind.is_some());
-        items.push(("esplora", listeners + cap(config.esplora_max_sockets)));
+        items.push(("esplora", listeners + socket_cap(config.esplora_max_sockets, config.esplora_max_conns)));
     }
     if config.electrum {
         let listeners = 1 + u64::from(config.electrum_tls_bind.is_some());
@@ -157,7 +165,7 @@ pub fn needs(config: &Config) -> Vec<(&'static str, u64)> {
         items.push(("events grpc", 1 + cap(config.events_grpc_max_conns)));
     }
     if config.streamws_bind.is_some() {
-        items.push(("streamws", 1 + cap(config.streamws_max_sockets)));
+        items.push(("streamws", 1 + socket_cap(config.streamws_max_sockets, config.streamws_max_conns)));
     }
     if config.mcp && config.mcp_port.is_some() {
         items.push(("mcp", 1 + satd_mcp::MCP_MAX_CONNECTIONS as u64));
@@ -213,10 +221,12 @@ pub fn raise_fd_limit(want: u64) -> u64 {
     if lim.rlim_cur == libc::RLIM_INFINITY { u64::MAX } else { lim.rlim_cur as u64 }
 }
 
-/// Core's Windows branch returns 2048.
+/// No `RLIMIT_NOFILE` to read: the limit is unknown, so nothing is
+/// lowered. (Core's Windows branch returns 2048, which fits Core's ~150
+/// descriptor minimum but not satd's; satd ships no non-unix build.)
 #[cfg(not(unix))]
 pub fn raise_fd_limit(_want: u64) -> u64 {
-    2048
+    u64::MAX
 }
 
 #[cfg(test)]
@@ -307,9 +317,12 @@ mod tests {
         assert_eq!(item(&items, "metrics"), Some(1 + 64));
         assert_eq!(item(&items, "rpc"), Some(101));
 
-        let items = needs(&config(&["--maxopenfiles=-1", "--esploramaxsockets=0"]));
+        let items = needs(&config(&["--maxopenfiles=-1", "--esploramaxsockets=0", "--esploramaxconns=7"]));
         assert_eq!(item(&items, "rocksdb"), None);
-        assert_eq!(item(&items, "esplora"), Some(1));
+        assert_eq!(item(&items, "esplora"), Some(1 + 7), "socket cap off: the connection cap");
+
+        let items = needs(&config(&["--esploramaxsockets=0", "--esploramaxconns=0"]));
+        assert_eq!(item(&items, "esplora"), Some(1), "both caps off: nothing to budget");
 
         let items = needs(&config(&["--esplora=0"]));
         assert_eq!(item(&items, "esplora"), None);
