@@ -44,6 +44,7 @@ It includes every fix shipped in 0.7.1:
 - P2P: a node with no outbound peer on a network it can reach (IPv4, IPv6 or onion) opens an extra full-relay connection to that network about every five minutes, as Core does, and keeps it as the only peer there (#1156).
 - P2P: once initial sync is over, the node opens an extra block-relay-only connection about every five minutes to check its tip, and then drops whichever of its two youngest block-relay-only peers gave it a block least recently, as Core does (#1155).
 - P2P: `.onion` fixed seeds for testnet4 and testnet3, and refreshed ones for mainnet and signet, from Core v31.2's lists, so a Tor-only node can bootstrap on every network (#1162).
+- P2P: a peer's block announcements or headers that do not connect draw one `getheaders` and then none until it answers or two minutes pass, as in Core's `MaybeSendGetHeaders`; they drew one every 2 seconds (#1262).
 - Config: `reindex=1` and `reindexchainstate=1` in `bitcoin.conf` are honoured, as in Core, instead of accepted and ignored (#840).
 - Operator: the shadow verification queue is bounded by memory, `-shadowqueuemb` (default 128 MiB), as well as by entry count (#1145).
 - Operator: the core runtime has at least two worker threads, so one blocked worker cannot freeze RPC and P2P on a 1-CPU host (#1144).
