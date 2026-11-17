@@ -203,6 +203,22 @@ pub fn mining_order(g: &Graph) -> Vec<usize> {
     chunks.into_iter().flat_map(|(_, _, _, txs)| txs).collect()
 }
 
+/// The chunk `tx` is mined in: the summed fee and sigop-adjusted weight of
+/// its chunk in the linearization of its cluster, which Core's
+/// `getmempoolentry` reports as `fees.chunk` and `chunkweight`
+/// (`TxGraph::GetMainChunkFeerate`, `entryToJSON` in v31 and later
+/// `rpc/mempool.cpp`). `g` must hold exactly `tx`'s cluster, its
+/// transactions in txid order, as [`Graph`]'s builders leave them.
+pub fn chunk_of(g: &Graph, tx: usize) -> FeeFrac {
+    let all: Vec<usize> = (0..g.txids.len()).collect();
+    let order = g.linearize_group(&all);
+    g.chunks(&order)
+        .into_iter()
+        .find(|(txs, _)| txs.contains(&tx))
+        .map(|(_, ff)| ff)
+        .expect("every transaction of the cluster is in one of its chunks")
+}
+
 /// Core's `TxGraph::Trim` after a reorg (v31.1 `txgraph.cpp`), which
 /// `UpdateTransactionsFromBlock` calls once the transactions a reorg
 /// returned are linked to the mempool transactions already spending them.
@@ -355,6 +371,29 @@ mod tests {
         reversed.reverse();
         let backward = graph(&reversed);
         assert_eq!(ids(&forward, &mining_order(&forward)), ids(&backward, &mining_order(&backward)));
+    }
+
+    /// The chunks Core v32.1 reports for a chain of three 437-weight
+    /// transactions paying 100, 10 000 and 200 sat: the child pays for its
+    /// parent and shares its chunk, the cheap grandchild is a chunk of its
+    /// own.
+    #[test]
+    fn a_child_paying_for_its_parent_shares_its_chunk() {
+        let g = graph(&[(1, 100, 437, &[]), (2, 10_000, 437, &[1]), (3, 200, 437, &[2])]);
+        assert_eq!(chunk_of(&g, 0), FeeFrac::new(10_100, 874));
+        assert_eq!(chunk_of(&g, 1), FeeFrac::new(10_100, 874));
+        assert_eq!(chunk_of(&g, 2), FeeFrac::new(200, 437));
+    }
+
+    /// The same chain after `prioritisetransaction` takes 20 000 sat off
+    /// the parent: its modified fee goes negative, and Core v32.1 reports
+    /// the whole chain as one chunk paying -9 700 sat for 1311 weight.
+    #[test]
+    fn a_negative_parent_pulls_its_descendants_into_its_chunk() {
+        let g = graph(&[(1, -19_900, 437, &[]), (2, 10_000, 437, &[1]), (3, 200, 437, &[2])]);
+        for tx in 0..3 {
+            assert_eq!(chunk_of(&g, tx), FeeFrac::new(-9_700, 1311));
+        }
     }
 
     /// A cluster within the limits is not touched, whatever it holds.

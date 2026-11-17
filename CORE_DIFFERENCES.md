@@ -972,6 +972,14 @@ silently returning an empty or wrong answer.
   verbose object's keys are sorted by txid; Core's follow the same mining
   order.
 
+- **`chunkweight` and `fees.chunk`** (`getmempoolentry` and the verbose
+  mempool views) — the chunk of that same fresh linearization, so they
+  agree with Core where the order does. The fees are signed, as Core's
+  are. Admission, replacement and the `getrawmempool` order clamp a
+  modified fee a negative `prioritisetransaction` delta takes below zero
+  at zero; these two fields do not, so for such a transaction the chunk
+  they report can be larger than the one the order lists.
+
 - **`getindexinfo` / `getsatdindexinfo`: `txindex.synced`** — reports whether
   `-txindex` is on, not whether the index covers the whole chain. satd writes
   txindex entries inline during `connect_block`, so with the flag set the index

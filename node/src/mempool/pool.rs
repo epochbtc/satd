@@ -4433,17 +4433,23 @@ impl Mempool {
     /// The graph [`clusters`] works on: `txids` (sorted here, so the
     /// result does not depend on the caller's order), each with its parents
     /// among them.
-    fn cluster_graph(inner: &MempoolInner, mut txids: Vec<Txid>) -> clusters::Graph {
+    fn cluster_graph(inner: &MempoolInner, txids: Vec<Txid>) -> clusters::Graph {
+        Self::cluster_graph_with(inner, txids, |e| modified_fee(e.fee, e.fee_delta) as i64)
+    }
+
+    /// [`Self::cluster_graph`], each transaction's fee given by `fee`.
+    fn cluster_graph_with(
+        inner: &MempoolInner,
+        mut txids: Vec<Txid>,
+        fee: impl Fn(&MempoolEntry) -> i64,
+    ) -> clusters::Graph {
         txids.sort_unstable();
         let index: HashMap<Txid, usize> = txids.iter().enumerate().map(|(i, t)| (*t, i)).collect();
         let mut ff = Vec::with_capacity(txids.len());
         let mut parents = Vec::with_capacity(txids.len());
         for txid in &txids {
             let e = &inner.entries[txid];
-            ff.push(crate::mempool::feefrac::FeeFrac::new(
-                modified_fee(e.fee, e.fee_delta) as i64,
-                e.adjusted_weight() as i64,
-            ));
+            ff.push(crate::mempool::feefrac::FeeFrac::new(fee(e), e.adjusted_weight() as i64));
             let mut mine: Vec<usize> =
                 e.tx.input.iter().filter_map(|i| index.get(&i.previous_output.txid).copied()).collect();
             mine.sort_unstable();
@@ -4467,6 +4473,39 @@ impl Mempool {
     /// [`Self::acting_mining_order`], for `getrawmempool`.
     pub fn acting_txids_in_mining_order(&self) -> Vec<Txid> {
         Self::acting_mining_order(&self.inner.read())
+    }
+
+    /// The fee and sigop-adjusted weight of the chunk `txid` is mined in ([`clusters::chunk_of`]), for `getmempoolentry`'s
+    /// `fees.chunk` and `chunkweight`. The cluster is every acting
+    /// transaction `txid` reaches through spends either way. Fees are
+    /// modified fees, signed as Core's `GetModifiedFee` is: Core v32.1
+    /// reports a chunk a negative `prioritisetransaction` delta drags below
+    /// zero with its negative fee, and the chunk then takes in descendants
+    /// a clamped zero would leave out. `None` if `txid` is not an acting
+    /// entry.
+    fn chunk_feerate(inner: &MempoolInner, txid: &Txid) -> Option<crate::mempool::feefrac::FeeFrac> {
+        let acting = |t: &Txid| inner.entries.get(t).is_some_and(|e| e.scope.is_acting());
+        if !acting(txid) {
+            return None;
+        }
+        let mut cluster: HashSet<Txid> = HashSet::from([*txid]);
+        let mut queue = vec![*txid];
+        let mut buf: Vec<Txid> = Vec::new();
+        while let Some(current) = queue.pop() {
+            buf.clear();
+            Self::collect_children(inner, &current, &mut buf);
+            buf.extend(inner.entries[&current].tx.input.iter().map(|i| i.previous_output.txid));
+            for next in buf.drain(..) {
+                if acting(&next) && cluster.insert(next) {
+                    queue.push(next);
+                }
+            }
+        }
+        let g = Self::cluster_graph_with(inner, cluster.into_iter().collect(), |e| {
+            signed_modified_fee(e.fee, e.fee_delta)
+        });
+        let at = g.txids.binary_search(txid).expect("the cluster holds its own transaction");
+        Some(clusters::chunk_of(&g, at))
     }
 
     /// Core's trim after a reorg (`UpdateTransactionsFromBlock`, then
@@ -6341,6 +6380,9 @@ impl Mempool {
         let children = self.get_children(txid).unwrap_or_default();
 
         let inner = self.inner.read();
+        // Core's `GetMainChunkFeerate`. The entry can have left the pool
+        // while the lock was released; it is then not in the mempool.
+        let chunk = Self::chunk_feerate(&inner, txid)?;
 
         // Invisibility (design §6.1): the ancestor/descendant graph reported on
         // this standard surface must exclude the quarantine class. Infectious
@@ -6422,6 +6464,7 @@ impl Mempool {
                 "modified": signed_amount(entry_modified_fee),
                 "ancestor": signed_amount(ancestor_fees),
                 "descendant": signed_amount(descendant_fees),
+                "chunk": signed_amount(chunk.fee),
             },
             "vsize": vsize,
             "weight": entry_weight,
@@ -6434,6 +6477,7 @@ impl Mempool {
             "ancestorcount": ancestor_count + 1,
             "ancestorsize": ancestor_size,
             "ancestorfees": ancestor_fees,
+            "chunkweight": chunk.size,
             "depends": depends.into_iter().collect::<Vec<_>>(),
             "spentby": children.iter().map(|c| c.to_string()).collect::<Vec<_>>(),
             "bip125-replaceable": bip125_replaceable,
