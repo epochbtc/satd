@@ -48,6 +48,7 @@ It includes every fix shipped in 0.7.1:
 - P2P: one source's network group holds at most 1,024 new entries in the address book, a sixteenth of it, as one source group reaches 64 of Core's 1,024 new buckets; a peer announcing addresses across many groups could fill the book (#1264).
 - P2P: a `cmpctblock` from a peer that never sent a version-2 `sendcmpct` is ignored, header included, as in Core v32 (#1275).
 - P2P: `.onion` fixed seeds for testnet4 and testnet3, and refreshed ones for mainnet and signet, from Core v31.2's lists, so a Tor-only node can bootstrap on every network (#1162).
+- P2P: a peer's block announcements or headers that do not connect draw one `getheaders` and then none until it answers or two minutes pass, as in Core's `MaybeSendGetHeaders`; they drew one every 2 seconds (#1262).
 - Config: `reindex=1` and `reindexchainstate=1` in `bitcoin.conf` are honoured, as in Core, instead of accepted and ignored (#840).
 - Operator: `-dbcache=auto` sizes from the memory cgroup limit (systemd `MemoryMax=`, Docker `--memory`, cgroup v2 or v1) when it is below host memory; it sized from the host alone (#1272).
 - Operator: the shadow verification queue is bounded by memory, `-shadowqueuemb` (default 128 MiB), as well as by entry count (#1145).
