@@ -75,11 +75,13 @@ const PING_INTERVAL: Duration = Duration::from_secs(120);
 /// outstanding for twenty minutes unless the connection is at least that old.
 const PING_TIMEOUT: Duration = Duration::from_secs(20 * 60);
 
-/// Minimum interval between announcement-triggered `getheaders` to a single
-/// peer. Caps the header-discovery work a peer can make us do by spamming
-/// invs / unconnectable headers (anti-DoS), while still reacting promptly to
-/// an honest competing-chain announcement.
-const GETHEADERS_MIN_INTERVAL: Duration = Duration::from_secs(2);
+/// How long a `getheaders` to a peer counts as outstanding: Core's
+/// `HEADERS_RESPONSE_TIME` (`net_processing.cpp`). While one is outstanding
+/// and younger than this, announcements from that peer (block `inv`s,
+/// headers that do not connect, a block or `cmpctblock` with an unknown
+/// parent) bring no further `getheaders`; the peer's `headers` reply clears
+/// it, so the next request can follow the reply at once.
+const HEADERS_RESPONSE_TIME: Duration = Duration::from_secs(2 * 60);
 
 /// Cap on the peer-reported addresses `-discover` remembers as our own.
 /// Each outbound peer reports one; an honest set holds one per IP family.
@@ -969,9 +971,12 @@ struct PeerHandle {
     /// The peer's outbound queue. It counts the bytes queued, which Core's
     /// send-buffer limit is measured in; see [`crate::net::send_queue`].
     msg_tx: crate::net::send_queue::PeerSender,
-    /// Last time we sent this peer a `getheaders`, for rate-limiting
-    /// announcement-triggered header discovery (anti-DoS). `None` until the
-    /// first send.
+    /// When the `getheaders` outstanding to this peer went out: Core's
+    /// `m_last_getheaders_timestamp`. Set by every `getheaders` we send;
+    /// cleared by a `headers` reply that is empty or connects to the block
+    /// index, which Core takes as the answer. `None` when nothing is
+    /// outstanding. Gates announcement-triggered requests
+    /// ([`PeerManager::maybe_send_getheaders`]).
     last_getheaders_sent: Option<Instant>,
     /// Whether header sync has started with this peer, and how it went.
     header_sync: HeaderSync,
@@ -5505,8 +5510,9 @@ impl PeerManager {
     }
 
     /// Whether to start header sync with `id` now, and if so, mark it
-    /// started; the caller sends the `getheaders`. Core's `SendMessages`:
-    /// while the best header is more than a day old, header sync runs with a
+    /// started and its `getheaders` outstanding (Core starts sync through
+    /// `MaybeSendGetHeaders`, which records the request); the caller sends
+    /// it. Core's `SendMessages`: while the best header is more than a day old, header sync runs with a
     /// single peer, preferably a preferred-download one (outbound or
     /// `noban`), so a fresh node does not fetch the whole header chain once
     /// from every peer it connects to; past that, every peer. A peer that
@@ -5542,6 +5548,7 @@ impl PeerManager {
         }
         if let Some(h) = peers.get_mut(&id) {
             h.header_sync.started = true;
+            h.last_getheaders_sent = Some(Instant::now());
         }
         true
     }
@@ -7263,7 +7270,7 @@ impl PeerManager {
             // them and triggers rate limits.
             if self.is_ibd() && ticks.is_multiple_of(4) && self.ibd_header_probe_due() {
                 if let Some(pid) = self.header_probe_peer() {
-                    self.send_to_peer(pid, sync::make_getheaders(&self.chain_state));
+                    self.send_getheaders(pid, sync::make_getheaders(&self.chain_state));
                 }
             } else if !self.is_ibd() && ticks.is_multiple_of(20) {
                 let peer_ids: Vec<PeerId> = {
@@ -7276,7 +7283,7 @@ impl PeerManager {
                         .collect()
                 };
                 for pid in &peer_ids {
-                    self.send_to_peer(*pid, sync::make_getheaders(&self.chain_state));
+                    self.send_getheaders(*pid, sync::make_getheaders(&self.chain_state));
                 }
             }
 
@@ -8681,10 +8688,22 @@ impl PeerManager {
     }
 
     fn handle_headers(&self, id: PeerId, headers: Vec<bitcoin::block::Header>) {
-        if headers.len() < 2000
-            && let Some(h) = self.peers.write().get_mut(&id)
-        {
-            h.header_sync.done = true;
+        // Core's `ProcessHeadersMessage`: an empty `headers` cannot be an
+        // announcement, and headers whose first one connects to the block
+        // index can be the answer to our `getheaders`; either clears the
+        // outstanding request (`m_last_getheaders_timestamp = {}`). Headers
+        // that do not connect cannot be an answer and leave it standing, so
+        // a peer sending them cannot draw a `getheaders` per message.
+        let answers_getheaders = headers
+            .first()
+            .is_none_or(|first| self.chain_state.get_block_index(&first.prev_blockhash).is_some());
+        if let Some(h) = self.peers.write().get_mut(&id) {
+            if headers.len() < 2000 {
+                h.header_sync.done = true;
+            }
+            if answers_getheaders {
+                h.last_getheaders_sent = None;
+            }
         }
         if headers.is_empty() {
             return;
@@ -8705,7 +8724,7 @@ impl PeerManager {
             && headers.len() >= 2000
             && let Some(last) = headers.last()
         {
-            self.send_to_peer(id, sync::make_getheaders_after(&self.chain_state, last.block_hash()));
+            self.send_getheaders(id, sync::make_getheaders_after(&self.chain_state, last.block_hash()));
         }
         // Core's `UpdateBlockAvailability`: the peer has at least the last
         // header it sent, already known or not.
@@ -8739,6 +8758,10 @@ impl PeerManager {
                     // with a batch that no longer connects, and the exchange
                     // ran to 100 points — a ban — in half a second, leaving the
                     // node with no block source and its sync stopped dead.
+                    //
+                    // At most one such `getheaders` is outstanding per peer
+                    // (`HEADERS_RESPONSE_TIME`): these headers did not clear
+                    // the last one, as they cannot be its answer.
                     self.maybe_send_getheaders(id);
                 }
                 // A header more than two hours ahead of our clock may be
@@ -14037,6 +14060,15 @@ impl PeerManager {
             return;
         }
 
+        // 0b. A peer that never sent a version-2 `sendcmpct` has not
+        // negotiated compact blocks, and Core v32 ignores its `cmpctblock`,
+        // the header included (`m_provides_cmpctblocks`,
+        // `net_processing.cpp:4795-4802` at v32.1).
+        if !self.peers.read().get(&id).is_some_and(|h| h.info.compact_blocks) {
+            tracing::debug!("peer={id} sent us a compact block despite never having sent us a SENDCMPCT!");
+            return;
+        }
+
         // 1. Still syncing: take the header, leave the block to the download
         // scheduler. Core: `if (!already_in_flight && !CanDirectFetch()) return`.
         if self.ibd.read().is_some() || self.is_ibd() {
@@ -14379,21 +14411,27 @@ impl PeerManager {
         }
     }
 
-    /// Send `getheaders` to a peer for headers-first chain discovery, but no
-    /// more than once per [`GETHEADERS_MIN_INTERVAL`] per peer. Returns whether
-    /// a message was sent. Used on inv/headers announcements so a flood of
-    /// announcements (or unconnectable headers) can't make us emit a getheaders
-    /// — and the locator-building work behind it — on every message.
+    /// Core's `MaybeSendGetHeaders` (v32.1 `net_processing.cpp`): send
+    /// `getheaders` to a peer for headers-first chain discovery, unless one
+    /// is already outstanding to it and under [`HEADERS_RESPONSE_TIME`] old.
+    /// Returns whether a message was sent. Used on announcements (block
+    /// `inv`s, headers that do not connect, a block or `cmpctblock` with an
+    /// unknown parent), so a flood of them cannot make us emit a
+    /// `getheaders` — and the locator-building work behind it — per message.
+    /// The peer's reply clears the request ([`Self::handle_headers`]).
     fn maybe_send_getheaders(&self, id: PeerId) -> bool {
+        self.maybe_send_getheaders_at(id, Instant::now())
+    }
+
+    fn maybe_send_getheaders_at(&self, id: PeerId, now: Instant) -> bool {
         {
             let mut peers = self.peers.write();
             let Some(handle) = peers.get_mut(&id) else {
                 return false;
             };
-            let now = Instant::now();
             let due = handle
                 .last_getheaders_sent
-                .is_none_or(|t| now.duration_since(t) >= GETHEADERS_MIN_INTERVAL);
+                .is_none_or(|t| now.saturating_duration_since(t) > HEADERS_RESPONSE_TIME);
             if !due {
                 return false;
             }
@@ -14401,6 +14439,18 @@ impl PeerManager {
         }
         self.send_to_peer(id, sync::make_getheaders(&self.chain_state));
         true
+    }
+
+    /// Send a `getheaders` that is not gated on an outstanding one (header
+    /// sync's continuation, the stall probe, the periodic poll; its start is
+    /// recorded by [`Self::start_header_sync`]), and record it as outstanding, as every `getheaders` Core sends
+    /// goes through `MaybeSendGetHeaders`. An announcement arriving before
+    /// its answer then brings no second request: the answer covers it.
+    fn send_getheaders(&self, id: PeerId, msg: NetworkMessage) {
+        if let Some(h) = self.peers.write().get_mut(&id) {
+            h.last_getheaders_sent = Some(Instant::now());
+        }
+        self.send_to_peer(id, msg);
     }
 
     fn request_missing_blocks(&self, id: PeerId) {
@@ -20441,7 +20491,9 @@ mod tests {
         let addr: SocketAddr = "10.0.0.1:8333".parse().unwrap();
         let (h, mut rx) = mk_handle_rx(1, addr, PeerState::Connected, 0);
         pm.peers.write().insert(1, h);
-        // We asked this peer for high-bandwidth relay, so its push is taken.
+        // The peer speaks BIP 152 version 2, and we asked it for
+        // high-bandwidth relay, so its push is taken.
+        pm.peers.write().get_mut(&1).unwrap().info.compact_blocks = true;
         pm.peers.write().get_mut(&1).unwrap().info.hb_to = true;
 
         let compact = bitcoin::bip152::HeaderAndShortIds::from_block(&block, 42, 2, &[])
@@ -21179,6 +21231,28 @@ mod tests {
         let b2 = coinbase_only_child(&f.tip, 2);
         deliver(&f.pm, 1, NetworkMessage::Headers(vec![b2.header]));
         assert_eq!(block_requests(&drain(&mut f.rx), b2.block_hash()), vec![false]);
+    }
+
+    /// Core's `m_provides_cmpctblocks` on receipt (v32.1
+    /// `net_processing.cpp:4795-4802`): a `cmpctblock` from a peer that never
+    /// sent a version-2 `sendcmpct` is ignored, its header included. Once the
+    /// same peer sends `sendcmpct(0, 2)`, the same `cmpctblock` is taken.
+    #[test]
+    fn a_cmpctblock_from_a_peer_without_version_two_sendcmpct_is_ignored() {
+        use bitcoin::p2p::message_compact_blocks::SendCmpct;
+        let mut f = compact_fetch_fixture_with(crate::time::now_secs() as u32, 1);
+        let b2 = coinbase_only_child(&f.tip, 2);
+        let h2 = b2.block_hash();
+        let tip = f.pm.chain_state.tip_hash();
+
+        deliver(&f.pm, 1, cmpctblock_of(&b2));
+        assert!(f.pm.chain_state.get_block_index(&h2).is_none(), "no header row");
+        assert_eq!(f.pm.chain_state.tip_hash(), tip);
+        assert!(drain(&mut f.rx).is_empty(), "nothing asked of the peer");
+
+        deliver(&f.pm, 1, NetworkMessage::SendCmpct(SendCmpct { send_compact: false, version: 2 }));
+        deliver(&f.pm, 1, cmpctblock_of(&b2));
+        assert!(f.pm.chain_state.get_block_index(&h2).is_some(), "a negotiated peer's header is taken");
     }
 
     /// Core's `!m_opts.ignore_incoming_txs`: under `-blocksonly` the mempool

@@ -175,6 +175,39 @@ pub enum ChainError {
     /// starts the reindex over.
     #[error("the interrupted reindex cannot be continued: {0}")]
     ReindexCannotResume(String),
+    /// The store holds a block index, but not this network's genesis block:
+    /// the datadir belongs to another network (#1270). Core's
+    /// `LoadChainstate` (`src/node/chainstate.cpp`) refuses with this text.
+    #[error("Incorrect or no genesis block found. Wrong datadir for network?")]
+    WrongGenesis,
+}
+
+/// Refuse a store that belongs to another network (#1270).
+///
+/// Core's `LoadChainstate` (`src/node/chainstate.cpp`) fails when the block
+/// index is not empty and does not contain the network's genesis block. A
+/// store with a tip has a block index, so that case needs no scan; a store
+/// without one is either fresh (empty index, which passes) or had its
+/// chainstate cleared by `-reindex-chainstate` (index kept, which is
+/// checked). The scan runs only when genesis is missing, so a node on its
+/// own datadir pays one point lookup.
+///
+/// Every signet shares one genesis block, so this cannot tell two signets
+/// apart.
+pub fn check_genesis(store: &dyn Store, network: Network) -> Result<(), ChainError> {
+    let genesis_hash = bitcoin::constants::genesis_block(network).block_hash();
+    if store.get_block_index(&genesis_hash).is_some() {
+        return Ok(());
+    }
+    if store.get_tip().is_some() {
+        return Err(ChainError::WrongGenesis);
+    }
+    let mut rows = 0u64;
+    let stats = store.for_each_block_index(&mut |_, _| rows += 1)?;
+    if rows > 0 || stats.skipped_bad_key > 0 || stats.skipped_bad_value > 0 {
+        return Err(ChainError::WrongGenesis);
+    }
+    Ok(())
 }
 
 impl ChainError {
@@ -250,7 +283,8 @@ impl ChainError {
             | ChainError::BlockNotFound
             | ChainError::InvalidArgument(_)
             | ChainError::ReactivationFailed(_)
-            | ChainError::ReindexCannotResume(_) => false,
+            | ChainError::ReindexCannotResume(_)
+            | ChainError::WrongGenesis => false,
         }
     }
 }
@@ -1003,6 +1037,10 @@ impl ChainState {
         // (AssumeUTXO) via Arc. Callers still pass a Box; the conversion
         // is free and keeps every existing call site unchanged.
         let script_verifier: Arc<dyn ScriptVerifier> = Arc::from(script_verifier);
+
+        // A datadir from another network is refused before anything is
+        // read from or written to it (#1270).
+        check_genesis(&*store, network)?;
 
         // Wrap the store in a CoinCache for batched UTXO writes
         let store = std::sync::Arc::new(CoinCache::new(store, dbcache_mb));
@@ -10497,12 +10535,54 @@ impl ChainState {
     /// Connect the best available valid chain if it differs from the current
     /// tip (Core's ActivateBestChain, scoped to candidates already present
     /// locally). Caller must hold `accept_lock`.
+    ///
+    /// Core's `ActivateBestChain` (`validation.cpp`, v32.1) loops: when
+    /// `ActivateBestChainStep` reports `fInvalidFound` it clears
+    /// `pindexMostWork`, runs `FindMostWorkChain` again and tries the next
+    /// candidate, and it returns failure only for a system error (disk,
+    /// database). This does the same. A `reorg_to` that fails on a verdict on
+    /// a block has marked that block and its descendants `Invalid` and rolled
+    /// back to the tip it started from, so `find_best_valid_tip` is asked
+    /// again; any other failure is returned as it is.
+    ///
+    /// The loop terminates. A candidate is a block whose status is
+    /// `DataStored` or `Valid`, and `find_best_valid_tip` only offers one whose
+    /// every block down to the active chain has such a status. So the block a
+    /// verdict names was a candidate before the attempt, and the check below
+    /// requires that it reads `Invalid` after it. Nothing clears a mark while
+    /// the caller holds `accept_lock` (`reconsider_block` takes it), so every
+    /// iteration that goes round again leaves the finite candidate set at
+    /// least one block smaller. A mark that did not land (its write failed)
+    /// would offer the same candidate again, so that case returns the error
+    /// instead of retrying.
     fn activate_best_chain(&self) -> Result<(), ChainError> {
-        let best = self.find_best_valid_tip()?;
-        if best.header.block_hash() == self.tip_hash() {
-            return Ok(());
+        loop {
+            let best = self.find_best_valid_tip()?;
+            if best.header.block_hash() == self.tip_hash() {
+                return Ok(());
+            }
+            let mut invalid = None;
+            let Err(e) = self.reorg_to_naming_invalid(&best, &mut invalid) else {
+                return Ok(());
+            };
+            let Some(bad) = invalid else {
+                return Err(e);
+            };
+            let marked = self
+                .store
+                .get_block_index(&bad)
+                .is_some_and(|entry| entry.status == BlockStatus::Invalid);
+            if !marked {
+                return Err(e);
+            }
+            tracing::warn!(
+                error = %e,
+                invalid = %bad,
+                target = %best.header.block_hash(),
+                target_height = best.height,
+                "Could not activate the best chain, a block on it is invalid; trying the next-best chain"
+            );
         }
-        self.reorg_to(&best)
     }
 
     /// The highest block on the best-header chain whose whole path down to the
@@ -13399,9 +13479,13 @@ pub(crate) mod tests {
             arr[0] = h as u8;
             arr[1] = (h >> 8) as u8;
             arr[3] = 0x5A; // distinguish from real hashes
-            let hash = BlockHash::from_raw_hash(
-                bitcoin::hashes::sha256d::Hash::from_byte_array(arr),
-            );
+            // Height 0 is the real genesis hash: `ChainState::new` refuses a
+            // block index without it (#1270).
+            let hash = if h == 0 {
+                base_header.block_hash()
+            } else {
+                BlockHash::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array(arr))
+            };
             let mut header = base_header;
             header.time = 1_500_000_000 + h as u32 * 600;
             header.prev_blockhash = prev_hash;
@@ -14075,14 +14159,17 @@ pub(crate) mod tests {
     }
 
     /// #977: `invalidateblock` whose re-activation fails on an invalid block
-    /// of the competing branch ends on the invalidated block's parent, with
-    /// that branch marked invalid, as Core's `InvalidateBlock` does. It used to
-    /// run the truncation and the reconnect as one reorg, and the abort put
-    /// the node back on the pre-invalidation tip -- a block it had just marked
-    /// `Invalid` -- where it refused every block extending the real best chain
-    /// until a restart.
+    /// of the competing branch never ends on the pre-invalidation tip. It used
+    /// to run the truncation and the reconnect as one reorg, and the abort put
+    /// the node back on that tip -- a block it had just marked `Invalid` --
+    /// where it refused every block extending the real best chain until a
+    /// restart.
+    ///
+    /// Since #1261 the activation then tries the next-best chain, as Core's
+    /// `ActivateBestChain` does after `InvalidBlockFound`: here the valid
+    /// prefix b1 of the failed branch, which still out-works the parent.
     #[test]
-    fn invalidateblock_whose_reactivation_fails_ends_on_the_parent() {
+    fn invalidateblock_whose_reactivation_fails_ends_on_the_best_valid_chain() {
         let (cs, dir) = make_chain_state();
         let base = build_and_connect_chain(&cs, 3);
         let base_tip = base[2].block_hash();
@@ -14103,14 +14190,12 @@ pub(crate) mod tests {
             cs.store_block(b).unwrap();
         }
 
-        let err = cs
-            .invalidate_block(a1.block_hash())
-            .expect_err("re-activation fails on b2");
-        assert!(matches!(err, ChainError::ReactivationFailed(_)), "got {err:?}");
+        cs.invalidate_block(a1.block_hash())
+            .expect("b2 failing leaves b1, which out-works the parent");
 
-        assert_eq!(cs.tip_hash(), base_tip, "the tip must fall back to the invalidated block's parent");
-        assert_eq!(cs.tip_height(), 3);
-        assert_eq!(cs.get_block_index(&base_tip).unwrap().status, BlockStatus::Valid);
+        assert_eq!(cs.tip_hash(), b1.block_hash(), "the tip must be the best valid chain left");
+        assert_eq!(cs.tip_height(), 4);
+        assert_eq!(cs.get_block_index(&b1.block_hash()).unwrap().status, BlockStatus::Valid);
         for b in [&a1, &a2, &b2, &b3] {
             assert_eq!(
                 cs.get_block_index(&b.block_hash()).unwrap().status,
@@ -14120,10 +14205,150 @@ pub(crate) mod tests {
             );
         }
 
-        // The node goes on from the parent: a block extending it connects.
-        let c1 = build_test_block(base_tip, 4, 1_600_000_024);
+        // The node goes on from there: a block extending it connects.
+        let c1 = build_test_block(b1.block_hash(), 5, 1_600_000_024);
         cs.accept_block(&c1).unwrap();
         assert_eq!(cs.tip_hash(), c1.block_hash());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1261: two branches compete above the invalidated block, and the
+    /// heavier one holds an invalid block. `invalidateblock` must end on the
+    /// other branch's tip, as Core's `ActivateBestChain` does by running
+    /// `FindMostWorkChain` again after `InvalidBlockFound`. It used to stop
+    /// after the one failed attempt, on the invalidated block's parent, and
+    /// return an error.
+    #[test]
+    fn invalidateblock_tries_the_next_best_branch_after_an_invalid_one() {
+        let (cs, dir) = make_chain_state();
+        let base = build_and_connect_chain(&cs, 3);
+        let base_tip = base[2].block_hash();
+
+        let a1 = build_test_block(base_tip, 4, 1_600_000_004);
+        cs.accept_block(&a1).unwrap();
+
+        // B: the most work, with an invalid block in the middle.
+        let missing = bitcoin::OutPoint { txid: bitcoin::Txid::from_byte_array([7; 32]), vout: 0 };
+        let b1 = build_test_block_spending(base_tip, 4, 1_600_000_014, missing);
+        let b2 = build_test_block(b1.block_hash(), 5, 1_600_000_015);
+        let b3 = build_test_block(b2.block_hash(), 6, 1_600_000_016);
+        // C: less work than B, more than the parent, all valid.
+        let c1 = build_test_block(base_tip, 4, 1_600_000_024);
+        let c2 = build_test_block(c1.block_hash(), 5, 1_600_000_025);
+        for b in [&b1, &b2, &b3, &c1, &c2] {
+            cs.accept_header(&b.header).unwrap();
+            cs.store_block(b).unwrap();
+        }
+        assert_eq!(cs.tip_hash(), a1.block_hash(), "storing the branches activates neither");
+
+        cs.invalidate_block(a1.block_hash())
+            .expect("B fails, and C is activated in its place");
+
+        assert_eq!(cs.tip_hash(), c2.block_hash(), "the node must end on C's tip");
+        assert_eq!(cs.tip_height(), 5);
+        for b in [&a1, &b1, &b2, &b3] {
+            assert_eq!(cs.get_block_index(&b.block_hash()).unwrap().status, BlockStatus::Invalid);
+        }
+        for b in [&c1, &c2] {
+            assert_eq!(cs.get_block_index(&b.block_hash()).unwrap().status, BlockStatus::Valid);
+        }
+        // C's coinbases are coins, and B's are not.
+        let coinbase = |b: &Block| bitcoin::OutPoint { txid: b.txdata[0].compute_txid(), vout: 0 };
+        assert!(cs.get_coin(&coinbase(&c2)).is_some());
+        assert!(cs.get_coin(&coinbase(&b1)).is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1261, `reconsiderblock`: clearing the marks puts a branch back in
+    /// play, but a heavier stored branch that holds an invalid block is tried
+    /// first. The activation must go on to the reconsidered branch rather
+    /// than stop on the parent with an error.
+    #[test]
+    fn reconsiderblock_tries_the_next_best_branch_after_an_invalid_one() {
+        let (cs, dir) = make_chain_state();
+        let base = build_and_connect_chain(&cs, 3);
+        let base_tip = base[2].block_hash();
+
+        let a1 = build_test_block(base_tip, 4, 1_600_000_004);
+        cs.accept_block(&a1).unwrap();
+        let a2 = build_test_block(a1.block_hash(), 5, 1_600_000_005);
+        cs.accept_block(&a2).unwrap();
+        cs.invalidate_block(a1.block_hash()).unwrap();
+        assert_eq!(cs.tip_hash(), base_tip);
+
+        // B: more work than A, with an invalid second block. Stored only.
+        let missing = bitcoin::OutPoint { txid: bitcoin::Txid::from_byte_array([7; 32]), vout: 0 };
+        let b1 = build_test_block(base_tip, 4, 1_600_000_014);
+        let b2 = build_test_block_spending(b1.block_hash(), 5, 1_600_000_015, missing);
+        let b3 = build_test_block(b2.block_hash(), 6, 1_600_000_016);
+        for b in [&b1, &b2, &b3] {
+            cs.accept_header(&b.header).unwrap();
+            cs.store_block(b).unwrap();
+        }
+        assert_eq!(cs.tip_hash(), base_tip);
+
+        cs.reconsider_block(a1.block_hash())
+            .expect("B fails at b2, and A is activated in its place");
+
+        assert_eq!(cs.tip_hash(), a2.block_hash(), "the node must end on the reconsidered branch");
+        for b in [&b2, &b3] {
+            assert_eq!(cs.get_block_index(&b.block_hash()).unwrap().status, BlockStatus::Invalid);
+        }
+        for b in [&a1, &a2] {
+            assert_eq!(cs.get_block_index(&b.block_hash()).unwrap().status, BlockStatus::Valid);
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1261: when every candidate above the invalidated block fails, the
+    /// activation tries each once and ends on the best valid chain, the
+    /// parent, with success. Each failed attempt marks a block invalid, so
+    /// the candidates strictly shrink and the loop cannot come back to one.
+    #[test]
+    fn invalidateblock_ends_on_the_parent_when_every_branch_fails() {
+        let (cs, dir) = make_chain_state();
+        let base = build_and_connect_chain(&cs, 3);
+        let base_tip = base[2].block_hash();
+
+        let a1 = build_test_block(base_tip, 4, 1_600_000_004);
+        cs.accept_block(&a1).unwrap();
+
+        // Three branches, each out-working the parent, each failing at its
+        // first block.
+        let missing = bitcoin::OutPoint { txid: bitcoin::Txid::from_byte_array([7; 32]), vout: 0 };
+        let mut branches: Vec<Vec<Block>> = Vec::new();
+        for (i, len) in [3u32, 2, 1].into_iter().enumerate() {
+            let t = 1_600_000_100 + 100 * i as u32;
+            let mut blocks = vec![build_test_block_spending(base_tip, 4, t, missing)];
+            for h in 5..4 + len {
+                let prev = blocks.last().unwrap().block_hash();
+                blocks.push(build_test_block(prev, h, t + h));
+            }
+            for b in &blocks {
+                cs.accept_header(&b.header).unwrap();
+                cs.store_block(b).unwrap();
+            }
+            branches.push(blocks);
+        }
+
+        cs.invalidate_block(a1.block_hash())
+            .expect("no branch is valid, and the parent is the best valid chain");
+
+        assert_eq!(cs.tip_hash(), base_tip);
+        assert_eq!(cs.tip_height(), 3);
+        for b in branches.iter().flatten() {
+            assert_eq!(
+                cs.get_block_index(&b.block_hash()).unwrap().status,
+                BlockStatus::Invalid,
+                "{} must be marked invalid",
+                b.block_hash()
+            );
+        }
+        // Nothing is left to try.
+        assert_eq!(cs.find_best_valid_tip().unwrap().header.block_hash(), base_tip);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -15490,12 +15715,13 @@ pub(crate) mod tests {
         assert_eq!(tip_stats["window_final_block_height"], 3);
 
         // Explicit historical blockhash (height 2): cumulative = 6, window
-        // of 2 sums heights 1..=2 = 2+3 = 5.
+        // of 1 is height 2 alone = 3. (Core refuses a window reaching the
+        // final block's height, so 2 is not a valid count here.)
         let hist =
-            crate::rpc::blockchain::get_chain_tx_stats(&cs, Some(2), Some(hashes[2])).unwrap();
+            crate::rpc::blockchain::get_chain_tx_stats(&cs, Some(1), Some(hashes[2])).unwrap();
         assert_eq!(hist["txcount"], 6);
-        assert_eq!(hist["window_block_count"], 2);
-        assert_eq!(hist["window_tx_count"], 5);
+        assert_eq!(hist["window_block_count"], 1);
+        assert_eq!(hist["window_tx_count"], 3);
         assert_eq!(hist["window_final_block_height"], 2);
 
         // An unknown block hash → error.
@@ -16363,6 +16589,82 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// #1270: a store holding another network's block index is refused, with
+    /// or without a tip (a tip-less one is what `-reindex-chainstate` leaves);
+    /// an empty store is a fresh datadir and passes. Core: `LoadChainstate`.
+    ///
+    /// Perturbation: make `check_genesis` return `Ok(())` and the first
+    /// wrong-network case passes.
+    #[test]
+    fn a_store_from_another_network_is_refused() {
+        use crate::storage::StoreBatch;
+
+        let regtest = bitcoin::constants::genesis_block(Network::Regtest);
+        let seeded = |with_tip: bool| {
+            let store = InMemoryStore::new();
+            let mut batch = StoreBatch::default();
+            batch.block_index_puts.push((
+                regtest.block_hash(),
+                BlockIndexEntry {
+                    header: regtest.header,
+                    height: 0,
+                    status: BlockStatus::Valid,
+                    num_tx: 1,
+                    file_number: 0,
+                    data_pos: 0,
+                    chainwork: [0u8; 32],
+                },
+            ));
+            batch.height_hash_puts.push((0, regtest.block_hash()));
+            if with_tip {
+                batch.tip = Some(regtest.block_hash());
+            }
+            store.write_batch(batch).unwrap();
+            store
+        };
+
+        for with_tip in [true, false] {
+            let store = seeded(with_tip);
+            assert!(check_genesis(&store, Network::Regtest).is_ok());
+            for network in [Network::Testnet4, Network::Signet, Network::Bitcoin] {
+                assert!(
+                    matches!(check_genesis(&store, network), Err(ChainError::WrongGenesis)),
+                    "{network:?}, tip {with_tip}"
+                );
+            }
+        }
+        assert!(check_genesis(&InMemoryStore::new(), Network::Testnet4).is_ok());
+
+        let dir = std::env::temp_dir().join(format!(
+            "satd-wrong-genesis-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        let blocks_dir = dir.join("blocks");
+        std::fs::create_dir_all(&blocks_dir).unwrap();
+        let result = ChainState::new(
+            Box::new(seeded(true)),
+            FlatFileManager::new(&blocks_dir).unwrap(),
+            Network::Testnet4,
+            Box::new(NoopVerifier),
+            AssumeValid::Disabled,
+            450,
+            4,
+            Default::default(),
+            Default::default(),
+            Default::default(),
+        );
+        let err = result.err().expect("a regtest store opened as testnet4 is refused");
+        assert_eq!(
+            err.to_string(),
+            "Incorrect or no genesis block found. Wrong datadir for network?"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Regression for the `-reindex-chainstate` + read-only blocks/
     /// scenario: `clear_chainstate` wipes the tip pointer but keeps
     /// `CF_BLOCK_INDEX` intact, so `ChainState::new` lands in the
@@ -17146,14 +17448,14 @@ pub(crate) mod tests {
 
         // The side block the polluted row names is now accepted: the index is
         // the fast path, and only a writer bug can put a side block in it.
-        let stats = crate::rpc::blockchain::get_chain_tx_stats(&cs, Some(1), Some(b1_hash))
+        let stats = crate::rpc::blockchain::get_chain_tx_stats(&cs, None, Some(b1_hash))
             .expect("the index row is trusted for a positive answer");
         assert_eq!(stats["window_final_block_hash"], b1_hash.to_string());
 
         // The half that still matters, and the one a correct caller depends on:
         // the genuinely-active A1 is accepted even though the height index no
         // longer points at it. Delete the fallback walk and this fails.
-        let ok = crate::rpc::blockchain::get_chain_tx_stats(&cs, Some(1), Some(a1_hash))
+        let ok = crate::rpc::blockchain::get_chain_tx_stats(&cs, None, Some(a1_hash))
             .expect("A1 is on the active chain");
         assert_eq!(ok["window_final_block_height"], 1);
 

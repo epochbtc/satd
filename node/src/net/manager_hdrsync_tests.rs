@@ -437,7 +437,11 @@ fn a_block_inv_brings_one_getheaders_per_block_before_sync() {
     pm.handle_inv(3, vec![Inventory::Block(block_b)]);
     assert_eq!(getheaders_sent(&mut rx3), 1, "a new block from a new peer is");
 
-    // The sync peer itself is asked on every new block (throttle aside).
+    // The sync peer itself is asked on every new block, once its initial
+    // `getheaders` is answered: until then that request covers the block.
+    pm.handle_inv(1, vec![Inventory::Block(block_b)]);
+    assert_eq!(getheaders_sent(&mut sync_rx), 0, "the initial request is outstanding");
+    pm.handle_headers(1, Vec::new());
     pm.handle_inv(1, vec![Inventory::Block(block_b)]);
     assert_eq!(getheaders_sent(&mut sync_rx), 1);
 }
@@ -455,4 +459,127 @@ fn the_catch_up_gap_runs_to_the_best_header() {
     assert_eq!(pm.chain_state.headers_tip_height(), 2100);
     assert_eq!(PeerManager::ibd_catchup_gap(&pm.chain_state, 2000), 2100);
     assert_eq!(PeerManager::ibd_catchup_gap(&pm.chain_state, 2500), 2500, "a target past the headers counts");
+}
+
+/// Peer `id` with header sync started and nothing outstanding: the initial
+/// `getheaders` has gone out and been answered with an empty `headers`.
+fn synced_peer(pm: &PeerManager, id: PeerId) -> mpsc::Receiver<NetworkMessage> {
+    let mut rx = add_peer(pm, id);
+    pm.start_header_syncs();
+    assert_eq!(getheaders_sent(&mut rx), 1, "header sync starts with the peer");
+    pm.handle_headers(id, Vec::new());
+    rx
+}
+
+/// A header whose parent the node has never seen: a BIP 130 announcement
+/// that does not connect.
+fn unconnecting_header() -> bitcoin::block::Header {
+    *header_chain(3, 1_700_000_000).last().unwrap()
+}
+
+/// Backdate the outstanding `getheaders` to `peer` by `secs`.
+fn age_getheaders(pm: &PeerManager, id: PeerId, secs: u64) {
+    let mut peers = pm.peers.write();
+    let sent = peers.get_mut(&id).unwrap().last_getheaders_sent.as_mut().expect("one is outstanding");
+    *sent = sent.checked_sub(Duration::from_secs(secs)).unwrap();
+}
+
+/// Core's `MaybeSendGetHeaders`: a peer that keeps sending headers that do
+/// not connect, or block `inv`s, draws one `getheaders` and then none
+/// while that one is outstanding and under `HEADERS_RESPONSE_TIME` (2
+/// minutes) old. A fixed 2 s interval let it draw one every 2 s (#1262).
+#[test]
+fn announcement_spam_draws_one_getheaders_per_response_time() {
+    let (pm, _dir) = mk_pm();
+    let mut rx = synced_peer(&pm, 1);
+    let header = unconnecting_header();
+
+    for i in 0..20u8 {
+        pm.handle_headers(1, vec![header]);
+        pm.handle_inv(1, vec![Inventory::Block(bitcoin::BlockHash::from_byte_array([i; 32]))]);
+    }
+    assert_eq!(getheaders_sent(&mut rx), 1, "one getheaders for the whole burst");
+
+    age_getheaders(&pm, 1, 3);
+    pm.handle_headers(1, vec![header]);
+    pm.handle_inv(1, vec![Inventory::Block(bitcoin::BlockHash::from_byte_array([0xee; 32]))]);
+    assert_eq!(getheaders_sent(&mut rx), 0, "3 s on, the request is still outstanding");
+
+    age_getheaders(&pm, 1, 118);
+    pm.handle_headers(1, vec![header]);
+    assert_eq!(getheaders_sent(&mut rx), 1, "past HEADERS_RESPONSE_TIME a new one goes out");
+    pm.handle_headers(1, vec![header]);
+    assert_eq!(getheaders_sent(&mut rx), 0, "and is outstanding in turn");
+}
+
+/// Headers that do not connect cannot be the answer to our `getheaders`,
+/// so they leave it outstanding (Core #36422's check in
+/// `p2p_sendheaders.py`).
+#[test]
+fn unconnecting_headers_do_not_answer_the_getheaders() {
+    let (pm, _dir) = mk_pm();
+    let mut rx = synced_peer(&pm, 1);
+    let header = unconnecting_header();
+
+    pm.handle_headers(1, vec![header]);
+    assert_eq!(getheaders_sent(&mut rx), 1);
+    let sent = pm.peers.read()[&1].last_getheaders_sent;
+    assert!(sent.is_some());
+    pm.handle_headers(1, vec![header]);
+    assert_eq!(pm.peers.read()[&1].last_getheaders_sent, sent, "the request stands");
+    assert_eq!(getheaders_sent(&mut rx), 0);
+}
+
+/// A `headers` reply that is empty, or whose first header connects to the
+/// block index, answers the outstanding `getheaders`: the next announcement
+/// is followed by a request at once.
+#[test]
+fn a_headers_reply_answers_the_getheaders() {
+    let (pm, _dir) = mk_pm();
+    let mut rx = synced_peer(&pm, 1);
+    let header = unconnecting_header();
+
+    pm.handle_headers(1, vec![header]);
+    assert_eq!(getheaders_sent(&mut rx), 1);
+    pm.handle_headers(1, Vec::new());
+    pm.handle_headers(1, vec![header]);
+    assert_eq!(getheaders_sent(&mut rx), 1, "an empty reply answers it");
+
+    pm.handle_headers(1, header_chain(5, 1_500_000_000));
+    assert_eq!(pm.chain_state.headers_tip_height(), 5, "the reply connects");
+    pm.handle_headers(1, vec![header]);
+    assert_eq!(getheaders_sent(&mut rx), 1, "connecting headers answer it");
+
+    pm.handle_headers(1, header_chain(5, 1_500_000_000));
+    pm.handle_inv(1, vec![Inventory::Block(bitcoin::BlockHash::from_byte_array([0x77; 32]))]);
+    assert_eq!(getheaders_sent(&mut rx), 1, "so do known headers that connect, before a block inv");
+}
+
+/// A full batch answers the request and asks for the next one, which is
+/// then the outstanding request: an announcement before its answer brings
+/// no second request chain.
+#[test]
+fn the_continuation_is_the_outstanding_getheaders() {
+    let (pm, _dir) = mk_pm();
+    let mut rx = synced_peer(&pm, 1);
+    pm.handle_headers(1, header_chain(2000, 1_500_000_000));
+    assert_eq!(getheaders_sent(&mut rx), 1, "the continuation");
+    pm.handle_headers(1, vec![unconnecting_header()]);
+    pm.handle_inv(1, vec![Inventory::Block(bitcoin::BlockHash::from_byte_array([0x55; 32]))]);
+    assert_eq!(getheaders_sent(&mut rx), 0, "the continuation's answer covers the announcements");
+}
+
+/// Starting header sync records its `getheaders` as outstanding, on both
+/// paths that send it (the connection's own opening request and the sync
+/// loop's): an announcement that arrives before the answer brings no second
+/// request.
+#[test]
+fn the_opening_getheaders_is_outstanding() {
+    let (pm, _dir) = mk_pm();
+    let mut rx = add_peer(&pm, 1);
+    assert!(pm.start_header_sync(1), "the peer takes the sync slot");
+    assert!(pm.peers.read()[&1].last_getheaders_sent.is_some());
+    pm.handle_headers(1, vec![unconnecting_header()]);
+    pm.handle_inv(1, vec![Inventory::Block(bitcoin::BlockHash::from_byte_array([0x33; 32]))]);
+    assert_eq!(getheaders_sent(&mut rx), 0, "the opening request covers the announcements");
 }

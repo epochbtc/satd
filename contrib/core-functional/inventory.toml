@@ -312,6 +312,7 @@ note = "measured 2026-09-15: L12 RemoteDisconnected: stop closes the RPC listene
 [[test]]
 file = "feature_signet.py"
 status = "run"
+note = "runs with a temporary shim bridge while PIN is v32.1: the shim links signet/.cookie to signet_<message start>/.cookie for a custom signet (satd #1271, Core #34566); remove it on the move to v33 (README, Bumping the pin, step 6)"
 
 [[test]]
 file = "feature_startupnotify.py"
@@ -832,7 +833,7 @@ note = "measured 2026-09-16 with message ordering behind ping in place: past L32
 file = "p2p_sendheaders.py"
 status = "skip"
 reason = "feature-missing"
-note = "re-measured 2026-09-28: L252, a getheaders with a null locator whose hashStop satd holds only as a header is answered with headers 1..tip; Core answers nothing for a block it may not serve (BlockRequestAllowed). Measured 2026-09-15 at L334, an unexpected getheaders after a block inv; behind both: inv->getheaders-not-getdata and per-peer announcement state. Follow-up: Core's header announcement state machine"
+note = "re-measured 2026-11-16 with the getheaders wait-for-response rule (#1262): still L258 (test_null_locators), a getheaders with a null locator whose hashStop satd holds only as a header is answered; with that subtest skipped, the next stop is L361, where the block the inv node relayed is announced back to it (inv/headers in its last_message). The getheaders pacing parts of Part 5 are not reached. Earlier: re-measured 2026-09-28: L252, a getheaders with a null locator whose hashStop satd holds only as a header is answered with headers 1..tip; Core answers nothing for a block it may not serve (BlockRequestAllowed). Measured 2026-09-15 at L334, an unexpected getheaders after a block inv; behind both: inv->getheaders-not-getdata and per-peer announcement state. Follow-up: Core's header announcement state machine"
 
 [[test]]
 file = "p2p_sendtxrcncl.py"
@@ -898,9 +899,7 @@ note = "measured 2026-09-15: L100 createmultisig is Method not found. Follow-up:
 
 [[test]]
 file = "rpc_decodescript.py"
-status = "skip"
-reason = "rpc-missing"
-note = "measured 2026-09-15: L36 asm renders 'OP_PUSHBYTES_72 <hex>' where Core's ScriptToAsmStr renders the bare push. Behind it: the segwit sub-object and miniscript descriptors. Follow-up: Core's asm rendering"
+status = "run"
 
 [[test]]
 file = "rpc_deprecated.py"

@@ -96,6 +96,32 @@ pub fn read_xor_key(blocks_dir: &Path) -> std::io::Result<[u8; 8]> {
     }
 }
 
+/// Read one block record's payload without opening a manager, so nothing in
+/// `blocks_dir` is created or written: for the startup check that looks at
+/// another signet's blocks before choosing a datadir (#1271).
+pub fn read_record_read_only(blocks_dir: &Path, pos: &FlatFilePos) -> std::io::Result<Vec<u8>> {
+    let key = read_xor_key(blocks_dir)?;
+    let mut file = File::open(blocks_dir.join(format!("blk{:05}.dat", pos.file_number)))?;
+    file.seek(SeekFrom::Start(pos.data_pos as u64))?;
+    let mut header = [0u8; 8];
+    file.read_exact(&mut header)?;
+    xor_in_place(&mut header, &key, pos.data_pos as u64);
+    let size = u32::from_le_bytes([header[4], header[5], header[6], header[7]]) as u64;
+    if size + 8 > MAX_FILE_SIZE {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "block record at blk{:05}.dat:{} claims {size} bytes",
+                pos.file_number, pos.data_pos
+            ),
+        ));
+    }
+    let mut data = vec![0u8; size as usize];
+    file.read_exact(&mut data)?;
+    xor_in_place(&mut data, &key, pos.data_pos as u64 + 8);
+    Ok(data)
+}
+
 /// Load the obfuscation key per `mode`, creating `xor.dat` if missing.
 /// Mirrors Bitcoin Core's `InitBlocksdirXorKey`: a dir is "first-run" when
 /// it contains only hidden (dot-prefixed) entries — a `.lock` file may

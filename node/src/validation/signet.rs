@@ -80,6 +80,26 @@ pub fn signet_magic(challenge: &[u8]) -> Magic {
     Magic::from_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
 }
 
+/// The data directory name of a signet, Bitcoin Core's `GetSignetDataDir`
+/// (`src/chainparamsbase.cpp`, bitcoin/bitcoin#34566): `signet` for the
+/// default signet, whether its challenge is left out or given explicitly,
+/// and `signet_<message start in lowercase hex>` for any other challenge,
+/// the empty one included. (Core also keeps `signet` for a challenge that is
+/// not hex; satd refuses that one at config load, before a directory is
+/// chosen.)
+pub fn signet_data_dir(challenge: Option<&[u8]>) -> String {
+    match challenge {
+        Some(ch) if ch != DEFAULT_SIGNET_CHALLENGE.as_slice() => {
+            let magic = signet_magic(ch).to_bytes();
+            format!(
+                "signet_{:02x}{:02x}{:02x}{:02x}",
+                magic[0], magic[1], magic[2], magic[3]
+            )
+        }
+        _ => "signet".to_string(),
+    }
+}
+
 /// Locate the witness-commitment output (last coinbase output whose
 /// script starts with the BIP 141 header). Returns its index.
 fn witness_commitment_index(coinbase: &Transaction) -> Option<usize> {
@@ -406,6 +426,25 @@ mod tests {
         let derived: Vec<u8> = signet_magic(&DEFAULT_SIGNET_CHALLENGE).to_bytes().to_vec();
         let crate_magic: Vec<u8> = Magic::from(Network::Signet).to_bytes().to_vec();
         assert_eq!(derived, crate_magic, "derived signet magic must match bitcoin crate");
+    }
+
+    /// Parity with Core's `GetSignetDataDir`. The expected names were
+    /// computed with the `message_start` helper of Core's
+    /// `test/functional/test_framework/signet.py` (bitcoin/bitcoin#34566).
+    #[test]
+    fn signet_data_dir_matches_core() {
+        assert_eq!(signet_data_dir(None), "signet");
+        assert_eq!(signet_data_dir(Some(&DEFAULT_SIGNET_CHALLENGE)), "signet");
+        assert_eq!(signet_data_dir(Some(&[0x51])), "signet_54d26fbd");
+        assert_eq!(signet_data_dir(Some(&[])), "signet_1406e058");
+        let mut multisig = vec![0x51, 0x21, 0x02];
+        multisig.extend([0x11; 32]);
+        multisig.extend([0x51, 0xae]);
+        assert_eq!(signet_data_dir(Some(&multisig)), "signet_93abaa9b");
+        // A challenge past 252 bytes takes a 3-byte compact-size prefix.
+        assert_eq!(signet_data_dir(Some(&[0x6a; 300])), "signet_a9503e92");
+        // Past 65,535 bytes: a 5-byte compact-size prefix.
+        assert_eq!(signet_data_dir(Some(&[0x6a; 70_000])), "signet_3c08542a");
     }
 
     use bitcoin::blockdata::opcodes::all::OP_PUSHNUM_1;
