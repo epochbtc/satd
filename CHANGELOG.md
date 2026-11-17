@@ -22,6 +22,7 @@ It includes every fix shipped in 0.7.1:
 - Consensus: the Rust script engine reports a tapscript push that runs past the end of the script as `BAD_OPCODE` ("Opcode missing or not understood"), as Core does; it gave the error of whatever execution reached first. Verdicts are unchanged.
 - Dependencies: `rmcp` 3.9.0 (RUSTSEC-2026-0457, -0462; client features satd does not build); MCP requests are capped at 4 MiB.
 - RPC: any request `Content-Type` is read as JSON, as in Core (#824).
+- RPC: `invalidateblock`, `reconsiderblock` and `preciousblock` go on to the next-best chain when the best one holds an invalid block, as in Core; they stopped on the first and returned an error (#1261).
 - RPC: `getrawtransaction`'s not-found message matches the node's `-txindex` state (#1066).
 - RPC: `testmempoolaccept` forgives a standardness failure an `allow` policy rule forgives, as `sendrawtransaction` does (#999).
 - RPC: an open JSON-RPC WebSocket stops working when its bearer token is revoked or expires; its frames are answered `-32006` (#821).
@@ -30,6 +31,7 @@ It includes every fix shipped in 0.7.1:
 - RPC: `warnings` in `getblockchaininfo`, `getnetworkinfo` and `getmininginfo` is always an array, `[]` when empty, as in Core v28; `-deprecatedrpc=warnings` brings back the string form (#956).
 - Chain: the node leaves initial block download only once its tip has the network's minimum chain work as well as a recent timestamp, and does not re-enter it when the tip goes stale, as in Core (#1071).
 - Mempool: a transaction version below 1 or above 3 is non-standard, reason `version`, as in Core (#1070).
+- Mining: block templates keep a `prioritisetransaction` delta below a transaction's fee as a negative modified fee, as in Core; a child that does not cover its parent's delta no longer pulls both in, and a package with a negative modified fee is left out even at `-blockmintxfee=0` (#1274).
 - P2P: the node's own disconnects are no longer logged as `reason="rpc_request"` (#1152).
 - P2P: onion peers are logged by their `.onion` address, not `0.0.0.0` (#1165).
 - P2P: during initial sync, blocks are downloaded no more than `-maxahead` above the tip, so a pruned node prunes during IBD instead of filling its disk (#1154).
@@ -95,6 +97,8 @@ It includes every fix shipped in 0.7.1:
 - Tor: the onion address and private key `ADD_ONION` returns, and the saved key, are checked as Core checks them before they are used, and a control-port line over 100,000 bytes is refused. Also in 0.7.2.
 - Electrum: JSON-RPC notifications (requests with no `id`) are no longer run only to drop their reply. Also in 0.7.2.
 - RPC: `addnode` refuses an empty node with Core's `-8` error; `addnode "" add` kept it and retried it forever. Also in 0.7.2.
+- RPC: every `asm` field is Core's `ScriptToAsmStr`: bare hex pushes, small numbers as numbers, Core's opcode names, and a scriptSig signature's sighash type decoded (`[ALL]`); it was rust-bitcoin's format (`OP_PUSHBYTES_20`, `OP_0`, `OP_CSV`). Electrum's verbose `blockchain.transaction.get` too (#1265).
+- RPC: every scriptPubKey object (`decoderawtransaction`, `getrawtransaction`, `getblock` 2/3, Electrum's verbose transaction) carries Core's inferred `desc`; `decodescript` adds `desc`, `address` and the `segwit` object, as in Core (#1266).
 
 ## Releases
 
