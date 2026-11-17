@@ -1025,5 +1025,20 @@ mod tests {
         for net in [Network::Regtest, Network::Signet] {
             assert_eq!(taproot_deployment(net).start_time, ALWAYS_ACTIVE, "{net}");
         }
+
+        // Every field, on every network, so no network can borrow another's
+        // row: testnet3 ran a real signalling window, and regtest's period is
+        // its own 144.
+        let field = |d: Bip9Deployment| {
+            (d.bit, d.start_time, d.timeout, d.min_activation_height, d.threshold, d.period)
+        };
+        for (net, want) in [
+            (Network::Testnet, (2, 1_619_222_400, 1_628_640_000, 0, 1512, 2016)),
+            (Network::Testnet4, (2, ALWAYS_ACTIVE, NO_TIMEOUT, 0, 1512, 2016)),
+            (Network::Signet, (2, ALWAYS_ACTIVE, NO_TIMEOUT, 0, 1815, 2016)),
+            (Network::Regtest, (2, ALWAYS_ACTIVE, NO_TIMEOUT, 0, 108, 144)),
+        ] {
+            assert_eq!(field(taproot_deployment(net)), want, "{net}");
+        }
     }
 }
