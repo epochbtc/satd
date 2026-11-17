@@ -1767,8 +1767,9 @@ pub async fn start(
                 } else {
                     let tx_bytes = hex::decode(hex)
                         .map_err(|_| ErrorObjectOwned::owned(-22, format!("Transaction decode failed for {hex}"), None::<()>))?;
-                    let tx: bitcoin::Transaction = bitcoin::consensus::deserialize(&tx_bytes)
-                        .map_err(|_| ErrorObjectOwned::owned(-22, format!("Transaction decode failed for {hex}"), None::<()>))?;
+                    // Core's `DecodeHexTx` (`generateblock`, src/rpc/mining.cpp).
+                    let tx: bitcoin::Transaction = rawtx::decode_tx(&tx_bytes, true, true)
+                        .ok_or_else(|| ErrorObjectOwned::owned(-22, format!("Transaction decode failed for {hex}"), None::<()>))?;
                     txs.push(tx);
                 }
             }

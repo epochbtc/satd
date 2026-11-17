@@ -365,6 +365,14 @@ fn a_transaction_with_no_inputs_is_refused_as_core_refuses_it() {
     assert_eq!(decoded["txid"], json!("4ebd325a4b394cff8c57e8317ccf5a8d0e2bdf1b8526f8aad6c8e43d8240621a"));
     assert_eq!(decoded["vin"], json!([]));
 
+    // `generateblock` takes it into the block, which fails `CheckBlock`.
+    // Core: -25 "TestBlockValidity failed: bad-txns-vin-empty, Transaction
+    // check failed (tx hash ...)".
+    let output = node.rpc_ok("getdescriptorinfo", vec![json!("raw(51)")])["descriptor"].clone();
+    let (code, message) = refused(&node, "generateblock", vec![output, json!([EMPTY])]);
+    assert_eq!(code, -25, "{message}");
+    assert!(message.starts_with("TestBlockValidity failed: bad-txns-vin-empty"), "{message}");
+
     // A witness flag with no inputs: Core refuses the bytes.
     assert_eq!(
         refused(&node, "sendrawtransaction", vec![json!("020000000001000000000000")]).0,

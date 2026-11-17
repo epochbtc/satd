@@ -1166,14 +1166,15 @@ pub fn combine_raw_transaction(hex_txs: &[String]) -> Result<Value, (i32, String
 
     // Deserialize the first tx as the base
     let first_bytes = hex::decode(&hex_txs[0]).map_err(|_| (-22, "TX decode failed".to_string()))?;
-    let mut combined: Transaction = bitcoin::consensus::deserialize(&first_bytes)
-        .map_err(|_| (-22, "TX decode failed".to_string()))?;
+    // Core reads each with `DecodeHexTx` (src/rpc/rawtransaction.cpp).
+    let mut combined: Transaction = decode_tx(&first_bytes, true, true)
+        .ok_or((-22, "TX decode failed".to_string()))?;
 
     // Merge scriptSig and witness from subsequent txs
     for hex_tx in &hex_txs[1..] {
         let tx_bytes = hex::decode(hex_tx).map_err(|_| (-22, "TX decode failed".to_string()))?;
-        let tx: Transaction = bitcoin::consensus::deserialize(&tx_bytes)
-            .map_err(|_| (-22, "TX decode failed".to_string()))?;
+        let tx: Transaction = decode_tx(&tx_bytes, true, true)
+            .ok_or((-22, "TX decode failed".to_string()))?;
 
         if tx.input.len() != combined.input.len() {
             return Err((-22, "Transaction input count mismatch".to_string()));
@@ -1360,8 +1361,9 @@ pub fn sign_raw_transaction_with_key(
     sighash_type: Option<&str>,
 ) -> Result<Value, (i32, String)> {
     let tx_bytes = hex::decode(hex_tx).map_err(|_| (-22, "TX decode failed".to_string()))?;
-    let mut tx: Transaction = bitcoin::consensus::deserialize(&tx_bytes)
-        .map_err(|_| (-22, "TX decode failed".to_string()))?;
+    // Core's `DecodeHexTx` (src/rpc/rawtransaction.cpp).
+    let mut tx: Transaction = decode_tx(&tx_bytes, true, true)
+        .ok_or((-22, "TX decode failed".to_string()))?;
 
     let secp = Secp256k1::new();
     let ecdsa_sighash_type = parse_sighash_type(sighash_type)?;
@@ -2301,6 +2303,19 @@ mod tests {
                 ),
             }],
         }
+    }
+
+    /// `combinerawtransaction` and `signrawtransactionwithkey` read their hex
+    /// with Core's `DecodeHexTx`, which takes `version | 00 00 | lock_time`
+    /// as a transaction with no inputs (#1242); rust-bitcoin refuses it.
+    #[test]
+    fn hex_rpcs_read_a_transaction_with_no_inputs_as_core_does() {
+        const EMPTY: &str = "02000000000000000000";
+        let combined = combine_raw_transaction(&[EMPTY.to_string(), EMPTY.to_string()]);
+        assert!(combined.is_ok(), "{combined:?}");
+        let (cs, _dir) = make_chain_state();
+        let signed = sign_raw_transaction_with_key(&cs, EMPTY, &[], None, None);
+        assert!(signed.is_ok(), "{signed:?}");
     }
 
     #[test]
