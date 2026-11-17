@@ -30,9 +30,10 @@ use crate::error::JsonRpcError;
 use crate::extras::StoredTx;
 use crate::merkle::compute_merkle_branch;
 use crate::state::ElectrumState;
+use crate::version::ProtocolVersion;
 use crate::status::{compute_status_hash, mempool_facts, status_hash_to_json};
 use crate::types::{
-    BalanceResponse, FeeHistogramEntry, GetMerkleResponse, HeadersResponse,
+    BalanceResponse, FeeHistogramEntry, GetMerkleResponse, HeadersListResponse, HeadersResponse,
     HistoryEntry as WireHistoryEntry, ListUnspentEntry, ScripthashHex, TxidHex, merkle_node_to_hex, parse_wire_scripthash,
 };
 
@@ -87,7 +88,15 @@ pub fn block_header(state: &ElectrumState, params: Value) -> Result<Value, JsonR
     Ok(Value::String(hex::encode(serialize(&header))))
 }
 
-pub fn block_headers(state: &ElectrumState, params: Value) -> Result<Value, JsonRpcError> {
+/// `blockchain.block.headers(start_height, count[, cp_height])`. From
+/// protocol 1.6 the headers are a list (`headers`), before it one
+/// concatenated string (`hex`). A nonzero `cp_height` is refused at every
+/// version: satd does not build checkpoint proofs.
+pub fn block_headers(
+    state: &ElectrumState,
+    params: Value,
+    version: &ProtocolVersion,
+) -> Result<Value, JsonRpcError> {
     // `(start_height, count, [cp_height])` — same `cp_height`
     // semantics as `block_header`. Reject nonzero values until
     // checkpoint proofs are implemented (M3, review round 1).
@@ -103,24 +112,23 @@ pub fn block_headers(state: &ElectrumState, params: Value) -> Result<Value, Json
     let max = state.config.max_headers_per_request;
     let want = count_req.min(max);
 
-    // Build the concatenated raw-header hex up to the tip, returning
-    // however many we actually got (`count` may be < requested if
-    // start runs past tip).
-    let mut hex_buf = String::new();
-    let mut got = 0u32;
+    // Every header up to the tip, as hex: `count` may be < requested if
+    // start runs past tip.
+    let mut headers: Vec<String> = Vec::new();
     for h in start..start.saturating_add(want) {
         match state.electrum_extras.header_at(h) {
-            Some(header) => {
-                hex_buf.push_str(&hex::encode(serialize(&header)));
-                got += 1;
-            }
+            Some(header) => headers.push(hex::encode(serialize(&header))),
             None => break,
         }
     }
+    let count = headers.len() as u32;
 
+    if *version >= ProtocolVersion::new(&[1, 6]) {
+        return Ok(serde_json::to_value(HeadersListResponse { count, headers, max }).unwrap());
+    }
     let resp = HeadersResponse {
-        count: got,
-        hex: hex_buf,
+        count,
+        hex: headers.concat(),
         max,
     };
     Ok(serde_json::to_value(&resp).unwrap())
@@ -1045,19 +1053,21 @@ pub fn transaction_broadcast(state: &ElectrumState, params: Value) -> Result<Val
     Ok(Value::String(txid.to_string()))
 }
 
-/// `blockchain.transaction.broadcast_package(txs[, verbose])` — accept
-/// an array of hex-encoded transactions and submit each to the local
-/// mempool. The return shape mirrors `romanz/electrs`'s non-verbose
-/// path: `{"success": <bool>}` when every tx accepted, plus an
-/// `"errors": [{"txid": ..., "error": ...}, ...]` array for any
-/// rejections. `success` is true only when no rejections occurred.
+/// `blockchain.transaction.broadcast_package(raw_txs[, verbose])` — Core's
+/// `submitpackage` (spesmilo/electrum-protocol `b3db795b`,
+/// `protocol-methods.rst`): a child and its parents, sorted, the child last,
+/// accepted as one package so a parent below the minimum feerate is carried
+/// by its child (CPFP). Served at every version (satd served it at 1.4
+/// before the spec added it at 1.6).
 ///
-/// `verbose=true` is accepted but treated as identical to `false` —
-/// electrs forwards bitcoind's full `submitpackage` JSON in verbose
-/// mode; satd doesn't have a package-level submission API yet (the
-/// Mempool admits per-tx). Documenting this divergence as a known
-/// v1 limitation; clients that pass `verbose=true` get the same
-/// summary shape and can cross-check against per-tx broadcast.
+/// - `verbose=false`: `{"success": bool}`, plus `"errors": [{"txid",
+///   "error"}]` for each member the mempool refused. `success` is whether
+///   `package_msg` is `success`, as in ElectrumX.
+/// - `verbose=true`: the `submitpackage` answer itself.
+///
+/// A package that is not one child with its direct parents is a JSON-RPC
+/// error, as `submitpackage` makes it, worded as ElectrumX words a daemon
+/// error. Every newly accepted member is announced to peers.
 pub fn transaction_broadcast_package(
     state: &ElectrumState,
     params: Value,
@@ -1066,7 +1076,7 @@ pub fn transaction_broadcast_package(
     let txs_array = arr[0].as_array().ok_or_else(|| {
         JsonRpcError::invalid_params("first arg must be an array of tx hex strings")
     })?;
-    let _verbose = arr.get(1).and_then(|v| v.as_bool()).unwrap_or(false);
+    let verbose = arr.get(1).and_then(|v| v.as_bool()).unwrap_or(false);
 
     let max_pkg = state.config.max_broadcast_package_txs;
     if txs_array.len() > max_pkg {
@@ -1075,10 +1085,17 @@ pub fn transaction_broadcast_package(
             txs_array.len()
         )));
     }
+    // Core's bound on `submitpackage`'s array, checked before decoding.
+    let max_count = node::mempool::pool::MAX_PACKAGE_COUNT;
+    if txs_array.is_empty() || txs_array.len() > max_count {
+        return Err(package_rejected(&format!(
+            "Array must contain between 1 and {max_count} transactions."
+        )));
+    }
 
-    // Decode every tx up front so a single bad hex doesn't leave us
-    // with a half-broadcast package. Decode failures are JSON-RPC
-    // -32602 (invalid params) — same as `transaction_broadcast`.
+    // Decode every tx up front so a single bad hex rejects the call before
+    // anything is submitted. Decode failures are JSON-RPC -32602 (invalid
+    // params) — same as `transaction_broadcast`.
     let mut decoded = Vec::with_capacity(txs_array.len());
     for v in txs_array {
         let s = v
@@ -1091,50 +1108,55 @@ pub fn transaction_broadcast_package(
         decoded.push(tx);
     }
 
-    // Accept + announce each tx so accepted ones propagate; a bare
-    // mempool accept would leave them sitting on this node. Submit in
-    // passes until a fixpoint so the package may arrive in any order: a
-    // child listed before its parent fails its first pass on missing
-    // inputs, then succeeds once the parent is admitted. (Core's
-    // `submitpackage` rejects unsorted packages with `package-not-sorted`;
-    // accepting any order is strictly more permissive.) Only the final
-    // no-progress pass's failures are reported.
-    let mut errors: Vec<Value> = Vec::new();
-    let mut pending: Vec<usize> = (0..decoded.len()).collect();
-    loop {
-        let mut next_pending: Vec<usize> = Vec::new();
-        let mut pass_errors: Vec<(usize, String)> = Vec::new();
-        for &i in &pending {
-            if let Err(e) = state
-                .tx_broadcaster
-                .submit_and_announce(decoded[i].clone(), node::mempool::pool::TxSource::Electrum, false)
-            {
-                next_pending.push(i);
-                pass_errors.push((i, e.to_string()));
-            }
-        }
-        if next_pending.len() == pending.len() {
-            // No progress this pass — the remaining failures are final.
-            for (i, err) in pass_errors {
-                errors.push(json!({
-                    "txid": decoded[i].compute_txid().to_string(),
-                    "error": err,
-                }));
-            }
-            break;
-        }
-        if next_pending.is_empty() {
-            break;
-        }
-        pending = next_pending;
+    // Core's `submitpackage` (`src/rpc/mempool.cpp`): one child and its
+    // direct parents, no parent spending another.
+    if decoded.len() > 1 && !node::mempool::pool::is_child_with_parents_tree(&decoded) {
+        return Err(package_rejected(
+            "package topology disallowed. not child-with-parents or parents depend on each other.",
+        ));
     }
 
-    let success = errors.is_empty();
-    Ok(if errors.is_empty() {
-        json!({ "success": success })
-    } else {
-        json!({ "success": success, "errors": errors })
-    })
+    // `submitpackage`'s default `maxfeerate`, 0.10 BTC/kvB: ElectrumX
+    // passes none. A member that would be relay-quarantined is refused, as
+    // `transaction.broadcast` refuses it.
+    let result = state.mempool.accept_package_from(
+        decoded,
+        &state.chain,
+        state.chain.script_verifier(),
+        Some(SUBMITPACKAGE_DEFAULT_MAXFEERATE_SAT_PER_KVB),
+        node::mempool::pool::TxSource::Electrum,
+    );
+    for txid in result.newly_accepted() {
+        state.tx_broadcaster.announce(txid);
+    }
+
+    if verbose {
+        return Ok(result.submitpackage_json());
+    }
+    let errors: Vec<Value> = result
+        .tx_results
+        .values()
+        .filter_map(|entry| {
+            let error = entry.get("error")?;
+            Some(json!({"txid": entry.get("txid"), "error": error}))
+        })
+        .collect();
+    let mut answer = json!({"success": result.package_msg == "success"});
+    if !errors.is_empty() {
+        answer["errors"] = Value::Array(errors);
+    }
+    Ok(answer)
+}
+
+/// `submitpackage`'s default `maxfeerate`, 0.10 BTC/kvB, in sat/kvB.
+const SUBMITPACKAGE_DEFAULT_MAXFEERATE_SAT_PER_KVB: u64 = 10_000_000;
+
+/// A package refused before any member is tried, worded as ElectrumX words
+/// a `submitpackage` error (`session.py`, `phandle_package_broadcast`).
+fn package_rejected(message: &str) -> JsonRpcError {
+    JsonRpcError::bad_request(format!(
+        "the tx package was rejected by network rules.\n\n{message}"
+    ))
 }
 
 pub fn transaction_id_from_pos(
@@ -1178,25 +1200,51 @@ pub fn transaction_id_from_pos(
 
 // ── fees ──────────────────────────────────────────────────────────
 
+/// `blockchain.estimatefee(number[, mode])`. `mode` (protocol 1.6, served
+/// at every version as ElectrumX does) is Core's `estimate_mode`:
+/// `ECONOMICAL` or `CONSERVATIVE`, case-insensitive; see
+/// [`estimatefee_conservative`].
 pub fn estimatefee(state: &ElectrumState, params: Value) -> Result<Value, JsonRpcError> {
-    let arr = require_array(&params, 1, "blockchain.estimatefee")?;
+    let arr = require_array_range(&params, 1, 2, "blockchain.estimatefee")?;
     let target = parse_u32(&arr[0], "num_blocks")?;
+    let conservative = estimatefee_conservative(arr.get(1))?;
     // Unified through the shared `smart_fees` resolver (blend mode) so
-    // Electrum agrees with the JSON-RPC `estimatefees`, the TUI and Esplora.
-    // Unauthenticated surface, so the expensive mempool simulation comes from
-    // the shared short-TTL cache instead of being rebuilt per request.
+    // Electrum agrees with the JSON-RPC `estimatesmartfee`, the TUI and
+    // Esplora. Core's two modes are blend with and without `conservative`,
+    // as `estimatesmartfee` passes them. Unauthenticated surface, so the
+    // expensive mempool simulation comes from the shared short-TTL cache
+    // instead of being rebuilt per request.
     let floor_sat_per_kvb = state.mempool.fee_estimate_floor();
     let est = state.fee_estimator.cached_mempool_estimate(&state.mempool);
     let sf = node::mempool::estimate::smart_fees_from_estimate(
         &est,
         &state.fee_estimator,
-        node::mempool::estimate::near_rate(&state.mempool, &state.fee_estimator, false),
+        node::mempool::estimate::near_rate(&state.mempool, &state.fee_estimator, conservative),
         &[target],
         node::mempool::estimate::EstimateMode::Blend,
-        false,
+        conservative,
         floor_sat_per_kvb,
     );
     Ok(json!(estimatefee_answer(&sf)))
+}
+
+/// Whether `blockchain.estimatefee`'s `mode` asks for Core's conservative
+/// estimate. ElectrumX's rule (spesmilo/electrumx 2.0.1, `session.py`,
+/// `phandle_estimatefee`): a string is upper-cased and must be `ECONOMICAL`
+/// or `CONSERVATIVE`; anything that is not a string is no mode, the
+/// default, which is economical. Any other string is refused with
+/// ElectrumX's message.
+pub(crate) fn estimatefee_conservative(mode: Option<&Value>) -> Result<bool, JsonRpcError> {
+    let Some(Value::String(mode)) = mode else {
+        return Ok(false);
+    };
+    match mode.to_uppercase().as_str() {
+        "ECONOMICAL" => Ok(false),
+        "CONSERVATIVE" => Ok(true),
+        other => Err(JsonRpcError::bad_request(format!(
+            "unknown estimatefee mode: {other}"
+        ))),
+    }
 }
 
 /// `blockchain.estimatefee`'s answer in BTC/kB for the one target in `sf`,

@@ -599,32 +599,6 @@ fn parse_fee_rate_arg(
     Ok(rate)
 }
 
-/// Core's `IsChildWithParentsTree` (`src/policy/packages.cpp`): the package is
-/// one child and its direct parents, and no parent spends another parent.
-///
-/// The package is expected to be sorted, so the child is last.
-fn is_child_with_parents_tree(txs: &[bitcoin::Transaction]) -> bool {
-    if txs.len() < 2 {
-        return false;
-    }
-    let (parents, child) = txs.split_at(txs.len() - 1);
-    let child = &child[0];
-    let child_inputs: std::collections::HashSet<bitcoin::Txid> =
-        child.input.iter().map(|i| i.previous_output.txid).collect();
-    // Every other member must be a parent of the child…
-    let parent_txids: std::collections::HashSet<bitcoin::Txid> =
-        parents.iter().map(|t| t.compute_txid()).collect();
-    if !parent_txids.iter().all(|t| child_inputs.contains(t)) {
-        return false;
-    }
-    // …and no parent may spend another.
-    parents.iter().all(|p| {
-        !p.input
-            .iter()
-            .any(|i| parent_txids.contains(&i.previous_output.txid))
-    })
-}
-
 fn net_datadir_from(ctx: &RpcContext) -> Option<std::path::PathBuf> {
     let base = ctx
         .effective_config
@@ -2458,7 +2432,7 @@ pub async fn start(
         // direct parents, and no parent may spend another. Without this a
         // package of unrelated transactions was accepted and judged
         // member by member, which is not what package acceptance means.
-        if txs.len() > 1 && !is_child_with_parents_tree(&txs) {
+        if txs.len() > 1 && !crate::mempool::pool::is_child_with_parents_tree(&txs) {
             return Err(ErrorObjectOwned::owned(
                 -25,
                 "package topology disallowed. not child-with-parents or parents \
@@ -2475,27 +2449,11 @@ pub async fn start(
         );
 
         // Announce any newly-accepted transactions to peers.
-        for (_wtxid, entry) in &result.tx_results {
-            if entry.get("error").is_none()
-                && entry.get("other-wtxid").is_none()
-                && let Some(txid_str) = entry.get("txid").and_then(|v| v.as_str())
-                && let Ok(txid) = txid_str.parse::<bitcoin::Txid>()
-            {
-                ctx.peer_manager.announce_tx(txid);
-            }
+        for txid in result.newly_accepted() {
+            ctx.peer_manager.announce_tx(txid);
         }
 
-        Ok::<_, ErrorObjectOwned>(serde_json::json!({
-            "package_msg": result.package_msg,
-            "tx-results": result.tx_results,
-            // Core emits this unconditionally, empty when nothing was
-            // replaced; a client that reads it had to guess.
-            "replaced-transactions": result
-                .replaced
-                .iter()
-                .map(|t| t.to_string())
-                .collect::<Vec<_>>(),
-        }))
+        Ok::<_, ErrorObjectOwned>(result.submitpackage_json())
     })?;
 
     // --- PSBT RPCs ---

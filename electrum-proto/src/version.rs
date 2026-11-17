@@ -70,7 +70,7 @@ impl fmt::Display for ProtocolVersion {
 pub const PROTOCOL_MIN: &str = "1.4";
 
 /// The highest protocol version satd speaks, as `server.features` reports it.
-pub const PROTOCOL_MAX: &str = "1.4";
+pub const PROTOCOL_MAX: &str = "1.6";
 
 /// The version a `1.4.2-asof` session speaks: rbitcoin's dialect is 1.4.2
 /// with stamps and `asof:`, and a client that asks for it gets it whatever
@@ -193,6 +193,12 @@ const fn served(method: &'static str, since: &'static [u32]) -> MethodVersions {
 }
 
 const V1_4: &[u32] = &[1, 4];
+const V1_6: &[u32] = &[1, 6];
+
+/// A method removed at `until`.
+const fn removed(method: &'static str, since: &'static [u32], until: &'static [u32]) -> MethodVersions {
+    MethodVersions { method, since, until: Some(until) }
+}
 
 /// Every method satd serves, with the versions it is served at. A method not
 /// listed here, or listed but outside the connection's version, is "method not
@@ -228,8 +234,10 @@ const METHODS: &[MethodVersions] = &[
     served("blockchain.transaction.broadcast", V1_4),
     served("blockchain.transaction.broadcast_package", V1_4),
     served("blockchain.estimatefee", V1_4),
-    served("blockchain.relayfee", V1_4),
+    // Removed in 1.6; `mempool.get_info`'s `minrelaytxfee` replaces it.
+    removed("blockchain.relayfee", V1_4, V1_6),
     served("mempool.get_fee_histogram", V1_4),
+    served("mempool.get_info", V1_6),
 ];
 
 /// Whether `method` is served at `version`.
@@ -245,10 +253,11 @@ fn served_in(table: &[MethodVersions], method: &str, version: &ProtocolVersion) 
     })
 }
 
-/// Every method in the table, for tests that walk it.
+/// Every method in the table with the first version it is served at, for
+/// tests that walk it.
 #[cfg(test)]
-pub(crate) fn all_methods() -> impl Iterator<Item = &'static str> {
-    METHODS.iter().map(|m| m.method)
+pub(crate) fn all_methods() -> impl Iterator<Item = (&'static str, ProtocolVersion)> {
+    METHODS.iter().map(|m| (m.method, ProtocolVersion::new(m.since)))
 }
 
 #[cfg(test)]
@@ -271,29 +280,33 @@ mod tests {
         assert_eq!(v("1.4.2").to_string(), "1.4.2");
     }
 
-    /// At satd's 1.4..1.4 the spec rule gives the answers satd gave before it
-    /// negotiated: an exact `1.4`, a range containing it, and nothing else.
+    /// The spec rule at satd's 1.4..1.6.
     #[test]
-    fn negotiation_at_one_four_matches_the_old_exact_check() {
+    fn negotiation_follows_the_spec_rule() {
         assert_eq!(answer(json!(["w", "1.4"])).as_deref(), Some("1.4"));
-        assert_eq!(answer(json!(["w", "1.4.5"])), None);
-        assert_eq!(answer(json!(["w", "1.5"])), None);
-        assert_eq!(answer(json!(["w", "1.3"])), None);
+        assert_eq!(answer(json!(["w", "1.6"])).as_deref(), Some("1.6"));
+        // 1.5 is a skipped number, served the 1.4 methods, as by ElectrumX.
+        assert_eq!(answer(json!(["w", "1.5"])).as_deref(), Some("1.5"));
         // Sparrow.
-        assert_eq!(answer(json!(["w", ["1.3", "1.4.2"]])).as_deref(), Some("1.4"));
-        // Electrum, BDK: 1.5 and 1.6 lie inside the range, 1.4 is the overlap.
-        assert_eq!(answer(json!(["w", ["1.4", "1.6"]])).as_deref(), Some("1.4"));
-        assert_eq!(answer(json!(["w", ["1.2", "1.5"]])).as_deref(), Some("1.4"));
+        assert_eq!(answer(json!(["w", ["1.3", "1.4.2"]])).as_deref(), Some("1.4.2"));
+        // Electrum 4.7+, BDK.
+        assert_eq!(answer(json!(["w", ["1.4", "1.6"]])).as_deref(), Some("1.6"));
+        // Electrum's pending 1.7-only client, and a range reaching past 1.6.
+        assert_eq!(answer(json!(["w", "1.7"])), None);
+        assert_eq!(answer(json!(["w", ["1.4", "1.7"]])).as_deref(), Some("1.6"));
+        // 1.5 inside a range.
+        assert_eq!(answer(json!(["w", ["1.2", "1.5"]])).as_deref(), Some("1.5"));
         // No overlap, either side.
-        assert_eq!(answer(json!(["w", ["1.4.5", "1.7"]])), None);
+        assert_eq!(answer(json!(["w", ["1.7", "1.8"]])), None);
         assert_eq!(answer(json!(["w", ["1.0", "1.3"]])), None);
-        assert_eq!(answer(json!(["w", ["1.5", "1.3"]])), None);
+        assert_eq!(answer(json!(["w", "1.3"])), None);
+        assert_eq!(answer(json!(["w", ["1.6", "1.4"]])), None);
         assert_eq!(answer(json!(["w", "garbage"])), None);
     }
 
     /// The spec default and satd's long-standing leniency: no argument, null,
     /// a non-string argument, and a pair with a missing end, which is the
-    /// default too.
+    /// default too: a short range is never moved up to 1.6.
     #[test]
     fn missing_arguments_take_the_defaults() {
         assert_eq!(answer(json!([])).as_deref(), Some("1.4"));
@@ -301,7 +314,10 @@ mod tests {
         assert_eq!(answer(json!(["w", null])).as_deref(), Some("1.4"));
         assert_eq!(answer(json!(["w", 14])).as_deref(), Some("1.4"));
         assert_eq!(answer(json!(["w", ["1.3"]])).as_deref(), Some("1.4"));
+        assert_eq!(answer(json!(["w", ["1.4"]])).as_deref(), Some("1.4"));
+        assert_eq!(answer(json!(["w", ["1.6"]])), None);
         assert_eq!(answer(json!(["w", [null, "1.4"]])).as_deref(), Some("1.4"));
+        assert_eq!(answer(json!(["w", [null, "1.6"]])).as_deref(), Some("1.6"));
         assert_eq!(answer(json!(["w", []])).as_deref(), Some("1.4"));
         assert_eq!(answer(json!({"client": "w"})).as_deref(), Some("1.4"));
     }
@@ -312,9 +328,9 @@ mod tests {
         assert_eq!(
             answer(json!(["electrum/4.6.2", ["1.4", "1.6"], "trailing_garbage1", 9999.9, {"dd": {}}]))
                 .as_deref(),
-            Some("1.4")
+            Some("1.6")
         );
-        assert_eq!(answer(json!(["w", "1.5", "1.4"])), None);
+        assert_eq!(answer(json!(["w", "1.3", "1.6"])), None);
     }
 
     /// rbitcoin's dialect wins over any dotted range that names it, and is a
@@ -371,10 +387,39 @@ mod tests {
         assert!(!served_in(&table, "unknown", &v("1.6")));
     }
 
+    /// The 1.6 rows: `relayfee` up to 1.6, `mempool.get_info` from it.
     #[test]
-    fn every_method_is_served_at_the_minimum() {
-        for m in all_methods() {
-            assert!(method_served(m, &protocol_min()), "{m}");
+    fn the_one_six_methods_are_gated() {
+        let v = ProtocolVersion::parse;
+        for below in ["1.4", "1.4.2", "1.5"] {
+            assert!(method_served("blockchain.relayfee", &v(below)), "{below}");
+            assert!(!method_served("mempool.get_info", &v(below)), "{below}");
+        }
+        assert!(!method_served("blockchain.relayfee", &v("1.6")));
+        assert!(method_served("mempool.get_info", &v("1.6")));
+        // satd's extensions and the 1.4.2 unsubscribe stay at every version.
+        for m in [
+            "blockchain.transaction.broadcast_package",
+            "blockchain.headers.get",
+            "blockchain.scripthash.get_first_use",
+            "blockchain.scripthash.unsubscribe",
+            "blockchain.tweaks.subscribe",
+        ] {
+            assert!(method_served(m, &v("1.4")) && method_served(m, &v("1.6")), "{m}");
+        }
+    }
+
+    #[test]
+    fn every_method_is_served_at_its_first_version() {
+        for m in METHODS {
+            assert!(method_served(m.method, &ProtocolVersion::new(m.since)), "{}", m.method);
+        }
+    }
+
+    #[test]
+    fn every_method_is_served_at_the_minimum_unless_added_later() {
+        for m in METHODS.iter().filter(|m| m.since == V1_4) {
+            assert!(method_served(m.method, &protocol_min()), "{}", m.method);
         }
     }
 }

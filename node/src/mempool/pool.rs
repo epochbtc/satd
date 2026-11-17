@@ -1553,6 +1553,32 @@ where
     Ok(())
 }
 
+/// Core's `IsChildWithParentsTree` (`src/policy/packages.cpp`): the package is
+/// one child and its direct parents, and no parent spends another parent.
+///
+/// The package is expected to be sorted, so the child is last.
+pub fn is_child_with_parents_tree(txs: &[bitcoin::Transaction]) -> bool {
+    if txs.len() < 2 {
+        return false;
+    }
+    let (parents, child) = txs.split_at(txs.len() - 1);
+    let child = &child[0];
+    let child_inputs: std::collections::HashSet<bitcoin::Txid> =
+        child.input.iter().map(|i| i.previous_output.txid).collect();
+    // Every other member must be a parent of the child…
+    let parent_txids: std::collections::HashSet<bitcoin::Txid> =
+        parents.iter().map(|t| t.compute_txid()).collect();
+    if !parent_txids.iter().all(|t| child_inputs.contains(t)) {
+        return false;
+    }
+    // …and no parent may spend another.
+    parents.iter().all(|p| {
+        !p.input
+            .iter()
+            .any(|i| parent_txids.contains(&i.previous_output.txid))
+    })
+}
+
 /// What `submitpackage` needs to answer with: Core's `package_msg`, one
 /// per-transaction result keyed by wtxid, and the txids of everything the
 /// package replaced.
@@ -1567,6 +1593,36 @@ pub struct PackageResult {
     /// wtxid, for the P2P package relay to record as Core's
     /// `ProcessPackageResult` records each member's state.
     pub member_errors: HashMap<Wtxid, MempoolError>,
+}
+
+impl PackageResult {
+    /// `submitpackage`'s answer: `package_msg`, `tx-results` and
+    /// `replaced-transactions`.
+    pub fn submitpackage_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "package_msg": self.package_msg,
+            "tx-results": self.tx_results,
+            // Core emits this unconditionally, empty when nothing was
+            // replaced; a client that reads it had to guess.
+            "replaced-transactions": self
+                .replaced
+                .iter()
+                .map(|t| t.to_string())
+                .collect::<Vec<_>>(),
+        })
+    }
+
+    /// The txids of the members this call newly admitted: no `error`, and no
+    /// `other-wtxid` (a same-txid transaction already in the pool). These are
+    /// the ones to announce to peers.
+    pub fn newly_accepted(&self) -> Vec<Txid> {
+        self.tx_results
+            .values()
+            .filter(|entry| entry.get("error").is_none() && entry.get("other-wtxid").is_none())
+            .filter_map(|entry| entry.get("txid").and_then(|v| v.as_str()))
+            .filter_map(|txid| txid.parse().ok())
+            .collect()
+    }
 }
 
 /// A package member's refusal: the text `submitpackage` reports for it, and

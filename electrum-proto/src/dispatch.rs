@@ -19,7 +19,7 @@ use crate::state::ElectrumState;
 use crate::status::compute_status_hash;
 use crate::subscribe::{HeadersSource, Subscriptions};
 use crate::types::{ScripthashHex, parse_wire_scripthash};
-use crate::version::{Session, method_served, negotiate};
+use crate::version::{ProtocolVersion, Session, method_served, negotiate, protocol_min};
 
 /// Inbound JSON-RPC 2.0 request.
 ///
@@ -196,6 +196,13 @@ impl Notification {
 /// connection's requests go through [`dispatch_session`], which applies
 /// both.
 pub fn dispatch(state: &ElectrumState, req: Request) -> Response {
+    dispatch_at(state, &protocol_min(), req)
+}
+
+/// [`dispatch`] for a connection at `version`: the handlers whose answer's
+/// shape changed between versions answer in that version's shape. Whether
+/// the method is served at `version` at all is [`dispatch_session`]'s check.
+pub fn dispatch_at(state: &ElectrumState, version: &ProtocolVersion, req: Request) -> Response {
     let id = req.id.clone().unwrap_or(Value::Null);
     let params = req.params.unwrap_or(Value::Array(Vec::new()));
     let (params, asof) = match take_trailing_asof(&req.method, params) {
@@ -205,7 +212,7 @@ pub fn dispatch(state: &ElectrumState, req: Request) -> Response {
     if STAMPED_METHODS.contains(&req.method.as_str()) {
         return dispatch_pinned(state, id, &req.method, &params, asof);
     }
-    dispatch_unpinned(state, id, &req.method, params)
+    dispatch_unpinned(state, version, id, &req.method, params)
 }
 
 /// The prefix of the trailing `asof:<blockhash>` argument, rbitcoin's.
@@ -315,7 +322,13 @@ fn dispatch_pinned(
 }
 
 /// The rest of [`dispatch`]: the methods that are not pinned.
-fn dispatch_unpinned(state: &ElectrumState, id: Value, method: &str, params: Value) -> Response {
+fn dispatch_unpinned(
+    state: &ElectrumState,
+    version: &ProtocolVersion,
+    id: Value,
+    method: &str,
+    params: Value,
+) -> Response {
     let outcome: Result<Value, JsonRpcError> = match method {
         // server.*
         "server.version" => handlers::server_methods::version(state, params),
@@ -331,7 +344,7 @@ fn dispatch_unpinned(state: &ElectrumState, id: Value, method: &str, params: Val
 
         // blockchain.block.*
         "blockchain.block.header" => handlers::blockchain::block_header(state, params),
-        "blockchain.block.headers" => handlers::blockchain::block_headers(state, params),
+        "blockchain.block.headers" => handlers::blockchain::block_headers(state, params, version),
 
         // blockchain.scripthash.*
         "blockchain.scripthash.get_mempool" => {
@@ -370,6 +383,7 @@ fn dispatch_unpinned(state: &ElectrumState, id: Value, method: &str, params: Val
 
         // mempool.*
         "mempool.get_fee_histogram" => handlers::mempool::get_fee_histogram(state),
+        "mempool.get_info" => handlers::mempool::get_info(state),
 
         unknown => Err(JsonRpcError::method_not_found(unknown)),
     };
@@ -430,10 +444,11 @@ pub fn dispatch_session(
             }
         };
     }
-    if !method_served(&req.method, &session.version()) {
+    let version = session.version();
+    if !method_served(&req.method, &version) {
         return Response::error(id, JsonRpcError::method_not_found(&req.method));
     }
-    dispatch_with_subscriptions(state, subs, headers_source, extras, req)
+    dispatch_with_subscriptions_at(state, &version, subs, headers_source, extras, req)
 }
 
 /// Subscription-aware dispatch. Handles
@@ -455,6 +470,19 @@ pub fn dispatch_session(
 /// both.
 pub fn dispatch_with_subscriptions(
     state: &ElectrumState,
+    subs: &mut Subscriptions,
+    headers_source: &dyn HeadersSource,
+    extras: Arc<dyn ElectrumExtras>,
+    req: Request,
+) -> Response {
+    dispatch_with_subscriptions_at(state, &protocol_min(), subs, headers_source, extras, req)
+}
+
+/// [`dispatch_with_subscriptions`] for a connection at `version`; see
+/// [`dispatch_at`].
+pub fn dispatch_with_subscriptions_at(
+    state: &ElectrumState,
+    version: &ProtocolVersion,
     subs: &mut Subscriptions,
     headers_source: &dyn HeadersSource,
     extras: Arc<dyn ElectrumExtras>,
@@ -482,7 +510,7 @@ pub fn dispatch_with_subscriptions(
             handle_headers_subscribe(state, subs, headers_source, extras, &req)
         }
         "blockchain.tweaks.subscribe" => handle_tweaks_subscribe(state, subs, &req),
-        _ => return dispatch(state, req),
+        _ => return dispatch_at(state, version, req),
     };
     match outcome {
         Ok(result) => Response::success(id, result),

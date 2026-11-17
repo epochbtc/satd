@@ -45,6 +45,10 @@ mod esplora_paging;
 mod esplora_asof;
 #[path = "e2e/electrum_asof.rs"]
 mod electrum_asof;
+// Electrum protocol 1.6: package broadcast (CPFP) and the canonical mempool
+// order, through a client that negotiates 1.6.
+#[path = "e2e/electrum_protocol.rs"]
+mod electrum_protocol;
 
 use common::{
     DeterministicWallet, TestNode, build_signed_p2wpkh_spend_from_block1_coinbase,
@@ -2462,31 +2466,47 @@ fn test_e2e_electrum_estimatefee_and_relayfee() {
     // satd's internal unit is sat/kvB (per vbyte), so BTC/kB = sat/kvB / 1e8
     // (see electrum-proto blockchain.rs sat_per_kvb_to_btc_per_kb). A unit
     // regression here has historically been a 4x error.
-    use electrum_client::ElectrumApi;
+    //
+    // `electrum-client` offers protocol 1.4 to 1.6 and gets 1.6, where
+    // `blockchain.relayfee` is gone and `mempool.get_info` carries the same
+    // floor as `minrelaytxfee`. A 1.4 connection still has `relayfee`.
+    use electrum_client::{ElectrumApi, EstimationMode};
     let mut e2e = E2eNode::boot_with(&electrum_e2e_args());
     let url = electrum_url_for(&e2e);
     let client = electrum_client::Client::new(&url).expect("electrum connect");
 
-    // relay_fee always has a value because it reflects the mempool
-    // admission floor (a static operator config, not estimator data).
-    let relay = client.relay_fee().expect("relay_fee");
+    // The relay floor always has a value: it is the mempool admission floor
+    // (a static operator config, not estimator data).
+    let info = client.mempool_get_info().expect("mempool.get_info");
+    let relay = info.minrelaytxfee;
     assert!(
         relay > 0.0 && relay < 1.0,
-        "relay_fee should be a small positive BTC/kB, got {}",
+        "minrelaytxfee should be a small positive BTC/kB, got {}",
         relay
     );
+    assert!(info.mempoolminfee >= relay, "{info:?}");
+    assert!(info.incrementalrelayfee > 0.0, "{info:?}");
+    assert!(client.relay_fee().is_err(), "blockchain.relayfee is removed at 1.6");
+
+    let mut cli = RawElectrum::connect(e2e.electrum_port.expect("electrum port"));
+    cli.send(r#"{"id":1,"method":"server.version","params":["test","1.4"]}"#);
+    assert_eq!(cli.recv()["result"][1], "1.4");
+    cli.send(r#"{"id":2,"method":"blockchain.relayfee"}"#);
+    assert_eq!(cli.recv()["result"].as_f64(), Some(relay), "relayfee at 1.4 is minrelaytxfee");
 
     // estimate_fee on a fresh chain has no real estimator data;
     // satd returns -1.0 as a sentinel. Either a positive estimate
     // OR -1.0 is acceptable wire behavior — both are valid Electrum
     // responses (-1.0 mirrors what Electrum servers return when they
-    // can't form an estimate).
-    let est = client.estimate_fee(6, None).expect("estimate_fee");
-    assert!(
-        est == -1.0 || est > 0.0,
-        "estimate_fee should be -1.0 (no data) or a positive BTC/kB, got {}",
-        est
-    );
+    // can't form an estimate). Both of Core's modes are taken.
+    for mode in [None, Some(EstimationMode::Economical), Some(EstimationMode::Conservative)] {
+        let est = client.estimate_fee(6, mode).expect("estimate_fee");
+        assert!(
+            est == -1.0 || est > 0.0,
+            "estimate_fee should be -1.0 (no data) or a positive BTC/kB, got {}",
+            est
+        );
+    }
 
     e2e.node.stop();
 }

@@ -166,6 +166,17 @@ pub struct HeadersResponse {
     pub max: u32,
 }
 
+/// `blockchain.block.headers` response from protocol 1.6: the same, with
+/// the headers as a list of hex strings, one per header, instead of one
+/// concatenated `hex` (spesmilo/electrum-protocol `b3db795b`,
+/// `protocol-methods.rst`, `blockchain.block.headers`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HeadersListResponse {
+    pub count: u32,
+    pub headers: Vec<String>,
+    pub max: u32,
+}
+
 /// `mempool.get_fee_histogram` returns an array of `[fee_per_vbyte,
 /// total_vbytes]` pairs in descending fee-rate order. We model one row;
 /// the response is `Vec<FeeHistogramEntry>`.
