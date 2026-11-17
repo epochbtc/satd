@@ -224,6 +224,179 @@ fn write_rebuild_marker(
     }
 }
 
+/// `path` quoted for a POSIX shell, so the printed command can be pasted.
+fn shell_quote(path: &std::path::Path) -> String {
+    let s = path.display().to_string();
+    if !s.is_empty()
+        && s.bytes().all(|b| b.is_ascii_alphanumeric() || b"/._-+:@,".contains(&b))
+    {
+        s
+    } else {
+        format!("'{}'", s.replace('\'', "'\\''"))
+    }
+}
+
+/// A custom signet's datadir is `signet_<message start>`, as in Core's
+/// `GetSignetDataDir` (#1271). Earlier releases kept every signet in
+/// `signet/`. When this signet's own directory holds no chainstate yet and
+/// `signet/` does, look at its tip: if its solution satisfies this node's
+/// challenge and not the default one, `signet/` is this signet's chain, and
+/// starting in the new directory would sync it again from genesis. Refuse
+/// instead, with the commands that move it. Nothing is moved or written
+/// here; the chainstate is opened read-only.
+///
+/// A `signet/` holding only genesis, the default signet or another signet is
+/// left alone, and the node starts in its own directory. So does one that
+/// cannot be read, with a warning that names the move.
+fn check_old_signet_datadir(config: &Config, net_datadir: &std::path::Path) {
+    use node::chain::signet_datadir::{SignetDirContents, inspect};
+    use std::path::{Path, PathBuf};
+
+    let Some(challenge) = config.signet_challenge.as_deref() else {
+        return;
+    };
+    let old_name = "signet";
+    let Some(new_name) = net_datadir.file_name().map(|n| n.to_os_string()) else {
+        return;
+    };
+    if config.network != bitcoin::Network::Signet
+        || new_name == old_name
+        // A directory left by an aborted start, or made by hand, holds no
+        // chainstate and does not count as this signet's.
+        || net_datadir.join("chainstate").exists()
+    {
+        return;
+    }
+    if !config.datadir.join(old_name).join("chainstate").is_dir() {
+        return;
+    }
+    // The printed commands use canonical paths: they work from any working
+    // directory, and a `-blocksdir` that names the datadir by another
+    // spelling is recognised as the same directory.
+    let canonical = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let datadir = canonical(&config.datadir);
+    let blocksdir = config.blocksdir.as_deref().map(canonical);
+    let old_datadir = datadir.join(old_name);
+    let net_datadir = &datadir.join(&new_name);
+    // Where the old directory's blocks can be: under it, or under
+    // `-blocksdir`, which may have been added or dropped since it ran.
+    let old_blocks_root = blocksdir.as_deref().map(|r| r.join(old_name));
+    let mut candidates = vec![old_datadir.join("blocks")];
+    if let Some(root) = &old_blocks_root
+        && !candidates.contains(&root.join("blocks"))
+    {
+        candidates.push(root.join("blocks"));
+    }
+    let contents = inspect(&old_datadir.join("chainstate"), &candidates, challenge);
+
+    // The moves, as commands. A target that already exists (it can only
+    // lack a chainstate, see above) is moved aside first, so `mv` renames
+    // rather than nesting the source inside it.
+    let new_blocks = config::resolve_blocks_dir(
+        blocksdir.as_deref(),
+        &datadir,
+        bitcoin::Network::Signet,
+        Some(challenge),
+    );
+    let found_blocks = match &contents {
+        SignetDirContents::ThisSignet { blocks_dir, .. } => blocks_dir.clone(),
+        _ => candidates.iter().rev().find(|d| d.exists()).cloned().unwrap_or_else(|| candidates[0].clone()),
+    };
+    let mut commands: Vec<String> = Vec::new();
+    let mv = |commands: &mut Vec<String>, from: &Path, to: &Path| {
+        if to.exists() {
+            // A name nothing holds yet: `mv` into an existing directory
+            // would nest instead of renaming.
+            let aside = (1..)
+                .map(|n| {
+                    let mut a = to.as_os_str().to_os_string();
+                    a.push(if n == 1 { ".unused".to_string() } else { format!(".unused.{n}") });
+                    PathBuf::from(a)
+                })
+                .find(|a| !a.exists())
+                .expect("an unused name");
+            commands.push(format!("mv {} {}", shell_quote(to), shell_quote(&aside)));
+        }
+        commands.push(format!("mv {} {}", shell_quote(from), shell_quote(to)));
+    };
+    mv(&mut commands, &old_datadir, net_datadir);
+    // Where a path is once the first move has run: a `-blocksdir` inside the
+    // old directory moves with it.
+    let after_first_move = |p: &Path| -> PathBuf {
+        match p.strip_prefix(&old_datadir) {
+            Ok(rel) => net_datadir.join(rel),
+            Err(_) => p.to_path_buf(),
+        }
+    };
+    let blocks_after_first_move = after_first_move(&found_blocks);
+    // Blocks that are nowhere (an unreadable directory) get no command: a
+    // move of a missing path would stop the script halfway.
+    if found_blocks.exists() && blocks_after_first_move != new_blocks {
+        match (&old_blocks_root, blocksdir.as_deref()) {
+            // The usual `-blocksdir` case: its `signet/` subtree is renamed
+            // whole.
+            (Some(old_root), Some(root)) if found_blocks == old_root.join("blocks") => {
+                mv(
+                    &mut commands,
+                    &after_first_move(old_root),
+                    &after_first_move(root).join(&new_name),
+                );
+            }
+            _ => {
+                if let Some(parent) = new_blocks.parent()
+                    && !parent.exists()
+                    && parent != net_datadir
+                {
+                    commands.push(format!("mkdir -p {}", shell_quote(parent)));
+                }
+                mv(&mut commands, &blocks_after_first_move, &new_blocks);
+            }
+        }
+    }
+    let commands: String = commands.iter().map(|c| format!("  {c}\n")).collect();
+
+    match contents {
+        SignetDirContents::ThisSignet { height, hash, .. } => {
+            eprintln!(
+                "Error: a custom signet (-signetchallenge) keeps its data in {}, as in Bitcoin \
+                 Core (bitcoin/bitcoin#34566), but this signet's chain is in {} (its tip, \
+                 block {height} {hash}, carries a solution for this challenge). Stop anything \
+                 else using it, then move it:\n{commands}\
+                 and start again. Nothing was changed.",
+                net_datadir.display(),
+                old_datadir.display(),
+            );
+            node::shutdown::exit_now(1);
+        }
+        SignetDirContents::Genesis | SignetDirContents::DefaultSignet => {
+            tracing::info!(
+                old = %old_datadir.display(),
+                new = %net_datadir.display(),
+                "custom signet: starting in its own datadir; the old signet directory holds no \
+                 chain of this signet and is left as it is"
+            );
+        }
+        SignetDirContents::OtherSignet => {
+            tracing::warn!(
+                old = %old_datadir.display(),
+                new = %net_datadir.display(),
+                "custom signet: starting in its own datadir; the old signet directory holds \
+                 another signet's chain and is left as it is"
+            );
+        }
+        SignetDirContents::Unreadable(e) => {
+            tracing::warn!(
+                old = %old_datadir.display(),
+                new = %net_datadir.display(),
+                error = %e,
+                "custom signet: could not tell which signet the old signet directory holds; \
+                 starting in its own datadir. If it holds this signet's chain, stop satd and \
+                 move it:\n{commands}"
+            );
+        }
+    }
+}
+
 /// The coverage floor a full `-reindex` replay is held to (issue #504): the
 /// highest tip the node is known to have reached before the wipe. Three
 /// places can know it, and any of them can be absent: the chain database's
@@ -736,6 +909,9 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
 
     // Create network-specific data directory
     let net_datadir = config.network_datadir();
+    // A custom signet has a datadir of its own (#1271); one this signet ran
+    // in before, `signet/`, is moved by the operator, never by satd.
+    check_old_signet_datadir(&config, &net_datadir);
     if let Err(e) = std::fs::create_dir_all(&net_datadir) {
         eprintln!(
             "Error creating data directory {}: {}",
@@ -934,6 +1110,18 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
             node::shutdown::exit_now(1);
         }
     };
+
+    // A datadir from another network is refused here, before
+    // `-reindex-chainstate` (or `-upgradechainstate`) clears its UTXO set
+    // and before a cookie is written into it (#1270). `ChainState::new`
+    // checks again for every other caller. A full `-reindex` wipes the block
+    // index first, as Core's does, so there is nothing to check.
+    if (!reindex || continue_reindex)
+        && let Err(e) = node::chain::state::check_genesis(&raw_store, config.network)
+    {
+        eprintln!("Error: {e}");
+        node::shutdown::exit_now(1);
+    }
 
     // Beyond this point we're committing to daemon startup. Set up
     // authentication: cookie (always written unless rpcuser is set),
@@ -4961,7 +5149,8 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
 
     // Spawn adaptive-dbcache controller if --dbcache=auto was requested.
     // It resizes the RocksDB block cache and the CoinCache clean LRU every
-    // 30 seconds based on /proc/meminfo MemAvailable.
+    // 30 seconds based on /proc/meminfo MemAvailable, clamped to the
+    // process's memory cgroup headroom.
     if config.dbcache_mode.is_auto() {
         let max_bytes = config.dbcache as u64 * 1_000_000;
         let cs = chain_state.clone();
@@ -4969,7 +5158,7 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
         node::adaptive_cache::spawn_adaptive_cache(cs, max_bytes, rx);
         tracing::info!(
             max_mb = config.dbcache,
-            "Adaptive dbcache enabled — cap set to max budget, adjusted from /proc/meminfo"
+            "Adaptive dbcache enabled — cap set to max budget, adjusted from host and cgroup memory"
         );
     }
 

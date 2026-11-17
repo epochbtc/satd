@@ -18,7 +18,9 @@ tarball alongside `satd` and `sat-cli`.
 sat-tui                        # mainnet, default RPC port (8332)
 sat-tui --regtest              # regtest, port 18443
 sat-tui --testnet              # testnet, port 18332
+sat-tui --testnet4             # testnet4, port 48332
 sat-tui --signet               # signet, port 38332
+sat-tui --signet --signetchallenge=<hex>   # a custom signet
 ```
 
 ### Authentication
@@ -45,6 +47,7 @@ splash.
 | `--rpcuser <user>` | (none) | Userpass auth (with `--rpcpassword`). |
 | `--rpcpassword <pass>` | (none) | Userpass auth (with `--rpcuser`). |
 | `--rpccookiefile <path>` | auto | Override cookie path. |
+| `--signetchallenge <hex>` | (none) | A custom signet's challenge. Its cookie is in `signet_<message start>`, as satd and Bitcoin Core name the directory. |
 
 The TUI exits cleanly on `q` or `Ctrl-C` and restores the terminal mode.
 

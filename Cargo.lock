@@ -4618,6 +4618,7 @@ name = "sat-tui"
 version = "0.8.0-pre"
 dependencies = [
  "base64 0.22.1",
+ "bitcoin",
  "clap",
  "crossterm 0.28.1",
  "parking_lot",

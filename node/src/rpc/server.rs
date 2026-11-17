@@ -15,7 +15,7 @@ use crate::http_serve::serve_http_connection;
 use crate::warn_budget::WarnBudget;
 use crate::rpc::named_params::NamedParamsLayer;
 
-use crate::rpc::params::Args;
+use crate::rpc::params::{core_int, Args};
 use crate::rpc::readonly::ReadOnlyLayer;
 use crate::rpc::{access, address, blockchain, indexes, mining, network, psbt, rawtx, util};
 use crate::storage::Store;
@@ -635,7 +635,10 @@ fn net_datadir_from(ctx: &RpcContext) -> Option<std::path::PathBuf> {
         bitcoin::Network::Bitcoin => base,
         bitcoin::Network::Testnet => base.join("testnet3"),
         bitcoin::Network::Testnet4 => base.join("testnet4"),
-        bitcoin::Network::Signet => base.join("signet"),
+        // A custom signet's own directory (#1271), as satd's config names it.
+        bitcoin::Network::Signet => base.join(crate::validation::signet::signet_data_dir(
+            ctx.chain_state.signet_challenge(),
+        )),
         bitcoin::Network::Regtest => base.join("regtest"),
     })
 }
@@ -1060,10 +1063,16 @@ pub async fn start(
 
     module.register_method("getblockhash", |params, ctx, _extensions| {
         let mut args = Args::new(&params);
-        let height: u32 = args.required("height")?;
+        // Core: `getInt<int>`, then "Block height out of range" for a
+        // negative height as for one past the tip (rpc/blockchain.cpp).
+        let height: i32 = args.required("height")?;
         args.check()?;
         let tip = ctx.chain_state.tip_height();
-        blockchain::get_block_hash(&ctx.chain_state, height).map_err(|e| {
+        let found = match u32::try_from(height) {
+            Ok(h) => blockchain::get_block_hash(&ctx.chain_state, h),
+            Err(_) => Err("Block height out of range".to_string()),
+        };
+        found.map_err(|e| {
             crate::rpc::error::RpcError::new(-8, "rpc.input.range", e)
                 .with_suggestion(format!(
                     "Chain tip is at height {}. Request a height in [0, {}].",
@@ -1078,8 +1087,10 @@ pub async fn start(
         let mut args = Args::new(&params);
         let hash: String = args.required("blockhash")?;
         // Core defaults this to 1 and accepts a bool, where `false` means 0 --
-        // a hex string, not an object.
-        let verbosity = args.verbosity("verbosity", 1)?;
+        // a hex string, not an object. Any `int` is accepted: at or below 0
+        // is the hex string and 3 or more is verbosity 3 (rpc/blockchain.cpp
+        // `getblock`).
+        let verbosity = args.verbosity("verbosity", 1)?.max(0) as u32;
         args.check()?;
         blockchain::get_block(&ctx.chain_state, &hash, verbosity)
             .map_err(|e| {
@@ -1110,13 +1121,15 @@ pub async fn start(
     module.register_method("getblockfrompeer", |params, ctx, _extensions| {
         let mut args = Args::new(&params);
         let hash: String = args.required("blockhash")?;
-        // Read `peer_id` raw: a negative or too-large number is a valid JSON
-        // number that maps to no peer, and Core accepts it at the
-        // deserialization layer and rejects it in the lookup ("Peer does not
-        // exist", -1). A non-number is the type error (-3).
+        // Read `peer_id` raw: Core reads it with `getInt<int64_t>`, so a
+        // negative number maps to no peer and is rejected in the lookup
+        // ("Peer does not exist", -1), while one that is not an `int64_t` is
+        // "JSON integer out of range". A non-number is the type error (-3).
         let peer_id: Option<crate::net::peer::PeerId> = match args.raw("peer_id")? {
             None => None,
-            Some(serde_json::Value::Number(n)) => Some(n.as_u64().unwrap_or(u64::MAX)),
+            Some(serde_json::Value::Number(n)) => {
+                Some(u64::try_from(core_int::<i64>(&n)?).unwrap_or(u64::MAX))
+            }
             Some(other) => {
                 return Err(ErrorObjectOwned::owned(
                     -3,
@@ -1145,8 +1158,7 @@ pub async fn start(
         // the `stats` filter with it.
         let mut args = Args::new(&params);
         let hash_or_height = match args.raw("hash_or_height")? {
-            Some(serde_json::Value::String(s)) => s,
-            Some(serde_json::Value::Number(n)) => n.to_string(),
+            Some(v @ (serde_json::Value::String(_) | serde_json::Value::Number(_))) => v,
             Some(other) => {
                 return Err(ErrorObjectOwned::owned(
                     -1,
@@ -1167,6 +1179,18 @@ pub async fn start(
         };
         let stats: Option<Vec<String>> = args.optional("stats")?;
         args.check()?;
+        // A number is a height, read as Core's `ParseHashOrHeight` reads it:
+        // `getInt<int>`, then "Target block height N is negative" or "...
+        // after current tip". A string keeps its existing path.
+        let hash_or_height = match hash_or_height {
+            serde_json::Value::Number(_) => {
+                blockchain::parse_hash_or_height(&ctx.chain_state, &hash_or_height)
+                    .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))?
+                    .to_string()
+            }
+            serde_json::Value::String(s) => s,
+            _ => unreachable!("only a string or a number gets past the match above"),
+        };
 
         let all = blockchain::get_block_stats(&ctx.chain_state, &hash_or_height).map_err(|e| {
             ErrorObjectOwned::owned(blockchain::get_block_stats_error_code(&e), e, None::<()>)
@@ -1202,7 +1226,9 @@ pub async fn start(
 
     module.register_method("getchaintxstats", |params, ctx, _extensions| {
         let mut args = Args::new(&params);
-        let nblocks: Option<u32> = args.optional("nblocks")?;
+        // Core: `getInt<int>`; a negative count, or one reaching the final
+        // block's height, is `RPC_INVALID_PARAMETER` (rpc/blockchain.cpp).
+        let nblocks: Option<i32> = args.optional("nblocks")?;
         // Core's optional second arg: the block that ends the window.
         let blockhash_str: Option<String> = args.optional("blockhash")?;
         args.check()?;
@@ -1212,8 +1238,10 @@ pub async fn start(
             })?),
             None => None,
         };
-        blockchain::get_chain_tx_stats(&ctx.chain_state, nblocks, final_blockhash)
-            .map_err(|e| ErrorObjectOwned::owned(-1, e, None::<()>))
+        blockchain::get_chain_tx_stats(&ctx.chain_state, nblocks, final_blockhash).map_err(|e| {
+            let code = if e == blockchain::INVALID_BLOCK_COUNT { -8 } else { -1 };
+            ErrorObjectOwned::owned(code, e, None::<()>)
+        })
     })?;
 
     module.register_method("getmempoolancestors", |params, ctx, _extensions| {
@@ -1329,10 +1357,12 @@ pub async fn start(
         // Core takes a signed height so it can name the two out-of-range
         // cases apart: a negative height is "Negative block height", while a
         // value past the tip is "Blockchain is shorter...". Reading it as
-        // unsigned would collapse both into a parse error.
-        let height: i64 = args.required("height")?;
+        // unsigned would collapse both into a parse error. The type is
+        // checked here, but the `getInt<int>` conversion comes after Core's
+        // prune-mode check, so `prune_blockchain` does it.
+        let height: serde_json::Number = args.required("height")?;
         args.check()?;
-        blockchain::prune_blockchain(&ctx.chain_state, prune_mode_from(ctx), height)
+        blockchain::prune_blockchain(&ctx.chain_state, prune_mode_from(ctx), &height)
             .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
     })?;
 
@@ -1354,13 +1384,16 @@ pub async fn start(
 
     module.register_method("verifychain", |params, ctx, _extensions| {
         let mut args = Args::new(&params);
-        let check_level: u32 = args.optional_or("checklevel", 3)?;
-        let nblocks: u32 = args.optional_or("nblocks", 6)?;
+        // Core reads both with `getInt<int>`, and `VerifyDB` clamps rather
+        // than refuses: the level to [0, 4], and a depth at or below 0 (or
+        // past the tip) to the whole chain (validation.cpp).
+        let check_level: i32 = args.optional_or("checklevel", 3)?;
+        let nblocks: i32 = args.optional_or("nblocks", 6)?;
         args.check()?;
         Ok::<_, ErrorObjectOwned>(blockchain::verify_chain(
             &ctx.chain_state,
-            check_level,
-            nblocks,
+            check_level.clamp(0, 4) as u32,
+            nblocks.max(0) as u32,
         ))
     })?;
 
@@ -1657,14 +1690,20 @@ pub async fn start(
 
     module.register_method("generatetoaddress", |params, ctx, _extensions| {
         let mut args = Args::new(&params);
-        let nblocks: u32 = args.required("nblocks")?;
+        // Core: `getInt<int>` for both, and a count at or below 0 mines
+        // nothing (rpc/mining.cpp `generatetoaddress`).
+        let nblocks: i32 = args.required("nblocks")?;
         let address: String = args.required("address")?;
         // Core's third argument. satd used to read two and drop whatever came
         // third, so `generatetoaddress 1 <addr> "notanumber"` mined a block
         // where Core answers -3 -- and the nonce loop it bounds had no bound
         // at all (#688).
-        let max_tries: u64 = args.optional_or("maxtries", crate::mining::miner::DEFAULT_MAX_TRIES)?;
+        let max_tries: Option<i32> = args.optional("maxtries")?;
         args.check()?;
+        // `static_cast<uint64_t>` of Core's `int`: a negative count wraps to
+        // a huge budget, as `as` sign-extends.
+        let max_tries = max_tries.map_or(crate::mining::miner::DEFAULT_MAX_TRIES, |t| t as u64);
+        let nblocks = nblocks.max(0) as u32;
         // A call still mining when the node shuts down stops at the next
         // block, so main's wait for the RPC server to drain ends.
         let stopping = || *ctx.shutdown_tx.borrow();
@@ -1674,11 +1713,14 @@ pub async fn start(
 
     module.register_method("generatetodescriptor", |params, ctx, _extensions| {
         let mut args = Args::new(&params);
-        let nblocks: u32 = args.required("num_blocks")?;
+        // Core: `Arg<int>` for the count (at or below 0 mines nothing) and
+        // `Arg<uint64_t>` for the budget (rpc/mining.cpp).
+        let nblocks: i32 = args.required("num_blocks")?;
         let descriptor: String = args.required("descriptor")?;
         let max_tries: u64 =
             args.optional_or("maxtries", crate::mining::miner::DEFAULT_MAX_TRIES)?;
         args.check()?;
+        let nblocks = nblocks.max(0) as u32;
         let stopping = || *ctx.shutdown_tx.borrow();
         mining::generate_to_descriptor(
             &ctx.chain_state,
@@ -1858,10 +1900,12 @@ pub async fn start(
         // difficulty change" for `nblocks`, so neither can be read as an
         // unsigned type without rejecting a documented value.
         let mut args = Args::new(&params);
-        let nblocks: i64 = args.optional_or("nblocks", 120)?;
-        let height: i64 = args.optional_or("height", -1)?;
+        // Both are `Arg<int>` in Core: past `int` is "JSON integer out of
+        // range".
+        let nblocks: i32 = args.optional_or("nblocks", 120)?;
+        let height: i32 = args.optional_or("height", -1)?;
         args.check()?;
-        mining::get_network_hash_ps(&ctx.chain_state, nblocks, height)
+        mining::get_network_hash_ps(&ctx.chain_state, nblocks.into(), height.into())
             // A double, printed as Core's `UniValue::setFloat` prints it.
             .map(crate::rpc::util::univalue_double)
             .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
@@ -2057,16 +2101,11 @@ pub async fn start(
         let mut args = Args::new(&params);
         let txid: String = args.required("txid")?;
         // Core declares this NUM with a 0 default and accepts a bool for it.
-        let verbosity = args.verbosity("verbose", 0)?;
+        // Any `int` is accepted: at or below 0 is the hex string, and 2 or
+        // more is verbosity 2 (rpc/rawtransaction.cpp `getrawtransaction`).
+        let verbosity = args.verbosity("verbose", 0)?.clamp(0, 2) as u32;
         let blockhash: Option<String> = args.optional("blockhash")?;
         args.check()?;
-        if verbosity > 2 {
-            return Err(ErrorObjectOwned::owned(
-                -8,
-                "Invalid verbosity value",
-                None::<()>,
-            ));
-        }
         let verbose = verbosity >= 1;
         rawtx::get_raw_transaction(
             &ctx.chain_state,
@@ -2161,9 +2200,9 @@ pub async fn start(
         let locktime_val: Option<u32> = match &locktime {
             None | Some(serde_json::Value::Null) => None,
             Some(serde_json::Value::Number(n)) => {
-                let v = n.as_i64().ok_or_else(|| ErrorObjectOwned::owned(
-                    -8, "Invalid parameter, locktime out of range", None::<()>,
-                ))?;
+                // `ConstructTransaction` (rpc/rawtransaction_util.cpp):
+                // `getInt<int64_t>`, then the range check.
+                let v = core_int::<i64>(n)?;
                 if !(0..=0xFFFF_FFFF_i64).contains(&v) {
                     return Err(ErrorObjectOwned::owned(
                         -8, "Invalid parameter, locktime out of range", None::<()>,
@@ -2187,12 +2226,9 @@ pub async fn start(
         let version_val: Option<u32> = match &version {
             None | Some(serde_json::Value::Null) => None,
             Some(serde_json::Value::Number(n)) => {
-                let v = n.as_u64().ok_or_else(|| ErrorObjectOwned::owned(
-                    -8, format!("Invalid parameter, version out of range({TX_VERSION_MIN}~{TX_VERSION_MAX})"), None::<()>,
-                ))?;
-                let v32 = u32::try_from(v).map_err(|_| ErrorObjectOwned::owned(
-                    -8, format!("Invalid parameter, version out of range({TX_VERSION_MIN}~{TX_VERSION_MAX})"), None::<()>,
-                ))?;
+                // `Arg<uint32_t>("version")`: a value that is not a `uint32_t`
+                // is "JSON integer out of range" before the 1~3 check.
+                let v32 = core_int::<u32>(n)?;
                 if !(TX_VERSION_MIN..=TX_VERSION_MAX).contains(&v32) {
                     return Err(ErrorObjectOwned::owned(
                         -8, format!("Invalid parameter, version out of range({TX_VERSION_MIN}~{TX_VERSION_MAX})"), None::<()>,
@@ -2511,18 +2547,28 @@ pub async fn start(
         let outputs: serde_json::Value = args
             .raw_or_null("outputs")?
             .ok_or_else(|| ErrorObjectOwned::owned(-1, "Missing required argument outputs", None::<()>))?;
-        let locktime: Option<u32> = args.optional("locktime")?;
+        // `ConstructTransaction` reads the locktime with `getInt<int64_t>`
+        // and refuses one outside `uint32_t` by name, -8.
+        let locktime: Option<i64> = args.optional("locktime")?;
         // Core's trailing pair. satd has never honoured either here, and this
         // does not start: they are read only so that the satd argument after
         // them lands in the slot a Core-shaped positional call leaves free.
+        // `version` is still read as Core's `Arg<uint32_t>`, so a value that
+        // is not one is refused as Core refuses it.
         let _replaceable: Option<serde_json::Value> = args.raw("replaceable")?;
-        let _version: Option<serde_json::Value> = args.raw("version")?;
+        let _version: Option<u32> = args.optional("version")?;
         // satd extension: `psbt_version=2` emits a BIP 370 version 2 PSBT,
         // which is what a silent payment recipient needs. It goes *after*
         // Core's arguments so that a positional call written against Core
         // keeps meaning what it meant.
         let psbt_version: Option<u32> = args.optional("psbt_version")?;
         args.check()?;
+        let locktime = match locktime {
+            None => None,
+            Some(v) => Some(u32::try_from(v).map_err(|_| {
+                ErrorObjectOwned::owned(-8, "Invalid parameter, locktime out of range", None::<()>)
+            })?),
+        };
         // Same duplicate-preserving read as `createrawtransaction`: Core
         // reaches one `ParseOutputs` from both, so both must see the same
         // sequence. `createpsbt` had no duplicate detection at all.
@@ -2758,6 +2804,22 @@ pub async fn start(
         }
     })?;
 
+    /// Core's `ParseConfirmTarget` (src/rpc/util.cpp): `getInt<int>`, so a
+    /// fraction or a value past `int` is -1 "JSON integer out of range", then
+    /// one range error, -8, for anything below 1 or above the highest target
+    /// the estimator tracks -- negative targets included.
+    fn parse_confirm_target(n: &serde_json::Number, max_target: u32) -> Result<u32, ErrorObjectOwned> {
+        let target = core_int::<i32>(n)?;
+        match u32::try_from(target) {
+            Ok(t) if (1..=max_target).contains(&t) => Ok(t),
+            _ => Err(ErrorObjectOwned::owned(
+                -8,
+                format!("Invalid conf_target, must be between 1 and {max_target}"),
+                None::<()>,
+            )),
+        }
+    }
+
     module.register_method("estimatesmartfee", |params, ctx, _extensions| {
         // Parse as raw Values for Core-compatible arg-count and type checking.
         let args: Vec<serde_json::Value> = params.parse().unwrap_or_default();
@@ -2769,10 +2831,11 @@ pub async fn start(
             ));
         }
         // Type check arg 0: must be number
-        let conf_target: u32 = match &args[0] {
-            serde_json::Value::Number(n) => n.as_u64()
-                .and_then(|n| u32::try_from(n).ok())
-                .ok_or_else(|| ErrorObjectOwned::owned(-8, "Invalid conf_target", None::<()>))?,
+        // The value is converted after the other arguments' types are
+        // checked, as Core's `ParseConfirmTarget` runs after `RPCHelpMan`'s
+        // type checks.
+        let conf_target = match &args[0] {
+            serde_json::Value::Number(n) => n.clone(),
             other => {
                 return Err(ErrorObjectOwned::owned(
                     -3,
@@ -2817,6 +2880,9 @@ pub async fn start(
             ));
         }
 
+        // Core parses the target before the mode (rpc/fees.cpp).
+        let conf_target = parse_confirm_target(&conf_target, 1008)?;
+
         // Validate estimate_mode if provided
         if let Some(ref mode) = mode_str
             && EstimateMode::parse(Some(mode.as_str())).is_none()
@@ -2824,18 +2890,6 @@ pub async fn start(
             return Err(ErrorObjectOwned::owned(
                 -8,
                 "Invalid estimate_mode parameter, must be one of: \"unset\", \"economical\", \"conservative\", \"mempool\"",
-                None::<()>,
-            ));
-        }
-
-        // Core validates the range (`rpc/fees.cpp`: `1 <= conf_target <=
-        // maxTarget`), and `estimaterawfee` in this same file already did.
-        // `estimatesmartfee` did not, so `conf_target: 0` reached the
-        // estimator and was answered with a feerate rather than refused.
-        if !(1..=1008).contains(&conf_target) {
-            return Err(ErrorObjectOwned::owned(
-                -8,
-                "Invalid conf_target, must be between 1 and 1008",
                 None::<()>,
             ));
         }
@@ -2911,10 +2965,11 @@ pub async fn start(
             ));
         }
         // Type check arg 0: must be number
-        let conf_target: u32 = match &args[0] {
-            serde_json::Value::Number(n) => n.as_u64()
-                .and_then(|n| u32::try_from(n).ok())
-                .ok_or_else(|| ErrorObjectOwned::owned(-8, "Invalid conf_target", None::<()>))?,
+        // The value is converted after the other arguments' types are
+        // checked, as Core's `ParseConfirmTarget` runs after `RPCHelpMan`'s
+        // type checks.
+        let conf_target = match &args[0] {
+            serde_json::Value::Number(n) => n.clone(),
             other => {
                 return Err(ErrorObjectOwned::owned(
                     -3,
@@ -2946,14 +3001,7 @@ pub async fn start(
             None
         };
 
-        // Validate conf_target range (1..=1008)
-        if !(1..=1008).contains(&conf_target) {
-            return Err(ErrorObjectOwned::owned(
-                -8,
-                "Invalid conf_target, must be between 1 and 1008",
-                None::<()>,
-            ));
-        }
+        let conf_target = parse_confirm_target(&conf_target, 1008)?;
 
         // Core validates the threshold it is given; satd used to bind it to
         // `_threshold` and drop it, so an out-of-range value was accepted in
@@ -3264,7 +3312,8 @@ pub async fn start(
         let mut args = Args::new(&params);
         let subnet_str: String = args.required("subnet")?;
         let command: String = args.required("command")?;
-        let bantime: Option<u64> = args.optional("bantime")?;
+        // Core: `getInt<int64_t>`.
+        let bantime: Option<i64> = args.optional("bantime")?;
         let absolute: Option<bool> = args.optional("absolute")?;
         args.check()?;
 
@@ -3289,7 +3338,16 @@ pub async fn start(
                     // bantime is an absolute Unix timestamp. Core's guard is
                     // `banTime < GetTime()`, so a timestamp of exactly now is
                     // accepted (and expires immediately).
-                    let abs = bantime.unwrap_or_else(|| now.saturating_add(default_duration));
+                    let abs = bantime.unwrap_or_else(|| {
+                        i64::try_from(now.saturating_add(default_duration)).unwrap_or(i64::MAX)
+                    });
+                    let Ok(abs) = u64::try_from(abs) else {
+                        return Err(ErrorObjectOwned::owned(
+                            -8,
+                            "Error: Absolute timestamp is in the past",
+                            None::<()>,
+                        ));
+                    };
                     if abs < now {
                         return Err(ErrorObjectOwned::owned(
                             -8,
@@ -3299,13 +3357,13 @@ pub async fn start(
                     }
                     (now, abs)
                 } else {
-                    // bantime is a relative duration in seconds (0 = default).
-                    // Saturating: `bantime` is operator-supplied and `u64::MAX`
-                    // would otherwise panic in debug and wrap to an
-                    // already-expired ban in release.
+                    // bantime is a relative duration in seconds. Core's
+                    // `BanMan::Ban` takes one at or below 0 as the default.
+                    // Saturating: `bantime` is operator-supplied and `i64::MAX`
+                    // would otherwise overflow.
                     let duration = match bantime {
-                        Some(0) | None => default_duration,
-                        Some(d) => d,
+                        Some(d) if d > 0 => d as u64,
+                        _ => default_duration,
                     };
                     (now, now.saturating_add(duration))
                 };
@@ -3501,7 +3559,9 @@ pub async fn start(
     // functional tests use it to send types the node does not know.
     module.register_method("sendmsgtopeer", |params, ctx, _extensions| {
         let mut args = Args::new(&params);
-        let peer_id: u64 = args.required("peer_id")?;
+        // Core: `getInt<int64_t>`; a negative id is a peer that does not
+        // exist, refused by the send below.
+        let peer_id: i64 = args.required("peer_id")?;
         let msg_type: String = args.required("msg_type")?;
         let msg: String = args.required("msg")?;
         args.check()?;
@@ -3516,6 +3576,7 @@ pub async fn start(
         let payload = hex::decode(&msg).map_err(|_| {
             ErrorObjectOwned::owned(-8, "Error parsing input for msg", None::<()>)
         })?;
+        let peer_id = u64::try_from(peer_id).unwrap_or(u64::MAX);
         if !ctx.peer_manager.send_raw_message(peer_id, &msg_type, payload) {
             return Err(ErrorObjectOwned::owned(
                 -1,
@@ -3533,7 +3594,8 @@ pub async fn start(
     // `i2p` and `cjdns` are valid networks that are always empty.
     module.register_method("getnodeaddresses", |params, ctx, _extensions| {
         let mut args = Args::new(&params);
-        let count: Option<i64> = args.optional("count")?;
+        // Core: `getInt<int>`.
+        let count: Option<i32> = args.optional("count")?;
         let network: Option<String> = args.optional("network")?;
         args.check()?;
         let count = count.unwrap_or(1);
@@ -3670,8 +3732,11 @@ pub async fn start(
         // framework disconnects, so the address slot is present but empty.
         let mut args = Args::new(&params);
         let addr_str: Option<String> = args.optional("address")?;
-        let node_id: Option<u64> = args.optional("nodeid")?;
+        // Core: `getInt<int64_t>`. A negative id names no peer, so it is
+        // "Node not found" below rather than a parse error.
+        let node_id: Option<i64> = args.optional("nodeid")?;
         args.check()?;
+        let node_id = node_id.map(|id| u64::try_from(id).unwrap_or(u64::MAX));
 
         // Core's branch conditions verbatim (rpc/net.cpp): an address that was
         // supplied at all -- including as the empty string -- takes the
@@ -3906,12 +3971,12 @@ pub async fn start(
             ));
         }
         let mut args = Args::new(&params);
-        let timestamp: i64 = args.required("timestamp").map_err(|e| {
-            ErrorObjectOwned::owned(-8, format!("Invalid timestamp: {}", e.message()), None::<()>)
-        })?;
+        // Core: `getInt<int64_t>`; a type error is Core's -3 and a value past
+        // `int64_t` its -1, neither rewrapped.
+        let timestamp: i64 = args.required("timestamp")?;
         args.check()?;
-        // Core's bound is the largest second representable as nanoseconds.
-        const MAX_MOCK_TIME: i64 = i64::MAX / 1_000_000_000;
+        // Core v32.1's bound (rpc/node.cpp): block timestamps are `uint32_t`.
+        const MAX_MOCK_TIME: i64 = u32::MAX as i64;
         if !(0..=MAX_MOCK_TIME).contains(&timestamp) {
             return Err(ErrorObjectOwned::owned(
                 -8,
@@ -4606,12 +4671,21 @@ pub async fn start(
 
     // --- Long-polling RPCs ---
 
+    /// The `timeout` of Core's `waitfor*` calls (rpc/blockchain.cpp): an
+    /// `int` of milliseconds, and a negative one is -1 "Negative timeout".
+    fn wait_timeout_ms(timeout: i32) -> Result<u64, ErrorObjectOwned> {
+        u64::try_from(timeout)
+            .map_err(|_| ErrorObjectOwned::owned(-1, "Negative timeout", None::<()>))
+    }
+
     module.register_async_method(
         "waitforblockheight",
         |params, ctx, _extensions| async move {
             let mut args = Args::new(&params);
-            let target_height: u32 = args.required("height")?;
-            let timeout_ms: u64 = args.optional_or("timeout", 0)?;
+            // Core: `getInt<int>` for both. A height at or below the tip --
+            // any negative one included -- answers with the tip at once.
+            let target_height: i32 = args.required("height")?;
+            let timeout_ms = wait_timeout_ms(args.optional_or("timeout", 0)?)?;
             args.check()?;
             let timeout = if timeout_ms > 0 {
                 std::time::Duration::from_millis(timeout_ms)
@@ -4622,7 +4696,7 @@ pub async fn start(
 
             loop {
                 let height = ctx.chain_state.tip_height();
-                if height >= target_height {
+                if i64::from(height) >= i64::from(target_height) {
                     let hash = ctx.chain_state.tip_hash();
                     return Ok::<_, ErrorObjectOwned>(serde_json::json!({
                         "hash": hash.to_string(),
@@ -4645,7 +4719,7 @@ pub async fn start(
 
     module.register_async_method("waitfornewblock", |params, ctx, _extensions| async move {
         let mut args = Args::new(&params);
-        let timeout_ms: u64 = args.optional_or("timeout", 0)?;
+        let timeout_ms = wait_timeout_ms(args.optional_or("timeout", 0)?)?;
         args.check()?;
         let timeout = if timeout_ms > 0 {
             std::time::Duration::from_millis(timeout_ms)
@@ -4678,7 +4752,7 @@ pub async fn start(
     module.register_async_method("waitforblock", |params, ctx, _extensions| async move {
         let mut args = Args::new(&params);
         let blockhash: String = args.required("blockhash")?;
-        let timeout_ms: u64 = args.optional_or("timeout", 0)?;
+        let timeout_ms = wait_timeout_ms(args.optional_or("timeout", 0)?)?;
         args.check()?;
         let target_hash: bitcoin::BlockHash = blockhash
             .parse()
