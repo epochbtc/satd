@@ -899,9 +899,7 @@ note = "measured 2026-09-15: L100 createmultisig is Method not found. Follow-up:
 
 [[test]]
 file = "rpc_decodescript.py"
-status = "skip"
-reason = "rpc-missing"
-note = "measured 2026-09-15: L36 asm renders 'OP_PUSHBYTES_72 <hex>' where Core's ScriptToAsmStr renders the bare push. Behind it: the segwit sub-object and miniscript descriptors. Follow-up: Core's asm rendering"
+status = "run"
 
 [[test]]
 file = "rpc_deprecated.py"

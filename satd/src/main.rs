@@ -1111,6 +1111,18 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
         }
     };
 
+    // A datadir from another network is refused here, before
+    // `-reindex-chainstate` (or `-upgradechainstate`) clears its UTXO set
+    // and before a cookie is written into it (#1270). `ChainState::new`
+    // checks again for every other caller. A full `-reindex` wipes the block
+    // index first, as Core's does, so there is nothing to check.
+    if (!reindex || continue_reindex)
+        && let Err(e) = node::chain::state::check_genesis(&raw_store, config.network)
+    {
+        eprintln!("Error: {e}");
+        node::shutdown::exit_now(1);
+    }
+
     // Beyond this point we're committing to daemon startup. Set up
     // authentication: cookie (always written unless rpcuser is set),
     // plus any --rpcauth lines, plus the optional plain --rpcuser /
@@ -5137,7 +5149,8 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
 
     // Spawn adaptive-dbcache controller if --dbcache=auto was requested.
     // It resizes the RocksDB block cache and the CoinCache clean LRU every
-    // 30 seconds based on /proc/meminfo MemAvailable.
+    // 30 seconds based on /proc/meminfo MemAvailable, clamped to the
+    // process's memory cgroup headroom.
     if config.dbcache_mode.is_auto() {
         let max_bytes = config.dbcache as u64 * 1_000_000;
         let cs = chain_state.clone();
@@ -5145,7 +5158,7 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
         node::adaptive_cache::spawn_adaptive_cache(cs, max_bytes, rx);
         tracing::info!(
             max_mb = config.dbcache,
-            "Adaptive dbcache enabled — cap set to max budget, adjusted from /proc/meminfo"
+            "Adaptive dbcache enabled — cap set to max budget, adjusted from host and cgroup memory"
         );
     }
 
