@@ -1009,6 +1009,38 @@ impl ChainState {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         store: Box<dyn Store>,
+        flat_files: FlatFileManager,
+        network: Network,
+        script_verifier: Box<dyn ScriptVerifier>,
+        assumevalid: AssumeValid,
+        dbcache_mb: u64,
+        num_threads: usize,
+        address_index: crate::index::address::AddressIndexConfig,
+        filter_index: crate::index::filter::FilterIndexConfig,
+        sp_index: crate::index::silent_payments::SpIndexConfig,
+    ) -> Result<Self, ChainError> {
+        Self::new_with_signet_challenge(
+            store,
+            flat_files,
+            network,
+            script_verifier,
+            assumevalid,
+            dbcache_mb,
+            num_threads,
+            address_index,
+            filter_index,
+            sp_index,
+            None,
+        )
+    }
+
+    /// [`Self::new`] on a custom signet: `signet_challenge` is applied as
+    /// [`Self::set_signet_challenge`] would, and before genesis is written,
+    /// so a fresh datadir's first block record is framed with the custom
+    /// signet's message start like every later one (#1283).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_signet_challenge(
+        store: Box<dyn Store>,
         mut flat_files: FlatFileManager,
         network: Network,
         script_verifier: Box<dyn ScriptVerifier>,
@@ -1018,6 +1050,7 @@ impl ChainState {
         address_index: crate::index::address::AddressIndexConfig,
         filter_index: crate::index::filter::FilterIndexConfig,
         sp_index: crate::index::silent_payments::SpIndexConfig,
+        signet_challenge: Option<Vec<u8>>,
     ) -> Result<Self, ChainError> {
         // The `filter_index` field it feeds is cfg-gated, but the parameter is
         // not: every caller passes a config regardless of build, so the
@@ -1109,7 +1142,7 @@ impl ChainState {
                     hash = %tip_hash,
                     "Loaded chain tip from storage"
                 );
-                let cs = Self {
+                let mut cs = Self {
                     store,
                     flat_files: Arc::new(Mutex::new(flat_files)),
                     blocks_dir,
@@ -1169,6 +1202,7 @@ impl ChainState {
                     bulk_load: std::sync::atomic::AtomicBool::new(false),
                     strip: Default::default(),
                 };
+                cs.set_signet_challenge(signet_challenge);
                 // Self-heal a tip left durably `Invalid` by a crash mid-
                 // invalidateblock (no-op in the normal case).
                 cs.reconcile_invalid_tip()?;
@@ -1219,7 +1253,7 @@ impl ChainState {
         } else {
             let block_data = serialize(&genesis);
             let pos = flat_files
-                .write_block(&block_data, network_magic(network), 0)
+                .write_block(&block_data, block_magic(network, signet_challenge.as_deref()), 0)
                 .map_err(|e| ChainError::FlatFile(e.to_string()))?;
             // Same data-before-pointer ordering `write_block_durable`
             // enforces on the steady-state paths. This one runs once per
@@ -1256,7 +1290,7 @@ impl ChainState {
         })?;
         store.write_batch(batch)?;
 
-        let cs = Self {
+        let mut cs = Self {
             store,
             flat_files: Arc::new(Mutex::new(flat_files)),
             blocks_dir,
@@ -1316,6 +1350,7 @@ impl ChainState {
             bulk_load: std::sync::atomic::AtomicBool::new(false),
             strip: Default::default(),
         };
+        cs.set_signet_challenge(signet_challenge);
         cs.start_group_commit();
         Ok(cs)
     }
@@ -1474,6 +1509,16 @@ impl ChainState {
         }
     }
 
+    /// The message start that frames each `blk*.dat` record and tags a
+    /// `dumptxoutset` snapshot: the network's P2P magic, which a custom
+    /// signet derives from its challenge. Core writes
+    /// `GetParams().MessageStart()` in `BlockManager::WriteBlock`
+    /// (`node/blockstorage.cpp`) and `SnapshotMetadata::m_network_magic`
+    /// (`node/utxo_snapshot.h`). Reads do not check it (#1283).
+    pub(crate) fn block_magic(&self) -> [u8; 4] {
+        block_magic(self.network, self.signet_challenge.as_deref())
+    }
+
     /// Verify a block's signet solution (BIP 325) against this node's
     /// challenge: `-signetchallenge` on a custom signet, the default
     /// signet's otherwise. No-op off signet. Core checks it in `CheckBlock`
@@ -1531,6 +1576,7 @@ impl ChainState {
             self.checkpoints.clone(),
             self.enforce_checkpoints,
             self.network,
+            self.block_magic(),
             self.num_threads,
             bg_dir,
             snapshot_height,
@@ -2005,7 +2051,7 @@ impl ChainState {
         // 1. Header: magic/version (in deserialize), network, base hash.
         let meta = cc::SnapshotMetadata::deserialize(reader)
             .map_err(|e| ChainError::Snapshot(format!("bad snapshot header: {e}")))?;
-        if meta.network_magic != network_magic(self.network) {
+        if meta.network_magic != self.block_magic() {
             return Err(ChainError::Snapshot(
                 "snapshot network magic does not match this node's network".into(),
             ));
@@ -2688,7 +2734,7 @@ impl ChainState {
         let mut writer = BufWriter::new(file);
         let placeholder = cc::SnapshotMetadata {
             version: cc::SNAPSHOT_VERSION,
-            network_magic: network_magic(self.network),
+            network_magic: self.block_magic(),
             base_blockhash: {
                 use bitcoin::hashes::Hash;
                 bitcoin::BlockHash::all_zeros()
@@ -2755,7 +2801,7 @@ impl ChainState {
             writer.seek(SeekFrom::Start(0))?;
             let meta = cc::SnapshotMetadata {
                 version: cc::SNAPSHOT_VERSION,
-                network_magic: network_magic(self.network),
+                network_magic: self.block_magic(),
                 base_blockhash: base_hash,
                 coins_count: base.coin_count,
             };
@@ -4460,7 +4506,7 @@ impl ChainState {
         let (pos, pending, sync) = {
             let mut flat = self.flat_files.lock();
             let (pos, pending) = flat
-                .write_block_pending(block_data, network_magic(self.network), height)
+                .write_block_pending(block_data, self.block_magic(), height)
                 .map_err(|e| ChainError::FlatFile(e.to_string()))?;
             let sync = flat.sync_handle().map_err(|e| ChainError::FlatFile(e.to_string()))?;
             (pos, pending, sync)
@@ -5652,7 +5698,7 @@ impl ChainState {
         let (flat_pos, pending) = self
             .flat_files
             .lock()
-            .write_block_pending(&block_data, network_magic(self.network), new_height)
+            .write_block_pending(&block_data, self.block_magic(), new_height)
             .map_err(|e| ChainError::FlatFile(e.to_string()))?;
 
         // Store block index entry as DataStored
@@ -11792,6 +11838,16 @@ impl Drop for TempFileGuard {
             // manual filesystem surgery.
             let _ = std::fs::remove_file(&path);
         }
+    }
+}
+
+/// [`ChainState::block_magic`] before a `ChainState` exists.
+fn block_magic(network: Network, signet_challenge: Option<&[u8]>) -> [u8; 4] {
+    match signet_challenge {
+        Some(ch) if network == Network::Signet => {
+            crate::validation::signet::signet_magic(ch).to_bytes()
+        }
+        _ => network_magic(network),
     }
 }
 
@@ -24372,6 +24428,104 @@ pub(crate) mod tests {
             "000000007a61e4230b28ac5cb6b5e5a0130de37ac1faf2f8987d2fa6505b67f4"
         );
         assert!(matches!(default_assumevalid(Network::Regtest, false), AssumeValid::Disabled));
+    }
+
+    /// The message start of every record in `blocks/blk00000.dat`, in order,
+    /// read straight from the de-obfuscated file.
+    fn record_magics(blocks_dir: &std::path::Path) -> Vec<[u8; 4]> {
+        let key = crate::storage::flatfile::read_xor_key(blocks_dir).unwrap();
+        let mut data = std::fs::read(blocks_dir.join("blk00000.dat")).unwrap();
+        crate::storage::flatfile::xor_in_place(&mut data, &key, 0);
+        let mut magics = Vec::new();
+        let mut offset = 0;
+        while offset + 8 <= data.len() {
+            let size =
+                u32::from_le_bytes(data[offset + 4..offset + 8].try_into().unwrap()) as usize;
+            if size == 0 {
+                break;
+            }
+            magics.push(data[offset..offset + 4].try_into().unwrap());
+            offset += 8 + size;
+        }
+        magics
+    }
+
+    /// A custom signet frames its block records, genesis included, with its
+    /// own message start, as Core's `BlockManager::WriteBlock` writes
+    /// `GetParams().MessageStart()` (#1283). They were framed with the
+    /// default signet's, so Core refused every record ("Block magic
+    /// mismatch") and a Core `-reindex` over the directory found no blocks.
+    ///
+    /// Perturbation: frame records with `network_magic(network)` again, in
+    /// the genesis write or in `write_block_durable`, or tag the snapshot
+    /// with it, and this fails.
+    #[test]
+    fn a_custom_signet_frames_block_records_with_its_own_message_start() {
+        use crate::validation::signet::fixtures::default_signet_block;
+        let dir = tempfile::TempDir::new().unwrap();
+        let blocks = dir.path().join("blocks");
+        let cs = ChainState::new_with_signet_challenge(
+            Box::new(InMemoryStore::new()),
+            FlatFileManager::new(&blocks).unwrap(),
+            Network::Signet,
+            Box::new(NoopVerifier),
+            AssumeValid::Disabled,
+            450,
+            4,
+            Default::default(),
+            Default::default(),
+            Default::default(),
+            Some(vec![0x51]), // OP_TRUE: any solution satisfies it
+        )
+        .unwrap();
+        cs.accept_block(&default_signet_block(1)).expect("block 1 under OP_TRUE");
+        cs.flat_files.lock().sync_all().unwrap();
+
+        let custom = crate::validation::signet::signet_magic(&[0x51]).to_bytes();
+        assert_ne!(custom, network_magic(Network::Signet), "premise: the magics differ");
+        assert_eq!(cs.block_magic(), custom);
+        assert_eq!(record_magics(&blocks), vec![custom, custom], "genesis and block 1");
+
+        // A `dumptxoutset` snapshot is tagged with it too, as Core's
+        // `SnapshotMetadata::m_network_magic` is `MessageStart()`.
+        let path = dir.path().join("dump.snapshot");
+        cs.dump_utxo_snapshot(&path).expect("dump_utxo_snapshot");
+        let mut reader = std::io::BufReader::new(std::fs::File::open(&path).unwrap());
+        let meta = crate::storage::compressed_coin::SnapshotMetadata::deserialize(&mut reader)
+            .expect("parse header");
+        assert_eq!(meta.network_magic, custom);
+    }
+
+    /// A custom-signet datadir written before #1283 holds records framed
+    /// with the default signet's magic. Reads do not check the magic, so
+    /// those records still read and rescan, and records written from then on
+    /// carry the custom magic: the directory mixes both.
+    #[test]
+    fn a_custom_signet_still_reads_records_framed_with_the_default_magic() {
+        use crate::validation::signet::fixtures::default_signet_block;
+        let dir = tempfile::TempDir::new().unwrap();
+        let blocks = dir.path().join("blocks");
+        // Genesis and block 1 framed with the default magic, as a custom
+        // signet's were before #1283; then the custom challenge applies.
+        let mut cs = signet_chain_state_over(dir.path());
+        let b1 = default_signet_block(1);
+        cs.accept_block(&b1).expect("block 1");
+        cs.set_signet_challenge(Some(vec![0x51])); // OP_TRUE
+        let b2 = default_signet_block(2);
+        cs.accept_block(&b2).expect("block 2 under OP_TRUE");
+        cs.flat_files.lock().sync_all().unwrap();
+
+        let default = network_magic(Network::Signet);
+        let custom = crate::validation::signet::signet_magic(&[0x51]).to_bytes();
+        assert_eq!(record_magics(&blocks), vec![default, default, custom]);
+        assert_eq!(cs.get_block(&b1.block_hash()), Some(b1));
+        assert_eq!(cs.get_block(&b2.block_hash()), Some(b2));
+        let scanned = cs
+            .flat_files
+            .lock()
+            .for_each_block(|_, _| std::ops::ControlFlow::Continue(()))
+            .unwrap();
+        assert_eq!(scanned, 3, "the -reindex scan reaches every record");
     }
 
     /// A default-signet `ChainState` with an empty database over `dir`'s
