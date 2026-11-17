@@ -681,6 +681,32 @@ fn under_a_blocks_xor_key_a_lost_record_is_still_caught() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// Under a blocks-dir xor key the direct reads decode every record, whatever
+/// its offset's phase in the key: a stored block connects, and a replay of
+/// the whole chain reaches the same tip.
+#[test]
+fn stored_blocks_connect_and_replay_under_a_blocks_xor_key() {
+    let (cs, dir) = make_xor_chain_state();
+    let blocks = chain(&cs);
+    assert!(
+        blocks.iter().any(|b| cs.store.get_block_index(&b.block_hash()).unwrap().data_pos % 8 != 0),
+        "premise: some record is not 8-aligned"
+    );
+
+    let next = build_test_block(blocks[104].block_hash(), 106, time(106));
+    cs.accept_header(&next.header).unwrap();
+    cs.store_block(&next).unwrap();
+    cs.connect_stored_block(&next.block_hash()).unwrap();
+    assert_eq!(cs.tip_hash(), next.block_hash());
+
+    let plan = rewind(&cs);
+    for height in 1..=106u32 {
+        cs.reindex_connect_direct(&plan, height, plan.hash_at(height).unwrap()).unwrap();
+    }
+    assert_eq!(cs.tip_hash(), next.block_hash());
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 /// A prune that lands between the plan's index read and its read of the
 /// bytes makes the read fail. That is a race, not corruption: no warning.
 #[test]

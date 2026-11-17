@@ -1639,6 +1639,9 @@ mod tests {
         assert!(!bip30_exempt(Network::Bitcoin, 91_842, &BlockHash::all_zeros()));
         // Right hash, wrong height → not exempt.
         assert!(!bip30_exempt(Network::Bitcoin, 91_843, &h91842));
+        // The same holds for the second pair.
+        assert!(!bip30_exempt(Network::Bitcoin, 91_880, &BlockHash::all_zeros()));
+        assert!(!bip30_exempt(Network::Bitcoin, 91_881, &h91880));
         // Other networks are never exempt.
         assert!(!bip30_exempt(Network::Regtest, 91_842, &h91842));
         assert!(!bip30_exempt(Network::Testnet, 91_880, &h91880));
