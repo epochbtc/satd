@@ -1534,7 +1534,7 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
             .with_queue_bytes(config.shadow_queue_mb.saturating_mul(1 << 20)))
         }
     };
-    let chain_state = match ChainState::new(
+    let chain_state = match ChainState::new_with_signet_challenge(
         store,
         flat_files,
         config.network,
@@ -1565,11 +1565,12 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
         node::index::silent_payments::SpIndexConfig {
             enabled: config.silentpaymentindex,
         },
+        // Custom signet (BIP 325): block-solution validation, the custom
+        // P2P magic, and the message start framing block records, genesis
+        // included (#1283).
+        config.signet_challenge.clone(),
     ) {
         Ok(mut cs) => {
-            // Custom signet (BIP 325): enables block-solution validation
-            // and custom P2P magic. Set before sharing the ChainState.
-            cs.set_signet_challenge(config.signet_challenge.clone());
             node::chain::state::ChainState::set_max_tip_age(config.maxtipage);
             cs.set_minimum_chain_work(config.minimumchainwork);
             if config.allow_test_strip {

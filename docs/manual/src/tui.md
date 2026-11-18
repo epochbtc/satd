@@ -198,7 +198,7 @@ Mempool (left half):
   min-relay floor of about 1 sat/vB. A non-zero value means the mempool
   is full and is evicting low-fee txs. New txs need at least this rate
   to enter.
-- **Tx Rate**: recent tx-entry rate from `getchaintxstats` (tx/s).
+- **Tx Rate**: transactions per second over the last month of blocks, from `getchaintxstats` with its default window.
 - **Size distribution**: bar chart of transactions per vbyte bucket (0,
   100, 250, 500, 1k, 5k, 10k, 50k+), each bar labelled with its lower edge
   and its count. The bar heights are on a log scale, so a bucket of a few
