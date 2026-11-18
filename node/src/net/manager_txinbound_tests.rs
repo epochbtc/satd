@@ -236,3 +236,74 @@ async fn the_inbound_handshake_drops_a_tx_relay_peer_past_the_cap() {
         assert_eq!(ids(&pm).len(), 11, "no tx-relay inbound peer was evicted");
     }
 }
+
+/// Accept one real loopback connection through the inbound accept path,
+/// returning the dialing end, which must stay open for the peer to stay.
+async fn accept_one(pm: &Arc<PeerManager>) -> tokio::net::TcpStream {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let dialer = tokio::net::TcpStream::connect(listener.local_addr().unwrap());
+    let (dialed, accepted) = tokio::join!(dialer, listener.accept());
+    let (accepted, peer_addr) = accepted.unwrap();
+    pm.accept_inbound(accepted, peer_addr);
+    dialed.unwrap()
+}
+
+fn loopback_peers(pm: &PeerManager) -> usize {
+    pm.peers.read().values().filter(|h| h.info.addr.ip().is_loopback()).count()
+}
+
+/// Core's `CreateNodeFromAcceptedSocket` (v32.1 `src/net.cpp`): with every
+/// inbound slot taken, `AttemptToEvictConnection` makes room and the newcomer
+/// is kept. The slots are `-maxconnections` less the 11 automatic outbound
+/// ones: at 41, the 30 inbound peers here fill them, which the old cap of
+/// `-maxconnections` less 8 (33) did not. Thirty, because the eviction rules
+/// protect up to 20 transaction-relaying peers before the ratio step.
+/// Outbound peers are never evicted.
+#[tokio::test]
+async fn a_full_inbound_set_evicts_a_peer_and_keeps_the_newcomer() {
+    let (pm, _dir) = mk_pm();
+    pm.set_max_connections(41);
+    assert_eq!(pm.max_inbound(), 30);
+    for id in 1..=30 {
+        add(&pm, peer(id, Direction::Inbound, true));
+    }
+    for id in 40..45 {
+        add(&pm, peer(id, Direction::Outbound, true));
+    }
+    let before = ids(&pm);
+
+    let _dialer = accept_one(&pm).await;
+
+    let gone: Vec<PeerId> = before.difference(&ids(&pm)).copied().collect();
+    assert_eq!(gone.len(), 1, "exactly one peer evicted: {gone:?}");
+    assert!((1..=30).contains(&gone[0]), "an inbound peer: {gone:?}");
+    assert_eq!(loopback_peers(&pm), 1, "the newcomer is kept");
+
+    // One slot short of full, nobody is evicted.
+    let (pm, _dir) = mk_pm();
+    pm.set_max_connections(41);
+    for id in 1..=29 {
+        add(&pm, peer(id, Direction::Inbound, true));
+    }
+    let before = ids(&pm);
+    let _dialer = accept_one(&pm).await;
+    assert!(before.is_subset(&ids(&pm)), "no eviction below the cap");
+    assert_eq!(loopback_peers(&pm), 1);
+}
+
+/// When no inbound peer can be evicted, here because every one is `noban`,
+/// the newcomer is dropped instead, as Core drops it ("failed to find an
+/// eviction candidate - connection dropped (full)").
+#[tokio::test]
+async fn a_full_inbound_set_with_no_candidate_drops_the_newcomer() {
+    let (pm, _dir) = mk_pm();
+    small(&pm);
+    for id in 1..=20 {
+        let mut info = peer(id, Direction::Inbound, true);
+        info.permissions.noban = true;
+        add(&pm, info);
+    }
+    let before = ids(&pm);
+    let _dialer = accept_one(&pm).await;
+    assert_eq!(ids(&pm), before, "nobody evicted, and the newcomer not added");
+}

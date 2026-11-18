@@ -3802,38 +3802,58 @@ impl PeerManager {
     /// `noban` peers count but are never evicted; outbound and manual
     /// connections are neither.
     fn evict_tx_peer_if_full(&self, protect_peer: Option<PeerId>) -> bool {
+        {
+            let peers = self.peers.read();
+            let tx_inbound_peers = peers
+                .values()
+                .filter(|h| h.info.state != PeerState::Disconnected && h.info.tx_relay_requested)
+                .filter(|h| h.info.direction == Direction::Inbound)
+                .count();
+            if tx_inbound_peers <= self.max_inbound_full_relay() {
+                return true;
+            }
+        }
+        self.attempt_to_evict_connection(true, protect_peer, "evicted for an inbound tx-relay slot")
+    }
+
+    /// Core's `CConnman::AttemptToEvictConnection` (v32.1 `src/net.cpp:1699`):
+    /// pick an inbound peer by the eviction rules
+    /// ([`crate::net::eviction::select_node_to_evict`]) and disconnect it.
+    /// Every connected peer is a candidate except `protect_peer` and, with
+    /// `evict_tx_relay_peer_only`, those that do not relay transactions; the
+    /// rules themselves never pick an outbound, manual or `noban` peer.
+    /// Returns false when they find no peer to evict.
+    fn attempt_to_evict_connection(
+        &self,
+        evict_tx_relay_peer_only: bool,
+        protect_peer: Option<PeerId>,
+        reason: &'static str,
+    ) -> bool {
         struct Seen {
             id: PeerId,
             addr: SocketAddr,
             inbound: bool,
             inbound_onion: bool,
             noban: bool,
+            relay_txs: bool,
             connected: u64,
             has_all_wanted_services: bool,
             stats: Arc<PeerStats>,
         }
         let seen: Vec<Seen> = {
             let peers = self.peers.read();
-            let relaying = |h: &&PeerHandle| h.info.state != PeerState::Disconnected && h.info.tx_relay_requested;
-            let tx_inbound_peers = peers
-                .values()
-                .filter(relaying)
-                .filter(|h| h.info.direction == Direction::Inbound)
-                .count();
-            if tx_inbound_peers <= self.max_inbound_full_relay() {
-                return true;
-            }
-            // Core's `AttemptToEvictConnection(evict_tx_relay_peer_only=true)`.
             peers
                 .values()
-                .filter(relaying)
+                .filter(|h| h.info.state != PeerState::Disconnected)
                 .filter(|h| Some(h.info.id) != protect_peer)
+                .filter(|h| !evict_tx_relay_peer_only || h.info.tx_relay_requested)
                 .map(|h| Seen {
                     id: h.info.id,
                     addr: h.info.addr,
                     inbound: h.info.conn_type == ConnType::Inbound,
                     inbound_onion: h.info.inbound_onion,
                     noban: h.info.permissions.noban,
+                    relay_txs: h.info.tx_relay_requested,
                     connected: h
                         .info
                         .conn_time
@@ -3867,7 +3887,7 @@ impl PeerManager {
                         last_block_time: p.stats.last_block(),
                         last_tx_time: p.stats.last_transaction(),
                         relevant_services: p.has_all_wanted_services,
-                        relay_txs: true,
+                        relay_txs: p.relay_txs,
                         bloom_filter: false,
                         keyed_net_group: bitcoin::hashes::siphash24::Hash::hash_to_u64_with_keys(
                             self.netgroup_key.0,
@@ -3887,7 +3907,8 @@ impl PeerManager {
             return false;
         };
         tracing::debug!("selected inbound connection for eviction, disconnecting peer={victim}");
-        self.disconnect_peer(victim, "evicted for an inbound tx-relay slot");
+        // A victim that left in the meantime freed its slot all the same.
+        self.disconnect_peer(victim, reason);
         true
     }
 
@@ -4682,7 +4703,9 @@ impl PeerManager {
             return;
         }
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let msg_rx = {
+        // Whether a peer was already evicted to make room for this one.
+        let mut evicted = false;
+        let msg_rx = loop {
             let mut peers = self.peers.write();
             // Authoritative pause check under the peers lock (mirrors
             // spawn_peer / set_network_active). Closes the race where
@@ -4696,10 +4719,6 @@ impl PeerManager {
             // (matches Bitcoin Core's manual-conn / whitelist handling).
             if !perms.noban {
                 let (inbound_count, same_ip_count) = Self::count_inbound(&peers, ip);
-                if inbound_count >= self.max_connections.load(Ordering::Relaxed).saturating_sub(MAX_OUTBOUND) {
-                    tracing::warn!(%addr, "Max inbound connections reached, dropping connection");
-                    return;
-                }
                 // The per-IP sub-cap is an anti-eclipse / anti-DoS guard
                 // against a single *remote* source monopolizing inbound
                 // slots. Loopback is the operator's own machine: local
@@ -4709,8 +4728,9 @@ impl PeerManager {
                 // from the one loopback address and would otherwise trip a
                 // cap meant for hostile peers. Bitcoin Core does not
                 // throttle localhost this way. The total `inbound_count`
-                // cap above still bounds loopback, so this cannot exhaust
-                // all slots.
+                // cap below still bounds loopback, so this cannot exhaust
+                // all slots. It is checked first so that no peer is evicted
+                // for a newcomer it then refuses.
                 if !ip.is_loopback() && same_ip_count >= self.max_inbound_per_ip.load(Ordering::Relaxed) {
                     tracing::warn!(
                         %addr,
@@ -4719,6 +4739,30 @@ impl PeerManager {
                         "Per-IP inbound limit reached, dropping connection",
                     );
                     return;
+                }
+                // Core's `CreateNodeFromAcceptedSocket` (v32.1
+                // `src/net.cpp:1842`): with every inbound slot
+                // (`m_max_inbound`, `-maxconnections` less the 11 automatic
+                // outbound slots) taken, evict an inbound peer by the
+                // eviction rules to make room, and drop the newcomer only
+                // if none can be evicted. The eviction takes the peers lock
+                // itself, so it runs with this one released, and the count
+                // is taken again after it. Still full then means another
+                // accept took the freed slot: this newcomer goes.
+                if inbound_count >= self.max_inbound() {
+                    if evicted {
+                        tracing::debug!(%addr, "inbound slot taken by another connection - connection dropped (full)");
+                        return;
+                    }
+                    drop(peers);
+                    if !self.attempt_to_evict_connection(false, None, "evicted for an inbound slot") {
+                        tracing::debug!(
+                            "failed to find an eviction candidate - connection dropped (full), peer={addr}"
+                        );
+                        return;
+                    }
+                    evicted = true;
+                    continue;
                 }
             }
             // Reserve the slot under the same write lock so further
@@ -4751,7 +4795,7 @@ impl PeerManager {
                     stats: PeerStats::new(self.net_totals.clone()),
                 },
             );
-            msg_rx
+            break msg_rx;
         };
         tracing::info!(%addr, id, noban = perms.noban, "Accepted inbound peer");
         tracing::debug!("Added connection peer={id}");

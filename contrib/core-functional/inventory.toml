@@ -625,7 +625,7 @@ status = "run"
 file = "p2p_connection_limits.py"
 status = "skip"
 reason = "needs-triage"
-note = "measured 2026-11-03 at v32.1: L53 expects 'failed to find a tx-relaying eviction candidate - connection dropped' (-inboundrelaypercent, which satd does not implement)"
+note = "re-measured 2026-11-18 with inbound eviction (#1293) and -inboundrelaypercent (#1263): past L53; now L79 in test_inbound_limits expects 'connection dropped after filterload message', under -peerbloomfilters, a blocks-only peer that turns tx relay on with BIP 37 filterload past the tx-relay cap. satd has no BIP 37 (-peerbloomfilters). Follow-up: none planned Earlier, 2026-11-03: L53, -inboundrelaypercent missing"
 
 [[test]]
 file = "p2p_disconnect_ban.py"
@@ -639,9 +639,8 @@ note = "measured 2026-09-15: the DNS seeding disabled line landed; L36 then want
 
 [[test]]
 file = "p2p_eviction.py"
-status = "skip"
-reason = "feature-missing"
-note = "measured 2026-09-15: L119 no inbound peer is evicted (0 != 1); satd has no inbound eviction. Follow-up: inbound eviction"
+status = "run"
+note = "flipped 2026-11-18: inbound eviction when inbound is full (#1293); the test's peers all relay transactions, so the tx-relay eviction of #1263 already passed it, measured on the tree before #1293"
 
 [[test]]
 file = "p2p_feefilter.py"
