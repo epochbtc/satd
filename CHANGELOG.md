@@ -38,6 +38,7 @@ It includes every fix shipped in 0.7.1:
 - P2P: during initial sync, a block that arrives while another is being connected no longer stops all peer message handling until the connect finishes (#875).
 - P2P: a `headers` message is accepted on a thread of its own, so a batch waiting for a block connect no longer stops peer handling (#1187).
 - P2P: a `getheaders` with an empty locator gets only the header it names, and only if Core's `BlockRequestAllowed` admits it (#1298).
+- P2P: a new block is not announced to a peer whose chain already has it, as in Core (#1299).
 - P2P: automatic outbound dials draw from the whole address book with Core's odds, and skip a candidate on a bad port or without the needed services before dialling it (#1148).
 - P2P: onion addresses learned from gossip go in the address book with the rest, so `peers.dat` keeps them across a restart and they are tried and evicted like any address; `peers.dat` moves to format version 3 (#1157).
 - P2P: the node opens feeler connections, as Core does, about every two minutes once its outbound slots are full, to test new addresses and the tried-table incumbent a newcomer would evict (#1149).

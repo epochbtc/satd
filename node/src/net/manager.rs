@@ -582,6 +582,12 @@ const NODE_NETWORK_LIMITED_MIN_BLOCKS: u32 = 288;
 /// Core's `nPrunedBlocksLikelyToHave` (`MIN_BLOCKS_TO_KEEP` less an hour of
 /// blocks): a pruned node's `getblocks` answer stops above this depth.
 const PRUNED_BLOCKS_LIKELY_TO_HAVE: u32 = 288 - 6;
+
+/// How far [`PeerManager::peer_has_header`] walks parent links from a peer's
+/// known block off the active chain before it gives up. Core's skip list
+/// answers any depth; a side branch this long is not one a block
+/// announcement needs to look through.
+const ANNOUNCE_ANCESTRY_WALK_LIMIT: u32 = 2000;
 /// What [`PeerManager::block_request_refusal`] does with a refused request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BlockRefusal {
@@ -8378,6 +8384,13 @@ impl PeerManager {
                         );
                     }
                     if self.chain_state.get_block_index(&hash).is_none() {
+                        // Core's `UpdateBlockAvailability` for an unknown
+                        // block: keep it as `hashLastUnknownBlock`, which
+                        // becomes the best known block once its header
+                        // arrives, from this peer or another.
+                        if let Some(h) = self.peers.write().get_mut(&id) {
+                            h.info.last_unknown_block = Some(hash);
+                        }
                         blocks_to_get.push(hash);
                     } else {
                         // Core's INV handler calls `UpdateBlockAvailability`
@@ -8924,10 +8937,145 @@ impl PeerManager {
     /// returns having asked for nothing. Every path that accepts a header
     /// from a peer must come through here.
     fn note_block_availability(&self, id: PeerId, hash: &bitcoin::BlockHash) {
+        self.process_block_availability(id);
         if let Some(entry) = self.chain_state.get_block_index(hash) {
             self.note_peer_height(id, entry.height);
+            self.note_best_known_block(id, *hash, &entry);
             self.maybe_send_sendheaders(id, &entry);
         }
+    }
+
+    /// Core's `ProcessBlockAvailability` (v32.1 `net_processing.cpp`): a
+    /// block the peer announced before we knew it, its
+    /// [`PeerInfo::last_unknown_block`], is now indexed, so it counts as
+    /// announced.
+    fn process_block_availability(&self, id: PeerId) {
+        let Some(Some(hash)) = self.peers.read().get(&id).map(|h| h.info.last_unknown_block) else {
+            return;
+        };
+        let Some(entry) = self.chain_state.get_block_index(&hash) else {
+            return;
+        };
+        {
+            let mut peers = self.peers.write();
+            match peers.get_mut(&id) {
+                // A later unknown announcement replaced it: that one waits.
+                Some(h) if h.info.last_unknown_block == Some(hash) => h.info.last_unknown_block = None,
+                _ => return,
+            }
+        }
+        self.note_peer_height(id, entry.height);
+        self.note_best_known_block(id, hash, &entry);
+        self.maybe_send_sendheaders(id, &entry);
+    }
+
+    /// The rest of Core's `UpdateBlockAvailability` (v32.1
+    /// `net_processing.cpp`): `hash` becomes the peer's
+    /// `pindexBestKnownBlock` unless the one recorded has more work.
+    fn note_best_known_block(
+        &self,
+        id: PeerId,
+        hash: bitcoin::BlockHash,
+        entry: &crate::storage::blockindex::BlockIndexEntry,
+    ) {
+        let Some(current) = self.peers.read().get(&id).map(|h| h.info.best_known_block) else {
+            return;
+        };
+        if let Some(cur) = current {
+            if cur == hash {
+                return;
+            }
+            if let Some(cur_entry) = self.chain_state.get_block_index(&cur)
+                && crate::chain::state::compare_u256(&entry.chainwork, &cur_entry.chainwork) < 0
+            {
+                return;
+            }
+        }
+        // Set only if nothing moved it while the work was compared: the
+        // chain lookup above runs outside the peers lock.
+        if let Some(h) = self.peers.write().get_mut(&id)
+            && h.info.best_known_block == current
+        {
+            h.info.best_known_block = Some(hash);
+        }
+    }
+
+    /// Core's `PeerHasHeader` (v32.1 `net_processing.cpp`): whether the block
+    /// `hash` (index entry `entry`) is on the chain of a block the peer is
+    /// known to have, its best known block or the last block it sent us or
+    /// we announced to it ([`PeerInfo::known_block`], which stands in for
+    /// Core's `pindexBestHeaderSent`). `known` is those blocks.
+    ///
+    /// Core answers with `GetAncestor`. Here a block on the active chain is
+    /// checked against the height index; one off it walks parent links,
+    /// [`ANNOUNCE_ANCESTRY_WALK_LIMIT`] at most, and a longer walk answers
+    /// "no", which at worst announces a block the peer has.
+    fn peer_has_header(
+        &self,
+        known: &[Option<bitcoin::BlockHash>],
+        hash: bitcoin::BlockHash,
+        entry: &crate::storage::blockindex::BlockIndexEntry,
+    ) -> bool {
+        known.iter().flatten().any(|tip| {
+            if *tip == hash {
+                return true;
+            }
+            let Some(tip_entry) = self.chain_state.get_block_index(tip) else {
+                return false;
+            };
+            if tip_entry.height <= entry.height {
+                return false;
+            }
+            if self.chain_state.active_chain_hash_at_height_indexed(tip_entry.height) == Some(*tip) {
+                return self.chain_state.active_chain_hash_at_height_indexed(entry.height) == Some(hash);
+            }
+            if tip_entry.height - entry.height > ANNOUNCE_ANCESTRY_WALK_LIMIT {
+                return false;
+            }
+            let mut cur = tip_entry.header.prev_blockhash;
+            for _ in entry.height + 1..tip_entry.height {
+                match self.chain_state.get_block_index(&cur) {
+                    Some(e) => cur = e.header.prev_blockhash,
+                    None => return false,
+                }
+            }
+            cur == hash
+        })
+    }
+
+    /// The peers that already have `hash` by [`Self::peer_has_header`].
+    /// Read under the peers lock, checked outside it.
+    fn peers_with_header(
+        &self,
+        hash: bitcoin::BlockHash,
+        entry: Option<&crate::storage::blockindex::BlockIndexEntry>,
+    ) -> std::collections::HashSet<PeerId> {
+        // Core runs `ProcessBlockAvailability` for each peer before
+        // announcing to it (`SendMessages`).
+        let waiting: Vec<PeerId> = self
+            .peers
+            .read()
+            .iter()
+            .filter(|(_, h)| h.info.last_unknown_block.is_some())
+            .map(|(id, _)| *id)
+            .collect();
+        for id in waiting {
+            self.process_block_availability(id);
+        }
+        let known: Vec<(PeerId, [Option<bitcoin::BlockHash>; 2])> = self
+            .peers
+            .read()
+            .iter()
+            .map(|(id, h)| (*id, [h.info.best_known_block, h.info.known_block]))
+            .collect();
+        known
+            .into_iter()
+            .filter(|(_, blocks)| match entry {
+                Some(e) => self.peer_has_header(blocks, hash, e),
+                None => blocks.contains(&Some(hash)),
+            })
+            .map(|(id, _)| id)
+            .collect()
     }
 
     /// The part of Core's `UpdatePeerStateForReceivedHeaders` (v31.1
@@ -12452,13 +12600,17 @@ impl PeerManager {
         // to us or the pre-connect announcement already reached it, is
         // skipped.
         let is_tip = self.chain_state.tip_hash() == hash;
+        // Core's `PeerHasHeader`: a peer whose chain already has the block,
+        // because it sent the block or announced it or a descendant, is not
+        // told about it again.
+        let has_header = self.peers_with_header(hash, Some(&entry));
         let wants_compact = is_tip && {
             let peers = self.peers.read();
-            peers.values().any(|h| {
+            peers.iter().any(|(id, h)| {
                 h.info.state == PeerState::Connected
                     && h.info.hb_from
                     && h.info.compact_blocks
-                    && h.info.known_block != Some(hash)
+                    && !has_header.contains(id)
             })
         };
         let compact = if wants_compact {
@@ -12475,7 +12627,7 @@ impl PeerManager {
         {
             let peers = self.peers.read();
             for (id, handle) in peers.iter() {
-                if handle.info.state != PeerState::Connected || handle.info.known_block == Some(hash) {
+                if handle.info.state != PeerState::Connected || has_header.contains(id) {
                     continue;
                 }
                 let msg = match &compact {
@@ -13814,6 +13966,7 @@ impl PeerManager {
         let msg = NetworkMessage::CmpctBlock(bitcoin::p2p::message_compact_blocks::CmpctBlock {
             compact_block: (*compact).clone(),
         });
+        let has_header = self.peers_with_header(hash, self.chain_state.get_block_index(&hash).as_ref());
         let mut announced = Vec::new();
         {
             let peers = self.peers.read();
@@ -13821,7 +13974,7 @@ impl PeerManager {
                 if handle.info.state == PeerState::Connected
                     && handle.info.hb_from
                     && handle.info.compact_blocks
-                    && handle.info.known_block != Some(hash)
+                    && !has_header.contains(id)
                     && handle.msg_tx.try_send(msg.clone()).is_ok()
                 {
                     announced.push(*id);
