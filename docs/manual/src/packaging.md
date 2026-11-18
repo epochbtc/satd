@@ -107,7 +107,7 @@ At startup satd works out how many descriptors it needs, as Bitcoin Core
 does in `AppInitParameterInteraction`:
 
 ```text
-required = 151                              base: stdio, logs, block and undo files,
+needs    = 151                              base: stdio, logs, block and undo files,
                                             RocksDB's WAL/MANIFEST/LOG, runtime
          + maxopenfiles                     RocksDB table files (when > 0; default 2048)
          + 8                                addnode peers
@@ -124,7 +124,7 @@ required = 151                              base: stdio, logs, block and undo fi
          + MCP HTTP:    1 + 128
          + metrics:     1 + 64, and 1 + 64 for its TLS listener
          + 1 per ZMQ endpoint
-total    = required + maxconnections
+total    = needs + maxconnections
 ```
 
 Only enabled surfaces count. When an Esplora or streamws socket cap is `0`,
@@ -133,18 +133,34 @@ SSE streams): they bound the sockets holding a request or a stream, though
 not idle ones. A cap that is off with nothing to fall back on
 (`maxopenfiles=-1`, or a socket cap and its connection caps all `0`) counts
 nothing, and neither do ZMQ subscribers or an AssumeUTXO background
-chainstate. With the defaults `required` is 3,435.
+chainstate.
 
-satd raises the soft `RLIMIT_NOFILE` to `total`, never past the hard limit.
-If the result is below `required` it refuses to start with
-`Not enough file descriptors available. X available, Y required.`; if it is
-below `total`, `maxconnections` is lowered to what is left, with
-`Reducing -maxconnections from X to Y, because of system limitations.` The
-log line `Using at most N automatic connections (M file descriptors
-available)` reports the outcome. A SIGHUP that raises `maxconnections` is
-fitted into the same limit. Unlike Core, satd does not refuse to start
-because a raised listener cap (Core's `-rpcmaxconnections`) is what does
-not fit.
+The caps in the formula (`maxopenfiles` and the connection and socket caps)
+count at their value when set on the command line or in `bitcoin.conf`. A
+cap left at its default counts only a floor of 64 (or its default, if
+smaller) toward the hard minimum. With the defaults the hard minimum is 491
+and `total` is 3,435.
+
+satd raises the soft `RLIMIT_NOFILE` to `total`, never past the hard limit,
+and then, in Core's order:
+
+1. If the result is below the hard minimum, it refuses to start with
+   `Not enough file descriptors available. X available, Y required.`
+2. `maxconnections` is lowered to what is left, if it must be, with
+   `Reducing -maxconnections from X to Y, because of system limitations.`
+3. The caps left at their defaults share what remains, each in proportion
+   to its default less its floor, and each one lowered is logged the same
+   way (`Reducing -maxopenfiles from 2048 to 288, ...`). Under a limit of
+   1,024 a default node keeps its 200 peers and runs with 288 RocksDB table
+   files and 172 Esplora sockets.
+
+The log line `Using at most N automatic connections (M file descriptors
+available)` reports the outcome. A SIGHUP keeps the startup split: caps
+still at their defaults keep their fitted values, and a raised
+`maxconnections` is fitted into the room the peers had. Unlike Core, satd
+does not refuse to start because a raised listener cap (Core's
+`-rpcmaxconnections`) is what does not fit; a cap that is set and does not
+fit fails step 1.
 
 ## Signals
 

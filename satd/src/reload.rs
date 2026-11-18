@@ -252,6 +252,9 @@ pub struct ReloadHandles {
     /// The startup file-descriptor budget; a reloaded `maxconnections` is
     /// fitted into it ([`crate::fd_budget`]).
     pub fd_budget: crate::fd_budget::FdBudget,
+    /// The caps the startup budget shrank; a reload gives them back to any
+    /// that are still at their defaults ([`crate::fd_budget::apply`]).
+    pub fd_fitted: Vec<crate::fd_budget::FittedCap>,
     /// Unified-auth bearer-token store, present only when `authfile=` is set.
     /// Re-read on every SIGHUP independently of the rest of the config so that
     /// removing a `[[token]]` revokes it live; a re-read error keeps the
@@ -1217,6 +1220,9 @@ pub fn reload_from_sighup(handles: &ReloadHandles, running: &Config) -> Config {
             return running.clone();
         }
     };
+    // The startup descriptor split: caps still at their defaults run at the
+    // values the budget fitted, so they are not reported as changed.
+    crate::fd_budget::apply(&mut new, &handles.fd_fitted);
 
     let mut applied = 0usize;
     let mut restart_required = 0usize;

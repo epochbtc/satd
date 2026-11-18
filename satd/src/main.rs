@@ -910,28 +910,33 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
 
     // File-descriptor budget, Core's `AppInitParameterInteraction`
     // (`src/init.cpp`): raise the soft limit toward satd's needs plus every
-    // automatic peer, refuse to start if satd's own needs do not fit, and
-    // otherwise lower `-maxconnections` to what is left. Done before the
+    // automatic peer, and refuse to start if the hard minimum (fixed needs,
+    // every cap the operator set, a floor for each cap left at its default)
+    // does not fit. Then `-maxconnections` is fitted as Core does, and the
+    // caps left at their defaults share what is left. Done before the
     // chainstate opens, since RocksDB's table files are part of the need.
     // `config.maxconnections` keeps the operator's value so a SIGHUP diffs
     // against what was configured; the peer manager gets the fitted one.
     let fd_needs = fd_budget::needs(&config);
-    let fd_required = fd_budget::required(&fd_needs);
-    let fd_available =
-        fd_budget::raise_fd_limit(fd_required.saturating_add(config.maxconnections as u64));
-    let fd_budget = match fd_budget::check(fd_available, fd_required) {
-        Ok(budget) => budget,
+    let fd_available = fd_budget::raise_fd_limit(fd_budget::wanted(&fd_needs, config.maxconnections));
+    let fd_plan = match fd_budget::plan(&fd_needs, config.maxconnections, fd_available) {
+        Ok(plan) => plan,
         Err(e) => {
             tracing::debug!(needs = ?fd_needs, "file-descriptor budget");
             eprintln!("Error: {e}");
             node::shutdown::exit_now(1);
         }
     };
-    let (max_connections, fd_note) = fd_budget.fit(config.maxconnections);
-    if let Some(note) = fd_note {
+    tracing::debug!(needs = ?fd_needs, "file-descriptor budget");
+    if let Some(note) = &fd_plan.max_connections_note {
         tracing::warn!("{note}");
     }
-    tracing::debug!(needs = ?fd_needs, "file-descriptor budget");
+    for cap in &fd_plan.fitted {
+        tracing::warn!("{}", cap.note());
+    }
+    fd_budget::apply(&mut config, &fd_plan.fitted);
+    let max_connections = fd_plan.max_connections;
+    let fd_budget = fd_plan.budget;
     tracing::info!(
         "Using at most {} automatic connections ({} file descriptors available)",
         max_connections,
@@ -5302,6 +5307,7 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
         alert_thresholds: alert_thresholds.clone(),
         alert_reloader: alert_reloader.clone(),
         fd_budget,
+        fd_fitted: fd_plan.fitted.clone(),
     };
     loop {
         tokio::select! {

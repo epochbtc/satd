@@ -1313,7 +1313,7 @@ fn test_rpc_bearer_websocket_frames_follow_revocation_and_expiry() {
 /// Every connection-cap option accepts any `usize`. Each is clamped to
 /// `CAP_CEILING` (100,000) before it reaches a tokio semaphore -- unit tests
 /// beside each surface hold that -- and each enabled listener's cap counts
-/// toward the node's file-descriptor needs, as Core counts
+/// toward the node's file-descriptor needs when set, as Core counts
 /// `-rpcmaxconnections` (#1294). Three of them at the ceiling need more than
 /// a 65,536 limit holds, so the node refuses to start with Core's error
 /// instead of panicking or running out of descriptors later.
@@ -1379,10 +1379,11 @@ fn test_oversized_connection_caps_refuse_to_start_cleanly() {
     std::io::Read::read_to_string(&mut child.stderr.take().unwrap(), &mut stderr).unwrap();
     assert_eq!(status.code(), Some(1), "satd did not refuse: {stderr}");
     assert!(!stderr.contains("panicked"), "{stderr}");
-    // 151 base + 2048 RocksDB + 8 addnode + 1 P2P listener + 2 x 101 RPC,
-    // and each surface's listener plus its clamped 100,000.
+    // 151 base + 64 (RocksDB's default table-file cap, at its floor) + 8
+    // addnode + 1 P2P listener + 2 x 101 RPC, and each surface's listener
+    // plus its set cap, clamped to 100,000.
     assert!(
-        stderr.contains(&format!("Error: Not enough file descriptors available. {limit} available, 302413 required.")),
+        stderr.contains(&format!("Error: Not enough file descriptors available. {limit} available, 300429 required.")),
         "{stderr}"
     );
     let _ = std::fs::remove_dir_all(&datadir);

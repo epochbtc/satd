@@ -108,6 +108,111 @@ pub fn check(available: u64, required: u64) -> Result<FdBudget, NotEnough> {
     Ok(FdBudget { available, required })
 }
 
+/// The least a cap left at its default is shrunk to: 64, Core's LevelDB
+/// `max_open_files` on hosts where its table files hold real descriptors
+/// (`SetMaxOpenFiles`, `src/dbwrapper.cpp`), and the default of satd's
+/// smallest connection caps. A default below it is its own floor.
+pub const DEFAULT_CAP_FLOOR: u64 = 64;
+
+/// One line of satd's needs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Need {
+    /// Descriptors satd needs whatever the limit: the base, listeners,
+    /// constant caps, and every cap the operator set.
+    Fixed(u64),
+    /// A cap left at its default (`option` names it): it needs `floor`,
+    /// and takes up to `default` from what is left once the fixed needs
+    /// and `-maxconnections` are met.
+    Default { option: &'static str, default: u64, floor: u64 },
+}
+
+impl Need {
+    fn hard(&self) -> u64 {
+        match *self {
+            Need::Fixed(n) => n,
+            Need::Default { floor, .. } => floor,
+        }
+    }
+
+    fn headroom(&self) -> u64 {
+        match *self {
+            Need::Fixed(_) => 0,
+            Need::Default { default, floor, .. } => default - floor,
+        }
+    }
+}
+
+/// A cap that was shrunk to fit: its option, its default and the value
+/// the node runs with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FittedCap {
+    pub option: &'static str,
+    pub default: u64,
+    pub fitted: u64,
+}
+
+impl FittedCap {
+    /// The line logged for it, after Core's `-maxconnections` warning.
+    pub fn note(&self) -> String {
+        format!(
+            "Reducing -{} from {} to {}, because of system limitations.",
+            self.option, self.default, self.fitted
+        )
+    }
+}
+
+/// What the budget decided at startup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Plan {
+    /// The limit and everything but the automatic peers, as the node runs;
+    /// a reloaded `-maxconnections` is fitted into it.
+    pub budget: FdBudget,
+    /// `-maxconnections` as fitted, and Core's warning if it was lowered.
+    pub max_connections: usize,
+    pub max_connections_note: Option<String>,
+    /// The default caps that were lowered.
+    pub fitted: Vec<FittedCap>,
+}
+
+/// The descriptors to ask the system for: every need at its full value,
+/// plus `-maxconnections`.
+pub fn wanted(items: &[(&'static str, Need)], maxconnections: usize) -> u64 {
+    items
+        .iter()
+        .fold(maxconnections as u64, |acc, (_, n)| acc.saturating_add(n.hard()).saturating_add(n.headroom()))
+}
+
+/// The hard minimum: the fixed needs and each default cap's floor.
+pub fn required(items: &[(&'static str, Need)]) -> u64 {
+    items.iter().fold(0u64, |acc, (_, n)| acc.saturating_add(n.hard()))
+}
+
+/// Fit the node into `available`, in Core's order: refuse if the hard
+/// minimum does not fit, then fit `-maxconnections` as Core does, then
+/// give what is left to the caps left at their defaults, each in
+/// proportion to its headroom above its floor.
+pub fn plan(items: &[(&'static str, Need)], maxconnections: usize, available: u64) -> Result<Plan, NotEnough> {
+    let hard = check(available, required(items))?;
+    let (max_connections, max_connections_note) = hard.fit(maxconnections);
+    let left = available - hard.required - max_connections as u64;
+    let headroom: u64 = items.iter().fold(0u64, |acc, (_, n)| acc.saturating_add(n.headroom()));
+    let mut used = hard.required;
+    let mut fitted = Vec::new();
+    for (_, need) in items {
+        let Need::Default { option, default, floor } = *need else { continue };
+        let extra = if left >= headroom {
+            default - floor
+        } else {
+            (u128::from(default - floor) * u128::from(left) / u128::from(headroom)) as u64
+        };
+        used += extra;
+        if floor + extra < default {
+            fitted.push(FittedCap { option, default, fitted: floor + extra });
+        }
+    }
+    Ok(Plan { budget: FdBudget { available, required: used }, max_connections, max_connections_note, fitted })
+}
+
 /// A connection cap as the surface applies it: clamped to
 /// [`node::http_serve::CAP_CEILING`], `0` read as `0` (no cap, nothing to
 /// budget) unless the surface takes `0` as `1`.
@@ -115,30 +220,33 @@ fn cap(n: usize) -> u64 {
     node::http_serve::clamp_cap(n) as u64
 }
 
-/// A surface with a socket cap and a connection cap taken inside its
-/// handlers: the socket cap, or, when that is off, the connection cap,
-/// which bounds the sockets that hold a request or a stream (idle sockets
-/// stay unbounded).
-fn socket_cap(sockets: usize, conns: usize) -> u64 {
-    if sockets == 0 { cap(conns) } else { cap(sockets) }
+/// The need for cap `option` with value `n`: [`Need::Default`] if the
+/// operator left it at its default, else fixed at its value.
+fn cap_need(config: &Config, option: &'static str, n: u64) -> Need {
+    if config.caps_at_default.contains(&option) && n > 0 {
+        Need::Default { option, default: n, floor: n.min(DEFAULT_CAP_FLOOR) }
+    } else {
+        Need::Fixed(n)
+    }
 }
 
 /// satd's needs apart from the automatic peers, itemized. See the module
 /// docs for the formula.
-pub fn needs(config: &Config) -> Vec<(&'static str, u64)> {
-    let mut items: Vec<(&'static str, u64)> = vec![("base", MIN_SATD_FDS)];
+pub fn needs(config: &Config) -> Vec<(&'static str, Need)> {
+    let fixed = |n: u64| Need::Fixed(n);
+    let mut items: Vec<(&'static str, Need)> = vec![("base", fixed(MIN_SATD_FDS))];
     if config.max_open_files > 0 {
-        items.push(("rocksdb", config.max_open_files as u64));
+        items.push(("rocksdb", cap_need(config, "maxopenfiles", config.max_open_files as u64)));
     }
-    items.push(("addnode", node::net::manager::MAX_ADDNODE_CONNECTIONS as u64));
+    items.push(("addnode", fixed(node::net::manager::MAX_ADDNODE_CONNECTIONS as u64)));
     // Core: `std::max(num_user_p2p_bind, size_t(1))`, counted whether or
     // not the node listens.
-    items.push(("p2p listeners", (config.binds.len() + config.whitebind.len()).max(1) as u64));
+    items.push(("p2p listeners", fixed((config.binds.len() + config.whitebind.len()).max(1) as u64)));
     if config.listenonion {
-        items.push(("tor control", 1));
+        items.push(("tor control", fixed(1)));
     }
     if config.nap {
-        items.push(("nap pulls", node::nap::pull::MAX_PULL_CONNECTIONS as u64));
+        items.push(("nap pulls", fixed(node::nap::pull::MAX_PULL_CONNECTIONS as u64)));
     }
     let rpc_listeners = config.rpcbind.len()
         + usize::from(config.rpc_tls_bind.is_some())
@@ -146,54 +254,86 @@ pub fn needs(config: &Config) -> Vec<(&'static str, u64)> {
         + usize::from(config.rpc_readonly_tls_bind.is_some());
     items.push((
         "rpc",
-        rpc_listeners as u64 * (1 + node::rpc::server::RPC_MAX_CONNECTIONS as u64),
+        fixed(rpc_listeners as u64 * (1 + node::rpc::server::RPC_MAX_CONNECTIONS as u64)),
     ));
     if config.esplora {
-        let listeners = 1 + u64::from(config.esplora_tls_bind.is_some());
-        // Without a socket cap, requests in flight (`esploramaxconns`) and
-        // open SSE streams (`esplorasseconns`, its own semaphore) both hold
-        // sockets.
-        let held = cap(config.esplora_max_conns).saturating_add(cap(config.esplora_sse_max_conns));
-        let clients = if config.esplora_max_sockets == 0 { held } else { cap(config.esplora_max_sockets) };
-        items.push(("esplora", listeners + clients));
+        items.push(("esplora listeners", fixed(1 + u64::from(config.esplora_tls_bind.is_some()))));
+        if config.esplora_max_sockets == 0 {
+            // Without a socket cap, requests in flight (`esploramaxconns`)
+            // and open SSE streams (`esplorasseconns`, its own semaphore)
+            // both hold sockets.
+            items.push(("esplora requests", cap_need(config, "esploramaxconns", cap(config.esplora_max_conns))));
+            items.push(("esplora sse", cap_need(config, "esplorasseconns", cap(config.esplora_sse_max_conns))));
+        } else {
+            items.push(("esplora sockets", cap_need(config, "esploramaxsockets", cap(config.esplora_max_sockets))));
+        }
     }
     if config.electrum {
-        let listeners = 1 + u64::from(config.electrum_tls_bind.is_some());
-        items.push(("electrum", listeners + cap(config.electrum_max_conns).max(1)));
+        items.push(("electrum listeners", fixed(1 + u64::from(config.electrum_tls_bind.is_some()))));
+        items.push(("electrum", cap_need(config, "electrummaxconns", cap(config.electrum_max_conns).max(1))));
     }
     if config.stratum {
         let listeners = 1
             + u64::from(config.stratum_tls_bind.is_some())
             + u64::from(config.stratum_v2_bind.is_some());
-        items.push(("stratum", listeners + cap(config.stratum_max_conns).max(1)));
+        items.push(("stratum listeners", fixed(listeners)));
+        items.push(("stratum", cap_need(config, "stratummaxconns", cap(config.stratum_max_conns).max(1))));
     }
     if config.events_grpc_bind.is_some() {
-        items.push(("events grpc", 1 + cap(config.events_grpc_max_conns)));
+        items.push(("events grpc listener", fixed(1)));
+        items.push(("events grpc", cap_need(config, "eventsgrpcmaxconns", cap(config.events_grpc_max_conns))));
     }
     if config.streamws_bind.is_some() {
-        items.push(("streamws", 1 + socket_cap(config.streamws_max_sockets, config.streamws_max_conns)));
+        items.push(("streamws listener", fixed(1)));
+        // Without a socket cap, the connection cap bounds the sockets that
+        // hold a stream (idle sockets stay unbounded).
+        items.push(if config.streamws_max_sockets == 0 {
+            ("streamws", cap_need(config, "streamwsmaxconns", cap(config.streamws_max_conns)))
+        } else {
+            ("streamws", cap_need(config, "streamwsmaxsockets", cap(config.streamws_max_sockets)))
+        });
     }
     if config.mcp && config.mcp_port.is_some() {
-        items.push(("mcp", 1 + satd_mcp::MCP_MAX_CONNECTIONS as u64));
+        items.push(("mcp", fixed(1 + satd_mcp::MCP_MAX_CONNECTIONS as u64)));
     }
     if config.metricsport.is_some() {
         let per = 1 + node::metrics::METRICS_HTTP_MAX_CONNECTIONS as u64;
         let tls = 1 + node::metrics::METRICS_TLS_MAX_CONNECTIONS as u64;
-        items.push(("metrics", per + if config.metrics_tls_bind.is_some() { tls } else { 0 }));
+        items.push(("metrics", fixed(per + if config.metrics_tls_bind.is_some() { tls } else { 0 })));
     }
     let mut zmq: Vec<&str> = config.zmq_pub.iter().map(|(_, e)| e.as_str()).collect();
     zmq.extend(config.events_zmq_bind.as_deref());
     zmq.sort_unstable();
     zmq.dedup();
     if !zmq.is_empty() {
-        items.push(("zmq", zmq.len() as u64));
+        items.push(("zmq", fixed(zmq.len() as u64)));
     }
     items
 }
 
-/// The sum of [`needs`].
-pub fn required(items: &[(&'static str, u64)]) -> u64 {
-    items.iter().fold(0u64, |acc, (_, n)| acc.saturating_add(*n))
+/// Run the node with the fitted caps: set each one that is still at its
+/// default in `config`. At startup that is every one of them; on a reload
+/// a cap the operator has since set keeps the new value (and is reported
+/// as needing a restart), and the rest keep the startup split.
+pub fn apply(config: &mut Config, fitted: &[FittedCap]) {
+    for cap in fitted {
+        if !config.caps_at_default.contains(&cap.option) {
+            continue;
+        }
+        let n = cap.fitted as usize;
+        match cap.option {
+            "maxopenfiles" => config.max_open_files = cap.fitted as i32,
+            "esploramaxsockets" => config.esplora_max_sockets = n,
+            "esploramaxconns" => config.esplora_max_conns = n,
+            "esplorasseconns" => config.esplora_sse_max_conns = n,
+            "electrummaxconns" => config.electrum_max_conns = n,
+            "stratummaxconns" => config.stratum_max_conns = n,
+            "eventsgrpcmaxconns" => config.events_grpc_max_conns = n,
+            "streamwsmaxsockets" => config.streamws_max_sockets = n,
+            "streamwsmaxconns" => config.streamws_max_conns = n,
+            other => unreachable!("fd budget names no cap {other}"),
+        }
+    }
 }
 
 /// Core's `RaiseFileDescriptorLimit` (`src/util/fs_helpers.cpp`): raise the
@@ -285,27 +425,34 @@ mod tests {
         Config::from_cli(cli).unwrap()
     }
 
-    fn item(items: &[(&'static str, u64)], name: &str) -> Option<u64> {
+    fn item(items: &[(&'static str, Need)], name: &str) -> Option<Need> {
         items.iter().find(|(k, _)| *k == name).map(|(_, n)| *n)
     }
 
-    /// The defaults: the base, RocksDB's 2048 table files, eight addnode
-    /// peers, one P2P listener, two RPC loopback listeners of 1 + 100, and
-    /// Esplora (on by default) with its 1024-socket cap.
+    fn default_cap(option: &'static str, default: u64) -> Option<Need> {
+        Some(Need::Default { option, default, floor: default.min(64) })
+    }
+
+    /// The defaults: the base, eight addnode peers, one P2P listener, two
+    /// RPC loopback listeners of 1 + 100, Esplora's listener (Esplora is on
+    /// by default), and two caps left at their defaults, RocksDB's 2048
+    /// table files and Esplora's 1024 sockets, which need only their floor.
     #[test]
     fn default_needs() {
         let items = needs(&config(&[]));
-        assert_eq!(item(&items, "base"), Some(151));
-        assert_eq!(item(&items, "rocksdb"), Some(2048));
-        assert_eq!(item(&items, "addnode"), Some(8));
-        assert_eq!(item(&items, "p2p listeners"), Some(1));
-        assert_eq!(item(&items, "rpc"), Some(2 * 101));
-        assert_eq!(item(&items, "esplora"), Some(1 + 1024));
-        assert_eq!(required(&items), 151 + 2048 + 8 + 1 + 202 + 1025);
+        assert_eq!(item(&items, "base"), Some(Need::Fixed(151)));
+        assert_eq!(item(&items, "rocksdb"), default_cap("maxopenfiles", 2048));
+        assert_eq!(item(&items, "addnode"), Some(Need::Fixed(8)));
+        assert_eq!(item(&items, "p2p listeners"), Some(Need::Fixed(1)));
+        assert_eq!(item(&items, "rpc"), Some(Need::Fixed(2 * 101)));
+        assert_eq!(item(&items, "esplora listeners"), Some(Need::Fixed(1)));
+        assert_eq!(item(&items, "esplora sockets"), default_cap("esploramaxsockets", 1024));
+        assert_eq!(required(&items), 151 + 8 + 1 + 202 + 1 + 64 + 64);
+        assert_eq!(wanted(&items, 200), 151 + 8 + 1 + 202 + 1 + 2048 + 1024 + 200);
     }
 
-    /// Every enabled surface counts its listeners and its client cap; an
-    /// uncapped one (`0`, `-1`) counts no clients.
+    /// A cap the operator set is fixed at its value, even when it equals
+    /// the default; an uncapped one (`0`, `-1`) counts nothing.
     #[test]
     fn each_surface_counts_its_cap() {
         let items = needs(&config(&[
@@ -317,11 +464,15 @@ mod tests {
             "--rpcbind=127.0.0.1",
             "--rpcallowip=127.0.0.1",
         ]));
-        assert_eq!(item(&items, "rocksdb"), Some(500));
-        assert_eq!(item(&items, "esplora"), Some(1 + 10));
-        assert_eq!(item(&items, "stratum"), Some(1 + 5));
-        assert_eq!(item(&items, "metrics"), Some(1 + 64));
-        assert_eq!(item(&items, "rpc"), Some(101));
+        assert_eq!(item(&items, "rocksdb"), Some(Need::Fixed(500)));
+        assert_eq!(item(&items, "esplora sockets"), Some(Need::Fixed(10)));
+        assert_eq!(item(&items, "stratum listeners"), Some(Need::Fixed(1)));
+        assert_eq!(item(&items, "stratum"), Some(Need::Fixed(5)));
+        assert_eq!(item(&items, "metrics"), Some(Need::Fixed(1 + 64)));
+        assert_eq!(item(&items, "rpc"), Some(Need::Fixed(101)));
+
+        let items = needs(&config(&["--esploramaxsockets=1024"]));
+        assert_eq!(item(&items, "esplora sockets"), Some(Need::Fixed(1024)), "set to the default value");
 
         let items = needs(&config(&[
             "--maxopenfiles=-1",
@@ -330,12 +481,103 @@ mod tests {
             "--esplorasseconns=3",
         ]));
         assert_eq!(item(&items, "rocksdb"), None);
-        assert_eq!(item(&items, "esplora"), Some(1 + 7 + 3), "socket cap off: requests and SSE streams");
+        assert_eq!(item(&items, "esplora requests"), Some(Need::Fixed(7)), "socket cap off: requests");
+        assert_eq!(item(&items, "esplora sse"), Some(Need::Fixed(3)), "and SSE streams");
+
+        let items = needs(&config(&["--esploramaxsockets=0"]));
+        assert_eq!(item(&items, "esplora requests"), default_cap("esploramaxconns", 256));
+        assert_eq!(item(&items, "esplora sse"), default_cap("esplorasseconns", 256));
 
         let items = needs(&config(&["--esploramaxsockets=0", "--esploramaxconns=0", "--esplorasseconns=0"]));
-        assert_eq!(item(&items, "esplora"), Some(1), "both caps off: nothing to budget");
+        assert_eq!(item(&items, "esplora requests"), Some(Need::Fixed(0)), "both caps off: nothing to budget");
 
         let items = needs(&config(&["--esplora=0"]));
-        assert_eq!(item(&items, "esplora"), None);
+        assert_eq!(item(&items, "esplora listeners"), None);
+    }
+
+    /// A default config under the common shell limit of 1,024: the hard
+    /// minimum (491) fits, `-maxconnections` keeps its 200, and the 333
+    /// descriptors left go to RocksDB's table files and Esplora's sockets
+    /// in proportion to their headroom above the floor (1984 : 960).
+    #[test]
+    fn default_caps_shrink_to_fit_a_1024_limit() {
+        let items = needs(&config(&[]));
+        let plan = plan(&items, 200, 1024).expect("a default node starts under 1,024");
+        assert_eq!(plan.max_connections, 200);
+        assert_eq!(plan.max_connections_note, None);
+        assert_eq!(
+            plan.fitted,
+            vec![
+                FittedCap { option: "maxopenfiles", default: 2048, fitted: 64 + 224 },
+                FittedCap { option: "esploramaxsockets", default: 1024, fitted: 64 + 108 },
+            ]
+        );
+        assert!(plan.budget.required + 200 <= 1024);
+        assert_eq!(plan.budget, FdBudget { available: 1024, required: 491 + 224 + 108 });
+        assert_eq!(
+            plan.fitted[1].note(),
+            "Reducing -esploramaxsockets from 1024 to 172, because of system limitations."
+        );
+
+        let mut cfg = config(&[]);
+        apply(&mut cfg, &plan.fitted);
+        assert_eq!((cfg.max_open_files, cfg.esplora_max_sockets), (288, 172));
+    }
+
+    /// The order is Core's: `-maxconnections` is fitted before the default
+    /// caps grow past their floors, and with room for everything nothing is
+    /// lowered.
+    #[test]
+    fn maxconnections_is_fitted_before_the_default_caps() {
+        let items = needs(&config(&[]));
+        let plan = plan(&items, 200, 600).unwrap();
+        assert_eq!(plan.max_connections, 109, "600 - 491");
+        assert!(plan.max_connections_note.is_some());
+        assert_eq!(plan.fitted.iter().map(|c| c.fitted).collect::<Vec<_>>(), vec![64, 64]);
+
+        let plan = plan_for(&items, 200, 65_536);
+        assert_eq!(plan.max_connections, 200);
+        assert!(plan.fitted.is_empty());
+        assert_eq!(plan.budget.required, 151 + 8 + 1 + 202 + 1 + 2048 + 1024);
+    }
+
+    fn plan_for(items: &[(&'static str, Need)], maxconnections: usize, available: u64) -> Plan {
+        plan(items, maxconnections, available).unwrap()
+    }
+
+    /// A cap the operator set stays in the hard minimum: an oversized one
+    /// still refuses, where the same value left as a default could not
+    /// arise.
+    #[test]
+    fn an_explicit_cap_stays_in_the_hard_minimum() {
+        let items = needs(&config(&["--esploramaxsockets=5000"]));
+        assert_eq!(
+            plan(&items, 200, 1024).unwrap_err(),
+            NotEnough { available: 1024, required: 151 + 8 + 1 + 202 + 1 + 64 + 5000 }
+        );
+    }
+
+    /// A reload re-parses the file: caps still at their defaults get the
+    /// startup split back, so restart-only diffs see no change and the
+    /// peer room stays what it was; a cap the operator has since set keeps
+    /// its new value.
+    #[test]
+    fn a_reload_keeps_the_startup_split() {
+        let mut running = config(&[]);
+        let plan = plan(&needs(&running), 200, 1024).unwrap();
+        apply(&mut running, &plan.fitted);
+
+        let mut reloaded = config(&[]);
+        apply(&mut reloaded, &plan.fitted);
+        assert_eq!(
+            (reloaded.max_open_files, reloaded.esplora_max_sockets),
+            (running.max_open_files, running.esplora_max_sockets)
+        );
+        assert_eq!(plan.budget.fit(200), (200, None));
+        assert_eq!(plan.budget.fit(400).0, 201, "a raised maxconnections gets only the peer room");
+
+        let mut set = config(&["--esploramaxsockets=100"]);
+        apply(&mut set, &plan.fitted);
+        assert_eq!((set.max_open_files, set.esplora_max_sockets), (288, 100));
     }
 }
