@@ -20506,6 +20506,27 @@ fn addconnection_is_refused_off_regtest() {
 /// against signet's genesis target.
 const OP_TRUE_SIGNET_BLOCK_1: &str = "00000020f61eee3b63a380a477a063af32b2bbc97c9ff9f01f2c4225e9739881080000000101811a9245cfae75af3f2fb5ebebb35ee25dfee53b74afac6a45be242bbab400f15365ae77031ef3d0140001020000000001010000000000000000000000000000000000000000000000000000000000000000ffffffff025100ffffffff0200f2052a0100000001510000000000000000266a24aa21a9ede2f61c3f71d1defd3fa999dfa36953755c690689799962b48bebd836974e8cf90120000000000000000000000000000000000000000000000000000000000000000000000000";
 
+/// The message start of each record in `blocks_dir/blk00000.dat`, in order,
+/// after undoing the `xor.dat` obfuscation.
+fn blk_record_magics(blocks_dir: &std::path::Path) -> Vec<[u8; 4]> {
+    let key = std::fs::read(blocks_dir.join("xor.dat")).unwrap();
+    let mut data = std::fs::read(blocks_dir.join("blk00000.dat")).unwrap();
+    for (i, b) in data.iter_mut().enumerate() {
+        *b ^= key[i % key.len()];
+    }
+    let mut magics = Vec::new();
+    let mut offset = 0;
+    while offset + 8 <= data.len() {
+        let size = u32::from_le_bytes(data[offset + 4..offset + 8].try_into().unwrap()) as usize;
+        if size == 0 {
+            break;
+        }
+        magics.push(data[offset..offset + 4].try_into().unwrap());
+        offset += 8 + size;
+    }
+    magics
+}
+
 /// #1271: a custom signet keeps its data in `signet_<message start>`, as in
 /// Core's `GetSignetDataDir`. One that earlier releases kept in `signet/` is
 /// found there by its tip's solution, and startup refuses with the moves to
@@ -20514,7 +20535,9 @@ const OP_TRUE_SIGNET_BLOCK_1: &str = "00000020f61eee3b63a380a477a063af32b2bbc97c
 ///
 /// Perturbation: drop `check_old_signet_datadir` from `main` and the refused
 /// start instead starts on an empty `signet_54d26fbd/`, so
-/// `run_satd_until_exit_on` times out.
+/// `run_satd_until_exit_on` times out. Build the `ChainState` with
+/// `ChainState::new` and set the challenge afterwards, as before #1283, and
+/// genesis is framed with the default signet's magic.
 #[test]
 fn a_custom_signet_in_the_old_signet_directory_is_refused_with_the_moves() {
     let datadir = fresh_test_datadir("satd-custom-signet-moved");
@@ -20538,6 +20561,12 @@ fn a_custom_signet_in_the_old_signet_directory_is_refused_with_the_moves() {
     node.datadir = PathBuf::new();
     assert!(!datadir.join("signet").exists());
     assert!(blocks_root.join(own).join("blocks").is_dir());
+    // Genesis and block 1 are framed with this signet's message start, as
+    // Core frames them, not the default signet's `0a03cf40` (#1283).
+    assert_eq!(
+        blk_record_magics(&blocks_root.join(own).join("blocks")),
+        vec![[0x54, 0xd2, 0x6f, 0xbd]; 2]
+    );
 
     // Where earlier releases kept it.
     std::fs::rename(datadir.join(own), datadir.join("signet")).unwrap();

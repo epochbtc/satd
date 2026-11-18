@@ -1405,16 +1405,35 @@ pub fn get_block_stats(
     // below and report every fee as zero.) With no undo row (a block that
     // never connected) the live set is the only source, and it is correct
     // for exactly that case: the coins are still there.
+    //
+    // The same coins give the size of every spent output, which
+    // `utxo_size_inc` and `utxo_size_inc_actual` subtract. Without an undo
+    // row only the prevouts still in the live set are subtracted.
     let undo = chain_state
         .read_undo(&hash)
         .map_err(|_| UNDO_READ_FAILED.to_string())?;
-    let profile = match undo {
-        Some(undo) => BlockFeeProfile::from_undo(&block, &undo).map_err(|e| {
-            format!("undo data for block {hash} is inconsistent with the block ({e}); fee statistics unavailable")
-        })?,
-        None => BlockFeeProfile::from_lookup(&block, |prevout| {
-            chain_state.get_coin(prevout).map(|coin| coin.amount)
-        }),
+    let (profile, spent_size) = match undo {
+        Some(undo) => {
+            let profile = BlockFeeProfile::from_undo(&block, &undo).map_err(|e| {
+                format!("undo data for block {hash} is inconsistent with the block ({e}); fee statistics unavailable")
+            })?;
+            let spent: i64 = undo.spent_coins.iter().map(|c| utxo_size(&c.script_pubkey)).sum();
+            (profile, spent)
+        }
+        None => {
+            let profile = BlockFeeProfile::from_lookup(&block, |prevout| {
+                chain_state.get_coin(prevout).map(|coin| coin.amount)
+            });
+            let spent: i64 = block
+                .txdata
+                .iter()
+                .filter(|tx| !tx.is_coinbase())
+                .flat_map(|tx| tx.input.iter())
+                .filter_map(|txin| chain_state.get_coin(&txin.previous_output))
+                .map(|coin| utxo_size(&coin.script_pubkey))
+                .sum();
+            (profile, spent)
+        }
     };
 
     // Every size, weight and feerate statistic is over the non-coinbase
@@ -1436,17 +1455,40 @@ pub fn get_block_stats(
     // Core's `mediantxsize` is the truncated median of the non-coinbase
     // transactions' total sizes (`CalculateTruncatedMedian(txsize_array)`).
     let mut tx_sizes: Vec<u64> = Vec::with_capacity(num_txs.saturating_sub(1));
+    // Core's `utxo_size_inc` counts every output; the `_actual` pair leaves
+    // out the outputs that never enter the UTXO set: unspendable ones, and
+    // the whole coinbase of the genesis block and of the two BIP30 repeats
+    // (v32.1 `src/rpc/blockchain.cpp:2115-2129`).
+    let mut utxo_size_inc: i64 = 0;
+    let mut utxo_size_inc_actual: i64 = 0;
+    let mut utxos_actual: i64 = 0;
+    let mut inputs: i64 = 0;
+    let coinbase_not_in_set =
+        entry.height == 0 || crate::chain::connect::bip30_exempt(chain_state.network, entry.height, &hash);
 
     for tx in &block.txdata {
-        let out_sum: u64 = tx.output.iter().map(|o| o.value.to_sat()).sum();
-        total_out += out_sum;
         utxo_increase += tx.output.len() as i64;
+        for out in &tx.output {
+            let size = utxo_size(&out.script_pubkey);
+            utxo_size_inc += size;
+            if (coinbase_not_in_set && tx.is_coinbase())
+                || crate::chain::connect::is_unspendable(&out.script_pubkey)
+            {
+                continue;
+            }
+            utxos_actual += 1;
+            utxo_size_inc_actual += size;
+        }
 
         if tx.is_coinbase() {
             continue;
         }
 
+        // Core leaves the coinbase out of `total_out` ("excluding coinbase
+        // and thus reward", v32.1 `:2133-2138`).
+        total_out += tx.output.iter().map(|o| o.value.to_sat()).sum::<u64>();
         utxo_increase -= tx.input.len() as i64;
+        inputs += tx.input.len() as i64;
         let tx_size = serialize(tx).len();
         let tx_weight = tx.weight().to_wu();
         tx_sizes.push(tx_size as u64);
@@ -1541,8 +1583,23 @@ pub fn get_block_stats(
         "totalfee": total_fee,
         "txs": num_txs,
         "utxo_increase": utxo_increase,
-        "utxo_size_inc": utxo_increase * 50,
+        "utxo_size_inc": utxo_size_inc - spent_size,
+        "utxo_increase_actual": utxos_actual - inputs,
+        "utxo_size_inc_actual": utxo_size_inc_actual - spent_size,
     }))
+}
+
+/// Core's `PER_UTXO_OVERHEAD` (v32.1 `src/rpc/blockchain.cpp:1990`):
+/// `sizeof(COutPoint) + sizeof(uint32_t)`, the outpoint plus the packed
+/// height and coinbase flag.
+const PER_UTXO_OVERHEAD: i64 = 36 + 4;
+
+/// What one output adds to `utxo_size_inc`: Core's
+/// `GetSerializeSize(out) + PER_UTXO_OVERHEAD`, the serialized `CTxOut`
+/// (8-byte value, compact-size length, script) plus the overhead.
+fn utxo_size(script_pubkey: &bitcoin::Script) -> i64 {
+    let len = script_pubkey.len();
+    (8 + bitcoin::consensus::encode::VarInt(len as u64).size() + len) as i64 + PER_UTXO_OVERHEAD
 }
 
 /// `getchaintips` — return info for every chain tip known to the block index.
