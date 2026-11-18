@@ -443,9 +443,11 @@ pub(crate) fn decode_transaction_verbose_net(
     network: bitcoin::Network,
 ) -> Value {
     let txid = tx.compute_txid();
-    let raw = bitcoin::consensus::serialize(tx);
+    // Core's measures, which leave out the marker and flag rust-bitcoin
+    // counts for a transaction with no inputs (`validation::decode`).
+    let raw = crate::validation::decode::serialize_transaction(tx);
     let size = raw.len();
-    let weight = tx.weight().to_wu() as usize;
+    let weight = crate::validation::decode::weight(tx).to_wu() as usize;
     let vsize = weight.div_ceil(4);
     let unit = default_unit();
     // A coinbase has no undo data; an undo slice that does not match the
@@ -506,8 +508,9 @@ pub(crate) fn decode_transaction_verbose_net(
 
     // The wtxid (`hash` in Core's output). For non-segwit transactions
     // this equals the txid; for segwit transactions it is the hash that
-    // commits to the witness data as well (BIP 141).
-    let wtxid = tx.compute_wtxid();
+    // commits to the witness data as well (BIP 141). Core's value, which
+    // is the txid for a transaction with no inputs.
+    let wtxid = crate::validation::decode::wtxid(tx);
 
     let mut result = json!({
         "txid": txid.to_string(),
@@ -782,7 +785,8 @@ pub fn create_raw_transaction(
         output: tx_outputs,
     };
 
-    let raw = bitcoin::consensus::serialize(&tx);
+    // Core's bytes: no marker and flag for a transaction with no inputs.
+    let raw = crate::validation::decode::serialize_transaction(&tx);
     Ok(Value::String(hex::encode(raw)))
 }
 
@@ -1190,7 +1194,7 @@ pub fn combine_raw_transaction(hex_txs: &[String]) -> Result<Value, (i32, String
         }
     }
 
-    let raw = bitcoin::consensus::serialize(&combined);
+    let raw = crate::validation::decode::serialize_transaction(&combined);
     Ok(Value::String(hex::encode(raw)))
 }
 
@@ -1652,7 +1656,7 @@ pub fn sign_raw_transaction_with_key(
 
     let complete = errors.is_empty()
         && tx.input.iter().all(|inp| !inp.script_sig.is_empty() || !inp.witness.is_empty());
-    let raw = bitcoin::consensus::serialize(&tx);
+    let raw = crate::validation::decode::serialize_transaction(&tx);
 
     let mut result = json!({
         "hex": hex::encode(raw),

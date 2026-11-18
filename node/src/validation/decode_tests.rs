@@ -152,3 +152,33 @@ fn compact_block_messages_read_their_transactions_as_core_reads_them() {
     assert!(deserialize::<BlockTransactions>(&raw).is_err());
     assert!(read_block_transactions(&mut raw.as_slice()).unwrap().transactions[0].input.is_empty());
 }
+
+/// Core writes, measures and hashes a transaction with no inputs without the
+/// marker and flag: `decoderawtransaction 02000000000000000000` on Core v32.1
+/// reports size 10, vsize 10, weight 40 and hash = txid, and
+/// `createrawtransaction [] '[{"data":"00"}]'` returns
+/// `0200000000010000000000000000036a01 0000000000` (spaces aside).
+#[test]
+fn a_transaction_with_no_inputs_is_written_and_measured_as_core_does() {
+    let tx = deserialize_transaction(&bytes(EMPTY)).unwrap();
+    assert_eq!(hex::encode(serialize_transaction(&tx)), EMPTY);
+    assert_eq!(total_size(&tx), 10);
+    assert_eq!(weight(&tx).to_wu(), 40);
+    assert_eq!(vsize(&tx), 10);
+    assert_eq!(serialize(&tx).len(), 12, "rust-bitcoin writes the marker and flag");
+
+    let data = Transaction {
+        output: vec![TxOut { value: Amount::ZERO, script_pubkey: ScriptBuf::from_bytes(vec![0x6a, 0x01, 0x00]) }],
+        ..tx
+    };
+    assert_eq!(hex::encode(serialize_transaction(&data)), "0200000000010000000000000000036a010000000000");
+    assert_eq!((total_size(&data), weight(&data).to_wu(), vsize(&data)), (22, 88, 22));
+
+    // Every transaction with an input is written and measured as before.
+    for t in [spend(&[]), spend(&[b"w"])] {
+        assert_eq!(serialize_transaction(&t), serialize(&t));
+        assert_eq!(total_size(&t), t.total_size());
+        assert_eq!(weight(&t), t.weight());
+        assert_eq!(vsize(&t), t.vsize());
+    }
+}

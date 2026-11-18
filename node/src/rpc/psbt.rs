@@ -746,7 +746,7 @@ pub fn finalize_psbt(
             if extract && complete {
                 let tx = psbt_v2::extract(&finalized)?;
                 Ok(json!({
-                    "hex": hex::encode(bitcoin::consensus::serialize(&tx)),
+                    "hex": hex::encode(crate::validation::decode::serialize_transaction(&tx)),
                     "complete": true,
                 }))
             } else {
@@ -772,7 +772,8 @@ fn finalize_psbt_v0(mut psbt: Psbt, extract: bool) -> Result<Value, (i32, String
 
     if extract && complete {
         let tx = psbt.extract_tx_unchecked_fee_rate();
-        let tx_hex = hex::encode(bitcoin::consensus::serialize(&tx));
+        // Core's bytes, also for a transaction with no inputs.
+        let tx_hex = hex::encode(crate::validation::decode::serialize_transaction(&tx));
         Ok(json!({
             "hex": tx_hex,
             "complete": true,

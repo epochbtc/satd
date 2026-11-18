@@ -23,9 +23,11 @@
 //! rust-bitcoin's decoders exactly as before.
 //!
 //! Because of the second point, bytes rust-bitcoin wrote for a transaction
-//! with no inputs do not read back here. These readers are for bytes from
-//! outside: the P2P messages and the RPC arguments Core reads with
-//! `TX_WITH_WITNESS`.
+//! with no inputs do not read back here. Core writes such a transaction
+//! without the marker and flag (`SerializeTransaction` writes them only when
+//! an input carries a witness), and measures and hashes it in that form:
+//! [`serialize_transaction`], [`total_size`], [`weight`], [`vsize`] and
+//! [`wtxid`] do the same, for every RPC that prints or writes one.
 
 use bitcoin::bip152::{BlockTransactions, HeaderAndShortIds, PrefilledTransaction, ShortId};
 use bitcoin::consensus::encode::{self, Decodable, VarInt, MAX_VEC_SIZE};
@@ -147,6 +149,49 @@ pub fn wtxid(tx: &Transaction) -> Wtxid {
     } else {
         tx.compute_wtxid()
     }
+}
+
+/// A transaction written as Core writes it with witnesses allowed
+/// (`SerializeTransaction`, `TX_WITH_WITNESS`): the marker and flag only when
+/// an input carries a witness.
+///
+/// rust-bitcoin writes the same bytes for every transaction with an input.
+/// For one with no inputs it writes `version 00 01 ...`, which neither Core
+/// nor [`read_transaction`] reads back; Core writes `version 00 <outputs>
+/// lock_time`, what `createrawtransaction` with no inputs returns.
+pub fn serialize_transaction(tx: &Transaction) -> Vec<u8> {
+    if !tx.input.is_empty() {
+        return encode::serialize(tx);
+    }
+    let mut out = Vec::with_capacity(tx.base_size());
+    encode::Encodable::consensus_encode(&tx.version, &mut out).expect("vec");
+    encode::Encodable::consensus_encode(&tx.input, &mut out).expect("vec");
+    encode::Encodable::consensus_encode(&tx.output, &mut out).expect("vec");
+    encode::Encodable::consensus_encode(&tx.lock_time, &mut out).expect("vec");
+    out
+}
+
+/// The length of [`serialize_transaction`]'s bytes (Core's
+/// `GetSerializeSize(TX_WITH_WITNESS(tx))`, `size` in `decoderawtransaction`).
+pub fn total_size(tx: &Transaction) -> usize {
+    if tx.input.is_empty() { tx.base_size() } else { tx.total_size() }
+}
+
+/// Core's `GetTransactionWeight`: three times the size without witnesses plus
+/// [`total_size`]. For a transaction with no inputs it is four times its
+/// size; rust-bitcoin counts the marker and flag in it.
+pub fn weight(tx: &Transaction) -> bitcoin::Weight {
+    if tx.input.is_empty() {
+        bitcoin::Weight::from_wu_usize(tx.base_size() * 4)
+    } else {
+        tx.weight()
+    }
+}
+
+/// [`weight`] in virtual bytes, rounded up (Core's `GetVirtualTransactionSize`
+/// with no sigops).
+pub fn vsize(tx: &Transaction) -> usize {
+    (weight(tx).to_wu() as usize).div_ceil(4)
 }
 
 #[cfg(test)]

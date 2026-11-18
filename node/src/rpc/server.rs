@@ -2310,7 +2310,7 @@ pub async fn start(
                 .map(|tx| {
                     serde_json::json!({
                         "txid": tx.compute_txid().to_string(),
-                        "wtxid": tx.compute_wtxid().to_string(),
+                        "wtxid": crate::validation::decode::wtxid(tx).to_string(),
                         "package-error": reason,
                     })
                 })
@@ -2329,7 +2329,7 @@ pub async fn start(
             match judged {
                 Ok((vsize, fees)) => {
                     let (vsize, fees) = (*vsize, *fees);
-                    let wtxid = tx.compute_wtxid();
+                    let wtxid = crate::validation::decode::wtxid(tx);
                     let feerate_sat_per_kvb = fees.saturating_mul(1000) / (vsize as u64).max(1);
                     if maxfeerate_sat_per_kvb > 0 && feerate_sat_per_kvb > maxfeerate_sat_per_kvb {
                         entry["allowed"] = false.into();
@@ -2370,7 +2370,7 @@ pub async fn start(
             // `wtxid` is on *every* Core result, including the refusals.
             serde_json::json!({
                 "txid": tx.compute_txid().to_string(),
-                "wtxid": tx.compute_wtxid().to_string(),
+                "wtxid": crate::validation::decode::wtxid(tx).to_string(),
             })
         };
         // Core (`validation.cpp`) reports `txn-already-known` only when one
@@ -2409,7 +2409,7 @@ pub async fn start(
                 if let Some(e) = &package.package_error {
                     entry["package-error"] = e.clone().into();
                 }
-                if let Some(judged) = package.results.get(&tx.compute_wtxid())
+                if let Some(judged) = package.results.get(&crate::validation::decode::wtxid(tx))
                     && !exit_early
                 {
                     exit_early = render(tx, judged, &mut entry);

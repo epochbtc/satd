@@ -1516,7 +1516,7 @@ where
     // Core reports a single oversized transaction against the per-transaction
     // limit instead, which is the more specific message.
     if pkg.len() > 1 {
-        let total: u64 = pkg.iter().map(|p| p.tx().weight().to_wu()).sum();
+        let total: u64 = pkg.iter().map(|p| crate::validation::decode::weight(p.tx()).to_wu()).sum();
         if total > MAX_PACKAGE_WEIGHT {
             return Err("package-too-large");
         }
@@ -7006,7 +7006,7 @@ impl Mempool {
             match checked {
                 Ok(p) => pre.push(p),
                 Err(e) => {
-                    out.results.insert(tx.compute_wtxid(), Err(e));
+                    out.results.insert(crate::validation::decode::wtxid(tx), Err(e));
                     return out;
                 }
             }
@@ -7031,13 +7031,13 @@ impl Mempool {
             if !cfg.accept_non_std_txn
                 && let Some((i, e)) = Self::package_ephemeral_spends(&inner, &cfg, txs)
             {
-                out.results.insert(txs[i].compute_wtxid(), Err(e));
+                out.results.insert(crate::validation::decode::wtxid(&txs[i]), Err(e));
                 return out;
             }
         }
 
         for (tx, p) in txs.iter().zip(pre) {
-            let wtxid = tx.compute_wtxid();
+            let wtxid = crate::validation::decode::wtxid(tx);
             match self.test_finish(tx, chain_state, script_verifier, p) {
                 Ok((_, vsize, fee)) => {
                     out.results.insert(wtxid, Ok((vsize, fee)));
@@ -7500,7 +7500,9 @@ impl Mempool {
             .into_iter()
             .map(|tx| {
                 let txid = tx.compute_txid();
-                let wtxid = tx.compute_wtxid();
+                // Core's wtxid, which keys `tx-results` (the txid for a
+                // transaction with no inputs).
+                let wtxid = crate::validation::decode::wtxid(&tx);
                 PkgTx { tx, txid, wtxid }
             })
             .collect();
