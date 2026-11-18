@@ -42,16 +42,24 @@ def mutant(outcome):
 
 
 def read_known(path):
-    """The rows of known-missed.tsv, keyed by (file, column, mutation, line)."""
+    """The rows of known-missed.tsv, keyed by (file, column, mutation, line).
+
+    A malformed row is named on stderr and skipped: its mutant is then
+    reported as new, which is safe, rather than failing the report."""
     rows = {}
     if not os.path.exists(path):
         return rows
     with open(path) as f:
-        for raw in f:
+        for n, raw in enumerate(f, 1):
             if raw.startswith("#") or not raw.strip():
                 continue
-            file, column, mutation, kind, why, line = raw.rstrip("\n").split("\t")
-            rows[(file, int(column), mutation, line)] = (kind, why)
+            fields = raw.rstrip("\r\n").split("\t")
+            try:
+                file, column, mutation, kind, why, line = fields
+                rows[(file, int(column), mutation, line)] = (kind, why)
+            except ValueError:
+                print(f"warning: {path}:{n}: not 6 tab-separated fields with a numeric "
+                      "column; row ignored", file=sys.stderr)
     return rows
 
 
@@ -78,13 +86,13 @@ class Sources:
             return None
         raw = lines[start["line"] - 1]
         line = raw.strip()
-        # A line that appears twice in its function would make one row stand
-        # for both copies, hiding a new one: such a mutant never matches.
+        # A line that appears twice in its function (in its file, for a
+        # mutant outside any function) would make one row stand for both
+        # copies, hiding a new one: such a mutant never matches.
         fn = (m.get("function") or {}).get("span")
-        if fn:
-            body = lines[fn["start"]["line"] - 1 : fn["end"]["line"]]
-            if sum(1 for r in body if r.strip() == line) > 1:
-                return None
+        scope = lines[fn["start"]["line"] - 1 : fn["end"]["line"]] if fn else lines
+        if sum(1 for r in scope if r.strip() == line) > 1:
+            return None
         column = start["column"] - (len(raw) - len(raw.lstrip()))
         return (m["file"], column, m["name"].split(": ", 1)[-1], line)
 
@@ -120,7 +128,7 @@ def main():
     timeouts = by.get("Timeout", [])
     caught = len(by.get("CaughtMutant", []))
     unviable = len(by.get("Unviable", []))
-    viable = caught + len(missed) + len(timeouts)
+    viable = caught + len(missed) + len(judged) + len(timeouts)
 
     out = ["### Mutation testing", ""]
     if args.note:

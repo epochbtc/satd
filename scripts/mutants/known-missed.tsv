@@ -14,7 +14,8 @@
 # A row must name exactly one mutant (check with `cargo mutants --list` on
 # its file). The report never matches a mutant whose line text appears more
 # than once in its function, so a copy of a known line added later is
-# reported as new rather than hidden by the row.
+# reported as new rather than hidden by the row. For a mutant outside any
+# function (a constant, say) the line must be unique in its file.
 #
 # Tab-separated: file, column, mutation, kind, why, line.
 consensus/src/encoding.rs	22	replace | with ^ in check_signature_encoding	equivalent	DERSIG, LOW_S and STRICTENC are distinct single bits, so | and ^ agree.	flags::VERIFY_DERSIG | flags::VERIFY_LOW_S | flags::VERIFY_STRICTENC,
