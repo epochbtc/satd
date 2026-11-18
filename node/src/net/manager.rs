@@ -12739,11 +12739,11 @@ impl PeerManager {
         source: crate::mempool::pool::TxSource,
         allow_quarantined: bool,
     ) -> Result<serde_json::Value, (i32, String)> {
-        let tx_bytes =
-            hex::decode(hex_tx).map_err(|_| (-22, "TX decode failed".to_string()))?;
         // Core's `DecodeHexTx`, as `sendrawtransaction`'s own checks read it.
-        let tx: bitcoin::Transaction = crate::rpc::rawtx::decode_tx(&tx_bytes, true, true)
-            .ok_or((-22, "TX decode failed".to_string()))?;
+        let tx: bitcoin::Transaction = hex::decode(hex_tx)
+            .ok()
+            .and_then(|bytes| crate::rpc::rawtx::decode_hex_tx(&bytes))
+            .ok_or_else(|| (-22, crate::rpc::rawtx::send_decode_failed()))?;
         let txid = self
             .submit_and_announce(tx, source, allow_quarantined)
             .map_err(|e| {

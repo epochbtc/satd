@@ -324,6 +324,28 @@ pub(crate) fn decode_tx(
     extended.or(legacy)
 }
 
+/// Core's `DecodeHexTx` with its defaults (`try_no_witness=false`,
+/// `try_witness=true`, `src/core_io.h`): the extended reading only. Every RPC
+/// but `decoderawtransaction`, `converttopsbt` and the wallet's
+/// `fundrawtransaction` reads a transaction this way, so a transaction only
+/// the legacy reading makes sense of, such as `createrawtransaction`'s
+/// answer with no inputs and an output, is a decode failure there.
+pub(crate) fn decode_hex_tx(tx_bytes: &[u8]) -> Option<bitcoin::Transaction> {
+    decode_tx(tx_bytes, false, true)
+}
+
+/// What Core adds to a decode failure in `sendrawtransaction`,
+/// `testmempoolaccept`, `submitpackage`, `combinerawtransaction`,
+/// `signrawtransactionwithkey` and `generateblock` (v32.1,
+/// `src/rpc/mempool.cpp`, `rawtransaction.cpp`, `mining.cpp`).
+pub(crate) const AT_LEAST_ONE_INPUT: &str = "Make sure the tx has at least one input.";
+
+/// Core's decode-failure message for `sendrawtransaction` and
+/// `signrawtransactionwithkey`.
+pub(crate) fn send_decode_failed() -> String {
+    format!("TX decode failed. {AT_LEAST_ONE_INPUT}")
+}
+
 /// Read a transaction with the pre-segwit serialization: version, inputs,
 /// outputs, locktime, and nothing else. Refuses trailing bytes.
 fn deserialize_legacy_tx(bytes: &[u8]) -> Option<bitcoin::Transaction> {
@@ -1168,17 +1190,20 @@ pub fn combine_raw_transaction(hex_txs: &[String]) -> Result<Value, (i32, String
         return Err((-8, "Missing transactions".to_string()));
     }
 
-    // Deserialize the first tx as the base
-    let first_bytes = hex::decode(&hex_txs[0]).map_err(|_| (-22, "TX decode failed".to_string()))?;
-    // Core reads each with `DecodeHexTx` (src/rpc/rawtransaction.cpp).
-    let mut combined: Transaction = decode_tx(&first_bytes, true, true)
-        .ok_or((-22, "TX decode failed".to_string()))?;
+    // Core reads every one with `DecodeHexTx`'s defaults before merging, and
+    // names the one that fails by its index (src/rpc/rawtransaction.cpp).
+    let mut txs = Vec::with_capacity(hex_txs.len());
+    for (idx, hex_tx) in hex_txs.iter().enumerate() {
+        let tx = hex::decode(hex_tx).ok().and_then(|bytes| decode_hex_tx(&bytes)).ok_or_else(|| {
+            (-22, format!("TX decode failed for tx {idx}. {AT_LEAST_ONE_INPUT}"))
+        })?;
+        txs.push(tx);
+    }
+    let mut txs = txs.into_iter();
+    let mut combined: Transaction = txs.next().expect("not empty");
 
     // Merge scriptSig and witness from subsequent txs
-    for hex_tx in &hex_txs[1..] {
-        let tx_bytes = hex::decode(hex_tx).map_err(|_| (-22, "TX decode failed".to_string()))?;
-        let tx: Transaction = decode_tx(&tx_bytes, true, true)
-            .ok_or((-22, "TX decode failed".to_string()))?;
+    for tx in txs {
 
         if tx.input.len() != combined.input.len() {
             return Err((-22, "Transaction input count mismatch".to_string()));
@@ -1364,10 +1389,12 @@ pub fn sign_raw_transaction_with_key(
     prevtxs: Option<&[Value]>,
     sighash_type: Option<&str>,
 ) -> Result<Value, (i32, String)> {
-    let tx_bytes = hex::decode(hex_tx).map_err(|_| (-22, "TX decode failed".to_string()))?;
-    // Core's `DecodeHexTx` (src/rpc/rawtransaction.cpp).
-    let mut tx: Transaction = decode_tx(&tx_bytes, true, true)
-        .ok_or((-22, "TX decode failed".to_string()))?;
+    // Core's `DecodeHexTx` with its defaults, and its message
+    // (src/rpc/rawtransaction.cpp).
+    let mut tx: Transaction = hex::decode(hex_tx)
+        .ok()
+        .and_then(|bytes| decode_hex_tx(&bytes))
+        .ok_or_else(|| (-22, send_decode_failed()))?;
 
     let secp = Secp256k1::new();
     let ecdsa_sighash_type = parse_sighash_type(sighash_type)?;
@@ -2312,14 +2339,68 @@ mod tests {
     /// `combinerawtransaction` and `signrawtransactionwithkey` read their hex
     /// with Core's `DecodeHexTx`, which takes `version | 00 00 | lock_time`
     /// as a transaction with no inputs (#1242); rust-bitcoin refuses it.
+    ///
+    /// Both write it back as Core does, without the marker and flag. Both
+    /// read only the extended form, as `DecodeHexTx`'s defaults do, so
+    /// `createrawtransaction`'s answer with no inputs and an output, which
+    /// only the legacy reading makes sense of, is a decode failure, with
+    /// Core's message. Every answer is a Core v31.1 regtest node's.
     #[test]
     fn hex_rpcs_read_a_transaction_with_no_inputs_as_core_does() {
         const EMPTY: &str = "02000000000000000000";
         let combined = combine_raw_transaction(&[EMPTY.to_string(), EMPTY.to_string()]);
-        assert!(combined.is_ok(), "{combined:?}");
+        assert_eq!(combined, Ok(json!(EMPTY)));
         let (cs, _dir) = make_chain_state();
-        let signed = sign_raw_transaction_with_key(&cs, EMPTY, &[], None, None);
-        assert!(signed.is_ok(), "{signed:?}");
+        let signed = sign_raw_transaction_with_key(&cs, EMPTY, &[], None, None).unwrap();
+        assert_eq!(signed["hex"], json!(EMPTY), "{signed}");
+        assert_eq!(signed["complete"], json!(true), "{signed}");
+
+        let data = create_raw_transaction(&[], &json!([{"data": "00"}]), None, None, None, bitcoin::Network::Regtest)
+            .unwrap();
+        let data = data.as_str().unwrap().to_string();
+        assert_eq!(data, "0200000000010000000000000000036a010000000000");
+        assert_eq!(
+            combine_raw_transaction(std::slice::from_ref(&data)),
+            Err((-22, "TX decode failed for tx 0. Make sure the tx has at least one input.".to_string()))
+        );
+        assert_eq!(
+            combine_raw_transaction(&[EMPTY.to_string(), data.clone()]),
+            Err((-22, "TX decode failed for tx 1. Make sure the tx has at least one input.".to_string()))
+        );
+        assert_eq!(
+            sign_raw_transaction_with_key(&cs, &data, &[], None, None),
+            Err((-22, "TX decode failed. Make sure the tx has at least one input.".to_string()))
+        );
+        assert_eq!(
+            sign_raw_transaction_with_key(&cs, "zz", &[], None, None),
+            Err((-22, "TX decode failed. Make sure the tx has at least one input.".to_string()))
+        );
+    }
+
+    /// `createrawtransaction` with no inputs writes Core's bytes, and
+    /// `decoderawtransaction` reads them back (by the legacy reading) and
+    /// measures them as Core does: no marker and flag, hash = txid.
+    #[test]
+    fn a_transaction_with_no_inputs_round_trips_and_is_measured_as_core_does() {
+        let net = bitcoin::Network::Regtest;
+        let empty = create_raw_transaction(&[], &json!([]), None, None, None, net).unwrap();
+        assert_eq!(empty, json!("02000000000000000000"));
+        let d = decode_raw_transaction(empty.as_str().unwrap(), None, net).unwrap();
+        let txid = "4ebd325a4b394cff8c57e8317ccf5a8d0e2bdf1b8526f8aad6c8e43d8240621a";
+        assert_eq!((&d["txid"], &d["hash"]), (&json!(txid), &json!(txid)), "{d}");
+        assert_eq!((&d["size"], &d["vsize"], &d["weight"]), (&json!(10), &json!(10), &json!(40)), "{d}");
+
+        let data = create_raw_transaction(&[], &json!([{"data": "00"}]), None, None, None, net).unwrap();
+        let d = decode_raw_transaction(data.as_str().unwrap(), None, net).unwrap();
+        let txid = "a3d7f8ae2affadf33258cb830bcccd1451cfc122d766ec5e8e9922c5e4ad60a9";
+        assert_eq!((&d["txid"], &d["hash"]), (&json!(txid), &json!(txid)), "{d}");
+        assert_eq!((&d["size"], &d["vsize"], &d["weight"]), (&json!(22), &json!(22), &json!(88)), "{d}");
+        assert_eq!(d["vout"][0]["scriptPubKey"]["hex"], json!("6a0100"), "{d}");
+        // Core: forcing the extended reading fails.
+        assert_eq!(
+            decode_raw_transaction(data.as_str().unwrap(), Some(true), net),
+            Err((-22, "TX decode failed".to_string()))
+        );
     }
 
     #[test]
