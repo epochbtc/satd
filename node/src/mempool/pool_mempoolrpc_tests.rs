@@ -220,6 +220,57 @@ fn entry_fee_rollups_carry_a_negative_modified_fee() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Core v31's chunk fields (`entryToJSON`: `chunkweight` and `fees.chunk`,
+/// from `GetMainChunkFeerate`), on the shape a Core v32.1 regtest node was
+/// run with: a lone transaction paying 1 000 sat, and a chain paying 100,
+/// 10 000 and 200. Core reported the lone transaction as its own chunk,
+/// the parent and child as one chunk paying 10 100 sat for both weights,
+/// and the grandchild alone. After `prioritisetransaction` took 20 000 sat
+/// off the parent, it reported all three as one chunk paying -9 700 sat.
+#[test]
+fn entry_reports_the_chunk_it_is_mined_in() {
+    let (cs, mp, dir) = env(&[1, 2]);
+    let lone = spend(&[prev(1)], COIN_VALUE, 1_000, 3);
+    let parent = spend(&[prev(2)], COIN_VALUE, 100, 4);
+    let child = spend(&[out0(&parent)], COIN_VALUE - 100, 10_000, 5);
+    let grandchild = spend(&[out0(&child)], COIN_VALUE - 10_100, 200, 6);
+    let w = |tx: &Transaction| tx.weight().to_wu();
+    let (wl, wp, wc, wg) = (w(&lone), w(&parent), w(&child), w(&grandchild));
+    let l = admit(&mp, &cs, lone);
+    let p = admit(&mp, &cs, parent);
+    let c = admit(&mp, &cs, child);
+    let g = admit(&mp, &cs, grandchild);
+
+    let chunk = |txid: &Txid| {
+        let v = entry_json(&mp, txid);
+        (v["chunkweight"].as_u64().unwrap_or_else(|| panic!("no chunkweight: {v}")), v["fees"]["chunk"].to_string())
+    };
+    assert_eq!(chunk(&l), (wl, "0.00001000".to_string()));
+    assert_eq!(chunk(&p), (wp + wc, "0.00010100".to_string()));
+    assert_eq!(chunk(&c), (wp + wc, "0.00010100".to_string()));
+    assert_eq!(chunk(&g), (wg, "0.00000200".to_string()));
+
+    mp.prioritise_transaction(&p, -20_000).expect("prioritised");
+    for txid in [p, c, g] {
+        assert_eq!(chunk(&txid), (wp + wc + wg, "-0.00009700".to_string()));
+    }
+    assert_eq!(chunk(&l), (wl, "0.00001000".to_string()));
+
+    // A verbose view asks once per entry. The first member of a cluster
+    // linearizes it for all of them, and the rest are answered from the
+    // cache with the same values.
+    let mut cache = ChunkCache::default();
+    let first = mp.get_entry_verbose_cached(&g, &mut cache).expect("in the pool");
+    assert_eq!(cache.0.len(), 3, "one linearization fills the whole cluster");
+    for txid in [p, c] {
+        let cached = mp.get_entry_verbose_cached(&txid, &mut cache).expect("in the pool");
+        assert_eq!(cached, entry_json(&mp, &txid));
+    }
+    assert_eq!(first, entry_json(&mp, &g));
+    assert_eq!(cache.0.len(), 3);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn info_usage_grows_with_the_pool() {
     let (cs, mp, dir) = env(&[1, 2]);

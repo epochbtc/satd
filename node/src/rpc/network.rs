@@ -188,14 +188,16 @@ pub fn get_network_info(
 
     let unit = crate::rpc::amounts::default_unit();
     let mut response = json!({
-        // Advertises Bitcoin Core wire-protocol vintage (Core v28).
-        // Distinct from `subversion`, which carries satd's own
-        // implementation version. Clients use `version` to gate
-        // legacy compatibility adapters — `bitcoincore-rpc`
-        // pre-`getblockchaininfo` switches softfork shape on
-        // `version < 190000`, so anything advertising sub-0.19 here
-        // breaks every Core-compat client.
-        "version": 280000,
+        // The Bitcoin Core release whose RPC surface satd serves (v32),
+        // distinct from `subversion`, which carries satd's own version.
+        // Clients gate on it: Bark's captaind and Eclair refuse below
+        // 310000 (captaind reads Core v31's `chunkweight` and
+        // `fees.chunk`), Bark's client below 290000, and
+        // `bitcoincore-rpc` switches the softfork shape on
+        // `version < 190000`. It may rise only once the RPCs a client
+        // switches on at the new value answer in that release's shape;
+        // the script engine's version does not set it.
+        "version": 320000,
         "subversion": crate::user_agent(),
         "protocolversion": 70016,
         // The flags this node actually advertises, from the same call the

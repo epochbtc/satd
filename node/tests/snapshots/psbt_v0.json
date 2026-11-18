@@ -134,11 +134,37 @@
         {}
       ],
       "tx": {
+        "hash": "e8a89a4a3dcac7a1c9464dee28fd7529f8ed7f17d925e21ac603f79186bc32e8",
         "locktime": 0,
+        "size": 82,
         "txid": "e8a89a4a3dcac7a1c9464dee28fd7529f8ed7f17d925e21ac603f79186bc32e8",
         "version": 2,
-        "vin": 1,
-        "vout": 1
+        "vin": [
+          {
+            "scriptSig": {
+              "asm": "",
+              "hex": ""
+            },
+            "sequence": 4294967295,
+            "txid": "0707070707070707070707070707070707070707070707070707070707070707",
+            "vout": 1
+          }
+        ],
+        "vout": [
+          {
+            "n": 0,
+            "scriptPubKey": {
+              "address": "bc1qcsc0vnz82mdrzrdargy92uh09xvjvfevuqqa6s",
+              "asm": "0 c430f64c4756da310dbd1a085572ef299926272c",
+              "desc": "addr(bc1qcsc0vnz82mdrzrdargy92uh09xvjvfevuqqa6s)#nkcf5dvd",
+              "hex": "0014c430f64c4756da310dbd1a085572ef299926272c",
+              "type": "witness_v0_keyhash"
+            },
+            "value": 0.00090000
+          }
+        ],
+        "vsize": 82,
+        "weight": 328
       },
       "tx_hex": "020000000107070707070707070707070707070707070707070707070707070707070707070100000000ffffffff01905f010000000000160014c430f64c4756da310dbd1a085572ef299926272c00000000"
     }
@@ -157,7 +183,11 @@
           "witness_utxo": {
             "amount": 0.00100000,
             "scriptPubKey": {
-              "hex": "00142269acb34a645bd3496bbbf50bbb81c9063f4f94"
+              "address": "bc1qyf56ev62v3daxjtth06shwupeyrr7nu5lrl7q7",
+              "asm": "0 2269acb34a645bd3496bbbf50bbb81c9063f4f94",
+              "desc": "addr(bc1qyf56ev62v3daxjtth06shwupeyrr7nu5lrl7q7)#6khfjqxl",
+              "hex": "00142269acb34a645bd3496bbbf50bbb81c9063f4f94",
+              "type": "witness_v0_keyhash"
             }
           }
         }
@@ -166,11 +196,37 @@
         {}
       ],
       "tx": {
+        "hash": "e8a89a4a3dcac7a1c9464dee28fd7529f8ed7f17d925e21ac603f79186bc32e8",
         "locktime": 0,
+        "size": 82,
         "txid": "e8a89a4a3dcac7a1c9464dee28fd7529f8ed7f17d925e21ac603f79186bc32e8",
         "version": 2,
-        "vin": 1,
-        "vout": 1
+        "vin": [
+          {
+            "scriptSig": {
+              "asm": "",
+              "hex": ""
+            },
+            "sequence": 4294967295,
+            "txid": "0707070707070707070707070707070707070707070707070707070707070707",
+            "vout": 1
+          }
+        ],
+        "vout": [
+          {
+            "n": 0,
+            "scriptPubKey": {
+              "address": "bc1qcsc0vnz82mdrzrdargy92uh09xvjvfevuqqa6s",
+              "asm": "0 c430f64c4756da310dbd1a085572ef299926272c",
+              "desc": "addr(bc1qcsc0vnz82mdrzrdargy92uh09xvjvfevuqqa6s)#nkcf5dvd",
+              "hex": "0014c430f64c4756da310dbd1a085572ef299926272c",
+              "type": "witness_v0_keyhash"
+            },
+            "value": 0.00090000
+          }
+        ],
+        "vsize": 82,
+        "weight": 328
       },
       "tx_hex": "020000000107070707070707070707070707070707070707070707070707070707070707070100000000ffffffff01905f010000000000160014c430f64c4756da310dbd1a085572ef299926272c00000000"
     }
@@ -203,7 +259,11 @@
           "witness_utxo": {
             "amount": 0.00100000,
             "scriptPubKey": {
-              "hex": "00142269acb34a645bd3496bbbf50bbb81c9063f4f94"
+              "address": "bc1qyf56ev62v3daxjtth06shwupeyrr7nu5lrl7q7",
+              "asm": "0 2269acb34a645bd3496bbbf50bbb81c9063f4f94",
+              "desc": "addr(bc1qyf56ev62v3daxjtth06shwupeyrr7nu5lrl7q7)#6khfjqxl",
+              "hex": "00142269acb34a645bd3496bbbf50bbb81c9063f4f94",
+              "type": "witness_v0_keyhash"
             }
           }
         }
@@ -212,11 +272,37 @@
         {}
       ],
       "tx": {
+        "hash": "e8a89a4a3dcac7a1c9464dee28fd7529f8ed7f17d925e21ac603f79186bc32e8",
         "locktime": 0,
+        "size": 82,
         "txid": "e8a89a4a3dcac7a1c9464dee28fd7529f8ed7f17d925e21ac603f79186bc32e8",
         "version": 2,
-        "vin": 1,
-        "vout": 1
+        "vin": [
+          {
+            "scriptSig": {
+              "asm": "",
+              "hex": ""
+            },
+            "sequence": 4294967295,
+            "txid": "0707070707070707070707070707070707070707070707070707070707070707",
+            "vout": 1
+          }
+        ],
+        "vout": [
+          {
+            "n": 0,
+            "scriptPubKey": {
+              "address": "bc1qcsc0vnz82mdrzrdargy92uh09xvjvfevuqqa6s",
+              "asm": "0 c430f64c4756da310dbd1a085572ef299926272c",
+              "desc": "addr(bc1qcsc0vnz82mdrzrdargy92uh09xvjvfevuqqa6s)#nkcf5dvd",
+              "hex": "0014c430f64c4756da310dbd1a085572ef299926272c",
+              "type": "witness_v0_keyhash"
+            },
+            "value": 0.00090000
+          }
+        ],
+        "vsize": 82,
+        "weight": 328
       },
       "tx_hex": "020000000107070707070707070707070707070707070707070707070707070707070707070100000000ffffffff01905f010000000000160014c430f64c4756da310dbd1a085572ef299926272c00000000"
     }
@@ -231,7 +317,11 @@
           "witness_utxo": {
             "amount": 0.00100000,
             "scriptPubKey": {
-              "hex": "00142269acb34a645bd3496bbbf50bbb81c9063f4f94"
+              "address": "bc1qyf56ev62v3daxjtth06shwupeyrr7nu5lrl7q7",
+              "asm": "0 2269acb34a645bd3496bbbf50bbb81c9063f4f94",
+              "desc": "addr(bc1qyf56ev62v3daxjtth06shwupeyrr7nu5lrl7q7)#6khfjqxl",
+              "hex": "00142269acb34a645bd3496bbbf50bbb81c9063f4f94",
+              "type": "witness_v0_keyhash"
             }
           }
         }
@@ -240,11 +330,37 @@
         {}
       ],
       "tx": {
+        "hash": "e8a89a4a3dcac7a1c9464dee28fd7529f8ed7f17d925e21ac603f79186bc32e8",
         "locktime": 0,
+        "size": 82,
         "txid": "e8a89a4a3dcac7a1c9464dee28fd7529f8ed7f17d925e21ac603f79186bc32e8",
         "version": 2,
-        "vin": 1,
-        "vout": 1
+        "vin": [
+          {
+            "scriptSig": {
+              "asm": "",
+              "hex": ""
+            },
+            "sequence": 4294967295,
+            "txid": "0707070707070707070707070707070707070707070707070707070707070707",
+            "vout": 1
+          }
+        ],
+        "vout": [
+          {
+            "n": 0,
+            "scriptPubKey": {
+              "address": "bc1qcsc0vnz82mdrzrdargy92uh09xvjvfevuqqa6s",
+              "asm": "0 c430f64c4756da310dbd1a085572ef299926272c",
+              "desc": "addr(bc1qcsc0vnz82mdrzrdargy92uh09xvjvfevuqqa6s)#nkcf5dvd",
+              "hex": "0014c430f64c4756da310dbd1a085572ef299926272c",
+              "type": "witness_v0_keyhash"
+            },
+            "value": 0.00090000
+          }
+        ],
+        "vsize": 82,
+        "weight": 328
       },
       "tx_hex": "020000000107070707070707070707070707070707070707070707070707070707070707070100000000ffffffff01905f010000000000160014c430f64c4756da310dbd1a085572ef299926272c00000000"
     }
@@ -265,7 +381,11 @@
           "witness_utxo": {
             "amount": 0.00100000,
             "scriptPubKey": {
-              "hex": "00142269acb34a645bd3496bbbf50bbb81c9063f4f94"
+              "address": "bc1qyf56ev62v3daxjtth06shwupeyrr7nu5lrl7q7",
+              "asm": "0 2269acb34a645bd3496bbbf50bbb81c9063f4f94",
+              "desc": "addr(bc1qyf56ev62v3daxjtth06shwupeyrr7nu5lrl7q7)#6khfjqxl",
+              "hex": "00142269acb34a645bd3496bbbf50bbb81c9063f4f94",
+              "type": "witness_v0_keyhash"
             }
           }
         }
@@ -274,11 +394,37 @@
         {}
       ],
       "tx": {
+        "hash": "e8a89a4a3dcac7a1c9464dee28fd7529f8ed7f17d925e21ac603f79186bc32e8",
         "locktime": 0,
+        "size": 82,
         "txid": "e8a89a4a3dcac7a1c9464dee28fd7529f8ed7f17d925e21ac603f79186bc32e8",
         "version": 2,
-        "vin": 1,
-        "vout": 1
+        "vin": [
+          {
+            "scriptSig": {
+              "asm": "",
+              "hex": ""
+            },
+            "sequence": 4294967295,
+            "txid": "0707070707070707070707070707070707070707070707070707070707070707",
+            "vout": 1
+          }
+        ],
+        "vout": [
+          {
+            "n": 0,
+            "scriptPubKey": {
+              "address": "bc1qcsc0vnz82mdrzrdargy92uh09xvjvfevuqqa6s",
+              "asm": "0 c430f64c4756da310dbd1a085572ef299926272c",
+              "desc": "addr(bc1qcsc0vnz82mdrzrdargy92uh09xvjvfevuqqa6s)#nkcf5dvd",
+              "hex": "0014c430f64c4756da310dbd1a085572ef299926272c",
+              "type": "witness_v0_keyhash"
+            },
+            "value": 0.00090000
+          }
+        ],
+        "vsize": 82,
+        "weight": 328
       },
       "tx_hex": "020000000107070707070707070707070707070707070707070707070707070707070707070100000000ffffffff01905f010000000000160014c430f64c4756da310dbd1a085572ef299926272c00000000"
     }
