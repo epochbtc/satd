@@ -272,6 +272,10 @@ const DEFAULT_MAX_INBOUND_PER_IP: usize = 3;
 /// `src/net.h:81`). Core v32 raised it from 125 so that the extra inbound
 /// slots go to block-relay-only peers.
 pub const DEFAULT_MAX_PEER_CONNECTIONS: usize = 200;
+/// Bitcoin Core's `MAX_PEER_CONNECTIONS` (v32.1 `src/net.h:83`,
+/// bitcoin/bitcoin#35919): the largest `-maxconnections` taken. A larger
+/// value is lowered to it, with a warning.
+pub const MAX_PEER_CONNECTIONS: usize = 2_000;
 /// Bitcoin Core's `DEFAULT_FULL_RELAY_INBOUND_PCT`, `-inboundrelaypercent`
 /// (v32.1 `src/net.h:85`): the share of inbound slots transaction-relaying
 /// peers may hold.

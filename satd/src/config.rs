@@ -1551,6 +1551,51 @@ impl std::fmt::Debug for Config {
     }
 }
 
+/// An integer option read the way Core's `GetArg<int>` reads an oversized
+/// one: a value past `int`'s range saturates to `i32::MAX` / `i32::MIN`
+/// (`LocaleIndependentAtoi`, `src/util/strencodings.h`) instead of failing
+/// the parse and silently falling back to the default. A value that is not
+/// a number at all is `None`, as before.
+fn saturating_int_arg(raw: &str) -> Option<i64> {
+    use std::num::IntErrorKind;
+    match raw.trim().parse::<i64>() {
+        Ok(n) => Some(n.clamp(i64::from(i32::MIN), i64::from(i32::MAX))),
+        Err(e) => match e.kind() {
+            IntErrorKind::PosOverflow => Some(i64::from(i32::MAX)),
+            IntErrorKind::NegOverflow => Some(i64::from(i32::MIN)),
+            _ => None,
+        },
+    }
+}
+
+/// `--maxconnections` on the command line, saturated as
+/// [`saturating_int_arg`] does for the file, so an oversized value reaches
+/// the cap (and its warning) instead of a parse error.
+fn parse_maxconnections_arg(raw: &str) -> Result<usize, String> {
+    match saturating_int_arg(raw) {
+        Some(n) => usize::try_from(n)
+            .map_err(|_| "-maxconnections must be greater or equal than zero".to_string()),
+        None => Err(format!("invalid value '{raw}' for -maxconnections")),
+    }
+}
+
+/// Core v32.1's `-maxconnections` cap (bitcoin/bitcoin#35919,
+/// `AppInitParameterInteraction` in `src/init.cpp`): a value above
+/// [`node::net::manager::MAX_PEER_CONNECTIONS`] is lowered to it, with
+/// Core's warning text.
+fn clamp_maxconnections(maxconnections: &mut usize) -> Option<ConfigNote> {
+    let cap = node::net::manager::MAX_PEER_CONNECTIONS;
+    if *maxconnections <= cap {
+        return None;
+    }
+    let note = ConfigNote {
+        level: NoteLevel::Warn,
+        message: format!("Reducing -maxconnections from {maxconnections} to {cap}."),
+    };
+    *maxconnections = cap;
+    Some(note)
+}
+
 /// A deferred operator-facing note emitted during config load. Its
 /// `level` selects the tracing macro in `main.rs`.
 #[derive(Debug, Clone)]
@@ -2750,11 +2795,11 @@ impl Config {
         // branch instead of failing `usize::from_str` and silently falling
         // through to the default -- which left the node listening and
         // accepting peers where Core would have taken none.
-        let maxconnections: usize = cli
+        let mut maxconnections: usize = cli
             .maxconnections
             .or_else(|| {
                 file_get("maxconnections")
-                    .and_then(|v| v.trim().parse::<i64>().ok())
+                    .and_then(|v| saturating_int_arg(&v))
                     .map(|n| usize::try_from(n).unwrap_or(0))
             })
             .or(profile_defaults.maxconnections)
@@ -2771,6 +2816,15 @@ impl Config {
         // set, so a bind still wins, as in Core.
         // Logging is not up yet; these join `pending_notes` below.
         let mut net_notes: Vec<ConfigNote> = Vec::new();
+        // Core v32.1 caps `-maxconnections` at `MAX_PEER_CONNECTIONS` (2000)
+        // in `AppInitParameterInteraction` (`src/init.cpp`, bitcoin/bitcoin
+        // #35919), after the listen soft-sets above have read the value and
+        // before the descriptor budget sees it. Every limit derived from it
+        // (the inbound slots, the transaction-relay inbound share) follows the
+        // capped value.
+        if let Some(note) = clamp_maxconnections(&mut maxconnections) {
+            net_notes.push(note);
+        }
         if !listen_explicit && !binds_requested && proxy.is_some() && listen {
             net_notes.push(ConfigNote {
                 level: NoteLevel::Info,
@@ -6283,7 +6337,8 @@ pub struct CliArgs {
     #[arg(
         long,
         value_name = "N",
-        help = "Maximum total connections (default: 200)"
+        value_parser = parse_maxconnections_arg,
+        help = "Maximum total connections (default: 200, maximum: 2000)"
     )]
     pub maxconnections: Option<usize>,
 
@@ -15501,6 +15556,38 @@ mcpallowedhost=node.local
         let cfg = parse_negation(&["satd", "--regtest", "--datadir", dd]).expect("starts");
         assert_eq!(cfg.maxconnections, 0);
         assert!(!cfg.listen, "maxconnections <= 0 soft-sets listen=0");
+    }
+
+    /// Core v32.1 caps `-maxconnections` at 2000 (bitcoin/bitcoin#35919)
+    /// with "Reducing -maxconnections from X to 2000.", from the command
+    /// line or the file. An oversized value saturates to `int`'s maximum
+    /// first, as Core's `GetArg<int>` does, so it reaches the cap instead of
+    /// a parse error (command line) or the silent default (file).
+    #[test]
+    fn maxconnections_is_capped_at_cores_2000() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let dd = tmpdir.path().to_str().unwrap();
+        let warned = |cfg: &Config| -> Vec<String> {
+            cfg.pending_notes
+                .iter()
+                .filter(|n| matches!(n.level, NoteLevel::Warn))
+                .map(|n| n.message.clone())
+                .filter(|m| m.starts_with("Reducing -maxconnections"))
+                .collect()
+        };
+        for (arg, parsed) in [("-maxconnections=2001", 2001u64), ("-maxconnections=18446744073709551616", 2147483647)] {
+            let cfg = parse_negation(&["satd", "--regtest", "--datadir", dd, arg]).expect("starts");
+            assert_eq!(cfg.maxconnections, 2000, "{arg}");
+            assert_eq!(warned(&cfg), vec![format!("Reducing -maxconnections from {parsed} to 2000.")], "{arg}");
+        }
+        let cfg = parse_negation(&["satd", "--regtest", "--datadir", dd, "-maxconnections=2000"]).expect("starts");
+        assert_eq!(cfg.maxconnections, 2000);
+        assert!(warned(&cfg).is_empty(), "2000 itself is taken as given");
+
+        std::fs::write(tmpdir.path().join("bitcoin.conf"), "maxconnections=99999999999999999999\n").unwrap();
+        let cfg = parse_negation(&["satd", "--regtest", "--datadir", dd]).expect("starts");
+        assert_eq!(cfg.maxconnections, 2000);
+        assert_eq!(warned(&cfg), vec!["Reducing -maxconnections from 2147483647 to 2000.".to_string()]);
     }
 
     /// Core v32's connection defaults: `-maxconnections` 200 and
