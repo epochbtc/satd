@@ -180,10 +180,12 @@ def main():
     stale = []
     for (file, _, mutation, line) in sorted(known):
         lines = sources.lines(file)
-        if lines is not None and not any(raw.strip() == line for raw in lines):
+        if lines is None:
+            stale.append(f"- `{file}` (no such file): {mutation}")
+        elif not any(raw.strip() == line for raw in lines):
             stale.append(f"- `{file}`: {mutation}")
     if stale:
-        out += ["#### known-missed.tsv rows whose line is gone", "",
+        out += ["#### known-missed.tsv rows whose line or file is gone", "",
                 "Each mutant is reported as new again when it is missed; judge it afresh "
                 "and fix or drop its row.", ""] + stale + [""]
     report = "\n".join(out) + "\n"
