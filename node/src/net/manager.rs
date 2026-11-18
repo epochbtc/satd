@@ -3802,18 +3802,15 @@ impl PeerManager {
     /// `noban` peers count but are never evicted; outbound and manual
     /// connections are neither.
     fn evict_tx_peer_if_full(&self, protect_peer: Option<PeerId>) -> bool {
-        {
-            let peers = self.peers.read();
+        let over_cap = |peers: &HashMap<PeerId, PeerHandle>| {
             let tx_inbound_peers = peers
                 .values()
                 .filter(|h| h.info.state != PeerState::Disconnected && h.info.tx_relay_requested)
                 .filter(|h| h.info.direction == Direction::Inbound)
                 .count();
-            if tx_inbound_peers <= self.max_inbound_full_relay() {
-                return true;
-            }
-        }
-        self.attempt_to_evict_connection(true, protect_peer, "evicted for an inbound tx-relay slot")
+            tx_inbound_peers > self.max_inbound_full_relay()
+        };
+        self.attempt_to_evict_connection(true, protect_peer, &over_cap, "evicted for an inbound tx-relay slot")
     }
 
     /// Core's `CConnman::AttemptToEvictConnection` (v32.1 `src/net.cpp:1699`):
@@ -3823,10 +3820,15 @@ impl PeerManager {
     /// `evict_tx_relay_peer_only`, those that do not relay transactions; the
     /// rules themselves never pick an outbound, manual or `noban` peer.
     /// Returns false when they find no peer to evict.
+    ///
+    /// `needed` is checked under the same read of the peers as the
+    /// candidates are taken from; when it is false there is room already,
+    /// nothing is evicted and the result is true.
     fn attempt_to_evict_connection(
         &self,
         evict_tx_relay_peer_only: bool,
         protect_peer: Option<PeerId>,
+        needed: &dyn Fn(&HashMap<PeerId, PeerHandle>) -> bool,
         reason: &'static str,
     ) -> bool {
         struct Seen {
@@ -3842,6 +3844,9 @@ impl PeerManager {
         }
         let seen: Vec<Seen> = {
             let peers = self.peers.read();
+            if !needed(&peers) {
+                return true;
+            }
             peers
                 .values()
                 .filter(|h| h.info.state != PeerState::Disconnected)
@@ -4746,16 +4751,19 @@ impl PeerManager {
                 // outbound slots) taken, evict an inbound peer by the
                 // eviction rules to make room, and drop the newcomer only
                 // if none can be evicted. The eviction takes the peers lock
-                // itself, so it runs with this one released, and the count
-                // is taken again after it. Still full then means another
-                // accept took the freed slot: this newcomer goes.
-                if inbound_count >= self.max_inbound() {
-                    if evicted {
-                        tracing::debug!(%addr, "inbound slot taken by another connection - connection dropped (full)");
-                        return;
-                    }
+                // itself, so it runs with this one released. Once a peer
+                // was evicted the newcomer is admitted without counting
+                // again, as Core admits it: a recount could find the freed
+                // slot taken by an accept on another listener, or, at
+                // `max_inbound() == 0`, never find one, and dropping the
+                // newcomer then would cost an inbound peer for nothing. The
+                // overshoot is one peer per listener accepting at once.
+                if !evicted && inbound_count >= self.max_inbound() {
                     drop(peers);
-                    if !self.attempt_to_evict_connection(false, None, "evicted for an inbound slot") {
+                    let still_full = |peers: &HashMap<PeerId, PeerHandle>| {
+                        Self::count_inbound(peers, ip).0 >= self.max_inbound()
+                    };
+                    if !self.attempt_to_evict_connection(false, None, &still_full, "evicted for an inbound slot") {
                         tracing::debug!(
                             "failed to find an eviction candidate - connection dropped (full), peer={addr}"
                         );

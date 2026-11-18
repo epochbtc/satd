@@ -307,3 +307,23 @@ async fn a_full_inbound_set_with_no_candidate_drops_the_newcomer() {
     let _dialer = accept_one(&pm).await;
     assert_eq!(ids(&pm), before, "nobody evicted, and the newcomer not added");
 }
+
+/// After a successful eviction the newcomer is admitted without counting
+/// again, as Core admits it. At `-maxconnections` 11 there are no inbound
+/// slots, so a recount is always full: inbound peers left over from a
+/// higher cap were evicted one per attempt while every newcomer was dropped
+/// too, draining inbound. Core rotates them one for one.
+#[tokio::test]
+async fn an_eviction_admits_the_newcomer_even_with_no_inbound_slots() {
+    let (pm, _dir) = mk_pm();
+    pm.set_max_connections(11);
+    assert_eq!(pm.max_inbound(), 0);
+    for id in 1..=30 {
+        add(&pm, peer(id, Direction::Inbound, true));
+    }
+    let before = ids(&pm);
+    let _dialer = accept_one(&pm).await;
+    let gone: Vec<PeerId> = before.difference(&ids(&pm)).copied().collect();
+    assert_eq!(gone.len(), 1, "one peer evicted: {gone:?}");
+    assert_eq!(loopback_peers(&pm), 1, "and the newcomer kept in its place");
+}
