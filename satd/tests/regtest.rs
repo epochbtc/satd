@@ -1346,25 +1346,43 @@ fn test_oversized_connection_caps_refuse_to_start_cleanly() {
         .args(&args)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped());
-    // A fixed limit, so the outcome does not depend on the host's.
+    // A fixed limit, so the outcome does not depend on the host's: 65,536,
+    // or the host's hard limit if lower (a process cannot raise it).
+    let mut host = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+    // SAFETY: getrlimit only writes the struct passed.
+    assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut host) }, 0);
+    let limit = if host.rlim_max == libc::RLIM_INFINITY { 65_536 } else { host.rlim_max.min(65_536) };
     // SAFETY: setrlimit is async-signal-safe and touches only the child.
     unsafe {
-        cmd.pre_exec(|| {
-            let lim = libc::rlimit { rlim_cur: 65_536, rlim_max: 65_536 };
+        cmd.pre_exec(move || {
+            let lim = libc::rlimit { rlim_cur: limit, rlim_max: limit };
             if libc::setrlimit(libc::RLIMIT_NOFILE, &lim) != 0 {
                 return Err(std::io::Error::last_os_error());
             }
             Ok(())
         });
     }
-    let out = cmd.output().expect("run satd");
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert_eq!(out.status.code(), Some(1), "satd did not refuse: {stderr}");
+    let mut child = cmd.spawn().expect("spawn satd");
+    let deadline = Instant::now() + test_timeout(60);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() > deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("satd did not refuse within the deadline");
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    let mut stderr = String::new();
+    std::io::Read::read_to_string(&mut child.stderr.take().unwrap(), &mut stderr).unwrap();
+    assert_eq!(status.code(), Some(1), "satd did not refuse: {stderr}");
     assert!(!stderr.contains("panicked"), "{stderr}");
     // 151 base + 2048 RocksDB + 8 addnode + 1 P2P listener + 2 x 101 RPC,
     // and each surface's listener plus its clamped 100,000.
     assert!(
-        stderr.contains("Error: Not enough file descriptors available. 65536 available, 302413 required."),
+        stderr.contains(&format!("Error: Not enough file descriptors available. {limit} available, 302413 required.")),
         "{stderr}"
     );
     let _ = std::fs::remove_dir_all(&datadir);
