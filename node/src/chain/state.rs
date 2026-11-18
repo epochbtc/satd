@@ -49,55 +49,31 @@ pub enum AssumeValid {
     All { max_age_secs: u64 },
 }
 
-/// Per-network default assumevalid hashes.
-/// These are well-known blocks deep in the chain that the community has validated.
-/// Matches Bitcoin Core's approach of shipping a default per release.
+/// Per-network default assumevalid hashes: Bitcoin Core v32.1's
+/// `defaultAssumeValid` (`src/kernel/chainparams.cpp`), heights from Core's
+/// comments. Bump them with each Core release satd pins, together with
+/// [`ChainState::minimum_chain_work`].
 ///
 /// A custom signet (`-signetchallenge`) has none: the default signet's block
 /// is not on its chain. Core's `SigNetParams` clears `defaultAssumeValid` when
 /// a challenge is given.
 pub fn default_assumevalid(network: Network, custom_signet: bool) -> AssumeValid {
-    match network {
-        Network::Signet if custom_signet => AssumeValid::Disabled,
-        Network::Bitcoin => {
-            // Bitcoin Core v28.0 default (height 840,000)
-            AssumeValid::Hash(
-                "0000000000000000000320283a032748cef8227873ff4872689bf23f1cda83a5"
-                    .parse()
-                    .unwrap(),
-            )
-        }
-        Network::Signet => {
-            // Signet block at height 218,000 (before the heavy-tx region)
-            AssumeValid::Hash(
-                "000000f085851d46ad302bcc9246d00435ec24f2095fb9cfa9523837bbac1da3"
-                    .parse()
-                    .unwrap(),
-            )
-        }
-        Network::Testnet => {
-            // Bitcoin Core's testnet3 default (height 4,842,348)
-            AssumeValid::Hash(
-                "000000007a61e4230b28ac5cb6b5e5a0130de37ac1faf2f8987d2fa6505b67f4"
-                    .parse()
-                    .unwrap(),
-            )
-        }
-        Network::Testnet4 => {
-            // Bitcoin Core's testnet4 default (height 123,613). Past block
-            // 51,540, whose 14,200 inputs a full script check could not
-            // get through without tripping the stall watchdog (#1216).
-            AssumeValid::Hash(
-                "0000000002368b1e4ee27e2e85676ae6f9f9e69579b29093e9a82c170bf7cf8a"
-                    .parse()
-                    .unwrap(),
-            )
-        }
-        Network::Regtest => {
-            // Regtest has no meaningful default
-            AssumeValid::Disabled
-        }
-    }
+    let hex = match network {
+        Network::Signet if custom_signet => return AssumeValid::Disabled,
+        // Height 966,143.
+        Network::Bitcoin => "00000000000000000000748969ec33043c0e52a763c6dd5193861f559f2c72e3",
+        // Height 5,128,859.
+        Network::Testnet => "00000000b318a3703d14a844c55ef507f4c2fc8f8766e24271fd43c180c51637",
+        // Height 151,604. Past block 51,540, whose 14,200 inputs a full
+        // script check could not get through without tripping the stall
+        // watchdog (#1216).
+        Network::Testnet4 => "0000000021df65b91665a342e26ceb05e54826ad7d8fcd40316230058fa3b865",
+        // Height 321,295.
+        Network::Signet => "00000002a5e0ba0498f1e9f4591af0b66b63c654665efe65206fd0ae7bbaf923",
+        // Regtest has none, as in Core.
+        Network::Regtest => return AssumeValid::Disabled,
+    };
+    AssumeValid::Hash(hex.parse().expect("a 64-digit hex block hash"))
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -1473,7 +1449,7 @@ impl ChainState {
     }
 
     /// Bitcoin Core's `nMinimumChainWork` for this network, big-endian like
-    /// every chainwork in the block index (`kernel/chainparams.cpp`, v31.1).
+    /// every chainwork in the block index (`kernel/chainparams.cpp`, v32.1).
     /// A custom signet has none, as in Core: its chain starts wherever its
     /// operator started it. satd does not gate header acceptance or block
     /// download on it; the peer manager reads it to decide when a peer has
@@ -1484,11 +1460,11 @@ impl ChainState {
             return work;
         }
         let hex = match self.network {
-            Network::Bitcoin => "0000000000000000000000000000000000000001128750f82f4c366153a3a030",
-            Network::Testnet => "0000000000000000000000000000000000000000000017dde1c649f3708d14b6",
-            Network::Testnet4 => "0000000000000000000000000000000000000000000009a0fe15d0177d086304",
+            Network::Bitcoin => "000000000000000000000000000000000000000145ec036acc5ba740052af1a0",
+            Network::Testnet => "0000000000000000000000000000000000000000000017f49f702147f10c0eb6",
+            Network::Testnet4 => "000000000000000000000000000000000000000000000e346a558455ade8eca9",
             Network::Signet if self.signet_challenge.is_none() => {
-                "00000000000000000000000000000000000000000000000000000b463ea0a4b8"
+                "00000000000000000000000000000000000000000000000000001090e9dc1520"
             }
             _ => return [0u8; 32],
         };
@@ -11884,7 +11860,7 @@ pub(crate) mod tests {
         make_chain_state_with_store(Box::new(InMemoryStore::new()))
     }
 
-    /// `nMinimumChainWork` per network, as Bitcoin Core v31.1's
+    /// `nMinimumChainWork` per network, as Bitcoin Core v32.1's
     /// `kernel/chainparams.cpp` sets it. A custom signet has none; regtest
     /// has none.
     #[test]
@@ -11909,19 +11885,19 @@ pub(crate) mod tests {
         };
         assert_eq!(
             hex_of(Network::Bitcoin, None),
-            "0000000000000000000000000000000000000001128750f82f4c366153a3a030"
+            "000000000000000000000000000000000000000145ec036acc5ba740052af1a0"
         );
         assert_eq!(
             hex_of(Network::Testnet, None),
-            "0000000000000000000000000000000000000000000017dde1c649f3708d14b6"
+            "0000000000000000000000000000000000000000000017f49f702147f10c0eb6"
         );
         assert_eq!(
             hex_of(Network::Testnet4, None),
-            "0000000000000000000000000000000000000000000009a0fe15d0177d086304"
+            "000000000000000000000000000000000000000000000e346a558455ade8eca9"
         );
         assert_eq!(
             hex_of(Network::Signet, None),
-            "00000000000000000000000000000000000000000000000000000b463ea0a4b8"
+            "00000000000000000000000000000000000000000000000000001090e9dc1520"
         );
         assert_eq!(hex_of(Network::Signet, Some(vec![0x51])), "0".repeat(64));
         assert_eq!(hex_of(Network::Regtest, None), "0".repeat(64));
@@ -24411,21 +24387,34 @@ pub(crate) mod tests {
         assert!(matches!(default_assumevalid(Network::Bitcoin, true), AssumeValid::Hash(_)));
     }
 
-    /// The testnets take Bitcoin Core's defaults. Without one, a fresh
-    /// testnet4 sync checks every script of block 51,540 and stalls (#1216).
+    /// Every network takes Bitcoin Core v32.1's `defaultAssumeValid`
+    /// (`src/kernel/chainparams.cpp`). Without one, a fresh testnet4 sync
+    /// checks every script of block 51,540 and stalls (#1216).
     #[test]
-    fn the_testnets_default_to_cores_assumevalid() {
+    fn every_network_defaults_to_cores_assumevalid() {
         let hash = |network| match default_assumevalid(network, false) {
             AssumeValid::Hash(h) => h.to_string(),
             other => panic!("{network:?}: expected a default hash, got {other:?}"),
         };
+        // 966143
         assert_eq!(
-            hash(Network::Testnet4),
-            "0000000002368b1e4ee27e2e85676ae6f9f9e69579b29093e9a82c170bf7cf8a"
+            hash(Network::Bitcoin),
+            "00000000000000000000748969ec33043c0e52a763c6dd5193861f559f2c72e3"
         );
+        // 5128859
         assert_eq!(
             hash(Network::Testnet),
-            "000000007a61e4230b28ac5cb6b5e5a0130de37ac1faf2f8987d2fa6505b67f4"
+            "00000000b318a3703d14a844c55ef507f4c2fc8f8766e24271fd43c180c51637"
+        );
+        // 151604
+        assert_eq!(
+            hash(Network::Testnet4),
+            "0000000021df65b91665a342e26ceb05e54826ad7d8fcd40316230058fa3b865"
+        );
+        // 321295
+        assert_eq!(
+            hash(Network::Signet),
+            "00000002a5e0ba0498f1e9f4591af0b66b63c654665efe65206fd0ae7bbaf923"
         );
         assert!(matches!(default_assumevalid(Network::Regtest, false), AssumeValid::Disabled));
     }
