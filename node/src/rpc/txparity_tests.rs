@@ -255,6 +255,55 @@ fn getblockstats_sizes_leave_out_the_header_and_coinbase() {
     }
 }
 
+/// `total_out` leaves out the coinbase, as Core does ("excluding coinbase
+/// and thus reward", v32.1 `src/rpc/blockchain.cpp:2133-2138`). satd added
+/// the block reward to it.
+#[test]
+fn getblockstats_total_out_leaves_out_the_coinbase() {
+    let (tx, _, stats, coinbase_only) = spend_block_stats();
+    let out: u64 = tx.output.iter().map(|o| o.value.to_sat()).sum();
+    assert_eq!(stats["total_out"], json!(out), "{stats}");
+    assert_eq!(coinbase_only["total_out"], json!(0), "{coinbase_only}");
+}
+
+/// Core's `utxo_size_inc`: each output's `GetSerializeSize(out) +
+/// PER_UTXO_OVERHEAD` (40), minus the same for each spent prevout, read
+/// from undo data (v32.1 `:2119-2120`, `:2171-2172`). The test blocks pay
+/// empty scripts, so every output and the spent prevout is 8 + 1 + 0 + 40
+/// = 49 bytes. satd reported a flat 50 per net output.
+#[test]
+fn getblockstats_utxo_size_inc_sums_the_real_sizes() {
+    let (_, _, stats, coinbase_only) = spend_block_stats();
+    // Coinbase output + spend output - spent coinbase output.
+    assert_eq!(stats["utxo_size_inc"], json!(49 + 49 - 49), "{stats}");
+    assert_eq!(coinbase_only["utxo_size_inc"], json!(49), "{coinbase_only}");
+}
+
+/// Core's `utxo_increase_actual` and `utxo_size_inc_actual` (v32.1
+/// `:2121-2129`, `:2233-2234`). With no unspendable output they equal the
+/// plain pair; the genesis coinbase never enters the UTXO set, so the
+/// genesis block's are zero while its `utxo_size_inc` still counts it.
+/// satd refused both as invalid statistics.
+#[test]
+fn getblockstats_reports_the_actual_utxo_statistics() {
+    let (_, _, stats, coinbase_only) = spend_block_stats();
+    assert_eq!(stats["utxo_increase_actual"], json!(1), "{stats}");
+    assert_eq!(stats["utxo_size_inc_actual"], json!(49), "{stats}");
+    assert_eq!(coinbase_only["utxo_increase_actual"], json!(1), "{coinbase_only}");
+    assert_eq!(coinbase_only["utxo_size_inc_actual"], json!(49), "{coinbase_only}");
+
+    let (cs, dir) = make_chain_state();
+    let genesis = bitcoin::constants::genesis_block(Network::Regtest);
+    let g = blockchain::get_block_stats(&cs, &genesis.block_hash().to_string()).unwrap();
+    let _ = std::fs::remove_dir_all(dir);
+    let spk_len = genesis.txdata[0].output[0].script_pubkey.len();
+    assert_eq!(spk_len, 67, "premise: the genesis coinbase pays a 67-byte P2PK script");
+    assert_eq!(g["utxo_increase"], json!(1), "{g}");
+    assert_eq!(g["utxo_size_inc"], json!(8 + 1 + 67 + 40), "{g}");
+    assert_eq!(g["utxo_increase_actual"], json!(0), "{g}");
+    assert_eq!(g["utxo_size_inc_actual"], json!(0), "{g}");
+}
+
 /// `getblockstats` refuses a block whose undo row is there but unreadable,
 /// as Core does (`RPC_MISC_ERROR`), instead of pricing it from the live
 /// UTXO set: the coins the block spent are gone from it, so every fee

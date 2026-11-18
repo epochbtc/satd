@@ -201,7 +201,9 @@ fn reset(req: &Fields) -> Result<(Chain, BlockHash), Fail> {
         .map_err(|e| internal(format!("opening the chainstate: {e}")))?;
     let flat_files = node::storage::flatfile::FlatFileManager::new(&dir.path().join("blocks"))
         .map_err(|e| internal(format!("opening the block files: {e}")))?;
-    let mut cs = ChainState::new(
+    // The challenge goes in at construction, so genesis is framed with the
+    // custom signet's message start like every later block record (#1283).
+    let cs = ChainState::new_with_signet_challenge(
         Box::new(store),
         flat_files,
         network,
@@ -212,9 +214,9 @@ fn reset(req: &Fields) -> Result<(Chain, BlockHash), Fail> {
         Default::default(),
         Default::default(),
         Default::default(),
+        signet_challenge,
     )
     .map_err(|e| internal(format!("creating the chain: {e}")))?;
-    cs.set_signet_challenge(signet_challenge);
     let genesis = cs.tip_hash();
     Ok((Chain { cs, orphans: OrphanBlocks::new(), _dir: dir }, genesis))
 }
@@ -512,5 +514,30 @@ impl Chain {
         fields.insert("hash_serialized_3".into(), json!(hex::encode(hash)));
         fields.insert("txouts".into(), json!(txouts));
         Ok(fields)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// A custom-signet chain frames its genesis record with the custom
+    /// signet's message start, as Core does (#1283).
+    ///
+    /// Perturbation: build it with `ChainState::new` and set the challenge
+    /// afterwards, and the record carries the default signet's `0a03cf40`.
+    #[test]
+    fn a_custom_signet_chain_frames_genesis_with_its_own_message_start() {
+        let req = json!({"network": "signet", "options": {"signetchallenge": "51"}});
+        let Ok((chain, _)) = reset(req.as_object().unwrap()) else {
+            panic!("reset refused a custom signet");
+        };
+        let blocks = chain._dir.path().join("blocks");
+        let key = node::storage::flatfile::read_xor_key(&blocks).unwrap();
+        let data = std::fs::read(blocks.join("blk00000.dat")).unwrap();
+        let magic: Vec<u8> = data[..4].iter().zip(key).map(|(b, k)| b ^ k).collect();
+        assert_eq!(magic, chain.cs.p2p_magic().to_bytes());
+        assert_eq!(magic, [0x54, 0xd2, 0x6f, 0xbd]);
     }
 }
