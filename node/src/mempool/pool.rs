@@ -1545,9 +1545,14 @@ where
     }
 
     // Two members spending one outpoint would otherwise both be accepted and
-    // leave the mempool holding a double spend.
+    // leave the mempool holding a double spend. A member with no inputs is
+    // inconsistent too, as in Core's `IsConsistentPackage`: consistency is
+    // judged by inputs, and no unconfirmed transaction may lack them.
     let mut spent: HashSet<bitcoin::OutPoint> = HashSet::new();
     for p in pkg {
+        if p.tx().input.is_empty() {
+            return Err("conflict-in-package");
+        }
         for input in &p.tx().input {
             if !spent.insert(input.previous_output) {
                 return Err("conflict-in-package");
@@ -9730,6 +9735,13 @@ mod tests {
             .collect();
         assert_eq!(check_well_formed_package(&heavy), Err("package-too-large"));
         assert!(check_well_formed_package(&heavy[..1]).is_ok());
+
+        // A member with no inputs, alone or not: Core's `IsConsistentPackage`
+        // refuses it, and `submitpackage` answers `conflict-in-package`.
+        let empty = tx_spending(&[], 0);
+        assert!(empty.input.is_empty());
+        assert_eq!(check_well_formed_package(std::slice::from_ref(&empty)), Err("conflict-in-package"));
+        assert_eq!(check_well_formed_package(&[parent.clone(), empty]), Err("conflict-in-package"));
     }
     use super::*;
     use crate::storage::db::InMemoryStore;
