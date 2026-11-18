@@ -1310,49 +1310,64 @@ fn test_rpc_bearer_websocket_frames_follow_revocation_and_expiry() {
     node.stop();
 }
 
-/// Every connection-cap option accepts any `usize`, and tokio's semaphore
-/// panics above `usize::MAX >> 3`. A node given the largest value for each
-/// cap still starts and serves: the caps are clamped, not handed through.
+/// Every connection-cap option accepts any `usize`. Each is clamped to
+/// `CAP_CEILING` (100,000) before it reaches a tokio semaphore -- unit tests
+/// beside each surface hold that -- and each enabled listener's cap counts
+/// toward the node's file-descriptor needs, as Core counts
+/// `-rpcmaxconnections` (#1294). Three of them at the ceiling need more than
+/// a 65,536 limit holds, so the node refuses to start with Core's error
+/// instead of panicking or running out of descriptors later.
+#[cfg(unix)]
 #[test]
-fn test_oversized_connection_caps_do_not_panic_at_boot() {
+fn test_oversized_connection_caps_refuse_to_start_cleanly() {
+    use std::os::unix::process::CommandExt;
+
     let huge = usize::MAX.to_string();
-    let esplora_port = find_available_port();
-    let electrum_port = find_available_port();
-    let stratum_port = find_available_port();
+    let datadir = fresh_test_datadir("satd-oversized-caps");
     let args: Vec<String> = vec![
         "--esplora=1".into(),
-        format!("--esplorabind=127.0.0.1:{esplora_port}"),
+        format!("--esplorabind=127.0.0.1:{}", find_available_port()),
         format!("--esploramaxconns={huge}"),
         format!("--esploramaxsockets={huge}"),
         format!("--esplorasseconns={huge}"),
         "--electrum=1".into(),
-        format!("--electrumbind=127.0.0.1:{electrum_port}"),
+        format!("--electrumbind=127.0.0.1:{}", find_available_port()),
         "--txindex=1".into(),
         format!("--electrummaxconns={huge}"),
         "--stratum=1".into(),
-        format!("--stratumbind=127.0.0.1:{stratum_port}"),
+        format!("--stratumbind=127.0.0.1:{}", find_available_port()),
         format!("--stratummaxconns={huge}"),
     ];
-    let args: Vec<&str> = args.iter().map(String::as_str).collect();
-    let mut node = TestNode::start(&args);
-
-    let height = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .build()
-        .unwrap()
-        .get(format!("http://127.0.0.1:{esplora_port}/blocks/tip/height"))
-        .send()
-        .unwrap();
-    assert_eq!(height.status().as_u16(), 200, "Esplora serves under a clamped cap");
-    for (name, port) in [("electrum", electrum_port), ("stratum", stratum_port)] {
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
-            assert!(Instant::now() < deadline, "{name} never started listening");
-            std::thread::sleep(Duration::from_millis(100));
-        }
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_satd"));
+    cmd.arg("--regtest")
+        .arg(format!("--datadir={}", datadir.display()))
+        .arg(format!("--rpcport={}", find_available_port()))
+        .arg(format!("--port={}", find_available_port()))
+        .args(&args)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped());
+    // A fixed limit, so the outcome does not depend on the host's.
+    // SAFETY: setrlimit is async-signal-safe and touches only the child.
+    unsafe {
+        cmd.pre_exec(|| {
+            let lim = libc::rlimit { rlim_cur: 65_536, rlim_max: 65_536 };
+            if libc::setrlimit(libc::RLIMIT_NOFILE, &lim) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
     }
-
-    node.stop();
+    let out = cmd.output().expect("run satd");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "satd did not refuse: {stderr}");
+    assert!(!stderr.contains("panicked"), "{stderr}");
+    // 151 base + 2048 RocksDB + 8 addnode + 1 P2P listener + 2 x 101 RPC,
+    // and each surface's listener plus its clamped 100,000.
+    assert!(
+        stderr.contains("Error: Not enough file descriptors available. 65536 available, 302413 required."),
+        "{stderr}"
+    );
+    let _ = std::fs::remove_dir_all(&datadir);
 }
 
 /// Esplora `POST /tx` broadcasts only for a token holding `rpc:submit` (or

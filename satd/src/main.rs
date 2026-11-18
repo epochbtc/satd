@@ -4374,15 +4374,7 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
             // (review M2). `0` means "no cap"; we still use a sized-1
             // semaphore + add_permits so try_acquire never fails in
             // that mode.
-            let sse_cap = if config.esplora_sse_max_conns == 0 {
-                let s = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
-                s.add_permits(usize::MAX >> 8);
-                s
-            } else {
-                std::sync::Arc::new(tokio::sync::Semaphore::new(node::http_serve::clamp_cap(
-                    config.esplora_sse_max_conns,
-                )))
-            };
+            let sse_cap = esplora_sse_semaphore(config.esplora_sse_max_conns);
             let state = esplora_handlers::EsploraState {
                 chain: chain_state.clone(),
                 mempool: mempool.clone(),
@@ -6412,6 +6404,33 @@ async fn persist_sp_failed_with_cleanup(
     }
 }
 
+
+/// The Esplora SSE stream semaphore: `-esplorasseconns`, clamped to
+/// [`node::http_serve::CAP_CEILING`] since tokio's `Semaphore::new` panics
+/// above `usize::MAX >> 3`. `0` means no cap: a semaphore with
+/// `usize::MAX >> 8` permits, so `try_acquire` never fails.
+fn esplora_sse_semaphore(max: usize) -> std::sync::Arc<tokio::sync::Semaphore> {
+    if max == 0 {
+        let s = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+        s.add_permits(usize::MAX >> 8);
+        s
+    } else {
+        std::sync::Arc::new(tokio::sync::Semaphore::new(node::http_serve::clamp_cap(max)))
+    }
+}
+
+#[cfg(test)]
+mod esplora_sse_semaphore_tests {
+    /// Every cap option accepts any `usize`; the largest is clamped, not
+    /// handed to tokio.
+    #[test]
+    fn an_oversized_sse_cap_is_clamped_not_panicking() {
+        let sem = super::esplora_sse_semaphore(usize::MAX);
+        assert_eq!(sem.available_permits(), node::http_serve::CAP_CEILING);
+        assert_eq!(super::esplora_sse_semaphore(5).available_permits(), 5);
+        assert!(super::esplora_sse_semaphore(0).available_permits() > node::http_serve::CAP_CEILING);
+    }
+}
 
 #[cfg(test)]
 mod startup_tests {

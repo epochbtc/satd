@@ -373,6 +373,25 @@ impl AcceptWarnings {
     }
 }
 
+/// The connection semaphore shared by every Stratum listener:
+/// `-stratummaxconns`, clamped to [`crate::http_serve::CAP_CEILING`] (tokio's
+/// `Semaphore::new` panics above `usize::MAX >> 3`), at least 1.
+fn connection_semaphore(max_conns: usize) -> Arc<Semaphore> {
+    Arc::new(Semaphore::new(crate::http_serve::clamp_cap(max_conns).max(1)))
+}
+
+#[cfg(test)]
+mod connection_semaphore_tests {
+    /// Every cap option accepts any `usize`; the largest is clamped, not
+    /// handed to tokio, and `0` still admits one connection.
+    #[test]
+    fn an_oversized_connection_cap_is_clamped_not_panicking() {
+        let sem = super::connection_semaphore(usize::MAX);
+        assert_eq!(sem.available_permits(), crate::http_serve::CAP_CEILING);
+        assert_eq!(super::connection_semaphore(0).available_permits(), 1);
+    }
+}
+
 impl StratumServer {
     /// Bind every configured listener. Binding here rather than in
     /// [`run`](Self::run) makes a port conflict or an unreadable certificate
@@ -423,8 +442,7 @@ impl StratumServer {
             return Err(StratumServerError::V2Unavailable);
         }
         let allow = ClientAllowList::new(config.mtls_client_allow.iter().cloned());
-        let semaphore =
-            Arc::new(Semaphore::new(crate::http_serve::clamp_cap(config.max_conns).max(1)));
+        let semaphore = connection_semaphore(config.max_conns);
         let (work, _) = watch::channel(None);
         let listeners = Listeners {
             v1: listener.local_addr().ok(),
