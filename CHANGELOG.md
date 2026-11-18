@@ -18,20 +18,20 @@ It includes every fix shipped in 0.7.1:
 
 - Consensus: `-consensus` defaults to `cpp-shadow`, the Rust engine deciding and Core's interpreter checking it; `rust-shadow` keeps the old order.
 - Consensus: `-test=bip94` enforces BIP 94's timewarp rule on regtest, as in Core (#1245).
-- Consensus: the P2SH, WITNESS and TAPROOT script flags are on for every block except Core's three exception blocks, as in Core; they were gated on activation heights, and `-testactivationheight=segwit` turned them off below its height (#1244, #724). Verdicts on the main chains are unchanged.
-- Consensus: the Rust script engine reports a tapscript push that runs past the end of the script as `BAD_OPCODE` ("Opcode missing or not understood"), as Core does; it gave the error of whatever execution reached first. Verdicts are unchanged.
+- Consensus: P2SH, WITNESS and TAPROOT are on for every block except Core's three exception blocks, as in Core, instead of from activation heights; main-chain verdicts are unchanged (#1244, #724).
+- Consensus: the Rust engine reports a tapscript push past the script's end as `BAD_OPCODE`, as Core does; verdicts are unchanged.
 - Dependencies: `rmcp` 3.9.0 (RUSTSEC-2026-0457, -0462; client features satd does not build); MCP requests are capped at 4 MiB.
 - RPC: any request `Content-Type` is read as JSON, as in Core (#824).
-- RPC: `invalidateblock`, `reconsiderblock` and `preciousblock` go on to the next-best chain when the best one holds an invalid block, as in Core; they stopped on the first and returned an error (#1261).
+- RPC: `invalidateblock`, `reconsiderblock` and `preciousblock` go on to the next-best valid chain, as in Core (#1261).
 - RPC: `getrawtransaction`'s not-found message matches the node's `-txindex` state (#1066).
 - RPC: `testmempoolaccept` forgives a standardness failure an `allow` policy rule forgives, as `sendrawtransaction` does (#999).
 - RPC: an open JSON-RPC WebSocket stops working when its bearer token is revoked or expires; its frames are answered `-32006` (#821).
 - RPC: `getnetworkinfo` reports each network's `reachable` and `limited` from `-onlynet` and the proxies, as Core does, and lists `i2p` and `cjdns` (#1164).
-- RPC: `getblockstats` reports `feerate_percentiles`; `minfeerate`, `maxfeerate` and `avgfeerate` are in sat/vB instead of sat/kvB, a thousandth of what 0.7 reported; and `mediantxsize`, `avgtxsize`, `mintxsize`, `maxtxsize`, `total_size`, `total_weight` and `avgfeerate` leave out the header and coinbase, as in Core.
+- RPC: `getblockstats` adds `feerate_percentiles`, reports feerates in sat/vB instead of sat/kvB, and leaves the header and coinbase out of its size statistics, as in Core.
 - RPC: `warnings` in `getblockchaininfo`, `getnetworkinfo` and `getmininginfo` is always an array, `[]` when empty, as in Core v28; `-deprecatedrpc=warnings` brings back the string form (#956).
 - Chain: the node leaves initial block download only once its tip has the network's minimum chain work as well as a recent timestamp, and does not re-enter it when the tip goes stale, as in Core (#1071).
 - Mempool: a transaction version below 1 or above 3 is non-standard, reason `version`, as in Core (#1070).
-- Mining: block templates keep a `prioritisetransaction` delta below a transaction's fee as a negative modified fee, as in Core; a child that does not cover its parent's delta no longer pulls both in, and a package with a negative modified fee is left out even at `-blockmintxfee=0` (#1274).
+- Mining: a negative `prioritisetransaction` modified fee stays negative in template selection, as in Core, even at `-blockmintxfee=0` (#1274).
 - P2P: the node's own disconnects are no longer logged as `reason="rpc_request"` (#1152).
 - P2P: onion peers are logged by their `.onion` address, not `0.0.0.0` (#1165).
 - P2P: during initial sync, blocks are downloaded no more than `-maxahead` above the tip, so a pruned node prunes during IBD instead of filling its disk (#1154).
@@ -44,16 +44,16 @@ It includes every fix shipped in 0.7.1:
 - RPC: `addconnection` opens typed connections to onion addresses through the proxy; it refused them (#1150).
 - P2P: the node opens Core's two automatic block-relay-only outbound connections once its eight full-relay peers are up; it opened none, and an `addconnection` block-relay-only peer took a full-relay slot (#1225).
 - P2P: a node with no outbound peer on a network it can reach (IPv4, IPv6 or onion) opens an extra full-relay connection to that network about every five minutes, as Core does, and keeps it as the only peer there (#1156).
-- P2P: once initial sync is over, the node opens an extra block-relay-only connection about every five minutes to check its tip, and then drops whichever of its two youngest block-relay-only peers gave it a block least recently, as Core does (#1155).
-- P2P: one source's network group holds at most 1,024 new entries in the address book, a sixteenth of it, as one source group reaches 64 of Core's 1,024 new buckets; a peer announcing addresses across many groups could fill the book (#1264).
+- P2P: after initial sync, an extra block-relay-only peer about every five minutes, then drops the youngest or second-youngest, whichever gave a block less recently, as in Core (#1155).
+- P2P: one source's network group holds at most 1,024 new address-book entries, a sixteenth of the book, as Core's bucketing limits one source (#1264).
 - P2P: a `cmpctblock` from a peer that never sent a version-2 `sendcmpct` is ignored, header included, as in Core v32 (#1275).
 - P2P: `.onion` fixed seeds for testnet4 and testnet3, and refreshed ones for mainnet and signet, from Core v31.2's lists, so a Tor-only node can bootstrap on every network (#1162).
 - P2P: a peer's block announcements or headers that do not connect draw one `getheaders` and then none until it answers or two minutes pass, as in Core's `MaybeSendGetHeaders`; they drew one every 2 seconds (#1262).
 - Config: `reindex=1` and `reindexchainstate=1` in `bitcoin.conf` are honoured, as in Core, instead of accepted and ignored (#840).
-- Operator: `-dbcache=auto` sizes from the memory cgroup limit (systemd `MemoryMax=`, Docker `--memory`, cgroup v2 or v1) when it is below host memory; it sized from the host alone (#1272).
+- Operator: `-dbcache=auto` sizes from the memory cgroup limit when it is below host memory (#1272).
 - Operator: the shadow verification queue is bounded by memory, `-shadowqueuemb` (default 128 MiB), as well as by entry count (#1145).
 - Operator: a datadir from another network is refused at startup with Core's "Incorrect or no genesis block found. Wrong datadir for network?", before `-reindex-chainstate` clears anything (#1270).
-- Operator: a custom signet keeps its data in `signet_<message start>`, as in Core; a node that ran one in `signet/` refuses to start and prints the `mv` to make. `sat-cli` and `sat-tui` take `-signetchallenge`; an empty challenge is a custom signet, as in Core (#1271).
+- Operator: a custom signet keeps its data in `signet_<message start>`, as in Core; a node that ran one in `signet/` refuses to start and prints the `mv` (#1271).
 - Operator: the core runtime has at least two worker threads, so one blocked worker cannot freeze RPC and P2P on a 1-CPU host (#1144).
 - Stack: `conf.d/local.conf` overrides the keys `satd-init` writes (#843).
 - HTTP: a client that stops reading a response, SSE stream or WebSocket is disconnected once a write has stalled for `-rpcservertimeout` on JSON-RPC and 60 s on Esplora and streamws (#823).
@@ -67,50 +67,53 @@ It includes every fix shipped in 0.7.1:
 - Electrum: the default server name carries an `electrumx` token so Sparrow batches against satd, and `-electrummaxbatchrequests` defaults to 345 to take Sparrow's largest batch (#1069).
 - Consensus: signet `nBits` is checked against the retarget schedule, as in Core (#838).
 - Release tooling: `contrib/release/sign-tarballs.sh` keeps a per-tag working directory across failed runs and reuses only the files whose hashes still match the release (#903).
-- Consensus: `-reindex` holds every block in the block files to the header rules header sync applies (difficulty schedule, median time past, version, checkpoints), and neither replays nor indexes one that breaks them, or any block built on it (#506).
-- Operator: AssumeUTXO background validation retries a failed block connect instead of stopping, its three alerts reach the `status` stream, webhooks and `satd_alert_active` as well as `getwarnings`, and new `satd_assumeutxo_*` gauges show its progress (#557).
-- Streaming: `Subscribe` and `Watch` responses carry the stream's head cursor in a `satd-head-cursor` header, and the Go and Rust resilient watch and subscription resume from it, so a drop before the first confirmed event no longer loses what was in flight (#777).
-- Packaging: the Nix build of `satd` no longer depends on the build host's CPU; jemalloc's address width, page and hugepage size are pinned on x86_64, and `flake.lock` is committed so a rebuild of a tag evaluates the same Nix inputs; the x86_64 Linux release tarballs pin the same jemalloc constants (#321).
-- RPC: `estimatesmartfee` takes Core 32.1's shape (`options.fee_rate_estimator`, `options.verbosity`, `estimator`, `blocks` as answered, target 1 served as 2, Core's no-data `errors`), and every fee surface floors at the rolling mempool minimum; new, not yet the new estimator (#1200).
-- Config: Core v31 and v32.1's new options (`prevoutfetchthreads`, `rpcmaxconnections`, `txsendrate`) load with a warning instead of being refused as typos; `privatebroadcast`, which satd does not implement, is refused. The node creates `<datadir>/fees/` as Core v32 does. `converttopsbt` takes Core v32's `psbt_version` argument and refuses a version it cannot produce (#1203).
-- RPC: `estimatesmartfee` with `fee_rate_estimator=mempool_policy` is Core 32's mempool estimator (health gate, template percentiles), and `verbosity` 2 reports the health window and a `mempool_health` verdict; opt-in, not yet the default (#1202).
-- RPC: `estimatesmartfee` with `fee_rate_estimator=block_policy` answers from a new chain-history estimator: each of the last 3,200 blocks' fee hurdle, read with analog windows (rbitcoin's method), saved to `fees/fee_history.dat` and filled from block and undo data for what the file lacks; opt-in, not yet the default (#1250).
-- RPC: the default fee estimate (`estimatesmartfee` `auto`, `estimatefees`, Esplora, Electrum, MCP, status page) is the mempool's template percentile for 1-2 blocks while the health gate passes and the chain-history estimate beyond, held at or below the 2-block answer; `conservative` never below history, which answers it at 97.5% (was 99%); lower than 0.7's in a calm market; every estimate floors at the rolling mempool minimum or `-minrelaytxfee` (0.1 sat/vB by default) as in Core, no longer at 1 sat/vB (#1254).
+- Consensus: `-reindex` applies header sync's rules (difficulty, median time past, version, checkpoints) to every stored block and skips a failing block and its descendants (#506).
+- Operator: AssumeUTXO background validation retries a failed connect, its alerts reach every alert surface, and new `satd_assumeutxo_*` gauges show progress (#557).
+- Streaming: a `satd-head-cursor` header lets the Go and Rust resilient watches resume after a drop before their first confirmed event (#777).
+- Packaging: Nix builds and x86_64 Linux tarballs no longer depend on the build CPU (jemalloc constants pinned), and `flake.lock` is committed (#321).
+- RPC: `estimatesmartfee` takes Core 32.1's shape (`options`, `estimator`, answered `blocks`, no-data `errors`), and every fee surface floors at the rolling mempool minimum (#1200).
+- Config: Core v31/v32.1's new options load with a warning, `privatebroadcast` is refused, `<datadir>/fees/` is created, and `converttopsbt` takes `psbt_version` (#1203).
+- RPC: `estimatesmartfee`'s `mempool_policy` is Core 32's mempool estimator, with its health gate; `verbosity` 2 reports the gate (#1202).
+- RPC: `estimatesmartfee`'s `block_policy` answers from the last 3,200 blocks' fee hurdles with analog windows, saved in `fees/fee_history.dat` (#1250).
+- RPC: the default fee estimate on every surface is the mempool's for 1-2 blocks and chain history beyond; floor 0.1 sat/vB, no longer 1 sat/vB (#1254).
 - RPC: `validateaddress` reports one `error_locations` entry, the position where the string passes the limit, for a too-long Bech32 string, as Core v32 does (#1204).
 - RPC: a connection from a source address outside `-rpcallowip` is closed without a reply, as Core v32 does, instead of answered `403 Forbidden` (#1204).
 - P2P: a transaction hash repeated in one `inv` is processed once, and each is logged as Core v32's `got inv:` line under `-debug=net` (#1204).
 - P2P: a peer that asks for a filtered block (`MSG_FILTERED_BLOCK`) is disconnected, as Core v32 does without `NODE_BLOOM` (#1204).
 - P2P: under `-blocksonly`, every `cmpctblock` is ignored, as in Core v32, including one for a block the node requested (#1204).
-- P2P: the node's onion address is announced only to peers that cannot see its IP (in on the onion listener, or out through the proxy), `-externalip` is no longer sent beside it or in the version message's `addr_from`, and `getaddr` replies never carry the node's own addresses (#1209).
-- P2P: `-maxconnections` defaults to 200, as in Core v32, and transaction-relaying inbound peers may hold at most `-inboundrelaypercent` (default 50) of the inbound slots; past it a new one evicts another by Core's inbound eviction rules, or is dropped if all are protected, so the extra slots go to block-relay-only peers (#1263).
-- P2P: `-maxconnections` above 2000 is lowered to 2000 with a warning, as in Core v32.1 (#1295).
-- P2P: at startup satd raises its soft file-descriptor limit and fits `-maxconnections` to it with Core's warning, shrinks caps left at their defaults to fit what is left, or refuses to start with "Not enough file descriptors available." when the fixed needs and the caps the operator set do not fit (#1294).
+- P2P: the onion address goes only to peers that cannot see the node's IP, and `getaddr` replies never carry the node's own addresses (#1209).
+- P2P: `-maxconnections` defaults to 200, as in Core v32, and `-inboundrelaypercent` (default 50) caps transaction-relaying inbound peers (#1263).
 - P2P: `-discover` announces to outbound clearnet peers the address they report seeing the node at, off by default (Core's is on) (#1209).
-- The C++ script engine is Bitcoin Core's interpreter through `libbitcoinkernel`
-  instead of `libbitcoinconsensus`, which redid a transaction's signature
-  hashing for every input. About 27x faster on a 3,373-input signet block,
-  2.3x on a typical mainnet block (#874). Building from source now needs cmake
-  and the Boost headers.
-- IBD: an arriving block or `headers` message is handled at once instead of at the P2P loop's next 500 ms tick, which lifts the early part of a sync from about 25 blocks a second per peer to about 250 from one peer on local storage (#1228).
-- IBD: the coin cache flushes when its dirty coins fill the `-dbcache` budget, as Bitcoin Core's does, instead of every 1,000 blocks and at a quarter of the budget; a prune always flushes first. Initial sync also no longer starts verification threads for blocks below `-assumevalid`, and storing a block no longer walks back to the connected tip. From one local peer the first 300 seconds of a mainnet sync reached about 211,000 blocks, up from about 155,000. Peak memory during initial sync rises by roughly the `-dbcache` budget, and after a crash the node reconnects the blocks since the last flush, up to a few thousand.
-- IBD: a stored block's index entry is written with up to 63 others after one sync of the block files, instead of each block syncing the file on its own; the first 100,000 mainnet blocks from one local peer took about 70 seconds instead of about 7 minutes. A crash loses at most the last 100 ms of downloaded blocks, which are fetched again.
-- IBD: the coin cache erases a coin created and spent between two flushes, as Bitcoin Core does, and its flush threshold counts what it actually holds: the dirty coins, once each, and the index rows buffered with them. Spent fresh coins had been most of the dirty map during initial sync, counted twice, so the cache flushed at about a third of its budget. With the same indexes as Core (`-txindex`, `-addressindex=0`), the first five minutes of a mainnet sync from one local peer now keep pace with Core 29.3.
+- The C++ script engine is Bitcoin Core's interpreter through `libbitcoinkernel` instead of `libbitcoinconsensus`: about 27x faster on a 3,373-input signet block, 2.3x on a typical mainnet block (#874). Building from source now needs cmake and the Boost headers.
+- IBD: blocks and `headers` are handled on arrival, not on the P2P loop's 500 ms tick, lifting early sync well past 25 blocks a second per peer (#1228).
+- IBD: the coin cache flushes when dirty coins fill `-dbcache`, as in Core, not every 1,000 blocks; peak IBD memory rises by up to the `-dbcache` budget.
+- IBD: block files are synced once per batch of up to 64 blocks or 100 ms, not once per block; height 100,000 in about 70 seconds instead of 7 minutes.
+- IBD: the coin cache erases a coin created and spent between flushes, as Core does, and its flush threshold counts what it holds.
 - IBD: a fresh node runs initial sync with RocksDB's write-ahead log off, as intended for any catch-up of 10,000 blocks or more; the decision was taken against the first 2,000-header batch, so a fresh sync never qualified.
-- IBD: header sync runs with one peer, preferably an outbound one, until the best header is less than a day old, as in Bitcoin Core, instead of with every peer the node connects to; a fresh testnet4 node with seven peers received the 13 MB header chain once instead of about six times.
-- IBD: header sync no longer downloads the header chain many times over; a new request goes out only after the header tip has stood still for 10 seconds, and a full batch asks only the peer that sent it for more. A fresh mainnet sync from one peer took 5.6 GB of `headers` for the 78 MB chain (#1229).
-- IBD: testnet4 and testnet3 get Bitcoin Core's default `-assumevalid`, and the stall watchdog counts the script inputs the connect path verifies as progress, so one very large block is no longer taken for a wedge; in 0.7.1 a fresh testnet4 sync stopped for good at block 51,540 (#1216).
+- IBD: header sync runs with one peer until the best header is less than a day old, as in Core, instead of with every peer.
+- IBD: header sync no longer downloads the header chain many times over (5.6 GB of `headers` for a 78 MB chain) (#1229).
+- IBD: testnet4 and testnet3 get Core's default `-assumevalid`, and the stall watchdog counts verified script inputs, so a fresh testnet4 sync gets past block 51,540 (#1216).
 - Esplora: `/`, `/mempool`, `/mempool/txids`, `/mempool/recent` and `/tx/:txid/outspends` no longer copy the whole mempool on every request; any client that could reach Esplora could make the node do so at will. Also in 0.7.2.
 - P2P: a peer that sends a `getblocktxn` naming no transaction is disconnected, as in Bitcoin Core; one 33-byte request could make the node upload a whole block. Also in 0.7.2.
 - P2P: a block that extends the tip is announced to peers only after its BIP 34 coinbase height and transaction finality are checked, as in Core. Also in 0.7.2.
 - Tor: the onion address and private key `ADD_ONION` returns, and the saved key, are checked as Core checks them before they are used, and a control-port line over 100,000 bytes is refused. Also in 0.7.2.
 - Electrum: `server.version` negotiates the protocol version per connection by the spec's rule and gates each method on it; a second `server.version` is refused, and one with no version in common now closes the connection.
-- Electrum: protocol 1.6. A client offering it (Electrum 4.7+, BDK) gets `block.headers` as a list, `mempool.get_info` in place of `blockchain.relayfee`; `estimatefee` takes `ECONOMICAL`/`CONSERVATIVE`; `broadcast_package` is `submitpackage` at every version, so a child can pay for a parent below the minimum feerate.
+- Electrum: protocol 1.6 (Electrum 4.7+, BDK); `estimatefee` takes a mode and `broadcast_package` is `submitpackage` at every version.
 - Electrum: JSON-RPC notifications (requests with no `id`) are no longer run only to drop their reply. Also in 0.7.2.
 - RPC: `addnode` refuses an empty node with Core's `-8` error; `addnode "" add` kept it and retried it forever. Also in 0.7.2.
-- RPC: every `asm` field is Core's `ScriptToAsmStr`: bare hex pushes, small numbers as numbers, Core's opcode names, and a scriptSig signature's sighash type decoded (`[ALL]`); it was rust-bitcoin's format (`OP_PUSHBYTES_20`, `OP_0`, `OP_CSV`). Electrum's verbose `blockchain.transaction.get` too (#1265).
-- RPC: every scriptPubKey object (`decoderawtransaction`, `getrawtransaction`, `getblock` 2/3, Electrum's verbose transaction) carries Core's inferred `desc`; `decodescript` adds `desc`, `address` and the `segwit` object, as in Core (#1266).
-- RPC: integer and verbosity arguments are parsed as in Core: a negative `getblock`/`getrawtransaction` verbosity means hex and a too-high one the top level, a fraction or a value outside the argument's C++ type is `-1 JSON integer out of range`, and each method answers Core's range error (#1267).
-- CLI: `sat-cli` converts a raw RPC call's arguments by Bitcoin Core's per-method table, as `bitcoin-cli` does, instead of parsing every argument that looks like JSON: `signmessagewithprivkey <key> 123` signs the text `123`. A listed argument that is not valid JSON is refused. Adds `-stdinrpcpass`; `-stdin` keeps empty lines (#1268).
+- RPC: every `asm` field is Core's `ScriptToAsmStr` format instead of rust-bitcoin's (#1265).
+- RPC: every scriptPubKey object carries Core's inferred `desc`, and `decodescript` adds `desc`, `address` and `segwit`, as in Core (#1266).
+- RPC: integer and verbosity arguments are parsed and range-checked as in Core; out-of-type values are `-1 JSON integer out of range` (#1267).
+- CLI: `sat-cli` converts arguments by Core's per-method table, as `bitcoin-cli` does; adds `-stdinrpcpass`, and `-stdin` keeps empty lines (#1268).
+- IBD: the default `-assumevalid` and the minimum chain work of every network are Bitcoin Core v32.1's; mainnet's default block moves from height 840,000 to 966,143 and signet's from 218,000 to 321,295 (#1217).
+- RPC: `getblockstats`' `total_out` leaves out the coinbase, `utxo_size_inc` sums the real output and prevout sizes, and `utxo_increase_actual` and `utxo_size_inc_actual` are reported, as in Core (#1208).
+- Operator: a custom signet frames its `blk*.dat` records and `dumptxoutset` snapshots with its own message start, as Core does, not the default signet's; a pre-0.8.0 custom-signet blocks directory mixes both and needs a fresh sync before Core can read it (#1283).
+- RPC: `getchaintxstats` defaults to one month of blocks (4320) and accepts `nblocks=0`, as in Core (#1297).
+- RPC: `decodepsbt`'s `tx` is the transaction as `decoderawtransaction` decodes it, and its script objects carry Core's `asm`, `hex`, `type` and, for a scriptPubKey, `desc` and `address` (#1296).
+- RPC: `getmempoolentry`, `getrawmempool true` and `getmempoolancestors`/`getmempooldescendants true` report Core v31's `chunkweight` and `fees.chunk` (#1068).
+- RPC: `getnetworkinfo` reports `version` 320000 (Bitcoin Core v32), up from 280000, so clients with a Core v29 or v31 floor (Bark, Eclair) start (#1068).
+- P2P: `-maxconnections` above 2000 is lowered to 2000 with a warning, as in Core v32.1 (#1295).
+- P2P: at startup satd raises its soft file-descriptor limit and fits `-maxconnections` to it with Core's warning, shrinks caps left at their defaults to fit what is left, or refuses to start with "Not enough file descriptors available." when the fixed needs and the caps the operator set do not fit (#1294).
 
 ## Releases
 

@@ -66,6 +66,15 @@ ignore = [
     # directly and the shims leave the lock.
     { id = "RUSTSEC-2026-0381", reason = "webpki-roots 0.26.11 is a shim re-exporting 1.x, locked to fixed 1.0.10" },
     { id = "RUSTSEC-2026-0383", reason = "webpki-root-certs 0.26.11 is a shim re-exporting 1.x, locked to fixed 1.0.10" },
+
+    # chrono 0.4.44 -- RUSTSEC-2026-0543 (unmaintained, all versions, no
+    # patched release). Informational only: it reports no vulnerability.
+    # satd has no direct dependency on chrono and calls none of its API; it
+    # comes in only through rmcp (satd-mcp), which uses it for RFC 3339
+    # timestamps in MCP task/annotation metadata, and through schemars 1.x's
+    # `chrono04` feature that rmcp enables. Removing it needs rmcp to drop
+    # chrono (upstream modelcontextprotocol/rust-sdk#1469); tracked in #1314.
+    { id = "RUSTSEC-2026-0543", reason = "unmaintained, no vuln; transitive via rmcp only, no direct use; tracked in #1314" },
 ]
 
 # ---------------------------------------------------------------------------

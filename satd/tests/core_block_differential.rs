@@ -1074,20 +1074,18 @@ fn core_block_live_differential() {
 // weight-weighted), witness transactions (weight is not four times the
 // size, and the sizes count witness bytes), rates that `fee * 4 / weight`
 // truncates, and both odd and even transaction counts (the median of an
-// even count averages the two middle values).
+// even count averages the two middle values). For the UTXO statistics
+// (`total_out`, `utxo_size_inc` and the `_actual` pair) they also cover
+// unspendable outputs (`OP_RETURN` in a transaction and in the coinbase's
+// witness commitment, a script over `MAX_SCRIPT_SIZE`), scripts of
+// different lengths, and the genesis block, whose coinbase never enters
+// the UTXO set.
 
 /// Statistics satd still reports differently from Core, compared by
 /// neither side. A statistic missing from this list must match; one that
 /// starts to match while it is listed fails too, so the list cannot go
-/// stale.
-///
-/// - `total_out`: satd counts the coinbase's outputs; Core does not.
-/// - `utxo_size_inc`: satd charges a flat 50 bytes per output; Core sums
-///   each output's serialized size plus its overhead, minus the spent ones.
-/// - `utxo_increase_actual`, `utxo_size_inc_actual`: satd does not report
-///   them.
-const KNOWN_DIFFERENT: &[&str] =
-    &["total_out", "utxo_size_inc", "utxo_increase_actual", "utxo_size_inc_actual"];
+/// stale. Empty: every statistic matches.
+const KNOWN_DIFFERENT: &[&str] = &[];
 
 /// `OP_TRUE` as a P2WSH witness script.
 fn p2wsh_op_true() -> ScriptBuf {
@@ -1267,6 +1265,50 @@ fn core_getblockstats_differential() {
     );
     submit(&mut ctx, "truncating_rates", b);
 
+    // 7. Unspendable outputs, which `utxo_size_inc` counts and the `_actual`
+    //    pair leaves out: an `OP_RETURN` with data, a bare `OP_RETURN`
+    //    carrying value, and a script one byte over `MAX_SCRIPT_SIZE`
+    //    (consensus-valid, never spendable), beside a spendable output with
+    //    a script long enough to need a three-byte length prefix. A witness
+    //    spend in the same block puts the `OP_RETURN` commitment in the
+    //    coinbase.
+    let cb = ctx.take_mature_coinbase(&mut used);
+    let op_return_data = ScriptBuf::new_op_return([0xab; 40]);
+    let op_return_bare = ScriptBuf::from(vec![0x6a]);
+    let oversized = ScriptBuf::from(vec![0x51; 10_001]);
+    let long_spendable = {
+        // OP_TRUE, then a 300-byte push dropped again: spendable, and its
+        // length (304) needs the three-byte compact-size prefix.
+        let mut v = vec![0x51, 0x4d, 0x2c, 0x01];
+        v.extend([0u8; 300]);
+        v.push(0x75);
+        ScriptBuf::from(v)
+    };
+    let unspendable = Transaction {
+        version: TxVersion(2),
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: cb.outpoint,
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::MAX,
+            witness: Witness::new(),
+        }],
+        output: vec![
+            TxOut { value: Amount::from_sat(cb.amount - 30_000), script_pubkey: p2wsh_op_true() },
+            TxOut { value: Amount::ZERO, script_pubkey: op_return_data },
+            TxOut { value: Amount::from_sat(5_000), script_pubkey: op_return_bare },
+            TxOut { value: Amount::from_sat(5_000), script_pubkey: oversized },
+            TxOut { value: Amount::from_sat(10_000), script_pubkey: long_spendable },
+        ],
+    };
+    let witness_spend = pay(&[out_of(&unspendable, 0)], 4_321, &[op_true(), op_true()]);
+    let b = fee_block(&ctx, vec![unspendable, witness_spend]);
+    submit(&mut ctx, "unspendable_outputs", b);
+
+    // The genesis block: its coinbase is in `utxo_size_inc` but in neither
+    // `_actual` statistic. Both nodes already hold it.
+    blocks.push(("genesis", bitcoin::constants::genesis_block(Network::Regtest)));
+
     let mut report = String::from("\nLive-Core getblockstats differential\n");
     let mut failures: Vec<String> = Vec::new();
     let mut still_different: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
@@ -1292,12 +1334,18 @@ fn core_getblockstats_differential() {
             }
         }
         report.push_str(&format!(
-            "{} {name:<20} feerate_percentiles={} mediantxsize={} avgfeerate={} total_size={}\n",
+            "{} {name:<20} feerate_percentiles={} mediantxsize={} avgfeerate={} total_size={} \
+             total_out={} utxo_increase={}/{} utxo_size_inc={}/{}\n",
             if ok { "✓" } else { "✗" },
             c["feerate_percentiles"],
             c["mediantxsize"],
             c["avgfeerate"],
             c["total_size"],
+            c["total_out"],
+            c["utxo_increase"],
+            c["utxo_increase_actual"],
+            c["utxo_size_inc"],
+            c["utxo_size_inc_actual"],
         ));
     }
     for known in KNOWN_DIFFERENT {
@@ -1330,6 +1378,20 @@ fn core_getblockstats_differential() {
     assert!(pct[0] < pct[4], "the mixed block must spread its percentiles: {pct:?}");
     let witness = core_stats("witness_even_count");
     assert!(witness["mediantxsize"].as_u64().unwrap() > 0, "{witness}");
+    // The unspendable outputs and the genesis coinbase must separate the
+    // `_actual` statistics from the plain ones, and `total_out` must be
+    // short of the coinbase's value.
+    for name in ["unspendable_outputs", "genesis"] {
+        let c = core_stats(name);
+        assert_ne!(c["utxo_increase_actual"], c["utxo_increase"], "{name}: {c}");
+        assert_ne!(c["utxo_size_inc_actual"], c["utxo_size_inc"], "{name}: {c}");
+    }
+    let unspendable = core_stats("unspendable_outputs");
+    let left_out = unspendable["utxo_increase"].as_i64().unwrap()
+        - unspendable["utxo_increase_actual"].as_i64().unwrap();
+    assert_eq!(left_out, 4, "three unspendable outputs and the coinbase commitment: {unspendable}");
+    assert!(unspendable["utxo_size_inc"].as_i64().unwrap() > 10_000, "{unspendable}");
+    assert_eq!(core_stats("coinbase_only")["total_out"], serde_json::json!(0));
 
     satd.stop();
     assert!(failures.is_empty(), "getblockstats divergences:\n{}", failures.join("\n"));

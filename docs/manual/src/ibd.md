@@ -126,7 +126,7 @@ accepts three forms. The third is a satd extension.
 
 | Value | Meaning | Compat |
 |---|---|---|
-| `-assumevalid=<blockhash>` | Skip script verification for that block's ancestors, under Core's conditions (below). A per-network default ships in the binary, as in Core: mainnet height 840,000, signet 218,000, and Core's own defaults for testnet4 (123,613) and testnet3 (4,842,348). | Core |
+| `-assumevalid=<blockhash>` | Skip script verification for that block's ancestors, under Core's conditions (below). A per-network default ships in the binary: Bitcoin Core v32.1's, mainnet height 966,143, testnet3 5,128,859, testnet4 151,604 and signet 321,295. A custom signet and regtest have none. | Core |
 | `-assumevalid=0` | Verify everything; no skipping. | Core |
 | `-assumevalid=all` | Skip script verification for blocks older than a cutoff age; verify recent and new blocks in full. The cutoff is `-assumevalidage` (default 86400 s, 24 h). | satd extension |
 
