@@ -14891,11 +14891,13 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A dust parent that is already confirmed contributes no dust to sweep:
-    /// Core's `CheckEphemeralSpends` gathers it only from in-package and
-    /// in-mempool parents. Resubmitted with a child that spends only its
-    /// ordinary output, the parent cannot enter (its input is spent), and the
-    /// child, accepted on its own, is not refused for the dust.
+    /// A dust parent that is already confirmed has no dust left to strand.
+    /// Resubmitted with a child that spends only its ordinary output, the
+    /// parent cannot enter (its input is spent), and the child, accepted on
+    /// its own, is not refused for the dust. In Core the parent fails
+    /// `PreChecks` (`txn-already-known`), so `CheckEphemeralSpends` never
+    /// judges the child. Only the child's outcome is pinned here: satd's
+    /// package-level answer for the parent differs from Core's.
     #[test]
     fn an_accepted_child_of_a_confirmed_dust_parent_is_not_refused() {
         let op = outpoint(0xCC);
