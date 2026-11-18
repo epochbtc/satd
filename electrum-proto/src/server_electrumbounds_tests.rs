@@ -216,3 +216,22 @@ async fn a_timed_out_request_keeps_its_connection_slot_until_its_work_ends() {
     sd_tx.send(true).unwrap();
     let _ = tokio::time::timeout(Duration::from_secs(5), join).await;
 }
+
+/// Every cap option accepts any `usize`, and tokio's semaphore panics above
+/// `usize::MAX >> 3`. A server given the largest `max_conns` binds and
+/// serves: the cap is clamped, not handed through.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_oversized_connection_cap_is_clamped_not_panicking() {
+    let server = ElectrumServer::bind_with_factory(config(Duration::from_secs(30), usize::MAX), slow_factory())
+        .await
+        .unwrap();
+    let addr = server.local_addr().unwrap();
+    let (sd_tx, sd_rx) = watch::channel(false);
+    let join = tokio::spawn(server.serve(sd_rx));
+    let mut conn = connect(addr).await;
+    send(&mut conn, 1, "server.ping").await;
+    assert_eq!(recv(&mut conn).await.expect("answer")["result"], "server.ping");
+    let _ = sd_tx.send(true);
+    drop(conn);
+    let _ = join.await;
+}

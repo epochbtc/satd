@@ -113,6 +113,7 @@ It includes every fix shipped in 0.7.1:
 - RPC: `getmempoolentry`, `getrawmempool true` and `getmempoolancestors`/`getmempooldescendants true` report Core v31's `chunkweight` and `fees.chunk` (#1068).
 - RPC: `getnetworkinfo` reports `version` 320000 (Bitcoin Core v32), up from 280000, so clients with a Core v29 or v31 floor (Bark, Eclair) start (#1068).
 - P2P: `-maxconnections` above 2000 is lowered to 2000 with a warning, as in Core v32.1 (#1295).
+- P2P: at startup satd raises its soft file-descriptor limit and fits `-maxconnections` to it with Core's warning, shrinks caps left at their defaults to fit what is left, or refuses to start with "Not enough file descriptors available." when the fixed needs and the caps the operator set do not fit (#1294).
 
 ## Releases
 

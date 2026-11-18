@@ -1536,6 +1536,11 @@ pub struct Config {
     /// up, so logging from inside the resolver would silently disappear
     /// (round-3 M2). Consumed once by `take_pending_notes`.
     pub pending_notes: Vec<ConfigNote>,
+    /// The connection and file caps the descriptor budget may shrink:
+    /// those the operator left at their defaults, by option name
+    /// (`crate::fd_budget`). A cap set on the command line or in the file
+    /// is not here and is budgeted at its value.
+    pub caps_at_default: Vec<&'static str>,
 }
 
 /// `Config` holds `rpcpassword`, `rpcauth`, `torpassword`, `esplorauserpass`
@@ -1984,6 +1989,32 @@ impl Config {
                     vals
                 })
                 .unwrap_or_default()
+        };
+
+        // Which descriptor-budgeted caps were left at their defaults: set
+        // neither on the command line nor by a value in the file that
+        // parses, as each one's resolution below reads it.
+        let caps_at_default: Vec<&'static str> = {
+            let in_file = |key: &str, signed: bool| {
+                file_get(key).is_some_and(|v| {
+                    if signed { v.parse::<i32>().is_ok() } else { v.parse::<usize>().is_ok() }
+                })
+            };
+            [
+                ("maxopenfiles", cli.maxopenfiles.is_some(), true),
+                ("esploramaxsockets", cli.esploramaxsockets.is_some(), false),
+                ("esploramaxconns", cli.esploramaxconns.is_some(), false),
+                ("esplorasseconns", cli.esplorasseconns.is_some(), false),
+                ("electrummaxconns", cli.electrummaxconns.is_some(), false),
+                ("stratummaxconns", cli.stratum_args.stratummaxconns.is_some(), false),
+                ("eventsgrpcmaxconns", cli.events_grpc_max_conns.is_some(), false),
+                ("streamwsmaxsockets", cli.streamws_max_sockets.is_some(), false),
+                ("streamwsmaxconns", cli.streamws_max_conns.is_some(), false),
+            ]
+            .into_iter()
+            .filter(|(key, on_cli, signed)| !on_cli && !in_file(key, *signed))
+            .map(|(key, _, _)| key)
+            .collect()
         };
 
         // Merge: CLI > config file > defaults
@@ -4915,6 +4946,7 @@ impl Config {
             zmq_pub: zmq.zmq_pub,
             zmq_hwm: zmq.zmq_hwm,
             pending_notes,
+            caps_at_default,
         })
     }
 

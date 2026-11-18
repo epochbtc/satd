@@ -101,6 +101,67 @@ Consequences of the single instance:
 - RocksDB keeps many SST files mmapped. Budget `LimitNOFILE=65536` at
   minimum. The systemd unit and the Docker image both pre-set this.
 
+### File descriptors
+
+At startup satd works out how many descriptors it needs, as Bitcoin Core
+does in `AppInitParameterInteraction`:
+
+```text
+needs    = 151                              base: stdio, logs, block and undo files,
+                                            RocksDB's WAL/MANIFEST/LOG, runtime
+         + maxopenfiles                     RocksDB table files (when > 0; default 2048)
+         + 8                                addnode peers
+         + max(1, bind + whitebind)         P2P listeners
+         + 1 with listenonion               Tor control
+         + 2 with nap                       attestation pulls
+         + 101 per RPC listener             plain (2 by default), TLS, read-only, read-only TLS
+         + Esplora:     listeners + esploramaxsockets
+                        (esploramaxconns + esplorasseconns if 0)
+         + Electrum:    listeners + electrummaxconns
+         + Stratum:     listeners + stratummaxconns
+         + events gRPC: 1 + eventsgrpcmaxconns
+         + streamws:    1 + streamwsmaxsockets (streamwsmaxconns if 0)
+         + MCP HTTP:    1 + 128
+         + metrics:     1 + 64, and 1 + 64 for its TLS listener
+         + 1 per ZMQ endpoint
+total    = needs + maxconnections
+```
+
+Only enabled surfaces count. When an Esplora or streamws socket cap is `0`,
+its connection caps are counted instead (for Esplora, requests in flight plus
+SSE streams): they bound the sockets holding a request or a stream, though
+not idle ones. A cap that is off with nothing to fall back on
+(`maxopenfiles=-1`, or a socket cap and its connection caps all `0`) counts
+nothing, and neither do ZMQ subscribers or an AssumeUTXO background
+chainstate.
+
+The caps in the formula (`maxopenfiles` and the connection and socket caps)
+count at their value when set on the command line or in `bitcoin.conf`. A
+cap left at its default counts only a floor of 64 (or its default, if
+smaller) toward the hard minimum. With the defaults the hard minimum is 491
+and `total` is 3,435.
+
+satd raises the soft `RLIMIT_NOFILE` to `total`, never past the hard limit,
+and then, in Core's order:
+
+1. If the result is below the hard minimum, it refuses to start with
+   `Not enough file descriptors available. X available, Y required.`
+2. `maxconnections` is lowered to what is left, if it must be, with
+   `Reducing -maxconnections from X to Y, because of system limitations.`
+3. The caps left at their defaults share what remains, each in proportion
+   to its default less its floor, and each one lowered is logged the same
+   way (`Reducing -maxopenfiles from 2048 to 288, ...`). Under a limit of
+   1,024 a default node keeps its 200 peers and runs with 288 RocksDB table
+   files and 172 Esplora sockets.
+
+The log line `Using at most N automatic connections (M file descriptors
+available)` reports the outcome. A SIGHUP keeps the startup split: caps
+still at their defaults keep their fitted values, and a raised
+`maxconnections` is fitted into the room the peers had. Unlike Core, satd
+does not refuse to start because a raised listener cap (Core's
+`-rpcmaxconnections`) is what does not fit; a cap that is set and does not
+fit fails step 1.
+
 ## Signals
 
 | Signal | Behaviour |

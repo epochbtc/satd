@@ -53,3 +53,34 @@ where
     .await
     .map_err(|e| EsploraError::Internal(format!("handler task failed: {e}")))?
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt as _;
+
+    use crate::test_support::regtest_state;
+
+    /// Every cap option accepts any `usize`, and tokio's semaphore (under
+    /// both the work permits and tower's `ConcurrencyLimitLayer`) panics
+    /// above `usize::MAX >> 3`. With the largest value the router still
+    /// builds and serves: the cap is clamped, not handed through.
+    #[tokio::test]
+    async fn an_oversized_request_cap_is_clamped_not_panicking() {
+        let permits = super::work_permits_for(usize::MAX).expect("a cap");
+        assert_eq!(permits.available_permits(), node::http_serve::CAP_CEILING);
+
+        let (mut state, _dir) = regtest_state();
+        state.config = Arc::new(crate::EsploraConfig { max_concurrency: usize::MAX, ..Default::default() });
+        state.work_permits = Some(permits);
+        let router = crate::build_router(state).unwrap();
+        let resp = router
+            .oneshot(Request::get("/blocks/tip/height").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+}
