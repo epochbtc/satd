@@ -13315,6 +13315,29 @@ impl PeerManager {
             return;
         }
 
+        // Core's `locator.IsNull()` branch (v32.1 `net_processing.cpp`,
+        // `ProcessMessage`, `NetMsgType::GETHEADERS`): an empty locator asks
+        // for the one header `hashStop` names. Core answers nothing at all
+        // for a block it does not know or that fails `BlockRequestAllowed`:
+        // a block held only as a header, or a stale one it never validated
+        // or that is past the 30-day window. satd treated an empty locator
+        // as one matching nothing and answered with headers from height 1.
+        if msg.locator_hashes.is_empty() {
+            let Some(entry) = self.chain_state.get_block_index(&msg.stop_hash) else {
+                return;
+            };
+            let on_active_chain =
+                self.chain_state.active_chain_hash_at_height_indexed(entry.height) == Some(msg.stop_hash);
+            if !on_active_chain && !self.stale_block_request_allowed(&entry) {
+                tracing::debug!(
+                    "ignoring request from peer={id} for old block header that isn't in the main chain"
+                );
+                return;
+            }
+            self.send_to_peer(id, NetworkMessage::Headers(vec![entry.header]));
+            return;
+        }
+
         let start = self.locator_fork_height(&msg.locator_hashes) + 1;
         let tip = self.chain_state.tip_height();
         let end = std::cmp::min(start + 2000, tip + 1);

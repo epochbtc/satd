@@ -277,3 +277,60 @@ fn a_stale_block_buried_under_a_month_of_work_is_not_served() {
     pm.handle_getdata(1, vec![Inventory::WitnessBlock(b[0])]);
     assert!(drain(&mut rx).is_empty(), "membership is read from the height index, without a walk");
 }
+
+/// A `getheaders` with an empty locator asks for the one header `hashStop`
+/// names, and Core answers it only under `BlockRequestAllowed` (v32.1
+/// `net_processing.cpp`, `GETHEADERS`, the `locator.IsNull()` branch): not
+/// for a block held only as a header, an unknown one, or a stale one never
+/// validated. satd answered every one of them with headers from height 1.
+#[test]
+fn a_null_locator_getheaders_is_answered_only_for_a_block_it_may_serve() {
+    use bitcoin::p2p::message_blockdata::GetHeadersMessage;
+    let (pm, _dir) = mk_pm();
+    let a = mine(&pm, 3, 1);
+    let mut rx = add_peer(&pm, 1, false);
+    let headers = |rx: &mut mpsc::Receiver<NetworkMessage>| -> Option<Vec<bitcoin::BlockHash>> {
+        let mut msgs = drain(rx);
+        assert!(msgs.len() <= 1, "{msgs:?}");
+        msgs.pop().map(|m| match m {
+            NetworkMessage::Headers(hs) => hs.iter().map(|h| h.block_hash()).collect(),
+            other => panic!("expected headers, got {other:?}"),
+        })
+    };
+
+    // An active-chain block: its header alone.
+    pm.handle_getheaders(1, GetHeadersMessage::new(vec![], a[1]));
+    assert_eq!(headers(&mut rx), Some(vec![a[1]]), "one header, the one named");
+
+    // A block known only as a header: no reply at all.
+    let child = crate::mining::miner::build_block_to_script(
+        &pm.chain_state,
+        &Mempool::new(1_000_000, 0),
+        bitcoin::ScriptBuf::new_op_return([9]),
+        None,
+    )
+    .expect("build block");
+    pm.chain_state.accept_header(&child.header).expect("accept header");
+    pm.handle_getheaders(1, GetHeadersMessage::new(vec![], child.block_hash()));
+    assert_eq!(headers(&mut rx), None, "a header-only block is not answered");
+
+    // An unknown block: no reply either.
+    pm.handle_getheaders(1, GetHeadersMessage::new(vec![], bitcoin::BlockHash::from_byte_array([7; 32])));
+    assert_eq!(headers(&mut rx), None, "an unknown block is not answered");
+
+    // A stale block never validated is withheld; one validated is served.
+    pm.chain_state.invalidate_block(a[1]).unwrap();
+    let b = mine(&pm, 3, 2);
+    pm.chain_state.reconsider_block(a[1]).unwrap();
+    assert_eq!(pm.chain_state.tip_hash(), b[2]);
+    pm.handle_getheaders(1, GetHeadersMessage::new(vec![], a[2]));
+    assert_eq!(headers(&mut rx), None, "a stale block never validated is not answered");
+    pm.handle_getheaders(1, GetHeadersMessage::new(vec![], a[0]));
+    assert_eq!(headers(&mut rx), Some(vec![a[0]]), "a[0] is still on the active chain");
+    pm.chain_state.invalidate_block(b[0]).unwrap();
+    pm.chain_state.reconsider_block(b[0]).unwrap();
+    assert_eq!(pm.chain_state.tip_hash(), b[2]);
+    pm.handle_getheaders(1, GetHeadersMessage::new(vec![], a[2]));
+    assert_eq!(headers(&mut rx), Some(vec![a[2]]), "a validated stale block is answered");
+    assert!(pm.peers.read().contains_key(&1), "no refusal disconnects");
+}
