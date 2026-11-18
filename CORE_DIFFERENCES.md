@@ -615,9 +615,9 @@ preserved; the satd extension is opt-in per request or per flag.
 - **PSBT version 2 (BIP 370) and the BIP 375 silent payment fields** —
   every PSBT method accepts a version 2 PSBT and answers with one, as
   Core does since v32 (up to v31 Core rejected any PSBT whose
-  `PSBT_GLOBAL_VERSION` was above zero). The version 0 path is
-  byte-identical to what it was, error text included, and is guarded by
-  a snapshot test. `createpsbt` and `converttopsbt` default to version 0
+  `PSBT_GLOBAL_VERSION` was above zero). Adding version 2 left the
+  version 0 path as it was, error text included; a snapshot test guards
+  it. `createpsbt` and `converttopsbt` default to version 0
   where Core v32 defaults to 2 (see `converttopsbt psbt_version` below).
   The BIP 375 silent payment fields are satd's own. Four notes for anyone
   comparing against Core.

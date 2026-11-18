@@ -31,7 +31,7 @@ use parking_lot::RwLock;
 
 use crate::chain::checkpoints::{self, Checkpoint};
 use crate::chain::connect;
-use crate::chain::state::{ChainError, network_magic};
+use crate::chain::state::ChainError;
 use crate::storage::coin_cache::CoinCache;
 use crate::storage::compressed_coin::hash_utxo_set;
 use crate::storage::profile::StorageTuning;
@@ -119,6 +119,9 @@ pub struct BackgroundChainState {
     /// it on the background re-validation path too.
     enforce_checkpoints: bool,
     network: Network,
+    /// Message start framing each block record this writes
+    /// ([`crate::chain::state::ChainState::block_magic`]).
+    block_magic: [u8; 4],
     num_threads: usize,
     /// On-disk directory of the private coins DB, removed at handoff.
     bg_dir: PathBuf,
@@ -142,6 +145,7 @@ impl BackgroundChainState {
         checkpoints: Vec<Checkpoint>,
         enforce_checkpoints: bool,
         network: Network,
+        block_magic: [u8; 4],
         num_threads: usize,
         bg_dir: PathBuf,
         snapshot_height: u32,
@@ -189,6 +193,7 @@ impl BackgroundChainState {
             checkpoints,
             enforce_checkpoints,
             network,
+            block_magic,
             num_threads,
             bg_dir,
             snapshot_height,
@@ -332,7 +337,7 @@ impl BackgroundChainState {
                 let block_data = serialize(block);
                 let mut flat = self.flat_files.lock();
                 let (pos, pending) = flat
-                    .write_block_pending(&block_data, network_magic(self.network), new_height)
+                    .write_block_pending(&block_data, self.block_magic, new_height)
                     .map_err(|e| ChainError::FlatFile(e.to_string()))?;
                 // Same "data before the pointer" ordering
                 // `ChainState::write_block_durable` enforces, and for the same

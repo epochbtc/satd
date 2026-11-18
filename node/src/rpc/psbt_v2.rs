@@ -18,6 +18,7 @@ use serde_json::{Value, json};
 
 use crate::chain::state::ChainState;
 use crate::rpc::amounts::{default_unit, format_amount};
+use crate::rpc::psbt;
 
 type RpcError = (i32, String);
 
@@ -57,6 +58,11 @@ fn script_is_computed(map: &RawMap) -> bool {
 pub fn decode(raw: &RawPsbt, network: Option<bitcoin::Network>) -> Result<Value, RpcError> {
     let view = V2View::new(raw).map_err(bad)?;
     let unit = default_unit();
+    // Scripts are spelled as the version 0 decoder spells them.
+    let script_net = network.unwrap_or(bitcoin::Network::Bitcoin);
+    let script = |bytes: &[u8], include_address: bool| {
+        psbt::script_univ(bitcoin::Script::from_bytes(bytes), include_address, script_net)
+    };
 
     let mut out = json!({
         "psbt_version": 2,
@@ -108,7 +114,7 @@ pub fn decode(raw: &RawPsbt, network: Option<bitcoin::Network>) -> Result<Value,
         if let Ok(Some(utxo)) = input.witness_utxo() {
             v["witness_utxo"] = json!({
                 "amount": format_amount(utxo.value.to_sat(), unit),
-                "scriptPubKey": { "hex": hex::encode(utxo.script_pubkey.as_bytes()) },
+                "scriptPubKey": script(utxo.script_pubkey.as_bytes(), true),
             });
         }
         let sigs: Vec<Value> = input
@@ -118,14 +124,14 @@ pub fn decode(raw: &RawPsbt, network: Option<bitcoin::Network>) -> Result<Value,
         if !sigs.is_empty() {
             v["partial_signatures"] = json!(sigs);
         }
-        if let Some(script) = map.get_single(keys::input::REDEEM_SCRIPT) {
-            v["redeem_script"] = json!({ "hex": hex::encode(script) });
+        if let Some(s) = map.get_single(keys::input::REDEEM_SCRIPT) {
+            v["redeem_script"] = script(s, false);
         }
-        if let Some(script) = map.get_single(keys::input::WITNESS_SCRIPT) {
-            v["witness_script"] = json!({ "hex": hex::encode(script) });
+        if let Some(s) = map.get_single(keys::input::WITNESS_SCRIPT) {
+            v["witness_script"] = script(s, false);
         }
         if let Some(sig) = map.get_single(keys::input::FINAL_SCRIPTSIG) {
-            v["final_scriptSig"] = json!({ "hex": hex::encode(sig) });
+            v["final_scriptSig"] = psbt::final_script_sig_univ(bitcoin::Script::from_bytes(sig));
         }
         if let Some(wit) = map.get_single(keys::input::FINAL_SCRIPTWITNESS) {
             v["final_scriptwitness"] = match bitcoin::consensus::deserialize::<bitcoin::Witness>(wit)
@@ -163,14 +169,14 @@ pub fn decode(raw: &RawPsbt, network: Option<bitcoin::Network>) -> Result<Value,
         // Absent means "not computed yet", which is a state only a silent
         // payment output can be in. Emitting an empty script here instead
         // would read as an output paying nobody.
-        if let Some(script) = map.get_single(keys::output::SCRIPT) {
-            v["script"] = json!({ "hex": hex::encode(script) });
+        if let Some(s) = map.get_single(keys::output::SCRIPT) {
+            v["script"] = script(s, true);
         }
-        if let Some(script) = map.get_single(keys::output::REDEEM_SCRIPT) {
-            v["redeem_script"] = json!({ "hex": hex::encode(script) });
+        if let Some(s) = map.get_single(keys::output::REDEEM_SCRIPT) {
+            v["redeem_script"] = script(s, false);
         }
-        if let Some(script) = map.get_single(keys::output::WITNESS_SCRIPT) {
-            v["witness_script"] = json!({ "hex": hex::encode(script) });
+        if let Some(s) = map.get_single(keys::output::WITNESS_SCRIPT) {
+            v["witness_script"] = script(s, false);
         }
         if let Some(info) = map.get_single(keys::output::SP_V0_INFO) {
             let mut sp = json!({});
@@ -212,13 +218,7 @@ pub fn decode(raw: &RawPsbt, network: Option<bitcoin::Network>) -> Result<Value,
     // silent payment output is still being computed there is nothing to
     // serialise, and inventing something would be worse than saying so.
     if let Ok(tx) = view.unsigned_tx() {
-        out["tx"] = json!({
-            "txid": tx.compute_txid().to_string(),
-            "version": tx.version.0,
-            "locktime": tx.lock_time.to_consensus_u32(),
-            "vin": tx.input.len(),
-            "vout": tx.output.len(),
-        });
+        out["tx"] = psbt::tx_univ(&tx, script_net);
         out["tx_hex"] = json!(hex::encode(bitcoin::consensus::serialize(&tx)));
     }
     if let Ok(id) = view.unique_id() {

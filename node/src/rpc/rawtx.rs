@@ -1664,7 +1664,7 @@ pub fn sign_raw_transaction_with_key(
 
 /// Classify a script's type: the `TxoutType` name Core's `Solver`
 /// (`script/solver.cpp`) gives it, in Core's order.
-fn script_type(script: &bitcoin::Script) -> &'static str {
+pub(crate) fn script_type(script: &bitcoin::Script) -> &'static str {
     use bitcoin::opcodes::all::{OP_PUSHNUM_1, OP_PUSHNUM_16, OP_RETURN};
     let b = script.as_bytes();
     if script.is_p2sh() {
