@@ -913,17 +913,6 @@ silently returning an empty or wrong answer.
   reconsiders an orphan when a block confirms one of its parents; Core
   reconsiders orphans only when a parent enters the mempool.
 
-- **Invalid transactions from peers** — Core v30 stopped penalising a peer
-  for any transaction it relays (`MaybePunishNodeForTx` was removed from
-  `src/net_processing.cpp`): an invalid transaction is refused and the peer
-  is left alone. satd charges 10 misbehaviour points for a transaction that
-  fails its scripts under the consensus flags or spends more than its inputs
-  (`bad-txns-in-belowout`), and disconnects and bans a peer that reaches
-  100, as for other misbehaviour. A transaction failing `CheckTransaction`
-  (`bad-txns-vin-empty` and the rest) or a policy rule costs the peer
-  nothing, as in Core. Only a peer that sends script-invalid or overspending
-  transactions is affected.
-
 - **Order of a block's checks** — Core's `CheckBlock` (`src/validation.cpp`)
   runs `CheckTransaction` on every transaction straight after the coinbase
   checks and before the legacy sigop count; `ContextualCheckBlock` then

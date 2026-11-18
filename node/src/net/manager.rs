@@ -256,14 +256,6 @@ struct ManualTarget {
 /// enough that an honest peer announcing a better chain (one such message,
 /// resolved by the getheaders we send back) stays far under [`BAN_THRESHOLD`],
 /// but a peer streaming endless unconnectable headers still accrues to a ban.
-/// Ban score charged when a peer relays a *consensus-invalid* transaction (bad
-/// script/signature, or outputs exceeding inputs). Mirrors the `block rejected`
-/// score: relaying an invalid tx is real misbehavior, but we deliberately avoid
-/// an instant ban (the verifier could have an edge case), so a peer accrues to a
-/// ban over several. Policy/standardness/resource rejections (fee floor, dust,
-/// mempool-full, RBF, conflicts) are NOT misbehavior and carry no score — see
-/// [`tx_rejection_ban_score`].
-const INVALID_TX_BAN_SCORE: u32 = 10;
 /// Hardcoded fallback when callers (tests, the no-config `new` constructor)
 /// don't supply a value. Operator-facing path goes through
 /// `Config::maxinboundperip` and the `-maxinboundperip` CLI flag.
@@ -11910,63 +11902,6 @@ impl PeerManager {
         fee_rates
     }
 
-    /// Ban score for a mempool rejection of a peer-relayed transaction. Only
-    /// *consensus-invalid* transactions are peer misbehavior; policy,
-    /// standardness, resource and RBF rejections are not — the peer cannot know
-    /// our local relay policy, and banning for them severs honest peers on
-    /// low-fee networks (testnet4 is a sub-min-relay-fee tx soup, which used to
-    /// ban our entire peer set one `+1` at a time). This mirrors Bitcoin Core,
-    /// which DoS-scores only `TX_CONSENSUS` failures. `MissingInputs` never
-    /// reaches here — it is handled as an orphan upstream.
-    fn tx_rejection_ban_score(e: &MempoolError) -> u32 {
-        match e {
-            // Consensus-invalid: bad script/signature, or outputs > inputs.
-            MempoolError::Script(..) | MempoolError::BadAmounts => INVALID_TX_BAN_SCORE,
-            // Everything else is local policy / standardness / resource limits /
-            // RBF / duplicates — not misbehavior.
-            MempoolError::AlreadyExists
-            | MempoolError::AlreadyKnown
-            | MempoolError::SameNonWitnessData
-            | MempoolError::ConflictingSpend
-            | MempoolError::MissingInputs
-            | MempoolError::InsufficientFee(..)
-            | MempoolError::MempoolFull
-            | MempoolError::MempoolMinFeeNotMet(..)
-            | MempoolError::Validation(_)
-            | MempoolError::PrematureCoinbaseSpend
-            | MempoolError::DecodeFailed
-            | MempoolError::Dust
-            | MempoolError::NonStandardOpReturn
-            // Core's standardness for what is spent and how, its policy
-            // script flags and its sigop cap: `TX_NOT_STANDARD` and
-            // `TX_INPUTS_NOT_STANDARD`, never scored.
-            | MempoolError::NonStandardInputs(_)
-            | MempoolError::NonStandardWitness
-            | MempoolError::TooManySigops(_)
-            | MempoolError::PolicyScript(..)
-            | MempoolError::InsufficientReplacementFee(..)
-            | MempoolError::SpendsConflictingTx(..)
-            | MempoolError::TooManyReplacements(..)
-            | MempoolError::DoesNotImproveFeerateDiagram(..)
-            | MempoolError::TooLongMempoolChain
-            // Non-final for the *next* block is tip-relative, not misbehavior:
-            // a peer one block behind (or ahead) legitimately relays these.
-            // Core classes them TX_PREMATURE_SPEND, which it does not score.
-            | MempoolError::NonFinal
-            | MempoolError::NonBip68Final
-            // Local-submission-only refusal (§6.1); P2P traffic never produces it
-            // and it is never peer misbehavior.
-            | MempoolError::Quarantined(_)
-            // Ephemeral dust policy errors: local package submission only.
-            | MempoolError::EphemeralDustFee
-            | MempoolError::MissingEphemeralSpends(_)
-            // BIP 431 topology and size policy.
-            | MempoolError::TrucViolation(_)
-            | MempoolError::ReplacementDisallowed
-            | MempoolError::SiblingEviction(_) => 0,
-        }
-    }
-
     /// Whether `hash`, a txid or a wtxid, was refused since the tip moved,
     /// by either filter: Core's `AlreadyHaveTx(gtxid,
     /// include_reconsiderable = true)`, which the `inv` and `tx` handlers
@@ -12236,7 +12171,9 @@ impl PeerManager {
                         );
                     }
                     Err(OrphanReject::TooLarge) => {
-                        self.add_ban_score(id, 1, "orphan too large");
+                        // Core's `TxOrphanage::AddTx` ignores it, and
+                        // punishes no one (`txorphanage.cpp`).
+                        tracing::debug!(%txid, peer = id, "ignoring large orphan tx");
                     }
                 }
             }
@@ -12277,17 +12214,20 @@ impl PeerManager {
                 } else if !witness_stripped {
                     self.tx_requests.lock().forget_tx_hash(&wtxid.to_byte_array());
                 }
-                // Only consensus-invalid transactions are misbehavior; policy
-                // rejections (fee floor, dust, mempool limits, RBF, …) carry no
-                // ban score so we don't sever honest peers on low-fee networks.
-                let score = Self::tx_rejection_ban_score(&e);
-                if score > 0 {
-                    self.add_ban_score(id, score, &format!("Tx rejected: {}", e));
-                } else if !matches!(e, MempoolError::AlreadyExists) {
-                    // Refused by policy but well-formed: a miner with other
-                    // policy may still include it. Core's first-time-reject
-                    // insertion. A consensus-invalid transaction is not kept,
-                    // and one we already hold is not a rejection.
+                // No refusal of a relayed transaction is misbehaviour: Core
+                // v30 removed `MaybePunishNodeForTx` (266dd0e10d), which
+                // scored only consensus failures, since a peer that is not
+                // scored for non-standard transactions gains nothing from
+                // sending invalid ones, and a relay policy change could
+                // otherwise split the network.
+                //
+                // Refused by policy but well-formed: a miner with other
+                // policy may still include it, so it is kept for
+                // reconstruction (Core's first-time-reject insertion). A
+                // consensus-invalid transaction is not kept, and one we
+                // already hold is not a rejection.
+                let consensus_invalid = matches!(e, MempoolError::Script(..) | MempoolError::BadAmounts);
+                if !consensus_invalid && !matches!(e, MempoolError::AlreadyExists) {
                     if package.is_some() {
                         self.keep_for_reconstruction(tx.clone());
                     } else {
@@ -16822,50 +16762,6 @@ mod tests {
         assert!(StuckWait::should_warn(&mut wait, 101, moved + STUCK_WAIT_WARN_AFTER));
     }
 
-    /// A peer relaying a *policy*-rejected tx (fee floor, dust, mempool limits,
-    /// RBF, conflicts, non-standard) must NOT accrue ban score — banning for
-    /// these severs honest peers on low-fee networks (the testnet4 wedge). Only
-    /// consensus-invalid txs (bad script / outputs-exceed-inputs) are scored.
-    #[test]
-    fn tx_rejection_ban_score_only_scores_consensus_invalid() {
-        // Consensus-invalid → scored.
-        assert_eq!(
-            PeerManager::tx_rejection_ban_score(&MempoolError::Script("x".into(), None)),
-            INVALID_TX_BAN_SCORE
-        );
-        assert_eq!(
-            PeerManager::tx_rejection_ban_score(&MempoolError::BadAmounts),
-            INVALID_TX_BAN_SCORE
-        );
-
-        // Policy / standardness / resource / RBF / duplicate → no score.
-        for e in [
-            // Valid by consensus, refused by Core's policy flags.
-            MempoolError::PolicyScript("NOPx reserved for soft-fork upgrades".into(), None),
-            MempoolError::NonStandardInputs("input 0 script unknown".into()),
-            MempoolError::NonStandardWitness,
-            MempoolError::TooManySigops(19_705),
-            MempoolError::InsufficientFee(254, 1000),
-            MempoolError::Dust,
-            MempoolError::MempoolFull,
-            MempoolError::AlreadyExists,
-            MempoolError::ConflictingSpend,
-            MempoolError::NonStandardOpReturn,
-            MempoolError::InsufficientReplacementFee(1, 2, String::new(), String::new()),
-            MempoolError::TooLongMempoolChain,
-            MempoolError::PrematureCoinbaseSpend,
-            MempoolError::Validation("nonstandard".into()),
-            MempoolError::DecodeFailed,
-            MempoolError::MissingInputs,
-        ] {
-            assert_eq!(
-                PeerManager::tx_rejection_ban_score(&e),
-                0,
-                "policy rejection {e:?} must not be ban-scored"
-            );
-        }
-    }
-
     fn bh(byte: u8) -> bitcoin::BlockHash {
         use bitcoin::hashes::Hash;
         bitcoin::BlockHash::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array(
@@ -19466,6 +19362,10 @@ mod tests {
 
     /// Minimal regtest `PeerManager` for the rebroadcast / echo tests.
     fn mk_test_pm() -> (Arc<PeerManager>, tempfile::TempDir) {
+        mk_test_pm_with_mempool(Arc::new(Mempool::new(1_000_000, 0)))
+    }
+
+    fn mk_test_pm_with_mempool(mempool: Arc<Mempool>) -> (Arc<PeerManager>, tempfile::TempDir) {
         use crate::chain::state::AssumeValid;
         use crate::storage::db::InMemoryStore;
         use crate::storage::flatfile::FlatFileManager;
@@ -19489,7 +19389,6 @@ mod tests {
             )
             .unwrap(),
         );
-        let mempool = Arc::new(Mempool::new(1_000_000, 0));
         let fee_estimator = Arc::new(FeeEstimator::new());
         let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let pm = PeerManager::new(chain_state, mempool, fee_estimator, Network::Regtest, shutdown_rx);
@@ -20107,6 +20006,28 @@ mod tests {
         clock.advance(crate::net::txrequest::TXID_RELAY_DELAY);
         pm.send_all_tx_requests();
         assert!(rx1.try_recv().is_err(), "not fetched again by its wtxid");
+    }
+
+    /// Core's `TxOrphanage::AddTx` ignores an orphan above the standard
+    /// weight and punishes no one (`txorphanage.cpp`); satd charged the
+    /// sender a point for each.
+    #[test]
+    fn a_large_orphan_costs_its_sender_nothing() {
+        let config = crate::mempool::pool::MempoolConfig { accept_non_std_txn: true, ..Default::default() };
+        let (pm, _dir) = mk_test_pm_with_mempool(Arc::new(Mempool::with_config(config)));
+        // Out of initial sync, as in `rejects_pm`, or the tx is not looked at.
+        let tip = pm.chain_state.tip_hash();
+        let block = crate::chain::state::tests::build_test_block(tip, 1, crate::time::now_secs() as u32);
+        pm.chain_state.accept_block(&block).expect("block connects");
+        let (mut h1, _rx1) = mk_handle_rx(1, "10.0.0.1:8333".parse().unwrap(), PeerState::Connected, 0);
+        h1.info.services = ServiceFlags::NETWORK | ServiceFlags::WITNESS;
+        pm.peers.write().insert(1, h1);
+        let mut big = witness_tx(0x51, 0xaa);
+        big.output[0].script_pubkey = bitcoin::ScriptBuf::from_bytes(vec![0x51; 100_001]);
+        assert!(big.weight().to_wu() > 400_000);
+        pm.handle_tx(1, big.clone());
+        assert!(!pm.orphanage.contains(&big.compute_txid()), "not kept");
+        assert_eq!(pm.peers.read()[&1].info.ban_score, 0);
     }
 
     /// A transaction refused since the tip moved is not validated again when
