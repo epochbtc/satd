@@ -70,8 +70,9 @@ pub fn get_raw_mempool(mempool: &Mempool, verbose: bool) -> Value {
     let entries = mempool.get_acting_entries();
 
     let mut result = serde_json::Map::new();
+    let mut chunks = crate::mempool::pool::ChunkCache::default();
     for (txid, _entry) in &entries {
-        if let Some(verbose) = mempool.get_entry_verbose(txid) {
+        if let Some(verbose) = mempool.get_entry_verbose_cached(txid, &mut chunks) {
             result.insert(txid.to_string(), verbose);
         }
     }
@@ -1663,7 +1664,7 @@ pub fn sign_raw_transaction_with_key(
 
 /// Classify a script's type: the `TxoutType` name Core's `Solver`
 /// (`script/solver.cpp`) gives it, in Core's order.
-fn script_type(script: &bitcoin::Script) -> &'static str {
+pub(crate) fn script_type(script: &bitcoin::Script) -> &'static str {
     use bitcoin::opcodes::all::{OP_PUSHNUM_1, OP_PUSHNUM_16, OP_RETURN};
     let b = script.as_bytes();
     if script.is_p2sh() {

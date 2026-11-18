@@ -523,7 +523,7 @@ fn bip30_enforced(
 /// The two pre-BIP34 mainnet blocks (CVE-2012-1909) that intentionally
 /// duplicate an earlier coinbase txid and were grandfathered in. BIP 30 is
 /// suspended for exactly these so historical replay reproduces Core.
-fn bip30_exempt(network: Network, height: u32, hash: &BlockHash) -> bool {
+pub(crate) fn bip30_exempt(network: Network, height: u32, hash: &BlockHash) -> bool {
     if network != Network::Bitcoin {
         return false;
     }

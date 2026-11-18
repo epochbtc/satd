@@ -223,6 +223,49 @@ fn gettxspendingprevout_reads_the_mempool_then_the_chain() {
     );
 }
 
+/// Core v31's chunk fields, as a client that sets fees by the chunk a
+/// transaction is mined in reads them (`entryToJSON`: `chunkweight` and
+/// `fees.chunk`): on `getmempoolentry` and on every verbose mempool view.
+/// A child paying 10 000 sat for a parent paying 200 shares its chunk.
+#[test]
+fn mempool_entries_carry_their_chunk() {
+    let wallet = DeterministicWallet::from_secret([0x5e; 32]);
+    let mut node = funded_node(&[], &wallet);
+    let secp = bitcoin::secp256k1::Secp256k1::new();
+    let (parent_hex, parent, kp, spk) = spend_coinbase_to_taproot(&node, &wallet, 200);
+    let (child_hex, child) = build_signed_p2tr_keypath_spend(
+        &secp,
+        &kp,
+        bitcoin::OutPoint { txid: bitcoin::Txid::from_str(&parent).unwrap(), vout: 0 },
+        spk,
+        50 * 100_000_000 - 200,
+        wallet.address.script_pubkey(),
+        10_000,
+    );
+    node.rpc_ok("sendrawtransaction", vec![json!(parent_hex)]);
+    node.rpc_ok("sendrawtransaction", vec![json!(child_hex)]);
+    let weight = |hex: &str| {
+        let tx: bitcoin::Transaction = bitcoin::consensus::deserialize(&hex::decode(hex).unwrap()).unwrap();
+        tx.weight().to_wu()
+    };
+    let chunk_weight = weight(&parent_hex) + weight(&child_hex);
+    let check = |entry: &Value, view: &str| {
+        assert_eq!(entry["chunkweight"], json!(chunk_weight), "{view}: {entry}");
+        assert_eq!(entry["fees"]["chunk"].to_string(), "0.00010200", "{view}: {entry}");
+    };
+
+    for txid in [&parent, &child] {
+        check(&node.rpc_ok("getmempoolentry", vec![json!(txid)]), "getmempoolentry");
+    }
+    let verbose = node.rpc_ok("getrawmempool", vec![json!(true)]);
+    for txid in [&parent, &child] {
+        check(&verbose[txid.as_str()], "getrawmempool true");
+    }
+    check(&node.rpc_ok("getmempoolancestors", vec![json!(child), json!(true)])[parent.as_str()], "getmempoolancestors true");
+    check(&node.rpc_ok("getmempooldescendants", vec![json!(parent), json!(true)])[child.as_str()], "getmempooldescendants true");
+    node.stop();
+}
+
 /// A reorg that returns a transaction whose spenders are already in the
 /// mempool joins them into one cluster, and Core trims one past the cluster
 /// limits (`UpdateTransactionsFromBlock`). Here a parent is mined, three

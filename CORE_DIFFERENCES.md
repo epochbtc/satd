@@ -615,9 +615,9 @@ preserved; the satd extension is opt-in per request or per flag.
 - **PSBT version 2 (BIP 370) and the BIP 375 silent payment fields** —
   every PSBT method accepts a version 2 PSBT and answers with one, as
   Core does since v32 (up to v31 Core rejected any PSBT whose
-  `PSBT_GLOBAL_VERSION` was above zero). The version 0 path is
-  byte-identical to what it was, error text included, and is guarded by
-  a snapshot test. `createpsbt` and `converttopsbt` default to version 0
+  `PSBT_GLOBAL_VERSION` was above zero). Adding version 2 left the
+  version 0 path as it was, error text included; a snapshot test guards
+  it. `createpsbt` and `converttopsbt` default to version 0
   where Core v32 defaults to 2 (see `converttopsbt psbt_version` below).
   The BIP 375 silent payment fields are satd's own. Four notes for anyone
   comparing against Core.
@@ -971,6 +971,14 @@ silently returning an empty or wrong answer.
   can list differently. On chains and other simple clusters they agree. The
   verbose object's keys are sorted by txid; Core's follow the same mining
   order.
+
+- **`chunkweight` and `fees.chunk`** (`getmempoolentry` and the verbose
+  mempool views) — the chunk of that same fresh linearization, so they
+  agree with Core where the order does. The fees are signed, as Core's
+  are. Admission, replacement and the `getrawmempool` order clamp a
+  modified fee a negative `prioritisetransaction` delta takes below zero
+  at zero; these two fields do not, so for such a transaction the chunk
+  they report can be larger than the one the order lists.
 
 - **`getindexinfo` / `getsatdindexinfo`: `txindex.synced`** — reports whether
   `-txindex` is on, not whether the index covers the whole chain. satd writes
