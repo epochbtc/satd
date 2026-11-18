@@ -232,7 +232,8 @@ jobs:
     timeout-minutes: 10
     steps:
       # The sources too: the report reads the mutated lines to match them
-      # against scripts/mutants/known-missed.tsv.
+      # against scripts/mutants/known-missed.tsv. Keep these in step with
+      # NIGHTLY_GLOBS in scripts/mutants/run.sh.
       - name: Checkout sources
         uses: actions/checkout@v7
         with:
