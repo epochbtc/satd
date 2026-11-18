@@ -432,7 +432,9 @@ pub(crate) fn final_script_sig_univ(script: &bitcoin::Script) -> Value {
 
 fn decode_psbt_v0(psbt: &Psbt, network: bitcoin::Network) -> Result<Value, (i32, String)> {
     let tx = &psbt.unsigned_tx;
-    let tx_hex = hex::encode(bitcoin::consensus::serialize(tx));
+    // Core's bytes, also for an unsigned transaction with no inputs, the
+    // bytes the PSBT itself holds (`validation::decode`).
+    let tx_hex = hex::encode(crate::validation::decode::serialize_transaction(tx));
 
     let inputs: Vec<Value> = psbt
         .inputs
@@ -972,6 +974,24 @@ pub fn utxo_update_psbt(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A PSBT whose unsigned transaction has no inputs holds it in Core's
+    /// form, without the marker and flag (rust-bitcoin writes and reads the
+    /// global record that way), and `decodepsbt` shows it in that form too.
+    /// The PSBTs are Core v31.1's `converttopsbt` answers for
+    /// `02000000000000000000` and for `createrawtransaction [] [{"data":"00"}]`.
+    #[test]
+    fn a_psbt_of_a_transaction_with_no_inputs_matches_cores() {
+        for (hex_tx, core_psbt) in [
+            ("02000000000000000000", "cHNidP8BAAoCAAAAAAAAAAAAAA=="),
+            ("0200000000010000000000000000036a010000000000", "cHNidP8BABYCAAAAAAEAAAAAAAAAAANqAQAAAAAAAAA="),
+        ] {
+            assert_eq!(convert_to_psbt(hex_tx, false, None), Ok(json!(core_psbt)));
+            let decoded = decode_psbt_for(core_psbt, Some(bitcoin::Network::Regtest)).unwrap();
+            assert_eq!(decoded["tx_hex"], json!(hex_tx), "{decoded}");
+            assert_eq!(decoded["tx"]["size"], json!(hex_tx.len() / 2), "{decoded}");
+        }
+    }
 
     /// Core reads a PSBT input's amount through `GetInputUTXO`, which prefers
     /// the `non_witness_utxo` and only after checking its txid against the
