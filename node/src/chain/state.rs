@@ -439,6 +439,10 @@ struct SequenceIds {
 /// from many peers and the IBD connector walks them in.
 const MAX_ACTIVATION_AHEAD: u32 = 128;
 
+/// How many parent links [`ChainState::is_ancestor_of_best_header_or_tip`]
+/// follows from a best header off the active chain.
+const BEST_HEADER_ANCESTOR_WALK_LIMIT: u32 = 2016;
+
 /// A block `store_block` has validated and written to a block file but not
 /// yet indexed. Holding the pending record keeps a prune from deleting the
 /// bytes before the index entry that names them is committed.
@@ -1448,17 +1452,25 @@ impl ChainState {
         self.minimum_chain_work_override = work;
     }
 
-    /// Bitcoin Core's `nMinimumChainWork` for this network, big-endian like
-    /// every chainwork in the block index (`kernel/chainparams.cpp`, v32.1).
-    /// A custom signet has none, as in Core: its chain starts wherever its
-    /// operator started it. satd does not gate header acceptance or block
-    /// download on it; the peer manager reads it to decide when a peer has
-    /// shown a chain worth asking for header announcements (Core's
-    /// `MaybeSendSendHeaders`).
+    /// Core's `ChainstateManager::MinimumChainWork`: `-minimumchainwork`
+    /// when set, else the network's `nMinimumChainWork`
+    /// ([`Self::network_minimum_chain_work`]). It feeds the IBD latch, the
+    /// anti-DoS work threshold for headers
+    /// ([`Self::anti_dos_work_threshold`]), and the peer manager's test of
+    /// when a peer has shown a chain worth asking for header announcements
+    /// (Core's `MaybeSendSendHeaders`).
     pub fn minimum_chain_work(&self) -> [u8; 32] {
         if let Some(work) = self.minimum_chain_work_override {
             return work;
         }
+        self.network_minimum_chain_work()
+    }
+
+    /// Bitcoin Core's `nMinimumChainWork` for this network, big-endian like
+    /// every chainwork in the block index (`kernel/chainparams.cpp`, v32.1),
+    /// whatever `-minimumchainwork` says. A custom signet has none, as in
+    /// Core: its chain starts wherever its operator started it.
+    pub fn network_minimum_chain_work(&self) -> [u8; 32] {
         let hex = match self.network {
             Network::Bitcoin => "000000000000000000000000000000000000000145ec036acc5ba740052af1a0",
             Network::Testnet => "0000000000000000000000000000000000000000000017f49f702147f10c0eb6",
@@ -1471,6 +1483,67 @@ impl ChainState {
         let mut work = [0u8; 32];
         hex::decode_to_slice(hex, &mut work).expect("a 64-digit hex constant");
         work
+    }
+
+    /// Core's `GetAntiDoSWorkThreshold` (v32.1 `net_processing.cpp`): the
+    /// work a header chain must claim before its headers are stored. The
+    /// larger of [`Self::minimum_chain_work`] and the tip's work less 144
+    /// blocks' worth of the tip's proof, so a fork from near the tip is
+    /// always taken.
+    pub fn anti_dos_work_threshold(&self) -> [u8; 32] {
+        use crate::storage::blockindex::{mul_u256_u32, sub_u256, work_for_bits};
+        let min_work = self.minimum_chain_work();
+        let Some(tip) = self.get_block_index(&self.tip_hash()) else {
+            return min_work;
+        };
+        let buffer = mul_u256_u32(&work_for_bits(tip.header.bits), 144);
+        let near_tip = if compare_u256(&buffer, &tip.chainwork) >= 0 {
+            [0u8; 32]
+        } else {
+            sub_u256(&tip.chainwork, &buffer)
+        };
+        if compare_u256(&near_tip, &min_work) > 0 { near_tip } else { min_work }
+    }
+
+    /// Core's `IsAncestorOfBestHeaderOrTip`: whether `hash`, at `height`, is
+    /// on the active chain or an ancestor of the best header. Headers a peer
+    /// sends that end on such a block take no more memory, so they skip the
+    /// work threshold. Above the tip the height rows are the best-header
+    /// chain by construction (see [`Self::commit_accepted_headers`]); below
+    /// it, when the best header is on another branch, that branch is walked,
+    /// [`BEST_HEADER_ANCESTOR_WALK_LIMIT`] links at most, and a longer walk
+    /// answers "no", which at worst runs the work check on known headers.
+    pub fn is_ancestor_of_best_header_or_tip(&self, hash: &BlockHash, height: u32) -> bool {
+        if height > self.tip_height() {
+            return self.store.get_block_hash_by_height(height) == Some(*hash);
+        }
+        if self.active_chain_contains(hash, height) {
+            return true;
+        }
+        let best = self.best_header_hash();
+        let Some(mut entry) = self.store.get_block_index(&best) else {
+            return false;
+        };
+        if entry.height < height || entry.height - height > BEST_HEADER_ANCESTOR_WALK_LIMIT {
+            return false;
+        }
+        let mut cur = best;
+        while entry.height > height {
+            cur = entry.header.prev_blockhash;
+            match self.store.get_block_index(&cur) {
+                Some(e) => entry = e,
+                None => return false,
+            }
+        }
+        cur == *hash
+    }
+
+    /// The block `hash` as the start of a headers presync: its index entry
+    /// and median time past. `None` if it is not in the index.
+    pub fn headers_sync_chain_start(&self, hash: &BlockHash) -> Option<crate::net::headerssync::ChainStart> {
+        let entry = self.store.get_block_index(hash)?;
+        let mtp = validation::pow::median_time_past_of(&entry, |h| self.store.get_block_index(h));
+        Some(crate::net::headerssync::ChainStart::new(*hash, &entry, mtp))
     }
 
     /// Effective P2P network magic. Custom-signet challenges derive their

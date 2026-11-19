@@ -79,7 +79,10 @@ fn a_tall_low_work_header_chain_leaves_the_node_out_of_ibd() {
     cs.refresh_best_header_to_tip();
     assert_eq!(cs.best_header_hash(), parent);
 
+    // A `noban` peer: its headers skip the anti-DoS work check, which would
+    // otherwise keep this low-work chain out of the index altogether (#1132).
     let mut rx = add_peer(&pm, 1, Direction::Outbound);
+    pm.peers.write().get_mut(&1).unwrap().info.permissions.noban = true;
     let fork = header_chain(130, now - 100_000);
     pm.handle_headers(1, fork.clone());
     let fork_tip = fork.last().unwrap().block_hash();

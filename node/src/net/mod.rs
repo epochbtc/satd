@@ -13,6 +13,7 @@ pub mod eviction;
 pub mod flow;
 pub mod ibd;
 pub mod headers_queue;
+pub mod headerssync;
 pub mod ibd_store;
 pub mod limits;
 pub mod manager;

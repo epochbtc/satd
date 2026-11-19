@@ -212,9 +212,7 @@ note = "measured 2026-09-15: L57 KeyError 'uploadtarget' on getnettotals. The fi
 
 [[test]]
 file = "feature_minchainwork.py"
-status = "skip"
-reason = "feature-missing"
-note = "measured 2026-09-15: L72 node2 accepts headers below -minimumchainwork (getchaintips has more than one tip). Follow-up: Core's low-work headers gating"
+status = "run"
 
 [[test]]
 file = "feature_notifications.py"
@@ -674,7 +672,7 @@ status = "run"
 file = "p2p_headers_sync_with_minchainwork.py"
 status = "skip"
 reason = "core-log"
-note = "measured 2026-09-15: L59 assert_debug_log 'Synchronizing blockheaders, height: 14'; satd has no anti-DoS headers presync to log"
+note = "re-measured 2026-11-19 with headers presync (#1132): still L59, which wants Core's header-tip progress line 'Synchronizing blockheaders, height: 14' from the noban node, which satd does not log. The last subtest cannot pass as written: it expects the node to abort (exit -6) when the clock is behind the chain start, where satd shuts down cleanly (CORE_DIFFERENCES.md). Follow-up: Core's header-tip progress log"
 
 [[test]]
 file = "p2p_i2p_ports.py"

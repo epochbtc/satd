@@ -476,11 +476,35 @@ struct HeaderSync {
 /// The periodic IBD header probe's state.
 #[derive(Default)]
 struct HeaderProbe {
-    /// The header tip when last seen, and since when it has stood there.
-    tip: Option<(u32, Instant)>,
+    /// The header tip and the headers-sync progress count when last seen,
+    /// and since when both have stood there.
+    tip: Option<((u32, u64), Instant)>,
     /// When the last probe went out.
     last_sent: Option<Instant>,
 }
+
+/// Core's `HeadersPresyncStats` for each peer with a headers sync in
+/// progress, and the best of them: `m_headers_presync_stats`,
+/// `m_headers_presync_bestpeer`.
+#[derive(Default)]
+struct PresyncStats {
+    stats: HashMap<PeerId, PresyncStat>,
+    best: Option<PeerId>,
+    /// When progress was last logged: Core's `m_last_presync_update`.
+    last_report: Option<Instant>,
+}
+
+/// One peer's presync work and, while in PRESYNC, its height and the last
+/// header's time. Ordered as Core's `std::pair` is: work first, then a
+/// sync in PRESYNC above one past it.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct PresyncStat {
+    work: [u8; 32],
+    presync: Option<(i64, u32)>,
+}
+
+/// Core's rate limit on presync progress lines: four a second.
+const PRESYNC_REPORT_INTERVAL: Duration = Duration::from_millis(250);
 
 /// Token-bucket cap for the promotion-INV drain (§8): at most this many
 /// reloaded-and-promoted transactions are announced per drain tick, so a
@@ -1069,6 +1093,10 @@ mod ibdwindow_tests;
 mod hdrsync_tests;
 
 #[cfg(test)]
+#[path = "manager_presync_tests.rs"]
+mod presync_tests;
+
+#[cfg(test)]
 #[path = "manager_bgcatchup_tests.rs"]
 mod bgcatchup_tests;
 
@@ -1455,6 +1483,21 @@ pub struct PeerManager {
     /// The periodic IBD header probe's state: see
     /// [`Self::ibd_header_probe_due`].
     ibd_header_probe: parking_lot::Mutex<HeaderProbe>,
+    /// Each peer's low-work headers sync, Core's `Peer::m_headers_sync`:
+    /// see [`crate::net::headerssync`]. Only the headers thread processes
+    /// one; the header probe and the post-IBD poll look here to leave a
+    /// peer with a sync in progress alone.
+    headers_syncs: parking_lot::Mutex<HashMap<PeerId, crate::net::headerssync::HeadersSyncState>>,
+    /// Core's `m_headers_presync_stats` and `m_headers_presync_bestpeer`,
+    /// for the presync progress log.
+    headers_presync: parking_lot::Mutex<PresyncStats>,
+    /// Counts the `headers` messages a headers sync took in its PRESYNC or
+    /// REDOWNLOAD phase. Those store nothing and leave the header tip
+    /// where it is, so the IBD header probe counts this as progress too.
+    header_sync_progress: AtomicU64,
+    /// The sender that asks the daemon to shut down, where one was given
+    /// ([`Self::set_shutdown_sender`]).
+    shutdown_request: parking_lot::Mutex<Option<tokio::sync::watch::Sender<bool>>>,
     /// The block whose `inv` last brought a `getheaders` from a peer whose
     /// header sync had not started: Core's
     /// `m_last_block_inv_triggering_headers_sync`.
@@ -1884,6 +1927,10 @@ impl PeerManager {
             nap_puller: RwLock::new(None),
             drain_now: Arc::new(tokio::sync::Notify::new()),
             ibd_header_probe: parking_lot::Mutex::new(HeaderProbe::default()),
+            headers_syncs: parking_lot::Mutex::new(HashMap::new()),
+            headers_presync: parking_lot::Mutex::new(PresyncStats::default()),
+            header_sync_progress: AtomicU64::new(0),
+            shutdown_request: parking_lot::Mutex::new(None),
             last_block_inv_getheaders: parking_lot::Mutex::new(None),
             block_tx,
             pending_compact: RwLock::new(HashMap::new()),
@@ -5534,8 +5581,17 @@ impl PeerManager {
         self.ibd_header_probe_due_at(Instant::now())
     }
 
+    ///
+    /// A headers presync stores nothing until the peer's chain has shown
+    /// enough work, so the header tip stands still through it. Each message
+    /// a presync or redownload takes counts as progress as well
+    /// ([`Self::header_sync_progress`]), or the probe would ask another peer
+    /// every interval of a presync and start a second one from genesis.
     fn ibd_header_probe_due_at(&self, now: Instant) -> bool {
-        let tip = self.chain_state.headers_tip_height();
+        let tip = (
+            self.chain_state.headers_tip_height(),
+            self.header_sync_progress.load(Ordering::Relaxed),
+        );
         let mut probe = self.ibd_header_probe.lock();
         match probe.tip {
             Some((last, _)) if last == tip => {}
@@ -5636,12 +5692,17 @@ impl PeerManager {
     /// The peer the stall probe asks: one header sync has not started with,
     /// if there is one, so a stalled sync peer is replaced rather than asked
     /// again; once every peer has started, the one asked least, so the probe
-    /// goes round them. It counts as started from then on.
+    /// goes round them. It counts as started from then on. A peer with a
+    /// headers presync in progress is never asked: its answer to the probe's
+    /// locator would not follow on from the presync, and end it.
     fn header_probe_peer(&self) -> Option<PeerId> {
+        let syncing = self.peers_with_headers_sync();
         let mut peers = self.peers.write();
         let pick = peers
             .iter()
-            .filter(|(_, h)| h.info.state == PeerState::Connected && Self::syncs_headers(&h.info))
+            .filter(|(id, h)| {
+                h.info.state == PeerState::Connected && Self::syncs_headers(&h.info) && !syncing.contains(id)
+            })
             .min_by_key(|(id, h)| (h.header_sync.started, h.header_sync.probes, **id))
             .map(|(id, _)| *id)?;
         if let Some(h) = peers.get_mut(&pick) {
@@ -7327,16 +7388,7 @@ impl PeerManager {
                     self.send_getheaders(pid, sync::make_getheaders(&self.chain_state));
                 }
             } else if !self.is_ibd() && ticks.is_multiple_of(20) {
-                let peer_ids: Vec<PeerId> = {
-                    let peers = self.peers.read();
-                    peers.iter()
-                        .filter(|(_, h)| {
-                            h.info.state == PeerState::Connected && h.info.serves_blocks()
-                        })
-                        .map(|(id, _)| *id)
-                        .collect()
-                };
-                for pid in &peer_ids {
+                for pid in &self.header_poll_peers() {
                     self.send_getheaders(*pid, sync::make_getheaders(&self.chain_state));
                 }
             }
@@ -7481,6 +7533,7 @@ impl PeerManager {
             }
         }
         drop(peers);
+        self.end_headers_sync(id);
         self.nap_limits.lock().forget(id);
         if let Some(puller) = self.nap_puller.read().as_ref() {
             puller.forget(id);
@@ -8749,6 +8802,13 @@ impl PeerManager {
     }
 
     fn handle_headers(&self, id: PeerId, headers: Vec<bitcoin::block::Header>) {
+        self.handle_headers_at(id, headers, crate::time::now_secs());
+    }
+
+    /// [`Self::handle_headers`] at the time `now`, seconds since the epoch,
+    /// which a headers sync started here measures its clock bound against.
+    fn handle_headers_at(&self, id: PeerId, mut headers: Vec<bitcoin::block::Header>, now: u64) {
+        let count = headers.len();
         // Core's `ProcessHeadersMessage`: an empty `headers` cannot be an
         // announcement, and headers whose first one connects to the block
         // index can be the answer to our `getheaders`; either clears the
@@ -8759,7 +8819,7 @@ impl PeerManager {
             .first()
             .is_none_or(|first| self.chain_state.get_block_index(&first.prev_blockhash).is_some());
         if let Some(h) = self.peers.write().get_mut(&id) {
-            if headers.len() < 2000 {
+            if count < crate::net::limits::MAX_HEADERS_RESULTS {
                 h.header_sync.done = true;
             }
             if answers_getheaders {
@@ -8767,7 +8827,48 @@ impl PeerManager {
             }
         }
         if headers.is_empty() {
+            // The peer has nothing more to give: any headers sync with it
+            // is over.
+            self.end_headers_sync(id);
             return;
+        }
+
+        // Core's `CheckHeadersPoW`, before any header reaches a headers
+        // sync: every header meets the work it claims, within the
+        // network's limit, and each builds on the one before.
+        if let Some(reason) = self.headers_pow_failure(&headers) {
+            self.add_ban_score(id, BAN_THRESHOLD, reason);
+            return;
+        }
+
+        // A headers sync in progress with this peer takes the message. It
+        // hands back nothing while the peer's chain has not shown enough
+        // work, and, in its second pass, the headers that may now be
+        // validated and stored.
+        let mut already_validated_work = self.continue_headers_sync(id, &mut headers);
+        if headers.is_empty() {
+            return;
+        }
+        let have_headers_sync = self.headers_syncs.lock().contains_key(&id);
+
+        // The anti-DoS work check, for headers that connect to the index
+        // (those that do not are handled below as before, and store
+        // nothing). Skipped for headers that end on the best header chain
+        // or the active chain, which take no more memory, and for a `noban`
+        // peer, as in Core.
+        if let Some(chain_start) = self.chain_state.get_block_index(&headers[0].prev_blockhash) {
+            if let Some(last) = headers.last()
+                && let Some(entry) = self.chain_state.get_block_index(&last.block_hash())
+            {
+                already_validated_work = already_validated_work
+                    || self.chain_state.is_ancestor_of_best_header_or_tip(&last.block_hash(), entry.height);
+            }
+            if self.peers.read().get(&id).is_some_and(|h| h.info.permissions.noban) {
+                already_validated_work = true;
+            }
+            if !already_validated_work && self.try_low_work_headers_sync(id, &chain_start, &mut headers, now) {
+                return;
+            }
         }
 
         let (accepted, err) = self.chain_state.accept_headers(&headers);
@@ -8780,9 +8881,11 @@ impl PeerManager {
         // GetLocator(pindexLast))` whenever `nCount == MAX_HEADERS_RESULTS`).
         // A locator from our own height rows would bring a peer whose chain
         // forks below them back to the fork point, and to the same batch.
+        // A headers sync in progress asks for its own next batch.
         let batch_connected = matches!(err, None | Some(crate::chain::state::ChainError::Duplicate));
         if batch_connected
-            && headers.len() >= 2000
+            && count >= crate::net::limits::MAX_HEADERS_RESULTS
+            && !have_headers_sync
             && let Some(last) = headers.last()
         {
             self.send_getheaders(id, sync::make_getheaders_after(&self.chain_state, last.block_hash()));
@@ -8902,6 +9005,241 @@ impl PeerManager {
             if !has_ibd && let Some(last) = headers.last() {
                 self.request_announced_blocks(id, last.block_hash());
             }
+        }
+    }
+
+    /// Core's `CheckHeadersPoW` (v32.1 `net_processing.cpp`): the reason to
+    /// punish the peer for `headers`, if any. Each header must meet the
+    /// target it claims, within the network's proof-of-work limit
+    /// (`HasValidProofOfWork`), and build on the one before it
+    /// (`CheckHeadersAreContinuous`).
+    fn headers_pow_failure(&self, headers: &[bitcoin::block::Header]) -> Option<&'static str> {
+        let network = self.chain_state.network;
+        if headers
+            .iter()
+            .any(|h| crate::validation::pow::check_proof_of_work_bounded(h, network).is_err())
+        {
+            return Some("header with invalid proof of work");
+        }
+        if headers.windows(2).any(|w| w[1].prev_blockhash != w[0].block_hash()) {
+            return Some("non-continuous headers sequence");
+        }
+        None
+    }
+
+    /// The peers the post-IBD `getheaders` poll asks: every connected one
+    /// that serves blocks, but not one with a headers presync in progress.
+    /// The presync asks for its own next headers, and an answer to the
+    /// poll's locator would not follow on from it, and end it.
+    fn header_poll_peers(&self) -> Vec<PeerId> {
+        let syncing = self.peers_with_headers_sync();
+        self.peers
+            .read()
+            .iter()
+            .filter(|(id, h)| {
+                h.info.state == PeerState::Connected && h.info.serves_blocks() && !syncing.contains(id)
+            })
+            .map(|(id, _)| *id)
+            .collect()
+    }
+
+    /// The peers with a headers sync in progress.
+    fn peers_with_headers_sync(&self) -> HashSet<PeerId> {
+        self.headers_syncs.lock().keys().copied().collect()
+    }
+
+    /// Hand the manager the sender that asks the daemon to shut down. A
+    /// headers sync that cannot start because the clock is far behind the
+    /// chain uses it (see [`Self::try_low_work_headers_sync`]).
+    pub fn set_shutdown_sender(&self, tx: tokio::sync::watch::Sender<bool>) {
+        *self.shutdown_request.lock() = Some(tx);
+    }
+
+    /// End any headers sync with `id` and forget its presync stats: Core's
+    /// `m_headers_sync.reset()` with `m_headers_presync_stats.erase()`.
+    fn end_headers_sync(&self, id: PeerId) {
+        self.headers_syncs.lock().remove(&id);
+        self.headers_presync.lock().stats.remove(&id);
+        if let Some(h) = self.peers.write().get_mut(&id) {
+            h.info.presync_height = -1;
+        }
+    }
+
+    /// Core's `IsContinuationOfLowWorkHeadersSync`: hand `headers` to the
+    /// headers sync in progress with `id`, if there is one. Returns whether
+    /// it took them; `headers` is then replaced by those it released for
+    /// validation, often none. On `false` (no sync, or the sync failed and
+    /// ended) `headers` is left as it was, for the usual processing.
+    fn continue_headers_sync(&self, id: PeerId, headers: &mut Vec<bitcoin::block::Header>) -> bool {
+        use crate::net::headerssync::State;
+        let mut syncs = self.headers_syncs.lock();
+        let Some(sync) = syncs.get_mut(&id) else {
+            return false;
+        };
+        let result = sync.process_next_headers(headers, headers.len() == crate::net::limits::MAX_HEADERS_RESULTS);
+        let state = sync.state();
+        let next = sync.next_request_start();
+        let chain_start = sync.chain_start().hash;
+        let stat = PresyncStat {
+            work: sync.presync_work(),
+            presync: (state == State::Presync).then(|| (sync.presync_height(), sync.presync_time())),
+        };
+        let presync_height = sync.presync_height();
+        if state == State::Final {
+            syncs.remove(&id);
+        }
+        drop(syncs);
+
+        if result.success {
+            // A valid continuation answers the outstanding `getheaders`.
+            if let Some(h) = self.peers.write().get_mut(&id) {
+                h.last_getheaders_sent = None;
+            }
+            self.header_sync_progress.fetch_add(1, Ordering::Relaxed);
+        }
+        if result.request_more
+            && let Some(first) = next
+        {
+            self.send_getheaders(id, sync::make_headers_sync_getheaders(&self.chain_state, first, chain_start));
+            tracing::debug!("more getheaders (from {first}) to peer={id}");
+        }
+        if state == State::Final {
+            self.end_headers_sync(id);
+        } else {
+            if let Some(h) = self.peers.write().get_mut(&id) {
+                h.info.presync_height = presync_height;
+            }
+            self.note_presync_stat(id, stat);
+        }
+        if result.success {
+            *headers = result.pow_validated_headers;
+        }
+        result.success
+    }
+
+    /// Record `id`'s presync progress, and log the best peer's when it moved:
+    /// the stats half of Core's `IsContinuationOfLowWorkHeadersSync`, then
+    /// `ReportHeadersPresync` (v32.1 `validation.cpp`).
+    fn note_presync_stat(&self, id: PeerId, stat: PresyncStat) {
+        let report = {
+            let mut presync = self.headers_presync.lock();
+            presync.stats.insert(id, stat);
+            let best_updated = match presync.best.and_then(|b| presync.stats.get(&b).map(|s| (b, *s))) {
+                // The best peer is gone: find the best of the rest.
+                None => {
+                    let best = presync.stats.iter().max_by_key(|(_, s)| **s).map(|(p, _)| *p);
+                    presync.best = best;
+                    best == Some(id)
+                }
+                Some((best, best_stat)) => {
+                    if best == id || stat > best_stat {
+                        presync.best = Some(id);
+                        true
+                    } else {
+                        false
+                    }
+                }
+            };
+            // Core reports only while the best header has less than the
+            // network's minimum chain work, at most four times a second.
+            let now = Instant::now();
+            let due = presync.last_report.is_none_or(|t| now.saturating_duration_since(t) >= PRESYNC_REPORT_INTERVAL);
+            match stat.presync {
+                Some(p) if best_updated && due && !self.best_header_has_minimum_chain_work() => {
+                    presync.last_report = Some(now);
+                    Some(p)
+                }
+                _ => None,
+            }
+        };
+        if let Some((height, time)) = report
+            && self.chain_state.is_initial_block_download()
+        {
+            let spacing = 600;
+            let blocks_left = (crate::time::now_secs() as i64 - i64::from(time)).max(0) / spacing;
+            let progress = 100.0 * height as f64 / (height + blocks_left).max(1) as f64;
+            tracing::info!("Pre-synchronizing blockheaders, height: {height} (~{progress:.2}%)");
+        }
+    }
+
+    /// Whether the best header has the network's own `nMinimumChainWork`
+    /// (not `-minimumchainwork`), which is what Core's
+    /// `ReportHeadersPresync` compares.
+    fn best_header_has_minimum_chain_work(&self) -> bool {
+        let best = self.chain_state.best_header_hash();
+        self.chain_state.get_block_index(&best).is_some_and(|e| {
+            crate::chain::state::compare_u256(&e.chainwork, &self.chain_state.network_minimum_chain_work()) >= 0
+        })
+    }
+
+    /// Core's `TryLowWorkHeadersSync`: when `headers`, building on
+    /// `chain_start`, claim less work than the anti-DoS threshold
+    /// ([`ChainState::anti_dos_work_threshold`]), they are not stored.
+    /// A full message starts a headers sync with the peer and feeds it these
+    /// headers; a short one means the peer's chain ends there, and it is
+    /// ignored. Returns whether the headers were taken this way; `headers`
+    /// is then empty.
+    ///
+    /// When the clock is more than two hours behind the chain start's median
+    /// time past, Core logs the error and aborts the process. satd logs the
+    /// same error and asks the daemon for a clean shutdown instead, so the
+    /// datadir is flushed (CORE_DIFFERENCES.md).
+    fn try_low_work_headers_sync(
+        &self,
+        id: PeerId,
+        chain_start: &crate::storage::blockindex::BlockIndexEntry,
+        headers: &mut Vec<bitcoin::block::Header>,
+        now: u64,
+    ) -> bool {
+        use crate::storage::blockindex::{add_u256, work_for_bits};
+        let total_work = headers
+            .iter()
+            .fold(chain_start.chainwork, |acc, h| add_u256(&acc, &work_for_bits(h.bits)));
+        let threshold = self.chain_state.anti_dos_work_threshold();
+        if crate::chain::state::compare_u256(&total_work, &threshold) >= 0 {
+            return false;
+        }
+        if headers.len() == crate::net::limits::MAX_HEADERS_RESULTS {
+            let start = self.chain_state.headers_sync_chain_start(&headers[0].prev_blockhash);
+            if let Some(start) = start {
+                let network = self.chain_state.network;
+                let params = crate::net::headerssync::HeadersSyncParams::for_network(network);
+                match crate::net::headerssync::HeadersSyncState::new(
+                    id,
+                    network,
+                    params,
+                    start,
+                    threshold,
+                    now,
+                ) {
+                    Ok(sync) => {
+                        self.headers_syncs.lock().insert(id, sync);
+                        let _ = self.continue_headers_sync(id, headers);
+                    }
+                    Err(e) => {
+                        let msg = format!("Failure when attempting to initiate headers sync: {e}");
+                        eprintln!("{msg}");
+                        tracing::error!("{msg}");
+                        self.request_shutdown();
+                    }
+                }
+            }
+        } else {
+            tracing::debug!(
+                "Ignoring low-work chain (height={}) from peer={id}",
+                chain_start.height as usize + headers.len()
+            );
+        }
+        headers.clear();
+        true
+    }
+
+    /// Ask the daemon to shut down, if it gave the manager a way to.
+    fn request_shutdown(&self) {
+        if let Some(tx) = self.shutdown_request.lock().as_ref()
+            && tx.send_if_modified(|stop| !std::mem::replace(stop, true))
+        {
+            tracing::info!("Shutdown requested");
         }
     }
 
@@ -17500,9 +17838,18 @@ mod tests {
         use bitcoin::hashes::Hash as _;
         let mut header = bitcoin::constants::genesis_block(Network::Regtest).header;
         header.prev_blockhash = bitcoin::BlockHash::from_byte_array([0x7au8; 32]);
-        for nonce in 0..(BAN_THRESHOLD + 10) {
+        // Each meets its own proof of work, which Core's `CheckHeadersPoW`
+        // checks first, and punishes.
+        let mut sent = 0;
+        let mut nonce = 0;
+        while sent < BAN_THRESHOLD + 10 {
             header.nonce = nonce;
+            nonce += 1;
+            if crate::validation::pow::check_proof_of_work(&header).is_err() {
+                continue;
+            }
             pm.handle_headers(1, vec![header]);
+            sent += 1;
         }
 
         let peers = pm.peers.read();

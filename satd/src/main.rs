@@ -2956,6 +2956,9 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
         config.stopatheight.map(|height| (height, shutdown_tx.clone())),
     );
 
+    // A headers sync that finds the clock far behind the chain asks for a
+    // clean shutdown on this, where Core aborts.
+    peer_manager.set_shutdown_sender(shutdown_tx.clone());
     // Bitcoin Core's `-timeout` bounds the version/verack handshake.
     // `config.timeout` is already normalised to milliseconds.
     peer_manager.set_connect_timeout_ms(config.timeout);
