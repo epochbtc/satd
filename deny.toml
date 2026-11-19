@@ -66,6 +66,28 @@ ignore = [
     # directly and the shims leave the lock.
     { id = "RUSTSEC-2026-0381", reason = "webpki-roots 0.26.11 is a shim re-exporting 1.x, locked to fixed 1.0.10" },
     { id = "RUSTSEC-2026-0383", reason = "webpki-root-certs 0.26.11 is a shim re-exporting 1.x, locked to fixed 1.0.10" },
+
+    # chrono 0.4.44 -- RUSTSEC-2026-0543 (unmaintained, all versions, no
+    # patched release). Informational only: it reports no vulnerability.
+    # satd has no direct dependency on chrono and calls none of its API; it
+    # comes in only through rmcp (satd-mcp), which uses it for RFC 3339
+    # timestamps in MCP task/annotation metadata, and through schemars 1.x's
+    # `chrono04` feature that rmcp enables. Removing it needs rmcp to drop
+    # chrono (upstream modelcontextprotocol/rust-sdk#1469); tracked in #1314.
+    { id = "RUSTSEC-2026-0543", reason = "unmaintained, no vuln; transitive via rmcp only, no direct use; tracked in #1314" },
+
+    # rmcp 2.2.0 -- RUSTSEC-2026-0457 (OAuth client SSRF filter checks host
+    # strings, not resolved addresses) and RUSTSEC-2026-0462 (Streamable HTTP
+    # clients buffer response bodies without a limit). Both are in client-side
+    # code: `transport::auth` is behind rmcp's `auth` feature and
+    # `transport::streamable_http_client` behind
+    # `transport-streamable-http-client` (rmcp-2.2.0/src/transport.rs:95-117).
+    # satd builds only `server`, `transport-io` and
+    # `transport-streamable-http-server`, so neither is compiled in. master
+    # bumped to rmcp 3.9.0 (#1241); release/0.7.x keeps 2.2.0 to avoid a major
+    # bump in a patch release. Remove both when this branch is retired.
+    { id = "RUSTSEC-2026-0457", reason = "rmcp OAuth client; `auth` feature not built (server-only use)" },
+    { id = "RUSTSEC-2026-0462", reason = "rmcp Streamable HTTP client; client transport not built (server-only use)" },
 ]
 
 # ---------------------------------------------------------------------------

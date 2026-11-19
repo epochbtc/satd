@@ -367,7 +367,7 @@ startup error.
 | `reindexchainstate` | off | restart | core | Rebuild the UTXO set from existing block files (Core `-reindex-chainstate`). Same rule in the config file as `reindex`. |
 | `upgradechainstate` | off | restart | satd | Rebuild the UTXO set from the block files, unprompted, when the datadir's chainstate schema is older than this satd's or a previous rebuild did not finish; otherwise nothing. Safe to leave on. Pruned nodes are refused (they must resync), and a newer schema is never downgraded. The app-store packages set it. |
 | `checkblockindex` | off (on for regtest) | restart | core | Audit block-index / active-chain consistency at startup (Core `-checkblockindex`). |
-| `dbcache` | 450 MB (or `auto`) | restart | core | Total write-cache size in MB, or `auto` for adaptive sizing. |
+| `dbcache` | 450 MB (or `auto`) | restart | core | Total write-cache size in MB, or `auto` for adaptive sizing within host memory and the node's memory cgroup limit. |
 | `storageprofile` | ssd | restart | satd | Storage class for chainstate tuning: `ssd` or `hdd`. |
 | `prefetchworkers` | CPU cores | restart | satd | Number of IBD prefetch worker threads. |
 | `maxahead` | 50000 | restart | satd | Max blocks ahead during IBD: number, `N%`, or `all`. |

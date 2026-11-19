@@ -67,7 +67,8 @@ impl DbCacheSize {
 
     /// Parse Bitcoin-Core-compatible string: either a number (MB) or "auto".
     /// When "auto" is given without an explicit max, the cap is chosen based
-    /// on total system memory: 50% of MemTotal, min 450 MB, max 8192 MB.
+    /// on total memory: 50% of MemTotal, or of the process's memory cgroup
+    /// limit when that is lower, min 450 MB, max 8192 MB.
     fn parse(s: &str) -> Option<Self> {
         let trimmed = s.trim();
         if trimmed.eq_ignore_ascii_case("auto") {
@@ -82,7 +83,9 @@ impl DbCacheSize {
 }
 
 fn default_auto_max_mb() -> usize {
-    // Read MemTotal once at config-load time. When unavailable (non-Linux:
+    // Read MemTotal once at config-load time, clamped to the memory cgroup
+    // limit (systemd MemoryMax=, a container's --memory) so a confined node
+    // does not size its cache for the whole host. When unavailable (non-Linux:
     // /proc/meminfo doesn't exist), fall back to Core's default static
     // budget — NOT a larger value. The adaptive controller will separately
     // detect the missing meminfo and stay inactive. Together this keeps
