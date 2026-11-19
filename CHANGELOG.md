@@ -74,6 +74,7 @@ It includes every fix shipped in 0.7.1:
 - Release tooling: `contrib/release/sign-tarballs.sh` keeps a per-tag working directory across failed runs and reuses only the files whose hashes still match the release (#903).
 - Consensus: `-reindex` applies header sync's rules (difficulty, median time past, version, checkpoints) to every stored block and skips a failing block and its descendants (#506).
 - Operator: AssumeUTXO background validation retries a failed connect, its alerts reach every alert surface, and new `satd_assumeutxo_*` gauges show progress (#557).
+- AssumeUTXO: Bitcoin Core v32.1's mainnet snapshot at height 965,000 loads with `loadtxoutset` and `--fast-start` (#1313).
 - Streaming: a `satd-head-cursor` header lets the Go and Rust resilient watches resume after a drop before their first confirmed event (#777).
 - Packaging: Nix builds and x86_64 Linux tarballs no longer depend on the build CPU (jemalloc constants pinned), and `flake.lock` is committed (#321).
 - RPC: `estimatesmartfee` takes Core 32.1's shape (`options`, `estimator`, answered `blocks`, no-data `errors`), and every fee surface floors at the rolling mempool minimum (#1200).
@@ -111,6 +112,7 @@ It includes every fix shipped in 0.7.1:
 - RPC: integer and verbosity arguments are parsed and range-checked as in Core; out-of-type values are `-1 JSON integer out of range` (#1267).
 - CLI: `sat-cli` converts arguments by Core's per-method table, as `bitcoin-cli` does; adds `-stdinrpcpass`, and `-stdin` keeps empty lines (#1268).
 - IBD: the default `-assumevalid` and the minimum chain work of every network are Bitcoin Core v32.1's; mainnet's default block moves from height 840,000 to 966,143 and signet's from 218,000 to 321,295 (#1217).
+- IBD: `verificationprogress` estimates from Bitcoin Core v32.1's `ChainTxData` on mainnet, testnet3, testnet4 and signet (#1312).
 - RPC: `getblockstats`' `total_out` leaves out the coinbase, `utxo_size_inc` sums the real output and prevout sizes, and `utxo_increase_actual` and `utxo_size_inc_actual` are reported, as in Core (#1208).
 - Operator: a custom signet frames its `blk*.dat` records and `dumptxoutset` snapshots with its own message start, as Core does, not the default signet's; a pre-0.8.0 custom-signet blocks directory mixes both and needs a fresh sync before Core can read it (#1283).
 - RPC: `getchaintxstats` defaults to one month of blocks (4320) and accepts `nblocks=0`, as in Core (#1297).
