@@ -69,6 +69,7 @@ const HELP_METHODS: &[(&str, &str)] = &[
     ("getdifficulty", "Blockchain"),
     ("getibdprogress", "Blockchain"),
     ("getmempoolancestors", "Blockchain"),
+    ("getmempoolcluster", "Blockchain"),
     ("getmempooldescendants", "Blockchain"),
     ("getmempoolentry", "Blockchain"),
     ("getmempoolhistory", "Blockchain"),
@@ -201,6 +202,7 @@ const HELP_METHODS: &[(&str, &str)] = &[
     ("addpeeraddress", "hidden"),
     ("getrawaddrman", "hidden"),
     ("getorphantxs", "hidden"),
+    ("getmempoolfeeratediagram", "hidden"),
     // satd's test-only strip tool; registered only with `-allowteststrip`
     // on regtest.
     ("stripopreturns", "hidden"),
@@ -1234,6 +1236,19 @@ pub async fn start(
         args.check()?;
         blockchain::get_mempool_descendants(&ctx.mempool, &txid, verbose)
             .map_err(|e| ErrorObjectOwned::owned(-5, e, None::<()>))
+    })?;
+
+    module.register_method("getmempoolcluster", |params, ctx, _extensions| {
+        let mut args = Args::new(&params);
+        let txid: String = args.required("txid")?;
+        args.check()?;
+        blockchain::get_mempool_cluster(&ctx.mempool, &txid)
+            .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
+    })?;
+
+    module.register_method("getmempoolfeeratediagram", |params, ctx, _extensions| {
+        Args::new(&params).check()?;
+        Ok::<_, ErrorObjectOwned>(blockchain::get_mempool_feerate_diagram(&ctx.mempool))
     })?;
 
     module.register_method("getmempoolentry", |params, ctx, _extensions| {
@@ -5863,7 +5878,7 @@ mod help_listing_tests {
     /// stays out of the listing. Naming them keeps a later re-categorisation
     /// from quietly advertising a test-only dial or raw-send RPC.
     #[test]
-    fn the_hidden_commands_are_the_expected_eight() {
+    fn the_hidden_commands_are_the_expected_nine() {
         let hidden: Vec<&str> = HELP_METHODS
             .iter()
             .filter(|(_, c)| *c == "hidden")
@@ -5879,6 +5894,7 @@ mod help_listing_tests {
                 "addpeeraddress",
                 "getrawaddrman",
                 "getorphantxs",
+                "getmempoolfeeratediagram",
                 "stripopreturns",
             ]
         );

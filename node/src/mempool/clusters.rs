@@ -182,6 +182,12 @@ impl Eq for Best {}
 /// [`linearize`] finds the linearization Core does, which it does for
 /// chains and other simple shapes.
 pub fn mining_order(g: &Graph) -> Vec<usize> {
+    main_chunks(g).into_iter().flat_map(|(_, txs)| txs).collect()
+}
+
+/// The chunks of [`mining_order`], each with its summed fee and weight:
+/// what Core's block builder takes one by one (`GetBlockBuilderChunk`).
+fn main_chunks(g: &Graph) -> Vec<(FeeFrac, Vec<usize>)> {
     let kids = g.children();
     let all: Vec<usize> = (0..g.txids.len()).collect();
     // (feerate, equal-feerate prefix size, highest txid, transactions)
@@ -200,7 +206,30 @@ pub fn mining_order(g: &Graph) -> Vec<usize> {
         }
     }
     chunks.sort_by(|a, b| feerate_compare(b.0, a.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
-    chunks.into_iter().flat_map(|(_, _, _, txs)| txs).collect()
+    chunks.into_iter().map(|(ff, _, _, txs)| (ff, txs)).collect()
+}
+
+/// Core's `CTxMemPool::GetFeerateDiagram` (`getmempoolfeeratediagram`):
+/// the cumulative fee and weight after each chunk of [`main_chunks`],
+/// starting from nothing.
+pub fn feerate_diagram(g: &Graph) -> Vec<FeeFrac> {
+    let mut out = vec![FeeFrac::default()];
+    for (ff, _) in main_chunks(g) {
+        let next = *out.last().expect("starts with zero") + ff;
+        out.push(next);
+    }
+    out
+}
+
+/// One cluster's chunks in its linearization's order, each chunk's
+/// transactions in that order with their summed fee and weight: what
+/// Core's `getmempoolcluster` reports (`clusterToJSON`, which walks
+/// `TxGraph::GetCluster` in linearization order and cuts it where each
+/// `GetMainChunkFeerate` ends). `g` must hold exactly one cluster.
+pub fn cluster_chunks(g: &Graph) -> Vec<(Vec<usize>, FeeFrac)> {
+    let all: Vec<usize> = (0..g.txids.len()).collect();
+    let order = g.linearize_group(&all);
+    g.chunks(&order)
 }
 
 /// The chunk each transaction is mined in: for `txids[i]`, the summed fee
