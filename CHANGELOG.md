@@ -25,6 +25,7 @@ It includes every fix shipped in 0.7.1:
 - RPC: any request `Content-Type` is read as JSON, as in Core (#824).
 - RPC: `invalidateblock`, `reconsiderblock` and `preciousblock` go on to the next-best valid chain, as in Core (#1261).
 - RPC: `getrawtransaction`'s not-found message matches the node's `-txindex` state (#1066).
+- RPC: a package member spending one outpoint twice is refused as `bad-txns-inputs-duplicate` by `submitpackage` and `testmempoolaccept`, as in Core, not as `conflict-in-package`.
 - RPC: `testmempoolaccept` forgives a standardness failure an `allow` policy rule forgives, as `sendrawtransaction` does (#999).
 - RPC: an open JSON-RPC WebSocket stops working when its bearer token is revoked or expires; its frames are answered `-32006` (#821).
 - RPC: `getnetworkinfo` reports each network's `reachable` and `limited` from `-onlynet` and the proxies, as Core does, and lists `i2p` and `cjdns` (#1164).
