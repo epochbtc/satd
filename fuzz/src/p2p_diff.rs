@@ -819,8 +819,8 @@ fn version_at(timestamp: i64, nonce: u64, user_agent: &str) -> VersionMessage {
 
 /// A resident regtest `bitcoind` and a v1 and a v2 connection to it.
 pub struct CoreOracle {
-    child: Child,
-    work: PathBuf,
+    daemon: Daemon,
+    work: WorkDir,
     log: std::fs::File,
     /// Bytes of a line Core has not finished writing.
     log_partial: Vec<u8>,
@@ -844,67 +844,83 @@ impl CoreOracle {
     /// Start `bitcoind`, mine one block so it leaves initial block download
     /// (Core drops a `tx` unread during IBD, `net_processing.cpp:4718`), and
     /// connect.
+    ///
+    /// The ports are picked free and then handed to `bitcoind`, so another
+    /// process can take one in between; startup is tried three times.
     pub fn start() -> Result<CoreOracle, String> {
+        let mut last = String::new();
+        for attempt in 1..=3 {
+            match Self::start_once() {
+                Ok(oracle) => return Ok(oracle),
+                Err(e) => {
+                    eprintln!("p2p-differential: starting Bitcoin Core, attempt {attempt}: {e}");
+                    last = e;
+                }
+            }
+        }
+        Err(last)
+    }
+
+    fn start_once() -> Result<CoreOracle, String> {
         let work = scratch_root().join(format!("satd-p2pdiff-{}-{}", std::process::id(), free_port().map_err(|e| e.to_string())?));
         std::fs::create_dir_all(&work).map_err(|e| format!("{}: {e}", work.display()))?;
-        let bitcoind = bitcoind_binary(&work)?;
-        let datadir = work.join("data");
+        // Removed on every early return below, and with the oracle.
+        let work = WorkDir(work);
+        let bitcoind = bitcoind_binary(&work.0)?;
+        let datadir = work.0.join("data");
         std::fs::create_dir_all(&datadir).map_err(|e| e.to_string())?;
         let rpc_port = free_port().map_err(|e| e.to_string())?;
         let p2p_port = free_port().map_err(|e| e.to_string())?;
         let (user, pass) = ("p2pdiff", format!("pw{rpc_port}"));
-        let child = Command::new(&bitcoind)
-            .arg("-regtest")
-            .arg(format!("-datadir={}", datadir.display()))
-            .args(["-server=1", "-rpcbind=127.0.0.1", "-rpcallowip=127.0.0.1"])
-            .arg(format!("-rpcport={rpc_port}"))
-            .arg(format!("-rpcuser={user}"))
-            .arg(format!("-rpcpassword={pass}"))
-            .args(["-listen=1", "-connect=0", "-dnsseed=0", "-fixedseeds=0", "-discover=0", "-listenonion=0", "-natpmp=0"])
-            .arg(format!("-bind=127.0.0.1:{p2p_port}"))
-            .args(["-v2transport=1", "-whitelist=noban@127.0.0.1"])
-            .args(["-debug=net", "-debug=mempool", "-debug=mempoolrej", "-debug=cmpctblock"])
-            .args(["-printtoconsole=0", "-shrinkdebugfile=0", "-logthreadnames=0", "-logtimestamps=0"])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(|e| format!("could not start {}: {e}", bitcoind.display()))?;
+        let mut args: Vec<String> = vec![
+            "-regtest".into(),
+            format!("-datadir={}", datadir.display()),
+            "-server=1".into(),
+            "-rpcbind=127.0.0.1".into(),
+            "-rpcallowip=127.0.0.1".into(),
+            format!("-rpcport={rpc_port}"),
+            format!("-rpcuser={user}"),
+            format!("-rpcpassword={pass}"),
+            format!("-bind=127.0.0.1:{p2p_port}"),
+        ];
+        args.extend(
+            [
+                "-listen=1", "-connect=0", "-dnsseed=0", "-fixedseeds=0", "-discover=0", "-listenonion=0",
+                "-natpmp=0", "-v2transport=1", "-whitelist=noban@127.0.0.1", "-debug=net", "-debug=mempool",
+                "-debug=mempoolrej", "-debug=cmpctblock", "-printtoconsole=0", "-shrinkdebugfile=0",
+                "-logthreadnames=0", "-logtimestamps=0",
+            ]
+            .map(String::from),
+        );
+        let mut daemon = Daemon::spawn(&bitcoind, &args, &work.0)?;
         let rpc = Client::new(&format!("http://127.0.0.1:{rpc_port}"), Auth::UserPass(user.into(), pass))
             .map_err(|e| format!("rpc client: {e}"))?;
-        let log_path = datadir.join("regtest").join("debug.log");
-        let mut oracle = None;
         let deadline = Instant::now() + Duration::from_secs(90);
-        let mut child = Some(child);
-        while Instant::now() < deadline {
-            if let Some(c) = child.as_mut()
-                && let Ok(Some(status)) = c.try_wait()
-            {
+        loop {
+            if let Some(status) = daemon.exited() {
                 return Err(format!("bitcoind exited during startup: {status}"));
             }
             if rpc.get_blockchain_info().is_ok() {
-                let log = std::fs::File::open(&log_path).map_err(|e| format!("{}: {e}", log_path.display()))?;
-                oracle = Some(CoreOracle {
-                    child: child.take().expect("child"),
-                    work: work.clone(),
-                    log,
-                    log_partial: Vec::new(),
-                    rpc,
-                    p2p_port,
-                    v1: None,
-                    v2: None,
-                    nonce: 1,
-                    stats: Stats::default(),
-                });
                 break;
+            }
+            if Instant::now() >= deadline {
+                return Err("bitcoind RPC did not come up within 90 s".into());
             }
             std::thread::sleep(Duration::from_millis(200));
         }
-        let Some(mut oracle) = oracle else {
-            if let Some(mut c) = child {
-                let _ = c.kill();
-                let _ = c.wait();
-            }
-            return Err("bitcoind RPC did not come up within 90 s".into());
+        let log_path = datadir.join("regtest").join("debug.log");
+        let log = std::fs::File::open(&log_path).map_err(|e| format!("{}: {e}", log_path.display()))?;
+        let mut oracle = CoreOracle {
+            daemon,
+            work,
+            log,
+            log_partial: Vec::new(),
+            rpc,
+            p2p_port,
+            v1: None,
+            v2: None,
+            nonce: 1,
+            stats: Stats::default(),
         };
         let desc: serde_json::Value = oracle
             .rpc
@@ -923,6 +939,11 @@ impl CoreOracle {
         oracle.peer(false)?;
         oracle.peer(true)?;
         Ok(oracle)
+    }
+
+    /// The oracle's scratch directory (datadir, and the copied `bitcoind`).
+    pub fn work_dir(&self) -> &Path {
+        &self.work.0
     }
 
     fn next_nonce(&mut self) -> u64 {
@@ -1017,6 +1038,9 @@ impl CoreOracle {
             std::thread::sleep(Duration::from_millis(1));
         }
         lines.extend(self.read_log());
+        // Read while the connection is still up: Core drops the peer from
+        // getpeerinfo once it is closed.
+        let services = if sent.is_ok() { self.peer_services(local_port) } else { None };
         drop(peer);
         if let Err(e) = sent {
             return Ok(CoreVerdict::Unobservable(format!("send failed: {e}")));
@@ -1036,7 +1060,7 @@ impl CoreOracle {
             let Some(mut fields) = parse_version_line(line) else {
                 return Err(format!("could not parse Core's version line: {line}"));
             };
-            fields.services = self.peer_services(local_port);
+            fields.services = services;
             return Ok(CoreVerdict::Accept(Observed { version: Some(fields), ..Observed::default() }));
         }
         Ok(classify_drop(&lines).unwrap_or_else(|| {
@@ -1066,13 +1090,78 @@ impl CoreOracle {
 
 impl Drop for CoreOracle {
     fn drop(&mut self) {
+        // Close the connections before Core goes away; the fields then drop
+        // in order: the daemon, then its work dir.
         self.v1 = None;
         self.v2 = None;
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-        if std::env::var_os("P2P_DIFF_KEEP").is_none() {
-            let _ = std::fs::remove_dir_all(&self.work);
+    }
+}
+
+/// Keeps `P2P_DIFF_KEEP` set to leave the work dir for inspection.
+fn keep_work() -> bool {
+    std::env::var_os("P2P_DIFF_KEEP").is_some()
+}
+
+/// The oracle's scratch directory, removed on drop.
+struct WorkDir(PathBuf);
+
+impl Drop for WorkDir {
+    fn drop(&mut self) {
+        if !keep_work() {
+            let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+}
+
+/// Runs `bitcoind` and stops it when this process lets go of the shim's
+/// stdin: on drop, and also when the process ends without dropping it. The
+/// fuzz target keeps the oracle in a static, which is never dropped, and
+/// libFuzzer leaves by `exit`, so a `Drop` alone would leave `bitcoind`
+/// running and its datadir behind after every run. The shim then removes the
+/// work dir.
+const SHIM: &str = r#"exec 3<&0
+"$@" </dev/null &
+pid=$!
+( cat <&3 >/dev/null; kill "$pid" 2>/dev/null ) &
+exec 3<&-
+wait "$pid"
+status=$?
+[ -n "$P2P_DIFF_KEEP" ] || rm -rf -- "$P2P_DIFF_WORK"
+exit "$status"
+"#;
+
+struct Daemon {
+    shim: Child,
+}
+
+impl Daemon {
+    fn spawn(bitcoind: &Path, args: &[String], work: &Path) -> Result<Daemon, String> {
+        let shim = Command::new("sh")
+            .arg("-c")
+            .arg(SHIM)
+            .arg("p2pdiff-bitcoind")
+            .arg(bitcoind)
+            .args(args)
+            .env("P2P_DIFF_WORK", work)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|e| format!("could not start {} under sh: {e}", bitcoind.display()))?;
+        Ok(Daemon { shim })
+    }
+
+    fn exited(&mut self) -> Option<std::process::ExitStatus> {
+        self.shim.try_wait().ok().flatten()
+    }
+}
+
+impl Drop for Daemon {
+    fn drop(&mut self) {
+        // End of input tells the shim to stop bitcoind; Core shuts down on
+        // SIGTERM in a few seconds.
+        drop(self.shim.stdin.take());
+        let _ = self.shim.wait();
     }
 }
 

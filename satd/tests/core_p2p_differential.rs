@@ -23,6 +23,8 @@ mod p2p_diff;
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::process::Command;
+use std::time::{Duration, Instant};
 
 use p2p_diff::{compare, satd_decode, seed_cases, CoreOracle, CoreVerdict, Outcome};
 
@@ -114,4 +116,66 @@ fn committed_seeds_match_the_generator() {
          cargo test -p satd --test core_p2p_differential --features core-p2p-differential \
          committed_seeds_match_the_generator"
     );
+}
+
+/// Set in a child run of this test binary to pick what the child does.
+const CHILD: &str = "P2P_DIFF_TEST_CHILD";
+
+/// Run one test of this binary in a child process, with `CHILD` set.
+fn run_child(test: &str, mode: &str, envs: &[(&str, &std::ffi::OsStr)]) -> std::process::Output {
+    let mut cmd = Command::new(std::env::current_exe().expect("test binary"));
+    cmd.args(["--exact", test, "--nocapture", "--test-threads=1"]).env(CHILD, mode);
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
+    cmd.output().expect("run the child test")
+}
+
+/// The fuzz target keeps the oracle in a static and libFuzzer leaves by
+/// `exit`, so the oracle is never dropped. `bitcoind` must stop, and its
+/// work dir go, when the process ends anyway.
+#[test]
+fn bitcoind_does_not_outlive_its_process() {
+    if std::env::var_os(CHILD).is_some_and(|m| m == "leak") {
+        let core = CoreOracle::start().unwrap_or_else(|e| panic!("could not start the Bitcoin Core oracle: {e}"));
+        println!("WORK={}", core.work_dir().display());
+        std::mem::forget(core);
+        std::process::exit(0);
+    }
+    let out = run_child("bitcoind_does_not_outlive_its_process", "leak", &[]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "child failed: {stdout}\n{}", String::from_utf8_lossy(&out.stderr));
+    let work = stdout
+        .lines()
+        .find_map(|l| l.split_once("WORK=").map(|(_, w)| w.trim()))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| panic!("the child printed no work dir: {stdout}"));
+    // The shim removes the work dir only after bitcoind has exited.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while work.exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(!work.exists(), "{} outlived the process that started it: bitcoind is still running", work.display());
+}
+
+/// A start that fails before bitcoind runs leaves no work dir behind.
+#[test]
+fn a_failed_start_leaves_no_work_dir() {
+    if std::env::var_os(CHILD).is_some_and(|m| m == "bad-bitcoind") {
+        match CoreOracle::start() {
+            Ok(_) => panic!("started an oracle on a binary that is not bitcoind"),
+            Err(e) => println!("refused: {e}"),
+        }
+        std::process::exit(0);
+    }
+    let scratch = tempfile::tempdir().expect("tempdir");
+    let out = run_child(
+        "a_failed_start_leaves_no_work_dir",
+        "bad-bitcoind",
+        &[("BITCOIND", "/bin/true".as_ref()), ("P2P_DIFF_TMPDIR", scratch.path().as_os_str())],
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success() && stdout.contains("refused: "), "child: {stdout}\n{}", String::from_utf8_lossy(&out.stderr));
+    let left: Vec<_> = std::fs::read_dir(scratch.path()).expect("read scratch").map(|e| e.expect("entry").path()).collect();
+    assert!(left.is_empty(), "a failed start left {left:?}");
 }
