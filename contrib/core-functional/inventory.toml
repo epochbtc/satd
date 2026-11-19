@@ -609,7 +609,7 @@ note = "measured 2026-10-01: wtxid relay landed (#714) and the getdata by wtxid 
 file = "p2p_compactblocks.py"
 status = "skip"
 reason = "feature-missing"
-note = "re-measured 2026-09-28 with low-bandwidth compact fetch (#867): make_utxos, the sendcmpct and construction subtests pass; L388 fails on the inv half of test_compactblock_requests -- satd answers a block inv with a full getdata where Core sends only getheaders, so the first getdata the test sees is MSG_WITNESS_BLOCK, not MSG_CMPCT_BLOCK. Measured with that half skipped, the headers half passes, as do the getblocktxn, handler and not-at-tip subtests; the test then stops at L657, which wants 'Ignoring low-work compact block' (Core's anti-DoS work threshold for cmpctblock headers). Follow-up: inv -> getheaders (see p2p_sendheaders) and the low-work threshold"
+note = "re-measured 2026-09-28 with low-bandwidth compact fetch (#867): make_utxos, the sendcmpct and construction subtests pass; L388 fails on the inv half of test_compactblock_requests -- satd answers a block inv with a full getdata where Core sends only getheaders, so the first getdata the test sees is MSG_WITNESS_BLOCK, not MSG_CMPCT_BLOCK. Measured with that half skipped, the headers half passes, as do the getblocktxn, handler and not-at-tip subtests; the test then stops at L657, which wants 'Ignoring low-work compact block' (Core's anti-DoS work threshold for cmpctblock headers). Follow-up: inv -> getheaders (see p2p_sendheaders). Re-measured 2026-11-19 with the low-work cmpctblock check (#1247): satd now ignores the header and logs 'Ignoring low-work compact block from peer N' (debug), but the run still stops first at L388, the inv half."
 
 [[test]]
 file = "p2p_compactblocks_blocksonly.py"
@@ -860,7 +860,7 @@ note = "measured 2026-11-03 at v32.1: L53 KeyError 'tx_send_rate' in getpeerinfo
 file = "p2p_unrequested_blocks.py"
 status = "skip"
 reason = "core-log"
-note = "measured 2026-09-15: L100 assert_debug_log 'AcceptBlockHeader: not adding new block header <hash>, missing anti-dos proof-of-work validation'; satd has no anti-DoS header gate to log"
+note = "re-measured 2026-11-19 with Core's AcceptBlock gates (#1247): L100 (the anti-DoS header gate's log line) and the unrequested less-work, equal-work and more-work cases of part 4 pass. The test now stops at L174: a block whose parent is unknown is expected to disconnect the sender, which satd does not do by design (CORE_DIFFERENCES.md, 'A block whose parent is unknown'). Follow-up: none while that difference stands"
 
 [[test]]
 file = "p2p_v2_encrypted.py"

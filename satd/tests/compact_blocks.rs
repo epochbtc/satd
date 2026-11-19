@@ -1685,3 +1685,83 @@ fn a_blocksonly_node_ignores_a_requested_cmpctblock() {
     peer.send(NetworkMessage::Block(b.clone()));
     poll_until(|| best_hash(&node) == b.block_hash(), test_timeout(20), "the full block connects");
 }
+
+// ---------------------------------------------------------------------------
+// Low-work blocks (#1247)
+// ---------------------------------------------------------------------------
+
+fn block_at_height(node: &TestNode, h: u32) -> Block {
+    let hash: BlockHash = node.rpc_ok("getblockhash", vec![json!(h)]).as_str().unwrap().parse().unwrap();
+    block_at(node, &hash)
+}
+
+fn has_header(node: &TestNode, hash: &BlockHash) -> bool {
+    node.rpc_call_with_params("getblockheader", vec![json!(hash.to_string())])
+        .unwrap()
+        .get("error")
+        .is_none_or(|e| e.is_null())
+}
+
+fn chain_tip_status(node: &TestNode, hash: &BlockHash) -> Option<String> {
+    node.rpc_ok("getchaintips", vec![])
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["hash"] == json!(hash.to_string()))
+        .map(|t| t["status"].as_str().unwrap().to_string())
+}
+
+/// Core's `AcceptBlock` gates, over P2P, on a 300-block chain. A block
+/// nobody asked for on a fork 200 blocks deep claims too little work and
+/// leaves nothing behind (`too-little-chainwork`); one on a fork 50 deep
+/// leaves only its header (`headers-only`, not `valid-headers`). A block
+/// that extends the tip is still taken, unrequested.
+#[test]
+fn unrequested_low_work_blocks_are_not_written() {
+    let (node, _) = started_node(300);
+    let peer = RawPeer::connect(node.p2p_port.unwrap());
+    poll_until(|| peer_count(&node) == 1, test_timeout(20), "peer must connect");
+
+    let deep = build_block(&block_at_height(&node, 100), 101, vec![], true, 7_001);
+    peer.send(NetworkMessage::Block(deep.clone()));
+    let near = build_block(&block_at_height(&node, 250), 251, vec![], true, 7_002);
+    peer.send(NetworkMessage::Block(near.clone()));
+    // A block that extends the tip, unrequested too: once it connects, the
+    // two before it have been judged.
+    let tip = block_at(&node, &best_hash(&node));
+    let next = build_block(&tip, 301, vec![], true, 7_003);
+    peer.send(NetworkMessage::Block(next.clone()));
+    poll_until(|| best_hash(&node) == next.block_hash(), test_timeout(20), "the next block must connect");
+
+    assert!(!has_header(&node, &deep.block_hash()), "the deep low-work block left a header");
+    assert_eq!(chain_tip_status(&node, &deep.block_hash()), None);
+    assert!(has_header(&node, &near.block_hash()), "the near fork's header is indexed, as in Core");
+    assert_eq!(
+        chain_tip_status(&node, &near.block_hash()).as_deref(),
+        Some("headers-only"),
+        "the near fork's block was written"
+    );
+    assert!(!peer.is_closed(), "unrequested blocks are not misbehaviour");
+    assert_eq!(banned_count(&node), 0);
+}
+
+/// Core's `cmpctblock` handler ignores a header whose chain claims too
+/// little work ("Ignoring low-work compact block"). A high-bandwidth peer's
+/// `cmpctblock` on a fork 200 blocks deep leaves nothing behind; one that
+/// extends the tip still connects.
+#[test]
+fn a_low_work_cmpctblock_is_ignored() {
+    let (node, _) = started_node(300);
+    let mut peer = RawPeer::connect(node.p2p_port.unwrap());
+    poll_until(|| peer_count(&node) == 1, test_timeout(20), "peer must connect");
+    promote(&node, &mut peer);
+
+    let deep = build_block(&block_at_height(&node, 100), 101, vec![], true, 7_101);
+    peer.send(cmpct(HeaderAndShortIds::from_block(&deep, 1, 2, &[]).unwrap()));
+    let tip = block_at(&node, &best_hash(&node));
+    let next = build_block(&tip, height(&node) + 1, vec![], true, 7_102);
+    peer.send(cmpct(HeaderAndShortIds::from_block(&next, 2, 2, &[]).unwrap()));
+    poll_until(|| best_hash(&node) == next.block_hash(), test_timeout(20), "the next cmpctblock must connect");
+
+    assert!(!has_header(&node, &deep.block_hash()), "the low-work cmpctblock's header was indexed");
+}

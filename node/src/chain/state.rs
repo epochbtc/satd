@@ -882,6 +882,24 @@ impl BlockAcceptance {
     }
 }
 
+/// What [`ChainState::peer_block_gate`] decides for a block from a peer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PeerBlockGate {
+    /// Store and validate the block as usual.
+    Process,
+    /// Index the header, but do not store the block: it was not asked for
+    /// and is not a candidate for the tip soon. The reason is for the log.
+    HeaderOnly(&'static str),
+    /// Store nothing: the header is new and its chain claims less than the
+    /// anti-DoS work threshold (Core's `too-little-chainwork`).
+    TooLittleChainwork,
+}
+
+/// Core's `MIN_BLOCKS_TO_KEEP` (`validation.h`): an unrequested block more
+/// than this far above the tip is not stored (`AcceptBlock`'s
+/// `fTooFarAhead`).
+pub const MIN_BLOCKS_TO_KEEP: u32 = 288;
+
 /// Core's `DEFAULT_MAX_TIP_AGE`: a tip older than this keeps the node in
 /// initial block download.
 pub const DEFAULT_MAX_TIP_AGE_SECS: i64 = 24 * 60 * 60;
@@ -1503,6 +1521,64 @@ impl ChainState {
             sub_u256(&tip.chainwork, &buffer)
         };
         if compare_u256(&near_tip, &min_work) > 0 { near_tip } else { min_work }
+    }
+
+    /// Core's `AcceptBlock` gates (v32.1 `validation.cpp`) for a block a
+    /// peer sent, judged on its header before any of the block is stored.
+    /// `requested` is Core's `fRequested`: this node asked for the block.
+    ///
+    /// - A header the index does not hold yet, on a known parent, whose
+    ///   chain claims less than [`Self::anti_dos_work_threshold`] is refused
+    ///   as `too-little-chainwork` and nothing is stored, not even the header
+    ///   (`net_processing.cpp` leaves `min_pow_checked` false, and
+    ///   `AcceptBlockHeader` refuses it).
+    /// - A block nobody asked for is not stored when its chain has less work
+    ///   than the tip, when it is more than [`MIN_BLOCKS_TO_KEEP`] above the
+    ///   tip (`fTooFarAhead`), or when its chain has less than
+    ///   [`Self::minimum_chain_work`]. Its header is still indexed, as
+    ///   `AcceptBlock` runs `AcceptBlockHeader` first.
+    ///
+    /// Everything else, including a block whose parent is unknown or that
+    /// the index already holds with its data, goes on to the usual checks.
+    pub fn peer_block_gate(&self, header: &bitcoin::block::Header, requested: bool) -> PeerBlockGate {
+        use crate::storage::blockindex::{add_u256, work_for_bits};
+        let hash = header.block_hash();
+        let existing = self.store.get_block_index(&hash);
+        if existing.as_ref().is_some_and(|e| e.status != BlockStatus::HeaderOnly) {
+            return PeerBlockGate::Process;
+        }
+        let (height, chainwork) = match existing {
+            Some(e) => (e.height, e.chainwork),
+            None => {
+                let Some(parent) = self.store.get_block_index(&header.prev_blockhash) else {
+                    return PeerBlockGate::Process;
+                };
+                let work = add_u256(&parent.chainwork, &work_for_bits(header.bits));
+                if compare_u256(&work, &self.anti_dos_work_threshold()) < 0 {
+                    tracing::debug!(
+                        "AcceptBlockHeader: not adding new block header {hash}, missing anti-dos proof-of-work validation"
+                    );
+                    return PeerBlockGate::TooLittleChainwork;
+                }
+                (parent.height + 1, work)
+            }
+        };
+        if requested {
+            return PeerBlockGate::Process;
+        }
+        let Some(tip) = self.get_block_index(&self.tip_hash()) else {
+            return PeerBlockGate::Process;
+        };
+        if compare_u256(&chainwork, &tip.chainwork) < 0 {
+            return PeerBlockGate::HeaderOnly("less work than the tip");
+        }
+        if height > tip.height.saturating_add(MIN_BLOCKS_TO_KEEP) {
+            return PeerBlockGate::HeaderOnly("too far ahead of the tip");
+        }
+        if compare_u256(&chainwork, &self.minimum_chain_work()) < 0 {
+            return PeerBlockGate::HeaderOnly("below the minimum chain work");
+        }
+        PeerBlockGate::Process
     }
 
     /// Core's `IsAncestorOfBestHeaderOrTip`: whether `hash`, at `height`, is

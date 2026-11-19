@@ -55,6 +55,12 @@ the header chain twice. `getpeerinfo` reports a presync's height as
 `presynced_headers`, and the log shows `Pre-synchronizing blockheaders,
 height: N (~P%)` during IBD. Headers from a `noban` peer skip the check.
 
+The same threshold applies to blocks. A block or `cmpctblock` whose header
+claims less work is ignored, header included. A block the node did not ask
+for is stored only if its chain has at least the tip's work, it is no more
+than 288 blocks above the tip, and its chain has the minimum chain work;
+otherwise only its header is indexed. Both rules are Core's.
+
 If the clock is more than two hours behind the block a presync would start
 from, the node logs `Failure when attempting to initiate headers sync:
 System clock is more than 120 minutes behind chain start MTP` and shuts down
