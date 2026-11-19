@@ -147,3 +147,59 @@ fn a_replacement_pays_relay_for_its_adjusted_size() {
     mp.accept_transaction(enough, &cs, &NoopVerifier, TxSource::Rpc, false).expect("pays its relay");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// The fixed spends behind Core v32.1's golden values: a plain P2WSH
+/// `OP_1` spend, and the heavy script spent from the same funding
+/// transaction.
+const CORE_FUNDING_TXID: &str = "ab907b3945981a9c4b2b8a9e70ef4fa5720f49acdc3c321e0387f6956487cd71";
+const CORE_PLAIN_SPEND: &str = concat!(
+        "0200000000010171cd876495f687031e323cdcac490f72a54fef709e8a2b4b9c1a9845397b90ab0100000000fdffffff",
+        "01c0030d24010000002200204ae81572f06e1b88fd5ced7a1a000945432e83e1551e6f721ee9c00b8cc3326001015100",
+        "000000",
+);
+
+fn core_heavy_spend() -> String {
+    format!(
+        "{}{}{}",
+        concat!(
+            "0200000000010171cd876495f687031e323cdcac490f72a54fef709e8a2b4b9c1a9845397b90ab0000000000fdffffff",
+            "01c0d3f205000000002200204ae81572f06e1b88fd5ced7a1a000945432e83e1551e6f721ee9c00b8cc3326001cb0063",
+            "51",
+        ),
+        "ae".repeat(198),
+        "685100000000",
+    )
+}
+
+/// Core v32.1 regtest (`getmempoolentry`, `testmempoolaccept`): the plain
+/// spend is 96 vbytes all three ways at weight 381; the heavy one is 19705
+/// adjusted and 146 by BIP 141 at weight 583. `vsize` stays the adjusted
+/// size.
+#[test]
+fn mempool_entries_carry_core_v32_1_vsize_bip141_and_vsize_adjusted() {
+    let funding: Txid = CORE_FUNDING_TXID.parse().unwrap();
+    let coin = |script: &[u8], amount: u64| Coin {
+        amount,
+        script_pubkey: ScriptBuf::new_p2wsh(&ScriptBuf::from_bytes(script.to_vec()).wscript_hash()),
+        height: 0,
+        coinbase: false,
+        txseq: node_index::TXSEQ_UNKNOWN,
+    };
+    let coins = vec![
+        (OutPoint { txid: funding, vout: 0 }, coin(&heavy_script(), 100_000_000)),
+        (OutPoint { txid: funding, vout: 1 }, coin(&[0x51], 4_899_900_000)),
+    ];
+    let (cs, mp, dir) = make_funded_template_env_with(&coins, Box::new(NoopVerifier));
+    for (hex, want) in [
+        (CORE_PLAIN_SPEND.to_string(), (96, 96, 96, 381)),
+        (core_heavy_spend(), (19_705, 19_705, 146, 583)),
+    ] {
+        let tx: Transaction = bitcoin::consensus::encode::deserialize_hex(&hex).unwrap();
+        let txid = mp.accept_transaction(tx, &cs, &NoopVerifier, TxSource::Rpc, false).expect("admitted");
+        let e = mp.get_entry_verbose(&txid).expect("resident");
+        let got = (&e["vsize"], &e["vsize_adjusted"], &e["vsize_bip141"], &e["weight"]);
+        let want = (&serde_json::json!(want.0), &serde_json::json!(want.1), &serde_json::json!(want.2), &serde_json::json!(want.3));
+        assert_eq!(got, want, "{e}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
