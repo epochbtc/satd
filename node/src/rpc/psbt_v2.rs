@@ -88,7 +88,7 @@ pub fn decode(raw: &RawPsbt, network: Option<bitcoin::Network>) -> Result<Value,
     if let Some(sp) = global_silent_payments(&raw.global) {
         out["silent_payments"] = sp;
     }
-    out["unknown"] = unknown_json(&raw.global, &known_global_types());
+    crate::rpc::psbt_fields::global_fields(&raw.global, &mut out);
 
     let mut inputs = Vec::with_capacity(raw.inputs.len());
     for input in view.inputs() {
@@ -117,13 +117,6 @@ pub fn decode(raw: &RawPsbt, network: Option<bitcoin::Network>) -> Result<Value,
                 "scriptPubKey": script(utxo.script_pubkey.as_bytes(), true),
             });
         }
-        let sigs: Vec<Value> = input
-            .partial_sigs()
-            .map(|(pk, sig)| json!({ "pubkey": hex::encode(pk), "signature": hex::encode(sig) }))
-            .collect();
-        if !sigs.is_empty() {
-            v["partial_signatures"] = json!(sigs);
-        }
         if let Some(s) = map.get_single(keys::input::REDEEM_SCRIPT) {
             v["redeem_script"] = script(s, false);
         }
@@ -140,9 +133,6 @@ pub fn decode(raw: &RawPsbt, network: Option<bitcoin::Network>) -> Result<Value,
                 Err(_) => json!(hex::encode(wit)),
             };
         }
-        if let Ok(Some(sighash)) = input.sighash_type() {
-            v["sighash"] = json!(sighash);
-        }
         v["has_utxo"] = json!(
             map.contains_type(keys::input::WITNESS_UTXO)
                 || map.contains_type(keys::input::NON_WITNESS_UTXO)
@@ -154,7 +144,7 @@ pub fn decode(raw: &RawPsbt, network: Option<bitcoin::Network>) -> Result<Value,
         if let Some(shares) = shares_json(map, keys::input::SP_ECDH_SHARE, keys::input::SP_DLEQ) {
             v["sp_shares"] = shares;
         }
-        v["unknown"] = unknown_json(map, &known_input_types());
+        crate::rpc::psbt_fields::input_fields(map, &mut v, script_net);
         inputs.push(v);
     }
     out["inputs"] = json!(inputs);
@@ -209,7 +199,7 @@ pub fn decode(raw: &RawPsbt, network: Option<bitcoin::Network>) -> Result<Value,
             }
             v["silent_payment"] = sp;
         }
-        v["unknown"] = unknown_json(map, &known_output_types());
+        crate::rpc::psbt_fields::output_fields(map, &mut v);
         outputs.push(v);
     }
     out["outputs"] = json!(outputs);
@@ -225,11 +215,25 @@ pub fn decode(raw: &RawPsbt, network: Option<bitcoin::Network>) -> Result<Value,
         out["unique_id"] = json!(id.to_string());
     }
 
-    out["fee"] = match fee(&view) {
-        Some(fee) => format_amount(fee.to_sat(), default_unit()),
-        None => Value::Null,
-    };
+    // Core writes `fee` only when it can be known, and signed.
+    if let Some(fee) = decode_fee(&view) {
+        out["fee"] = crate::rpc::amounts::format_signed_amount(fee, default_unit());
+    }
     Ok(out)
+}
+
+/// `decodepsbt`'s `fee`, as Core computes it: every input's previous
+/// output known, amounts within `MoneyRange`, inputs minus outputs.
+fn decode_fee(view: &V2View<'_>) -> Option<i64> {
+    let mut inputs = Vec::new();
+    for input in view.inputs() {
+        inputs.push(input.prevout().ok()??.value);
+    }
+    let mut outputs = Vec::new();
+    for output in view.outputs() {
+        outputs.push(output.amount().ok()?);
+    }
+    psbt::signed_fee(inputs, outputs)
 }
 
 /// The global ECDH shares and their proofs, if any are present.
@@ -268,56 +272,6 @@ fn shares_json(map: &RawMap, share_type: u64, proof_type: u64) -> Option<Value> 
     } else {
         Some(json!(rows))
     }
-}
-
-fn unknown_json(map: &RawMap, known: &[u64]) -> Value {
-    let mut obj = serde_json::Map::new();
-    for pair in map.pairs() {
-        if known.contains(&pair.key_type) {
-            continue;
-        }
-        let mut key = Vec::new();
-        satd_psbt::raw::write_compact_size(&mut key, pair.key_type);
-        key.extend_from_slice(&pair.key_data);
-        obj.insert(hex::encode(&key), json!(hex::encode(&pair.value)));
-    }
-    Value::Object(obj)
-}
-
-fn known_global_types() -> Vec<u64> {
-    vec![
-        keys::global::UNSIGNED_TX,
-        keys::global::XPUB,
-        keys::global::TX_VERSION,
-        keys::global::FALLBACK_LOCKTIME,
-        keys::global::INPUT_COUNT,
-        keys::global::OUTPUT_COUNT,
-        keys::global::TX_MODIFIABLE,
-        keys::global::SP_ECDH_SHARE,
-        keys::global::SP_DLEQ,
-        keys::global::VERSION,
-        keys::global::PROPRIETARY,
-    ]
-}
-
-fn known_input_types() -> Vec<u64> {
-    let mut v: Vec<u64> = (0x00..=0x18).collect();
-    v.extend([
-        keys::input::SP_ECDH_SHARE,
-        keys::input::SP_DLEQ,
-        keys::input::PROPRIETARY,
-    ]);
-    v
-}
-
-fn known_output_types() -> Vec<u64> {
-    let mut v: Vec<u64> = (0x00..=0x07).collect();
-    v.extend([
-        keys::output::SP_V0_INFO,
-        keys::output::SP_V0_LABEL,
-        keys::output::PROPRIETARY,
-    ]);
-    v
 }
 
 /// Inputs minus outputs, when every input's previous output is known.

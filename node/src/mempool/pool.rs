@@ -1801,6 +1801,8 @@ struct AcceptedMember {
     txid: Txid,
     weight: u64,
     vsize: usize,
+    /// The BIP 141 vsize, with no sigop adjustment (`vsize_bip141`).
+    vsize_bip141: u64,
     fee: u64,
     modified_fee: u64,
     admission: Admission,
@@ -1821,6 +1823,7 @@ impl AcceptedMember {
             txid,
             weight,
             vsize: policy::weight_to_vsize(weight) as usize,
+            vsize_bip141: policy::weight_to_vsize(entry.weight as u64),
             fee: entry.fee,
             modified_fee: modified_fee(entry.fee, entry.fee_delta),
             admission,
@@ -4518,6 +4521,18 @@ impl Mempool {
         if let Some(ff) = cache.0.get(txid) {
             return Some(*ff);
         }
+        let g = Self::signed_cluster_graph(inner, txid);
+        let chunks = clusters::chunk_feerates(&g);
+        cache.0.extend(g.txids.iter().copied().zip(chunks.iter().copied()));
+        Some(cache.0[txid])
+    }
+
+    /// The cluster of the acting transaction `txid`: every acting
+    /// transaction it reaches through spends either way, with modified
+    /// fees signed as Core's `GetModifiedFee` is (see
+    /// [`Self::chunk_feerate`]).
+    fn signed_cluster_graph(inner: &MempoolInner, txid: &Txid) -> clusters::Graph {
+        let acting = |t: &Txid| inner.entries.get(t).is_some_and(|e| e.scope.is_acting());
         let mut cluster: HashSet<Txid> = HashSet::from([*txid]);
         let mut queue = vec![*txid];
         let mut buf: Vec<Txid> = Vec::new();
@@ -4531,12 +4546,42 @@ impl Mempool {
                 }
             }
         }
-        let g = Self::cluster_graph_with(inner, cluster.into_iter().collect(), |e| {
+        Self::cluster_graph_with(inner, cluster.into_iter().collect(), |e| {
             signed_modified_fee(e.fee, e.fee_delta)
-        });
-        let chunks = clusters::chunk_feerates(&g);
-        cache.0.extend(g.txids.iter().copied().zip(chunks.iter().copied()));
-        Some(cache.0[txid])
+        })
+    }
+
+    /// Core's `getmempoolcluster`: the cluster of the acting transaction
+    /// `txid` as its chunks, in linearization order, each with its
+    /// transactions and its summed modified fee and sigop-adjusted weight
+    /// ([`clusters::cluster_chunks`]). Fees are signed, as for the chunk
+    /// fields of `getmempoolentry`. `None` if `txid` is not an acting
+    /// entry: a quarantined transaction is as invisible here as in
+    /// `getmempoolentry`.
+    pub fn mempool_cluster(&self, txid: &Txid) -> Option<Vec<(Vec<Txid>, crate::mempool::feefrac::FeeFrac)>> {
+        let inner = self.inner.read();
+        if !inner.entries.get(txid).is_some_and(|e| e.scope.is_acting()) {
+            return None;
+        }
+        let g = Self::signed_cluster_graph(&inner, txid);
+        Some(
+            clusters::cluster_chunks(&g)
+                .into_iter()
+                .map(|(txs, ff)| (txs.into_iter().map(|i| g.txids[i]).collect(), ff))
+                .collect(),
+        )
+    }
+
+    /// Core's `getmempoolfeeratediagram` (`CTxMemPool::GetFeerateDiagram`):
+    /// the cumulative modified fee and sigop-adjusted weight after each
+    /// chunk of the acting mempool, in mining order, from zero
+    /// ([`clusters::feerate_diagram`]). Fees are signed, as Core's are.
+    pub fn feerate_diagram(&self) -> Vec<crate::mempool::feefrac::FeeFrac> {
+        let inner = self.inner.read();
+        let acting: Vec<Txid> =
+            inner.entries.iter().filter(|(_, v)| v.scope.is_acting()).map(|(k, _)| *k).collect();
+        let g = Self::cluster_graph_with(&inner, acting, |e| signed_modified_fee(e.fee, e.fee_delta));
+        clusters::feerate_diagram(&g)
     }
 
     /// Core's trim after a reorg (`UpdateTransactionsFromBlock`, then
@@ -6398,8 +6443,12 @@ impl Mempool {
         if !entry.scope.is_acting() {
             return None;
         }
-        // Core's `GetVirtualTransactionSize`: weight / 4, rounded up.
+        // Core's `GetTxSize`: the sigop-adjusted size, which `vsize` and
+        // `vsize_adjusted` both report (`entryToJSON`, src/rpc/mempool.cpp).
         let vsize = Self::entry_vsize(entry);
+        // Core's `GetVirtualTransactionSize(tx)`: the BIP 141 vsize, weight
+        // / 4 rounded up, with no sigop adjustment.
+        let vsize_bip141 = policy::weight_to_vsize(entry.weight as u64);
         let entry_fee = entry.fee;
         let entry_fee_delta = entry.fee_delta;
         // Signed, as Core's `GetModifiedFee`: a negative delta can take it
@@ -6505,6 +6554,8 @@ impl Mempool {
                 "chunk": signed_amount(chunk.fee),
             },
             "vsize": vsize,
+            "vsize_bip141": vsize_bip141,
+            "vsize_adjusted": vsize,
             "weight": entry_weight,
             "fee": amount(entry_fee),
             "time": entry_time,
@@ -8649,7 +8700,12 @@ impl Mempool {
                     ptx.wtxid.to_string(),
                     json!({
                         "txid": ptx.txid.to_string(),
+                        // Core's `submitpackage`: `vsize` and
+                        // `vsize_adjusted` are the sigop-adjusted size,
+                        // `vsize_bip141` the BIP 141 one.
                         "vsize": m.vsize,
+                        "vsize_adjusted": m.vsize,
+                        "vsize_bip141": m.vsize_bip141,
                         "fees": fees,
                     }),
                 );

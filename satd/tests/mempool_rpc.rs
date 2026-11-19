@@ -267,6 +267,67 @@ fn mempool_entries_carry_their_chunk() {
     node.stop();
 }
 
+/// `getmempoolcluster` and `getmempoolfeeratediagram` over a CPFP pair whose
+/// parent is then prioritised below zero, in Core v32.1's shape
+/// (`clusterToJSON`, `getmempoolfeeratediagram`, src/rpc/mempool.cpp): one
+/// chunk, parent first, its fee the signed sum of modified fees, and the
+/// diagram from zero to that chunk.
+#[test]
+fn the_cluster_rpcs_answer_as_core_does() {
+    let wallet = DeterministicWallet::from_secret([0x5f; 32]);
+    let mut node = funded_node(&[], &wallet);
+    let secp = bitcoin::secp256k1::Secp256k1::new();
+    let (parent_hex, parent, kp, spk) = spend_coinbase_to_taproot(&node, &wallet, 200);
+    let (child_hex, child) = build_signed_p2tr_keypath_spend(
+        &secp,
+        &kp,
+        bitcoin::OutPoint { txid: bitcoin::Txid::from_str(&parent).unwrap(), vout: 0 },
+        spk,
+        50 * 100_000_000 - 200,
+        wallet.address.script_pubkey(),
+        10_000,
+    );
+    node.rpc_ok("sendrawtransaction", vec![json!(parent_hex)]);
+    node.rpc_ok("sendrawtransaction", vec![json!(child_hex)]);
+    let weight = |hex: &str| {
+        let tx: bitcoin::Transaction = bitcoin::consensus::deserialize(&hex::decode(hex).unwrap()).unwrap();
+        tx.weight().to_wu()
+    };
+    let w = weight(&parent_hex) + weight(&child_hex);
+    let cluster = |fee: &str| {
+        json!({
+            "clusterweight": w,
+            "txcount": 2,
+            "chunks": [{ "chunkfee": serde_json::Value::from_str(fee).unwrap(), "chunkweight": w, "txs": [&parent, &child] }],
+        })
+    };
+    for txid in [&parent, &child] {
+        assert_eq!(node.rpc_ok("getmempoolcluster", vec![json!(txid)]), cluster("0.00010200"));
+    }
+    let diagram = node.rpc_ok("getmempoolfeeratediagram", vec![]);
+    let points: Vec<(u64, String)> =
+        diagram.as_array().unwrap().iter().map(|p| (p["weight"].as_u64().unwrap(), p["fee"].to_string())).collect();
+    assert_eq!(points, [(0, "0.00000000".to_string()), (w, "0.00010200".to_string())]);
+
+    node.rpc_ok("prioritisetransaction", vec![json!(parent), json!(0), json!(-20_000)]);
+    assert_eq!(node.rpc_ok("getmempoolcluster", vec![json!(child)]), cluster("-0.00009800"));
+    let diagram = node.rpc_ok("getmempoolfeeratediagram", vec![]);
+    assert_eq!(diagram[1]["fee"].to_string(), "-0.00009800", "{diagram}");
+
+    // Named parameters, and Core's errors.
+    let named = node.rpc_call_with_named_params("getmempoolcluster", json!({ "txid": parent })).unwrap();
+    assert_eq!(named["result"]["txcount"], json!(2), "{named}");
+    assert_eq!(
+        refused(&node, "getmempoolcluster", vec![json!("00".repeat(32))]),
+        (-5, "Transaction not in mempool".to_string())
+    );
+    assert_eq!(
+        refused(&node, "getmempoolcluster", vec![json!("zz")]),
+        (-8, "txid must be of length 64 (not 2, for 'zz')".to_string())
+    );
+    node.stop();
+}
+
 /// A reorg that returns a transaction whose spenders are already in the
 /// mempool joins them into one cluster, and Core trims one past the cluster
 /// limits (`UpdateTransactionsFromBlock`). Here a parent is mined, three
