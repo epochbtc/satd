@@ -749,6 +749,140 @@ mod tests {
         assert!(repair(false).is_ok(), "without the record the same block passes");
     }
 
+    /// The height row of a lost delta may or may not have survived. A row
+    /// that already names the block is tolerated; a row naming any other
+    /// block is refused, and stays as it was.
+    #[test]
+    fn repair_tolerates_a_correct_height_row_and_refuses_a_foreign_one() {
+        let (store, block1, _block2_hash, seeded) = make_holed_store();
+        let block1_hash = block1.block_hash();
+        let repair = |apply| {
+            repair_lost_connect_delta(
+                &store,
+                &block1,
+                &NoopVerifier,
+                Network::Regtest,
+                1,
+                &AddressIndexConfig::default(),
+                apply,
+            )
+        };
+
+        let foreign = BlockHash::from_byte_array([0x77; 32]);
+        let batch = StoreBatch { height_hash_puts: vec![(1, foreign)], ..Default::default() };
+        store.write_batch(batch).unwrap();
+        match repair(true).unwrap_err() {
+            RepairError::SignatureMismatch(msg) => {
+                assert!(msg.contains("refusing to overwrite"), "got: {msg}")
+            }
+            other => panic!("expected SignatureMismatch, got: {other}"),
+        }
+        assert_eq!(store.get_block_hash_by_height(1), Some(foreign));
+        assert!(store.get_coin(&seeded).is_some() && store.get_undo(&block1_hash).is_none(), "nothing written");
+
+        let batch = StoreBatch { height_hash_puts: vec![(1, block1_hash)], ..Default::default() };
+        store.write_batch(batch).unwrap();
+        assert!(repair(true).unwrap().applied);
+        assert!(store.get_undo(&block1_hash).is_some());
+        assert_eq!(store.get_block_hash_by_height(1), Some(block1_hash));
+    }
+
+    /// The repair connects the block against the median of the eleven
+    /// timestamps ending at its parent, not the parent's own time. Here the
+    /// parent's time is below that median, and the block holds a tx whose
+    /// time lock lies between the two: final under the median, non-final
+    /// under the parent's time.
+    #[test]
+    fn repair_uses_the_median_of_eleven_not_the_parent_time() {
+        let store = InMemoryStore::new();
+        let base = 1_700_000_000;
+        // Heights 0..=11, connected. Height 11 (the parent) is stamped at
+        // base + 1800, below the median of heights 1..=11 (base + 3000).
+        let mut prev = BlockHash::all_zeros();
+        let mut parent_hash = prev;
+        for h in 0..=11u32 {
+            let mut block = seal(prev, h, vec![make_coinbase(h, 0)]);
+            if h == 11 {
+                block.header.time = base + 1800;
+            }
+            let hash = block.block_hash();
+            let mut batch = StoreBatch::default();
+            batch.block_index_puts.push((hash, index_entry(&block, h, BlockStatus::Valid)));
+            batch.height_hash_puts.push((h, hash));
+            batch.chain_tx_puts.push((hash, u64::from(h) + 1));
+            batch.tip = Some(hash);
+            store.write_batch(batch).unwrap();
+            parent_hash = hash;
+            prev = hash;
+        }
+
+        let seeded = OutPoint {
+            txid: Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array([0x42; 32])),
+            vout: 0,
+        };
+        let mut batch = StoreBatch::default();
+        batch.coin_puts.push((
+            seeded,
+            Coin {
+                amount: 50_000_000,
+                script_pubkey: bitcoin::ScriptBuf::new(),
+                height: 0,
+                coinbase: false,
+                txseq: node_index::TXSEQ_UNKNOWN,
+            },
+        ));
+        store.write_batch(batch).unwrap();
+
+        // Block 12, whose delta was lost, holds a tx time-locked to
+        // base + 2000 with a non-final sequence.
+        let locked = Transaction {
+            version: Version(2),
+            lock_time: bitcoin::blockdata::locktime::absolute::LockTime::from_consensus(base + 2000),
+            input: vec![TxIn {
+                previous_output: seeded,
+                script_sig: bitcoin::ScriptBuf::new(),
+                sequence: Sequence::ENABLE_LOCKTIME_NO_RBF,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(50_000_000),
+                script_pubkey: bitcoin::ScriptBuf::new(),
+            }],
+        };
+        let block12 = seal(parent_hash, 12, vec![make_coinbase(12, 0), locked]);
+        let block12_hash = block12.block_hash();
+        let mut batch = StoreBatch::default();
+        batch
+            .block_index_puts
+            .push((block12_hash, index_entry(&block12, 12, BlockStatus::DataStored)));
+        store.write_batch(batch).unwrap();
+
+        // Block 13 connected over the hole.
+        let block13 = seal(block12_hash, 13, vec![make_coinbase(13, 0)]);
+        let block13_hash = block13.block_hash();
+        let mut batch = StoreBatch::default();
+        batch
+            .block_index_puts
+            .push((block13_hash, index_entry(&block13, 13, BlockStatus::Valid)));
+        batch.height_hash_puts.push((13, block13_hash));
+        batch.tip = Some(block13_hash);
+        store.write_batch(batch).unwrap();
+
+        let report = repair_lost_connect_delta(
+            &store,
+            &block12,
+            &NoopVerifier,
+            Network::Regtest,
+            1,
+            &AddressIndexConfig::default(),
+            true,
+        )
+        .unwrap();
+        assert!(report.applied);
+        assert!(store.get_coin(&seeded).is_none());
+        assert_eq!(store.get_tip(), Some(block13_hash));
+    }
+
     #[test]
     fn refuses_a_healthy_block() {
         let (store, block1, _block2_hash, _seeded) = make_holed_store();

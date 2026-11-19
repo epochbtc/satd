@@ -334,6 +334,17 @@ mod tests {
         assert!(!a.av_on_best_chain(&hash(5), 4, &hash(3), 2, get));
     }
 
+    /// Core asks whether the block is an ancestor of the best header
+    /// (validation.cpp `m_best_header->GetAncestor(pindex->nHeight)`), which
+    /// holds when the best header is the assumevalid block itself.
+    #[test]
+    fn the_best_header_being_the_assumevalid_block_carries_it() {
+        let idx = fixture();
+        let get = |h: &BlockHash| idx.get(h).cloned();
+        let mut a = AvAncestry::default();
+        assert!(a.av_on_best_chain(&hash(5), 4, &hash(5), 4, get));
+    }
+
     /// A gap in the index answers "not an ancestor" and is not cached: once
     /// the entry is there, the answer is right.
     #[test]

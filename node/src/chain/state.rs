@@ -13379,6 +13379,87 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Rows above the best header, as a heavier-but-shorter switch leaves
+    /// them, are removed by the startup pass, and nothing at or below the
+    /// best header is touched.
+    #[test]
+    fn startup_repair_drops_stale_rows_above_the_best_header() {
+        let (cs, dir) = make_chain_state();
+        let blocks = build_and_connect_chain(&cs, 5);
+        let a6 = build_test_block(blocks[4].block_hash(), 6, 1_400_000_006);
+        cs.accept_header(&a6.header).unwrap();
+        assert_eq!(cs.best_header_hash(), a6.block_hash());
+        let b7 = build_test_block(a6.block_hash(), 7, 1_500_000_007);
+        let b8 = build_test_block(b7.block_hash(), 8, 1_500_000_008);
+        pollute_height_hash(&cs, 7, b7.block_hash());
+        pollute_height_hash(&cs, 8, b8.block_hash());
+
+        assert_eq!(cs.repair_header_rows_above_tip().unwrap(), (0, 2));
+        assert_eq!(cs.get_block_hash_by_height(7), None);
+        assert_eq!(cs.get_block_hash_by_height(8), None);
+        assert_eq!(cs.get_block_hash_by_height(6), Some(a6.block_hash()));
+        for (i, b) in blocks.iter().enumerate() {
+            assert_eq!(cs.get_block_hash_by_height(i as u32 + 1), Some(b.block_hash()));
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A stored block whose height row was lost gets it back when its header
+    /// arrives again, above the tip. At or below the tip the row is left
+    /// alone: a side block stored there must never take the slot.
+    #[test]
+    fn crash_resume_rows_are_written_above_the_tip_only() {
+        let (cs, dir) = make_chain_state();
+        let blocks = build_and_connect_chain(&cs, 3);
+        let tip = blocks[2].block_hash();
+
+        // Block 4, stored but its row lost.
+        let b4 = build_test_block(tip, 4, 1_400_000_004);
+        cs.accept_header(&b4.header).unwrap();
+        cs.store_block(&b4).unwrap();
+        drop_height_hash(&cs, 4);
+        let (_, err) = cs.accept_headers(&[b4.header]);
+        assert!(err.is_none(), "{err:?}");
+        assert_eq!(cs.get_block_hash_by_height(4), Some(b4.block_hash()), "the resume row is restored");
+
+        // Side blocks at the tip's height and below it, stored, with the
+        // rows at those heights gone.
+        let s3 = build_test_block(blocks[1].block_hash(), 3, 1_400_000_103);
+        let s2 = build_test_block(blocks[0].block_hash(), 2, 1_400_000_102);
+        for s in [&s3, &s2] {
+            cs.accept_header(&s.header).unwrap();
+            cs.store_block(s).unwrap();
+        }
+        drop_height_hash(&cs, 3);
+        drop_height_hash(&cs, 2);
+        let (_, err) = cs.accept_headers(&[s3.header, s2.header]);
+        assert!(err.is_none(), "{err:?}");
+        assert_eq!(cs.tip_hash(), tip, "premise: the tip did not move");
+        assert_eq!(cs.get_block_hash_by_height(3), None, "a side block never takes the tip's slot");
+        assert_eq!(cs.get_block_hash_by_height(2), None, "nor a slot below the tip");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A block stored above the tip before its header was ever accepted (a
+    /// crash-resume or out-of-order arrival) gets a height row, so the
+    /// connector finds it.
+    #[test]
+    fn a_stored_block_above_the_tip_without_its_header_gets_a_height_row() {
+        let (cs, dir) = make_chain_state();
+        let blocks = build_and_connect_chain(&cs, 3);
+        let b4 = build_test_block(blocks[2].block_hash(), 4, 1_400_000_004);
+        assert!(cs.get_block_index(&b4.block_hash()).is_none(), "premise: header never accepted");
+        cs.store_block(&b4).unwrap();
+        assert_eq!(cs.get_block_hash_by_height(4), Some(b4.block_hash()));
+        assert_eq!(cs.next_block_to_connect(4), Some(b4.block_hash()));
+        cs.connect_stored_block(&b4.block_hash()).unwrap();
+        assert_eq!(cs.tip_hash(), b4.block_hash());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn store_block_does_not_clobber_active_height_index_with_subtip_fork() {
         // The IBD block-store path (`store_block`) is the second door to the
@@ -16177,6 +16258,10 @@ pub(crate) mod tests {
         assert_eq!(summary.coins_loaded, dump.coins_written);
         assert_eq!(dst.tip_height(), snap_height);
         assert_eq!(dst.tip_hash(), snap_hash);
+        // The tip and the base's height row are durable, not just in
+        // memory: a restart reopens on the snapshot base.
+        assert_eq!(dst.store.get_tip(), Some(snap_hash));
+        assert_eq!(dst.store.get_block_hash_by_height(snap_height), Some(snap_hash));
         assert!(dst.has_background(), "background must be attached after load");
 
         // getchainstates now reports two chainstates: the snapshot
@@ -16296,8 +16381,14 @@ pub(crate) mod tests {
             .expect_err("a hash mismatch must be rejected");
         assert!(matches!(err, ChainError::Snapshot(_)));
 
-        // Rolled back to a fresh genesis chainstate; no background.
+        // Rolled back to a fresh genesis chainstate; no background. The
+        // durable tip is genesis too: clearing the chainstate dropped the
+        // tip row, and the rollback writes it back.
         assert_eq!(dst.tip_height(), 0);
+        assert_eq!(
+            dst.store.get_tip(),
+            Some(bitcoin::constants::genesis_block(Network::Regtest).block_hash())
+        );
         assert!(!dst.has_background());
 
         let _ = std::fs::remove_dir_all(&src_dir);
@@ -17828,6 +17919,30 @@ pub(crate) mod tests {
 
         // And a real active block named at the wrong height.
         assert!(!cs.active_chain_contains(&a1_hash, 0));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The tip's own height is answered from its row; a row above the tip
+    /// (a header not yet connected) is never returned.
+    #[test]
+    fn the_indexed_lookup_answers_at_the_tip_and_never_above_it() {
+        let (cs, dir) = make_chain_state();
+        let genesis_hash = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
+        let a1 = build_test_block(genesis_hash, 1, 1_300_000_001);
+        let a1_hash = cs.accept_block(&a1).expect("accept A1").hash();
+        let a2 = build_test_block(a1_hash, 2, 1_300_000_002);
+        let a2_hash = cs.accept_block(&a2).expect("accept A2").hash();
+        assert_eq!(cs.active_chain_hash_at_height_indexed(2), Some(a2_hash));
+
+        let a3 = build_test_block(a2_hash, 3, 1_300_000_003);
+        cs.accept_header(&a3.header).unwrap();
+        assert_eq!(
+            cs.get_block_hash_by_height(3),
+            Some(a3.block_hash()),
+            "premise: the header wrote a row above the tip"
+        );
+        assert_eq!(cs.active_chain_hash_at_height_indexed(3), None);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -20841,6 +20956,75 @@ pub(crate) mod tests {
             "a preprocessed block that is not its declared hash must be refused, got {result:?}"
         );
         assert_eq!(cs.tip_height(), 5, "the tip must not have moved");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The other two legs of the same check: the block is its declared hash,
+    /// but the entry is another block's, or names another height.
+    #[test]
+    fn connect_preprocessed_rejects_an_entry_that_is_not_its_declared_hash_or_height() {
+        use crate::chain::prefetch::PreprocessedBlock;
+        use std::collections::HashSet;
+
+        let (cs, dir) = make_chain_state();
+        build_and_connect_chain(&cs, 5);
+
+        let next = build_test_block(cs.tip_hash(), 6, 1_300_000_006);
+        cs.accept_header(&next.header).unwrap();
+        cs.store_block(&next).unwrap();
+        let entry = cs.get_block_index(&next.block_hash()).unwrap();
+        let sibling = build_test_block(cs.tip_hash(), 6, 1_300_000_007);
+        cs.accept_header(&sibling.header).unwrap();
+        let sibling_entry = cs.get_block_index(&sibling.block_hash()).unwrap();
+        let mut wrong_height = entry.clone();
+        wrong_height.height = 7;
+
+        for (what, entry) in [("another block's entry", sibling_entry), ("an entry at another height", wrong_height)] {
+            let pre = PreprocessedBlock {
+                height: 6,
+                hash: next.block_hash(),
+                block: next.clone(),
+                entry: entry.clone(),
+                parent: cs.get_block_index(&cs.tip_hash()).unwrap(),
+                flat_pos: crate::storage::flatfile::FlatFilePos {
+                    file_number: entry.file_number,
+                    data_pos: entry.data_pos,
+                },
+                mtp: cs.get_median_time_past(6),
+                txids: Vec::new(),
+                script_verified_txs: HashSet::new(),
+                wtxids: None,
+                script_skip_txs: Default::default(),
+                context_free_checked: false,
+            };
+            let result = cs.connect_preprocessed_block(pre);
+            assert!(matches!(result, Err(ChainError::FlatFile(_))), "{what} must be refused, got {result:?}");
+            assert_eq!(cs.tip_height(), 5, "{what}: the tip must not have moved");
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The connector's fallback scan runs once per `(tip, height)` per
+    /// interval: again at once when either moves, and again for the same
+    /// pair once the interval has passed.
+    #[test]
+    fn connector_scan_is_throttled_per_tip_and_height() {
+        let (cs, dir) = make_chain_state();
+        let t = BlockHash::from_byte_array([1; 32]);
+        let t2 = BlockHash::from_byte_array([2; 32]);
+        assert!(cs.connector_scan_due(t, 5));
+        assert!(!cs.connector_scan_due(t, 5), "throttled for the same tip and height");
+        assert!(cs.connector_scan_due(t2, 5), "the tip moved");
+        assert!(cs.connector_scan_due(t2, 6), "the height moved");
+        assert!(!cs.connector_scan_due(t2, 6));
+        let long_ago = std::time::Instant::now()
+            .checked_sub(ChainState::CONNECTOR_SCAN_INTERVAL + std::time::Duration::from_secs(1))
+            .unwrap();
+        *cs.connector_scan_last.lock() = Some((t2, 6, long_ago));
+        assert!(cs.connector_scan_due(t2, 6), "the interval passed");
+        assert!(!cs.connector_scan_due(t2, 6), "and the throttle is re-armed");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

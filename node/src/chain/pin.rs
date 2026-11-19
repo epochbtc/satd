@@ -222,6 +222,34 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A mutation still in flight when the read finishes is waited out, up
+    /// to [`VIEW_WAIT`]: once it ends as an extension, the answer stands.
+    #[test]
+    fn a_mutation_in_flight_at_the_check_is_waited_out() {
+        let (cs, dir) = make_chain_state();
+        let one = extend(&cs, 1_708_000_600);
+        let runs = Cell::new(0);
+        let got = std::thread::scope(|s| {
+            run_pinned(&cs, None, |pin| {
+                runs.set(runs.get() + 1);
+                let (tx, rx) = std::sync::mpsc::channel();
+                let cs = &cs;
+                s.spawn(move || {
+                    let guard = cs.begin_chain_mutation();
+                    tx.send(()).unwrap();
+                    std::thread::sleep(Duration::from_millis(50));
+                    drop(guard);
+                });
+                rx.recv().unwrap();
+                *pin
+            })
+        });
+        let want = Pin { hash: one, height: 1, mempool: true };
+        assert_eq!(got, Pinned::Answered(want, want));
+        assert_eq!(runs.get(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A chain that retreats under every run is refused once the attempts
     /// run out.
     #[test]
