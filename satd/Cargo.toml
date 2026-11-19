@@ -30,6 +30,12 @@ e2e = []
 # `--features core-block-differential`. The Lint job's `cargo clippy
 # --all-features` still type-checks the harness on every PR.
 core-block-differential = []
+# Marker for the live-Core P2P message decoding differential
+# (`tests/core_p2p_differential.rs`). It runs a regtest bitcoind (copied out of
+# the pinned Core image, or `$BITCOIND`) and replays the shared seed cases from
+# `fuzz/src/p2p_diff.rs` against it. Enabled only by the canary job, on pull
+# requests that touch the P2P decoders.
+core-p2p-differential = []
 
 # Pin the e2e integration test target to its own feature. Combined
 # with the `e2e = []` feature above, this keeps `cargo test --all`
@@ -47,6 +53,12 @@ required-features = ["e2e"]
 name = "core_block_differential"
 path = "tests/core_block_differential.rs"
 required-features = ["core-block-differential"]
+
+# Live-Core P2P decoding differential, gated the same way.
+[[test]]
+name = "core_p2p_differential"
+path = "tests/core_p2p_differential.rs"
+required-features = ["core-p2p-differential"]
 
 [dependencies]
 node = { path = "../node", default-features = false }
@@ -159,6 +171,9 @@ electrum-client = { version = "0.25", default-features = false }
 # up as a deserialize panic in the test, not a silent
 # shape-divergence in production.
 bitcoincore-rpc = "0.19"
+# BIP 324 v2 connection to Core in the P2P decoding differential
+# (tests/core_p2p_differential.rs). Already in the graph through `node`.
+bip324 = "0.10"
 # Third-party Esplora REST client (BDK). Same parity-oracle role
 # for the Esplora surface. `default-features = false` +
 # `features = ["blocking"]` selects the `minreq` blocking

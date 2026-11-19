@@ -1,6 +1,6 @@
 # Nightly run of every self-contained fuzz target in fuzz/ (all of them except
-# block_differential, which needs a live bitcoind and has its own job in
-# core_block_differential_fuzz.yml).
+# block_differential, which needs a live bitcoind and its own Core chain, and
+# has its own job in core_block_differential_fuzz.yml).
 #
 # The target list is not written down here. scripts/fuzz/run-standalone-targets.sh
 # takes it from `cargo fuzz list`, so a target added to fuzz/Cargo.toml is fuzzed
@@ -13,8 +13,14 @@
 # not cached: an ASan build of `node` is several GB, and the repository's
 # 10 GB Actions cache is already close to full with the CI caches.
 #
+# `p2p_differential` (#1135) is one of the targets. It compares satd's P2P
+# message decoding with a live Bitcoin Core: the target copies the pinned
+# CORE_IMAGE's `bitcoind` out with Docker and runs it on regtest, nothing more.
+#
 # A failure notifies through a GitHub issue, in the same three classes as the
-# block-differential job:
+# block-differential job, plus one of its own:
+#   (d) a `p2p_differential` divergence report
+#       (fuzz/artifacts/p2p_differential/divergence-*.txt) -> `p2p-decode-divergence`
 #   (a) a crash, timeout or OOM input under fuzz/artifacts/ -> `fuzz-crash`
 #   (b) the fuzz step failed or was cancelled without one (a build break, a
 #       target that ran no inputs, the job timeout)          -> `fuzz-targets-broken`
@@ -161,7 +167,46 @@ jobs:
             fi
           }
 
-          repros=$(find fuzz/artifacts -type f 2>/dev/null | sort || true)
+          filed=0
+
+          # (d) satd and Core decoded a P2P message differently. The report
+          # sits beside libFuzzer's reproducer of the same input; both are in
+          # the artifact.
+          divergences=$(find fuzz/artifacts/p2p_differential -name 'divergence-*.txt' 2>/dev/null | sort || true)
+          if [ -n "$divergences" ]; then
+            reports=$(for f in $divergences; do echo; echo '```'; head -c 4000 "$f"; echo '```'; done)
+            body=$(cat <<EOF
+          The **nightly P2P decoding differential** found a message satd and
+          Bitcoin Core decode differently (#1135).
+
+          - Run: $RUN_URL
+          - Commit: \`$COMMIT_SHA\`
+          - Reproducer(s) in the \`fuzz-targets-artifacts\` artifact, under
+            \`p2p_differential/\`.
+
+          $reports
+
+          Reproduce with \`BITCOIND=<bitcoind of the pinned CORE_IMAGE> cargo
+          +<pinned nightly> fuzz run p2p_differential <file>\`. Fix the decoder,
+          not the comparison; a difference satd keeps on purpose goes in
+          \`ALLOWED\` in \`fuzz/src/p2p_diff.rs\` with its reason. Close this
+          issue once resolved.
+          EOF
+            )
+            notify p2p-decode-divergence B60205 \
+              "satd and Bitcoin Core decode a P2P message differently" \
+              "P2P decoding divergence from Bitcoin Core ($today)" \
+              "$body" \
+              "Another P2P decoding divergence on $today: $RUN_URL"
+            filed=1
+          fi
+
+          # The divergence's own reproducer is not filed again as a crash.
+          if [ -n "$divergences" ]; then
+            repros=$(find fuzz/artifacts -type f ! -path 'fuzz/artifacts/p2p_differential/*' 2>/dev/null | sort || true)
+          else
+            repros=$(find fuzz/artifacts -type f 2>/dev/null | sort || true)
+          fi
 
           # (a) a reproducer exists: a real finding.
           if [ -n "$repros" ]; then
@@ -186,6 +231,9 @@ jobs:
               "Fuzz crash in a nightly target ($today)" \
               "$body" \
               "Another fuzz finding on $today: $RUN_URL"
+            exit 0
+          fi
+          if [ "$filed" = 1 ]; then
             exit 0
           fi
 

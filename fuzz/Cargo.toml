@@ -37,6 +37,9 @@ satd-auth = { path = "../satd-auth" }
 # PSBT raw codec: parses attacker-controlled bytes on a read-capability RPC
 # method, and carries a byte-identity property the vectors alone cannot cover.
 satd-psbt = { path = "../satd-psbt" }
+# BIP 324 transport for the P2P decoding differential's v2 connection to
+# Core; the version `node` resolves.
+bip324 = "=0.10.0"
 
 [[bin]]
 name = "block_differential"
@@ -83,6 +86,13 @@ bench = false
 [[bin]]
 name = "nap_p2p_decode"
 path = "fuzz_targets/nap_p2p_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "p2p_differential"
+path = "fuzz_targets/p2p_differential.rs"
 test = false
 doc = false
 bench = false

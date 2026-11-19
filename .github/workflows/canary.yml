@@ -179,6 +179,7 @@ jobs:
     timeout-minutes: 5
     outputs:
       code: ${{ steps.detect.outputs.code }}
+      p2p_decode: ${{ steps.detect.outputs.p2p_decode }}
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -194,10 +195,18 @@ jobs:
           if [ -z "${BASE_SHA:-}" ]; then
             echo "no PR base SHA (schedule/dispatch) — running full fleet"
             echo "code=true" >> "$GITHUB_OUTPUT"
+            echo "p2p_decode=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           changed="$(git diff --name-only "$BASE_SHA" "$HEAD_SHA")"
           echo "Changed files:"; printf '%s\n' "$changed"
+          # `p2p_decode` = the P2P message decoders, or the differential that
+          # replays them against Core, changed: run that replay.
+          if printf '%s\n' "$changed" | grep -qE '^node/src/net/(payload|addrv2|v2transport)\.rs$|^fuzz/src/p2p_diff\.rs$|^fuzz/seeds/p2p_differential/|^satd/tests/core_p2p_differential\.rs$'; then
+            echo "p2p_decode=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "p2p_decode=false" >> "$GITHUB_OUTPUT"
+          fi
           if [ -z "$changed" ]; then
             echo "code=false" >> "$GITHUB_OUTPUT"
             echo "result: no changed files -> skip"
@@ -668,11 +677,21 @@ jobs:
           . scripts/canary/PINS
           for i in 1 2 3; do docker pull "$CORE_IMAGE" && break || sleep $((i * 2)); done
 
+      # Both features on both steps, so the satd crate is compiled once for
+      # the two test targets (and matches ci.yml's seed-canary-cache build).
       - name: Run block-acceptance differential
         env:
           # Absorb hosted-runner load on satd startup, as ci.yml does.
           SATD_TEST_TIMEOUT_MULT: '2'
-        run: cargo test -p satd --test core_block_differential --features core-block-differential -- --nocapture
+        run: cargo test -p satd --test core_block_differential --features core-block-differential,core-p2p-differential -- --nocapture
+
+      # P2P message decoding differential (#1135): replays the fuzz target's
+      # seed cases against a regtest bitcoind copied out of CORE_IMAGE (pulled
+      # above). Only when the decoders or the differential changed; the
+      # nightly fuzz-targets job fuzzes them every night.
+      - name: Run P2P decoding differential (seed replay)
+        if: needs.changes.outputs.p2p_decode == 'true'
+        run: cargo test -p satd --test core_p2p_differential --features core-block-differential,core-p2p-differential -- --nocapture
 
       # A pull request's cache is visible to that pull request alone, and at
       # ~1.4 GB a target directory it pushed the repository past its 10 GB
