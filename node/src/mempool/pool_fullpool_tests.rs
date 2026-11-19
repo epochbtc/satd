@@ -175,6 +175,37 @@ fn a_child_keeps_its_parent_in_a_full_pool() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The same a generation further up: every ancestor is kept, not only the
+/// direct parent. Evicting the grandparent took the parent with it and left
+/// the child spending an output nothing provides.
+#[test]
+fn a_grandchild_keeps_its_grandparent_in_a_full_pool() {
+    let (cs, mp, dir) = env(&[1, 2, 3]);
+    let grandparent = admit(&mp, &cs, spend(&[prev(1)], COIN_VALUE, 100, 1, 1));
+    let parent = admit(
+        &mp,
+        &cs,
+        spend(&[OutPoint { txid: grandparent, vout: 0 }], COIN_VALUE - 100, 100, 1, 5),
+    );
+    let second = admit(&mp, &cs, spend(&[prev(2)], COIN_VALUE, 200, 1, 2));
+    let third = admit(&mp, &cs, spend(&[prev(3)], COIN_VALUE, 300, 1, 3));
+    set_max(&mp, mp.acting_bytes());
+
+    let child = admit(
+        &mp,
+        &cs,
+        spend(&[OutPoint { txid: parent, vout: 0 }], COIN_VALUE - 200, 10_000, 1, 4),
+    );
+    let now = pool(&mp);
+    assert!(now.contains(&grandparent), "the child's grandparent was evicted to make room for it");
+    assert!(now.contains(&parent));
+    assert!(!now.contains(&second), "the cheapest entry that is not an ancestor makes the room");
+    assert!(now.contains(&third));
+    assert!(now.contains(&child));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A child that outbids only its own parent has nothing it may evict, so it
 /// is refused and the pool is unchanged. (Core trims the parent and the child
 /// together as the worst-paying chunk and answers "mempool full".)

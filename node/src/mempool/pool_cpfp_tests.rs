@@ -229,6 +229,71 @@ fn a_package_trims_the_pool_once_it_is_all_in() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The same for parents below the floor, which go in on their child's fee:
+/// they too wait for the one trim after the package rather than each making
+/// room on its own, which a parent paying nothing could never do.
+#[test]
+fn a_child_pays_for_a_below_floor_parent_into_a_full_pool() {
+    let (cs, mp, dir) = floor_env(&[1, 2, 3, 4, 5, 6, 7, 8]);
+    let residents: Vec<Txid> = [3, 4, 5, 6, 7, 8]
+        .iter()
+        .map(|t| admit(&mp, &cs, spend(&[prev(*t)], COIN_VALUE, 500, 1, *t)))
+        .collect();
+    set_max(&mp, mp.acting_bytes());
+    let first = spend(&[prev(1)], COIN_VALUE, 0, 1, 1);
+    let second = spend(&[prev(2)], COIN_VALUE, 0, 1, 2);
+    let child = spend(
+        &[out(first.compute_txid(), 0), out(second.compute_txid(), 0)],
+        2 * COIN_VALUE,
+        20_000,
+        1,
+        9,
+    );
+
+    let r = submit(&mp, &cs, &[&first, &second, &child]);
+
+    assert_eq!(r.package_msg, "success", "{:?}", r.tx_results);
+    let now = pool(&mp);
+    for tx in [&first, &second, &child] {
+        assert!(now.contains(&tx.compute_txid()), "{:?}", r.tx_results);
+    }
+    assert!(residents.iter().any(|t| !now.contains(t)), "nothing was trimmed");
+    assert!(mp.acting_bytes() <= mp.config.read().max_size_bytes, "the pool was left over its limit");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A subpackage's `effective-includes` lists the members judged together
+/// and no others: a member of the same package accepted on its own feerate
+/// is not in it.
+#[test]
+fn a_subpackage_lists_only_its_own_wtxids() {
+    let (cs, mp, dir) = floor_env(&[1, 2]);
+    let paid = spend(&[prev(1)], COIN_VALUE, 1_000, 1, 1);
+    let unpaid = spend(&[prev(2)], COIN_VALUE, 0, 1, 2);
+    let child = spend(
+        &[out(paid.compute_txid(), 0), out(unpaid.compute_txid(), 0)],
+        2 * COIN_VALUE - 1_000,
+        5_000,
+        1,
+        3,
+    );
+
+    let r = submit(&mp, &cs, &[&paid, &unpaid, &child]);
+
+    assert_eq!(r.package_msg, "success", "{:?}", r.tx_results);
+    let together = serde_json::json!([unpaid.compute_wtxid().to_string(), child.compute_wtxid().to_string()]);
+    for tx in [&unpaid, &child] {
+        assert_eq!(result(&r, tx)["fees"]["effective-includes"], together, "{:?}", r.tx_results);
+    }
+    assert_eq!(
+        result(&r, &paid)["fees"]["effective-includes"],
+        serde_json::json!([paid.compute_wtxid().to_string()])
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A package that gets in but ranks below everything else is what the trim
 /// takes, and each of its members is reported as `mempool full` (Core's
 /// `LimitMempoolSize` after `AcceptPackage`). Its members were announced, so

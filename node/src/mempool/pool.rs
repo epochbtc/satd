@@ -11897,6 +11897,7 @@ mod tests {
         // script, and `None` when the gate is cold. Same CPFP admission harness
         // as `mempool_entry_retains_prevout_meta_by_level`, but with an
         // SP-eligible child: a taproot key-path spend into a taproot output.
+        // The `mempool_tweaks` firehose gate alone caches the tweak too.
         use bitcoin::blockdata::locktime::absolute::LockTime;
         use bitcoin::hashes::Hash;
         use bitcoin::secp256k1::{Secp256k1, SecretKey};
@@ -11914,7 +11915,9 @@ mod tests {
         };
         const PREVOUT_VALUE: u64 = 10_000;
 
-        for hot in [false, true] {
+        // (silent-payment gate hot, `mempool_tweaks` gate hot)
+        for (sp_hot, tweaks_hot) in [(false, false), (true, false), (false, true)] {
+            let hot = sp_hot || tweaks_hot;
             let (cs, _mp, dir) = make_test_env();
             let mp = Mempool::with_config(MempoolConfig {
                 max_size_bytes: 1_000_000,
@@ -11922,9 +11925,13 @@ mod tests {
                 prevout_meta: PrevoutMetaLevel::Hash, // no scripts on its own
                 ..Default::default()
             });
-            if hot {
+            if sp_hot {
                 let gate = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(1));
                 mp.set_sp_gate(gate);
+            }
+            if tweaks_hot {
+                let gate = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(1));
+                mp.set_mempool_tweaks_gate(gate);
             }
 
             let parent_tx = Transaction {
@@ -13710,6 +13717,79 @@ mod tests {
     }
 
     #[test]
+    fn reapply_propagates_a_relay_hold_infectiously() {
+        // The same as the template case, for the other path: a child of a
+        // relay-held parent may not be relayed either, and is attributed to
+        // the infectious marker since no rule matched it directly.
+        let op = outpoint(0xc5);
+        let (cs, mp, dir) = make_funded_env(&[(op, coin(200_000))]);
+        let parent = spend(op, 150_000, 0x33);
+        let parent_txid = parent.compute_txid();
+        let child = spend(OutPoint { txid: parent_txid, vout: 0 }, 100_000, 0x44);
+        let child_txid = child.compute_txid();
+
+        mp.accept_transaction(parent, &cs, &NoopVerifier, TxSource::P2p, false)
+            .expect("parent admitted");
+        mp.accept_transaction(child, &cs, &NoopVerifier, TxSource::P2p, false)
+            .expect("child admitted");
+
+        set_ruleset(
+            &mp,
+            "version 1\nquarantine big on relay when any outputs (out.value == 150000)",
+        );
+        mp.reapply_policy(&cs);
+
+        let pscope = scope_of(&mp, &parent_txid);
+        assert!(pscope.relay && !pscope.template, "parent held on relay");
+        let cscope = scope_of(&mp, &child_txid);
+        assert!(cscope.relay, "child inherits the parent's relay hold (infectious, §3/§7)");
+        assert_eq!(
+            mp.inner.read().entries[&child_txid].quarantine_rule.as_deref(),
+            Some(INFECTIOUS_RULE)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reapply_evicts_only_the_quarantine_overflow() {
+        // §8 for the quarantine class: a reload that moves more into
+        // quarantine than its budget holds evicts the overflow, lowest fee
+        // first, and keeps the rest held.
+        let ops = [outpoint(0xd5), outpoint(0xd6), outpoint(0xd7)];
+        let (cs, mp, dir) = make_funded_env(&ops.map(|op| (op, coin(100_000))));
+        // Fees 100, 200 and 300; all 1-in/1-out, so the same size.
+        let txs: Vec<Transaction> =
+            ops.iter().zip([100u64, 200, 300]).map(|(op, fee)| spend(*op, 100_000 - fee, 0x33)).collect();
+        let l = bitcoin::consensus::serialize(&txs[0]).len();
+        assert!(txs.iter().all(|t| bitcoin::consensus::serialize(t).len() == l));
+        let ids: Vec<Txid> = txs
+            .iter()
+            .map(|t| {
+                mp.accept_transaction(t.clone(), &cs, &NoopVerifier, TxSource::P2p, false)
+                    .expect("admitted to acting")
+            })
+            .collect();
+
+        // Room for two and a half of them in quarantine.
+        mp.reload_policy(MempoolConfig {
+            max_size_bytes: 1_000_000,
+            min_fee_rate: 0,
+            dust_relay_fee: 3_000,
+            quarantine_max_bytes: 2 * l + l / 2,
+            ..Default::default()
+        });
+        set_ruleset(&mp, "version 1\nquarantine catch when tx.version == 2");
+        let t = mp.reapply_policy(&cs);
+
+        assert_eq!(t.evicted, vec![ids[0]], "only the lowest-fee overflow goes");
+        for txid in &ids[1..] {
+            assert!(scope_of(&mp, txid).is_quarantined(), "the rest stay, held");
+        }
+        assert_eq!(mp.quarantine_bytes(), 2 * l);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn reload_policy_file_detects_noop_vs_change() {
         let mp = Mempool::new(1_000_000, 0);
         let path = std::env::temp_dir().join(format!(
@@ -14976,6 +15056,64 @@ mod tests {
         assert_eq!(msg, "success", "package rejected: {results:?}");
         assert!(in_pool(&mp, &parent_txid), "the ephemeral dust parent was not accepted");
         assert!(in_pool(&mp, &child_txid), "the child was not accepted");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The child only has to sweep the dust. One that spends nothing else of
+    /// the parent, and funds itself from a coin of its own, keeps its parent:
+    /// unwinding it would leave the accepted child spending an output nothing
+    /// provides.
+    #[test]
+    fn a_child_sweeping_only_the_dust_keeps_its_parent() {
+        let op = outpoint(0xCA);
+        let funding = outpoint(0xCB);
+        let (cs, mp, dir) = make_package_env(&[(op, coin(50_000)), (funding, coin(50_000))]);
+        let dust = p2wpkh_dust_threshold() - 1;
+
+        let parent = tx_from(&[op], &[(dust, 0x50), (50_000 - dust, 0x51)]);
+        let parent_txid = parent.compute_txid();
+        // Output 0 is the dust; output 1 is left for later.
+        let child = tx_from(
+            &[OutPoint { txid: parent_txid, vout: 0 }, funding],
+            &[(dust + 50_000 - 2_000, 0x52)],
+        );
+        let child_txid = child.compute_txid();
+
+        let (msg, results) =
+            mp.accept_package(vec![parent.clone(), child.clone()], &cs, &NoopVerifier);
+
+        assert_eq!(msg, "success", "package rejected: {results:?}");
+        assert!(in_pool(&mp, &parent_txid), "the parent was unwound: {results:?}");
+        assert!(in_pool(&mp, &child_txid), "the child was not accepted: {results:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A dust parent that is already confirmed has no dust left to strand.
+    /// Resubmitted with a child that spends only its ordinary output, the
+    /// parent cannot enter (its input is spent), and the child, accepted on
+    /// its own, is not refused for the dust. In Core the parent fails
+    /// `PreChecks` (`txn-already-known`), so `CheckEphemeralSpends` never
+    /// judges the child. Only the child's outcome is pinned here: satd's
+    /// package-level answer for the parent differs from Core's.
+    #[test]
+    fn an_accepted_child_of_a_confirmed_dust_parent_is_not_refused() {
+        let op = outpoint(0xCC);
+        let dust = p2wpkh_dust_threshold() - 1;
+        let parent = tx_from(&[op], &[(dust, 0x50), (50_000 - dust, 0x51)]);
+        let parent_txid = parent.compute_txid();
+        let (dust_out, rest_out) =
+            (OutPoint { txid: parent_txid, vout: 0 }, OutPoint { txid: parent_txid, vout: 1 });
+        // Mined: its outputs are coins, and the coin it spent is gone.
+        let (cs, mp, dir) = make_package_env(&[(dust_out, coin(dust)), (rest_out, coin(50_000 - dust))]);
+        let child = tx_from(&[rest_out], &[(40_000, 0x55)]);
+        let child_txid = child.compute_txid();
+
+        let (_msg, results) =
+            mp.accept_package(vec![parent.clone(), child.clone()], &cs, &NoopVerifier);
+
+        assert!(in_pool(&mp, &child_txid), "the child was not accepted: {results:?}");
+        assert!(!in_pool(&mp, &parent_txid), "a confirmed parent entered the mempool");
+        assert_eq!(err_of(&results, &child), "<no error reported>", "{results:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
