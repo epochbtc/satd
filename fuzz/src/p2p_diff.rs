@@ -1005,58 +1005,47 @@ impl CoreOracle {
             .and_then(|()| peer.send(NetworkMessage::Version(our_version(probe_nonce, PROBE_USER_AGENT))));
         let mut lines = Vec::new();
         let deadline = Instant::now() + Duration::from_secs(10);
-        let probe = format!("receive version message: {PROBE_USER_AGENT}: ");
-        let done = |lines: &[String]| {
-            lines.iter().any(|l| {
-                l.contains("redundant version message")
-                    || l.contains(&probe)
-                    || l.contains("peer using obsolete version")
-                    || l.contains("connected to self")
-            })
-        };
         let mut closed = false;
         while sent.is_ok() && Instant::now() < deadline {
             lines.extend(self.read_log());
-            if done(&lines) {
-                break;
-            }
-            if closed {
-                // Core closed the connection and has logged all it will.
+            if version_settled(&lines) || closed {
+                // Settled, or Core closed the connection and has logged all
+                // it will.
                 break;
             }
             closed = peer.closed_by_core();
             std::thread::sleep(Duration::from_millis(1));
         }
         lines.extend(self.read_log());
+        drop(peer);
         if let Err(e) = sent {
             return Ok(CoreVerdict::Unobservable(format!("send failed: {e}")));
         }
-        if !done(&lines) {
-            if let Some(v) = classify_drop(&lines) {
-                return Ok(v);
-            }
-            return Ok(CoreVerdict::Unobservable(if closed {
-                "Core closed the connection after the version".into()
-            } else {
-                "no version verdict within 10 s".into()
-            }));
-        }
-        if lines.iter().any(|l| l.contains("peer using obsolete version") || l.contains("connected to self")) {
+        let messages: Vec<&str> = lines.iter().map(|l| core_message(l)).collect();
+        if messages.iter().any(|m| m.starts_with("peer using obsolete version") || m.starts_with("connected to self")) {
             return Ok(CoreVerdict::Unobservable("version refused by policy before its read completed".into()));
         }
-        if lines.iter().any(|l| l.contains("redundant version message")) {
-            let Some(line) = lines.iter().find(|l| l.contains("receive version message: ") && !l.contains(&probe)) else {
+        // Core reads the fuzzed version before the probe, so when the probe
+        // is redundant the first version Core logged is the fuzzed one.
+        // Lines are matched at their start: the user agent is the peer's
+        // text and can contain any of these markers.
+        if messages.iter().any(|m| m.starts_with("redundant version message")) {
+            let Some(line) = messages.iter().find(|m| m.starts_with("receive version message: ")) else {
                 return Ok(CoreVerdict::Unobservable("accepted version not logged".into()));
             };
             let Some(mut fields) = parse_version_line(line) else {
                 return Err(format!("could not parse Core's version line: {line}"));
             };
             fields.services = self.peer_services(local_port);
-            drop(peer);
             return Ok(CoreVerdict::Accept(Observed { version: Some(fields), ..Observed::default() }));
         }
-        drop(peer);
-        Ok(classify_drop(&lines).unwrap_or_else(|| CoreVerdict::Unobservable("version neither read nor refused".into())))
+        Ok(classify_drop(&lines).unwrap_or_else(|| {
+            CoreVerdict::Unobservable(if closed {
+                "Core closed the connection after the version".into()
+            } else {
+                "version neither read nor refused".into()
+            })
+        }))
     }
 
     fn peer_services(&self, local_port: u16) -> Option<u64> {
@@ -1087,10 +1076,42 @@ impl Drop for CoreOracle {
     }
 }
 
+/// A log line without Core's `[category] ` prefix (`LogDebug` lines carry
+/// one; `LogInfo` lines do not). The start of what is left is Core's own text.
+fn core_message(line: &str) -> &str {
+    if line.starts_with('[')
+        && let Some(i) = line.find("] ")
+    {
+        return &line[i + 2..];
+    }
+    line
+}
+
+/// Core has finished with the fuzzed `version`: the probe after it was
+/// redundant (the fuzzed one was read), Core stopped on a policy check, or
+/// the fuzzed one was dropped and the probe was read after it.
+fn version_settled(lines: &[String]) -> bool {
+    let mut dropped = false;
+    for l in lines {
+        let m = core_message(l);
+        if m.starts_with("redundant version message")
+            || m.starts_with("peer using obsolete version")
+            || m.starts_with("connected to self")
+        {
+            return true;
+        }
+        if classify_drop(std::slice::from_ref(l)).is_some() {
+            dropped = true;
+        } else if dropped && m.starts_with("receive version message: ") {
+            return true;
+        }
+    }
+    false
+}
+
 /// Parse `receive version message: <ua>: version V, blocks=H, us=A, txrelay=R, peer=N`.
 fn parse_version_line(line: &str) -> Option<VersionFields> {
-    let start = line.find("receive version message: ")? + "receive version message: ".len();
-    let rest = &line[start..];
+    let rest = core_message(line).strip_prefix("receive version message: ")?;
     let split = rest.rfind(": version ")?;
     let user_agent = rest[..split].to_string();
     let mut version = None;
@@ -1118,16 +1139,17 @@ fn number_after(line: &str, prefix: &str) -> Option<usize> {
 /// Core dropped the message: before any handler, or in its read.
 fn classify_drop(lines: &[String]) -> Option<CoreVerdict> {
     for l in lines {
-        if l.contains("Header error: Wrong checksum")
-            || l.contains("Header error: Invalid message type")
-            || l.contains("V2 transport error: invalid message type")
+        let m = core_message(l);
+        if m.starts_with("Header error: Wrong checksum")
+            || m.starts_with("Header error: Invalid message type")
+            || m.starts_with("V2 transport error: invalid message type")
         {
             return Some(CoreVerdict::Ignore(l.clone()));
         }
-        if l.contains("ProcessMessages(") && l.contains("): Exception '") {
+        if m.starts_with("ProcessMessages(") && m.contains("): Exception '") {
             return Some(CoreVerdict::Reject(l.clone()));
         }
-        if l.contains("Unknown message type") {
+        if m.starts_with("Unknown message type") {
             return Some(CoreVerdict::Ignore(l.clone()));
         }
     }
@@ -1157,7 +1179,7 @@ fn classify(case: &Case, lines: &[String], sync_error: Option<String>) -> CoreVe
         return CoreVerdict::Unobservable(format!("{name}: policy stop before the read ({stop})"));
     }
     let reached = format!("received: {name} (");
-    if !lines.iter().any(|l| l.contains(&reached)) {
+    if !lines.iter().any(|l| core_message(l).starts_with(&reached)) {
         return CoreVerdict::Unobservable(match sync_error {
             Some(e) => format!("{name}: connection lost: {e}"),
             None => format!("{name}: handler not entered"),
