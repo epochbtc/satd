@@ -3975,12 +3975,17 @@ pub async fn start(
                 None::<()>,
             ));
         }
+        let before = crate::time::now_secs();
         // Core spells "stop mocking" as timestamp 0.
         crate::time::set_mock_time(if timestamp == 0 {
             None
         } else {
             Some(timestamp as u64)
         });
+        // Core's `SendMessages` sees the new time on its next pass, within
+        // milliseconds; the P2P manager's timers (header-download, chain-sync)
+        // would otherwise wait for its next tick.
+        ctx.peer_manager.clock_moved(crate::time::now_secs().saturating_sub(before));
         Ok::<_, ErrorObjectOwned>(serde_json::Value::Null)
     })?;
 

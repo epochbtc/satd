@@ -700,9 +700,7 @@ note = "measured 2026-10-01: wtxid relay landed (#714), so a MSG_WTX inv is now 
 
 [[test]]
 file = "p2p_initial_headers_sync.py"
-status = "skip"
-reason = "feature-missing"
-note = "measured 2026-09-15: L94 getheaders goes to a second peer during initial headers sync where Core sends to exactly one. Follow-up: Core's single-peer initial headers sync"
+status = "run"
 
 [[test]]
 file = "p2p_invalid_block.py"
@@ -776,9 +774,7 @@ note = "measured 2026-10-20 with the announcement trickle: past L173; L295 test_
 
 [[test]]
 file = "p2p_outbound_eviction.py"
-status = "skip"
-reason = "feature-missing"
-note = "measured 2026-09-15: L52 no getheaders probe to a stale outbound peer. Follow-up: Core's CHAIN_SYNC_TIMEOUT outbound eviction"
+status = "run"
 
 [[test]]
 file = "p2p_permissions.py"
@@ -830,7 +826,7 @@ note = "measured 2026-09-16 with message ordering behind ping in place: past L32
 file = "p2p_sendheaders.py"
 status = "skip"
 reason = "feature-missing"
-note = "re-measured 2026-11-18 with PeerHasHeader announcements (#1299) on top of the null-locator check (#1298): test_null_locators passes, and Part 2 rounds 2.0.0 and 2.0.1 pass L361 (no announcement back to the inv node). The test now stops at L340 in Part 2.1.0: test_node holds a getheaders that satd sent it after round 2.0.0, where Core sends only the one getheaders the test waits for. Follow-up: find what sends that getheaders. Earlier: re-measured 2026-11-17 with #1298: stops at L361, the block the inv node relayed announced back to it. re-measured 2026-11-16 with the getheaders wait-for-response rule (#1262): still L258 (test_null_locators), a getheaders with a null locator whose hashStop satd holds only as a header is answered; with that subtest skipped, the next stop is L361, where the block the inv node relayed is announced back to it (inv/headers in its last_message). The getheaders pacing parts of Part 5 are not reached. Earlier: re-measured 2026-09-28: L252, a getheaders with a null locator whose hashStop satd holds only as a header is answered with headers 1..tip; Core answers nothing for a block it may not serve (BlockRequestAllowed). Measured 2026-09-15 at L334, an unexpected getheaders after a block inv; behind both: inv->getheaders-not-getdata and per-peer announcement state. Follow-up: Core's header announcement state machine"
+note = "re-measured 2026-11-19 with no getheaders on a timer (#1122): gets past L340 (the stray getheaders was the 10 s poll) and now stops at L389 in Part 2, check_last_inv_announcement: a block inv the test expects is not announced. Follow-up: Core's header announcement state machine. Earlier: re-measured 2026-11-18 with PeerHasHeader announcements (#1299) on top of the null-locator check (#1298): test_null_locators passes, and Part 2 rounds 2.0.0 and 2.0.1 pass L361 (no announcement back to the inv node). The test now stops at L340 in Part 2.1.0: test_node holds a getheaders that satd sent it after round 2.0.0, where Core sends only the one getheaders the test waits for. Follow-up: find what sends that getheaders. Earlier: re-measured 2026-11-17 with #1298: stops at L361, the block the inv node relayed announced back to it. re-measured 2026-11-16 with the getheaders wait-for-response rule (#1262): still L258 (test_null_locators), a getheaders with a null locator whose hashStop satd holds only as a header is answered; with that subtest skipped, the next stop is L361, where the block the inv node relayed is announced back to it (inv/headers in its last_message). The getheaders pacing parts of Part 5 are not reached. Earlier: re-measured 2026-09-28: L252, a getheaders with a null locator whose hashStop satd holds only as a header is answered with headers 1..tip; Core answers nothing for a block it may not serve (BlockRequestAllowed). Measured 2026-09-15 at L334, an unexpected getheaders after a block inv; behind both: inv->getheaders-not-getdata and per-peer announcement state. Follow-up: Core's header announcement state machine"
 
 [[test]]
 file = "p2p_sendtxrcncl.py"

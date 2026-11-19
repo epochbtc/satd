@@ -232,32 +232,6 @@ fn a_full_batch_asks_only_its_own_peer_for_more() {
     }
 }
 
-/// The periodic IBD header probe goes out only once the header tip has stood
-/// still for `HEADER_PROBE_STALL`, and at most once per that interval. While
-/// a request chain advances the tip, or a slow peer's answer is still on its
-/// way, a probe would only start a second chain fetching the same headers
-/// (#1229).
-#[test]
-fn the_periodic_header_probe_waits_for_a_stall() {
-    let (pm, _dir) = mk_pm();
-    let chain = header_chain(2000, 1_500_000_000);
-    let _rx = add_peer(&pm, 1);
-    let t0 = Instant::now();
-    let at = |secs: u64| t0 + Duration::from_secs(secs);
-
-    assert!(!pm.ibd_header_probe_due_at(at(0)), "the first check records the tip");
-    assert!(!pm.ibd_header_probe_due_at(at(2)), "a tip still for 2 s may be a request in flight");
-    assert!(!pm.ibd_header_probe_due_at(at(9)), "still under the stall time");
-    assert!(pm.ibd_header_probe_due_at(at(10)), "still for the stall time: a stall");
-    assert!(!pm.ibd_header_probe_due_at(at(12)), "one probe per interval, however long the stall");
-    assert!(pm.ibd_header_probe_due_at(at(20)), "the next interval");
-
-    pm.handle_headers(1, chain[..1000].to_vec());
-    assert!(!pm.ibd_header_probe_due_at(at(22)), "the tip moved: header sync is progressing");
-    assert!(!pm.ibd_header_probe_due_at(at(31)), "still under the stall time since it moved");
-    assert!(pm.ibd_header_probe_due_at(at(32)), "and then stopped");
-}
-
 fn getheaders_sent(rx: &mut mpsc::Receiver<NetworkMessage>) -> usize {
     drain(rx).iter().filter(|m| matches!(m, NetworkMessage::GetHeaders(_))).count()
 }
@@ -288,11 +262,12 @@ fn a_node_far_behind_syncs_headers_with_one_peer() {
     assert_eq!(asked, 0, "while it syncs, no other peer starts");
 }
 
-/// A sync peer that answers with less than a full batch has no more headers
-/// past ours (a peer still syncing itself, say), so the next peer starts at
-/// once rather than after the stall probe.
+/// A sync peer that answers with less than a full batch keeps the slot, as
+/// in Core, where `nSyncStarted` counts it until it disconnects or its
+/// header-download timeout expires (`p2p_initial_headers_sync.py`). satd
+/// handed the slot on at once.
 #[test]
-fn the_next_peer_syncs_when_the_sync_peer_runs_out() {
+fn a_sync_peer_that_runs_out_keeps_the_slot() {
     let (pm, _dir) = mk_pm();
     let chain = header_chain(100, 1_500_000_000);
     let mut rxs: Vec<_> = (1..=4).map(|id| add_peer(&pm, id)).collect();
@@ -302,9 +277,8 @@ fn the_next_peer_syncs_when_the_sync_peer_runs_out() {
     pm.handle_headers(first, chain);
     assert_eq!(pm.chain_state.headers_tip_height(), 100);
     pm.start_header_syncs();
-    let asked: Vec<usize> = rxs.iter_mut().map(getheaders_sent).collect();
-    assert_eq!(asked.iter().sum::<usize>(), 1, "exactly one more peer: {asked:?}");
-    assert_eq!(asked[first as usize - 1], 0, "not the peer that ran out");
+    let asked: usize = rxs.iter_mut().map(getheaders_sent).sum();
+    assert_eq!(asked, 0, "no other peer starts while the best header is old");
 }
 
 /// Once the best header is less than a day old, header sync runs with every
@@ -339,11 +313,10 @@ fn an_inbound_peer_is_not_the_sync_peer_while_an_outbound_one_can_be() {
     assert_eq!(getheaders_sent(&mut outbound), 1);
 }
 
-/// A preferred peer that has synced and run out no longer holds back the
-/// non-preferred ones: with only inbound peers left to ask, one starts at
-/// once, not after the stall probe.
+/// The slot passes on when the sync peer leaves: an inbound peer takes it
+/// once the outbound sync peer has disconnected.
 #[test]
-fn an_inbound_peer_syncs_once_the_outbound_one_runs_out() {
+fn an_inbound_peer_syncs_once_the_outbound_one_leaves() {
     let (pm, _dir) = mk_pm();
     let mut inbound = add_inbound_peer(&pm, 1);
     let mut outbound = add_peer(&pm, 2);
@@ -351,6 +324,9 @@ fn an_inbound_peer_syncs_once_the_outbound_one_runs_out() {
     assert_eq!(getheaders_sent(&mut outbound), 1);
 
     pm.handle_headers(2, header_chain(100, 1_500_000_000));
+    pm.start_header_syncs();
+    assert_eq!(getheaders_sent(&mut inbound), 0, "the sync peer still holds the slot");
+    pm.handle_peer_disconnected(2);
     pm.start_header_syncs();
     assert_eq!(getheaders_sent(&mut inbound), 1, "the inbound peer takes the slot");
 }
@@ -378,7 +354,6 @@ fn a_feeler_never_syncs_headers() {
     pm.start_header_syncs();
     assert_eq!(getheaders_sent(&mut feeler), 0);
     assert_eq!(getheaders_sent(&mut outbound), 1);
-    assert_ne!(pm.header_probe_peer(), Some(1), "nor does the stall probe ask it");
 }
 
 /// With only inbound peers, one of them syncs.
@@ -391,26 +366,66 @@ fn an_inbound_peer_syncs_when_there_is_no_outbound_one() {
     assert_eq!(asked, 1);
 }
 
-/// The stall probe asks a peer header sync has not started with, so a
-/// stalled sync peer is replaced rather than asked again.
+/// Core's header-download timeout (v32.1 `net_processing.cpp:6470`): while
+/// the best header is more than a day old, the one sync peer is disconnected
+/// once 15 minutes plus 1 ms per expected header have passed, and another
+/// peer takes the sync over. satd polled other peers every 10 s instead.
 #[test]
-fn the_stall_probe_asks_a_peer_not_yet_syncing() {
+fn the_sync_peer_is_replaced_after_its_header_download_timeout() {
     let (pm, _dir) = mk_pm();
     let mut rxs: Vec<_> = (1..=3).map(|id| add_peer(&pm, id)).collect();
     pm.start_header_syncs();
     let first = rxs.iter_mut().position(|rx| getheaders_sent(rx) == 1).expect("one sync peer") as PeerId + 1;
+    let HeadersTimeout::At(at) = pm.peers.read()[&first].header_sync.download_timeout else {
+        panic!("no timeout set");
+    };
+    // The regtest genesis is from 2011: about 15 years of ten-minute blocks
+    // are expected, 1 ms each on top of the 15 minutes.
+    let now = crate::time::now_micros();
+    let expected = (now / 1_000_000 - 1_296_688_602) / 600;
+    let base = HEADERS_DOWNLOAD_TIMEOUT_BASE_MICROS + expected * 1_000;
+    assert!(at >= now - 5_000_000 + base && at <= now + base, "timeout {at}, now {now}, base {base}");
 
-    let probed = pm.header_probe_peer().expect("a peer to probe");
-    assert_ne!(probed, first, "the stalled sync peer is not asked again");
-    let again = pm.header_probe_peer().expect("a peer to probe");
-    assert!(again != first && again != probed, "each probe moves on to a new peer");
+    pm.check_headers_sync_timeouts(at);
+    assert!(pm.peers.read().contains_key(&first), "not before the timeout");
+    pm.check_headers_sync_timeouts(at + 1);
+    assert!(!pm.peers.read().contains_key(&first), "the sync peer was not disconnected");
+    pm.start_header_syncs();
+    let next: usize = rxs.iter_mut().map(getheaders_sent).sum();
+    assert_eq!(next, 1, "another peer takes the sync over");
+}
 
-    // Every peer has started now: the probe goes round them, not back to
-    // the same one. The sync peer, never probed yet, comes first.
-    assert_eq!(pm.header_probe_peer(), Some(first));
-    let rounds: std::collections::HashSet<PeerId> =
-        (0..3).map(|_| pm.header_probe_peer().expect("a peer to probe")).collect();
-    assert_eq!(rounds.len(), 3, "three probes, three different peers: {rounds:?}");
+/// A `noban` sync peer is not disconnected for the timeout: it loses the
+/// sync slot, as in Core, and header sync starts again with one peer (Core
+/// notes the noban peer itself may be asked again).
+#[test]
+fn a_noban_sync_peer_only_loses_the_slot() {
+    let (pm, _dir) = mk_pm();
+    let mut rx1 = add_peer(&pm, 1);
+    pm.peers.write().get_mut(&1).unwrap().info.permissions.noban = true;
+    pm.start_header_syncs();
+    assert_eq!(getheaders_sent(&mut rx1), 1);
+    let mut rx2 = add_peer(&pm, 2);
+    let HeadersTimeout::At(at) = pm.peers.read()[&1].header_sync.download_timeout else {
+        panic!("no timeout set");
+    };
+    pm.check_headers_sync_timeouts(at + 1);
+    assert!(pm.peers.read().contains_key(&1), "a noban peer stays connected");
+    assert!(!pm.peers.read()[&1].header_sync.started, "but loses the sync slot");
+    pm.start_header_syncs();
+    assert_eq!(getheaders_sent(&mut rx1) + getheaders_sent(&mut rx2), 1, "the slot is free again");
+}
+
+/// The sync peer is kept when no other preferred-download peer could take
+/// over, as Core requires `m_num_preferred_download_peers - fPreferredDownload
+/// >= 1`.
+#[test]
+fn the_only_sync_peer_is_kept_past_its_timeout() {
+    let (pm, _dir) = mk_pm();
+    let _rx = add_peer(&pm, 1);
+    pm.start_header_syncs();
+    pm.check_headers_sync_timeouts(u64::MAX);
+    assert!(pm.peers.read().contains_key(&1));
 }
 
 /// Before header sync has started with a peer, a block `inv` from it brings
@@ -582,4 +597,132 @@ fn the_opening_getheaders_is_outstanding() {
     pm.handle_headers(1, vec![unconnecting_header()]);
     pm.handle_inv(1, vec![Inventory::Block(bitcoin::BlockHash::from_byte_array([0x33; 32]))]);
     assert_eq!(getheaders_sent(&mut rx), 0, "the opening request covers the announcements");
+}
+
+/// Core's `ConsiderEviction` (v32.1 `net_processing.cpp:5501`): an outbound
+/// peer whose best known block has less work than our tip gets
+/// `CHAIN_SYNC_TIMEOUT` (20 min), then one `getheaders` from the tip's
+/// parent and `HEADERS_RESPONSE_TIME` (2 min) to answer, then is
+/// disconnected. satd kept such a peer for as long as it stayed connected.
+#[test]
+fn an_outbound_peer_behind_our_tip_is_disconnected() {
+    let (pm, _dir) = mk_pm();
+    let chain = header_chain(10, 1_600_000_000);
+    pm.chain_state.accept_headers(&chain);
+    let mut rx = add_peer(&pm, 1);
+    let t0 = 1_800_000_000;
+    {
+        let mut peers = pm.peers.write();
+        let h = peers.get_mut(&1).unwrap();
+        h.header_sync.started = true;
+        h.info.conn_time = std::time::UNIX_EPOCH + Duration::from_secs(t0);
+    }
+    pm.consider_evictions(t0);
+    assert!(getheaders_sent(&mut rx) == 0, "the timer starts; nothing is sent yet");
+    pm.consider_evictions(t0 + CHAIN_SYNC_TIMEOUT_SECS);
+    assert_eq!(getheaders_sent(&mut rx), 0, "not before the timeout");
+    pm.consider_evictions(t0 + CHAIN_SYNC_TIMEOUT_SECS + 1);
+    assert_eq!(getheaders_sent(&mut rx), 1, "one getheaders when it expires");
+    pm.consider_evictions(t0 + CHAIN_SYNC_TIMEOUT_SECS + 1 + HEADERS_RESPONSE_TIME.as_secs());
+    assert!(pm.peers.read().contains_key(&1), "the answer has until the response time");
+    pm.consider_evictions(t0 + CHAIN_SYNC_TIMEOUT_SECS + 2 + HEADERS_RESPONSE_TIME.as_secs());
+    assert!(!pm.peers.read().contains_key(&1), "the peer with an old chain was not disconnected");
+}
+
+/// A peer that shows our tip's work in time clears its timer, and a
+/// `chain_sync_protect` peer, or an inbound one, is never challenged.
+#[test]
+fn a_peer_that_shows_our_tips_work_or_is_protected_is_kept() {
+    let (pm, _dir) = mk_pm();
+    let chain = header_chain(10, 1_600_000_000);
+    pm.chain_state.accept_headers(&chain);
+    let tip = pm.chain_state.tip_hash();
+    let _rx1 = add_peer(&pm, 1);
+    let _rx2 = add_peer(&pm, 2);
+    let _rx3 = add_inbound_peer(&pm, 3);
+    let t0 = 1_800_000_000;
+    for id in 1..=3 {
+        let mut peers = pm.peers.write();
+        let h = peers.get_mut(&id).unwrap();
+        h.header_sync.started = true;
+        h.info.conn_time = std::time::UNIX_EPOCH + Duration::from_secs(t0);
+    }
+    pm.peers.write().get_mut(&2).unwrap().info.chain_sync_protect = true;
+    pm.consider_evictions(t0);
+    // Peer 1 announces our tip before the timeout.
+    pm.peers.write().get_mut(&1).unwrap().info.best_known_block = Some(tip);
+    pm.consider_evictions(t0 + 60);
+    assert!(pm.peers.read()[&1].header_sync.chain_sync.timeout.is_none(), "the timer is cleared");
+    let late = t0 + CHAIN_SYNC_TIMEOUT_SECS + HEADERS_RESPONSE_TIME.as_secs() + 10;
+    pm.consider_evictions(late);
+    pm.consider_evictions(late + HEADERS_RESPONSE_TIME.as_secs() + 10);
+    for id in 1..=3 {
+        assert!(pm.peers.read().contains_key(&id), "peer {id} was disconnected");
+    }
+}
+
+/// The first chain-sync timer runs from the pass that first finds the peer
+/// a candidate, as Core's first `SendMessages` with `fSyncStarted` sets it,
+/// not from the connection: a peer that starts header sync late gets the
+/// full 20 minutes.
+#[test]
+fn the_first_chain_sync_timer_runs_from_first_candidacy() {
+    let (pm, _dir) = mk_pm();
+    let mut rx = add_peer(&pm, 1);
+    let t0 = 1_800_000_000;
+    {
+        let mut peers = pm.peers.write();
+        let h = peers.get_mut(&1).unwrap();
+        h.header_sync.started = true;
+        h.info.conn_time = std::time::UNIX_EPOCH + Duration::from_secs(t0 - 3_600);
+    }
+    pm.consider_evictions(t0);
+    assert_eq!(pm.peers.read()[&1].header_sync.chain_sync.timeout, Some(t0 + CHAIN_SYNC_TIMEOUT_SECS));
+    assert_eq!(getheaders_sent(&mut rx), 0, "no challenge on first candidacy");
+}
+
+/// A peer that serves no blocks (no `NODE_NETWORK` or
+/// `NODE_NETWORK_LIMITED`, a light client) never takes the sync slot, as
+/// Core checks `CanServeBlocks`; it would hold it until its timeout.
+#[test]
+fn a_peer_that_serves_no_blocks_never_syncs_headers() {
+    let (pm, _dir) = mk_pm();
+    let mut light = add_inbound_peer(&pm, 1);
+    pm.peers.write().get_mut(&1).unwrap().info.services = ServiceFlags::WITNESS;
+    pm.start_header_syncs();
+    assert_eq!(getheaders_sent(&mut light), 0);
+    let mut full = add_inbound_peer(&pm, 2);
+    pm.start_header_syncs();
+    assert_eq!(getheaders_sent(&mut full), 1, "a block-serving peer takes the slot");
+}
+
+/// Block announcements stop only during initial block download, by the IBD
+/// latch, as Core's `UpdatedBlockTip` does. A best header far above the tip
+/// (one an `invalidateblock` left behind, say) used to silence them, and a
+/// peer then learned of new blocks only by polling, which neither Core nor
+/// satd does now (#1122).
+#[test]
+fn blocks_are_announced_out_of_ibd_whatever_the_header_tip() {
+    let (pm, _dir) = mk_pm();
+    let cs = Arc::clone(&pm.chain_state);
+    let now = crate::time::now_secs() as u32;
+    let genesis = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
+    let tip = crate::chain::state::tests::build_test_block(genesis, 1, now - 60);
+    cs.accept_block(&tip).expect("connect the tip");
+    assert!(!cs.is_initial_block_download(), "fixture: out of IBD");
+    // A header chain 40 above the tip.
+    let mut parent = tip.block_hash();
+    let ahead: Vec<_> = (2..=41)
+        .map(|h| {
+            let b = crate::chain::state::tests::build_test_block(parent, h, now - 60 + h);
+            parent = b.block_hash();
+            b.header
+        })
+        .collect();
+    assert_eq!(cs.accept_headers(&ahead).0, 40);
+    pm.refresh_headers_tip();
+    let mut rx = add_peer(&pm, 1);
+    pm.announce_block(tip.block_hash());
+    let announced = drain(&mut rx).iter().any(|m| matches!(m, NetworkMessage::Inv(_) | NetworkMessage::Headers(_)));
+    assert!(announced, "the tip was not announced");
 }

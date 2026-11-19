@@ -41,6 +41,29 @@ pipeline that keeps the network, the disk, and the CPU busy at the same time.
 Network I/O, block pre-processing, script verification, and chainstate writes
 overlap instead of running one after another.
 
+### Header sync
+
+While the best header is more than a day old, headers come from one peer,
+preferably an outbound one, as in Bitcoin Core. That peer has 15 minutes, plus
+1 ms for each header still expected, to bring the best header within a day of
+now. If it doesn't, and another outbound or `noban` peer could take over, it
+is disconnected (a `noban` peer only loses the sync), and another peer takes
+the sync over. No `getheaders` goes out on a timer. Header sync continues
+from each `headers` reply, and after IBD new headers come from block
+announcements.
+
+Two of Core's checks keep the node's view of the chain honest:
+
+- An outbound full-relay or block-relay-only peer whose best block has less
+  work than our tip for 20 minutes is sent one `getheaders`. If it has not
+  shown that much work 2 minutes later, it is disconnected. Up to four
+  full-relay peers that have shown our tip's work are exempt.
+- When the tip has not moved for 30 minutes and no block is being
+  downloaded, the node opens one extra full-relay outbound peer, checked
+  every 10 minutes. Once that peer has connected, the full-relay peer that
+  least recently announced a block is disconnected, as for any surplus
+  outbound peer. Not under `-connect`.
+
 ### Header presync
 
 As in Bitcoin Core, a header chain is stored only once it has shown enough

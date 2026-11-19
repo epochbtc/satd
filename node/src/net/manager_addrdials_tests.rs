@@ -2468,3 +2468,76 @@ async fn the_feeler_skips_this_passes_block_relay_dial() {
     assert_eq!(pm.dials_in_flight.lock().block_relay, 1, "the block-relay-only dial");
     assert!(!pm.pending_typed_dials.read().contains(&ConnType::Feeler), "no feeler to the same address");
 }
+
+// ---- An extra full-relay peer for a stale tip (#1122) ----
+
+/// Core's `CheckForStaleTipAndEvictPeers` and `TipMayBeStale` (v32.1
+/// `net_processing.cpp:5669`, `:1431`): once the tip has not moved for three
+/// target spacings (30 minutes) with no block in flight, the reconnect loop
+/// may open one full-relay peer past the target of 8 (`net.cpp:2812`). When
+/// the extra peer has connected, `EvictExtraOutboundPeers` drops the
+/// full-relay peer that least recently announced a block and stops trying
+/// extra peers until the next stale tip.
+#[test]
+fn a_stale_tip_opens_one_extra_full_relay_peer_and_eviction_closes_it() {
+    let (pm, _dir) = mk_pm();
+    leave_ibd(&pm);
+    fill_block_relay(&pm, MAX_OUTBOUND_BLOCK_RELAY);
+    fill_ipv4(&pm, MAX_OUTBOUND);
+    for h in pm.peers.write().values_mut() {
+        h.info.conn_time -= Duration::from_secs(60);
+    }
+    let extra = SocketAddr::from(([44, 1, 2, 3], 8333));
+    learn(&pm, extra);
+
+    let t0 = 1_800_000_000;
+    pm.check_for_stale_tip(t0);
+    assert!(!pm.try_new_outbound_peer.load(Ordering::Relaxed), "a tip just seen is not stale");
+    assert!(pm.reserve_stale_tip_peer(Instant::now(), &[]).is_none(), "no extra peer at the target");
+
+    // 30 minutes and a second later, past the 10-minute check interval.
+    pm.check_for_stale_tip(t0 + 3 * POW_TARGET_SPACING_SECS + 1);
+    assert!(pm.try_new_outbound_peer.load(Ordering::Relaxed), "the stale tip was not noticed");
+    let (target, slot) = pm.reserve_stale_tip_peer(Instant::now(), &[]).expect("an extra full-relay dial");
+    assert_eq!(target, PeerAddr::Socket(extra));
+    assert!(pm.reserve_stale_tip_peer(Instant::now(), &[]).is_none(), "one extra dial at a time");
+    drop(slot);
+
+    // The extra peer connects: nine full-relay peers, one past the target.
+    let mut info = peer(5000, extra, Direction::Outbound);
+    info.last_block_announcement = crate::time::now_secs();
+    info.conn_time -= Duration::from_secs(60);
+    add_peer(&pm, info);
+    let evicted = pm.evict_extra_outbound_peer_and_settle().expect("a surplus full-relay peer is dropped");
+    assert_ne!(evicted, 5000, "the peer that announced a block most recently stays");
+    assert!(!pm.try_new_outbound_peer.load(Ordering::Relaxed), "extra peers stop after the eviction");
+    assert!(pm.reserve_stale_tip_peer(Instant::now(), &[]).is_none());
+}
+
+/// A tip that moves between checks is not stale, and stops the extra peer:
+/// Core clears `m_try_another_outbound_peer` on the next check.
+#[test]
+fn a_tip_that_moves_is_not_stale() {
+    let (pm, _dir) = mk_pm();
+    leave_ibd(&pm);
+    let t0 = 1_800_000_000;
+    pm.check_for_stale_tip(t0);
+    pm.check_for_stale_tip(t0 + 3 * POW_TARGET_SPACING_SECS + 1);
+    assert!(pm.try_new_outbound_peer.load(Ordering::Relaxed));
+    // As if the tip had been another block until now: it moved.
+    *pm.last_tip_update.lock() = Some((bitcoin::BlockHash::all_zeros(), t0));
+    pm.check_for_stale_tip(t0 + 3 * POW_TARGET_SPACING_SECS + 2 + STALE_CHECK_INTERVAL_SECS);
+    assert!(!pm.try_new_outbound_peer.load(Ordering::Relaxed), "a tip that moved is not stale");
+}
+
+/// Not under `-connect`, as Core checks `GetUseAddrmanOutgoing`.
+#[test]
+fn no_stale_tip_peer_under_connect() {
+    let (pm, _dir) = mk_pm();
+    leave_ibd(&pm);
+    pm.automatic_outbound.store(false, Ordering::Relaxed);
+    let t0 = 1_800_000_000;
+    pm.check_for_stale_tip(t0);
+    pm.check_for_stale_tip(t0 + 3 * POW_TARGET_SPACING_SECS + 1);
+    assert!(!pm.try_new_outbound_peer.load(Ordering::Relaxed));
+}

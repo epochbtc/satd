@@ -442,11 +442,29 @@ impl DrainPacer {
     }
 }
 
-/// How long the header tip must stand still during IBD before the periodic
-/// header probe asks other peers, and the least time between two probes.
-/// Longer than any reasonable `getheaders` round trip, so a request still
-/// in flight is not taken for a stall (#1229).
-const HEADER_PROBE_STALL: Duration = Duration::from_secs(10);
+/// Core's `HEADERS_DOWNLOAD_TIMEOUT_BASE` (v32.1 `net_processing.cpp:100`):
+/// the initial header-sync peer has this long, plus
+/// [`HEADERS_DOWNLOAD_TIMEOUT_PER_HEADER_MICROS`] for each header expected,
+/// before it is replaced.
+const HEADERS_DOWNLOAD_TIMEOUT_BASE_MICROS: u64 = 15 * 60 * 1_000_000;
+
+/// Core's `HEADERS_DOWNLOAD_TIMEOUT_PER_HEADER` (v32.1
+/// `net_processing.cpp:101`): 1 ms.
+const HEADERS_DOWNLOAD_TIMEOUT_PER_HEADER_MICROS: u64 = 1_000;
+
+/// Core's `nPowTargetSpacing` (v32.1 `kernel/chainparams.cpp`, ten minutes
+/// on every network): the expected header count is the best header's age
+/// over it, and a tip is stale after three of it.
+const POW_TARGET_SPACING_SECS: u64 = 600;
+
+/// Core's `CHAIN_SYNC_TIMEOUT` (v32.1 `net_processing.cpp:109`): how long an
+/// unprotected outbound peer may stay behind our tip's work before it is
+/// sent one `getheaders` and then, without an answer, disconnected.
+const CHAIN_SYNC_TIMEOUT_SECS: u64 = 20 * 60;
+
+/// Core's `STALE_CHECK_INTERVAL` (v32.1 `net_processing.cpp:111`): how often
+/// the tip is checked for staleness.
+const STALE_CHECK_INTERVAL_SECS: u64 = 10 * 60;
 
 /// How recent the best header must be for header sync to run with every
 /// peer rather than one: Core's `SendMessages`, `m_best_header->Time() >
@@ -458,29 +476,43 @@ const HEADER_SYNC_ALL_PEERS_WITHIN_SECS: u64 = 24 * 60 * 60;
 struct HeaderSync {
     /// Core's `fSyncStarted`: the connection's `getheaders` has gone out.
     started: bool,
-    /// The peer answered with less than a full batch: it has no more
-    /// headers past ours. It no longer holds the one header-sync slot a
-    /// node far behind gives out, so the next peer can take it straight
-    /// away instead of after the stall probe (a peer that is itself still
-    /// syncing is the common case).
-    done: bool,
+    /// Core's `m_headers_sync_timeout`: when the initial header-sync peer is
+    /// replaced if the best header is still more than a day old.
+    download_timeout: HeadersTimeout,
+    /// Core's `ChainSyncTimeoutState`, for [`PeerManager::consider_eviction`].
+    chain_sync: ChainSyncTimeout,
     /// Core's `m_inv_triggered_getheaders_before_sync`: a block `inv` from
     /// this peer has already brought a `getheaders` before its header sync
     /// started.
     inv_getheaders_before_sync: bool,
-    /// How often the stall probe has asked this peer, so that once every
-    /// peer has started it goes round them rather than back to one.
-    probes: u32,
 }
 
-/// The periodic IBD header probe's state.
-#[derive(Default)]
-struct HeaderProbe {
-    /// The header tip and the headers-sync progress count when last seen,
-    /// and since when both have stood there.
-    tip: Option<((u32, u64), Instant)>,
-    /// When the last probe went out.
-    last_sent: Option<Instant>,
+/// Core's `m_headers_sync_timeout`, in microseconds of the node's clock
+/// ([`crate::time::now_micros`], mockable as Core's `GetTime` is).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum HeadersTimeout {
+    /// Not set: header sync has not started with the peer (Core's `0us`).
+    #[default]
+    Unset,
+    /// The peer is replaced after this time.
+    At(u64),
+    /// The best header has caught up once: the peer is never replaced for
+    /// it (Core's `microseconds::max()`).
+    Never,
+}
+
+/// Core's `ChainSyncTimeoutState` (v32.1 `net_processing.cpp`), seconds of
+/// the node's clock.
+#[derive(Clone, Copy, Debug, Default)]
+struct ChainSyncTimeout {
+    /// When the peer must have shown `work_header`'s work: Core's
+    /// `m_timeout`.
+    timeout: Option<u64>,
+    /// Our tip when the timeout was set, and its chain work: Core's
+    /// `m_work_header`.
+    work_header: Option<(bitcoin::BlockHash, [u8; 32])>,
+    /// The one `getheaders` has gone out: Core's `m_sent_getheaders`.
+    sent_getheaders: bool,
 }
 
 /// Core's `HeadersPresyncStats` for each peer with a headers sync in
@@ -839,6 +871,13 @@ enum DialBudget {
     /// met, with an outbound grant. It is a third block-relay-only peer
     /// until [`PeerManager::evict_extra_block_relay_peer`] drops one.
     ExtraBlockRelay,
+    /// The extra full-relay peer a stale tip allows
+    /// ([`PeerManager::reserve_stale_tip_peer`]): one at a time, only once the
+    /// full-relay and block-relay-only targets are met, with an outbound
+    /// grant. Core's `GetTryNewOutboundPeer` branch of
+    /// `ThreadOpenConnections`; [`PeerManager::evict_extra_outbound_peer`]
+    /// later drops a full-relay peer to bring the count back.
+    StaleTip,
 }
 
 /// Outbound dials in flight, per [`DialBudget`].
@@ -849,6 +888,7 @@ struct DialsInFlight {
     extra_network: usize,
     block_relay: usize,
     extra_block_relay: usize,
+    stale_tip: usize,
 }
 
 /// A dial's place in its [`DialBudget`], given back when dropped. Owned, so
@@ -874,6 +914,7 @@ impl Drop for DialSlot {
             DialBudget::ExtraBlockRelay => {
                 in_flight.extra_block_relay = in_flight.extra_block_relay.saturating_sub(1)
             }
+            DialBudget::StaleTip => in_flight.stale_tip = in_flight.stale_tip.saturating_sub(1),
             DialBudget::Unlimited => {}
         }
     }
@@ -1484,21 +1525,22 @@ pub struct PeerManager {
     /// The loop's periodic maintenance is still driven by the interval
     /// alone.
     drain_now: Arc<tokio::sync::Notify>,
-    /// The periodic IBD header probe's state: see
-    /// [`Self::ibd_header_probe_due`].
-    ibd_header_probe: parking_lot::Mutex<HeaderProbe>,
+    /// Core's `m_try_another_outbound_peer`: the tip looks stale, so the
+    /// reconnect loop may open one full-relay peer past the target
+    /// ([`Self::check_for_stale_tip`]).
+    try_new_outbound_peer: AtomicBool,
+    /// Core's `m_last_tip_update`, seconds of the node's clock, and the tip
+    /// it was taken for. `None` until first read.
+    last_tip_update: parking_lot::Mutex<Option<(bitcoin::BlockHash, u64)>>,
+    /// Core's `m_stale_tip_check_time`.
+    stale_tip_check_time: AtomicU64,
     /// Each peer's low-work headers sync, Core's `Peer::m_headers_sync`:
     /// see [`crate::net::headerssync`]. Only the headers thread processes
-    /// one; the header probe and the post-IBD poll look here to leave a
-    /// peer with a sync in progress alone.
+    /// one.
     headers_syncs: parking_lot::Mutex<HashMap<PeerId, crate::net::headerssync::HeadersSyncState>>,
     /// Core's `m_headers_presync_stats` and `m_headers_presync_bestpeer`,
     /// for the presync progress log.
     headers_presync: parking_lot::Mutex<PresyncStats>,
-    /// Counts the `headers` messages a headers sync took in its PRESYNC or
-    /// REDOWNLOAD phase. Those store nothing and leave the header tip
-    /// where it is, so the IBD header probe counts this as progress too.
-    header_sync_progress: AtomicU64,
     /// The sender that asks the daemon to shut down, where one was given
     /// ([`Self::set_shutdown_sender`]).
     shutdown_request: parking_lot::Mutex<Option<tokio::sync::watch::Sender<bool>>>,
@@ -1930,10 +1972,11 @@ impl PeerManager {
             nap_limits: parking_lot::Mutex::new(Default::default()),
             nap_puller: RwLock::new(None),
             drain_now: Arc::new(tokio::sync::Notify::new()),
-            ibd_header_probe: parking_lot::Mutex::new(HeaderProbe::default()),
+            try_new_outbound_peer: AtomicBool::new(false),
+            last_tip_update: parking_lot::Mutex::new(None),
+            stale_tip_check_time: AtomicU64::new(0),
             headers_syncs: parking_lot::Mutex::new(HashMap::new()),
             headers_presync: parking_lot::Mutex::new(PresyncStats::default()),
-            header_sync_progress: AtomicU64::new(0),
             shutdown_request: parking_lot::Mutex::new(None),
             last_block_inv_getheaders: parking_lot::Mutex::new(None),
             block_tx,
@@ -4049,7 +4092,7 @@ impl PeerManager {
             .filter(|h| h.info.conn_type == ConnType::OutboundFullRelay && h.info.state != PeerState::Disconnected)
             .count();
         let typed = self.pending_typed_dials.read().iter().filter(|t| **t == ConnType::OutboundFullRelay).count();
-        peers + in_flight.automatic + in_flight.extra_network + typed
+        peers + in_flight.automatic + in_flight.extra_network + in_flight.stale_tip + typed
     }
 
     /// The outbound sockets Core's `semOutbound` holds a grant for: every
@@ -4073,6 +4116,7 @@ impl PeerManager {
             + in_flight.extra_network
             + in_flight.block_relay
             + in_flight.extra_block_relay
+            + in_flight.stale_tip
     }
 
     /// The added nodes the operator listed, at the addresses they resolve to.
@@ -4213,6 +4257,20 @@ impl PeerManager {
                     return Err("no outbound grant free".to_string());
                 }
                 in_flight.extra_block_relay += 1;
+            }
+            DialBudget::StaleTip => {
+                if in_flight.stale_tip > 0 {
+                    return Err("a stale-tip peer is already being dialled".to_string());
+                }
+                // Core reaches this branch past both targets, and the
+                // `semOutbound` grant bounds it.
+                if !self.outbound_targets_met(&in_flight) {
+                    return Err("the outbound targets are not met".to_string());
+                }
+                if self.automatic_sockets_open(&in_flight) >= Self::max_automatic_outbound(&self.max_connections) {
+                    return Err("no outbound grant free".to_string());
+                }
+                in_flight.stale_tip += 1;
             }
             DialBudget::Unlimited => {}
         }
@@ -5571,48 +5629,6 @@ impl PeerManager {
         self.headers_tip.store(htip, Ordering::Relaxed);
     }
 
-    /// Whether the periodic IBD header probe should go out: only once the
-    /// header tip has not moved for [`HEADER_PROBE_STALL`], and at most once
-    /// per that interval. A full `headers` batch already asks its peer for
-    /// the next one (`handle_headers`), so while that chain of requests
-    /// advances the tip, a probe only starts a second chain behind it that
-    /// fetches the same headers again; one per probe, for as long as header
-    /// sync ran, came to 5.6 GB of `headers` for a 78 MB mainnet header
-    /// chain (#1229). The wait is longer than a slow peer's round trip, so a
-    /// request still in flight, the connection's own first `getheaders`
-    /// among them, is not taken for a stall.
-    fn ibd_header_probe_due(&self) -> bool {
-        self.ibd_header_probe_due_at(Instant::now())
-    }
-
-    ///
-    /// A headers presync stores nothing until the peer's chain has shown
-    /// enough work, so the header tip stands still through it. Each message
-    /// a presync or redownload takes counts as progress as well
-    /// ([`Self::header_sync_progress`]), or the probe would ask another peer
-    /// every interval of a presync and start a second one from genesis.
-    fn ibd_header_probe_due_at(&self, now: Instant) -> bool {
-        let tip = (
-            self.chain_state.headers_tip_height(),
-            self.header_sync_progress.load(Ordering::Relaxed),
-        );
-        let mut probe = self.ibd_header_probe.lock();
-        match probe.tip {
-            Some((last, _)) if last == tip => {}
-            _ => {
-                probe.tip = Some((tip, now));
-                return false;
-            }
-        }
-        let still_since = probe.tip.map_or(now, |(_, at)| at);
-        let quiet = |t: Instant| now.saturating_duration_since(t) >= HEADER_PROBE_STALL;
-        if !quiet(still_since) || probe.last_sent.is_some_and(|t| !quiet(t)) {
-            return false;
-        }
-        probe.last_sent = Some(now);
-        true
-    }
-
     /// Whether the best header is less than a day old, the point at which
     /// Core syncs headers with every peer instead of one.
     fn best_header_is_recent(&self) -> bool {
@@ -5629,12 +5645,23 @@ impl PeerManager {
     /// it. Core's `SendMessages`: while the best header is more than a day old, header sync runs with a
     /// single peer, preferably a preferred-download one (outbound or
     /// `noban`), so a fresh node does not fetch the whole header chain once
-    /// from every peer it connects to; past that, every peer. A peer that
-    /// answered with less than a full batch frees the slot
-    /// ([`HeaderSync::done`]), and the stall probe asks another peer when the
-    /// sync peer goes quiet.
+    /// from every peer it connects to; past that, every peer. As in Core,
+    /// the sync peer keeps the slot after it runs out of headers (Core's
+    /// `nSyncStarted` counts it until it disconnects): the slot passes on
+    /// when it leaves or its timeout expires. The peer gets Core's
+    /// header-download timeout
+    /// ([`Self::check_headers_sync_timeouts`]): 15 minutes, plus 1 ms for
+    /// each header the best header's age says is still to come.
     fn start_header_sync(&self, id: PeerId) -> bool {
         let recent = self.best_header_is_recent();
+        let now_micros = crate::time::now_micros();
+        let expected_headers = self
+            .chain_state
+            .get_block_index(&self.chain_state.best_header_hash())
+            .map_or(0, |e| (now_micros / 1_000_000).saturating_sub(u64::from(e.header.time)) / POW_TARGET_SPACING_SECS);
+        let timeout = now_micros
+            + HEADERS_DOWNLOAD_TIMEOUT_BASE_MICROS
+            + HEADERS_DOWNLOAD_TIMEOUT_PER_HEADER_MICROS.saturating_mul(expected_headers);
         let mut peers = self.peers.write();
         let preferred = |info: &PeerInfo| {
             Self::syncs_headers(info) && Self::tx_announcer_info(info).preferred
@@ -5648,7 +5675,7 @@ impl PeerManager {
         if !recent {
             let syncing = peers
                 .values()
-                .any(|p| p.header_sync.started && !p.header_sync.done);
+                .any(|p| p.header_sync.started);
             // Only a preferred peer that could take the slot now stands in a
             // non-preferred one's way: one that has synced already never
             // takes it again, and one still in its handshake may never
@@ -5662,21 +5689,214 @@ impl PeerManager {
         }
         if let Some(h) = peers.get_mut(&id) {
             h.header_sync.started = true;
+            h.header_sync.download_timeout = HeadersTimeout::At(timeout);
             h.last_getheaders_sent = Some(Instant::now());
         }
+        drop(peers);
+        // Core's line (v32.1 `net_processing.cpp:6160`): the height the
+        // locator starts at, the best header's parent
+        // ([`sync::make_initial_getheaders`]).
+        let start = self.chain_state.headers_tip_height().max(self.chain_state.tip_height()).saturating_sub(1);
+        tracing::debug!("initial getheaders ({start}) to peer={id}");
         true
     }
 
+    /// Core's header-sync timeout check in `SendMessages` (v32.1
+    /// `net_processing.cpp:6470-6501`), for every peer, at `now_micros`.
+    ///
+    /// While the best header is more than a day old, the one peer header
+    /// sync runs with is replaced once its timeout passes, if another
+    /// preferred-download peer could take over: it is disconnected, or,
+    /// with `noban`, only loses the sync slot. Once the best header has
+    /// caught up, no peer's timeout is checked again.
+    fn check_headers_sync_timeouts(&self, now_micros: u64) {
+        let recent = self.best_header_is_recent();
+        let mut timed_out: Vec<PeerId> = Vec::new();
+        {
+            let mut peers = self.peers.write();
+            let syncing = peers.values().filter(|p| p.header_sync.started).count();
+            let preferred_peers = peers
+                .values()
+                .filter(|p| p.info.state == PeerState::Connected && Self::tx_announcer_info(&p.info).preferred)
+                .count();
+            for (id, h) in peers.iter_mut() {
+                if !h.header_sync.started {
+                    continue;
+                }
+                let HeadersTimeout::At(at) = h.header_sync.download_timeout else {
+                    continue;
+                };
+                if recent {
+                    h.header_sync.download_timeout = HeadersTimeout::Never;
+                    continue;
+                }
+                let preferred = Self::tx_announcer_info(&h.info).preferred;
+                if now_micros > at
+                    && syncing == 1
+                    && preferred_peers - usize::from(preferred) >= 1
+                {
+                    if h.info.permissions.noban {
+                        tracing::info!("Timeout downloading headers from noban peer, not disconnecting peer={id}");
+                        h.header_sync.started = false;
+                        h.header_sync.download_timeout = HeadersTimeout::Unset;
+                    } else {
+                        tracing::info!("Timeout downloading headers, disconnecting peer={id}");
+                        timed_out.push(*id);
+                    }
+                }
+            }
+        }
+        for id in timed_out {
+            self.disconnect_peer(id, "header-download-timeout");
+        }
+    }
+
+    /// Core's `ConsiderEviction` (v32.1 `net_processing.cpp:5501`), for every
+    /// outbound full-relay and block-relay-only peer header sync has started
+    /// with, at `now` (seconds of the node's clock). A peer whose best known
+    /// block has less work than our tip gets [`CHAIN_SYNC_TIMEOUT_SECS`] to
+    /// show that much; then one `getheaders` from the tip's parent, and
+    /// [`HEADERS_RESPONSE_TIME`] to answer it; then it is disconnected. Up
+    /// to [`MAX_OUTBOUND_PEERS_TO_PROTECT_FROM_DISCONNECT`] full-relay peers
+    /// marked `chain_sync_protect` are exempt.
+    fn consider_evictions(&self, now: u64) {
+        self.consider_evictions_of(None, now);
+    }
+
+    /// [`Self::consider_evictions`] for `only` that peer, or every peer:
+    /// Core runs `ConsiderEviction` in each peer's `SendMessages`, right
+    /// after its messages, so a `headers` reply moves the timer at once.
+    fn consider_evictions_of(&self, only: Option<PeerId>, now: u64) {
+        let Some(tip) = self.chain_state.get_block_index(&self.chain_state.tip_hash()) else {
+            return;
+        };
+        let tip_hash = self.chain_state.tip_hash();
+        let candidates: Vec<(PeerId, Option<bitcoin::BlockHash>)> = self
+            .peers
+            .read()
+            .iter()
+            .filter(|(id, _)| only.is_none_or(|o| o == **id))
+            .filter(|(_, h)| {
+                !h.info.chain_sync_protect
+                    && matches!(h.info.conn_type, ConnType::OutboundFullRelay | ConnType::BlockRelay)
+                    && h.header_sync.started
+                    && h.info.state == PeerState::Connected
+            })
+            .map(|(id, h)| (*id, h.info.best_known_block))
+            .collect();
+        for (id, best_known) in candidates {
+            let best_work = best_known.and_then(|b| self.chain_state.get_block_index(&b)).map(|e| e.chainwork);
+            let at_least = |work: &[u8; 32]| {
+                best_work.is_some_and(|w| crate::chain::state::compare_u256(&w, work) >= 0)
+            };
+            let mut send_from = None;
+            let mut disconnect = false;
+            {
+                let mut peers = self.peers.write();
+                let Some(h) = peers.get_mut(&id) else { continue };
+                let cs = &mut h.header_sync.chain_sync;
+                if at_least(&tip.chainwork) {
+                    if cs.timeout.is_some() {
+                        *cs = ChainSyncTimeout::default();
+                    }
+                } else if cs.timeout.is_none() || cs.work_header.is_some_and(|(_, w)| at_least(&w)) {
+                    cs.timeout = Some(now + CHAIN_SYNC_TIMEOUT_SECS);
+                    cs.work_header = Some((tip_hash, tip.chainwork));
+                    cs.sent_getheaders = false;
+                } else if cs.timeout.is_some_and(|t| now > t) {
+                    if cs.sent_getheaders {
+                        tracing::info!(
+                            "Outbound peer has old chain, best known block = {}, disconnecting peer={id}",
+                            best_known.map_or_else(|| "<none>".to_string(), |b| b.to_string())
+                        );
+                        disconnect = true;
+                    } else {
+                        send_from = cs.work_header.map(|(hash, _)| hash);
+                        cs.sent_getheaders = true;
+                        cs.timeout = Some(now + HEADERS_RESPONSE_TIME.as_secs());
+                    }
+                }
+            }
+            if disconnect {
+                self.disconnect_peer(id, "old-chain");
+            } else if let Some(work_hash) = send_from {
+                // Core's `MaybeSendGetHeaders(GetLocator(m_work_header->pprev))`:
+                // gated on an outstanding request, which an answer to would
+                // serve as well.
+                let parent = self
+                    .chain_state
+                    .get_block_index(&work_hash)
+                    .map_or(work_hash, |e| e.header.prev_blockhash);
+                tracing::debug!(
+                    "sending getheaders to outbound peer={id} to verify chain work (current best known block:{}, benchmark blockhash: {work_hash})",
+                    best_known.map_or_else(|| "<none>".to_string(), |b| b.to_string())
+                );
+                self.maybe_send_getheaders_msg(id, sync::make_getheaders_after(&self.chain_state, parent));
+            }
+        }
+    }
+
+    /// Core's `m_last_tip_update`, kept from the run loop: the time the tip
+    /// last changed, at `now` (seconds of the node's clock). Core updates it
+    /// in `BlockConnected`; the tip's hash is compared here, so a reorg to
+    /// a same-height tip counts too.
+    fn note_tip_update(&self, now: u64) {
+        let tip = self.chain_state.tip_hash();
+        let mut last = self.last_tip_update.lock();
+        if last.is_none_or(|(hash, _)| hash != tip) {
+            *last = Some((tip, now));
+        }
+    }
+
+    /// Core's `TipMayBeStale` (v32.1 `net_processing.cpp:1431`): the tip has
+    /// not moved for three target spacings (30 minutes) and no block is in
+    /// flight.
+    fn tip_may_be_stale(&self, now: u64) -> bool {
+        self.note_tip_update(now);
+        let since = self.last_tip_update.lock().map_or(now, |(_, at)| at);
+        let in_flight = self
+            .in_flight_blocks
+            .read()
+            .values()
+            .any(|asked| asked.values().any(|r| r.at.elapsed() < BLOCK_IN_FLIGHT_TTL))
+            || self.ibd.read().as_ref().is_some_and(|s| s.progress().1 > 0);
+        since < now.saturating_sub(3 * POW_TARGET_SPACING_SECS) && !in_flight
+    }
+
+    /// The stale-tip half of Core's `CheckForStaleTipAndEvictPeers` (v32.1
+    /// `net_processing.cpp:5669`), every [`STALE_CHECK_INTERVAL_SECS`]: on a
+    /// tip that may be stale, allow one full-relay outbound peer past the
+    /// target ([`Self::reserve_stale_tip_peer`]); otherwise stop allowing
+    /// it. Not under `-connect`, as Core checks `GetUseAddrmanOutgoing`.
+    fn check_for_stale_tip(&self, now: u64) {
+        if now <= self.stale_tip_check_time.load(Ordering::Relaxed) {
+            return;
+        }
+        if self.automatic_outbound.load(Ordering::Relaxed) && self.tip_may_be_stale(now) {
+            let since = self.last_tip_update.lock().map_or(0, |(_, at)| now.saturating_sub(at));
+            tracing::info!(
+                "Potential stale tip detected, will try using extra outbound peer (last tip update: {since} seconds ago)"
+            );
+            self.try_new_outbound_peer.store(true, Ordering::Relaxed);
+        } else {
+            self.try_new_outbound_peer.store(false, Ordering::Relaxed);
+        }
+        self.stale_tip_check_time.store(now + STALE_CHECK_INTERVAL_SECS, Ordering::Relaxed);
+    }
+
     /// Whether header sync may run with this connection at all: one that
-    /// serves blocks and stays. A feeler is dropped once its handshake is
-    /// done, and would hold the one sync slot meanwhile.
+    /// serves blocks and stays. Core starts sync only with a peer that can
+    /// serve blocks (`CanServeBlocks`: `NODE_NETWORK` or
+    /// `NODE_NETWORK_LIMITED`, v32.1 `net_processing.cpp:6146`), so a light
+    /// client never holds the one sync slot. A feeler is dropped once its
+    /// handshake is done, and would hold the slot meanwhile.
     fn syncs_headers(info: &PeerInfo) -> bool {
-        info.serves_blocks() && info.conn_type != ConnType::Feeler
+        info.serves_blocks() && info.advertises_blocks() && info.conn_type != ConnType::Feeler
     }
 
     /// Start header sync with every connected peer
     /// [`start_header_sync`](Self::start_header_sync) allows: the one sync
-    /// peer after the last one left or ran out, and all of them once the
+    /// peer after the last one left or timed out, and all of them once the
     /// best header is recent.
     fn start_header_syncs(&self) {
         let waiting: Vec<PeerId> = self
@@ -5691,29 +5911,6 @@ impl PeerManager {
                 self.send_to_peer(id, sync::make_initial_getheaders(&self.chain_state));
             }
         }
-    }
-
-    /// The peer the stall probe asks: one header sync has not started with,
-    /// if there is one, so a stalled sync peer is replaced rather than asked
-    /// again; once every peer has started, the one asked least, so the probe
-    /// goes round them. It counts as started from then on. A peer with a
-    /// headers presync in progress is never asked: its answer to the probe's
-    /// locator would not follow on from the presync, and end it.
-    fn header_probe_peer(&self) -> Option<PeerId> {
-        let syncing = self.peers_with_headers_sync();
-        let mut peers = self.peers.write();
-        let pick = peers
-            .iter()
-            .filter(|(id, h)| {
-                h.info.state == PeerState::Connected && Self::syncs_headers(&h.info) && !syncing.contains(id)
-            })
-            .min_by_key(|(id, h)| (h.header_sync.started, h.header_sync.probes, **id))
-            .map(|(id, _)| *id)?;
-        if let Some(h) = peers.get_mut(&pick) {
-            h.header_sync.started = true;
-            h.header_sync.probes += 1;
-        }
-        Some(pick)
     }
 
     /// Whether a block `inv` from `id` naming `block` as its last unknown
@@ -5799,13 +5996,16 @@ impl PeerManager {
         self.redial_manual_peers(now);
         self.maybe_start_extra_block_relay_peers();
         self.evict_extra_block_relay_peer();
-        self.evict_extra_outbound_peer();
+        self.evict_extra_outbound_peer_and_settle();
+        self.check_for_stale_tip(crate::time::now_secs());
         self.resolve_tried_collisions();
         let mut dialled = self.open_anchor_peers(now);
         dialled.extend(self.dial_automatic_peers(now, &dialled));
         dialled.extend(self.open_block_relay_peer(now, &dialled));
-        // The last three each need the one outbound grant the targets leave
+        // The last four each need the one outbound grant the targets leave
         // free (the feeler's place), so at most one of them dials per pass.
+        // The stale-tip peer comes first, as in Core's `else if` chain.
+        self.open_stale_tip_peer(now, &dialled);
         self.open_extra_block_relay_peer(now, &dialled);
         self.open_feeler(now, &dialled);
         self.open_extra_network_peer(now, &dialled);
@@ -6199,8 +6399,22 @@ impl PeerManager {
         let mut rng = rand::thread_rng();
         let net = self.pick_network_without_peer(&mut rng)?;
         *self.next_extra_network_peer.lock() = next_extra_network_peer_after(now);
-
         let reachable = *self.reachable.read();
+        let chosen = self.pick_automatic_dial(now, dialled, &mut rng, |c| addr_network(&reachable, &c.addr) == Some(net));
+        chosen.map(|target| (target, net, slot))
+    }
+
+    /// One address-book entry for an automatic dial this pass, drawn as every
+    /// automatic one is ([`Self::automatic_dial_order`],
+    /// [`Self::automatic_dial_may_take`], one peer per network group) from the
+    /// entries `filter` admits, past the addresses and groups of `dialled`.
+    fn pick_automatic_dial(
+        &self,
+        now: Instant,
+        dialled: &[PeerAddr],
+        rng: &mut rand::rngs::ThreadRng,
+        filter: impl Fn(&DialCandidate) -> bool,
+    ) -> Option<PeerAddr> {
         let recent = now.checked_sub(RECENT_TRY_WINDOW);
         let tried_recently =
             |c: &DialCandidate| recent.is_some_and(|since| self.tried_since(&c.addr, since));
@@ -6210,8 +6424,7 @@ impl PeerManager {
             PeerAddr::Socket(sa) => self.outbound_netgroup(sa.ip()),
             PeerAddr::Onion { .. } => None,
         }));
-        let candidates =
-            self.automatic_dial_order(&mut rng).filter(|c| addr_network(&reachable, &c.addr) == Some(net));
+        let candidates = self.automatic_dial_order(rng).filter(|c| filter(c));
         let mut chosen = None;
         pass_over_recent_tries(candidates, tried_recently, |c, tries| {
             if dialled.contains(&c.addr) || !self.automatic_dial_may_take(&c, tries, now, tip_depth, restore_pending) {
@@ -6225,7 +6438,32 @@ impl PeerManager {
             chosen = Some(c.addr);
             Err(())
         });
-        chosen.map(|target| (target, net, slot))
+        chosen
+    }
+
+    /// Open the extra full-relay peer a stale tip allows, if one is due:
+    /// [`Self::reserve_stale_tip_peer`], then the dial.
+    fn open_stale_tip_peer(self: &Arc<Self>, now: Instant, dialled: &[PeerAddr]) {
+        let Some((target, slot)) = self.reserve_stale_tip_peer(now, dialled) else {
+            return;
+        };
+        tracing::debug!(%target, "Making extra outbound connection for a potential stale tip");
+        self.spawn_redial(target, slot, AUTOMATIC_RECONNECT_MAX_BACKOFF);
+    }
+
+    /// The address the extra full-relay peer is dialled at this pass and its
+    /// place in the dial limit, or `None` if none is due: Core's
+    /// `GetTryNewOutboundPeer` branch of `ThreadOpenConnections` (v32.1
+    /// `src/net.cpp:2812`). Only while [`Self::check_for_stale_tip`] allows
+    /// it, once the full-relay and block-relay-only targets are met, one at
+    /// a time ([`DialBudget::StaleTip`]). Not under `-connect`.
+    fn reserve_stale_tip_peer(self: &Arc<Self>, now: Instant, dialled: &[PeerAddr]) -> Option<(PeerAddr, DialSlot)> {
+        if !self.automatic_outbound.load(Ordering::Relaxed) || !self.try_new_outbound_peer.load(Ordering::Relaxed) {
+            return None;
+        }
+        let slot = self.reserve_dial(DialBudget::StaleTip).ok()?;
+        let mut rng = rand::thread_rng();
+        self.pick_automatic_dial(now, dialled, &mut rng, |_| true).map(|target| (target, slot))
     }
 
     /// A reachable network the node holds no manual or full-relay outbound
@@ -6882,6 +7120,19 @@ impl PeerManager {
         Some(id)
     }
 
+    /// [`Self::evict_extra_outbound_peer`], then, as Core's
+    /// `EvictExtraOutboundPeers` does when it drops a surplus full-relay
+    /// peer, stop trying extra peers for a stale tip until the next check
+    /// finds one: a peer opened since the last check connected (v32.1
+    /// `net_processing.cpp:5658`).
+    fn evict_extra_outbound_peer_and_settle(&self) -> Option<PeerId> {
+        let evicted = self.evict_extra_outbound_peer();
+        if evicted.is_some() {
+            self.try_new_outbound_peer.store(false, Ordering::Relaxed);
+        }
+        evicted
+    }
+
     /// Dial `target` for the reconnect loop in a task of its own, holding the
     /// place `slot` took for it, and keep its backoff: cleared when the dial
     /// connects, longer (up to `max_backoff`) when it fails. Only a
@@ -7384,18 +7635,14 @@ impl PeerManager {
             // far as `start_header_sync` allows.
             self.start_header_syncs();
 
-            // Request headers: during IBD, every 4 ticks (2s), from one peer,
-            // when header sync has stalled. Requesting from ALL peers floods
-            // them and triggers rate limits.
-            if self.is_ibd() && ticks.is_multiple_of(4) && self.ibd_header_probe_due() {
-                if let Some(pid) = self.header_probe_peer() {
-                    self.send_getheaders(pid, sync::make_getheaders(&self.chain_state));
-                }
-            } else if !self.is_ibd() && ticks.is_multiple_of(20) {
-                for pid in &self.header_poll_peers() {
-                    self.send_getheaders(*pid, sync::make_getheaders(&self.chain_state));
-                }
-            }
+            // No `getheaders` goes out on a timer, as in Core: header sync
+            // continues from each `headers` reply, a stalled sync peer is
+            // replaced when its download timeout expires, and after IBD new
+            // headers come from announcements, the chain-sync check and the
+            // extra peer a stale tip brings.
+            self.check_headers_sync_timeouts(crate::time::now_micros());
+            self.consider_evictions(crate::time::now_secs());
+            self.note_tip_update(crate::time::now_secs());
 
             ticks += 1;
 
@@ -7509,6 +7756,10 @@ impl PeerManager {
                 );
             }
         }
+        // Core's first `SendMessages` pass for the peer starts its chain-sync
+        // timer against the tip as it is now.
+        self.consider_evictions(crate::time::now_secs());
+
         // Assign IBD work to the new peer
         let has_ibd = self.ibd.read().is_some();
         if has_ibd {
@@ -8822,13 +9073,8 @@ impl PeerManager {
         let answers_getheaders = headers
             .first()
             .is_none_or(|first| self.chain_state.get_block_index(&first.prev_blockhash).is_some());
-        if let Some(h) = self.peers.write().get_mut(&id) {
-            if count < crate::net::limits::MAX_HEADERS_RESULTS {
-                h.header_sync.done = true;
-            }
-            if answers_getheaders {
-                h.last_getheaders_sent = None;
-            }
+        if answers_getheaders && let Some(h) = self.peers.write().get_mut(&id) {
+            h.last_getheaders_sent = None;
         }
         if headers.is_empty() {
             // The peer has nothing more to give: any headers sync with it
@@ -8958,6 +9204,8 @@ impl PeerManager {
         if let Some(last) = headers.last() {
             self.note_peer_has_block(id, last.block_hash());
         }
+        // Core's `ConsiderEviction` in this peer's next `SendMessages`.
+        self.consider_evictions_of(Some(id), crate::time::now_secs());
 
         if accepted > 0 {
             // Update headers tip tracking from actual chain state
@@ -8970,8 +9218,8 @@ impl PeerManager {
             // that is the only request it makes. Asking three other peers
             // as well, on every batch, started three more request chains
             // per batch, each fetching the same headers to the tip (#1229).
-            // If this peer stops answering, the periodic probe in the
-            // maintenance loop asks others once the header tip stalls.
+            // If this peer stops answering, its header-download timeout
+            // hands the sync to another peer.
 
             // Start or extend IBD scheduler when headers are ahead of blocks.
             //
@@ -9031,25 +9279,25 @@ impl PeerManager {
         None
     }
 
-    /// The peers the post-IBD `getheaders` poll asks: every connected one
-    /// that serves blocks, but not one with a headers presync in progress.
-    /// The presync asks for its own next headers, and an answer to the
-    /// poll's locator would not follow on from it, and end it.
-    fn header_poll_peers(&self) -> Vec<PeerId> {
-        let syncing = self.peers_with_headers_sync();
-        self.peers
-            .read()
-            .iter()
-            .filter(|(id, h)| {
-                h.info.state == PeerState::Connected && h.info.serves_blocks() && !syncing.contains(id)
-            })
-            .map(|(id, _)| *id)
-            .collect()
-    }
-
-    /// The peers with a headers sync in progress.
-    fn peers_with_headers_sync(&self) -> HashSet<PeerId> {
-        self.headers_syncs.lock().keys().copied().collect()
+    /// The node's clock moved (`setmocktime`), `forward_secs` ahead: check
+    /// the header-download and chain-sync timers now, as Core's
+    /// `SendMessages` does on its next pass, rather than on the manager's
+    /// next tick. An outstanding `getheaders` ages by the same amount: Core
+    /// keeps `m_last_getheaders_timestamp` on the node clock, which satd keeps
+    /// as an `Instant`.
+    pub fn clock_moved(&self, forward_secs: u64) {
+        if forward_secs > 0 {
+            let by = Duration::from_secs(forward_secs);
+            for h in self.peers.write().values_mut() {
+                // An `Instant` that cannot go back that far stands for a
+                // request old enough to be due, as `None` does.
+                h.last_getheaders_sent = h.last_getheaders_sent.and_then(|t| t.checked_sub(by));
+            }
+        }
+        self.check_headers_sync_timeouts(crate::time::now_micros());
+        self.start_header_syncs();
+        self.consider_evictions(crate::time::now_secs());
+        self.drain_now.notify_one();
     }
 
     /// Hand the manager the sender that asks the daemon to shut down. A
@@ -9099,7 +9347,6 @@ impl PeerManager {
             if let Some(h) = self.peers.write().get_mut(&id) {
                 h.last_getheaders_sent = None;
             }
-            self.header_sync_progress.fetch_add(1, Ordering::Relaxed);
         }
         if result.request_more
             && let Some(first) = next
@@ -12969,6 +13216,16 @@ impl PeerManager {
         missing
     }
 
+    /// A block joined the active chain (a `BlockConnected` chain event):
+    /// announce it ([`Self::announce_block`]), and look at every outbound
+    /// peer's chain against the new tip ([`Self::consider_evictions`]), as
+    /// Core's next `SendMessages` pass does. A peer that falls behind starts
+    /// its chain-sync timer now, not on the manager's next tick.
+    pub fn block_connected(&self, hash: bitcoin::BlockHash) {
+        self.announce_block(hash);
+        self.consider_evictions(crate::time::now_secs());
+    }
+
     /// Announce a newly-connected best-tip block to peers. Peers that
     /// sent `sendheaders` (BIP 130) receive a `headers` message carrying
     /// the new header; the rest receive a legacy `inv` advertising the
@@ -12982,17 +13239,17 @@ impl PeerManager {
     /// that indexes blocks over P2P — would learn the new height via
     /// polling yet never fetch the block, and sit permanently unsynced.
     ///
-    /// Suppressed while bulk-syncing (`tip` far below the best known
-    /// header): during IBD peers drive their own sync via `getheaders`,
-    /// and announcing every connected block would be redundant spam. The
-    /// guard mirrors [`Self::is_ibd`] but, unlike it, treats an unknown
-    /// header tip (`htip == 0`, e.g. a regtest node whose peers have no
-    /// chain) as "at the frontier" so self-mined blocks are still
-    /// announced.
+    /// Suppressed during initial block download
+    /// ([`ChainState::is_initial_block_download`]), as in Core.
     pub fn announce_block(&self, hash: bitcoin::BlockHash) {
-        let tip = self.chain_state.tip_height();
-        let htip = self.headers_tip.load(Ordering::Relaxed) as u32;
-        if htip != 0 && tip + 24 < htip {
+        // Core's `UpdatedBlockTip` (v32.1 `net_processing.cpp:2295`): no
+        // block is announced during initial block download, by the IBD
+        // latch. satd judged it by the tip's lag behind the header tip,
+        // which a stale best header (one an `invalidateblock` left
+        // above the tip, say) turned into silence a peer only noticed through
+        // its own `getheaders` poll; Core peers, and satd since #1122, do
+        // not poll.
+        if self.chain_state.is_initial_block_download() {
             return;
         }
         let Some(entry) = self.chain_state.get_block_index(&hash) else {
@@ -15023,6 +15280,16 @@ impl PeerManager {
     }
 
     fn maybe_send_getheaders_at(&self, id: PeerId, now: Instant) -> bool {
+        self.maybe_send_getheaders_msg_at(id, now, || sync::make_getheaders(&self.chain_state))
+    }
+
+    /// [`Self::maybe_send_getheaders`] with a locator of the caller's: the
+    /// chain-sync check's, from our tip's parent.
+    fn maybe_send_getheaders_msg(&self, id: PeerId, msg: NetworkMessage) -> bool {
+        self.maybe_send_getheaders_msg_at(id, Instant::now(), || msg)
+    }
+
+    fn maybe_send_getheaders_msg_at(&self, id: PeerId, now: Instant, msg: impl FnOnce() -> NetworkMessage) -> bool {
         {
             let mut peers = self.peers.write();
             let Some(handle) = peers.get_mut(&id) else {
@@ -15036,12 +15303,12 @@ impl PeerManager {
             }
             handle.last_getheaders_sent = Some(now);
         }
-        self.send_to_peer(id, sync::make_getheaders(&self.chain_state));
+        self.send_to_peer(id, msg());
         true
     }
 
     /// Send a `getheaders` that is not gated on an outstanding one (header
-    /// sync's continuation, the stall probe, the periodic poll; its start is
+    /// sync's continuation and the chain-sync check; its start is
     /// recorded by [`Self::start_header_sync`]), and record it as outstanding, as every `getheaders` Core sends
     /// goes through `MaybeSendGetHeaders`. An announcement arriving before
     /// its answer then brings no second request: the answer covers it.
@@ -15922,6 +16189,10 @@ impl PeerManager {
             })
             .await
             .map_err(|e| e.to_string())?;
+        // Have the manager take the new peer now, not on its next tick: Core
+        // runs a peer's first `SendMessages` (initial `getheaders`, the
+        // header-download and chain-sync timers) right after the `verack`.
+        self.drain_now.notify_one();
 
         // Split connection into read/write halves to avoid cancel-safety issues.
         // read_exact is not cancel-safe — if tokio::select! drops a recv() future

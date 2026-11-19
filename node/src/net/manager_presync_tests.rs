@@ -1,7 +1,6 @@
 //! Headers presync in the peer manager (#1132): Core's
 //! `TryLowWorkHeadersSync` and `IsContinuationOfLowWorkHeadersSync` in front
-//! of header acceptance, and how the IBD header probe and the post-IBD poll
-//! leave a sync in progress alone.
+//! of header acceptance.
 
 use super::*;
 use crate::storage::blockindex::{add_u256, work_for_bits};
@@ -233,42 +232,6 @@ fn headers_failing_cores_pow_check_are_refused_whole() {
     pm.handle_headers(2, gap.clone());
     assert!(pm.chain_state.get_block_index(&gap[0].block_hash()).is_none());
     assert!(!pm.peers.read().contains_key(&2), "non-continuous headers are punished");
-}
-
-/// The user's ruling on the stall probe (#1132): presync and redownload
-/// progress counts as header progress. A presync leaves the header tip where
-/// it is, and without this the probe would ask another peer every 10 s of it.
-#[test]
-fn presync_progress_holds_off_the_header_probe() {
-    let (pm, _dir) = mk_pm(Some(work_at(100_000)));
-    let _rx = add_peer(&pm, 1, false);
-    let chain = genesis_chain(6000, 8);
-    let t0 = Instant::now();
-    let at = |s: u64| t0 + Duration::from_secs(s);
-    pm.handle_headers(1, chain[..2000].to_vec());
-    assert!(!pm.ibd_header_probe_due_at(at(0)), "the first check records the state");
-    pm.handle_headers(1, chain[2000..4000].to_vec());
-    assert!(!pm.ibd_header_probe_due_at(at(10)), "the presync moved: no stall");
-    pm.handle_headers(1, chain[4000..].to_vec());
-    assert!(!pm.ibd_header_probe_due_at(at(20)), "and moved again");
-    assert_eq!(pm.chain_state.headers_tip_height(), 0, "the header tip never moved");
-    assert!(pm.ibd_header_probe_due_at(at(30)), "a presync that stops is a stall");
-}
-
-/// The other half of that ruling: neither the stall probe nor the post-IBD
-/// poll asks a peer with a headers sync in progress. Its answer would not
-/// follow on from the presync, and would end it.
-#[test]
-fn the_probe_and_the_poll_leave_a_syncing_peer_alone() {
-    let (pm, _dir) = mk_pm(Some(work_at(100_000)));
-    let _rx1 = add_peer(&pm, 1, false);
-    let _rx2 = add_peer(&pm, 2, false);
-    pm.handle_headers(1, genesis_chain(2000, 9));
-    assert!(pm.headers_syncs.lock().contains_key(&1));
-    for _ in 0..5 {
-        assert_eq!(pm.header_probe_peer(), Some(2), "the probe never picks the syncing peer");
-    }
-    assert_eq!(pm.header_poll_peers(), vec![2]);
 }
 
 /// The user's ruling on a clock far behind the chain (#1132): Core logs

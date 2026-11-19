@@ -244,3 +244,52 @@ fn a_fork_near_the_tip_is_stored_and_a_deep_low_work_one_is_not() {
     let tips = node.rpc_ok("getchaintips", vec![]);
     assert_eq!(tips.as_array().unwrap().len(), 2, "the active tip and the near fork: {tips}");
 }
+
+/// #1122, Core's header-download timeout over P2P. Header sync runs with one
+/// peer; a second peer is not asked while the first holds the slot, however
+/// long it stays silent, until the sync peer's timeout (15 minutes plus 1 ms
+/// per expected header) passes. The peers here are `noban`, so the silent
+/// one only loses the slot, as in Core, and header sync starts again with
+/// one of the two (Core may pick the noban peer again).
+#[test]
+fn a_silent_sync_peer_is_replaced_after_the_header_download_timeout() {
+    let node = TestNode::start(&["--whitelist=noban@127.0.0.1"]);
+    let port = node.p2p_port.unwrap();
+    let mut silent = Peer::connect(port);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        match silent.recv(deadline.saturating_duration_since(Instant::now()).max(Duration::from_millis(1))) {
+            Ok(NetworkMessage::GetHeaders(_)) => break,
+            Ok(NetworkMessage::Ping(n)) => silent.send(NetworkMessage::Pong(n)),
+            Ok(_) => {}
+            Err(e) => panic!("the first peer was never asked for headers: {e}"),
+        }
+    }
+    let mut other = Peer::connect(port);
+    let asked = |peer: &mut Peer, within: Duration| {
+        let deadline = Instant::now() + within;
+        while Instant::now() < deadline {
+            match peer.recv(Duration::from_millis(200)) {
+                Ok(NetworkMessage::GetHeaders(_)) => return true,
+                Ok(NetworkMessage::Ping(n)) => peer.send(NetworkMessage::Pong(n)),
+                Ok(_) => {}
+                Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {}
+                Err(e) => panic!("the node closed the connection: {e}"),
+            }
+        }
+        false
+    };
+    // Longer than the 10 s stall probe that used to ask another peer.
+    assert!(!asked(&mut other, Duration::from_secs(15)), "the second peer was asked while the sync peer held the slot");
+
+    // Past the timeout: the regtest genesis is from 2011, so about 15 years
+    // of ten-minute headers are expected, 1 ms each on top of 15 minutes.
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    node.rpc_ok("setmocktime", vec![serde_json::json!(now + 3600)]);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut restarted = false;
+    while !restarted && Instant::now() < deadline {
+        restarted = asked(&mut other, Duration::from_millis(500)) || asked(&mut silent, Duration::from_millis(500));
+    }
+    assert!(restarted, "the header sync did not start again after the timeout");
+}
