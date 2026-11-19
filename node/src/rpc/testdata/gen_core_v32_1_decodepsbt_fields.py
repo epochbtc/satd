@@ -132,6 +132,14 @@ def negative_fee_and_order(g, ins, outs):
     g.append((prop(b"aa", 9, b"\x01"), b"\x02"))
     g.append((prop(b"aa", 1, b"\x02"), b"\x03"))
 
+def xpub_two_encodings(g, ins, outs):
+    # One key and chain code as a tpub and as an xpub, under one origin:
+    # Core's std::set<CExtPubKey> keeps the first it reads, here the xpub,
+    # though the tpub's bytes sort first.
+    raw = xpub(TPUB)
+    g.append((b"\x01" + bytes.fromhex("0488b21e") + raw[4:], path("0000abcd", 7)))
+    g.append((b"\x01" + raw, path("0000abcd", 7)))
+
 def sighash(value):
     def add(g, ins, outs):
         ins[0].append((b"\x03", value.to_bytes(4, "little")))
@@ -140,6 +148,7 @@ def sighash(value):
 CASES = [
     ("EXTRA_all_fields", "WPKH_1_updated", all_fields),
     ("EXTRA_negative_fee_and_order", "TR_1_updated", negative_fee_and_order),
+    ("EXTRA_xpub_two_encodings", "MS_0_created", xpub_two_encodings),
     ("EXTRA_sighash_default", "MS_0_created", sighash(0x00)),
     ("EXTRA_sighash_unknown", "MS_0_created", sighash(0x1234)),
 ]

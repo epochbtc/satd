@@ -135,8 +135,8 @@ fn proprietary_json(map: &RawMap, key_type: u64, used: &mut BTreeSet<Vec<u8>>) -
 /// Core's `unknown`: every pair of a type Core does not read, every pair
 /// of a type this module renders that did not have the shape to be
 /// rendered, and every pair of a type the caller renders (`theirs`, by
-/// the field it writes) whose field the caller left out, because its value
-/// did not parse.
+/// the field it writes) that the caller did not render: one with key data,
+/// or one whose field the caller left out because its value did not parse.
 fn unknown_json(
     map: &RawMap,
     known: &[u64],
@@ -151,7 +151,9 @@ fn unknown_json(
         let shown = if mine.contains(&pair.key_type) {
             used.contains(&key)
         } else if let Some((_, field)) = theirs.iter().find(|(t, _)| *t == pair.key_type) {
-            out.get(*field).is_some()
+            // Every one of these is keyless, and the callers read only the
+            // keyless pair; one with key data is not the one rendered.
+            pair.key_data.is_empty() && out.get(*field).is_some()
         } else {
             known.contains(&pair.key_type)
         };
@@ -202,12 +204,19 @@ pub(crate) fn global_fields(map: &RawMap, out: &mut Value) {
         }
         used.insert(full_key(pair));
         let (chaincode, pubkey) = (pair.key_data[13..45].to_vec(), pair.key_data[45..].to_vec());
+        // `std::set<CExtPubKey>` compares the key and chain code only, so a
+        // second encoding of the same key under the same origin is one
+        // entry, the first read.
+        let order = ((fingerprint, path.len(), path.clone()), (pubkey.clone(), chaincode.clone()));
+        if xpubs.iter().any(|(o, _)| *o == order) {
+            continue;
+        }
         let row = json!({
             "xpub": bitcoin::base58::encode_check(&pair.key_data),
             "master_fingerprint": hex::encode(fingerprint),
             "path": keypath(&path),
         });
-        xpubs.push((((fingerprint, path.len(), path), (pubkey, chaincode)), row));
+        xpubs.push((order, row));
     }
     xpubs.sort_by(|a, b| a.0.cmp(&b.0));
     out["global_xpubs"] = Value::Array(xpubs.into_iter().map(|(_, row)| row).collect());

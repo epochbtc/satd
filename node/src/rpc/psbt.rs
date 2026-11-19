@@ -1183,6 +1183,20 @@ mod tests {
         assert_eq!(got["outputs"][0]["unknown"], json!({ "03": "010203" }), "{got}");
     }
 
+    /// A keyless type with key data beside the keyless pair the decoder
+    /// renders is a second pair, and is shown in `unknown` too.
+    #[test]
+    fn a_keyless_type_with_key_data_stays_in_unknown() {
+        let core: Value =
+            serde_json::from_str(include_str!("testdata/core_v32_1_decodepsbt.json")).unwrap();
+        let b64 = core["decodepsbt"]["v2_WPKH_1_updated"]["psbt"].as_str().unwrap();
+        let mut raw = RawPsbt::parse(&B64.decode(b64).unwrap()).unwrap();
+        raw.inputs[0].set(satd_psbt::raw::RawPair::new(0x01, vec![0xaa], vec![0x00]));
+        let got = decode_psbt_for(&B64.encode(raw.serialize()), Some(bitcoin::Network::Regtest)).unwrap();
+        assert!(got["inputs"][0]["witness_utxo"].is_object(), "{got}");
+        assert_eq!(got["inputs"][0]["unknown"], json!({ "01aa": "00" }), "{got}");
+    }
+
     /// `decodepsbt` against Bitcoin Core v32.1's own answers: PSBTs its
     /// wallet built with P2PKH, P2SH-P2WPKH, P2WPKH, P2WSH 2-of-2 and P2TR
     /// inputs, at each stage from created to finalized
