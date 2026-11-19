@@ -116,6 +116,7 @@ It includes every fix shipped in 0.7.1:
 - RPC: `getchaintxstats` defaults to one month of blocks (4320) and accepts `nblocks=0`, as in Core (#1297).
 - RPC: `decodepsbt`'s `tx` is the transaction as `decoderawtransaction` decodes it, and its script objects carry Core's `asm`, `hex`, `type` and, for a scriptPubKey, `desc` and `address` (#1296).
 - RPC: `getmempoolentry`, `getrawmempool true` and `getmempoolancestors`/`getmempooldescendants true` report Core v31's `chunkweight` and `fees.chunk` (#1068).
+- RPC: mempool entries, `testmempoolaccept` and `submitpackage` report Core v32.1's `vsize_bip141` and `vsize_adjusted`; `getorphantxs` adds `vsize_bip141` and `getrawtransaction` a mempool transaction's `vsize_adjusted` (#1326).
 - RPC: `getnetworkinfo` reports `version` 320000 (Bitcoin Core v32), up from 280000, so clients with a Core v29 or v31 floor (Bark, Eclair) start (#1068).
 - P2P: `-maxconnections` above 2000 is lowered to 2000 with a warning, as in Core v32.1 (#1295).
 - P2P: a peer is no longer penalised for a transaction it relays, as in Core v30 and later; satd charged 10 points for a script failure or an overspend and 1 for an oversized orphan, so ten such transactions disconnected or banned the peer.
