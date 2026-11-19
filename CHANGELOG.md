@@ -114,9 +114,9 @@ It includes every fix shipped in 0.7.1:
 - RPC: `getblockstats`' `total_out` leaves out the coinbase, `utxo_size_inc` sums the real output and prevout sizes, and `utxo_increase_actual` and `utxo_size_inc_actual` are reported, as in Core (#1208).
 - Operator: a custom signet frames its `blk*.dat` records and `dumptxoutset` snapshots with its own message start, as Core does, not the default signet's; a pre-0.8.0 custom-signet blocks directory mixes both and needs a fresh sync before Core can read it (#1283).
 - RPC: `getchaintxstats` defaults to one month of blocks (4320) and accepts `nblocks=0`, as in Core (#1297).
+- RPC: `getmempoolcluster` and the hidden `getmempoolfeeratediagram`, Core v31's cluster-mempool RPCs, with Core's signed fees (#1327).
 - RPC: `decodepsbt`'s `tx` is the transaction as `decoderawtransaction` decodes it, and its script objects carry Core's `asm`, `hex`, `type` and, for a scriptPubKey, `desc` and `address` (#1296).
 - RPC: `getmempoolentry`, `getrawmempool true` and `getmempoolancestors`/`getmempooldescendants true` report Core v31's `chunkweight` and `fees.chunk` (#1068).
-- RPC: `getmempoolcluster` and the hidden `getmempoolfeeratediagram`, Core v31's cluster-mempool RPCs, with Core's signed fees (#1327).
 - RPC: `getnetworkinfo` reports `version` 320000 (Bitcoin Core v32), up from 280000, so clients with a Core v29 or v31 floor (Bark, Eclair) start (#1068).
 - P2P: `-maxconnections` above 2000 is lowered to 2000 with a warning, as in Core v32.1 (#1295).
 - P2P: a peer is no longer penalised for a transaction it relays, as in Core v30 and later; satd charged 10 points for a script failure or an overspend and 1 for an oversized orphan, so ten such transactions disconnected or banned the peer.
