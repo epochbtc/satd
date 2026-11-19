@@ -123,7 +123,7 @@
   },
   "decodepsbt/bare": {
     "ok": {
-      "fee": null,
+      "global_xpubs": [],
       "inputs": [
         {
           "has_utxo": false,
@@ -133,6 +133,8 @@
       "outputs": [
         {}
       ],
+      "proprietary": [],
+      "psbt_version": 0,
       "tx": {
         "hash": "e8a89a4a3dcac7a1c9464dee28fd7529f8ed7f17d925e21ac603f79186bc32e8",
         "locktime": 0,
@@ -166,12 +168,14 @@
         "vsize": 82,
         "weight": 328
       },
-      "tx_hex": "020000000107070707070707070707070707070707070707070707070707070707070707070100000000ffffffff01905f010000000000160014c430f64c4756da310dbd1a085572ef299926272c00000000"
+      "tx_hex": "020000000107070707070707070707070707070707070707070707070707070707070707070100000000ffffffff01905f010000000000160014c430f64c4756da310dbd1a085572ef299926272c00000000",
+      "unknown": {}
     }
   },
   "decodepsbt/finalized": {
     "ok": {
       "fee": 0.00010000,
+      "global_xpubs": [],
       "inputs": [
         {
           "final_scriptwitness": [
@@ -195,6 +199,8 @@
       "outputs": [
         {}
       ],
+      "proprietary": [],
+      "psbt_version": 0,
       "tx": {
         "hash": "e8a89a4a3dcac7a1c9464dee28fd7529f8ed7f17d925e21ac603f79186bc32e8",
         "locktime": 0,
@@ -228,7 +234,8 @@
         "vsize": 82,
         "weight": 328
       },
-      "tx_hex": "020000000107070707070707070707070707070707070707070707070707070707070707070100000000ffffffff01905f010000000000160014c430f64c4756da310dbd1a085572ef299926272c00000000"
+      "tx_hex": "020000000107070707070707070707070707070707070707070707070707070707070707070100000000ffffffff01905f010000000000160014c430f64c4756da310dbd1a085572ef299926272c00000000",
+      "unknown": {}
     }
   },
   "decodepsbt/not-a-psbt": {
@@ -246,16 +253,15 @@
   "decodepsbt/signed": {
     "ok": {
       "fee": 0.00010000,
+      "global_xpubs": [],
       "inputs": [
         {
           "has_utxo": true,
           "is_final": false,
-          "partial_signatures": [
-            {
-              "pubkey": "02c817bb7521afc35ea96f3bfb270e6eb50ddffa5560627b961fec00f2996508bf",
-              "signature": "304402201705fcda06266edb32b1698677b37f67bb6e45d492ebfce656a880ee7f138eb602203dcde3239dd90636af64fb2412ca41e397c958a030777cff9c8940b9c777d74c01"
-            }
-          ],
+          "partial_signatures": {
+            "02c817bb7521afc35ea96f3bfb270e6eb50ddffa5560627b961fec00f2996508bf": "304402201705fcda06266edb32b1698677b37f67bb6e45d492ebfce656a880ee7f138eb602203dcde3239dd90636af64fb2412ca41e397c958a030777cff9c8940b9c777d74c01"
+          },
+          "sighash": "ALL",
           "witness_utxo": {
             "amount": 0.00100000,
             "scriptPubKey": {
@@ -271,6 +277,8 @@
       "outputs": [
         {}
       ],
+      "proprietary": [],
+      "psbt_version": 0,
       "tx": {
         "hash": "e8a89a4a3dcac7a1c9464dee28fd7529f8ed7f17d925e21ac603f79186bc32e8",
         "locktime": 0,
@@ -304,12 +312,14 @@
         "vsize": 82,
         "weight": 328
       },
-      "tx_hex": "020000000107070707070707070707070707070707070707070707070707070707070707070100000000ffffffff01905f010000000000160014c430f64c4756da310dbd1a085572ef299926272c00000000"
+      "tx_hex": "020000000107070707070707070707070707070707070707070707070707070707070707070100000000ffffffff01905f010000000000160014c430f64c4756da310dbd1a085572ef299926272c00000000",
+      "unknown": {}
     }
   },
   "decodepsbt/updated": {
     "ok": {
       "fee": 0.00010000,
+      "global_xpubs": [],
       "inputs": [
         {
           "has_utxo": true,
@@ -329,6 +339,8 @@
       "outputs": [
         {}
       ],
+      "proprietary": [],
+      "psbt_version": 0,
       "tx": {
         "hash": "e8a89a4a3dcac7a1c9464dee28fd7529f8ed7f17d925e21ac603f79186bc32e8",
         "locktime": 0,
@@ -362,22 +374,25 @@
         "vsize": 82,
         "weight": 328
       },
-      "tx_hex": "020000000107070707070707070707070707070707070707070707070707070707070707070100000000ffffffff01905f010000000000160014c430f64c4756da310dbd1a085572ef299926272c00000000"
+      "tx_hex": "020000000107070707070707070707070707070707070707070707070707070707070707070100000000ffffffff01905f010000000000160014c430f64c4756da310dbd1a085572ef299926272c00000000",
+      "unknown": {}
     }
   },
   "decodepsbt/with-unknowns": {
     "ok": {
       "fee": 0.00010000,
+      "global_xpubs": [],
       "inputs": [
         {
           "has_utxo": true,
           "is_final": false,
-          "partial_signatures": [
-            {
-              "pubkey": "02c817bb7521afc35ea96f3bfb270e6eb50ddffa5560627b961fec00f2996508bf",
-              "signature": "304402201705fcda06266edb32b1698677b37f67bb6e45d492ebfce656a880ee7f138eb602203dcde3239dd90636af64fb2412ca41e397c958a030777cff9c8940b9c777d74c01"
-            }
-          ],
+          "partial_signatures": {
+            "02c817bb7521afc35ea96f3bfb270e6eb50ddffa5560627b961fec00f2996508bf": "304402201705fcda06266edb32b1698677b37f67bb6e45d492ebfce656a880ee7f138eb602203dcde3239dd90636af64fb2412ca41e397c958a030777cff9c8940b9c777d74c01"
+          },
+          "sighash": "ALL",
+          "unknown": {
+            "7a73617464": "696e707574"
+          },
           "witness_utxo": {
             "amount": 0.00100000,
             "scriptPubKey": {
@@ -391,8 +406,14 @@
         }
       ],
       "outputs": [
-        {}
+        {
+          "unknown": {
+            "7a73617464": "6f7574707574"
+          }
+        }
       ],
+      "proprietary": [],
+      "psbt_version": 0,
       "tx": {
         "hash": "e8a89a4a3dcac7a1c9464dee28fd7529f8ed7f17d925e21ac603f79186bc32e8",
         "locktime": 0,
@@ -426,7 +447,10 @@
         "vsize": 82,
         "weight": 328
       },
-      "tx_hex": "020000000107070707070707070707070707070707070707070707070707070707070707070100000000ffffffff01905f010000000000160014c430f64c4756da310dbd1a085572ef299926272c00000000"
+      "tx_hex": "020000000107070707070707070707070707070707070707070707070707070707070707070100000000ffffffff01905f010000000000160014c430f64c4756da310dbd1a085572ef299926272c00000000",
+      "unknown": {
+        "7a73617464": "676c6f62616c"
+      }
     }
   },
   "finalizepsbt-extract/bare": {

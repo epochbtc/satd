@@ -9,6 +9,7 @@ use satd_psbt::raw::{PsbtVersion, RawPsbt};
 
 use crate::chain::state::ChainState;
 use crate::rpc::amounts::{default_unit, format_amount};
+use crate::rpc::psbt_fields;
 use crate::rpc::psbt_v2;
 use crate::rpc::script_asm::script_to_asm_str;
 
@@ -388,9 +389,65 @@ pub fn decode_psbt_for(
     network: Option<bitcoin::Network>,
 ) -> Result<Value, (i32, String)> {
     match parse_any(psbt_b64)? {
-        Parsed::V0(psbt) => decode_psbt_v0(&psbt, network.unwrap_or(bitcoin::Network::Bitcoin)),
+        Parsed::V0(psbt) => {
+            // The fields Core prints byte for byte are read from the bytes
+            // the caller sent, as Core reads them; `parse_any` has already
+            // decoded the same base64.
+            let bytes = B64.decode(psbt_b64).map_err(|_| (-22, "PSBT base64 decode failed".to_string()))?;
+            let raw = RawPsbt::parse(&bytes)
+                .ok()
+                .or_else(|| split_maps(&bytes, psbt.inputs.len(), psbt.outputs.len()))
+                .ok_or_else(|| (-22, "PSBT decode failed".to_string()))?;
+            decode_psbt_v0(&psbt, &raw, network.unwrap_or(bitcoin::Network::Bitcoin))
+        }
         Parsed::V2(raw) => psbt_v2::decode(&raw, network),
     }
+}
+
+/// The key-value maps of a version 0 PSBT `RawPsbt::parse` cannot read
+/// though rust-bitcoin can: one whose unsigned transaction has no inputs,
+/// which `RawPsbt` counts by decoding it as a segwit transaction. The
+/// counts come from rust-bitcoin's parse.
+fn split_maps(bytes: &[u8], n_in: usize, n_out: usize) -> Option<RawPsbt> {
+    fn compact(b: &[u8], at: &mut usize) -> Option<u64> {
+        let first = *b.get(*at)?;
+        *at += 1;
+        let len = match first {
+            0xfd => 2,
+            0xfe => 4,
+            0xff => 8,
+            n => return Some(u64::from(n)),
+        };
+        let mut v = [0u8; 8];
+        v[..len].copy_from_slice(b.get(*at..*at + len)?);
+        *at += len;
+        Some(u64::from_le_bytes(v))
+    }
+    fn map(b: &[u8], at: &mut usize) -> Option<satd_psbt::raw::RawMap> {
+        let mut pairs = Vec::new();
+        loop {
+            let key_len = usize::try_from(compact(b, at)?).ok()?;
+            if key_len == 0 {
+                return Some(pairs.into_iter().collect());
+            }
+            let key = b.get(*at..at.checked_add(key_len)?)?;
+            *at += key_len;
+            let mut k = 0;
+            let key_type = compact(key, &mut k)?;
+            let value_len = usize::try_from(compact(b, at)?).ok()?;
+            let value = b.get(*at..at.checked_add(value_len)?)?;
+            *at += value_len;
+            pairs.push(satd_psbt::raw::RawPair::new(key_type, &key[k..], value));
+        }
+    }
+    let mut at = 5;
+    if bytes.get(..5)? != b"psbt\xff" {
+        return None;
+    }
+    let global = map(bytes, &mut at)?;
+    let inputs = (0..n_in).map(|_| map(bytes, &mut at)).collect::<Option<Vec<_>>>()?;
+    let outputs = (0..n_out).map(|_| map(bytes, &mut at)).collect::<Option<Vec<_>>>()?;
+    (at == bytes.len()).then_some(RawPsbt { global, inputs, outputs })
 }
 
 /// The unsigned transaction as Core's `decodepsbt` writes it: `TxToUniv`
@@ -430,7 +487,7 @@ pub(crate) fn final_script_sig_univ(script: &bitcoin::Script) -> Value {
     })
 }
 
-fn decode_psbt_v0(psbt: &Psbt, network: bitcoin::Network) -> Result<Value, (i32, String)> {
+fn decode_psbt_v0(psbt: &Psbt, raw: &RawPsbt, network: bitcoin::Network) -> Result<Value, (i32, String)> {
     let tx = &psbt.unsigned_tx;
     // Core's bytes, also for an unsigned transaction with no inputs, the
     // bytes the PSBT itself holds (`validation::decode`).
@@ -448,19 +505,6 @@ fn decode_psbt_v0(psbt: &Psbt, network: bitcoin::Network) -> Result<Value, (i32,
                     "scriptPubKey": script_univ(&utxo.script_pubkey, true, network),
                 });
             }
-            if !input.partial_sigs.is_empty() {
-                let sigs: Vec<Value> = input
-                    .partial_sigs
-                    .iter()
-                    .map(|(pk, sig)| {
-                        json!({
-                            "pubkey": pk.to_string(),
-                            "signature": hex::encode(sig.serialize()),
-                        })
-                    })
-                    .collect();
-                v["partial_signatures"] = json!(sigs);
-            }
             if let Some(ref script) = input.redeem_script {
                 v["redeem_script"] = script_univ(script, false, network);
             }
@@ -474,9 +518,12 @@ fn decode_psbt_v0(psbt: &Psbt, network: bitcoin::Network) -> Result<Value, (i32,
                 let items: Vec<String> = final_witness.iter().map(hex::encode).collect();
                 v["final_scriptwitness"] = json!(items);
             }
+            if let Some(map) = raw.inputs.get(i) {
+                psbt_fields::input_fields(map, &mut v, network);
+            }
+            // satd's own, beside Core's fields.
             v["has_utxo"] = json!(input.witness_utxo.is_some() || input.non_witness_utxo.is_some());
             v["is_final"] = json!(input.final_script_sig.is_some() || input.final_script_witness.is_some());
-            let _ = i; // suppress unused
             v
         })
         .collect();
@@ -484,7 +531,8 @@ fn decode_psbt_v0(psbt: &Psbt, network: bitcoin::Network) -> Result<Value, (i32,
     let outputs: Vec<Value> = psbt
         .outputs
         .iter()
-        .map(|output| {
+        .enumerate()
+        .map(|(i, output)| {
             let mut v = json!({});
             if let Some(ref script) = output.redeem_script {
                 v["redeem_script"] = script_univ(script, false, network);
@@ -492,24 +540,56 @@ fn decode_psbt_v0(psbt: &Psbt, network: bitcoin::Network) -> Result<Value, (i32,
             if let Some(ref script) = output.witness_script {
                 v["witness_script"] = script_univ(script, false, network);
             }
+            if let Some(map) = raw.outputs.get(i) {
+                psbt_fields::output_fields(map, &mut v);
+            }
             v
         })
         .collect();
 
-    Ok(json!({
+    let mut out = json!({
         "tx": tx_univ(tx, network),
+        // satd's own: the unsigned transaction's bytes.
         "tx_hex": tx_hex,
+        "psbt_version": 0,
         "inputs": inputs,
         "outputs": outputs,
-        // Core emits `fee` once every input's UTXO is present, and omits it
-        // otherwise. This was an unconditional `null`, so a fully-populated
-        // PSBT still reported no fee — the number a signer most wants before
-        // committing.
-        "fee": match psbt_fee(psbt) {
-            Some(fee) => format_amount(fee.to_sat(), default_unit()),
-            None => Value::Null,
-        },
-    }))
+    });
+    psbt_fields::global_fields(&raw.global, &mut out);
+    // Core writes `fee` only when every input's UTXO is known, and then as
+    // inputs minus outputs, negative if the outputs are more.
+    if let Some(fee) = decode_fee(psbt) {
+        out["fee"] = crate::rpc::amounts::format_signed_amount(fee, default_unit());
+    }
+    Ok(out)
+}
+
+/// `decodepsbt`'s `fee`, as Core's `DecodePSBT` computes it: every input's
+/// UTXO known (as [`total_input_value`] reads them), each amount and running
+/// total within `MoneyRange`, and inputs minus outputs, which may be
+/// negative.
+fn decode_fee(psbt: &Psbt) -> Option<i64> {
+    signed_fee(input_values(psbt)?, psbt.unsigned_tx.output.iter().map(|o| o.value))
+}
+
+/// Core's `MAX_MONEY`.
+const MAX_MONEY: Amount = Amount::from_sat(21_000_000 * 100_000_000);
+
+/// Inputs minus outputs, when each amount and each running total is within
+/// Core's `MoneyRange`.
+pub(crate) fn signed_fee(
+    inputs: impl IntoIterator<Item = Amount>,
+    outputs: impl IntoIterator<Item = Amount>,
+) -> Option<i64> {
+    fn sum(amounts: impl IntoIterator<Item = Amount>) -> Option<Amount> {
+        amounts.into_iter().try_fold(Amount::ZERO, |acc, a| {
+            let next = acc.checked_add(a)?;
+            (a <= MAX_MONEY && next <= MAX_MONEY).then_some(next)
+        })
+    }
+    let total_in = sum(inputs)?;
+    let total_out = sum(outputs)?;
+    Some(total_in.to_sat() as i64 - total_out.to_sat() as i64)
 }
 
 /// Total input value, when every input's UTXO is known.
@@ -520,7 +600,13 @@ fn decode_psbt_v0(psbt: &Psbt, network: bitcoin::Network) -> Result<Value, (i32,
 /// subset of the inputs is not a smaller truth, it is a wrong number on the
 /// one field a signer checks before committing funds.
 fn total_input_value(psbt: &Psbt) -> Option<Amount> {
-    let mut total = Amount::ZERO;
+    input_values(psbt)?.into_iter().try_fold(Amount::ZERO, |acc, v| acc.checked_add(v))
+}
+
+/// Each input's previous output value, when every one is known; see
+/// [`total_input_value`].
+fn input_values(psbt: &Psbt) -> Option<Vec<Amount>> {
+    let mut values = Vec::with_capacity(psbt.inputs.len());
     for (i, input) in psbt.inputs.iter().enumerate() {
         let prevout = psbt.unsigned_tx.input.get(i)?.previous_output;
         // Core's `PartiallySignedTransaction::GetInputUTXO` (`src/psbt.cpp`),
@@ -556,9 +642,9 @@ fn total_input_value(psbt: &Psbt) -> Option<Amount> {
             (None, Some(txout)) => txout.value,
             (None, None) => return None,
         };
-        total = total.checked_add(value)?;
+        values.push(value);
     }
-    Some(total)
+    Some(values)
 }
 
 /// The fee this PSBT pays, when it can be known: inputs minus outputs.
@@ -1077,87 +1163,115 @@ mod tests {
         assert!(out["estimated_feerate"].is_null(), "{out}");
     }
 
-    /// `decodepsbt` against Bitcoin Core v32.1's own answers
+    /// `decodepsbt` against Bitcoin Core v32.1's own answers: PSBTs its
+    /// wallet built with P2PKH, P2SH-P2WPKH, P2WPKH, P2WSH 2-of-2 and P2TR
+    /// inputs, at each stage from created to finalized
     /// (`testdata/core_v32_1_decodepsbt.json`, from
-    /// `gen_core_v32_1_decodepsbt.sh`): PSBTs its wallet built with P2PKH,
-    /// P2SH-P2WPKH, P2WPKH, P2WSH 2-of-2 and P2TR inputs, at each stage from
-    /// created to finalized, as version 0 and version 2.
+    /// `gen_core_v32_1_decodepsbt.sh`), and the same PSBTs with every field
+    /// its wallet does not write added (`core_v32_1_decodepsbt_fields.json`,
+    /// from `gen_core_v32_1_decodepsbt_fields.py`), as version 0 and
+    /// version 2.
     ///
-    /// Compared field for field: `tx` (Core's `TxToUniv`, version 0 only;
-    /// Core writes none for version 2, so satd's version 2 `tx` is checked
-    /// against Core's version 0 `tx` of the same transaction), every input's
-    /// `witness_utxo`, `redeem_script`, `witness_script`, `final_scriptSig`
-    /// and `final_scriptwitness`, every output's `redeem_script`,
-    /// `witness_script`, `amount` and `script`, and `fee`.
+    /// A version 0 answer is Core's exactly, less satd's own `tx_hex`,
+    /// `has_utxo` and `is_final`. A version 2 answer has every field Core
+    /// writes, with Core's value; the fields it adds are the version 2
+    /// ones `CORE_DIFFERENCES.md` lists, and its `tx`, which Core does not
+    /// write for version 2, is Core's version 0 `tx` of the same
+    /// transaction.
     #[test]
     fn decodepsbt_matches_core_v32_1() {
-        const CORE: &str = include_str!("testdata/core_v32_1_decodepsbt.json");
-        let core: Value = serde_json::from_str(CORE).unwrap();
-        let cases = core["decodepsbt"].as_object().unwrap();
-        assert!(cases.len() >= 50);
+        let mut cases = serde_json::Map::new();
+        for fixture in [
+            include_str!("testdata/core_v32_1_decodepsbt.json"),
+            include_str!("testdata/core_v32_1_decodepsbt_fields.json"),
+        ] {
+            let core: Value = serde_json::from_str(fixture).unwrap();
+            cases.extend(core["decodepsbt"].as_object().unwrap().clone());
+        }
+        assert!(cases.len() >= 60);
 
-        const INPUT_FIELDS: &[&str] =
-            &["witness_utxo", "redeem_script", "witness_script", "final_scriptSig", "final_scriptwitness"];
-        const OUTPUT_FIELDS: &[&str] = &["redeem_script", "witness_script", "amount", "script"];
-        let mut seen: std::collections::BTreeSet<String> = Default::default();
+        const V2_TOP: &[&str] = &[
+            "tx", "tx_hex", "locktime", "unique_id", "inputs_modifiable", "outputs_modifiable",
+            "has_sighash_single", "fallback_locktime", "silent_payments",
+        ];
+        const V2_INPUT: &[&str] =
+            &["has_utxo", "is_final", "required_time_locktime", "required_height_locktime", "sp_shares"];
         let mut core_v0_tx: std::collections::HashMap<String, Value> = Default::default();
-        for (name, case) in cases {
+        for (name, case) in &cases {
             if name.starts_with("v0_") {
                 let tx = &case["core"]["tx"];
                 core_v0_tx.insert(tx["txid"].as_str().unwrap().to_string(), tx.clone());
             }
         }
+        // Core's keys in `want` all appear in `got` with Core's value, and
+        // `got`'s others are among `extra`.
+        fn superset(name: &str, got: &Value, want: &Value, extra: &[&str]) {
+            let (g, w) = (got.as_object().unwrap(), want.as_object().unwrap());
+            for (k, v) in w {
+                assert_eq!(g.get(k), Some(v), "{name}: {k}");
+            }
+            for k in g.keys().filter(|k| !w.contains_key(*k)) {
+                assert!(extra.contains(&k.as_str()), "{name}: {k} is not Core's: {got}");
+            }
+        }
 
-        for (name, case) in cases {
+        let mut seen: std::collections::BTreeSet<String> = Default::default();
+        for (name, case) in &cases {
             let want = &case["core"];
-            let got = decode_psbt_for(case["psbt"].as_str().unwrap(), Some(bitcoin::Network::Regtest))
+            let mut got = decode_psbt_for(case["psbt"].as_str().unwrap(), Some(bitcoin::Network::Regtest))
                 .unwrap_or_else(|e| panic!("{name}: {e:?}"));
+            let (gi, wi) = (got["inputs"].as_array().unwrap(), want["inputs"].as_array().unwrap());
+            assert_eq!(gi.len(), wi.len(), "{name}");
+            for w in wi.iter().chain(want["outputs"].as_array().unwrap()) {
+                seen.extend(w.as_object().unwrap().keys().cloned());
+            }
+            seen.extend(want.as_object().unwrap().keys().cloned());
+            if want.get("fee").is_none() {
+                seen.insert("no fee".into());
+            }
             if name.starts_with("v0_") {
-                assert_eq!(got["tx"], want["tx"], "{name}: tx");
-            } else if got["tx"].is_object() {
+                let obj = got.as_object_mut().unwrap();
+                assert!(obj.remove("tx_hex").is_some(), "{name}");
+                for input in obj["inputs"].as_array_mut().unwrap() {
+                    let input = input.as_object_mut().unwrap();
+                    assert!(input.remove("has_utxo").is_some() && input.remove("is_final").is_some());
+                }
+                assert_eq!(&got, want, "{name}");
+                continue;
+            }
+            let top = |v: &Value| {
+                let mut v = v.clone();
+                let o = v.as_object_mut().unwrap();
+                o.remove("inputs");
+                o.remove("outputs");
+                v
+            };
+            superset(name, &top(&got), &top(want), V2_TOP);
+            for (i, (g, w)) in gi.iter().zip(wi).enumerate() {
+                superset(&format!("{name}: inputs[{i}]"), g, w, V2_INPUT);
+            }
+            let (go, wo) = (got["outputs"].as_array().unwrap(), want["outputs"].as_array().unwrap());
+            assert_eq!(go.len(), wo.len(), "{name}");
+            for (i, (g, w)) in go.iter().zip(wo).enumerate() {
+                superset(&format!("{name}: outputs[{i}]"), g, w, &["silent_payment"]);
+            }
+            if got["tx"].is_object() {
                 let txid = got["tx"]["txid"].as_str().unwrap();
                 if let Some(v0) = core_v0_tx.get(txid) {
                     assert_eq!(&got["tx"], v0, "{name}: version 2 tx");
                     seen.insert("v2 tx".into());
                 }
             }
-            if let Some(fee) = want.get("fee") {
-                assert_eq!(&got["fee"], fee, "{name}: fee");
-            }
-            let (gi, wi) = (got["inputs"].as_array().unwrap(), want["inputs"].as_array().unwrap());
-            assert_eq!(gi.len(), wi.len(), "{name}");
-            for (i, (g, w)) in gi.iter().zip(wi).enumerate() {
-                for f in INPUT_FIELDS {
-                    assert_eq!(g.get(*f), w.get(*f), "{name}: inputs[{i}].{f}");
-                    if w.get(*f).is_some() {
-                        seen.insert((*f).into());
-                    }
-                }
-            }
-            let (go, wo) = (got["outputs"].as_array().unwrap(), want["outputs"].as_array().unwrap());
-            assert_eq!(go.len(), wo.len(), "{name}");
-            for (i, (g, w)) in go.iter().zip(wo).enumerate() {
-                for f in OUTPUT_FIELDS {
-                    assert_eq!(g.get(*f), w.get(*f), "{name}: outputs[{i}].{f}");
-                    if w.get(*f).is_some() {
-                        seen.insert((*f).into());
-                    }
-                }
-            }
-            for spk in wi.iter().filter_map(|w| w["witness_utxo"]["scriptPubKey"]["type"].as_str()) {
-                seen.insert(spk.into());
-            }
-            if wi.iter().any(|w| {
-                w["final_scriptSig"]["asm"].as_str().is_some_and(|a| a.contains("[SINGLE|ANYONECANPAY]"))
-            }) {
-                seen.insert("sighash decode".into());
-            }
         }
         // The corpus covers what it claims to.
         for f in [
-            "witness_utxo", "redeem_script", "witness_script", "final_scriptSig",
-            "final_scriptwitness", "script", "witness_v0_keyhash", "witness_v0_scripthash",
-            "witness_v1_taproot", "scripthash", "sighash decode", "v2 tx",
+            "witness_utxo", "non_witness_utxo", "partial_signatures", "sighash", "redeem_script",
+            "witness_script", "bip32_derivs", "final_scriptSig", "final_scriptwitness",
+            "ripemd160_preimages", "sha256_preimages", "hash160_preimages", "hash256_preimages",
+            "taproot_key_path_sig", "taproot_script_path_sigs", "taproot_scripts",
+            "taproot_bip32_derivs", "taproot_internal_key", "taproot_merkle_root",
+            "musig2_participant_pubkeys", "musig2_pubnonces", "musig2_partial_sigs", "proprietary",
+            "unknown", "global_xpubs", "taproot_tree", "script", "amount", "fee", "no fee", "v2 tx",
         ] {
             assert!(seen.contains(f), "the corpus has no {f}");
         }
