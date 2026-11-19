@@ -130,8 +130,23 @@ fn headers_past_max_headers_results_are_misbehaviour() {
     let (pm, _dir) = mk_pm();
     let genesis = pm.chain_state.get_block_index(&pm.chain_state.tip_hash()).unwrap().header;
 
+    // 2000 headers that link up and meet their own proof of work, which
+    // Core's `CheckHeadersPoW` asks of any message that size.
+    let mut parent = pm.chain_state.tip_hash();
+    let chain: Vec<bitcoin::block::Header> = (0..2000u32)
+        .map(|i| {
+            let mut h = genesis;
+            h.prev_blockhash = parent;
+            h.time = genesis.time + 1 + i;
+            while crate::validation::pow::check_proof_of_work(&h).is_err() {
+                h.nonce += 1;
+            }
+            parent = h.block_hash();
+            h
+        })
+        .collect();
     let _rx = add_peer(&pm, 1, addr(1), 8);
-    deliver(&pm, 1, NetworkMessage::Headers(vec![genesis; 2000]));
+    deliver(&pm, 1, NetworkMessage::Headers(chain));
     assert!(connected(&pm, 1), "2000 headers are allowed");
 
     let _rx = add_peer(&pm, 2, addr(2), 8);

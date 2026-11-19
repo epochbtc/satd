@@ -41,6 +41,25 @@ pipeline that keeps the network, the disk, and the CPU busy at the same time.
 Network I/O, block pre-processing, script verification, and chainstate writes
 overlap instead of running one after another.
 
+### Header presync
+
+As in Bitcoin Core, a header chain is stored only once it has shown enough
+work: the larger of the network's minimum chain work (`-minimumchainwork`
+overrides it) and the tip's work less 144 blocks' worth. A `headers` message
+below that is ignored if it is not full. A full one starts a *presync* with
+the peer: the headers are checked and their work summed, and only a salted
+one-bit commitment every few hundred headers is kept. Once the chain reaches
+the threshold, the node downloads the same headers again, checks them
+against the commitments, and stores them. A fresh node therefore downloads
+the header chain twice. `getpeerinfo` reports a presync's height as
+`presynced_headers`, and the log shows `Pre-synchronizing blockheaders,
+height: N (~P%)` during IBD. Headers from a `noban` peer skip the check.
+
+If the clock is more than two hours behind the block a presync would start
+from, the node logs `Failure when attempting to initiate headers sync:
+System clock is more than 120 minutes behind chain start MTP` and shuts down
+cleanly. Core aborts at this point.
+
 ## AssumeUTXO fast sync
 
 AssumeUTXO makes a node usable in minutes instead of days. The node loads a

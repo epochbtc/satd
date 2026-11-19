@@ -116,6 +116,22 @@ pub fn make_getheaders_after(chain_state: &ChainState, last: BlockHash) -> Netwo
     }
 }
 
+/// The `getheaders` a headers presync sends next: Core's
+/// `HeadersSyncState::NextHeadersRequestLocator`, `first` (the last header
+/// the sync took) and then the locator of the block the peer's chain builds
+/// on, `chain_start`, which is in the index.
+pub fn make_headers_sync_getheaders(chain_state: &ChainState, first: BlockHash, chain_start: BlockHash) -> NetworkMessage {
+    let mut locator = vec![first];
+    match build_locator_for_branch(chain_state, chain_start) {
+        Some(rest) => locator.extend(rest),
+        None => locator.extend(build_locator(chain_state)),
+    }
+    NetworkMessage::GetHeaders(GetHeadersMessage::new(
+        locator,
+        BlockHash::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array([0u8; 32])),
+    ))
+}
+
 /// Create a GetHeaders message using the current chain state.
 pub fn make_getheaders(chain_state: &ChainState) -> NetworkMessage {
     let locator = build_locator(chain_state);

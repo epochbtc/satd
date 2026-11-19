@@ -130,3 +130,40 @@ fn testnet_min_difficulty_rule_does_not_overflow() {
         assert_eq!(bits.to_consensus(), TESTNET_POWLIMIT_BITS, "{network:?}: after 20 minutes, minimum difficulty");
     }
 }
+
+/// Core's `PermittedDifficultyTransition`: off a retarget boundary the bits
+/// may not change; on one the target may move by at most a factor of four,
+/// capped at the proof-of-work limit; networks with minimum-difficulty
+/// blocks are not checked.
+#[test]
+fn permitted_difficulty_transition_follows_core() {
+    let old = 0x1b04_04cb;
+    assert!(permitted_difficulty_transition(Network::Bitcoin, 2017, old, old));
+    assert!(!permitted_difficulty_transition(Network::Bitcoin, 2017, old, 0x1b04_04cc), "off a boundary");
+
+    // On a boundary: the target times four, then a quarter, in compact form.
+    let old_target = target_from_compact(CompactTarget::from_consensus(old));
+    let scaled = |num: u32, den: u32| {
+        let t = crate::storage::blockindex::div_u256_u32(
+            &crate::storage::blockindex::mul_u256_u32(&old_target, num),
+            den,
+        );
+        compact_from_target(&t)
+    };
+    let easiest = scaled(4, 1);
+    let hardest = scaled(1, 4);
+    assert!(permitted_difficulty_transition(Network::Bitcoin, 4032, old, easiest));
+    assert!(permitted_difficulty_transition(Network::Bitcoin, 4032, old, hardest));
+    assert!(!permitted_difficulty_transition(Network::Bitcoin, 4032, old, easiest + 1), "easier than x4");
+    assert!(!permitted_difficulty_transition(Network::Bitcoin, 4032, old, hardest - 1), "harder than /4");
+
+    // At the limit the target cannot get easier.
+    assert!(permitted_difficulty_transition(Network::Bitcoin, 4032, 0x1d00_ffff, 0x1d00_ffff));
+    assert!(!permitted_difficulty_transition(Network::Bitcoin, 4032, 0x1d00_ffff, 0x1d01_fffe));
+
+    // Signet is checked; the min-difficulty networks are not.
+    assert!(!permitted_difficulty_transition(Network::Signet, 1, 0x1e03_77ae, 0x1d00_ffff));
+    for n in [Network::Testnet, Network::Testnet4, Network::Regtest] {
+        assert!(permitted_difficulty_transition(n, 1, 0x1e03_77ae, 0x1d00_ffff));
+    }
+}
