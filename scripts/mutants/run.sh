@@ -62,6 +62,10 @@ SCOPE_FILE="$MUTANTS_OUT/scope"
 
 # The consensus-critical scope of the nightly run: script and transaction
 # evaluation, block validation and connection, chain state, and the mempool.
+# The report job in .github/workflows/mutants.yml checks out only these
+# directories (and scripts/mutants): widen its sparse-checkout with them, or
+# report.py cannot read a new directory's lines and reports every mutant in
+# it as new.
 NIGHTLY_GLOBS=(
     'consensus/src/**'
     'node/src/validation/**'

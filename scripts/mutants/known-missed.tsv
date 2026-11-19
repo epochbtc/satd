@@ -1,0 +1,77 @@
+# Missed mutants a person has judged, so the nightly report can set them
+# apart from new ones. scripts/mutants/report.py reads this file.
+#
+# kind: "equivalent" (the mutant cannot change any result, so no test can
+# catch it) or "elsewhere" (a test outside the mutated crate catches it,
+# usually a satd/tests integration test, which cargo-mutants does not run).
+#
+# A row names a mutant by its source line rather than its line number, so it
+# survives code moving above it: file, the line's text with its indentation
+# trimmed, the mutant's column in that trimmed text, and the mutation as
+# cargo-mutants describes it after the location. When the line itself
+# changes the row stops matching and the mutant is reported as new again,
+# for a person to judge afresh; the report lists rows that match no line.
+# A row must name exactly one mutant (check with `cargo mutants --list` on
+# its file). The report never matches a mutant whose line text appears more
+# than once in its function, so a copy of a known line added later is
+# reported as new rather than hidden by the row. For a mutant outside any
+# function (a constant, say) the line must be unique in its file.
+#
+# Tab-separated: file, column, mutation, kind, why, line.
+consensus/src/encoding.rs	22	replace | with ^ in check_signature_encoding	equivalent	DERSIG, LOW_S and STRICTENC are distinct single bits, so | and ^ agree.	flags::VERIFY_DERSIG | flags::VERIFY_LOW_S | flags::VERIFY_STRICTENC,
+consensus/src/encoding.rs	1	replace | with ^ in find_and_delete_exact	equivalent	b0 | b1 << 8: the operands sit in different bytes.	| ((script[pc + 1] as usize) << 8)
+consensus/src/eval.rs	1	replace | with ^ in read_instruction	equivalent	Byte-disjoint OR of a push length.	| ((script[*pc + 1] as usize) << 8)
+consensus/src/eval.rs	8	replace < with <= in eval_script	equivalent	OP_MIN: when the two numbers are equal, either is the result.	if bn1 < bn2 {
+consensus/src/flags.rs	1	replace | with ^	equivalent	A union of distinct single-bit flags; a flags test pins the value.	| VERIFY_DERSIG
+consensus/src/flags.rs	1	replace | with ^	equivalent	A union of distinct single-bit flags; a flags test pins the value.	| VERIFY_NULLDUMMY
+consensus/src/scriptnum.rs	15	replace > with == in ScriptNum::getint	equivalent	Every caller decodes at most 4 bytes, so the value never leaves the i32 range.	if self.value > i32::MAX as i64 {
+consensus/src/scriptnum.rs	15	replace > with >= in ScriptNum::getint	equivalent	Every caller decodes at most 4 bytes, so the value never leaves the i32 range.	if self.value > i32::MAX as i64 {
+consensus/src/scriptnum.rs	22	replace < with <= in ScriptNum::getint	equivalent	Every caller decodes at most 4 bytes, so the value never leaves the i32 range.	} else if self.value < i32::MIN as i64 {
+consensus/src/scriptnum.rs	22	replace < with == in ScriptNum::getint	equivalent	Every caller decodes at most 4 bytes, so the value never leaves the i32 range.	} else if self.value < i32::MIN as i64 {
+consensus/src/sighash.rs	27	replace | with ^ in TxSignatureChecker<'a>::taproot_sighash	equivalent	ext_flag << 1 is 0 or 2 and the annex bit 0 or 1: disjoint.	e.input(&[(ext_flag << 1) | u8::from(exec_data.annex_present)]);
+consensus/src/sighash.rs	40	replace | with ^ in <impl SignatureChecker for TxSignatureChecker<'_>>::check_sequence	equivalent	The type flag (1 << 22) and the 16-bit mask are disjoint.	let mask = SEQUENCE_LOCKTIME_TYPE_FLAG | SEQUENCE_LOCKTIME_MASK;
+consensus/src/sighash.rs	1	replace | with ^ in remove_codeseparators	equivalent	Byte-disjoint OR of a push length.	| ((script[pc + 1] as usize) << 8)
+consensus/src/verify.rs	29	replace | with ^ in is_push_only	equivalent	Byte-disjoint OR of a push length.	let n = script[pc] as usize | ((script[pc + 1] as usize) << 8);
+consensus/src/verify.rs	1	replace | with ^ in is_push_only	equivalent	Byte-disjoint OR of a push length.	| ((script[pc + 1] as usize) << 8)
+consensus/src/verify.rs	1	replace | with ^ in is_push_only	equivalent	Byte-disjoint OR of a push length.	| ((script[pc + 2] as usize) << 16)
+consensus/src/verify.rs	1	replace | with ^ in is_push_only	equivalent	Byte-disjoint OR of a push length.	| ((script[pc + 3] as usize) << 24);
+node/src/validation/pow.rs	1	replace set_regtest_bip94 -> Result<(), &'static str> with Ok(())	elsewhere	satd/tests/regtest.rs test_bip94_refuses_a_timewarp_block_on_regtest_only_when_asked.	REGTEST_BIP94.set(()).map_err(|_| "regtest BIP 94 already set")
+node/src/validation/script.rs	1	replace | with ^	equivalent	A union of distinct single-bit flags; a script.rs test pins the value.	| VERIFY_NULLFAIL
+node/src/validation/script.rs	1	replace | with ^	equivalent	A union of distinct single-bit flags; a script.rs test pins the value.	| VERIFY_WITNESS_PUBKEYTYPE
+node/src/validation/script.rs	1	delete match arm KernelError::ScriptVerify(ScriptVerifyError::Invalid) in kernel_error_name	equivalent	The arm returns ERR_SCRIPT, the same string as the fallback arm.	KernelError::ScriptVerify(ScriptVerifyError::Invalid) => "ERR_SCRIPT",
+node/src/chain/state.rs	25	replace match guard entry.num_tx > 0 with true in ChainState::prune_up_to	equivalent	The prune plan only collects Invalid entries with num_tx > 0.	BlockStatus::Invalid if entry.num_tx > 0 => {
+node/src/chain/state.rs	30	delete ! in <impl node_sp_index::SpIndex for ChainState>::is_complete	elsewhere	satd/tests/opreturn_strip.rs esplora_and_electrum_read_a_stripped_block_through_its_record.	if !self.sp_index.enabled || !self.store.silent_payment_index_complete() {
+node/src/chain/state.rs	1	replace ReplayHashes::script_skip_txs -> Option<&std::collections::HashSet<usize>> with None	elsewhere	satd/tests/opreturn_strip.rs a_stripped_chain_replays_to_the_same_chainstate.	self.stripped.as_ref().map(|s| &s.script_skip_txs)
+node/src/chain/state.rs	1	replace ChainState::set_mempool with ()	elsewhere	satd/tests/mempool_rpc.rs a_reorg_keeps_a_returned_child_over_cheaper_mempool_spenders.	let _ = self.mempool.set(mempool);
+node/src/chain/state.rs	1	replace ChainState::verification_progress -> f64 with 0.0	elsewhere	satd/tests/regtest.rs verificationprogress_matches_bitcoin_core.	use crate::chain::verification_progress as vp;
+node/src/chain/state.rs	1	replace ChainState::is_assumevalid_active -> bool with true	equivalent	Its only consumer, the block prefetcher, ignores the value.	!matches!(self.assumevalid, AssumeValid::Disabled)
+node/src/chain/state.rs	29	replace < with <= in ChainState::connector_scan_due	equivalent	Differs only at exactly 30 s elapsed, which no test can hit.	&& now.duration_since(when) < Self::CONNECTOR_SCAN_INTERVAL =>
+node/src/mempool/clusters.rs	17	replace == with != in <impl PartialEq for Best>::eq	equivalent	The heap orders Best by Ord; nothing compares Best with ==.	self.cmp(other) == Ordering::Equal
+node/src/mempool/clusters.rs	1	replace <impl PartialEq for Best>::eq -> bool with false	equivalent	The heap orders Best by Ord; nothing compares Best with ==.	self.cmp(other) == Ordering::Equal
+node/src/mempool/clusters.rs	1	replace <impl PartialEq for Best>::eq -> bool with true	equivalent	The heap orders Best by Ord; nothing compares Best with ==.	self.cmp(other) == Ordering::Equal
+node/src/mempool/estimate.rs	1	replace Confidence::as_str -> &'static str with ""	elsewhere	satd/tests/regtest.rs test_estimatefees_default_shape.	match self {
+node/src/mempool/estimate.rs	1	replace EstimateSource::as_str -> &'static str with ""	elsewhere	satd/tests/regtest.rs estimatesmartfee_has_cores_32_1_shape.	match self {
+node/src/mempool/estimate.rs	1	replace EstimateSource::as_str -> &'static str with "xyzzy"	elsewhere	satd/tests/regtest.rs estimatesmartfee_has_cores_32_1_shape.	match self {
+node/src/mempool/fee.rs	62	replace - with + in FeeEstimator::estimate_fee	equivalent	len * p / 100 < len for p <= 90, so the .min(len - 1) never binds.	let idx = (sorted.len() * percentile / 100).min(sorted.len() - 1);
+node/src/mempool/fee.rs	62	replace - with / in FeeEstimator::estimate_fee	equivalent	len * p / 100 < len for p <= 90, so the .min(len - 1) never binds.	let idx = (sorted.len() * percentile / 100).min(sorted.len() - 1);
+node/src/mempool/health.rs	1	replace HealthWindow::clear with ()	elsewhere	satd/tests/regtest.rs the_mempool_health_window_persists_and_clears_without_the_mempool.	self.blocks.clear();
+node/src/mempool/policy_engine.rs	1	replace leaf_script -> &'a[u8] with Vec::leak(vec![0])	elsewhere	satd/tests/policy.rs layer_a_ordinals_quarantined and layer_a_atomicals_quarantined.	let w = &input.witness;
+node/src/mempool/policy_engine.rs	1	replace leaf_script -> &'a[u8] with Vec::leak(Vec::new())	elsewhere	satd/tests/policy.rs layer_a_ordinals_quarantined and layer_a_atomicals_quarantined.	let w = &input.witness;
+node/src/mempool/policy_engine.rs	1	replace output_is_dust -> bool with false	elsewhere	satd/tests/policy.rs layer_a_dust_storm_quarantined.	if out.script_pubkey.is_op_return() {
+node/src/mempool/policy_engine.rs	15	replace && with || in output_is_dust	equivalent	With a zero threshold, value < 0 is false for a u64 either way.	threshold > 0 && out.value.to_sat() < threshold
+node/src/mempool/pool.rs	1	replace Mempool::open_health with ()	elsewhere	satd/tests/regtest.rs the_mempool_health_window_persists_and_clears_without_the_mempool.	self.health.lock().open(net_datadir, tip);
+node/src/mempool/pool.rs	27	replace > with >= in Mempool::reapply_policy	equivalent	At equality the overflow is 0, and evicting 0 bytes evicts nothing.	if inner.quarantine_bytes > cfg.quarantine_max_bytes {
+node/src/mempool/pool.rs	13	replace > with >= in Mempool::accept_transaction_unexpired	equivalent	With locktime 0 the cutoff is at least 1, so both forms are false.	if locktime > 0
+node/src/mempool/pool.rs	11	delete ! in Mempool::accept_transaction_unexpired	elsewhere	satd/tests/compact_blocks.rs compact_block_reconstructs_from_the_extra_pool_after_rbf.	} else if !replaced_txs.is_empty()
+node/src/mempool/pool.rs	48	replace > with >= in Mempool::rbf_improves_diagram	equivalent	Only adds the two-transaction cluster case, where both chunkings agree.	&& Self::relatives_capped(inner, &parent, 1).1 > 1
+node/src/mempool/pool.rs	40	replace - with / in Mempool::vsize_bucket	equivalent	The buckets cover every size, so the fallback is unreachable.	.unwrap_or(MEMPOOL_VSIZE_BUCKETS.len() - 1)
+node/src/mempool/pool.rs	42	replace += with *= in Mempool::summary	elsewhere	satd/tests/regtest.rs getmempoolsummary_agrees_with_getrawmempool_verbose.	counts[Self::vsize_bucket(vsize as u64)] += 1;
+node/src/mempool/pool.rs	34	replace + with * in Mempool::summary	elsewhere	satd/tests/regtest.rs getmempoolsummary_agrees_with_getrawmempool_verbose.	descendantcount: descendantcount + 1,
+node/src/mempool/pool.rs	13	replace > with >= in Mempool::test_prechecks	equivalent	With locktime 0 the cutoff is at least 1, so both forms are false.	if locktime > 0
+node/src/mempool/pool.rs	48	replace < with > in Mempool::test_prechecks	elsewhere	satd/tests/bytespersigop.rs the_vsize_is_sigop_adjusted_by_the_configured_bytes_per_sigop.	if coin.coinbase && spend_height - coin.height < COINBASE_MATURITY {
+node/src/mempool/pool.rs	13	replace > with >= in Mempool::test_prechecks	equivalent	A u64 fee is never below 0.	if required > 0 && effective_fee < required && !replacing {
+node/src/mempool/pool.rs	1	replace && with || in Mempool::accept_package_from	equivalent	Only gates a loop that checks the same condition per member.	&& ptx
+node/src/mempool/truc.rs	57	replace + with * in single_truc_checks	equivalent	The ancestor count stops at its cap, and any count >= 2 already fails.	if view.ancestor_count(parent_txid, TRUC_ANCESTOR_LIMIT + 1) + 1 > TRUC_ANCESTOR_LIMIT {
+node/src/mempool/truc.rs	52	replace + with - in package_truc_checks	equivalent	With a mempool parent, the single-transaction TRUC check refuses first.	&& view.ancestor_count(parent, TRUC_ANCESTOR_LIMIT + 1) + in_package_parents.len() + 1
+node/src/mempool/truc.rs	52	replace + with * in package_truc_checks	equivalent	With a mempool parent, the single-transaction TRUC check refuses first.	&& view.ancestor_count(parent, TRUC_ANCESTOR_LIMIT + 1) + in_package_parents.len() + 1
+node/src/mempool/truc.rs	57	replace + with * in package_truc_checks	equivalent	With a mempool parent, the single-transaction TRUC check refuses first.	&& view.ancestor_count(parent, TRUC_ANCESTOR_LIMIT + 1) + in_package_parents.len() + 1

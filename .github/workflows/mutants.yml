@@ -231,10 +231,16 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
+      # The sources too: the report reads the mutated lines to match them
+      # against scripts/mutants/known-missed.tsv. Keep these in step with
+      # NIGHTLY_GLOBS in scripts/mutants/run.sh.
       - name: Checkout sources
         uses: actions/checkout@v7
         with:
-          sparse-checkout: scripts/mutants
+          sparse-checkout: |
+            scripts/mutants
+            consensus/src
+            node/src
 
       # Not fatal: when no part uploaded anything, `merge` still says so.
       # Merged, because each artifact holds its own mutants-part-<j>
