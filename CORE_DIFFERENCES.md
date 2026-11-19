@@ -913,6 +913,22 @@ silently returning an empty or wrong answer.
   reconsiders an orphan when a block confirms one of its parents; Core
   reconsiders orphans only when a parent enters the mempool.
 
+- **Order of a block's checks** — Core's `CheckBlock` (`src/validation.cpp`)
+  runs `CheckTransaction` on every transaction straight after the coinbase
+  checks and before the legacy sigop count; `ContextualCheckBlock` then
+  checks the finality of every transaction, the BIP 34 coinbase height, the
+  witness commitment and the weight, in that order. satd runs the merkle,
+  size, coinbase, sigop, witness and weight checks first, then goes through
+  the transactions one at a time: `CheckTransaction`, finality, and for the
+  coinbase the BIP 34 height. Every block gets Core's verdict, but a block
+  with two faults can be refused for a different one: a block over the
+  sigop limit that also holds a transaction with no inputs is
+  `bad-txns-vin-empty` in Core and `bad-blk-sigops` in satd, and a coinbase
+  with the wrong height followed by such a transaction is
+  `bad-txns-vin-empty` in Core and `bad-cb-height` in satd. Only a caller
+  that reads the reason sees it: `submitblock`, a `getblocktemplate`
+  proposal, the log.
+
 - **`getblockchaininfo.size_on_disk`** — Core's figure is `blk*.dat` plus
   `rev*.dat`. satd keeps undo data in RocksDB rather than in `rev*` files, so
   its number is the block files alone and is smaller than Core's for the same
@@ -1083,6 +1099,7 @@ default behavior set the corresponding flag.
 | `sendheaders` to an outbound peer | once the peer has shown a block past the minimum chain work (`MaybeSendSendHeaders`) | in the handshake | satd answers a block `inv` with a `getdata` for the block before it has the header, where Core sends `getheaders`, so a peer that mines while satd syncs from it would hand it blocks out of order until header announcements start. Inbound peers are sent it on Core's condition, and every peer at most once. |
 | A block whose parent is unknown | refused as `prev-blk-not-found`, nothing kept, and the sender discouraged (`MaybePunishNodeForBlock`) | kept until its parent connects if this node asked for it, otherwise dropped; the sender is asked for headers and not penalised | Because a block `inv` is answered with a `getdata` (row above), a block the node asked for can arrive before the parent it is still learning about, and keeping it saves fetching it again. A kept block must carry valid proof of work within the network's limit and be at most 4,000,000 bytes; at most 4 are kept per peer and 64 (32 MB) in all, the oldest going first, each for at most 5 minutes. |
 | Compact block reconstructions per block | at most three, unless we requested the block from the sender | at most three, always | satd's tip-following fetch asks every peer for a missing block, so Core's "requested from this peer" exemption would cover nearly every peer. The full block that request asked for still arrives; a sender we asked for a `cmpctblock` is asked for the full block instead. |
+| Refused relayed transactions kept for compact-block reconstruction (`-blockreconstructionextratxn`) | every first-time refusal under 100 kB except a witness-stripped one (`TxDownloadManagerImpl::MempoolRejectedTx`) | the same, except a transaction that fails the consensus script flags or spends more than its inputs is not kept | Such a transaction can only fill a slot in a block that is itself invalid, so keeping it buys nothing and lets invalid relay push useful entries out of the 100-slot pool. It changes which entries the pool holds, never which blocks are accepted. |
 | WebSocket upgrade by an `-rpcwhitelist`-restricted user | not applicable (Core serves no WebSocket) | refused with HTTP 403 | satd's JSON-RPC listeners accept WebSocket, and calls over an open WebSocket do not pass the layer that checks a user's method list, so a restricted user may not open one. Unrestricted users, and bearer tokens (scoped by their capabilities, not by `-rpcwhitelist`), are unaffected. `-rpcdisableauth` cannot be combined with an allowlist: that surface authenticates no user to restrict. |
 | `-txospenderindex` | a background index of its own | the address index's spend rows; needs `--addressindex` (on by default) | No second index to build or store. Those rows follow the active chain as blocks connect and disconnect, so after `invalidateblock` `gettxspendingprevout` stops naming a spender in the disconnected block at once; Core's index still names it until the next block connects and the index rewinds. |
 | `--listenonion` | on (no-op without Tor) | off (on if `-torcontrol` set) | Core defaults it on, but it's a silent no-op unless a Tor control port is reachable; satd defaults it off to avoid dialing the control port on every boot. When on, satd creates a v3 hidden service via `-torcontrol` (default `127.0.0.1:9051`). An explicit `-torcontrol` implies `-listenonion=1`; `-listenonion=0` forces it off. |

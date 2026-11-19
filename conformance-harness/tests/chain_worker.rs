@@ -112,3 +112,65 @@ fn the_refused_header_index_counts_known_headers() {
     assert_eq!(out[1]["result"], json!("invalid"), "{}", out[1]);
     assert_eq!(out[1]["index"], json!(1), "{}", out[1]);
 }
+
+/// `version | 00 00 | lock_time` is read as Core's `UnserializeTransaction`
+/// reads it: a transaction with no inputs, refused by `CheckTransaction` as
+/// `bad-txns-vin-empty`, not a decode failure (#1242; the `custom` suite's
+/// "ten-byte empty transaction"). A block holding it after its coinbase is
+/// refused for the same reason, by either path.
+#[test]
+fn a_transaction_with_no_inputs_is_refused_by_check_transaction() {
+    use bitcoin::consensus::serialize;
+    use bitcoin::hashes::Hash as _;
+
+    const EMPTY: [u8; 10] = [2, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    let out = run(&[json!({"op": "tx_check", "tx": hex::encode(EMPTY)})]);
+    assert_eq!(out[0]["valid"], json!(false), "{}", out[0]);
+    assert_eq!(out[0]["reason"], json!("bad-txns-vin-empty"), "{}", out[0]);
+
+    // Height 1 on regtest genesis: BIP 34 height push, then a pad byte.
+    let coinbase = bitcoin::Transaction {
+        version: bitcoin::transaction::Version::TWO,
+        lock_time: bitcoin::absolute::LockTime::ZERO,
+        input: vec![bitcoin::TxIn {
+            previous_output: bitcoin::OutPoint::null(),
+            script_sig: bitcoin::ScriptBuf::from_bytes(vec![0x51, 0x00]),
+            sequence: bitcoin::Sequence::MAX,
+            witness: bitcoin::Witness::new(),
+        }],
+        output: vec![bitcoin::TxOut {
+            value: bitcoin::Amount::from_sat(50 * 100_000_000),
+            script_pubkey: bitcoin::ScriptBuf::from_bytes(vec![0x51]),
+        }],
+    };
+    let genesis = bitcoin::constants::genesis_block(bitcoin::Network::Regtest);
+    let time = genesis.header.time + 600;
+    let mut header = bitcoin::block::Header {
+        version: bitcoin::block::Version::from_consensus(0x2000_0000),
+        prev_blockhash: genesis.block_hash(),
+        merkle_root: bitcoin::merkle_tree::calculate_root(
+            [coinbase.compute_txid(), bitcoin::Txid::hash(&EMPTY)].into_iter().map(bitcoin::TxMerkleNode::from),
+        )
+        .unwrap(),
+        time,
+        bits: genesis.header.bits,
+        nonce: 0,
+    };
+    while header.validate_pow(header.target()).is_err() {
+        header.nonce += 1;
+    }
+    let mut raw = serialize(&header);
+    raw.push(2);
+    raw.extend(serialize(&coinbase));
+    raw.extend_from_slice(&EMPTY);
+    let block = hex::encode(raw);
+
+    let reset = json!({"op": "chain_reset", "network": "regtest"});
+    let process = |via: &str| json!({"op": "chain_process_block", "block": block, "via": via, "now": time + 1});
+    let out = run(&[reset.clone(), process("p2p"), reset, process("rpc")]);
+    for r in [&out[1], &out[3]] {
+        assert_eq!(r["result"], json!("invalid"), "{r}");
+        assert_eq!(r["reason"], json!("bad-txns-vin-empty"), "{r}");
+        assert_eq!(r["height"], json!(0), "{r}");
+    }
+}

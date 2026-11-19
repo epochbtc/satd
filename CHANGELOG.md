@@ -20,6 +20,7 @@ It includes every fix shipped in 0.7.1:
 - Consensus: `-test=bip94` enforces BIP 94's timewarp rule on regtest, as in Core (#1245).
 - Consensus: P2SH, WITNESS and TAPROOT are on for every block except Core's three exception blocks, as in Core, instead of from activation heights; main-chain verdicts are unchanged (#1244, #724).
 - Consensus: the Rust engine reports a tapscript push past the script's end as `BAD_OPCODE`, as Core does; verdicts are unchanged.
+- Consensus: transactions are decoded as Core decodes them: `version | 00 00 | lock_time` is a transaction with no inputs, refused as `bad-txns-vin-empty` where satd refused the bytes, and a witness flag with no inputs is a decode failure; verdicts are unchanged (#1242). Such a transaction is written, measured and hashed as Core does (`createrawtransaction` with no inputs returns Core's bytes), `submitpackage` refuses it as `conflict-in-package`, and the RPCs that take a transaction give Core's decode-failure messages.
 - Dependencies: `rmcp` 3.9.0 (RUSTSEC-2026-0457, -0462; client features satd does not build); MCP requests are capped at 4 MiB.
 - RPC: any request `Content-Type` is read as JSON, as in Core (#824).
 - RPC: `invalidateblock`, `reconsiderblock` and `preciousblock` go on to the next-best valid chain, as in Core (#1261).
@@ -114,6 +115,7 @@ It includes every fix shipped in 0.7.1:
 - RPC: `getmempoolentry`, `getrawmempool true` and `getmempoolancestors`/`getmempooldescendants true` report Core v31's `chunkweight` and `fees.chunk` (#1068).
 - RPC: `getnetworkinfo` reports `version` 320000 (Bitcoin Core v32), up from 280000, so clients with a Core v29 or v31 floor (Bark, Eclair) start (#1068).
 - P2P: `-maxconnections` above 2000 is lowered to 2000 with a warning, as in Core v32.1 (#1295).
+- P2P: a peer is no longer penalised for a transaction it relays, as in Core v30 and later; satd charged 10 points for a script failure or an overspend and 1 for an oversized orphan, so ten such transactions disconnected or banned the peer.
 - P2P: at startup satd raises its soft file-descriptor limit and fits `-maxconnections` to it with Core's warning, shrinks caps left at their defaults to fit what is left, or refuses to start with "Not enough file descriptors available." when the fixed needs and the caps the operator set do not fit (#1294).
 
 ## Releases
