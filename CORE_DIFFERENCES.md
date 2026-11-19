@@ -996,6 +996,13 @@ silently returning an empty or wrong answer.
   at zero; these two fields do not, so for such a transaction the chunk
   they report can be larger than the one the order lists.
 
+- **`getmempoolcluster` and `getmempoolfeeratediagram`** — from that
+  same fresh linearization, with signed fees as the chunk fields have, so
+  a chunk a negative `prioritisetransaction` delta takes below zero is
+  reported negative, as Core reports it, and the diagram's cumulative fee
+  can fall. On a tangled cluster the chunks, and so the diagram's points,
+  can differ from Core's; on chains and other simple clusters they agree.
+
 - **`getindexinfo` / `getsatdindexinfo`: `txindex.synced`** — reports whether
   `-txindex` is on, not whether the index covers the whole chain. satd writes
   txindex entries inline during `connect_block`, so with the flag set the index

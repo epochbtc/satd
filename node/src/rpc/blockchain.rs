@@ -1932,6 +1932,48 @@ pub fn get_mempool_descendants(
     }
 }
 
+/// `getmempoolcluster <txid>` — Core's (`clusterToJSON`,
+/// src/rpc/mempool.cpp): the cluster's sigop-adjusted weight, its
+/// transaction count, and its chunks in linearization order, each with its
+/// modified fee (signed), weight and txids.
+pub fn get_mempool_cluster(mempool: &Mempool, txid_str: &str) -> Result<Value, (i32, String)> {
+    let txid: bitcoin::Txid = crate::rpc::util::parse_hash_v(txid_str, "txid")?;
+    let chunks = mempool
+        .mempool_cluster(&txid)
+        .ok_or_else(|| (-5, "Transaction not in mempool".to_string()))?;
+    let unit = crate::rpc::amounts::default_unit();
+    let weight: i64 = chunks.iter().map(|(_, ff)| ff.size).sum();
+    let count: usize = chunks.iter().map(|(txs, _)| txs.len()).sum();
+    let chunks: Vec<Value> = chunks
+        .into_iter()
+        .map(|(txs, ff)| {
+            json!({
+                "chunkfee": crate::rpc::amounts::format_signed_amount(ff.fee, unit),
+                "chunkweight": ff.size,
+                "txs": txs.iter().map(|t| t.to_string()).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    let mut out = json!({ "clusterweight": weight, "txcount": count, "chunks": chunks });
+    crate::rpc::amounts::annotate_units(&mut out, unit);
+    Ok(out)
+}
+
+/// `getmempoolfeeratediagram` — Core's hidden RPC: the cumulative
+/// sigop-adjusted `weight` and modified `fee` after each chunk of the
+/// mempool in mining order, from `{weight: 0, fee: 0}`.
+pub fn get_mempool_feerate_diagram(mempool: &Mempool) -> Value {
+    let unit = crate::rpc::amounts::default_unit();
+    let points: Vec<Value> = mempool
+        .feerate_diagram()
+        .into_iter()
+        .map(|ff| json!({ "weight": ff.size, "fee": crate::rpc::amounts::format_signed_amount(ff.fee, unit) }))
+        .collect();
+    let mut out = Value::Array(points);
+    crate::rpc::amounts::annotate_units(&mut out, unit);
+    out
+}
+
 /// `getmempoolentry` — return detailed info about a single mempool transaction.
 pub fn get_mempool_entry(
     mempool: &Mempool,
