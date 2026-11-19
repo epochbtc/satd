@@ -124,6 +124,10 @@ def negative_fee_and_order(g, ins, outs):
     # Xpubs and proprietary pairs listed out of Core's order.
     g.append((b"\x01" + xpub(TPUB), path("ffffffff", 1)))
     g.append((b"\x01" + xpub(TPUB2), path("00000001", 2, 3)))
+    # One fingerprint, paths m/0/0 and m/1: Core's KeyOriginInfo orders a
+    # shorter path first.
+    g.append((b"\x01" + xpub(TPUB)[:45] + PK[0], path("00000002", 0, 0)))
+    g.append((b"\x01" + xpub(TPUB)[:45] + PK[1], path("00000002", 1)))
     g.append((prop(b"zz", 5, b""), b"\x01"))
     g.append((prop(b"aa", 9, b"\x01"), b"\x02"))
     g.append((prop(b"aa", 1, b"\x02"), b"\x03"))

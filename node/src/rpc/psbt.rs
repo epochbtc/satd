@@ -1163,6 +1163,26 @@ mod tests {
         assert!(out["estimated_feerate"].is_null(), "{out}");
     }
 
+    /// A version 2 pair of a type Core reads but whose value does not
+    /// parse is shown in `unknown`, not dropped: Core refuses such a PSBT,
+    /// and the operator needs to see the bytes. Here an input's
+    /// `PSBT_IN_WITNESS_UTXO` is one byte, and an output's
+    /// `PSBT_OUT_AMOUNT` three.
+    #[test]
+    fn a_version_2_pair_that_does_not_parse_stays_in_unknown() {
+        let core: Value =
+            serde_json::from_str(include_str!("testdata/core_v32_1_decodepsbt.json")).unwrap();
+        let b64 = core["decodepsbt"]["v2_WPKH_0_created"]["psbt"].as_str().unwrap();
+        let mut raw = RawPsbt::parse(&B64.decode(b64).unwrap()).unwrap();
+        raw.inputs[0].set(satd_psbt::raw::RawPair::new(0x01, Vec::new(), vec![0x00]));
+        raw.outputs[0].set(satd_psbt::raw::RawPair::new(0x03, Vec::new(), vec![1, 2, 3]));
+        let got = decode_psbt_for(&B64.encode(raw.serialize()), Some(bitcoin::Network::Regtest)).unwrap();
+        assert!(got["inputs"][0].get("witness_utxo").is_none(), "{got}");
+        assert_eq!(got["inputs"][0]["unknown"], json!({ "01": "00" }), "{got}");
+        assert!(got["outputs"][0].get("amount").is_none(), "{got}");
+        assert_eq!(got["outputs"][0]["unknown"], json!({ "03": "010203" }), "{got}");
+    }
+
     /// `decodepsbt` against Bitcoin Core v32.1's own answers: PSBTs its
     /// wallet built with P2PKH, P2SH-P2WPKH, P2WPKH, P2WSH 2-of-2 and P2TR
     /// inputs, at each stage from created to finalized

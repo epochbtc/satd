@@ -132,20 +132,53 @@ fn proprietary_json(map: &RawMap, key_type: u64, used: &mut BTreeSet<Vec<u8>>) -
     rows.into_values().collect()
 }
 
-/// Core's `unknown`: every pair of a type Core does not read, and every
-/// pair of a type this module renders that did not have the shape to be
-/// rendered.
-fn unknown_json(map: &RawMap, known: &[u64], mine: &[u64], used: &BTreeSet<Vec<u8>>) -> Map<String, Value> {
+/// Core's `unknown`: every pair of a type Core does not read, every pair
+/// of a type this module renders that did not have the shape to be
+/// rendered, and every pair of a type the caller renders (`theirs`, by
+/// the field it writes) whose field the caller left out, because its value
+/// did not parse.
+fn unknown_json(
+    map: &RawMap,
+    known: &[u64],
+    mine: &[u64],
+    used: &BTreeSet<Vec<u8>>,
+    theirs: &[(u64, &str)],
+    out: &Value,
+) -> Map<String, Value> {
     let mut obj = Map::new();
     for pair in map.pairs() {
         let key = full_key(pair);
-        let shown = known.contains(&pair.key_type) && (!mine.contains(&pair.key_type) || used.contains(&key));
+        let shown = if mine.contains(&pair.key_type) {
+            used.contains(&key)
+        } else if let Some((_, field)) = theirs.iter().find(|(t, _)| *t == pair.key_type) {
+            out.get(*field).is_some()
+        } else {
+            known.contains(&pair.key_type)
+        };
         if !shown {
             obj.insert(hex::encode(&key), json!(hex::encode(&pair.value)));
         }
     }
     obj
 }
+
+/// The fields the callers write for Core's other known input and output
+/// types, by key type. A version 2 caller leaves a field out when its value
+/// does not parse.
+const THEIRS_INPUT: &[(u64, &str)] = &[
+    (0x01, "witness_utxo"),
+    (0x04, "redeem_script"),
+    (0x05, "witness_script"),
+    (0x07, "final_scriptSig"),
+    (0x08, "final_scriptwitness"),
+    (0x0e, "previous_txid"),
+    (0x0f, "previous_vout"),
+    (0x10, "sequence"),
+    (0x11, "required_time_locktime"),
+    (0x12, "required_height_locktime"),
+];
+const THEIRS_OUTPUT: &[(u64, &str)] =
+    &[(0x00, "redeem_script"), (0x01, "witness_script"), (0x03, "amount"), (0x04, "script")];
 
 /// The key types this module renders, in each map. Core's other known
 /// types are the callers'.
@@ -179,7 +212,8 @@ pub(crate) fn global_fields(map: &RawMap, out: &mut Value) {
     xpubs.sort_by(|a, b| a.0.cmp(&b.0));
     out["global_xpubs"] = Value::Array(xpubs.into_iter().map(|(_, row)| row).collect());
     out["proprietary"] = Value::Array(proprietary_json(map, keys::global::PROPRIETARY, &mut used));
-    out["unknown"] = Value::Object(unknown_json(map, CORE_GLOBAL, MINE_GLOBAL, &used));
+    let unknown = unknown_json(map, CORE_GLOBAL, MINE_GLOBAL, &used, &[], out);
+    out["unknown"] = Value::Object(unknown);
 }
 
 /// The input fields of Core's `decodepsbt` beyond the scripts and UTXOs
@@ -318,7 +352,7 @@ pub(crate) fn input_fields(map: &RawMap, out: &mut Value, network: bitcoin::Netw
     if !prop.is_empty() {
         out["proprietary"] = Value::Array(prop);
     }
-    let unknown = unknown_json(map, CORE_INPUT, MINE_INPUT, &used);
+    let unknown = unknown_json(map, CORE_INPUT, MINE_INPUT, &used, THEIRS_INPUT, out);
     if !unknown.is_empty() {
         out["unknown"] = Value::Object(unknown);
     }
@@ -355,7 +389,7 @@ pub(crate) fn output_fields(map: &RawMap, out: &mut Value) {
     if !prop.is_empty() {
         out["proprietary"] = Value::Array(prop);
     }
-    let unknown = unknown_json(map, CORE_OUTPUT, MINE_OUTPUT, &used);
+    let unknown = unknown_json(map, CORE_OUTPUT, MINE_OUTPUT, &used, THEIRS_OUTPUT, out);
     if !unknown.is_empty() {
         out["unknown"] = Value::Object(unknown);
     }
