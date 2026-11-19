@@ -1548,16 +1548,23 @@ where
     // leave the mempool holding a double spend. A member with no inputs is
     // inconsistent too, as in Core's `IsConsistentPackage`: consistency is
     // judged by inputs, and no unconfirmed transaction may lack them.
+    //
+    // Each member's inputs are compared against earlier members only, then
+    // added as one batch, as Core's `IsConsistentPackage` does
+    // (`src/policy/packages.cpp`, v32.1). A member spending one outpoint
+    // twice itself is not a package conflict: it reaches the per-transaction
+    // checks, which refuse it as `bad-txns-inputs-duplicate`
+    // (`CheckTransaction`).
     let mut spent: HashSet<bitcoin::OutPoint> = HashSet::new();
     for p in pkg {
-        if p.tx().input.is_empty() {
+        let inputs = &p.tx().input;
+        if inputs.is_empty() {
             return Err("conflict-in-package");
         }
-        for input in &p.tx().input {
-            if !spent.insert(input.previous_output) {
-                return Err("conflict-in-package");
-            }
+        if inputs.iter().any(|i| spent.contains(&i.previous_output)) {
+            return Err("conflict-in-package");
         }
+        spent.extend(inputs.iter().map(|i| i.previous_output));
     }
 
     Ok(())
@@ -7568,6 +7575,15 @@ impl Mempool {
                 if self.inner.read().entries.contains_key(&ptx.txid) {
                     continue;
                 }
+                // Core judges the ceiling only after `PreChecks`, which opens
+                // with `CheckTransaction` (`AcceptSingleTransactionInternal`,
+                // `AcceptMultipleTransactionsInternal`, `src/validation.cpp`
+                // v32.1). A member failing it is refused for that instead:
+                // one spending a coin twice would otherwise count the coin
+                // twice and report `max feerate exceeded`.
+                if crate::validation::tx::check_transaction(&ptx.tx).is_err() {
+                    continue;
+                }
                 // Unknowable fee (an input resolves nowhere) — acceptance will
                 // refuse it for that instead, and with a better reason.
                 let Some((base_fee, adj_weight)) = self.package_member_fee(&ptx.tx, chain_state, &pkg_tx_map)
@@ -9706,7 +9722,19 @@ mod tests {
         let a = tx_spending(&[(9, 0)], 500);
         let b = tx_spending(&[(9, 0)], 400);
         assert_ne!(a.compute_txid(), b.compute_txid());
-        assert_eq!(check_well_formed_package(&[a, b]), Err("conflict-in-package"));
+        assert_eq!(check_well_formed_package(&[a.clone(), b]), Err("conflict-in-package"));
+
+        // One member spending one outpoint twice is not a package conflict:
+        // Core adds a member's inputs as one batch (`IsConsistentPackage`)
+        // and leaves the duplicate to `CheckTransaction`'s
+        // `bad-txns-inputs-duplicate`. Alone, first or after another member.
+        let dup = tx_spending(&[(8, 0), (8, 0)], 500);
+        assert_eq!(check_well_formed_package(std::slice::from_ref(&dup)), Ok(()));
+        assert_eq!(check_well_formed_package(&[dup.clone(), a.clone()]), Ok(()));
+        assert_eq!(check_well_formed_package(&[a.clone(), dup.clone()]), Ok(()));
+        // It still conflicts with another member spending that outpoint.
+        let c = tx_spending(&[(8, 0)], 400);
+        assert_eq!(check_well_formed_package(&[dup, c]), Err("conflict-in-package"));
 
         // Duplicates are caught by txid, which also covers a same-txid,
         // different-witness pair.
