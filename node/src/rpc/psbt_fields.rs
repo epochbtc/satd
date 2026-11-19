@@ -179,6 +179,18 @@ const THEIRS_INPUT: &[(u64, &str)] = &[
     (0x11, "required_time_locktime"),
     (0x12, "required_height_locktime"),
 ];
+/// The global map's, also by the field: a version 0 answer has none of the
+/// version 2 fields, so a version 2 pair rust-bitcoin let through in a
+/// version 0 PSBT is shown in `unknown`.
+const THEIRS_GLOBAL: &[(u64, &str)] = &[
+    (0x00, "tx"),
+    (0x02, "tx_version"),
+    (0x03, "fallback_locktime"),
+    (0x04, "input_count"),
+    (0x05, "output_count"),
+    (0x06, "inputs_modifiable"),
+    (0xfb, "psbt_version"),
+];
 const THEIRS_OUTPUT: &[(u64, &str)] =
     &[(0x00, "redeem_script"), (0x01, "witness_script"), (0x03, "amount"), (0x04, "script")];
 
@@ -221,7 +233,7 @@ pub(crate) fn global_fields(map: &RawMap, out: &mut Value) {
     xpubs.sort_by(|a, b| a.0.cmp(&b.0));
     out["global_xpubs"] = Value::Array(xpubs.into_iter().map(|(_, row)| row).collect());
     out["proprietary"] = Value::Array(proprietary_json(map, keys::global::PROPRIETARY, &mut used));
-    let unknown = unknown_json(map, CORE_GLOBAL, MINE_GLOBAL, &used, &[], out);
+    let unknown = unknown_json(map, CORE_GLOBAL, MINE_GLOBAL, &used, THEIRS_GLOBAL, out);
     out["unknown"] = Value::Object(unknown);
 }
 

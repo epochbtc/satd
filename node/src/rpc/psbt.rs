@@ -1197,6 +1197,38 @@ mod tests {
         assert_eq!(got["inputs"][0]["unknown"], json!({ "01aa": "00" }), "{got}");
     }
 
+    /// A version 2 global pair in a version 0 PSBT, which rust-bitcoin
+    /// accepts and Core refuses, is shown in `unknown`: the version 0
+    /// answer has no field for it.
+    #[test]
+    fn a_version_2_global_pair_in_version_0_stays_in_unknown() {
+        let core: Value =
+            serde_json::from_str(include_str!("testdata/core_v32_1_decodepsbt.json")).unwrap();
+        let b64 = core["decodepsbt"]["v0_WPKH_0_created"]["psbt"].as_str().unwrap();
+        let bytes = B64.decode(b64).unwrap();
+        // Its global map holds only the unsigned transaction: magic, key
+        // length, `0x00`, value length, the transaction, then the
+        // separator, before which the new pair goes.
+        let psbt = Psbt::deserialize(&bytes).unwrap();
+        let tx_len = bitcoin::consensus::serialize(&psbt.unsigned_tx).len();
+        let global_len = 5 + 1 + 1 + raw_compact_len(tx_len) + tx_len;
+        assert_eq!(bytes[global_len], 0x00, "the global separator");
+        let mut spliced = bytes[..global_len].to_vec();
+        spliced.extend([0x01, 0x02, 0x04, 0x02, 0x00, 0x00, 0x00]);
+        spliced.extend(&bytes[global_len..]);
+        let got = decode_psbt_for(&B64.encode(&spliced), Some(bitcoin::Network::Regtest)).unwrap();
+        assert_eq!(got["unknown"], json!({ "02": "02000000" }), "{got}");
+        assert!(got.get("tx_version").is_none(), "{got}");
+    }
+
+    fn raw_compact_len(n: usize) -> usize {
+        match n {
+            0..=0xfc => 1,
+            0xfd..=0xffff => 3,
+            _ => 5,
+        }
+    }
+
     /// `decodepsbt` against Bitcoin Core v32.1's own answers: PSBTs its
     /// wallet built with P2PKH, P2SH-P2WPKH, P2WPKH, P2WSH 2-of-2 and P2TR
     /// inputs, at each stage from created to finalized
