@@ -12715,6 +12715,37 @@ mod tests {
     }
 
     #[test]
+    fn test_accept_refuses_an_oversize_tx_as_tx_size_before_its_fee() {
+        // Without `-acceptnonstdtxn` and with no `allow` rule, `tx-size`
+        // refuses at once, ahead of a relay fee the transaction also fails,
+        // as Core's `IsStandardTx` runs in `PreChecks` before the fees. A
+        // transaction of exactly the standard weight is standard.
+        use bitcoin::{Amount, ScriptBuf, TxOut};
+        let with_data = |mut tx: Transaction, len: usize| {
+            let mut data = vec![0x6a, 0x4e];
+            data.extend_from_slice(&(len as u32).to_le_bytes());
+            data.extend(std::iter::repeat_n(0u8, len));
+            tx.output.push(TxOut { value: Amount::ZERO, script_pubkey: ScriptBuf::from_bytes(data) });
+            tx
+        };
+
+        let op = outpoint(0xab);
+        let (cs, mp, dir) = make_funded_env(&[(op, coin(100_000))]);
+        mp.config.write().min_fee_rate = 1_000;
+        let over = with_data(spend(op, 99_000, 0x22), 99_900);
+        assert_eq!(over.weight().to_wu(), MAX_STANDARD_TX_WEIGHT as u64 + 4, "fixture");
+        let r = mp.test_accept(&over, &cs, &NoopVerifier);
+        assert!(matches!(r, Err(MempoolError::Validation(ref e)) if e == "tx-size"), "{r:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let (cs, mp, dir) = make_funded_env(&[(op, coin(100_000))]);
+        let at = with_data(spend(op, 99_000, 0x22), 99_899);
+        assert_eq!(at.weight().to_wu(), MAX_STANDARD_TX_WEIGHT as u64, "fixture");
+        mp.test_accept(&at, &cs, &NoopVerifier).expect("the standard weight itself is standard");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn no_allow_rules_rejects_nonstandard_early() {
         // A single dust output is standard (Core's MAX_DUST_OUTPUTS_PER_TX),
         // so nothing is deferred here at all and input resolution is the first
@@ -14339,6 +14370,20 @@ mod tests {
     }
 
     #[test]
+    fn a_bip68_time_lock_counts_512_second_units_not_blocks() {
+        // The type flag (bit 22) makes the lock value a count of 512-second
+        // units from the prevout's MTP context. Read as a block count, one
+        // unit would be met two blocks on, however little time had passed.
+        let (cs, _, dir) = make_funded_env(&[]);
+        let seq_time_1 = (1u32 << 22) | 1;
+        let anchor = cs.get_median_time_past(0);
+        assert!(!Mempool::bip68_satisfied(&cs, seq_time_1, 0, 2, anchor), "two blocks, no time");
+        assert!(!Mempool::bip68_satisfied(&cs, seq_time_1, 0, 2, anchor + 511), "one second short");
+        assert!(Mempool::bip68_satisfied(&cs, seq_time_1, 0, 0, anchor + 512), "512 seconds, no blocks");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn an_immature_coinbase_spend_is_rejected_at_admission() {
         // Coinbase maturity is enforced at mempool admission, not only at
         // block connect. Tip is at height 0, so a mempool tx would confirm at
@@ -14356,6 +14401,25 @@ mod tests {
         let (cs, mp, dir) = make_funded_env(&[(op, cb_coin)]);
         let tx = spend_with(op, 40_000, 0x2B, 2, 0xffff_ffff, 0);
         let r = mp.accept_transaction(tx, &cs, &NoopVerifier, TxSource::Rpc, false);
+        assert!(matches!(r, Err(MempoolError::PrematureCoinbaseSpend)), "{r:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_immature_coinbase_spend_is_rejected_by_test_accept() {
+        // `testmempoolaccept` holds a coinbase spend to the same maturity as
+        // admission: a height-0 coinbase coin spent at height 1 is refused.
+        let op = outpoint(0xEC);
+        let cb_coin = Coin {
+            amount: 50_000,
+            script_pubkey: p2wpkh_spk(0x11),
+            height: 0,
+            coinbase: true,
+            txseq: node_index::TXSEQ_UNKNOWN,
+        };
+        let (cs, mp, dir) = make_funded_env(&[(op, cb_coin)]);
+        let tx = spend_with(op, 40_000, 0x2C, 2, 0xffff_ffff, 0);
+        let r = mp.test_accept(&tx, &cs, &NoopVerifier);
         assert!(matches!(r, Err(MempoolError::PrematureCoinbaseSpend)), "{r:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
