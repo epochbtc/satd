@@ -328,7 +328,7 @@ impl Chain {
             Some(v) => v.as_bool().ok_or_else(|| bad_request("requested must be a bool"))?,
         };
         let bytes = field_hex(req, "block")?;
-        let outcome = match deserialize::<Block>(&bytes) {
+        let outcome = match node::validation::decode::deserialize_block(&bytes) {
             Err(e) => Outcome::Mutated(format!("block-decode: {e}")),
             Ok(block) => self.deliver_block(block, p2p, requested)?,
         };

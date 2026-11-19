@@ -44,9 +44,8 @@
 //!   * either returns a connectivity verdict → HARNESS BUG (fail)
 //!
 //! A handful of static-matrix cases are intentionally NOT reachable through the
-//! live RPC oracle (Core's `submitblock` coinbase pre-check, the zero-input
-//! SegWit-marker collision) and stay matrix-only; see the NOTEs by the case
-//! bodies.
+//! live RPC oracle (Core's `submitblock` coinbase pre-check) and stay
+//! matrix-only; see the NOTEs by the case bodies.
 //!
 //! ## Gating
 //!
@@ -389,6 +388,10 @@ fn satd_best_hash(node: &TestNode) -> String {
 enum Submission {
     Block(Block),
     Tx(Transaction),
+    /// Bytes rust-bitcoin cannot write: a block or a transaction holding
+    /// Core's ten-byte transaction with no inputs.
+    RawBlock(Vec<u8>),
+    RawTx(Vec<u8>),
 }
 
 struct Case {
@@ -537,12 +540,35 @@ fn c_merkle_mutation(ctx: &Ctx, _u: &mut Vec<usize>) -> Submission {
 
 // -- context-free transaction (testmempoolaccept) --
 //
-// NOTE: `tx_no_inputs` (bad-txns-vin-empty) is NOT in the live set: a
-// zero-input transaction's serialization collides with the SegWit marker byte
-// (`...00...`), so Core's deserializer rejects the bytes as malformed
-// (`-22 "TX decode failed … at least one input"`) rather than reaching
-// `CheckTransaction`. It is unrepresentable on the wire as a non-witness tx.
-// The static matrix covers it against `check_transaction` directly.
+// `tx_no_inputs` (bad-txns-vin-empty): a zero-input transaction with outputs
+// collides with the SegWit marker byte, and Core refuses the bytes (`-22 "TX
+// decode failed … at least one input"`). With no outputs either, Core's
+// `UnserializeTransaction` reads `version | 00 00 | lock_time` as a
+// transaction and `CheckTransaction` refuses it (#1242). rust-bitcoin cannot
+// write that form, so the case is raw bytes.
+
+/// Core's ten-byte transaction: version 2, no inputs, no outputs.
+const EMPTY_TX: [u8; 10] = [2, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+
+fn c_tx_no_inputs(_ctx: &Ctx, _u: &mut Vec<usize>) -> Submission {
+    Submission::RawTx(EMPTY_TX.to_vec())
+}
+
+/// A block holding [`EMPTY_TX`] after its coinbase, with no witness
+/// commitment. Core decodes it and `CheckBlock` refuses it.
+fn c_block_tx_no_inputs(ctx: &Ctx, _u: &mut Vec<usize>) -> Submission {
+    let h = ctx.candidate_height();
+    let cb = coinbase(h, block_subsidy(Network::Regtest, h), op_true());
+    let empty = bitcoin::Txid::hash(&EMPTY_TX);
+    let root = bitcoin::merkle_tree::calculate_root([cb.compute_txid(), empty].into_iter().map(TxMerkleNode::from))
+        .unwrap();
+    let mut b = assemble(ctx.tip_hash, ctx.candidate_time(), POWLIMIT_BITS, vec![cb], Some(root), true);
+    let mut raw = serialize(&b.header);
+    raw.push(2);
+    raw.extend(serialize(&b.txdata.remove(0)));
+    raw.extend_from_slice(&EMPTY_TX);
+    Submission::RawBlock(raw)
+}
 
 fn c_tx_no_outputs(_ctx: &Ctx, _u: &mut Vec<usize>) -> Submission {
     Submission::Tx(Transaction {
@@ -896,6 +922,8 @@ fn cases() -> Vec<Case> {
         case("unexpected_witness_coinbase", "witness", Some("unexpected-witness"), c_unexpected_witness_coinbase),
         case("witness_commitment_mismatch", "witness", Some("bad-witness-merkle-match"), c_witness_commitment_mismatch),
         // context-free transaction
+        case("tx_no_inputs", "tx-context-free", Some("bad-txns-vin-empty"), c_tx_no_inputs),
+        case("block_tx_no_inputs", "tx-context-free", Some("bad-txns-vin-empty"), c_block_tx_no_inputs),
         case("tx_no_outputs", "tx-context-free", Some("bad-txns-vout-empty"), c_tx_no_outputs),
         case("tx_output_over_max", "tx-context-free", Some("bad-txns-vout-toolarge"), c_tx_output_over_max),
         case("tx_duplicate_inputs", "tx-context-free", Some("bad-txns-inputs-duplicate"), c_tx_duplicate_inputs),
@@ -984,6 +1012,14 @@ fn core_block_live_differential() {
             }
             Submission::Tx(t) => {
                 let hex = hex::encode(serialize(t));
+                (satd_test_mempool_accept(&satd, &hex), core.test_mempool_accept(&hex))
+            }
+            Submission::RawBlock(raw) => {
+                let hex = hex::encode(raw);
+                (satd_submit_block(&satd, &hex), core.submit_block(&hex))
+            }
+            Submission::RawTx(raw) => {
+                let hex = hex::encode(raw);
                 (satd_test_mempool_accept(&satd, &hex), core.test_mempool_accept(&hex))
             }
         };

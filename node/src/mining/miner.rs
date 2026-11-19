@@ -532,9 +532,10 @@ fn compute_witness_root(_coinbase: &Transaction, others: &[Transaction]) -> [u8;
     // Coinbase wtxid = 0x00...00
     hashes.push([0u8; 32]);
 
-    // Other transactions use wtxid
+    // Other transactions use their wtxid, as Core's `GetWitnessHash` gives it
+    // (`generateblock` can be handed one with no inputs).
     for tx in others {
-        hashes.push(tx.compute_wtxid().to_raw_hash().to_byte_array());
+        hashes.push(crate::validation::decode::wtxid(tx).to_raw_hash().to_byte_array());
     }
 
     // Compute merkle root from these hashes
