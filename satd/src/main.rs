@@ -3147,7 +3147,7 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
                     _ = task_shutdown.changed() => break,
                     ev = rx.recv() => match ev {
                         Ok(node::chain::events::ChainEvent::BlockConnected { hash, .. }) => {
-                            pm.announce_block(hash);
+                            pm.block_connected(hash);
                         }
                         Ok(_) => {}
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
