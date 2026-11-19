@@ -40,6 +40,7 @@ It includes every fix shipped in 0.7.1:
 - P2P: during initial sync, a block that arrives while another is being connected no longer stops all peer message handling until the connect finishes (#875).
 - P2P: a `headers` message is accepted on a thread of its own, so a batch waiting for a block connect no longer stops peer handling (#1187).
 - P2P: header sync stores a header chain only once it has shown enough work, through Core's headers presync; `getpeerinfo` reports `presynced_headers` (#1132).
+- P2P: a block or `cmpctblock` whose header claims too little chain work is ignored, and an unrequested block is stored only when it could soon become the tip, as in Core (#1247).
 - P2P: a `getheaders` with an empty locator gets only the header it names, and only if Core's `BlockRequestAllowed` admits it (#1298).
 - P2P: a new block is not announced to a peer whose chain already has it, as in Core (#1299).
 - P2P: with inbound full, a new inbound peer evicts one by Core's eviction rules instead of being refused; inbound slots are `-maxconnections` less 11, not 8 (#1293).

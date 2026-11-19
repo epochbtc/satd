@@ -1097,6 +1097,10 @@ mod hdrsync_tests;
 mod presync_tests;
 
 #[cfg(test)]
+#[path = "manager_blockgate_tests.rs"]
+mod blockgate_tests;
+
+#[cfg(test)]
 #[path = "manager_bgcatchup_tests.rs"]
 mod bgcatchup_tests;
 
@@ -9781,6 +9785,13 @@ impl PeerManager {
         if full.is_empty() { intact } else { full }
     }
 
+    /// Whether `getblockfrompeer` or the OP_RETURN restore asked peer `id`
+    /// for `hash`, and the request has not expired.
+    fn block_refetch_registered(&self, hash: &bitcoin::BlockHash, id: PeerId) -> bool {
+        let pending = self.block_refetch.read();
+        !pending.is_empty() && pending.get(&(*hash, id)).is_some_and(|at| at.elapsed() < BLOCK_REFETCH_TTL)
+    }
+
     /// Route a block that `getblockfrompeer` asked for into the repair path.
     /// Returns true when the block was consumed here.
     fn handle_refetched_block(&self, id: PeerId, block: &bitcoin::Block) -> bool {
@@ -9926,7 +9937,13 @@ impl PeerManager {
         // Read before `note_block_arrived` clears the record. Core reads
         // `IsBlockRequested` at the same point (`net_processing.cpp:4800`);
         // here it decides whether the block may wait for an unknown parent.
-        let requested = self.block_is_requested(&block.block_hash());
+        //
+        // A block `getblockfrompeer` or the OP_RETURN restore asked this peer
+        // for counts as requested too: Core processes an operator fetch with
+        // `force_processing`, so the low-work gates in the block processor
+        // must not drop it.
+        let requested = self.block_is_requested(&block.block_hash())
+            || self.block_refetch_registered(&block.block_hash(), id);
         self.note_block_arrived(&block.block_hash());
         self.note_peer_has_block(id, block.block_hash());
         // A peer that pushes a block has it, so the same availability rule
@@ -10087,6 +10104,31 @@ impl PeerManager {
             );
             return;
         }
+        // Core's `AcceptBlock` gates, as in the block processor. A block on
+        // the best-header chain counts as requested, whether the scheduler
+        // still has it in flight or released it to another peer; any other
+        // block in the window is one nobody asked for. "On the best-header
+        // chain" is judged by ancestry, not by the height row alone, so a
+        // best header on a branch that leaves the active chain below the
+        // tip still counts. A header-only result
+        // is indexed on the store thread, which may wait for the accept lock
+        // where this task must not.
+        let mut header_only = false;
+        if let Some(parent) = self.chain_state.get_block_index(&block.header.prev_blockhash) {
+            let height = parent.height + 1;
+            let canonical = self.chain_state.is_ancestor_of_best_header_or_tip(&hash, height);
+            match self.chain_state.peer_block_gate(&block.header, requested || canonical) {
+                crate::chain::state::PeerBlockGate::Process => {}
+                crate::chain::state::PeerBlockGate::TooLittleChainwork => {
+                    tracing::debug!(%hash, height, peer = id, "IBD: block refused: too-little-chainwork");
+                    return;
+                }
+                crate::chain::state::PeerBlockGate::HeaderOnly(why) => {
+                    tracing::debug!(%hash, height, peer = id, why, "IBD: unrequested block not stored; header indexed");
+                    header_only = true;
+                }
+            }
+        }
         // Credit the delivery now: the store may wait behind the connector,
         // and the peer has done its part (see `IbdScheduler::block_arrived`).
         let arrived_at = self
@@ -10094,7 +10136,7 @@ impl PeerManager {
             .get_block_index(&block.header.prev_blockhash)
             .map(|parent| parent.height + 1)
             .filter(|&height| {
-                self.ibd.write().as_mut().is_some_and(|s| s.block_arrived(id, height, hash))
+                !header_only && self.ibd.write().as_mut().is_some_and(|s| s.block_arrived(id, height, hash))
             });
         let size = block.total_size();
         let job = crate::net::ibd_store::IbdStoreJob {
@@ -10103,6 +10145,7 @@ impl PeerManager {
             arrived_at,
             in_flight,
             size,
+            header_only,
         };
         if let Err(job) = self.ibd_store_queue.try_push(job) {
             // The queue is at its bound: the store cannot keep up, and
@@ -10256,8 +10299,16 @@ impl PeerManager {
     /// historical block additionally wakes the background connector. Runs on
     /// the IBD store thread, or inline when its queue is full.
     fn store_ibd_block(&self, job: crate::net::ibd_store::IbdStoreJob) {
-        let crate::net::ibd_store::IbdStoreJob { peer: id, block, arrived_at, in_flight, size: _ } = job;
+        let crate::net::ibd_store::IbdStoreJob { peer: id, block, arrived_at, in_flight, size: _, header_only } = job;
         let hash = block.block_hash();
+        if header_only {
+            match self.chain_state.accept_header(&block.header) {
+                Ok(_) | Err(crate::chain::state::ChainError::Duplicate) => self.apply_header_row_changes(),
+                Err(e) => tracing::debug!(%hash, peer = id, error = %e, "IBD: unrequested block's header refused"),
+            }
+            drop(in_flight);
+            return;
+        }
         let result = self.chain_state.store_block(&block);
         // A failed store leaves the height owed again, to time out and go to
         // another peer as it would have before the block arrived.
@@ -11365,6 +11416,31 @@ impl PeerManager {
                 if chain_state.get_block_index(&block.header.prev_blockhash).is_none() {
                     Self::hold_for_parent(&mut orphan_blocks, sender, block, requested, network, &peer_manager);
                     continue;
+                }
+                // Core's `AcceptBlock` gates, before anything is stored. A
+                // block rebuilt from a `cmpctblock` counts as requested, as
+                // Core processes it with `force_processing`; its header
+                // passed the work threshold in `accept_compact_header`.
+                match chain_state.peer_block_gate(&block.header, requested || via_compact) {
+                    crate::chain::state::PeerBlockGate::Process => {}
+                    crate::chain::state::PeerBlockGate::TooLittleChainwork => {
+                        tracing::debug!(%hash, peer = sender, "Block refused: too-little-chainwork");
+                        continue;
+                    }
+                    crate::chain::state::PeerBlockGate::HeaderOnly(why) => {
+                        tracing::debug!(%hash, peer = sender, why, "Unrequested block not stored; header indexed");
+                        match chain_state.accept_header(&block.header) {
+                            Ok(_) | Err(crate::chain::state::ChainError::Duplicate) => {
+                                if let Some(pm) = peer_manager.upgrade() {
+                                    pm.apply_header_row_changes();
+                                }
+                            }
+                            Err(e) => {
+                                tracing::debug!(%hash, peer = sender, error = %e, "Unrequested block's header refused");
+                            }
+                        }
+                        continue;
+                    }
                 }
                 // Compute fees BEFORE accept_block — connect_block removes spent coins.
                 let fees = Self::compute_block_fee_rates(&block, &chain_state);
@@ -14198,6 +14274,16 @@ impl PeerManager {
         if self.chain_state.get_block_index(&header.prev_blockhash).is_none() {
             self.maybe_send_getheaders(id);
             return None;
+        }
+        // Core's `cmpctblock` handler: a header whose chain claims less than
+        // the anti-DoS work threshold is ignored, known or not.
+        if let Some(parent) = self.chain_state.get_block_index(&header.prev_blockhash) {
+            use crate::storage::blockindex::{add_u256, work_for_bits};
+            let work = add_u256(&parent.chainwork, &work_for_bits(header.bits));
+            if crate::chain::state::compare_u256(&work, &self.chain_state.anti_dos_work_threshold()) < 0 {
+                tracing::debug!("Ignoring low-work compact block from peer {id}");
+                return None;
+            }
         }
         let new_header = match self.chain_state.accept_header(header) {
             Ok(_) => {

@@ -42,6 +42,10 @@ pub struct IbdStoreJob {
     pub in_flight: InFlight,
     /// The block's serialized size, as counted against the bound.
     pub size: usize,
+    /// Index the block's header only, and store none of the block: Core's
+    /// `AcceptBlock` for a block nobody asked for that is not a candidate
+    /// for the tip ([`crate::chain::state::PeerBlockGate::HeaderOnly`]).
+    pub header_only: bool,
 }
 
 #[derive(Default)]
@@ -152,6 +156,7 @@ mod tests {
             arrived_at: None,
             in_flight: InFlight::adopt(None),
             size,
+            header_only: false,
         }
     }
 
