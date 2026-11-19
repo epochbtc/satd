@@ -913,6 +913,33 @@ silently returning an empty or wrong answer.
   reconsiders an orphan when a block confirms one of its parents; Core
   reconsiders orphans only when a parent enters the mempool.
 
+- **Invalid transactions from peers** — Core v30 stopped penalising a peer
+  for any transaction it relays (`MaybePunishNodeForTx` was removed from
+  `src/net_processing.cpp`): an invalid transaction is refused and the peer
+  is left alone. satd charges 10 misbehaviour points for a transaction that
+  fails its scripts under the consensus flags or spends more than its inputs
+  (`bad-txns-in-belowout`), and disconnects and bans a peer that reaches
+  100, as for other misbehaviour. A transaction failing `CheckTransaction`
+  (`bad-txns-vin-empty` and the rest) or a policy rule costs the peer
+  nothing, as in Core. Only a peer that sends script-invalid or overspending
+  transactions is affected.
+
+- **Order of a block's checks** — Core's `CheckBlock` (`src/validation.cpp`)
+  runs `CheckTransaction` on every transaction straight after the coinbase
+  checks and before the legacy sigop count; `ContextualCheckBlock` then
+  checks the finality of every transaction, the BIP 34 coinbase height, the
+  witness commitment and the weight, in that order. satd runs the merkle,
+  size, coinbase, sigop, witness and weight checks first, then goes through
+  the transactions one at a time: `CheckTransaction`, finality, and for the
+  coinbase the BIP 34 height. Every block gets Core's verdict, but a block
+  with two faults can be refused for a different one: a block over the
+  sigop limit that also holds a transaction with no inputs is
+  `bad-txns-vin-empty` in Core and `bad-blk-sigops` in satd, and a coinbase
+  with the wrong height followed by such a transaction is
+  `bad-txns-vin-empty` in Core and `bad-cb-height` in satd. Only a caller
+  that reads the reason sees it: `submitblock`, a `getblocktemplate`
+  proposal, the log.
+
 - **`getblockchaininfo.size_on_disk`** — Core's figure is `blk*.dat` plus
   `rev*.dat`. satd keeps undo data in RocksDB rather than in `rev*` files, so
   its number is the block files alone and is smaller than Core's for the same
