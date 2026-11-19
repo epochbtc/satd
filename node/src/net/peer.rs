@@ -247,6 +247,15 @@ pub struct PeerInfo {
     /// indexed: Core's `pindexBestKnownBlock`, the bound on what the peer
     /// can be asked to serve.
     pub best_known_height: Option<u32>,
+    /// The most-work block this peer has announced that we have indexed,
+    /// Core's `pindexBestKnownBlock` itself (`UpdateBlockAvailability`). A
+    /// block on its chain is not announced back to the peer
+    /// (`PeerHasHeader`).
+    pub best_known_block: Option<bitcoin::BlockHash>,
+    /// The last block this peer announced by `inv` before we had its header:
+    /// Core's `hashLastUnknownBlock`, promoted to
+    /// [`Self::best_known_block`] once the header is indexed.
+    pub last_unknown_block: Option<bitcoin::BlockHash>,
     /// The nonce of the `version` we sent on this outbound connection, so an
     /// inbound `version` carrying it can be recognised as ourselves.
     pub local_nonce: Option<u64>,
@@ -374,6 +383,8 @@ impl PeerInfo {
             services: ServiceFlags::NONE,
             best_height: -1,
             best_known_height: None,
+            best_known_block: None,
+            last_unknown_block: None,
             local_nonce: None,
             user_agent: String::new(),
             ban_score: 0,

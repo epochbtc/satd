@@ -334,3 +334,81 @@ fn a_null_locator_getheaders_is_answered_only_for_a_block_it_may_serve() {
     assert_eq!(headers(&mut rx), Some(vec![a[2]]), "a validated stale block is answered");
     assert!(pm.peers.read().contains_key(&1), "no refusal disconnects");
 }
+
+/// The block hashes a peer was told about, by `inv` or `headers`.
+fn announced(rx: &mut mpsc::Receiver<NetworkMessage>) -> Vec<bitcoin::BlockHash> {
+    drain(rx)
+        .into_iter()
+        .flat_map(|m| match m {
+            NetworkMessage::Inv(inv) => inv
+                .into_iter()
+                .filter_map(|i| match i {
+                    Inventory::Block(h) => Some(h),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            NetworkMessage::Headers(hs) => hs.iter().map(|h| h.block_hash()).collect(),
+            other => panic!("unexpected {other:?}"),
+        })
+        .collect()
+}
+
+/// A block is not announced to a peer whose chain already has it (Core's
+/// `PeerHasHeader` in `SendMessages`, v32.1 `net_processing.cpp`): one that
+/// announced the block or a descendant of it, on the active chain or on a
+/// side branch. satd skipped only the peer whose last known block was that
+/// very block, so a peer that relayed several blocks heard each of them
+/// back but the last.
+#[test]
+fn a_block_is_not_announced_to_a_peer_whose_chain_has_it() {
+    let (pm, _dir) = mk_pm();
+    let a = mine(&pm, 3, 1);
+    // A one-block side branch off a[0], left stale when a[1] comes back.
+    pm.chain_state.invalidate_block(a[1]).unwrap();
+    let b = mine(&pm, 1, 2);
+    pm.chain_state.reconsider_block(a[1]).unwrap();
+    assert_eq!(pm.chain_state.tip_hash(), a[2]);
+
+    let mut at_tip = add_peer(&pm, 1, false);
+    pm.note_block_availability(1, &a[2]);
+    let mut behind = add_peer(&pm, 2, false);
+    pm.note_block_availability(2, &a[0]);
+    let mut silent = add_peer(&pm, 3, false);
+    let mut on_side = add_peer(&pm, 4, false);
+    pm.note_block_availability(4, &b[0]);
+    // A lower-work block announced later does not replace the best known.
+    pm.note_block_availability(1, &a[0]);
+
+    pm.announce_block(a[1]);
+    assert_eq!(announced(&mut at_tip), vec![], "a[1] is an ancestor of the peer's a[2]");
+    assert_eq!(announced(&mut behind), vec![a[1]]);
+    assert_eq!(announced(&mut silent), vec![a[1]]);
+    assert_eq!(announced(&mut on_side), vec![a[1]], "a[1] is not on the side branch");
+
+    pm.announce_block(a[0]);
+    assert_eq!(announced(&mut at_tip), vec![]);
+    assert_eq!(announced(&mut behind), vec![], "the peer announced a[0] itself");
+    assert_eq!(announced(&mut on_side), vec![], "a[0] is the side branch's parent");
+    assert_eq!(announced(&mut silent), vec![], "announced to it a moment ago");
+
+    pm.announce_block(a[2]);
+    assert_eq!(announced(&mut at_tip), vec![], "the peer announced a[2] itself");
+    assert_eq!(announced(&mut behind), vec![a[2]]);
+
+    // A block announced by `inv` before its header is known (Core's
+    // `hashLastUnknownBlock`) counts once the header arrives from anyone.
+    let mut early = add_peer(&pm, 5, false);
+    let c = crate::mining::miner::build_block_to_script(
+        &pm.chain_state,
+        &Mempool::new(1_000_000, 0),
+        bitcoin::ScriptBuf::new_op_return([3]),
+        None,
+    )
+    .expect("build block");
+    pm.handle_inv(5, vec![Inventory::Block(c.block_hash())]);
+    drain(&mut early);
+    pm.chain_state.accept_block(&c).expect("accept block");
+    pm.announce_block(c.block_hash());
+    assert_eq!(announced(&mut early), vec![], "the peer announced c before we had it");
+    assert_eq!(announced(&mut behind), vec![c.block_hash()]);
+}
