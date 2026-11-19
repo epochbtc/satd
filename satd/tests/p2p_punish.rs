@@ -259,3 +259,54 @@ fn a_misbehaving_manual_peer_stays_connected() {
     assert_eq!(banned(&node), Vec::<serde_json::Value>::new(), "nothing is banned");
     node.stop();
 }
+
+/// Core v30 stopped punishing a peer for any transaction it relays
+/// (`MaybePunishNodeForTx` was removed from `net_processing.cpp`, commit
+/// 266dd0e10d). satd charged 10 points for a transaction failing its scripts
+/// under the consensus flags or spending more than its inputs, so ten of them
+/// disconnected this local peer (and would have banned a remote one).
+///
+/// Twelve such transactions, each refused, leave the peer connected and
+/// served, and nothing banned.
+#[test]
+fn a_peer_relaying_invalid_transactions_is_not_punished() {
+    let p2p = find_available_port();
+    let mut node = TestNode::start(&[&format!("--port={p2p}"), &format!("--bind=127.0.0.1:{p2p}")]);
+    node.mine_blocks(101, ADDR);
+    let tip = best_hash(&node);
+    let block1 = node.rpc_ok("getblockhash", vec![json!(1)]);
+    let coinbase: bitcoin::Txid =
+        node.rpc_ok("getblock", vec![block1])["tx"][0].as_str().unwrap().parse().unwrap();
+    // ADDR's script: a P2WPKH program of twenty zero bytes, which no key
+    // can spend.
+    let spk = bitcoin::ScriptBuf::from_bytes([&[0x00, 0x14][..], &[0u8; 20]].concat());
+
+    let mut peer = Peer::connect(p2p).expect("handshake");
+    poll_until(|| peers_on(&node, p2p).len() == 1, test_timeout(20), "the peer is listed");
+    for i in 0..12u64 {
+        // Odd: outputs above the 50 BTC input (`bad-txns-in-belowout`).
+        // Even: a witness that does not match the program (a script
+        // failure under the consensus flags).
+        let (value, witness) = if i % 2 == 1 {
+            (5_000_000_000 + i, bitcoin::Witness::new())
+        } else {
+            (4_999_000_000 - i, bitcoin::Witness::from_slice(&[vec![0x30; 72], vec![0x02; 33]]))
+        };
+        let tx = bitcoin::Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![bitcoin::TxIn {
+                previous_output: bitcoin::OutPoint { txid: coinbase, vout: 0 },
+                script_sig: bitcoin::ScriptBuf::new(),
+                sequence: bitcoin::Sequence::MAX,
+                witness,
+            }],
+            output: vec![bitcoin::TxOut { value: bitcoin::Amount::from_sat(value), script_pubkey: spk.clone() }],
+        };
+        peer.send(NetworkMessage::Tx(tx));
+    }
+    assert!(peer.served(tip), "the peer is still connected and served");
+    assert_eq!(banned(&node), Vec::<serde_json::Value>::new(), "nothing is banned");
+    assert_eq!(node.rpc_ok("getmempoolinfo", vec![])["size"], json!(0), "every transaction was refused");
+    node.stop();
+}

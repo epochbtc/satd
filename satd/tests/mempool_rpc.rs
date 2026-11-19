@@ -345,3 +345,106 @@ fn a_reorg_keeps_a_returned_child_over_cheaper_mempool_spenders() {
 
     node.stop();
 }
+
+/// `version | 00 00 | lock_time` decodes, as Core's `DecodeHexTx` decodes
+/// it, to a transaction with no inputs, and each submission RPC refuses it
+/// as `bad-txns-vin-empty`, not "TX decode failed" (#1242). The answers are a
+/// Core v32.1 regtest node's.
+#[test]
+fn a_transaction_with_no_inputs_is_refused_as_core_refuses_it() {
+    const EMPTY: &str = "02000000000000000000";
+    let node = TestNode::start(&[]);
+    assert_eq!(
+        refused(&node, "sendrawtransaction", vec![json!(EMPTY)]),
+        (-26, "bad-txns-vin-empty".to_string())
+    );
+    let tma = node.rpc_ok("testmempoolaccept", vec![json!([EMPTY])]);
+    assert_eq!(tma[0]["allowed"], json!(false), "{tma}");
+    assert_eq!(tma[0]["reject-reason"], json!("bad-txns-vin-empty"), "{tma}");
+    let decoded = node.rpc_ok("decoderawtransaction", vec![json!(EMPTY)]);
+    assert_eq!(decoded["txid"], json!("4ebd325a4b394cff8c57e8317ccf5a8d0e2bdf1b8526f8aad6c8e43d8240621a"));
+    assert_eq!(decoded["vin"], json!([]));
+
+    // `generateblock` takes it into the block, which fails `CheckBlock`.
+    // Core: -25 "TestBlockValidity failed: bad-txns-vin-empty, Transaction
+    // check failed (tx hash ...)".
+    let output = node.rpc_ok("getdescriptorinfo", vec![json!("raw(51)")])["descriptor"].clone();
+    let (code, message) = refused(&node, "generateblock", vec![output, json!([EMPTY])]);
+    assert_eq!(code, -25, "{message}");
+    assert!(message.starts_with("TestBlockValidity failed: bad-txns-vin-empty"), "{message}");
+
+    // A witness flag with no inputs: Core refuses the bytes.
+    assert_eq!(
+        refused(&node, "sendrawtransaction", vec![json!("020000000001000000000000")]).0,
+        -22
+    );
+}
+
+/// The rest of Core's answers for a transaction with no inputs (Core v31.1
+/// regtest; the code paths are v32.1's):
+/// - `decoderawtransaction` measures it without the marker and flag, and its
+///   wtxid is its txid, which `testmempoolaccept` prints and `submitpackage`
+///   keys `tx-results` by;
+/// - `submitpackage` refuses it as `conflict-in-package` (`IsConsistentPackage`),
+///   as does a multi-transaction `testmempoolaccept`;
+/// - the submission RPCs read only the extended form (`DecodeHexTx`'s
+///   defaults), so `createrawtransaction`'s answer with no inputs and an
+///   output is a decode failure there, with Core's message, while
+///   `decoderawtransaction` reads it back.
+#[test]
+fn a_transaction_with_no_inputs_gets_cores_sizes_ids_and_messages() {
+    const EMPTY: &str = "02000000000000000000";
+    const EMPTY_TXID: &str = "4ebd325a4b394cff8c57e8317ccf5a8d0e2bdf1b8526f8aad6c8e43d8240621a";
+    // The same with lock time 1.
+    const EMPTY2: &str = "02000000000001000000";
+    const EMPTY2_TXID: &str = "d877b150e2f2cb183f38643fca5169da842be9c8fb841570d6fdf496bd56e829";
+    let node = TestNode::start(&[]);
+
+    let decoded = node.rpc_ok("decoderawtransaction", vec![json!(EMPTY)]);
+    assert_eq!(decoded["hash"], json!(EMPTY_TXID), "{decoded}");
+    assert_eq!((&decoded["size"], &decoded["vsize"], &decoded["weight"]), (&json!(10), &json!(10), &json!(40)));
+
+    let tma = node.rpc_ok("testmempoolaccept", vec![json!([EMPTY])]);
+    assert_eq!(tma[0]["wtxid"], json!(EMPTY_TXID), "{tma}");
+    let tma = node.rpc_ok("testmempoolaccept", vec![json!([EMPTY, EMPTY2])]);
+    assert_eq!(
+        tma,
+        json!([
+            {"txid": EMPTY_TXID, "wtxid": EMPTY_TXID, "package-error": "conflict-in-package"},
+            {"txid": EMPTY2_TXID, "wtxid": EMPTY2_TXID, "package-error": "conflict-in-package"},
+        ])
+    );
+
+    let sp = node.rpc_ok("submitpackage", vec![json!([EMPTY])]);
+    assert_eq!(
+        sp,
+        json!({
+            "package_msg": "conflict-in-package",
+            "tx-results": {EMPTY_TXID: {"txid": EMPTY_TXID, "error": "package-not-validated"}},
+            "replaced-transactions": [],
+        })
+    );
+
+    let data = node.rpc_ok("createrawtransaction", vec![json!([]), json!([{"data": "00"}])]);
+    let data = data.as_str().expect("hex").to_string();
+    assert_eq!(data, "0200000000010000000000000000036a010000000000");
+    let decoded = node.rpc_ok("decoderawtransaction", vec![json!(data)]);
+    assert_eq!(decoded["vout"][0]["scriptPubKey"]["hex"], json!("6a0100"), "{decoded}");
+    let at_least_one = "Make sure the tx has at least one input.";
+    assert_eq!(
+        refused(&node, "sendrawtransaction", vec![json!(data)]),
+        (-22, format!("TX decode failed. {at_least_one}"))
+    );
+    for method in ["testmempoolaccept", "submitpackage"] {
+        assert_eq!(
+            refused(&node, method, vec![json!([data])]),
+            (-22, format!("TX decode failed: {data} {at_least_one}")),
+            "{method}"
+        );
+    }
+    let output = node.rpc_ok("getdescriptorinfo", vec![json!("raw(51)")])["descriptor"].clone();
+    assert_eq!(
+        refused(&node, "generateblock", vec![output, json!([data])]),
+        (-22, format!("Transaction decode failed for {data}. {at_least_one}"))
+    );
+}

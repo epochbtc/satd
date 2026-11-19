@@ -1765,10 +1765,20 @@ pub async fn start(
                         .ok_or_else(|| ErrorObjectOwned::owned(-5, format!("Transaction {txid} not in mempool."), None::<()>))?;
                     txs.push(entry.tx.clone());
                 } else {
-                    let tx_bytes = hex::decode(hex)
-                        .map_err(|_| ErrorObjectOwned::owned(-22, format!("Transaction decode failed for {hex}"), None::<()>))?;
-                    let tx: bitcoin::Transaction = bitcoin::consensus::deserialize(&tx_bytes)
-                        .map_err(|_| ErrorObjectOwned::owned(-22, format!("Transaction decode failed for {hex}"), None::<()>))?;
+                    // Core's `DecodeHexTx` with its defaults, the extended
+                    // reading only, and its message (`generateblock`,
+                    // src/rpc/mining.cpp).
+                    let decode_failed = || {
+                        ErrorObjectOwned::owned(
+                            -22,
+                            format!("Transaction decode failed for {hex}. {}", rawtx::AT_LEAST_ONE_INPUT),
+                            None::<()>,
+                        )
+                    };
+                    let tx: bitcoin::Transaction = hex::decode(hex)
+                        .ok()
+                        .and_then(|bytes| rawtx::decode_hex_tx(&bytes))
+                        .ok_or_else(decode_failed)?;
                     txs.push(tx);
                 }
             }
@@ -1928,10 +1938,12 @@ pub async fn start(
         let maxburnamount_sat = parse_btc_amount_arg(maxburnamount_raw.as_ref(), 0)?;
 
         // Decode the transaction for pre-submit checks.
-        let tx_bytes = hex::decode(&hex_tx)
-            .map_err(|_| ErrorObjectOwned::owned(-22, "TX decode failed", None::<()>))?;
-        let tx: bitcoin::Transaction = bitcoin::consensus::deserialize(&tx_bytes)
-            .map_err(|_| ErrorObjectOwned::owned(-22, "TX decode failed", None::<()>))?;
+        // Core's `DecodeHexTx` with its defaults, the extended reading only,
+        // and its message (`sendrawtransaction`, src/rpc/mempool.cpp).
+        let tx: bitcoin::Transaction = hex::decode(&hex_tx)
+            .ok()
+            .and_then(|bytes| rawtx::decode_hex_tx(&bytes))
+            .ok_or_else(|| ErrorObjectOwned::owned(-22, rawtx::send_decode_failed(), None::<()>))?;
 
         // maxburnamount check: Core checks each output individually — any
         // single unspendable output whose value exceeds maxburnamount is
@@ -2287,10 +2299,18 @@ pub async fn start(
 
         let mut decoded: Vec<bitcoin::Transaction> = Vec::with_capacity(rawtxs.len());
         for hex_tx in &rawtxs {
-            let tx_bytes = hex::decode(hex_tx)
-                .map_err(|_| ErrorObjectOwned::owned(-22, "TX decode failed", None::<()>))?;
-            let tx: bitcoin::Transaction = bitcoin::consensus::deserialize(&tx_bytes)
-                .map_err(|_| ErrorObjectOwned::owned(-22, "TX decode failed", None::<()>))?;
+            // Core's `DecodeHexTx` with its defaults, and its message, which
+            // quotes the hex (src/rpc/mempool.cpp).
+            let tx: bitcoin::Transaction = hex::decode(hex_tx)
+                .ok()
+                .and_then(|bytes| rawtx::decode_hex_tx(&bytes))
+                .ok_or_else(|| {
+                    ErrorObjectOwned::owned(
+                        -22,
+                        format!("TX decode failed: {hex_tx} {}", rawtx::AT_LEAST_ONE_INPUT),
+                        None::<()>,
+                    )
+                })?;
             decoded.push(tx);
         }
 
@@ -2308,7 +2328,7 @@ pub async fn start(
                 .map(|tx| {
                     serde_json::json!({
                         "txid": tx.compute_txid().to_string(),
-                        "wtxid": tx.compute_wtxid().to_string(),
+                        "wtxid": crate::validation::decode::wtxid(tx).to_string(),
                         "package-error": reason,
                     })
                 })
@@ -2327,7 +2347,7 @@ pub async fn start(
             match judged {
                 Ok((vsize, fees)) => {
                     let (vsize, fees) = (*vsize, *fees);
-                    let wtxid = tx.compute_wtxid();
+                    let wtxid = crate::validation::decode::wtxid(tx);
                     let feerate_sat_per_kvb = fees.saturating_mul(1000) / (vsize as u64).max(1);
                     if maxfeerate_sat_per_kvb > 0 && feerate_sat_per_kvb > maxfeerate_sat_per_kvb {
                         entry["allowed"] = false.into();
@@ -2368,7 +2388,7 @@ pub async fn start(
             // `wtxid` is on *every* Core result, including the refusals.
             serde_json::json!({
                 "txid": tx.compute_txid().to_string(),
-                "wtxid": tx.compute_wtxid().to_string(),
+                "wtxid": crate::validation::decode::wtxid(tx).to_string(),
             })
         };
         // Core (`validation.cpp`) reports `txn-already-known` only when one
@@ -2407,7 +2427,7 @@ pub async fn start(
                 if let Some(e) = &package.package_error {
                     entry["package-error"] = e.clone().into();
                 }
-                if let Some(judged) = package.results.get(&tx.compute_wtxid())
+                if let Some(judged) = package.results.get(&crate::validation::decode::wtxid(tx))
                     && !exit_early
                 {
                     exit_early = render(tx, judged, &mut entry);
@@ -2447,10 +2467,18 @@ pub async fn start(
         // is an RPC error, not a per-transaction result.
         let mut txs = Vec::with_capacity(rawtxs.len());
         for hex_tx in &rawtxs {
-            let tx_bytes = hex::decode(hex_tx)
-                .map_err(|_| ErrorObjectOwned::owned(-22, "TX decode failed", None::<()>))?;
-            let tx: bitcoin::Transaction = bitcoin::consensus::deserialize(&tx_bytes)
-                .map_err(|_| ErrorObjectOwned::owned(-22, "TX decode failed", None::<()>))?;
+            // Core's `DecodeHexTx` with its defaults, and its message, which
+            // quotes the hex (src/rpc/mempool.cpp).
+            let tx: bitcoin::Transaction = hex::decode(hex_tx)
+                .ok()
+                .and_then(|bytes| rawtx::decode_hex_tx(&bytes))
+                .ok_or_else(|| {
+                    ErrorObjectOwned::owned(
+                        -22,
+                        format!("TX decode failed: {hex_tx} {}", rawtx::AT_LEAST_ONE_INPUT),
+                        None::<()>,
+                    )
+                })?;
             for out in &tx.output {
                 if rawtx::is_burn_output(out) && out.value.to_sat() > maxburnamount_sat {
                     return Err(ErrorObjectOwned::owned(

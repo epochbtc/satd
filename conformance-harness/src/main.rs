@@ -200,7 +200,7 @@ fn script_verify(req: &Fields) -> Result<Fields, Fail> {
 fn tx_check(req: &Fields) -> Result<Fields, Fail> {
     let bytes = field_hex(req, "tx")?;
     let mut fields = Fields::new();
-    let verdict = match deserialize::<Transaction>(&bytes) {
+    let verdict = match node::validation::decode::deserialize_transaction(&bytes) {
         Err(_) => Err("tx-decode".to_string()),
         Ok(tx) => node::validation::tx::check_transaction(&tx).map_err(|e| e.to_string()),
     };

@@ -307,6 +307,35 @@ fn submitblock_decode_failure_is_an_rpc_error() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A block holding `version | 00 00 | lock_time` after its coinbase. Core's
+/// `UnserializeTransaction` reads that as a transaction with no inputs, and
+/// `submitblock` answers `CheckBlock`'s `bad-txns-vin-empty`; it is not a
+/// decode failure (#1242). A Core v32.1 regtest node answers the same. The
+/// block is not stored, and the chain stays where it was.
+#[test]
+fn submitblock_reads_a_transaction_with_no_inputs_as_core_does() {
+    const EMPTY: [u8; 10] = [2, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    let (cs, dir, _) = chain(0, spaced);
+    let mut block = build_test_block(genesis_hash(), 1, spaced(1));
+    let empty_txid = Txid::hash(&EMPTY);
+    block.header.merkle_root = bitcoin::merkle_tree::calculate_root(
+        [block.txdata[0].compute_txid(), empty_txid].into_iter().map(bitcoin::TxMerkleNode::from),
+    )
+    .unwrap();
+    // The grind reads only the header, whose root now covers the empty tx.
+    grind_test_pow(&mut block);
+
+    let mut raw = bitcoin::consensus::serialize(&block.header);
+    raw.push(2);
+    raw.extend(bitcoin::consensus::serialize(&block.txdata[0]));
+    raw.extend_from_slice(&EMPTY);
+
+    assert_eq!(mining::submit_block(&cs, &pool(), &hex::encode(&raw)), Ok(json!("bad-txns-vin-empty")));
+    assert_eq!(cs.tip_height(), 0);
+    assert!(cs.get_block(&block.block_hash()).is_none(), "a block CheckBlock refuses is never stored");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Core answers a block whose index entry is marked failed with
 /// `duplicate-invalid` (`AcceptBlockHeader`, src/validation.cpp; asserted in
 /// `mining_basic.py`), and one it already holds as valid with `duplicate`.

@@ -164,7 +164,9 @@ impl ExtraTxnCache {
         if self.ring.is_empty() || tx.total_size() > MAX_EXTRA_TXN_BYTES {
             return;
         }
-        let wtxid = tx.compute_wtxid();
+        // Core's `GetWitnessHash`, the key a peer's short ID is built from:
+        // for a transaction with no inputs, its txid (#1242).
+        let wtxid = crate::validation::decode::wtxid(&tx);
         self.ring[self.next] = Some((wtxid, tx));
         self.next = (self.next + 1) % self.ring.len();
     }
@@ -269,7 +271,7 @@ pub fn try_reconstruct(
         *short_id_counts.entry(*short_id).or_insert(0) += 1;
     }
     let prefilled_wtxids: std::collections::HashSet<bitcoin::Wtxid> =
-        compact.prefilled_txs.iter().map(|p| p.tx.compute_wtxid()).collect();
+        compact.prefilled_txs.iter().map(|p| crate::validation::decode::wtxid(&p.tx)).collect();
     let mut stats = ReconstructStats::default();
     // Prefilled transactions we already held. A set, because a transaction
     // can be in the mempool and the extra cache at once.
@@ -508,7 +510,7 @@ pub fn prefill_candidates(block: &Block, mempool: &Mempool, extra: &ExtraTxnCach
     let cached: std::collections::HashSet<bitcoin::Wtxid> = extra.iter().map(|(w, _)| *w).collect();
     let (extra, needed) = absent
         .into_iter()
-        .partition(|&i| cached.contains(&block.txdata[i].compute_wtxid()));
+        .partition(|&i| cached.contains(&crate::validation::decode::wtxid(&block.txdata[i])));
     Some(PrefillCandidates { needed, extra })
 }
 
@@ -1038,6 +1040,30 @@ mod tests {
         match try_reconstruct(&compact, &mempool, &ExtraTxnCache::new(0)) {
             Ok(Reconstruction::Partial { missing_indices, .. }) => assert_eq!(missing_indices, vec![1]),
             _ => panic!("without the cache the slot must be requested"),
+        }
+    }
+
+    /// A transaction the mempool refused for having no inputs (#1242) is kept
+    /// for reconstruction, as Core keeps it, under Core's wtxid for it (its
+    /// txid), so a peer's short ID over that wtxid finds it.
+    #[test]
+    fn a_kept_transaction_with_no_inputs_matches_cores_short_id() {
+        let genesis = regtest_genesis();
+        let empty = crate::validation::decode::deserialize_transaction(&[2, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+            .expect("Core reads it");
+        let nonce = 7;
+        let keys = ShortId::calculate_siphash_keys(&genesis.header, nonce);
+        let compact = HeaderAndShortIds {
+            header: genesis.header,
+            nonce,
+            short_ids: vec![ShortId::with_siphash_keys(&empty.compute_txid().to_raw_hash(), keys)],
+            prefilled_txs: vec![bitcoin::bip152::PrefilledTransaction { idx: 0, tx: genesis.txdata[0].clone() }],
+        };
+        let mut extra = ExtraTxnCache::new(4);
+        extra.insert(empty.clone());
+        match try_reconstruct(&compact, &Mempool::new(300_000_000, 1_000), &extra) {
+            Ok(Reconstruction::Complete(b, _)) => assert_eq!(b.txdata[1], empty),
+            _ => panic!("the kept transaction must fill its slot"),
         }
     }
 

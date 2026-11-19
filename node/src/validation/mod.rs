@@ -1,4 +1,5 @@
 pub mod block;
+pub mod decode;
 pub mod pow;
 pub mod script;
 pub mod signet;

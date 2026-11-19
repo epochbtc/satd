@@ -1516,7 +1516,7 @@ where
     // Core reports a single oversized transaction against the per-transaction
     // limit instead, which is the more specific message.
     if pkg.len() > 1 {
-        let total: u64 = pkg.iter().map(|p| p.tx().weight().to_wu()).sum();
+        let total: u64 = pkg.iter().map(|p| crate::validation::decode::weight(p.tx()).to_wu()).sum();
         if total > MAX_PACKAGE_WEIGHT {
             return Err("package-too-large");
         }
@@ -1545,9 +1545,14 @@ where
     }
 
     // Two members spending one outpoint would otherwise both be accepted and
-    // leave the mempool holding a double spend.
+    // leave the mempool holding a double spend. A member with no inputs is
+    // inconsistent too, as in Core's `IsConsistentPackage`: consistency is
+    // judged by inputs, and no unconfirmed transaction may lack them.
     let mut spent: HashSet<bitcoin::OutPoint> = HashSet::new();
     for p in pkg {
+        if p.tx().input.is_empty() {
+            return Err("conflict-in-package");
+        }
         for input in &p.tx().input {
             if !spent.insert(input.previous_output) {
                 return Err("conflict-in-package");
@@ -7006,7 +7011,7 @@ impl Mempool {
             match checked {
                 Ok(p) => pre.push(p),
                 Err(e) => {
-                    out.results.insert(tx.compute_wtxid(), Err(e));
+                    out.results.insert(crate::validation::decode::wtxid(tx), Err(e));
                     return out;
                 }
             }
@@ -7031,13 +7036,13 @@ impl Mempool {
             if !cfg.accept_non_std_txn
                 && let Some((i, e)) = Self::package_ephemeral_spends(&inner, &cfg, txs)
             {
-                out.results.insert(txs[i].compute_wtxid(), Err(e));
+                out.results.insert(crate::validation::decode::wtxid(&txs[i]), Err(e));
                 return out;
             }
         }
 
         for (tx, p) in txs.iter().zip(pre) {
-            let wtxid = tx.compute_wtxid();
+            let wtxid = crate::validation::decode::wtxid(tx);
             match self.test_finish(tx, chain_state, script_verifier, p) {
                 Ok((_, vsize, fee)) => {
                     out.results.insert(wtxid, Ok((vsize, fee)));
@@ -7500,7 +7505,9 @@ impl Mempool {
             .into_iter()
             .map(|tx| {
                 let txid = tx.compute_txid();
-                let wtxid = tx.compute_wtxid();
+                // Core's wtxid, which keys `tx-results` (the txid for a
+                // transaction with no inputs).
+                let wtxid = crate::validation::decode::wtxid(&tx);
                 PkgTx { tx, txid, wtxid }
             })
             .collect();
@@ -9728,6 +9735,13 @@ mod tests {
             .collect();
         assert_eq!(check_well_formed_package(&heavy), Err("package-too-large"));
         assert!(check_well_formed_package(&heavy[..1]).is_ok());
+
+        // A member with no inputs, alone or not: Core's `IsConsistentPackage`
+        // refuses it, and `submitpackage` answers `conflict-in-package`.
+        let empty = tx_spending(&[], 0);
+        assert!(empty.input.is_empty());
+        assert_eq!(check_well_formed_package(std::slice::from_ref(&empty)), Err("conflict-in-package"));
+        assert_eq!(check_well_formed_package(&[parent.clone(), empty]), Err("conflict-in-package"));
     }
     use super::*;
     use crate::storage::db::InMemoryStore;
