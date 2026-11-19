@@ -22,6 +22,10 @@
 //! - `sendcmpct`'s high-bandwidth flag is a `bool`, which Core reads as any
 //!   byte, non-zero meaning true (`src/serialize.h:279`). rust-bitcoin
 //!   refuses a byte other than 0 or 1.
+//! - `tx`, `block`, `cmpctblock` and `blocktxn` read their transactions as
+//!   Core's `UnserializeTransaction` reads them ([`crate::validation::decode`]):
+//!   `version | 00 00 | lock_time` is a transaction with no inputs, which the
+//!   mempool or block validation then refuses, not an undecodable message.
 //! - `feefilter`'s value is read whole, whatever it is. Core reads the
 //!   `CAmount` and then ignores a value outside `MoneyRange`
 //!   (`net_processing.cpp:5035-5045`); the handler does the same
@@ -41,9 +45,11 @@ use bitcoin::consensus::encode::{self, Decodable};
 use bitcoin::hashes::{sha256d, Hash};
 use bitcoin::p2p::message::{CommandString, NetworkMessage};
 use bitcoin::p2p::address::Address;
-use bitcoin::p2p::message_compact_blocks::SendCmpct;
+use bitcoin::p2p::message_compact_blocks::{BlockTxn, CmpctBlock, SendCmpct};
 use bitcoin::p2p::message_network::VersionMessage;
 use bitcoin::p2p::ServiceFlags;
+
+use crate::validation::decode;
 
 /// Size of a v1 message header: magic 4, command 12, length 4, checksum 4.
 const V1_HEADER_SIZE: usize = 24;
@@ -132,7 +138,7 @@ pub fn decode_payload(command: CommandString, payload: &[u8]) -> Result<NetworkM
         "getblocks" => M::GetBlocks(read(payload)?),
         "getheaders" => M::GetHeaders(read(payload)?),
         "mempool" => M::MemPool,
-        "block" => M::Block(read(payload)?),
+        "block" => M::Block(decode::read_block(&mut &payload[..])?),
         "headers" => M::Headers(read_headers(payload)?),
         "sendheaders" => M::SendHeaders,
         "getaddr" => M::GetAddr,
@@ -142,7 +148,7 @@ pub fn decode_payload(command: CommandString, payload: &[u8]) -> Result<NetworkM
         "filterload" => M::FilterLoad(read(payload)?),
         "filteradd" => M::FilterAdd(read(payload)?),
         "filterclear" => M::FilterClear,
-        "tx" => M::Tx(read(payload)?),
+        "tx" => M::Tx(decode::read_transaction(&mut &payload[..])?),
         "getcfilters" => M::GetCFilters(read(payload)?),
         "cfilter" => M::CFilter(read(payload)?),
         "getcfheaders" => M::GetCFHeaders(read(payload)?),
@@ -158,9 +164,9 @@ pub fn decode_payload(command: CommandString, payload: &[u8]) -> Result<NetworkM
             let version = u64::consensus_decode(&mut r)?;
             M::SendCmpct(SendCmpct { send_compact: high_bandwidth != 0, version })
         }
-        "cmpctblock" => M::CmpctBlock(read(payload)?),
+        "cmpctblock" => M::CmpctBlock(CmpctBlock { compact_block: decode::read_header_and_short_ids(&mut &payload[..])? }),
         "getblocktxn" => M::GetBlockTxn(read(payload)?),
-        "blocktxn" => M::BlockTxn(read(payload)?),
+        "blocktxn" => M::BlockTxn(BlockTxn { transactions: decode::read_block_transactions(&mut &payload[..])? }),
         "wtxidrelay" => M::WtxidRelay,
         "addrv2" => M::AddrV2(read(payload)?),
         "sendaddrv2" => M::SendAddrV2,

@@ -12056,7 +12056,9 @@ impl PeerManager {
     fn record_rejection(&self, tx: &bitcoin::Transaction, e: &MempoolError, validated_at: bitcoin::BlockHash) {
         let has_witness = tx.input.iter().any(|i| !i.witness.is_empty());
         let Some(kind) = Self::rejection_kind(e, has_witness) else { return };
-        let mut hashes = vec![tx.compute_wtxid().to_byte_array()];
+        // Core's wtxid: for a transaction with no inputs, the txid
+        // (`validation::decode::wtxid`), which is what peers announce it by.
+        let mut hashes = vec![crate::validation::decode::wtxid(tx).to_byte_array()];
         if has_witness && matches!(e, MempoolError::NonStandardInputs(_)) {
             hashes.push(tx.compute_txid().to_byte_array());
         }
@@ -12079,7 +12081,7 @@ impl PeerManager {
         }
 
         let txid = tx.compute_txid();
-        let wtxid = tx.compute_wtxid();
+        let wtxid = crate::validation::decode::wtxid(&tx);
         let has_witness = tx.input.iter().any(|i| !i.witness.is_empty());
         // Core's `AddKnownTx`: the sender has it, by the id it relays by, so
         // it is not announced back.
@@ -12737,10 +12739,11 @@ impl PeerManager {
         source: crate::mempool::pool::TxSource,
         allow_quarantined: bool,
     ) -> Result<serde_json::Value, (i32, String)> {
-        let tx_bytes =
-            hex::decode(hex_tx).map_err(|_| (-22, "TX decode failed".to_string()))?;
-        let tx: bitcoin::Transaction = bitcoin::consensus::deserialize(&tx_bytes)
-            .map_err(|_| (-22, "TX decode failed".to_string()))?;
+        // Core's `DecodeHexTx`, as `sendrawtransaction`'s own checks read it.
+        let tx: bitcoin::Transaction = hex::decode(hex_tx)
+            .ok()
+            .and_then(|bytes| crate::rpc::rawtx::decode_hex_tx(&bytes))
+            .ok_or_else(|| (-22, crate::rpc::rawtx::send_decode_failed()))?;
         let txid = self
             .submit_and_announce(tx, source, allow_quarantined)
             .map_err(|e| {
@@ -20085,6 +20088,25 @@ mod tests {
         pm.chain_state.accept_block(&block).expect("block connects");
         pm.handle_inv(1, vec![Inventory::WTx(wtxid)]);
         expect_getdata(&mut rx1, &[Inventory::WTx(wtxid)], "a new tip forgets the refusal");
+    }
+
+    /// A transaction with no inputs (#1242) is refused and recorded under
+    /// Core's wtxid for it, its txid, which is what a wtxid-relay peer
+    /// announces it by; rust-bitcoin's wtxid hashes its extended form.
+    #[test]
+    fn a_refused_transaction_with_no_inputs_is_recorded_by_cores_wtxid() {
+        let mut clock = super::txrequest_tests::MockClock::install();
+        let (pm, _dir, mut rx1, _rx2) = rejects_pm();
+        let empty = crate::validation::decode::deserialize_transaction(&[2, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+            .expect("Core reads it");
+        let txid = empty.compute_txid();
+        assert_ne!(empty.compute_wtxid().to_byte_array(), txid.to_byte_array());
+        pm.handle_tx(2, empty);
+        assert!(pm.recently_rejected(&txid.to_byte_array()));
+        pm.handle_inv(1, vec![Inventory::WTx(bitcoin::Wtxid::from_byte_array(txid.to_byte_array()))]);
+        clock.advance(crate::net::txrequest::TXID_RELAY_DELAY);
+        pm.send_all_tx_requests();
+        assert!(rx1.try_recv().is_err(), "not fetched again by its wtxid");
     }
 
     /// A transaction refused since the tip moved is not validated again when
