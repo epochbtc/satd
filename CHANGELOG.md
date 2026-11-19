@@ -25,6 +25,7 @@ It includes every fix shipped in 0.7.1:
 - RPC: any request `Content-Type` is read as JSON, as in Core (#824).
 - RPC: `invalidateblock`, `reconsiderblock` and `preciousblock` go on to the next-best valid chain, as in Core (#1261).
 - RPC: `getrawtransaction`'s not-found message matches the node's `-txindex` state (#1066).
+- RPC: a package member spending one outpoint twice is refused as `bad-txns-inputs-duplicate` by `submitpackage` and `testmempoolaccept`, as in Core, not as `conflict-in-package`.
 - RPC: `testmempoolaccept` forgives a standardness failure an `allow` policy rule forgives, as `sendrawtransaction` does (#999).
 - RPC: an open JSON-RPC WebSocket stops working when its bearer token is revoked or expires; its frames are answered `-32006` (#821).
 - RPC: `getnetworkinfo` reports each network's `reachable` and `limited` from `-onlynet` and the proxies, as Core does, and lists `i2p` and `cjdns` (#1164).
@@ -111,6 +112,7 @@ It includes every fix shipped in 0.7.1:
 - RPC: integer and verbosity arguments are parsed and range-checked as in Core; out-of-type values are `-1 JSON integer out of range` (#1267).
 - CLI: `sat-cli` converts arguments by Core's per-method table, as `bitcoin-cli` does; adds `-stdinrpcpass`, and `-stdin` keeps empty lines (#1268).
 - IBD: the default `-assumevalid` and the minimum chain work of every network are Bitcoin Core v32.1's; mainnet's default block moves from height 840,000 to 966,143 and signet's from 218,000 to 321,295 (#1217).
+- IBD: `verificationprogress` estimates from Bitcoin Core v32.1's `ChainTxData` on mainnet, testnet3, testnet4 and signet (#1312).
 - RPC: `getblockstats`' `total_out` leaves out the coinbase, `utxo_size_inc` sums the real output and prevout sizes, and `utxo_increase_actual` and `utxo_size_inc_actual` are reported, as in Core (#1208).
 - Operator: a custom signet frames its `blk*.dat` records and `dumptxoutset` snapshots with its own message start, as Core does, not the default signet's; a pre-0.8.0 custom-signet blocks directory mixes both and needs a fresh sync before Core can read it (#1283).
 - RPC: `getchaintxstats` defaults to one month of blocks (4320) and accepts `nblocks=0`, as in Core (#1297).

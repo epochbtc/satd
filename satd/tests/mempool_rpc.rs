@@ -8,6 +8,7 @@ mod common;
 
 use common::{
     build_signed_p2tr_keypath_spend, build_signed_p2wpkh_spend_from_block1_coinbase,
+    build_signed_p2wpkh_spend_of_coinbase,
     block1_coinbase_txid, p2tr_keypath_output, poll_until, test_timeout, DeterministicWallet,
     TestNode,
 };
@@ -447,4 +448,133 @@ fn a_transaction_with_no_inputs_gets_cores_sizes_ids_and_messages() {
         refused(&node, "generateblock", vec![output, json!([data])]),
         (-22, format!("Transaction decode failed for {data}. {at_least_one}"))
     );
+}
+
+/// `tx` with its first input repeated: one outpoint spent twice.
+fn with_duplicated_input(hex: &str) -> (String, String, String) {
+    let mut tx: bitcoin::Transaction =
+        bitcoin::consensus::deserialize(&hex::decode(hex).unwrap()).unwrap();
+    tx.input.push(tx.input[0].clone());
+    (
+        hex::encode(bitcoin::consensus::serialize(&tx)),
+        tx.compute_txid().to_string(),
+        tx.compute_wtxid().to_string(),
+    )
+}
+
+/// A package member spending one outpoint twice itself, answered as Core
+/// answers it (v31.1 regtest; the code paths are v32.1's). Core's
+/// `IsConsistentPackage` (`src/policy/packages.cpp`) adds a member's inputs
+/// as one batch and compares only across members, so the package is well
+/// formed; the member then fails `CheckTransaction` with
+/// `bad-txns-inputs-duplicate`. A multi-transaction `testmempoolaccept`
+/// reports it on that member and leaves the rest with only their ids;
+/// `submitpackage` answers `transaction failed`, keeps the parent it accepted
+/// on its own, and gives the member its error.
+///
+/// Two members spending one outpoint stay `conflict-in-package`.
+#[test]
+fn a_member_spending_one_outpoint_twice_is_refused_as_core_refuses_it() {
+    let wallet = DeterministicWallet::from_secret([0x5b; 32]);
+    let mut node = funded_node(&[], &wallet);
+    // Blocks 2 and 3's coinbases mature too.
+    node.mine_blocks(2, &wallet.address.to_string());
+    let secp = bitcoin::secp256k1::Secp256k1::new();
+    let (parent, parent_txid, kp, spk) = spend_coinbase_to_taproot(&node, &wallet, 10_000);
+    let parent_tx: bitcoin::Transaction =
+        bitcoin::consensus::deserialize(&hex::decode(&parent).unwrap()).unwrap();
+    let parent_wtxid = parent_tx.compute_wtxid().to_string();
+    let parent_value = parent_tx.output[0].value.to_sat();
+    let parent_out = bitcoin::OutPoint::new(bitcoin::Txid::from_str(&parent_txid).unwrap(), 0);
+    let (child, _) =
+        build_signed_p2tr_keypath_spend(&secp, &kp, parent_out, spk.clone(), parent_value, spk.clone(), 10_000);
+    let (dup_child, dup_child_txid, dup_child_wtxid) = with_duplicated_input(&child);
+
+    // Two transactions, unrelated to the parent: `dup` spends block 2's
+    // coinbase twice, `other` spends block 3's.
+    let (spends_2, _) = build_signed_p2wpkh_spend_of_coinbase(&node, &wallet, 2, spk.clone(), 10_000);
+    let (dup, dup_txid, dup_wtxid) = with_duplicated_input(&spends_2);
+    let (other, other_txid) = build_signed_p2wpkh_spend_of_coinbase(&node, &wallet, 3, spk.clone(), 10_000);
+    let other_wtxid = {
+        let tx: bitcoin::Transaction =
+            bitcoin::consensus::deserialize(&hex::decode(&other).unwrap()).unwrap();
+        tx.compute_wtxid().to_string()
+    };
+    let refusal = |txid: &str, wtxid: &str| {
+        json!({
+            "txid": txid,
+            "wtxid": wtxid,
+            "allowed": false,
+            "reject-reason": "bad-txns-inputs-duplicate",
+            "reject-details": "bad-txns-inputs-duplicate",
+        })
+    };
+    let ids = |txid: &str, wtxid: &str| json!({"txid": txid, "wtxid": wtxid});
+
+    // Alone, as before.
+    assert_eq!(
+        node.rpc_ok("testmempoolaccept", vec![json!([dup])]),
+        json!([refusal(&dup_txid, &dup_wtxid)])
+    );
+    // In a package, wherever it stands, and whether or not the other member
+    // is its parent.
+    assert_eq!(
+        node.rpc_ok("testmempoolaccept", vec![json!([parent, dup_child])]),
+        json!([ids(&parent_txid, &parent_wtxid), refusal(&dup_child_txid, &dup_child_wtxid)])
+    );
+    assert_eq!(
+        node.rpc_ok("testmempoolaccept", vec![json!([dup, other])]),
+        json!([refusal(&dup_txid, &dup_wtxid), ids(&other_txid, &other_wtxid)])
+    );
+    assert_eq!(
+        node.rpc_ok("testmempoolaccept", vec![json!([other, dup])]),
+        json!([ids(&other_txid, &other_wtxid), refusal(&dup_txid, &dup_wtxid)])
+    );
+
+    // `submitpackage` of the member alone.
+    assert_eq!(
+        node.rpc_ok("submitpackage", vec![json!([dup])]),
+        json!({
+            "package_msg": "transaction failed",
+            "tx-results": {dup_wtxid.clone(): {"txid": dup_txid, "error": "bad-txns-inputs-duplicate"}},
+            "replaced-transactions": [],
+        })
+    );
+
+    // Two members spending one outpoint: still a package conflict, judged
+    // before any member.
+    let (spends_3_again, spends_3_again_txid) =
+        build_signed_p2wpkh_spend_of_coinbase(&node, &wallet, 3, spk.clone(), 20_000);
+    let spends_3_again_wtxid = {
+        let tx: bitcoin::Transaction =
+            bitcoin::consensus::deserialize(&hex::decode(&spends_3_again).unwrap()).unwrap();
+        tx.compute_wtxid().to_string()
+    };
+    let conflict = |txid: &str, wtxid: &str| {
+        json!({"txid": txid, "wtxid": wtxid, "package-error": "conflict-in-package"})
+    };
+    assert_eq!(
+        node.rpc_ok("testmempoolaccept", vec![json!([other, spends_3_again])]),
+        json!([conflict(&other_txid, &other_wtxid), conflict(&spends_3_again_txid, &spends_3_again_wtxid)])
+    );
+
+    // `submitpackage` of the parent and the child: the parent goes in on its
+    // own, the child carries its error.
+    let sp = node.rpc_ok("submitpackage", vec![json!([parent, dup_child])]);
+    assert_eq!(sp["package_msg"], json!("transaction failed"), "{sp}");
+    assert_eq!(sp["replaced-transactions"], json!([]), "{sp}");
+    let results = sp["tx-results"].as_object().expect("tx-results");
+    assert_eq!(results.len(), 2, "{sp}");
+    assert_eq!(
+        results[&dup_child_wtxid],
+        json!({"txid": dup_child_txid, "error": "bad-txns-inputs-duplicate"}),
+        "{sp}"
+    );
+    let accepted = &results[&parent_wtxid];
+    assert_eq!(accepted["txid"], json!(parent_txid), "{sp}");
+    assert!(accepted.get("error").is_none(), "{sp}");
+    assert_eq!(accepted["vsize"], json!(parent_tx.weight().to_wu().div_ceil(4)), "{sp}");
+    assert_eq!(accepted["fees"]["base"].as_f64(), Some(0.0001), "{sp}");
+    assert_eq!(accepted["fees"]["effective-includes"], json!([parent_wtxid]), "{sp}");
+    assert_eq!(node.rpc_ok("getrawmempool", vec![]), json!([parent_txid]));
 }
