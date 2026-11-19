@@ -2796,6 +2796,24 @@ mod tests {
         assert_eq!(batch.txseq_block_puts, vec![(0, 0)]);
     }
 
+    /// The last ordinal the 5-byte encoding holds can still be handed out;
+    /// one past it is refused rather than wrapped.
+    #[test]
+    fn connect_takes_ordinals_up_to_txseq_max_and_refuses_one_more() {
+        let block = make_coinbase_only_block(1, 0xffff_ffff, 0);
+        let store_at = |parent_count: u64| {
+            let store = InMemoryStore::new();
+            let mut batch = StoreBatch::default();
+            batch.chain_tx_puts.push((BlockHash::all_zeros(), parent_count));
+            store.write_batch(batch).unwrap();
+            store
+        };
+        let store = store_at(node_index::TXSEQ_MAX - 1);
+        connect_simple(&store, &block, 1, 0).expect("the block's one tx takes the last ordinal");
+        let store = store_at(node_index::TXSEQ_MAX);
+        assert!(matches!(connect_simple(&store, &block, 1, 0), Err(ConnectError::TxSeqOverflow)));
+    }
+
     fn connect_simple(
         store: &InMemoryStore,
         block: &Block,
