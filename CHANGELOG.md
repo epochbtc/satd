@@ -117,6 +117,7 @@ It includes every fix shipped in 0.7.1:
 - Operator: a custom signet frames its `blk*.dat` records and `dumptxoutset` snapshots with its own message start, as Core does, not the default signet's; a pre-0.8.0 custom-signet blocks directory mixes both and needs a fresh sync before Core can read it (#1283).
 - RPC: `getchaintxstats` defaults to one month of blocks (4320) and accepts `nblocks=0`, as in Core (#1297).
 - RPC: `decodepsbt`'s `tx` is the transaction as `decoderawtransaction` decodes it, and its script objects carry Core's `asm`, `hex`, `type` and, for a scriptPubKey, `desc` and `address` (#1296).
+- RPC: `decodepsbt` writes every field Core v32.1 does, in Core's shape: `partial_signatures` is an object, `sighash` a name, `fee` is absent rather than `null` when unknown, and version 0 gains `psbt_version`, `global_xpubs`, `proprietary`, `unknown` and the per-input and per-output derivation, taproot, MuSig2 and preimage fields (#1311).
 - RPC: `getmempoolentry`, `getrawmempool true` and `getmempoolancestors`/`getmempooldescendants true` report Core v31's `chunkweight` and `fees.chunk` (#1068).
 - RPC: mempool entries, `testmempoolaccept` and `submitpackage` report Core v32.1's `vsize_bip141` and `vsize_adjusted`; `getorphantxs` adds `vsize_bip141` and `getrawtransaction` a mempool transaction's `vsize_adjusted` (#1326).
 - RPC: `getnetworkinfo` reports `version` 320000 (Bitcoin Core v32), up from 280000, so clients with a Core v29 or v31 floor (Bark, Eclair) start (#1068).

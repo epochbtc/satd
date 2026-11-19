@@ -625,9 +625,17 @@ preserved; the satd extension is opt-in per request or per flag.
   - `decodepsbt` on a version 2 PSBT returns a different shape, with
     `psbt_version`, `tx_version`, `fallback_locktime`, per-input
     `previous_txid` / `previous_vout` / `sequence`, per-output `amount`
-    and `script`, a `silent_payments` object, and an `unknown` object
-    per map. Field names follow Core v32's where it has one. `tx` and `tx_hex` appear only once every output has a
-    script: a silent payment output whose script has not been computed
+    and `script`, and a `silent_payments` object. Every field Core
+    v32.1 writes is there, in Core's shape (for both versions; `unknown`
+    is Core's, BIP 375's pairs among it). Beyond Core's, satd always
+    writes `inputs_modifiable`, `outputs_modifiable`,
+    `has_sighash_single` and `fallback_locktime` (`null` when unset),
+    and adds `locktime`, `unique_id`, `required_time_locktime` /
+    `required_height_locktime` where Core writes `time_locktime` /
+    `height_locktime`, and the silent payment fields. In both versions
+    `tx_hex` and each input's `has_utxo` and `is_final` are satd's own.
+    In version 2, `tx` (which Core does not write) and `tx_hex` appear
+    only once every output has a script: a silent payment output whose script has not been computed
     yet describes no transaction, and emitting an empty script instead
     would read as an output paying nobody.
   - `combinepsbt` **refuses** two PSBTs that give different values for
