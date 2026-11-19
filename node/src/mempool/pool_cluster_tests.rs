@@ -283,3 +283,147 @@ fn a_returned_child_is_checked_without_its_parents_mempool_spenders() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Core v32.1 regtest's `getmempoolcluster` and `getmempoolfeeratediagram`
+/// for three clusters of P2WSH `OP_1` spends of 50 BTC coins: a CPFP pair
+/// (the parent pays 1000 sat, the child 100000), a pair whose parent pays
+/// 10000 sat and is prioritised by -200000 (its child pays 50000), and a
+/// lone spend paying 20000.
+mod core_v32_1_clusters {
+    use super::*;
+    use crate::mempool::feefrac::FeeFrac;
+    use crate::mining::template::tests::make_funded_template_env_with;
+    use crate::storage::coinview::Coin;
+    use bitcoin::hashes::Hash;
+
+    const CPFP_PARENT: &str = concat!(
+        "020000000001016c104e321f414c53d7459cb4747d97f20cc4c78050d6d732043ad0008b203b450000000000fdffffff",
+        "0118ee052a010000002200204ae81572f06e1b88fd5ced7a1a000945432e83e1551e6f721ee9c00b8cc3326001015100",
+        "000000",
+    );
+    const CPFP_CHILD: &str = concat!(
+        "02000000000101302f5ef2755857bdfe11b6bddacdf53bf65cdaab81122fccbe3aa5cd0ce106680000000000fdffffff",
+        "017867042a010000002200204ae81572f06e1b88fd5ced7a1a000945432e83e1551e6f721ee9c00b8cc3326001015100",
+        "000000",
+    );
+    const NEG_PARENT: &str = concat!(
+        "02000000000101d0f83fd92d975b3687ff46035a49b3ee91e40d22133cbf3a7afb7a93eb62089c0000000000fdffffff",
+        "01f0ca052a010000002200204ae81572f06e1b88fd5ced7a1a000945432e83e1551e6f721ee9c00b8cc3326001015100",
+        "000000",
+    );
+    const NEG_CHILD: &str = concat!(
+        "0200000000010101491fee95e565d39e61c6e119cb5d2e543a84ab39054f82ece9a307557f842d0000000000fdffffff",
+        "01a007052a010000002200204ae81572f06e1b88fd5ced7a1a000945432e83e1551e6f721ee9c00b8cc3326001015100",
+        "000000",
+    );
+    const LONE: &str = concat!(
+        "020000000001011407d5e627e8f087e3215366e8c0cfcb92f9f581c12391ef7897ebf7756ad3010000000000fdffffff",
+        "01e0a3052a010000002200204ae81572f06e1b88fd5ced7a1a000945432e83e1551e6f721ee9c00b8cc3326001015100",
+        "000000",
+    );
+
+    fn tx(hex: &str) -> Transaction {
+        bitcoin::consensus::encode::deserialize_hex(hex).unwrap()
+    }
+
+    fn txid(hex: &str) -> Txid {
+        tx(hex).compute_txid()
+    }
+
+    /// The mempool of Core's run.
+    fn core_mempool() -> (ChainState, Mempool, std::path::PathBuf) {
+        let op_true = bitcoin::ScriptBuf::new_p2wsh(&bitcoin::ScriptBuf::from_bytes(vec![0x51]).wscript_hash());
+        let coins: Vec<(OutPoint, Coin)> = [CPFP_PARENT, NEG_PARENT, LONE]
+            .iter()
+            .map(|h| {
+                let coin = Coin {
+                    amount: 5_000_000_000,
+                    script_pubkey: op_true.clone(),
+                    height: 0,
+                    coinbase: false,
+                    txseq: node_index::TXSEQ_UNKNOWN,
+                };
+                (tx(h).input[0].previous_output, coin)
+            })
+            .collect();
+        let (cs, mp, dir) = make_funded_template_env_with(&coins, Box::new(NoopVerifier));
+        for h in [CPFP_PARENT, CPFP_CHILD, NEG_PARENT] {
+            accept(&mp, &cs, &tx(h)).expect("admitted");
+        }
+        mp.prioritise_transaction(&txid(NEG_PARENT), -200_000).unwrap();
+        for h in [NEG_CHILD, LONE] {
+            accept(&mp, &cs, &tx(h)).expect("admitted");
+        }
+        (cs, mp, dir)
+    }
+
+    fn ff(fee: i64, size: i64) -> FeeFrac {
+        FeeFrac { fee, size }
+    }
+
+    /// Each cluster is one chunk of both transactions, parent first; the
+    /// prioritised one's fee is negative, -140000, not a clamped 50000.
+    #[test]
+    fn a_cluster_is_its_chunks_in_linearization_order() {
+        let (_cs, mp, dir) = core_mempool();
+        let cpfp = vec![(vec![txid(CPFP_PARENT), txid(CPFP_CHILD)], ff(101_000, 762))];
+        assert_eq!(mp.mempool_cluster(&txid(CPFP_PARENT)), Some(cpfp.clone()));
+        assert_eq!(mp.mempool_cluster(&txid(CPFP_CHILD)), Some(cpfp));
+        let neg = vec![(vec![txid(NEG_PARENT), txid(NEG_CHILD)], ff(-140_000, 762))];
+        assert_eq!(mp.mempool_cluster(&txid(NEG_CHILD)), Some(neg));
+        assert_eq!(mp.mempool_cluster(&txid(LONE)), Some(vec![(vec![txid(LONE)], ff(20_000, 381))]));
+        assert_eq!(mp.mempool_cluster(&Txid::from_byte_array([7; 32])), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Core: `[{0, 0}, {762, 0.00101}, {1143, 0.00121}, {1905, -0.00019}]`.
+    #[test]
+    fn the_feerate_diagram_is_cores() {
+        let (_cs, mp, dir) = core_mempool();
+        assert_eq!(
+            mp.feerate_diagram(),
+            vec![ff(0, 0), ff(101_000, 762), ff(121_000, 1143), ff(-19_000, 1905)]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The RPCs' JSON, as Core v32.1 writes it.
+    #[test]
+    fn the_rpcs_answer_in_cores_shape() {
+        let (_cs, mp, dir) = core_mempool();
+        let got = crate::rpc::blockchain::get_mempool_cluster(&mp, &txid(NEG_PARENT).to_string()).unwrap();
+        let want = serde_json::json!({
+            "clusterweight": 762,
+            "txcount": 2,
+            "chunks": [{
+                "chunkfee": crate::rpc::amounts::format_signed_amount(-140_000, crate::rpc::amounts::AmountUnit::Btc),
+                "chunkweight": 762,
+                "txs": [txid(NEG_PARENT).to_string(), txid(NEG_CHILD).to_string()],
+            }],
+        });
+        assert_eq!(got, want);
+        assert_eq!(got["chunks"][0]["chunkfee"].to_string(), "-0.00140000");
+        let diagram = crate::rpc::blockchain::get_mempool_feerate_diagram(&mp);
+        let points: Vec<(i64, String)> = diagram
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| (p["weight"].as_i64().unwrap(), p["fee"].to_string()))
+            .collect();
+        let want: Vec<(i64, String)> =
+            [(0, "0.00000000"), (762, "0.00101000"), (1143, "0.00121000"), (1905, "-0.00019000")]
+                .iter()
+                .map(|(w, f)| (*w, f.to_string()))
+                .collect();
+        assert_eq!(points, want);
+        assert_eq!(
+            crate::rpc::blockchain::get_mempool_cluster(&mp, &"00".repeat(32)),
+            Err((-5, "Transaction not in mempool".to_string()))
+        );
+        assert_eq!(
+            crate::rpc::blockchain::get_mempool_cluster(&mp, "zz"),
+            Err((-8, "txid must be of length 64 (not 2, for 'zz')".to_string()))
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

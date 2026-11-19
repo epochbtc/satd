@@ -105,7 +105,12 @@ pub fn get_raw_transaction(
     if blockhash.is_none()
         && let Some(entry) = mempool.get(&txid).filter(|e| e.scope.is_acting()) {
             return if verbose {
-                Ok(decode_transaction_verbose_net(&entry.tx, None, None, false, true, chain_state.network))
+                let mut out = decode_transaction_verbose_net(&entry.tx, None, None, false, true, chain_state.network);
+                // Core's `getrawtransaction` adds the sigop-adjusted size of
+                // a mempool transaction (`info.vsize`, src/rpc/rawtransaction.cpp).
+                out["vsize_adjusted"] =
+                    crate::mempool::policy::weight_to_vsize(entry.adjusted_weight()).into();
+                Ok(out)
             } else {
                 let raw = bitcoin::consensus::serialize(&entry.tx);
                 Ok(Value::String(hex::encode(raw)))

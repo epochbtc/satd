@@ -476,7 +476,9 @@ the silent payment fields are satd's own.
       { "scan_key": "02…", "ecdh_share": "03…", "dleq_proof": "…" }
     ]
   },
-  "unknown": { },                      // global pairs satd does not recognise
+  "global_xpubs": [ ],                 // as in Core, also in version 0
+  "proprietary": [ ],
+  "unknown": { },                      // the global pairs Core does not read, BIP 375's included
   "inputs": [
     {
       "previous_txid": "…",
@@ -486,12 +488,12 @@ the silent payment fields are satd's own.
         "amount": 0.001,
         "scriptPubKey": { "asm": "0 …", "desc": "addr(…)#…", "hex": "0014…", "address": "bc1q…", "type": "witness_v0_keyhash" }
       },
-      "has_utxo": true,
+      "has_utxo": true,                // satd's own, also in version 0
       "is_final": false,
       "sp_shares": [
         { "scan_key": "02…", "ecdh_share": "03…", "dleq_proof": "…" }
       ],
-      "unknown": { }
+      "unknown": { "1d02…": "03…" }    // only when the input has pairs Core does not read
     }
   ],
   "outputs": [
@@ -499,14 +501,22 @@ the silent payment fields are satd's own.
       "amount": 0.0009,
       "script": { "asm": "1 …", "desc": "rawtr(…)#…", "hex": "5120…", "address": "bc1p…", "type": "witness_v1_taproot" },  // absent while it has not been computed
       "silent_payment": { "scan_key": "02…", "spend_key": "03…", "label": 3 },
-      "unknown": { }
+      "unknown": { "0902…": "…" }      // only when the output has pairs Core does not read
     }
   ],
   "tx": { "txid": "…", "vin": [ ], "vout": [ ] }, "tx_hex": "…",  // only when every output has a script; `tx` is decoderawtransaction's shape
   "unique_id": "…",                    // BIP 370's identifier for this PSBT
-  "fee": 0.0001                        // as in version 0: null unless every input's UTXO is known
+  "fee": 0.0001                        // as in version 0: absent unless every input's UTXO is known
 }
 ```
+
+Each input and output also carries the fields Core's `decodepsbt` writes
+when the PSBT has them, in Core's shape and for both versions:
+`non_witness_utxo`, `partial_signatures` (an object from public key to
+signature), `sighash` (a name such as `"ALL|ANYONECANPAY"`, or `""` for a
+value Core cannot name), `bip32_derivs`, the four preimage maps, the
+`taproot_*` fields, the `musig2_*` fields and `proprietary`. `tx_hex`,
+`has_utxo` and `is_final` are satd's own and appear in version 0 too.
 
 An output's `script` is **absent**, not empty, while a silent payment
 script is still being computed. The two mean different things, and a

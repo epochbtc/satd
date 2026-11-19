@@ -69,6 +69,7 @@ const HELP_METHODS: &[(&str, &str)] = &[
     ("getdifficulty", "Blockchain"),
     ("getibdprogress", "Blockchain"),
     ("getmempoolancestors", "Blockchain"),
+    ("getmempoolcluster", "Blockchain"),
     ("getmempooldescendants", "Blockchain"),
     ("getmempoolentry", "Blockchain"),
     ("getmempoolhistory", "Blockchain"),
@@ -201,6 +202,7 @@ const HELP_METHODS: &[(&str, &str)] = &[
     ("addpeeraddress", "hidden"),
     ("getrawaddrman", "hidden"),
     ("getorphantxs", "hidden"),
+    ("getmempoolfeeratediagram", "hidden"),
     // satd's test-only strip tool; registered only with `-allowteststrip`
     // on regtest.
     ("stripopreturns", "hidden"),
@@ -1236,6 +1238,19 @@ pub async fn start(
             .map_err(|e| ErrorObjectOwned::owned(-5, e, None::<()>))
     })?;
 
+    module.register_method("getmempoolcluster", |params, ctx, _extensions| {
+        let mut args = Args::new(&params);
+        let txid: String = args.required("txid")?;
+        args.check()?;
+        blockchain::get_mempool_cluster(&ctx.mempool, &txid)
+            .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
+    })?;
+
+    module.register_method("getmempoolfeeratediagram", |params, ctx, _extensions| {
+        Args::new(&params).check()?;
+        Ok::<_, ErrorObjectOwned>(blockchain::get_mempool_feerate_diagram(&ctx.mempool))
+    })?;
+
     module.register_method("getmempoolentry", |params, ctx, _extensions| {
         // Accepts either a single txid string (Core-compat) or an array
         // of txids (bulk). On bulk, returns a map of txid → entry | null.
@@ -2042,23 +2057,7 @@ pub async fn start(
         let orphans = ctx.peer_manager.orphanage().orphans();
         let out: Vec<serde_json::Value> = orphans
             .into_iter()
-            .map(|(tx, from)| {
-                if verbosity == 0 {
-                    return serde_json::json!(tx.compute_txid().to_string());
-                }
-                let mut o = serde_json::json!({
-                    "txid": tx.compute_txid().to_string(),
-                    "wtxid": tx.compute_wtxid().to_string(),
-                    "bytes": tx.total_size(),
-                    "vsize": tx.vsize(),
-                    "weight": tx.weight().to_wu(),
-                    "from": from,
-                });
-                if verbosity == 2 {
-                    o["hex"] = serde_json::json!(bitcoin::consensus::encode::serialize_hex(&tx));
-                }
-                o
-            })
+            .map(|(tx, from)| orphan_to_json(&tx, &from, verbosity))
             .collect();
         Ok::<_, ErrorObjectOwned>(serde_json::Value::Array(out))
     })?;
@@ -2359,7 +2358,13 @@ pub async fn start(
                     // effective feerate is its own modified feerate and
                     // `effective-includes` is its own wtxid.
                     entry["allowed"] = true.into();
+                    // Core's `testmempoolaccept`: `vsize` and
+                    // `vsize_adjusted` are the sigop-adjusted size,
+                    // `vsize_bip141` the BIP 141 one.
+                    entry["vsize_adjusted"] = vsize.into();
                     entry["vsize"] = vsize.into();
+                    entry["vsize_bip141"] =
+                        crate::mempool::policy::weight_to_vsize(tx.weight().to_wu()).into();
                     entry["fees"] = serde_json::json!({
                         "base": format_amount(fees, default_unit()),
                         "effective-feerate": format_amount(feerate_sat_per_kvb, default_unit()),
@@ -5746,6 +5751,59 @@ async fn wait_for_longpoll(ctx: &RpcContext, lpval: &serde_json::Value) -> Resul
     }
 }
 
+/// Core's `OrphanToJSON` (src/rpc/mempool.cpp), at `getorphantxs`'s
+/// verbosity: the txid alone at 0, the object at 1, and its hex beside it
+/// at 2.
+fn orphan_to_json<F: serde::Serialize>(tx: &bitcoin::Transaction, from: &F, verbosity: i32) -> serde_json::Value {
+    if verbosity == 0 {
+        return serde_json::json!(tx.compute_txid().to_string());
+    }
+    let mut o = serde_json::json!({
+        "txid": tx.compute_txid().to_string(),
+        "wtxid": tx.compute_wtxid().to_string(),
+        "bytes": tx.total_size(),
+        // Both are the BIP 141 vsize in Core; `vsize` is the deprecated one.
+        "vsize": tx.vsize(),
+        "vsize_bip141": tx.vsize(),
+        "weight": tx.weight().to_wu(),
+        "from": from,
+    });
+    if verbosity == 2 {
+        o["hex"] = serde_json::json!(bitcoin::consensus::encode::serialize_hex(tx));
+    }
+    o
+}
+
+#[cfg(test)]
+mod orphan_json_tests {
+    use super::orphan_to_json;
+
+    /// Core v32.1's `getorphantxs` carries `vsize_bip141` beside `vsize`,
+    /// both by weight alone: this spend weighs 583, so 146 vbytes, though
+    /// its 3941 sigops would make it 19705 in the mempool.
+    #[test]
+    fn an_orphan_reports_its_bip141_vsize_twice() {
+        // The heavy spend from the Core v32.1 regtest run behind
+        // `pool_sigopsize_tests`.
+        let hex = format!(
+            "{}{}{}",
+            concat!(
+                "0200000000010171cd876495f687031e323cdcac490f72a54fef709e8a2b4b9c1a9845397b90ab0000000000fdffffff",
+                "01c0d3f205000000002200204ae81572f06e1b88fd5ced7a1a000945432e83e1551e6f721ee9c00b8cc3326001cb006351",
+            ),
+            "ae".repeat(198),
+            "685100000000",
+        );
+        let tx: bitcoin::Transaction = bitcoin::consensus::encode::deserialize_hex(&hex).unwrap();
+        let o = orphan_to_json(&tx, &[7u64], 1);
+        let sizes = (&o["vsize"], &o["vsize_bip141"], &o["weight"]);
+        assert_eq!(sizes, (&serde_json::json!(146), &serde_json::json!(146), &serde_json::json!(583)), "{o}");
+        assert!(o.get("vsize_adjusted").is_none(), "{o}");
+        assert!(o.get("hex").is_none());
+        assert!(orphan_to_json(&tx, &[7u64], 2)["hex"].is_string());
+    }
+}
+
 #[cfg(test)]
 mod raw_outputs_tests {
     use super::raw_outputs_sequence;
@@ -5825,7 +5883,7 @@ mod help_listing_tests {
     /// stays out of the listing. Naming them keeps a later re-categorisation
     /// from quietly advertising a test-only dial or raw-send RPC.
     #[test]
-    fn the_hidden_commands_are_the_expected_eight() {
+    fn the_hidden_commands_are_the_expected_nine() {
         let hidden: Vec<&str> = HELP_METHODS
             .iter()
             .filter(|(_, c)| *c == "hidden")
@@ -5841,6 +5899,7 @@ mod help_listing_tests {
                 "addpeeraddress",
                 "getrawaddrman",
                 "getorphantxs",
+                "getmempoolfeeratediagram",
                 "stripopreturns",
             ]
         );
