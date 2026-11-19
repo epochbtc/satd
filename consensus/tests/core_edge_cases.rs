@@ -4,6 +4,8 @@
 
 mod helpers;
 
+mod script_edges;
+
 use bitcoin::absolute::LockTime;
 use bitcoin::consensus::Encodable;
 use bitcoin::hashes::{sha256, Hash, HashEngine};
@@ -695,4 +697,94 @@ fn test_2swap_leaves_items_below_the_top_four() {
         want.extend([vec![3], vec![4], vec![1], vec![2]]);
         assert_eq!(stack, want, "{depth} item(s) below");
     }
+}
+
+// =========================================================================
+// 9. Pushes whose length runs past the script, and long length fields
+//
+// Core's GetOp fails on a push with too few length bytes or too little data,
+// and EvalScript then stops with BAD_OPCODE (script.cpp GetScriptOp,
+// interpreter.cpp EvalScript). FindAndDelete, IsPushOnly and the legacy
+// scriptCode serialisation walk scripts with the same GetOp. differential.rs
+// runs these cases through Core's interpreter as well.
+// =========================================================================
+
+/// A PUSHDATA2 with one length byte at the end of the script is BAD_OPCODE.
+#[test]
+fn truncated_pushdata2_length_is_bad_opcode_not_panic() {
+    assert_eq!(script_edges::pushdata2_missing_a_length_byte().verify(), Err(ScriptError::BadOpcode));
+}
+
+/// OP_CHECKSIG runs FindAndDelete over the scriptCode before it checks the
+/// signature, so the truncated PUSHDATA2 after it is parsed there first.
+#[test]
+fn truncated_pushdata2_after_checksig_is_bad_opcode_not_panic() {
+    let case = script_edges::pushdata2_missing_a_length_byte_after_checksig();
+    assert_eq!(case.verify(), Err(ScriptError::BadOpcode));
+}
+
+/// The same scriptCode as a P2SH redeemScript under every flag, as a relayed
+/// transaction would carry it: FindAndDelete runs, then the 1-byte
+/// signature fails DER.
+#[test]
+fn p2sh_redeem_script_with_a_truncated_pushdata2_fails_der_not_panic() {
+    let case = script_edges::p2sh_redeem_script_with_a_truncated_pushdata2();
+    assert_eq!(case.verify(), Err(ScriptError::SigDer));
+}
+
+/// A PUSHDATA4 length is read from all four bytes. 0x00010001 is far more
+/// than the one byte left, so the push fails; with length 1 it is true.
+#[test]
+fn pushdata4_length_uses_all_four_bytes() {
+    assert_eq!(script_edges::pushdata4_length_with_byte_2_set().verify(), Err(ScriptError::BadOpcode));
+    assert_eq!(script_edges::pushdata4_length_of_one().verify(), Ok(()));
+}
+
+/// A scriptSig that pushes a 257-byte redeemScript with PUSHDATA4 is push
+/// only (Core's IsPushOnly reads the push with GetOp), so the P2SH spend is
+/// valid.
+#[test]
+fn p2sh_redeem_script_pushed_with_pushdata4_256_plus_is_push_only() {
+    assert_eq!(script_edges::p2sh_redeem_script_pushed_with_pushdata4().verify(), Ok(()));
+}
+
+/// The legacy sighash serialises the scriptCode as it is when it holds no
+/// OP_CODESEPARATOR opcode (Core's SerializeScriptCode). 0xab bytes inside a
+/// PUSHDATA1 whose length byte is above 75 are data, so a signature over the
+/// unchanged script verifies.
+#[test]
+fn legacy_sighash_keeps_codeseparator_bytes_inside_pushdata1_data() {
+    let case = script_edges::checksig_with_codeseparator_bytes_in_pushdata1_data();
+    assert_eq!(case.verify(), Ok(()));
+}
+
+/// A 40-byte program is a witness program. Version 1 at that length is
+/// unknown, so it spends (or is discouraged under policy); version 0 at that
+/// length is the wrong length (interpreter.cpp VerifyWitnessProgram).
+#[test]
+fn witness_program_40_bytes() {
+    assert_eq!(script_edges::witness_v1_program_of_40_bytes(0).verify(), Ok(()));
+    assert_eq!(
+        script_edges::witness_v1_program_of_40_bytes(flags::VERIFY_DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM).verify(),
+        Err(ScriptError::DiscourageUpgradableWitnessProgram),
+    );
+    assert_eq!(
+        script_edges::witness_v0_program_of_40_bytes().verify(),
+        Err(ScriptError::WitnessProgramWrongLength),
+    );
+}
+
+/// Under CONST_SCRIPTCODE, a signature found in the scriptCode is
+/// SIG_FINDANDDELETE (interpreter.cpp FindAndDelete's caller). A 256-byte
+/// signature is pushed with PUSHDATA2, and the pattern has that prefix too.
+/// A signature whose push only appears inside the data of a 256-byte
+/// PUSHDATA4 is not found. The kernel API does not take CONST_SCRIPTCODE, so
+/// these stay out of differential.rs.
+#[test]
+fn find_and_delete_with_long_pushes_and_const_scriptcode() {
+    assert_eq!(
+        script_edges::const_scriptcode_finds_a_256_byte_signature().verify(),
+        Err(ScriptError::SigFindAndDelete),
+    );
+    assert_eq!(script_edges::const_scriptcode_skips_a_signature_inside_pushdata4_data().verify(), Ok(()));
 }

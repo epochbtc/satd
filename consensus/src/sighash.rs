@@ -519,4 +519,22 @@ mod tests {
             assert_eq!(got.as_bytes(), &script[..script.len() - 1], "push {push:02x?}");
         }
     }
+
+    #[test]
+    fn remove_codeseparators_keeps_pushdata1_data_with_a_long_length() {
+        // A length byte above 75 is not a push opcode itself, so reading the
+        // PUSHDATA1 wrong would expose its data. The 0xab bytes inside stay;
+        // only the OP_CODESEPARATOR after the push goes.
+        let mut script = vec![0x4c, 0x50];
+        script.extend([0xab; 80]);
+        script.push(0xab);
+        assert_eq!(remove_codeseparators(&script).as_bytes(), &script[..script.len() - 1]);
+    }
+
+    #[test]
+    fn remove_codeseparators_keeps_a_bare_pushdata1() {
+        // A PUSHDATA1 with no length byte is kept as it is, as Core's
+        // SerializeScriptCode copies it.
+        assert_eq!(remove_codeseparators(&[0x4c]).as_bytes(), &[0x4c]);
+    }
 }

@@ -368,4 +368,25 @@ mod tests {
             assert_eq!(result, script[..script.len() - 1], "push {push:02x?}");
         }
     }
+
+    #[test]
+    fn find_and_delete_stops_at_a_pushdata2_with_one_length_byte() {
+        // Core's GetOp fails on a PUSHDATA2 with fewer than two length bytes
+        // and FindAndDelete stops there, leaving the script as it was.
+        let script = [0xac, 0x4d, 0x01];
+        assert_eq!(find_and_delete(&script, &[0x01, 0x07]), (script.to_vec(), 0));
+    }
+
+    #[test]
+    fn find_and_delete_reads_all_four_pushdata4_length_bytes() {
+        // A length of 256 (byte 1 set): the pattern inside the data is skipped.
+        let mut script = vec![0x4e, 0x00, 0x01, 0x00, 0x00];
+        script.extend([0x51; 256]);
+        assert_eq!(find_and_delete(&script, &[0x51]), (script.clone(), 0));
+
+        // A length of 65536 (byte 2 set) runs past the end: the push takes the
+        // rest of the script, pattern and all.
+        let script = [0x4e, 0x00, 0x00, 0x01, 0x00, 0x01, 0x07];
+        assert_eq!(find_and_delete(&script, &[0x01, 0x07]), (script.to_vec(), 0));
+    }
 }
