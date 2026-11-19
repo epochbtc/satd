@@ -61,6 +61,7 @@ pub mod network;
 pub mod params;
 pub mod policy;
 pub mod psbt;
+pub(crate) mod psbt_fields;
 pub mod psbt_v2;
 pub mod rawtx;
 pub mod script_asm;
