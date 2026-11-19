@@ -73,6 +73,7 @@ It includes every fix shipped in 0.7.1:
 - Release tooling: `contrib/release/sign-tarballs.sh` keeps a per-tag working directory across failed runs and reuses only the files whose hashes still match the release (#903).
 - Consensus: `-reindex` applies header sync's rules (difficulty, median time past, version, checkpoints) to every stored block and skips a failing block and its descendants (#506).
 - Operator: AssumeUTXO background validation retries a failed connect, its alerts reach every alert surface, and new `satd_assumeutxo_*` gauges show progress (#557).
+- AssumeUTXO: Bitcoin Core v32.1's mainnet snapshot at height 965,000 loads with `loadtxoutset` and `--fast-start` (#1313).
 - Streaming: a `satd-head-cursor` header lets the Go and Rust resilient watches resume after a drop before their first confirmed event (#777).
 - Packaging: Nix builds and x86_64 Linux tarballs no longer depend on the build CPU (jemalloc constants pinned), and `flake.lock` is committed (#321).
 - RPC: `estimatesmartfee` takes Core 32.1's shape (`options`, `estimator`, answered `blocks`, no-data `errors`), and every fee surface floors at the rolling mempool minimum (#1200).

@@ -117,10 +117,9 @@ fn decode_blockhash(hex_str: &str) -> BlockHash {
 }
 
 // ---------------------------------------------------------------------------
-// Mainnet — copied verbatim from Bitcoin Core master at the time of writing.
-// Reference: `bitcoin/bitcoin@HEAD:src/kernel/chainparams.cpp` —
-// `CMainParams::m_assumeutxo_data`. Keep in sync with Core's master at PR
-// review time; values must match byte-for-byte.
+// Mainnet — copied verbatim from Bitcoin Core v32.1:
+// `src/kernel/chainparams.cpp` at tag `v32.1`,
+// `CMainParams::m_assumeutxo_data`. Values must match byte-for-byte.
 // ---------------------------------------------------------------------------
 
 fn mainnet_anchors() -> Vec<AssumeUtxoData> {
@@ -165,6 +164,17 @@ fn mainnet_anchors() -> Vec<AssumeUtxoData> {
                 "e4b90ef9eae834f56c4b64d2d50143cee10ad87994c614d7d04125e2a6025050",
             ),
         },
+        // Added in Core v32.1.
+        AssumeUtxoData {
+            height: 965_000,
+            blockhash: decode_blockhash(
+                "00000000000000000001595977e6000ce56129f5c9b4073e31ccc30b90b97da9",
+            ),
+            nchaintx: 1_429_611_231,
+            hash_serialized_3: decode_sha256(
+                "4a8d794337118c0c615b574f817c7306c687584a537184b8d233df42bf477ec2",
+            ),
+        },
     ]
 }
 
@@ -204,11 +214,11 @@ mod tests {
     }
 
     /// Pin EVERY mainnet anchor's full content against Bitcoin Core
-    /// master verbatim. A typo in any of the hex literals would
+    /// v32.1 verbatim (`src/kernel/chainparams.cpp` at tag `v32.1`). A typo in any of the hex literals would
     /// previously panic only on the first runtime lookup; this test
     /// catches the typo in CI before the binary ships.
     #[test]
-    fn all_mainnet_anchors_match_core_master() {
+    fn all_mainnet_anchors_match_core_v32_1() {
         let anchors = assumeutxo_for_network(Network::Bitcoin);
         let expected: &[(u32, &str, u64, &str)] = &[
             (
@@ -234,6 +244,12 @@ mod tests {
                 "0000000000000000000147034958af1652b2b91bba607beacc5e72a56f0fb5ee",
                 1_305_397_408,
                 "e4b90ef9eae834f56c4b64d2d50143cee10ad87994c614d7d04125e2a6025050",
+            ),
+            (
+                965_000,
+                "00000000000000000001595977e6000ce56129f5c9b4073e31ccc30b90b97da9",
+                1_429_611_231,
+                "4a8d794337118c0c615b574f817c7306c687584a537184b8d233df42bf477ec2",
             ),
         ];
         assert_eq!(
@@ -279,6 +295,24 @@ mod tests {
                 .expect("lookup_by_blockhash must find every anchor");
             assert_eq!(found.height, anchor.height);
         }
+    }
+
+    /// Core v32.1's 965,000 anchor, found both ways: a snapshot based on
+    /// this block is the one `loadtxoutset` and `--fast-start` accept.
+    #[test]
+    fn mainnet_965000_anchor_is_core_v32_1() {
+        let hash: BlockHash =
+            "00000000000000000001595977e6000ce56129f5c9b4073e31ccc30b90b97da9"
+                .parse()
+                .unwrap();
+        let a = lookup_by_blockhash(Network::Bitcoin, &hash).expect("965,000 anchor");
+        assert_eq!(a.height, 965_000);
+        assert_eq!(a.nchaintx, 1_429_611_231);
+        assert_eq!(
+            hex::encode(a.hash_serialized_3),
+            "4a8d794337118c0c615b574f817c7306c687584a537184b8d233df42bf477ec2"
+        );
+        assert_eq!(lookup_by_height(Network::Bitcoin, 965_000), Some(a));
     }
 
     #[test]

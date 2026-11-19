@@ -91,8 +91,8 @@ does not skip validation.
 
 satd hosts none, and does not name one for you. The anchors compiled into
 the binary decide which snapshots are loadable at all — currently mainnet
-heights 840,000, 880,000, 910,000 and 935,000, copied verbatim from Bitcoin
-Core's `m_assumeutxo_data`. Signet, testnet and regtest have no anchors, so
+heights 840,000, 880,000, 910,000, 935,000 and 965,000, copied verbatim from
+Bitcoin Core v32.1's `m_assumeutxo_data`. Signet, testnet and regtest have no anchors, so
 fast-start is mainnet-only.
 
 Several people publish the `utxo-<height>.dat` files Core's `dumptxoutset`
