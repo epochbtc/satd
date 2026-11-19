@@ -960,6 +960,28 @@ mod tests {
     }
 
     #[test]
+    fn a_block_of_exactly_max_weight_is_valid_and_one_unit_more_is_not() {
+        // Core's limit is inclusive: `bad-blk-weight` is
+        // `GetBlockWeight(block) > MAX_BLOCK_WEIGHT` (validation.cpp), so a
+        // block weighing exactly 4,000,000 WU is valid, and rejecting it
+        // would split the chain. Past 65,535 witness bytes the push's length
+        // prefix is a fixed 5 bytes, so each extra witness byte adds exactly
+        // one weight unit and the fixed overhead can be measured once.
+        let probe = 3_000_000;
+        let overhead = block_with_witness_bytes(probe, true).weight().to_wu() as usize - probe;
+        let at_limit = block_with_witness_bytes(MAX_BLOCK_WEIGHT - overhead, true);
+        assert_eq!(at_limit.weight().to_wu(), MAX_BLOCK_WEIGHT as u64);
+        assert!(check_block(&at_limit, Network::Regtest, 0).is_ok());
+
+        let over = block_with_witness_bytes(MAX_BLOCK_WEIGHT - overhead + 1, true);
+        assert_eq!(over.weight().to_wu(), MAX_BLOCK_WEIGHT as u64 + 1);
+        assert!(matches!(
+            check_block(&over, Network::Regtest, 0),
+            Err(ValidationError::OverweightBlock)
+        ));
+    }
+
+    #[test]
     fn test_weight_checked_after_witness_rules_like_core() {
         // The same overweight block with no commitment must fail on its
         // witness rules, not its weight — Core weighs a block only after the

@@ -1070,6 +1070,41 @@ mod tests {
         assert_eq!(STANDARD_SCRIPT_VERIFY_FLAGS, 0x1f_ffdf);
     }
 
+    /// A failed input's debug string is Core's `CScriptCheck` one,
+    /// `input %i of %s (wtxid %s), spending %s:%i` (validation.cpp), naming
+    /// the failing input's own prevout. `testmempoolaccept` reports it in
+    /// `reject-details`. An index past the inputs has no string.
+    #[test]
+    fn core_debug_string_names_the_failed_input_as_core_does() {
+        use bitcoin::hashes::Hash as _;
+        use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, TxIn, Witness, absolute::LockTime, transaction};
+        let input = |byte, vout| TxIn {
+            previous_output: OutPoint { txid: bitcoin::Txid::from_byte_array([byte; 32]), vout },
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::MAX,
+            witness: Witness::from_slice(&[[0x51]]),
+        };
+        let tx = Transaction {
+            version: transaction::Version(2),
+            lock_time: LockTime::ZERO,
+            input: vec![input(0x11, 3), input(0x22, 7)],
+            output: vec![TxOut { value: Amount::from_sat(1000), script_pubkey: ScriptBuf::new() }],
+        };
+        let (txid, wtxid) = (tx.compute_txid(), tx.compute_wtxid());
+        assert_ne!(txid.to_string(), wtxid.to_string(), "premise: the witness makes the two differ");
+
+        let failed = |input| ScriptError::VerifyFailed { input, reason: "Script failed an OP_EQUALVERIFY operation".into() };
+        assert_eq!(
+            failed(1).core_debug_string(&tx),
+            Some(format!("input 1 of {txid} (wtxid {wtxid}), spending {}:7", "22".repeat(32))),
+        );
+        assert_eq!(
+            failed(0).core_debug_string(&tx),
+            Some(format!("input 0 of {txid} (wtxid {wtxid}), spending {}:3", "11".repeat(32))),
+        );
+        assert_eq!(failed(2).core_debug_string(&tx), None);
+    }
+
     /// satd's BIP 322 extension flag is never part of a block or policy flag
     /// set. The consensus crate's entry points refuse it anyway; this pins the
     /// node side, so the flag cannot drift into validation.
@@ -1593,6 +1628,10 @@ mod tests {
             script_pubkey: bitcoin::ScriptBuf::from_bytes(vec![0x51; 200]),
         }];
         let cost = ShadowWork::cost(&tx, &prevs);
+        // The budget below is a multiple of `cost`, so it scales with
+        // whatever `cost` returns; pin that `cost` counts the bytes an item
+        // actually holds, or a budget in megabytes bounds nothing.
+        assert!(cost >= tx.total_size() + 200, "an item holds its tx and the 200-byte prevout script: {cost}");
         let verifier = ShadowVerifier::new(
             Box::new(NoopVerifier),
             Box::new(GatedShadow { gate: gate.clone(), started: started.clone() }),

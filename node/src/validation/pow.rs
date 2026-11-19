@@ -564,6 +564,10 @@ mod tests {
         assert!(t(0x0000_0000, Network::Regtest).is_none(), "zero");
         assert!(t(0x2101_ffff, Network::Regtest).is_none(), "overflow past 256 bits");
         assert!(t(0x2300_0001, Network::Regtest).is_none(), "overflow by exponent alone");
+        // Each size bound is strict: a 33-byte encoding may carry a 2-byte
+        // mantissa (0x100 << 240 = 2^248, inside regtest's limit), as Core's
+        // `nWord > 0xff && nSize > 33` allows.
+        assert!(t(0x2100_0100, Network::Regtest).is_some(), "size 33, two-byte word");
         // A zero mantissa with the sign bit set is zero, not negative.
         assert!(t(0x0480_0000, Network::Regtest).is_none());
 
@@ -871,6 +875,65 @@ mod tests {
             ),
             "prev-seeded (testnet3) difficulty must be rejected on testnet4"
         );
+    }
+
+    /// The BIP 94 retarget clamps its timespan to [T/4, 4T] like every other
+    /// retarget (Core's `CalculateNextWorkRequired` clamps before it seeds
+    /// from the first block under `enforce_BIP94`). The test above runs on an
+    /// exactly on-target period, and the clamp tests below run on mainnet, so
+    /// neither reaches the BIP 94 path's own clamp. A testnet4 period that
+    /// took ten times too long eases difficulty by exactly 4x; one that took
+    /// a tenth of the time tightens it by exactly 4x.
+    #[test]
+    fn testnet4_bip94_retarget_clamps_the_timespan_to_four_times_either_way() {
+        let period_bits = 0x1c00ffffu32;
+        let seed = CompactTarget::from_consensus(period_bits);
+        let t0 = 1_700_000_000u32;
+        let genesis = bitcoin::constants::genesis_block(Network::Testnet4);
+
+        for (elapsed, clamped) in [
+            (TARGET_TIMESPAN * 10, TARGET_TIMESPAN * 4),
+            (TARGET_TIMESPAN / 10, TARGET_TIMESPAN / 4),
+        ] {
+            let mut first_header = genesis.header;
+            first_header.time = t0;
+            first_header.bits = seed;
+            let first_entry = entry(first_header, 2016);
+
+            let mut prev_header = genesis.header;
+            prev_header.time = t0 + elapsed;
+            prev_header.bits = seed;
+            let prev = entry(prev_header, 4031);
+            let (prev, by_hash) = link_period(&first_entry, &prev);
+            let get_by_hash = |h: &BlockHash| by_hash.get(h).cloned();
+
+            let expected = retarget(seed, clamped, MAINNET_POWLIMIT_BITS);
+            // The clamp must move the target, and stay inside powLimit, or
+            // the test proves nothing.
+            assert_ne!(expected, period_bits, "{elapsed}s: premise");
+            assert_ne!(expected, MAINNET_POWLIMIT_BITS, "{elapsed}s: premise");
+
+            let mut new_header = genesis.header;
+            new_header.time = prev_header.time;
+            new_header.bits = CompactTarget::from_consensus(expected);
+            assert!(
+                check_difficulty(&new_header, &prev, Network::Testnet4, get_by_hash).is_ok(),
+                "{elapsed}s: the timespan clamped to {clamped}s gives the period's bits"
+            );
+
+            // A bound only a few seconds off the target timespan leaves the
+            // difficulty where it was, which testnet4 must not accept.
+            for wrong in [period_bits, retarget(seed, TARGET_TIMESPAN + 4, MAINNET_POWLIMIT_BITS)] {
+                new_header.bits = CompactTarget::from_consensus(wrong);
+                assert!(
+                    matches!(
+                        check_difficulty(&new_header, &prev, Network::Testnet4, get_by_hash),
+                        Err(ValidationError::BadDifficulty)
+                    ),
+                    "{elapsed}s: bits {wrong:#x} ignore the clamp"
+                );
+            }
+        }
     }
 
     /// Block templates take their `nBits` from `next_bits`, and a received
