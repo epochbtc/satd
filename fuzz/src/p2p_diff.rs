@@ -1026,8 +1026,11 @@ impl CoreOracle {
             .and_then(|()| peer.send(NetworkMessage::Version(our_version(probe_nonce, PROBE_USER_AGENT))));
         let mut lines = Vec::new();
         let deadline = Instant::now() + Duration::from_secs(10);
+        // Polled even when a send failed: Core may have logged its verdict
+        // on the fuzzed version and closed the connection before the probe
+        // went out.
         let mut closed = false;
-        while sent.is_ok() && Instant::now() < deadline {
+        while Instant::now() < deadline {
             lines.extend(self.read_log());
             if version_settled(&lines) || closed {
                 // Settled, or Core closed the connection and has logged all
@@ -1043,7 +1046,7 @@ impl CoreOracle {
         let services = if sent.is_ok() { self.peer_services(local_port) } else { None };
         drop(peer);
         if let Err(e) = sent {
-            return Ok(CoreVerdict::Unobservable(format!("send failed: {e}")));
+            return Ok(classify_drop(&lines).unwrap_or_else(|| CoreVerdict::Unobservable(format!("send failed: {e}"))));
         }
         let messages: Vec<&str> = lines.iter().map(|l| core_message(l)).collect();
         if messages.iter().any(|m| m.starts_with("peer using obsolete version") || m.starts_with("connected to self")) {
