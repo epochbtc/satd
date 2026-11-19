@@ -1003,6 +1003,14 @@ silently returning an empty or wrong answer.
   can fall. On a tangled cluster the chunks, and so the diagram's points,
   can differ from Core's; on chains and other simple clusters they agree.
 
+- **`bip125-replaceable`** (`getmempoolentry`, `getrawmempool true`,
+  `getmempoolancestors` / `getmempooldescendants` verbose) — always present.
+  Core v32.1 writes it only under `-deprecatedrpc=bip125`
+  (`src/rpc/mempool.cpp`, `entryToJSON`), since full RBF makes every
+  transaction replaceable. satd keeps it so clients that read it don't break;
+  it reports BIP 125 signalling (the transaction or an unconfirmed ancestor)
+  as before.
+
 - **`getindexinfo` / `getsatdindexinfo`: `txindex.synced`** — reports whether
   `-txindex` is on, not whether the index covers the whole chain. satd writes
   txindex entries inline during `connect_block`, so with the flag set the index
