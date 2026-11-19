@@ -540,20 +540,20 @@ pub fn compare(case: &Case, satd: &SatdVerdict, core: &CoreVerdict) -> Outcome {
                     }
                 }
             }
-            if let Some(n) = core_seen.count {
-                if ours.count != Some(n) {
-                    diffs.push(format!("entry count: satd {:?}, Core {n}", ours.count));
-                }
+            if let Some(n) = core_seen.count
+                && ours.count != Some(n)
+            {
+                diffs.push(format!("entry count: satd {:?}, Core {n}", ours.count));
             }
-            if let Some(t) = &core_seen.tx {
-                if ours.tx.as_ref() != Some(t) {
-                    diffs.push(format!("tx ids: satd {:?}, Core {t:?}", ours.tx));
-                }
+            if let Some(t) = &core_seen.tx
+                && ours.tx.as_ref() != Some(t)
+            {
+                diffs.push(format!("tx ids: satd {:?}, Core {t:?}", ours.tx));
             }
-            if let Some(b) = &core_seen.block {
-                if ours.block.as_ref() != Some(b) {
-                    diffs.push(format!("block hash: satd {:?}, Core {b}", ours.block));
-                }
+            if let Some(b) = &core_seen.block
+                && ours.block.as_ref() != Some(b)
+            {
+                diffs.push(format!("block hash: satd {:?}, Core {b}", ours.block));
             }
             if diffs.is_empty() {
                 return Outcome::Agree;
@@ -686,6 +686,19 @@ impl Peer {
         Ok(Peer { conn, stream, local_port })
     }
 
+    /// Whether Core has closed the connection: a non-blocking peek that
+    /// reads end of stream. Bytes waiting to be read are not a close.
+    fn closed_by_core(&self) -> bool {
+        if self.stream.set_nonblocking(true).is_err() {
+            return false;
+        }
+        let mut b = [0u8; 1];
+        let closed = matches!(self.stream.peek(&mut b), Ok(0))
+            || matches!(self.stream.peek(&mut b), Err(e) if e.kind() != io::ErrorKind::WouldBlock);
+        let _ = self.stream.set_nonblocking(false);
+        closed
+    }
+
     fn send_raw(&mut self, case: &Case) -> Result<(), String> {
         match &mut self.conn {
             Conn::V1(s) => s.write_all(&case.v1_frame()).map_err(|e| e.to_string()),
@@ -784,10 +797,15 @@ impl Drop for Peer {
 }
 
 fn our_version(nonce: u64, user_agent: &str) -> VersionMessage {
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+    version_at(now, nonce, user_agent)
+}
+
+fn version_at(timestamp: i64, nonce: u64, user_agent: &str) -> VersionMessage {
     let local = Address::new(&"127.0.0.1:0".parse().expect("addr"), ServiceFlags::NONE);
     let mut v = VersionMessage::new(
         ServiceFlags::NETWORK | ServiceFlags::WITNESS,
-        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0),
+        timestamp,
         local.clone(),
         local,
         nonce,
@@ -804,6 +822,8 @@ pub struct CoreOracle {
     child: Child,
     work: PathBuf,
     log: std::fs::File,
+    /// Bytes of a line Core has not finished writing.
+    log_partial: Vec<u8>,
     rpc: Client,
     p2p_port: u16,
     v1: Option<Peer>,
@@ -856,10 +876,10 @@ impl CoreOracle {
         let deadline = Instant::now() + Duration::from_secs(90);
         let mut child = Some(child);
         while Instant::now() < deadline {
-            if let Some(c) = child.as_mut() {
-                if let Ok(Some(status)) = c.try_wait() {
-                    return Err(format!("bitcoind exited during startup: {status}"));
-                }
+            if let Some(c) = child.as_mut()
+                && let Ok(Some(status)) = c.try_wait()
+            {
+                return Err(format!("bitcoind exited during startup: {status}"));
             }
             if rpc.get_blockchain_info().is_ok() {
                 let log = std::fs::File::open(&log_path).map_err(|e| format!("{}: {e}", log_path.display()))?;
@@ -867,6 +887,7 @@ impl CoreOracle {
                     child: child.take().expect("child"),
                     work: work.clone(),
                     log,
+                    log_partial: Vec::new(),
                     rpc,
                     p2p_port,
                     v1: None,
@@ -935,14 +956,20 @@ impl CoreOracle {
 
     fn skip_log(&mut self) {
         let _ = self.log.seek(SeekFrom::End(0));
+        self.log_partial.clear();
     }
 
+    /// The complete lines Core has written since the last read. A line still
+    /// being written is held back until its newline arrives, so a marker is
+    /// never split across two reads.
     fn read_log(&mut self) -> Vec<String> {
-        let mut s = String::new();
-        let mut buf = Vec::new();
-        let _ = self.log.read_to_end(&mut buf);
-        s.push_str(&String::from_utf8_lossy(&buf));
-        s.lines().map(str::to_string).collect()
+        let _ = self.log.read_to_end(&mut self.log_partial);
+        let Some(end) = self.log_partial.iter().rposition(|&b| b == b'\n') else {
+            return Vec::new();
+        };
+        let rest = self.log_partial.split_off(end + 1);
+        let done = std::mem::replace(&mut self.log_partial, rest);
+        String::from_utf8_lossy(&done).lines().map(str::to_string).collect()
     }
 
     /// Core's verdict on one case.
@@ -987,11 +1014,17 @@ impl CoreOracle {
                     || l.contains("connected to self")
             })
         };
+        let mut closed = false;
         while sent.is_ok() && Instant::now() < deadline {
             lines.extend(self.read_log());
             if done(&lines) {
                 break;
             }
+            if closed {
+                // Core closed the connection and has logged all it will.
+                break;
+            }
+            closed = peer.closed_by_core();
             std::thread::sleep(Duration::from_millis(1));
         }
         lines.extend(self.read_log());
@@ -999,7 +1032,14 @@ impl CoreOracle {
             return Ok(CoreVerdict::Unobservable(format!("send failed: {e}")));
         }
         if !done(&lines) {
-            return Ok(CoreVerdict::Unobservable("no version verdict within 10 s".into()));
+            if let Some(v) = classify_drop(&lines) {
+                return Ok(v);
+            }
+            return Ok(CoreVerdict::Unobservable(if closed {
+                "Core closed the connection after the version".into()
+            } else {
+                "no version verdict within 10 s".into()
+            }));
         }
         if lines.iter().any(|l| l.contains("peer using obsolete version") || l.contains("connected to self")) {
             return Ok(CoreVerdict::Unobservable("version refused by policy before its read completed".into()));
@@ -1235,7 +1275,8 @@ pub fn seed_payloads() -> Vec<(&'static str, &'static str, Vec<u8>)> {
     let gh = genesis.block_hash();
     let mut seeds: Vec<(&'static str, &'static str, Vec<u8>)> = Vec::new();
 
-    let full = our_version(7, "/Satoshi:32.1.0/");
+    // A fixed timestamp keeps the committed seeds equal to this generator.
+    let full = version_at(1_700_000_000, 7, "/Satoshi:32.1.0/");
     seeds.push(("version", "version-full", enc(&full)));
     let mut no_relay = enc(&full);
     no_relay.pop();
