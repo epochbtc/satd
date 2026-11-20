@@ -1,3 +1,4 @@
+mod behavior;
 mod nap;
 mod rpc;
 mod state;
@@ -247,6 +248,7 @@ fn run_app(
                         ViewMode::Chain => ui::chain::draw(f, &st),
                         ViewMode::Nap => ui::nap::draw(f, &st),
                     }
+                    ui::peer_detail::draw(f, &st);
                 }
                 // Draw warnings modal LAST so it overlays every other view.
                 // Respects per-id dismissal so acknowledged warnings don't
@@ -267,6 +269,7 @@ fn run_app(
                     KeyCode::Char('q') => {
                         if st.show_help { st.show_help = false; }
                         else if st.show_reorgs { st.show_reorgs = false; }
+                        else if st.shown_peer_detail().is_some() { st.peer_detail = None; }
                         else { return Ok(()); }
                     }
                     KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -294,8 +297,11 @@ fn run_app(
                     }
                     KeyCode::Esc => {
                         if st.show_help { st.show_help = false; }
-                        if st.show_reorgs { st.show_reorgs = false; }
+                        else if st.show_reorgs { st.show_reorgs = false; }
+                        else { st.peer_detail = None; }
                     }
+                    KeyCode::Enter => st.open_peer_detail(),
+                    KeyCode::Char('f') => st.toggle_flag_filter(),
                     KeyCode::Char('1') => st.toggle_mode(ViewMode::Ibd),
                     KeyCode::Char('2') => st.toggle_mode(ViewMode::Steady),
                     KeyCode::Char('3') => st.toggle_mode(ViewMode::Mempool),
@@ -308,11 +314,7 @@ fn run_app(
                             }
                         }
                         ViewMode::Nap => st.move_nap_selection(-1),
-                        _ => {
-                            if st.selected_peer > 0 {
-                                st.selected_peer -= 1;
-                            }
-                        }
+                        _ => st.move_peer_selection(-1),
                     },
                     KeyCode::Down => match st.active_mode() {
                         ViewMode::Mempool => {
@@ -321,11 +323,7 @@ fn run_app(
                             }
                         }
                         ViewMode::Nap => st.move_nap_selection(1),
-                        _ => {
-                            if st.selected_peer + 1 < st.peers.len() {
-                                st.selected_peer += 1;
-                            }
-                        }
+                        _ => st.move_peer_selection(1),
                     },
                     _ => {}
                 }
@@ -473,16 +471,21 @@ async fn poller(rpc: Arc<RpcClient>, state: Arc<Mutex<AppState>>) {
             // Index + server-status polls always run, regardless of IBD
             // state — they drive the always-visible services row, which
             // operators may force-display via key 2 even during IBD.
-            let (index_res, srv_res, netinfo_res) = tokio::join!(
+            // `getpeerbehavior` goes here too: the node judges its peers
+            // every 5 s, and the peers tables show in both IBD and steady
+            // state.
+            let (index_res, srv_res, netinfo_res, behavior_res) = tokio::join!(
                 rpc.get_index_info(),
                 rpc.get_server_status(),
-                rpc.get_network_info()
+                rpc.get_network_info(),
+                rpc.get_peer_behavior()
             );
             {
                 let mut st = state.lock();
                 apply_poll!(st, "getsatdindexinfo", index_res, update_index_info);
                 apply_poll!(st, "getserverstatus", srv_res, update_server_status);
                 apply_poll!(st, "getnetworkinfo", netinfo_res, update_server_version);
+                st.update_peer_behavior(behavior::classify(behavior_res));
             }
 
             // Heavy steady-state batch — only meaningful at chain tip.
