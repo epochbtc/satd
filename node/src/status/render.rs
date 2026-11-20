@@ -367,6 +367,18 @@ pub fn view(s: &StatusSnapshot, now: u64) -> View {
             })
             .collect(),
     );
+    v.lists.insert(
+        "peers.flags",
+        s.peers
+            .flagged
+            .iter()
+            .map(|f| Item {
+                label: format!("Flagged {} ({})", f.name, f.code),
+                value: f.count.to_string(),
+                state: WAIT,
+            })
+            .collect(),
+    );
     v
 }
 
@@ -601,6 +613,7 @@ pub fn html(v: &View) -> String {
     p.t("span", "peers.total");
     p.raw("</div>");
     p.list("peers.clients");
+    p.list("peers.flags");
     p.raw("</section>");
 
     p.raw("<footer class=\"mute\"><span id=\"freshness\">Reload to update.</span></footer>");

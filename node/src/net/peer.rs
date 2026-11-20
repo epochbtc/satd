@@ -362,6 +362,9 @@ pub struct PeerInfo {
     /// What the peer has done on the wire, in fixed-size counters. Recorded
     /// only; see [`crate::net::behavior`].
     pub behavior: crate::net::behavior::PeerBehavior,
+    /// The last fingerprint and behaviour flags judged from `behavior`; see
+    /// [`crate::net::flags`].
+    pub flags: crate::net::flags::PeerFlags,
 }
 
 /// Render a per-message-type byte tally as `getpeerinfo` reports it.
@@ -424,6 +427,7 @@ impl PeerInfo {
             tx_relay_requested: false,
             has_all_wanted_services: false,
             behavior: Default::default(),
+            flags: Default::default(),
         }
     }
 

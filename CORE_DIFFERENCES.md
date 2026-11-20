@@ -604,6 +604,12 @@ preserved; the satd extension is opt-in per request or per flag.
 - **`getibdprogress`** — IBD bitmap + per-peer tracking; richer than
   Core's `verificationprogress` scalar.
 
+- **`getpeerbehavior [peer_id]`** — per peer, by id: the implementation
+  family its handshake matches (from measured captures), behaviour flags
+  (crawler, spy, fingerprint mismatch, addr abuse, height lie, notfound
+  pattern, stalling) with their evidence, and the raw counters. Core has no
+  equivalent; `getpeerinfo` is unchanged. Flags only report.
+
 - **Native Tor v3** — `ADD_ONION` / `DEL_ONION` via control port, with
   `PROTOCOLINFO`-negotiated auth (SAFECOOKIE by default, password, or null) and
   hardcoded `.onion` seeds. No external torification daemon.

@@ -55,6 +55,7 @@ fn snapshot() -> StatusSnapshot {
                 user_agent: "/Satoshi:29.0.0/".to_string(),
                 count: 10,
             }],
+            flagged: vec![FlagCount { code: 'C', name: "crawler", count: 3 }],
         },
         mempool: MempoolStatus {
             transactions: 4321,
@@ -178,6 +179,22 @@ fn status_escapes_peer_user_agent() {
     let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(parsed["view"]["lists"]["peers.clients"][0]["label"], hostile);
     assert_eq!(parsed["snapshot"]["peers"]["clients"][0]["user_agent"], hostile);
+}
+
+/// The peers card counts the flags some peer carries, by name and code,
+/// and nothing about which peers.
+#[test]
+fn status_shows_flag_counts_only() {
+    let s = snapshot();
+    let v = view(&s, 1_780_000_300);
+    let flags = &v.lists["peers.flags"];
+    assert_eq!(flags.len(), 1);
+    assert_eq!((flags[0].label.as_str(), flags[0].value.as_str()), ("Flagged crawler (C)", "3"));
+    assert!(html(&v).contains("<span>Flagged crawler (C)</span><code>3</code>"));
+
+    let counts = crate::net::flags::FlagCounts { flagged: [0, 2, 0, 0, 0, 0, 1], ..Default::default() };
+    let shown: Vec<(char, usize)> = flag_counts(&counts).iter().map(|f| (f.code, f.count)).collect();
+    assert_eq!(shown, [('S', 2), ('T', 1)], "only the flags some peer carries");
 }
 
 #[test]
