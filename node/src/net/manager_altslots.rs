@@ -496,13 +496,18 @@ impl PeerManager {
         let (mut matched, _, _) = self.alt_peer_counts();
         let mut fills = Vec::new();
         let mut unmatched = Vec::new();
+        let mut no_room = Vec::new();
         let mut rejects = Vec::new();
         let mut results = Vec::new();
         let mut pending = pending;
-        pending.sort_unstable_by_key(|p| p.id);
+        // Trials first, so a fallback that newly matches cannot take the
+        // last slot from a trial judged in the same pass; the fallback is
+        // the one dropped as surplus then.
+        pending.sort_unstable_by_key(|p| (p.role != AltRole::Trial, p.id));
         for p in pending {
             let c = Candidate { fingerprint: p.fingerprint, user_agent: &p.user_agent, services: p.services, flags: p.flags };
-            let chosen = if matched < n {
+            let room = matched < n;
+            let chosen = if room {
                 config.choose(&c, |r| used.get(&r.to_string()).copied().unwrap_or(0)).map(|r| r.to_string())
             } else {
                 None
@@ -513,6 +518,9 @@ impl PeerManager {
                     *used.entry(rule.clone()).or_default() += 1;
                     fills.push((p.id, rule, c.trust(), p.fingerprint, p.role.clone()));
                 }
+                // Every slot is matched already: the trial goes, but its
+                // address is not held against it.
+                None if p.role == AltRole::Trial && !room => no_room.push(p.id),
                 None if p.role == AltRole::Trial => {
                     unmatched.push(p.id);
                     if let Some((addr, _)) = &p.record {
@@ -539,6 +547,15 @@ impl PeerManager {
                 );
                 h.info.alt = Some(AltRole::Matched { rule: rule.clone(), trust: *trust });
             }
+            // No longer a trial, so leaving does not pass its address over.
+            for id in &no_room {
+                if let Some(h) = peers.get_mut(id) {
+                    h.info.alt = None;
+                }
+            }
+        }
+        for id in no_room {
+            self.disconnect_peer(id, "alt-slot-filled");
         }
         if !rejects.is_empty() {
             let now = Instant::now();
@@ -568,7 +585,12 @@ impl PeerManager {
         }
         if !results.is_empty() {
             let now = crate::time::now_secs();
-            for (addr, record) in results {
+            for (addr, mut record) in results {
+                // A trial runs no probes: keep those a survey connection
+                // recorded for the address.
+                if let Some(probes) = self.read_survey_store(|s| s.get(&addr).map(|r| r.probes)).flatten() {
+                    record.probes = probes;
+                }
                 if !self.insert_survey_record(addr.clone(), record.clone(), now) {
                     self.alt_slots.state.lock().results.insert(addr, record, now);
                 }
