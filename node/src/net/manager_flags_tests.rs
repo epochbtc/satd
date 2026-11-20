@@ -134,6 +134,39 @@ fn crawler_needs_a_repeating_netgroup_and_a_short_session() {
     assert_eq!(codes(&flags_of(&pm, 8)), "", "ten minutes in");
 }
 
+/// `C`, honest, in the group's first seconds: a Core peer that has sent
+/// nothing yet, or `getaddr` and a block request (a peer catching up by
+/// block, not by header).
+#[test]
+fn crawler_spares_a_core_peer_that_has_not_asked_for_addresses_or_asks_for_blocks() {
+    let (pm, _dir) = pm_with_coins(&[]);
+    busy_netgroup(&pm);
+    let _rx = scripted(&pm, 7, "core-31.2-inbound", "11.22.7.7:8333", 2);
+    pm.note_inbound_netgroup(7);
+    assert_eq!(codes(&flags_of(&pm, 7)), "", "no getaddr");
+    deliver(&pm, 7, NetworkMessage::GetAddr);
+    let block = Inventory::WitnessBlock(bitcoin::BlockHash::from_byte_array([3; 32]));
+    deliver(&pm, 7, NetworkMessage::GetData(vec![block]));
+    assert_eq!(codes(&flags_of(&pm, 7)), "", "asks for a block");
+}
+
+/// `C` is never an outbound peer: we chose to dial it. Even one counted in
+/// a busy group, sending `getaddr` and nothing else, is spared.
+#[test]
+fn crawler_is_never_an_outbound_peer() {
+    let (pm, _dir) = pm_with_coins(&[]);
+    busy_netgroup(&pm);
+    let _rx = scripted(&pm, 9, "core-31.2-inbound", "11.22.9.9:8333", 2);
+    pm.note_inbound_netgroup(9);
+    let key = pm.peers.read()[&9].info.flags.netgroup;
+    assert!(key.is_some());
+    let _rx = scripted(&pm, 7, "core-31.2-outbound", "11.22.7.7:8333", 2);
+    pm.peers.write().get_mut(&7).unwrap().info.flags.netgroup = key;
+    deliver(&pm, 7, NetworkMessage::GetAddr);
+    assert_eq!(codes(&flags_of(&pm, 7)), "");
+    assert_eq!(codes(&flags_of(&pm, 9)), "", "and the inbound one has not asked for addresses");
+}
+
 /// `C` on a peer gone before the next pass: it is judged as it leaves.
 #[test]
 fn a_crawler_gone_before_the_timer_is_judged_as_it_leaves() {
@@ -354,6 +387,13 @@ fn notfound_pattern_spares_an_occasional_notfound() {
         b.note_notfound_after_inv(18);
     });
     assert_eq!(codes(&flags_of(&pm, 7)), "", "20 of 10,000");
+
+    // Half of a few announcements: too few to say anything.
+    let (pm, _dir) = pm_with_coins(&[]);
+    let _rx = scripted(&pm, 7, "core-31.2-outbound", "11.22.7.7:8333", 120);
+    announce_from_peer(&pm, 7, 10);
+    with_behavior(&pm, 7, |b| b.note_notfound_after_inv(5));
+    assert_eq!(codes(&flags_of(&pm, 7)), "", "5 of 10");
 }
 
 /// `T`: three block-download stalls.
