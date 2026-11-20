@@ -380,13 +380,14 @@ fn netgroup_rule_holds_with_eight_alt_slots() {
         }
     }
     let config = pm.alt_slot_config();
+    assert_eq!(pm.pick_alt_trial(Instant::now(), &[], &config), None, "records the book no longer holds");
+    learn(&pm, &taken);
+    learn(&pm, &[free]);
     for _ in 0..20 {
         assert_eq!(pm.pick_alt_trial(Instant::now(), &[], &config), Some(PeerAddr::Socket(free)));
     }
     // From the book, with the store's records gone.
     pm.alt_slots.state.lock().results = crate::net::survey::SurveyStore::default();
-    learn(&pm, &taken);
-    learn(&pm, &[free]);
     for _ in 0..20 {
         assert_eq!(pm.pick_alt_trial(Instant::now(), &[], &config), Some(PeerAddr::Socket(free)));
     }
@@ -419,13 +420,13 @@ fn verified_store_candidates_first_and_known_misses_skipped() {
         st.results.insert(PeerAddr::Socket(verified), rec(known(Family::Core), KNOTS), now);
         st.results.insert(PeerAddr::Socket(core), rec(known(Family::Core), CORE), now);
     }
+    learn(&pm, &[verified, unverified, core]);
     let config = pm.alt_slot_config();
     for _ in 0..10 {
         assert_eq!(pm.pick_alt_trial(Instant::now(), &[], &config), Some(PeerAddr::Socket(verified)));
     }
     pm.alt_slots.state.lock().results.insert(PeerAddr::Socket(verified), rec(known(Family::Core), CORE), now);
     pm.alt_slots.state.lock().results.insert(PeerAddr::Socket(unverified), rec(known(Family::Core), CORE), now);
-    learn(&pm, &[verified, unverified, core]);
     assert_eq!(pm.pick_alt_trial(Instant::now(), &[], &config), None, "every book entry is a known miss");
 }
 
@@ -481,4 +482,34 @@ fn spawn_peer_takes_the_role_of_its_dial() {
     assert_eq!(pm.take_alt_dial(&own_group(5), None), None);
     assert_eq!(pm.take_alt_dial(&a, None), Some(AltRole::Fallback));
     assert_eq!(pm.take_alt_dial(&a, None), None, "taken once");
+}
+
+/// A reload leaves the `-altfillwait` clock running: a periodic reload
+/// cannot hold the fallback off for ever.
+#[test]
+fn a_reload_does_not_restart_the_fill_wait() {
+    let (pm, _dir) = mk_pm();
+    alt(&pm, 2, &[], UaTrust::Consistent);
+    let since = Instant::now() - Duration::from_secs(300);
+    pm.alt_slots.state.lock().empty_since = Some(since);
+    alt(&pm, 2, &[], UaTrust::Consistent);
+    assert_eq!(pm.alt_slots.state.lock().empty_since, Some(since));
+}
+
+/// The extra peer for an unreached network (Core's
+/// `MaybePickPreferredNetwork`) counts empty alt-slots as held, as the
+/// automatic target does, so it is not held off for `-altfillwait`.
+#[test]
+fn the_extra_network_peer_counts_empty_alt_slots_as_held() {
+    let (pm, _dir) = mk_pm();
+    alt(&pm, 2, &[], UaTrust::Consistent);
+    for i in 0..6 {
+        add_peer(&pm, settled(i as PeerId + 1, own_group(i), None, known(Family::Core), CORE));
+    }
+    for i in 6..8 {
+        let mut info = settled(i as PeerId + 1, own_group(i), None, known(Family::Core), CORE);
+        info.conn_type = ConnType::BlockRelay;
+        add_peer(&pm, info);
+    }
+    assert!(pm.reserve_dial(DialBudget::ExtraNetwork).is_ok());
 }
