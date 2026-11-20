@@ -226,6 +226,7 @@ impl MetricsContext {
         );
         render_peer_flags(&mut out, &self.peer_manager.peer_flag_counts());
         render_peer_survey(&mut out, self.peer_manager.survey_metrics().as_ref());
+        render_alt_slots(&mut out, &self.peer_manager.alt_slot_counts());
         metric(
             &mut out,
             "satd_net_bytes_sent_total",
@@ -1012,6 +1013,23 @@ fn render_peer_survey(out: &mut String, m: Option<&crate::net::manager::SurveyMe
             metric_sample(out, "satd_peer_survey_probes_total", &[("probe", probe.name()), ("outcome", outcome)], n);
         }
     }
+}
+
+/// The alt-slots (`-altslots`): `satd_peer_alt_slots{state}`, matched,
+/// fallback and empty. Nothing with `-altslots=0`. Counts only.
+fn render_alt_slots(out: &mut String, c: &crate::net::manager::AltSlotCounts) {
+    if c.configured == 0 {
+        return;
+    }
+    metric_header(
+        out,
+        "satd_peer_alt_slots",
+        "Alt-slots (-altslots) by state: filled by a peer matching -altprefer, held by an ordinary fallback peer, or empty.",
+        "gauge",
+    );
+    metric_sample(out, "satd_peer_alt_slots", &[("state", "matched")], c.matched as u64);
+    metric_sample(out, "satd_peer_alt_slots", &[("state", "fallback")], c.fallback as u64);
+    metric_sample(out, "satd_peer_alt_slots", &[("state", "empty")], c.empty as u64);
 }
 
 /// Emit the `# HELP` / `# TYPE` pair for a metric family, once.

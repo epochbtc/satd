@@ -101,7 +101,7 @@ const ONION: &str = "pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.on
 fn a_survey_connection_takes_no_outbound_slot_or_grant() {
     let (pm, _dir) = mk_pm();
     pm.set_max_connections(125);
-    let limit = PeerManager::max_automatic_outbound(&pm.max_connections);
+    let limit = pm.max_automatic_outbound();
     for i in 0..limit - 1 {
         let addr = SocketAddr::from(([203, 0, 113, i as u8 + 1], 8333));
         add_handle(&pm, outbound(1000 + i as PeerId, addr, ConnType::OutboundFullRelay, PeerState::Connected));

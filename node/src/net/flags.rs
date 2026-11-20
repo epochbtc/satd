@@ -503,7 +503,7 @@ pub fn peer_json(info: &crate::net::peer::PeerInfo) -> serde_json::Value {
         });
     }
     let session_secs = session_secs(info);
-    json!({
+    let mut out = json!({
         "id": info.id,
         "connection_type": info.conn_type.as_str(),
         "session_secs": session_secs,
@@ -513,7 +513,20 @@ pub fn peer_json(info: &crate::net::peer::PeerInfo) -> serde_json::Value {
         "flag_codes": p.set().to_string(),
         "flags": flags,
         "counters": counters,
-    })
+    });
+    // An alt-slot peer (`-altslots`): the rule it matched and how far its
+    // user agent was trusted, or a fallback holding an empty slot. A trial
+    // still being judged has none yet.
+    match &info.alt {
+        Some(crate::net::altslots::AltRole::Matched { rule, trust }) => {
+            out["alt_slot"] = json!({"rule": rule, "trust": trust.name(), "fallback": false});
+        }
+        Some(crate::net::altslots::AltRole::Fallback) => {
+            out["alt_slot"] = json!({"rule": null, "trust": null, "fallback": true});
+        }
+        Some(crate::net::altslots::AltRole::Trial) | None => {}
+    }
+    out
 }
 
 #[cfg(test)]
