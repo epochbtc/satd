@@ -89,6 +89,7 @@ sat-cli getpeerbehavior 7
 | `evaluated` | Whether the peer has been judged yet; a peer connected in the last 5 seconds may not have been. |
 | `fingerprint` | `result` and its fields (above), `settled`, and `handshake`, the commands the fingerprint was judged on. |
 | `flag_codes`, `flags` | The flags from the last pass, each with its evidence. |
+| `alt_slot` | Only for a peer in an [alt-slot](#alt-slots): the `rule` it matched, the `trust` its user agent got, and `fallback`. |
 | `counters` | The raw record: `inv_tx_in`, `getdata_tx_in`, `getdata_latency` (count, `p10_ms`, `median_ms`, and the histogram), `inv_tx_announced_to`, `headers_req`, `blocks_req`, `getaddr_in`, `addr_in`, `addr_out`, `addr_rate_limited`, `notfound_after_inv`, `height_claim_gap`, `stalls`, and the `version` fields. |
 
 It is a read: allowed on the read-only listener, and for a bearer token it
@@ -214,6 +215,7 @@ node's own peers.
 | `probed` | Records with at least one probe outcome. |
 | `enabled`, `probes`, `interval` | The survey's settings. With the survey off, `enabled` is false and every count is zero. |
 | `connections` | Survey connections since start: `completed`, and `failed` at the dial or the handshake; `last`, the most recent to end, with its `time` (Unix seconds) and `result` (`completed` or `failed`), null until one ends. |
+| `alt_slots` | The [alt-slots](#alt-slots): `configured`, `matched`, `fallback` and `empty`. Reported with the survey off too. |
 
 `getpeersurvey true` adds `peers`, one row per address, most recently seen
 first: `addr`, `network`, `fingerprint` (as in `getpeerbehavior`, for
@@ -247,3 +249,134 @@ the survey starts empty.
 - `satd_peer_survey_probes_total{probe,outcome}`: probe outcomes.
 
 None carries an address.
+
+## Alt-slots
+
+**Off by default.** `-altslots=N` sets aside N of the full-relay outbound
+slots for peers that match the operator's preference rules, for example to
+keep connections to implementations other than Core. The rest of the slots
+are filled from the address book exactly as without it. Alt-slot peers are
+ordinary full-relay connections in every other respect: they relay blocks,
+transactions and addresses, and `getpeerinfo` reports them as
+`outbound-full-relay`. The two block-relay-only connections are never
+alt-slots.
+
+> **The eclipse trade-off.** The peers that match your rules are a far
+> smaller pool than the address book. An attacker who runs nodes matching
+> them competes for those slots against a few honest nodes instead of
+> thousands. With `-altslots` equal to `-maxoutboundfullrelay`, every
+> full-relay outbound comes from that small pool, and transaction and
+> address relay could be served entirely by the attacker's nodes. The two
+> block-relay-only connections stay ordinary and remain the backstop for
+> block delivery. What limits it: the network-group rule every outbound
+> obeys, flagged and contradicted candidates kept out by default, and
+> fingerprints that are harder to fake than user agents. The node logs a
+> warning when `-altslots` is above 4. The choice is yours; satd does not
+> refuse it.
+
+### Rules
+
+`-altprefer=<rule>`, repeatable; earlier rules have priority. A rule is one
+or more terms joined by `+`, all of which must hold, with an optional `@k`
+cap on how many slots it may fill:
+
+| Term | Matches |
+|---|---|
+| `family:<name>` | The family the peer's handshake matched: `core`, `btcd`, `bcoin`, `libbitcoin`, `floresta`, `rbitcoin`, `satd`, `bitcoin-seeder`, `bitnodes`, or `non-core` for any family but Core's. Knots and other Core forks are in Core's family. A peer whose handshake matched nothing matches no `family:` term. |
+| `ua:<glob>` | The claimed user agent, `*` and `?` wildcards, case-sensitive, subject to `-altuatrust`. |
+| `svc:<name>` | An advertised service: `network`, `bloom`, `witness`, `compact_filters`, `network_limited`, `p2p_v2`, `intact_blocks`, `nap` (`getpeerinfo`'s `servicesnames`, in lower case). |
+
+```
+altslots=6
+altprefer=family:btcd@2
+altprefer=family:floresta+svc:compact_filters@2
+altprefer=ua:/Satoshi:*Knots:*@1
+altprefer=family:non-core
+```
+
+With `-altslots` above 0 and no `-altprefer`, the one rule is
+`family:non-core`. An unknown term, family or service is a startup error.
+
+### How far a user agent is trusted
+
+A `ua:` term never rests on the user agent alone. Each candidate is
+**verified** (its handshake matched the family its agent names; a Knots
+agent with a Core-family handshake is verified), **unverified** (its
+handshake matched nothing the table knows, or its agent names no known
+family) or **contradicted** (its handshake matched another family; the peer
+carries the `F` flag). `-altuatrust`:
+
+- `strict`: `ua:` terms match verified candidates only.
+- `consistent` (default): verified and unverified match; verified ones are
+  tried first.
+- `any`: the agent alone decides, contradicted candidates included. Meant
+  for a client the fingerprint table does not know yet. It is the easiest
+  rule to game.
+
+Under `strict` and `consistent`, a peer carrying `C`, `S` or `F` never
+fills an alt-slot, whatever the rule.
+
+### Filling the slots
+
+Ordinary dials leave the alt-slots empty. Each reconnect pass (every 10
+seconds) may dial one **trial**: an address whose survey record matches a
+rule with a slot left (with `-peersurvey`; without it, the results of
+earlier trials, kept in memory), or else an address-book entry, drawn as
+any automatic dial is, whose recorded services can meet such a rule. Once
+the trial's handshake has settled (at most about 15 seconds), it takes the
+slot under the first rule it matches, with one `net` log line naming the
+rule; otherwise it is disconnected (`alt-slot-no-match`) and the next trial
+waits 30 seconds. One trial at a time. Every alt-slot dial obeys the same
+network-group rule as every other outbound.
+
+A slot still empty after `-altfillwait` seconds (600) gets an ordinary
+**fallback** peer, so the node keeps all its outbounds even when no
+matching peer is reachable. Trials go on; when one matches, it takes the
+slot and the fallback is disconnected (`alt-slot-fallback-replaced`). A
+fallback that turns out to match takes the slot itself.
+
+### The full-relay outbound count
+
+`-maxoutboundfullrelay=<n>` (default 8, Core's
+`MAX_OUTBOUND_FULL_RELAY_CONNECTIONS`) sets how many full-relay outbound
+peers the node keeps once synced; alt-slots are carved out of it. Core has
+no such option. Every extra outbound takes an inbound slot on another
+node, and Core holds everyone at 8 partly so the network does not run out
+of them:
+
+- above 8: a warning at startup and on reload;
+- above 16: a startup error, and a refused reload, unless
+  `-enable-dangerously-large-outbound-peer-limit` is also set;
+- above 64: always an error, even with the override.
+
+It also sizes the automatic outbound connections (full-relay, 2
+block-relay-only, 1 feeler), so the inbound slots are `-maxconnections`
+less that. During initial block download the full-relay target stays at
+64. `-altslots` above `-maxoutboundfullrelay`, or above `-maxconnections`,
+is a startup error.
+
+### Reload
+
+All six options reload on SIGHUP. A value past its limits refuses the
+whole reload, with the running values kept. Raising `-altslots` fills the
+new slots from the next pass; when every full-relay slot is taken, a match
+pushes the count one over and the usual surplus rule then drops an ordinary
+peer. Lowering `-altslots`, or a rule change that a peer no longer matches,
+turns the peer into an ordinary outbound without disconnecting it
+(fallbacks first). Lowering `-maxoutboundfullrelay` sheds the surplus one
+peer at a time, as after initial block download, never a peer that holds an
+alt-slot by its rules.
+
+### Visibility
+
+- `getpeerbehavior` gives each alt-slot peer
+  `"alt_slot": {"rule": "family:btcd@2", "trust": "verified", "fallback": false}`;
+  a fallback has `"rule": null, "trust": null, "fallback": true`. A trial
+  still being judged has none.
+- `getpeersurvey` reports `"alt_slots": {"configured", "matched",
+  "fallback", "empty"}`, with the survey on or off.
+- `satd_peer_alt_slots{state="matched|fallback|empty"}`, with `-altslots`
+  above 0. No addresses.
+- `sat-tui` tags alt-slot peers `alt` (`alt*` for a fallback) in the Flags
+  column, names the rule and trust in the detail overlay, and Peer clients
+  counts them.

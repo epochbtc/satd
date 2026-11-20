@@ -557,7 +557,11 @@ impl PeerManager {
     /// zero.
     pub fn get_peer_survey(&self, verbose: bool) -> serde_json::Value {
         let Some(run) = self.survey.get() else {
-            return survey::survey_json(&SurveyStore::default(), verbose, &serde_json::json!({ "enabled": false }));
+            return survey::survey_json(
+                &SurveyStore::default(),
+                verbose,
+                &serde_json::json!({ "enabled": false, "alt_slots": self.alt_slots_json() }),
+            );
         };
         let settings = serde_json::json!({
             "enabled": true,
@@ -571,6 +575,7 @@ impl PeerManager {
                     "result": if completed { "completed" } else { "failed" },
                 })),
             },
+            "alt_slots": self.alt_slots_json(),
         });
         if verbose {
             // Copied under the lock, serialized outside it.
@@ -601,6 +606,26 @@ impl PeerManager {
             v2: agg.v2,
             probe_outcomes,
         })
+    }
+
+    /// Run `f` on the survey's store; `None` with the survey off.
+    pub(super) fn read_survey_store<R>(&self, f: impl FnOnce(&SurveyStore) -> R) -> Option<R> {
+        self.survey.get().map(|run| f(&run.store.lock()))
+    }
+
+    /// Put a record in the survey's store, as a survey connection does, and
+    /// refresh the aggregate. Returns false with the survey off.
+    pub(super) fn insert_survey_record(&self, addr: PeerAddr, record: SurveyRecord, now: u64) -> bool {
+        let Some(run) = self.survey.get() else {
+            return false;
+        };
+        let aggregate = {
+            let mut store = run.store.lock();
+            store.insert(addr, record, now);
+            store.aggregate()
+        };
+        *run.aggregate.lock() = aggregate;
+        true
     }
 
     /// The survey's store, for tests.

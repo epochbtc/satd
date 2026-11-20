@@ -617,6 +617,13 @@ preserved; the satd extension is opt-in per request or per flag.
   `peersurvey.dat`. With `-peersurveyprobes` (on with the survey) it sends a
   few probes Core neither punishes nor disconnects for. Core has no survey.
 
+- **`-maxoutboundfullrelay` and alt-slots (`-altslots`, `-altprefer`)** —
+  the full-relay outbound count, fixed at 8 in Core, is configurable (above
+  16 only with `-enable-dangerously-large-outbound-peer-limit`, never above
+  64), and an opt-in number of those slots can be filled by peers whose
+  handshake fingerprint, user agent or services match the operator's rules.
+  With the defaults outbound selection is Core's. Core has neither.
+
 - **Native Tor v3** — `ADD_ONION` / `DEL_ONION` via control port, with
   `PROTOCOLINFO`-negotiated auth (SAFECOOKIE by default, password, or null) and
   hardcoded `.onion` seeds. No external torification daemon.

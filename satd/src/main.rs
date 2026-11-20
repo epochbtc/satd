@@ -3030,6 +3030,23 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
     // warmup ends: the file is gone by the time a client can see the node.
     peer_manager.load_anchors(&net_datadir.join(node::net::anchors::ANCHORS_FILE));
 
+    // `-maxoutboundfullrelay` and the alt-slots (#1355). Both default to
+    // the outbound selection Core makes: 8 full-relay peers, none set
+    // aside.
+    peer_manager.set_max_outbound_full_relay(config.maxoutboundfullrelay);
+    peer_manager.set_alt_slots(config.alt_slot_config());
+    for w in node::net::altslots::outbound_limit_warnings(config.maxoutboundfullrelay, config.altslots) {
+        tracing::warn!("{w}");
+    }
+    if config.altslots > 0 {
+        tracing::info!(
+            slots = config.altslots,
+            rules = %config.alt_slot_config().rules.iter().map(|r| r.to_string()).collect::<Vec<_>>().join(" "),
+            ua_trust = %config.altuatrust,
+            "Alt-slots enabled"
+        );
+    }
+
     // The network survey (#1353), off unless asked for: its store, then its
     // loop, whose first connection waits one interval.
     if config.peersurvey {

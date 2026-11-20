@@ -177,6 +177,11 @@ view's) show what the node judged about each peer:
   raw counters. `Esc` (or `q`) closes it.
 - `f` toggles a filter showing only flagged peers; the table title then
   reads `Peers (N connected, M flagged)`.
+- An [alt-slot](./peer-behavior.md#alt-slots) peer carries `alt` ahead
+  of its codes in the Flags column, `alt*` for a fallback; the overlay
+  names the rule it matched and how far its user agent was trusted, and
+  the Chain view's Peer clients panel adds an `alt-slots: M matched, F
+  fallback` line while any are connected.
 
 A node without the method answers "method not found": the column, the
 marker, the overlay and the filter key are not shown, and the tables are

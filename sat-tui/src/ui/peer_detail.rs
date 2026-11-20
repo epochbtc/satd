@@ -61,8 +61,17 @@ pub fn lines(state: &AppState, id: u64) -> Vec<Line<'static>> {
             Span::styled(fingerprint_line(b), fp_style),
         ]),
         field("handshake", if b.handshake.is_empty() { "-".into() } else { b.handshake.join(" ") }),
-        Line::from(""),
     ];
+    match &b.alt_slot {
+        Some(crate::behavior::AltSlot::Matched { rule, trust }) => {
+            out.push(field("alt-slot", format!("{rule} (user agent {trust})")));
+        }
+        Some(crate::behavior::AltSlot::Fallback) => {
+            out.push(field("alt-slot", "fallback: an ordinary peer until a match turns up".into()));
+        }
+        None => {}
+    }
+    out.push(Line::from(""));
 
     let (codes, tone) = flags_cell(b);
     out.push(Line::from(vec![
