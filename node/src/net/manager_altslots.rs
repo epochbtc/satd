@@ -240,6 +240,11 @@ impl PeerManager {
         if in_flight.alt_trial > 0 {
             return Err("an alt-slot trial is already being dialled".to_string());
         }
+        // A trial may run one over the full-relay target while a fallback
+        // holds its slot, but never past `-maxconnections`.
+        if self.automatic_sockets_open(in_flight) >= self.max_connections.load(Ordering::Relaxed) {
+            return Err("no connection left under -maxconnections".to_string());
+        }
         let (m, _, t) = self.alt_peer_counts();
         if t > 0 {
             return Err("an alt-slot trial is being judged".to_string());
@@ -265,10 +270,15 @@ impl PeerManager {
         Some(state.dials.swap_remove(i).1)
     }
 
-    /// A trial ended without taking a slot: the next waits
-    /// [`ALT_TRIAL_INTERVAL`].
-    pub(super) fn note_alt_trial_ended(&self, now: Instant) {
-        self.alt_slots.state.lock().next_trial = Some(now + ALT_TRIAL_INTERVAL);
+    /// A trial peer left without taking a slot, judged or not: the next
+    /// trial waits [`ALT_TRIAL_INTERVAL`], and its address is passed over.
+    /// Called with the peer table locked; takes only the alt-slot state.
+    pub(super) fn note_alt_trial_ended(&self, info: &PeerInfo, now: Instant) {
+        let mut state = self.alt_slots.state.lock();
+        state.next_trial = Some(now + ALT_TRIAL_INTERVAL);
+        if let Some(addr) = Self::dialled_book_addr(info) {
+            state.reject(addr, now);
+        }
     }
 
     /// The alt-slot half of a reconnect pass: a trial if one is due, then a
