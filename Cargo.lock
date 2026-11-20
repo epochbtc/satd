@@ -4636,6 +4636,7 @@ version = "0.8.0-pre"
 dependencies = [
  "axum 0.8.9",
  "base64 0.22.1",
+ "bip324",
  "bitcoin",
  "bitcoincore-rpc",
  "clap",

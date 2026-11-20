@@ -1,6 +1,8 @@
 #!/bin/bash
 # Run every self-contained fuzz target in fuzz/ for a fixed time each. Needs a
-# nightly toolchain and cargo-fuzz; no Docker.
+# nightly toolchain and cargo-fuzz. `p2p_differential` also needs a Bitcoin
+# Core oracle: `$BITCOIND` (the version pinned by CORE_IMAGE in
+# scripts/canary/PINS), or Docker to copy that `bitcoind` out of the image.
 #
 #   SECONDS_PER_TARGET=60 scripts/fuzz/run-standalone-targets.sh
 #   SECONDS_PER_TARGET=60 scripts/fuzz/run-standalone-targets.sh psbt_raw
@@ -12,12 +14,15 @@
 # running into the job timeout.
 #
 # With no arguments the targets come from `cargo fuzz list`, minus the ones in
-# ORACLE_TARGETS, which need a live bitcoind and have a job of their own
+# ORACLE_TARGETS, which have a job of their own
 # (.github/workflows/core_block_differential_fuzz.yml). Listing rather than
 # naming them is the point: a target added to fuzz/Cargo.toml is fuzzed the
 # next night without anyone remembering to wire it in. Three of the first four
 # targets were compiled by CI and never run, because only the one with a job
 # was ever run.
+#
+# A target with a committed seed corpus in fuzz/seeds/<target>/ is run over its
+# working corpus (fuzz/corpus/<target>/, where libFuzzer writes) and the seeds.
 #
 # Every target runs even when an earlier one fails, so one crash does not hide
 # another. A crash, timeout or OOM input lands in fuzz/artifacts/<target>/.
@@ -30,7 +35,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 SECONDS_PER_TARGET="${SECONDS_PER_TARGET:-600}"
 
-# Targets that need an external oracle and run elsewhere.
+# Targets that run in a job of their own (the block differential builds its
+# own Core chain and runs for half an hour).
 ORACLE_TARGETS=(block_differential)
 
 # The pinned nightly lives in run-block-differential.sh, so both fuzz jobs and
@@ -93,7 +99,12 @@ for t in "${targets[@]}"; do
     echo "::group::fuzz $t"
     log="$log_dir/$t.log"
     set +e
-    cargo "+$FUZZ_NIGHTLY" fuzz run "$t" -- -max_total_time="$SECONDS_PER_TARGET" 2>&1 | tee "$log"
+    corpus=()
+    if [ -d "fuzz/seeds/$t" ]; then
+        mkdir -p "fuzz/corpus/$t"
+        corpus=("$REPO_ROOT/fuzz/corpus/$t" "$REPO_ROOT/fuzz/seeds/$t")
+    fi
+    cargo "+$FUZZ_NIGHTLY" fuzz run "$t" "${corpus[@]}" -- -max_total_time="$SECONDS_PER_TARGET" 2>&1 | tee "$log"
     rc=${PIPESTATUS[0]}
     set -e
     echo "::endgroup::"

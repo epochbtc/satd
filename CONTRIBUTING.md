@@ -110,10 +110,21 @@ are not required to. Verification details are in `SECURITY.md`.
   say in review why it cannot change behaviour.
 - Fuzz targets — a target added to `fuzz/Cargo.toml` is run every night by
   the `Fuzz targets (nightly)` workflow without further wiring (targets that
-  need a live `bitcoind` are listed in `ORACLE_TARGETS` in
-  `scripts/fuzz/run-standalone-targets.sh` and need a job of their own).
+  need a job of their own, such as the block differential with its own Core
+  chain, are listed in `ORACLE_TARGETS` in
+  `scripts/fuzz/run-standalone-targets.sh`).
   Run one locally with
   `SECONDS_PER_TARGET=60 scripts/fuzz/run-standalone-targets.sh <target>`.
+- P2P message decoding — `p2p_differential` sends each message to a live
+  regtest Bitcoin Core over a v1 or v2 connection and compares Core's
+  verdict (and the decoded fields Core reports) with satd's
+  (`fuzz/src/p2p_diff.rs`). It runs in the nightly fuzz-targets job; its
+  seed cases replay on any pull request that changes
+  `node/src/net/{payload,addrv2,v2transport}.rs`. Locally:
+  `cargo test -p satd --test core_p2p_differential --features core-p2p-differential`,
+  with `BITCOIND` pointing at the `bitcoind` of the pinned `CORE_IMAGE`
+  version, or with Docker. If you change what a P2P message decodes to, add
+  a seed for it in `seed_payloads()`.
 - Coverage — the nightly `Coverage` workflow runs the unit, integration and
   E2E suites under `cargo-llvm-cov` and posts a per-crate and per-`node`-module
   table in its run summary, with the HTML report as an artifact. It gates

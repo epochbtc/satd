@@ -93,3 +93,7 @@ pub fn assemble(prev: BlockHash, time: u32, txdata: Vec<Transaction>) -> Block {
     grind(&mut b.header);
     b
 }
+
+/// P2P message decoding differential against a live Bitcoin Core (#1135),
+/// shared with `satd/tests/core_p2p_differential.rs`.
+pub mod p2p_diff;
