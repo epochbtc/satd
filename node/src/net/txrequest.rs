@@ -366,11 +366,12 @@ impl TxRequestTracker {
 
     /// Core's `ReceivedResponse`: `peer` answered for `hash` with the
     /// transaction or `notfound`. Its candidate or request is completed, and
-    /// the next candidate becomes eligible.
-    pub fn received_response(&mut self, peer: PeerId, hash: &[u8; 32]) {
-        let Some(anns) = self.txs.get_mut(hash) else { return };
+    /// the next candidate becomes eligible. Returns whether `hash` had been
+    /// requested from `peer` (rather than only announced by it).
+    pub fn received_response(&mut self, peer: PeerId, hash: &[u8; 32]) -> bool {
+        let Some(anns) = self.txs.get_mut(hash) else { return false };
         let Some(i) = anns.iter().position(|a| a.peer == peer && a.state != State::Completed) else {
-            return;
+            return false;
         };
         let a = anns[i].clone();
         Self::unindex(&mut self.timeline, &mut self.ready, hash, &a);
@@ -382,6 +383,7 @@ impl TxRequestTracker {
             }
         }
         self.reselect(hash);
+        a.state == State::Requested
     }
 
     /// Requests outstanding to `peer`. Core's `CountInFlight`.
@@ -837,7 +839,9 @@ mod tests {
                     }
                 }
                 3 => t.requested_tx(peer, &g.hash(), now + rng.gen_range(0..GETDATA_TX_INTERVAL)),
-                4 => t.received_response(peer, &g.hash()),
+                4 => {
+                    t.received_response(peer, &g.hash());
+                }
                 5 => t.forget_tx_hash(&g.hash()),
                 6 if rng.gen_range(0..10) == 0 => t.disconnected_peer(peer),
                 7 => now = now.saturating_add(rng.gen_range(0..3 * SECOND)),
