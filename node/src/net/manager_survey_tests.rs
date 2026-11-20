@@ -497,3 +497,33 @@ async fn a_failed_survey_dial_records_nothing() {
     assert!(pm.survey_store().unwrap().is_empty());
     assert!(pm.reconnect_backoff.read().get(&target).is_some_and(|s| s.attempts > 0));
 }
+
+/// A survey connection the node closes (`disconnectnode`, a ban,
+/// `setnetworkactive false`, shutdown) closes there and then: no probe
+/// follows, and nothing is recorded. Its handle going made the transcript
+/// read as closed, which once sent the session on into its probes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_survey_connection_the_node_closes_ends_at_once() {
+    let (pm, _dir) = mk_pm();
+    enable(&pm, true);
+    *pm.survey.get().unwrap().forced_probes.lock() = Some(Probe::ALL.to_vec());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let target = listener.local_addr().unwrap();
+    book_add(&pm, target);
+    // btcd's shape: nothing after `verack`, so the passive wait runs its
+    // full ten seconds unless the node ends it.
+    let script = Script { negotiation: vec![NetworkMessage::SendAddrV2], after_verack: vec![], ..core_script() };
+    let server = tokio::spawn(serve(listener, vec![script]));
+    assert!(pm.survey_tick().is_some());
+    wait_for(|| pm.peers.read().values().any(|h| h.info.behavior.handshake.len() >= 3), "the handshake").await;
+    let id = *pm.peers.read().keys().next().unwrap();
+    let closed_at = Instant::now();
+    assert!(pm.disconnect_peer(id, "test"));
+    let got = tokio::time::timeout(Duration::from_secs(5), server).await.expect("the socket closes at once").unwrap().remove(0);
+    assert!(closed_at.elapsed() < Duration::from_secs(5));
+    let cmds = commands(&got);
+    for probe in ["ping", "getheaders", "getdata"] {
+        assert!(!cmds.iter().any(|c| c == probe), "no {probe} after the close: {cmds:?}");
+    }
+    assert!(pm.survey_store().unwrap().is_empty(), "nothing recorded");
+}
