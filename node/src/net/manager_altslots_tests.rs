@@ -513,3 +513,42 @@ fn the_extra_network_peer_counts_empty_alt_slots_as_held() {
     }
     assert!(pm.reserve_dial(DialBudget::ExtraNetwork).is_ok());
 }
+
+/// A trial that matched the rule's terms but was kept out by its flags is
+/// not drawn again, though its record still matches.
+#[test]
+fn a_rejected_trial_is_not_drawn_again() {
+    let (pm, _dir) = mk_pm();
+    alt(&pm, 1, &["family:btcd"], UaTrust::Consistent);
+    let addr = own_group(1);
+    learn(&pm, &[addr]);
+    let mut info = settled(1, addr, Some(AltRole::Trial), known(Family::Btcd), BTCD);
+    info.flags.flags = vec![(crate::net::flags::Flag::Crawler, Vec::new())];
+    add_peer(&pm, info);
+    pm.judge_alt_slot_peers();
+    assert!(!connected(&pm, 1));
+    assert!(pm.alt_slots.state.lock().results.get(&PeerAddr::Socket(addr)).is_some(), "its record matches");
+    let config = pm.alt_slot_config();
+    assert_eq!(pm.pick_alt_trial(Instant::now(), &[], &config), None);
+}
+
+/// With no candidate, the next look waits the trial interval.
+#[test]
+fn no_candidate_waits_the_trial_interval() {
+    let (pm, _dir) = mk_pm();
+    alt(&pm, 1, &[], UaTrust::Consistent);
+    assert!(pm.open_alt_slot_peers(Instant::now(), &[]).is_empty());
+    assert!(pm.alt_slots_next_trial().is_some_and(|t| t > Instant::now() + Duration::from_secs(25)));
+}
+
+/// A dial's entry goes when the dial ends, however it ends.
+#[test]
+fn an_alt_dial_entry_goes_with_its_dial() {
+    let (pm, _dir) = mk_pm();
+    let a = own_group(4);
+    let entry = pm.alt_dial_entry(PeerAddr::Socket(a), AltRole::Trial);
+    assert_eq!(pm.alt_slots.state.lock().dials.len(), 1);
+    drop(entry);
+    assert!(pm.alt_slots.state.lock().dials.is_empty());
+    assert_eq!(pm.take_alt_dial(&a, None), None);
+}
