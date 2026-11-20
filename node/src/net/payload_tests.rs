@@ -344,3 +344,38 @@ fn a_headers_tx_count_is_read_as_a_compact_size_and_ignored() {
         assert!(decode_payload(cmd("headers"), &headers_with_tx_count(count)).is_err(), "tx count {count:02x?}");
     }
 }
+
+/// `getblocktxn` with `diffs` as the differentially encoded indexes.
+fn getblocktxn(diffs: &[u64]) -> Vec<u8> {
+    let mut p = vec![0x11u8; 32];
+    p.extend(encode::serialize(&encode::VarInt(diffs.len() as u64)));
+    for d in diffs {
+        p.extend(encode::serialize(&encode::VarInt(*d)));
+    }
+    p
+}
+
+fn read_indexes(payload: &[u8]) -> Result<Vec<u64>, encode::Error> {
+    match decode_payload(cmd("getblocktxn"), payload)? {
+        NetworkMessage::GetBlockTxn(g) => Ok(g.txs_request.indexes),
+        other => panic!("not a getblocktxn: {other:?}"),
+    }
+}
+
+/// Core's `BlockTransactionsRequest` holds `uint16_t` indexes, and
+/// `DifferenceFormatter` refuses a running index past 65535 (#1347).
+#[test]
+fn getblocktxn_indexes_are_bounded_to_16_bits() {
+    assert_eq!(read_indexes(&getblocktxn(&[0, 1])).unwrap(), vec![0, 2]);
+    assert_eq!(read_indexes(&getblocktxn(&[65535])).unwrap(), vec![65535]);
+    assert_eq!(read_indexes(&getblocktxn(&[65534, 0])).unwrap(), vec![65534, 65535]);
+    for refused in [&[65536][..], &[65535, 0], &[65534, 1], &[0, 65535], &[u64::MAX]] {
+        assert!(read_indexes(&getblocktxn(refused)).is_err(), "diffs {refused:?}");
+        // What rust-bitcoin's decoder made of it (it overflows only past u64).
+        if refused != [u64::MAX] {
+            assert!(deserialize::<GetBlockTxn>(&getblocktxn(refused)).is_ok(), "premise: {refused:?}");
+        }
+    }
+    // A step above MAX_SIZE is refused by `ReadCompactSize` itself.
+    assert!(read_indexes(&getblocktxn(&[0x0200_0001])).is_err());
+}

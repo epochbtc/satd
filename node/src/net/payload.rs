@@ -29,6 +29,9 @@
 //! - `headers` reads each header's transaction count as a CompactSize and
 //!   ignores it (`net_processing.cpp`, `HEADERS`); rust-bitcoin reads one
 //!   byte and refuses a non-zero count.
+//! - `getblocktxn` bounds its differentially encoded indexes to 16 bits,
+//!   as Core's `DifferenceFormatter` does (`src/blockencodings.h`);
+//!   rust-bitcoin reads them as `u64`.
 //! - `feefilter`'s value is read whole, whatever it is. Core reads the
 //!   `CAmount` and then ignores a value outside `MoneyRange`
 //!   (`net_processing.cpp:5035-5045`); the handler does the same
@@ -44,13 +47,15 @@
 //!
 //! `addrv2` is read by [`crate::net::addrv2`] before a payload gets here.
 
+use bitcoin::bip152::BlockTransactionsRequest;
 use bitcoin::consensus::encode::{self, Decodable};
 use bitcoin::hashes::{sha256d, Hash};
 use bitcoin::p2p::message::{CommandString, NetworkMessage};
 use bitcoin::p2p::address::Address;
-use bitcoin::p2p::message_compact_blocks::{BlockTxn, CmpctBlock, SendCmpct};
+use bitcoin::p2p::message_compact_blocks::{BlockTxn, CmpctBlock, GetBlockTxn, SendCmpct};
 use bitcoin::p2p::message_network::VersionMessage;
 use bitcoin::p2p::ServiceFlags;
+use bitcoin::BlockHash;
 
 use crate::validation::decode;
 
@@ -141,6 +146,30 @@ fn read_headers(payload: &[u8]) -> Result<Vec<bitcoin::block::Header>, encode::E
     Ok(out)
 }
 
+/// `getblocktxn`, as Core reads `BlockTransactionsRequest`
+/// (`src/blockencodings.h`): the indexes are `uint16_t`, differentially
+/// encoded, and `DifferenceFormatter::Unser` refuses a running index past
+/// 65535 ("differential value overflow"). rust-bitcoin reads them as `u64`
+/// with no such bound.
+fn read_getblocktxn(payload: &[u8]) -> Result<GetBlockTxn, encode::Error> {
+    let mut r = payload;
+    let block_hash = BlockHash::consensus_decode(&mut r)?;
+    let count = read_compact_size(&mut r)?;
+    // Each index takes at least a byte.
+    let mut indexes = Vec::with_capacity((count as usize).min(r.len()));
+    let mut shift: u64 = 0;
+    for _ in 0..count {
+        // At most MAX_SIZE plus 65536: no overflow.
+        shift += read_compact_size(&mut r)?;
+        if shift > u64::from(u16::MAX) {
+            return Err(encode::Error::ParseFailed("differential value overflow"));
+        }
+        indexes.push(shift);
+        shift += 1;
+    }
+    Ok(GetBlockTxn { txs_request: BlockTransactionsRequest { block_hash, indexes } })
+}
+
 /// Decode the payload of a message of type `command`, as Core reads it.
 /// A type no handler knows comes back as [`NetworkMessage::Unknown`].
 pub fn decode_payload(command: CommandString, payload: &[u8]) -> Result<NetworkMessage, encode::Error> {
@@ -182,7 +211,7 @@ pub fn decode_payload(command: CommandString, payload: &[u8]) -> Result<NetworkM
             M::SendCmpct(SendCmpct { send_compact: high_bandwidth != 0, version })
         }
         "cmpctblock" => M::CmpctBlock(CmpctBlock { compact_block: decode::read_header_and_short_ids(&mut &payload[..])? }),
-        "getblocktxn" => M::GetBlockTxn(read(payload)?),
+        "getblocktxn" => M::GetBlockTxn(read_getblocktxn(payload)?),
         "blocktxn" => M::BlockTxn(BlockTxn { transactions: decode::read_block_transactions(&mut &payload[..])? }),
         "wtxidrelay" => M::WtxidRelay,
         "addrv2" => M::AddrV2(read(payload)?),

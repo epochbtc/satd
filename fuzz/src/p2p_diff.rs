@@ -1456,6 +1456,14 @@ pub fn seed_payloads() -> Vec<(&'static str, &'static str, Vec<u8>)> {
     getblocktxn.extend(compact_size(0));
     getblocktxn.extend(compact_size(1));
     seeds.push(("getblocktxn", "getblocktxn-two", getblocktxn));
+    // Core's indexes are 16-bit: 65535 is read, 65536 is refused.
+    for (name, diff) in [("getblocktxn-index-65535", 65535), ("getblocktxn-index-65536", 65536)] {
+        let mut getblocktxn = enc(&gh);
+        getblocktxn.extend(compact_size(1));
+        getblocktxn.extend(compact_size(diff));
+        seeds.push(("getblocktxn", name, getblocktxn));
+    }
+
 
     seeds.push(("feefilter", "feefilter-1000", 1000i64.to_le_bytes().to_vec()));
     seeds.push(("feefilter", "feefilter-negative", (-1i64).to_le_bytes().to_vec()));
