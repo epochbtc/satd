@@ -772,6 +772,10 @@ pub struct Config {
     /// `-peersurveyprobes`: with `-peersurvey`, send the vetted probes on
     /// each survey connection before it closes. Default true. satd-only.
     pub peersurveyprobes: bool,
+    /// `-peerflagpolicy`: `observe` (default), flags are information only,
+    /// or `evict`, inbound peers flagged `C`, `S` or `F` are evicted first
+    /// when an inbound slot is needed. satd-only.
+    pub peerflagpolicy: String,
     /// `-maxoutboundfullrelay`: the full-relay outbound target out of IBD.
     /// Default 8 (Core's `MAX_OUTBOUND_FULL_RELAY_CONNECTIONS`); above 16
     /// only with `-enable-dangerously-large-outbound-peer-limit`, never
@@ -4426,6 +4430,7 @@ impl Config {
                 .peersurveyprobes
                 .or_else(|| file_get("peersurveyprobes").and_then(|v| parse_bool(&v)))
                 .unwrap_or(true),
+            peerflagpolicy: resolve_flag_policy(&cli.peer_survey_args.peerflagpolicy, &file_get)?,
             maxoutboundfullrelay: alt_slots.maxoutboundfullrelay,
             dangerous_outbound_limit: alt_slots.dangerous_outbound_limit,
             altslots: alt_slots.altslots,
@@ -5215,6 +5220,7 @@ impl Config {
         // Set apart: more keys inside the macro above pass its recursion
         // limit.
         out["p2p"]["max_outbound_full_relay"] = serde_json::json!(self.maxoutboundfullrelay);
+        out["p2p"]["peer_flag_policy"] = serde_json::json!(self.peerflagpolicy);
         out["p2p"]["alt_slots"] = serde_json::json!({
             "slots": self.altslots,
             "prefer": self.altprefer,
@@ -6298,8 +6304,9 @@ pub struct CliArgs {
     #[command(flatten)]
     pub nap_args: NapArgs,
 
-    /// `-peersurvey`, `-peersurveyinterval` and `-peersurveyprobes`,
-    /// hand-built for the same stack-frame reason as [`StratumArgs`].
+    /// `-peersurvey`, `-peersurveyinterval`, `-peersurveyprobes` and
+    /// `-peerflagpolicy`, hand-built for the same stack-frame reason as
+    /// [`StratumArgs`].
     #[command(flatten)]
     pub peer_survey_args: PeerSurveyArgs,
 
@@ -8282,13 +8289,25 @@ fn resolve_survey_interval(cli: &Option<u64>, file_get: &dyn Fn(&str) -> Option<
     Ok(secs)
 }
 
-/// `-peersurvey`, `-peersurveyinterval` and `-peersurveyprobes` (see
-/// [`CliArgs::peer_survey_args`]).
+/// `-peerflagpolicy`, the command line over the file. A value other than
+/// `observe` or `evict` is a startup error, as the command line refuses one.
+#[inline(never)]
+fn resolve_flag_policy(cli: &Option<String>, file_get: &dyn Fn(&str) -> Option<String>) -> Result<String, String> {
+    let policy = match cli.clone().or_else(|| file_get("peerflagpolicy")) {
+        Some(v) => node::net::flags::FlagPolicy::parse(&v)?,
+        None => node::net::flags::FlagPolicy::default(),
+    };
+    Ok(policy.name().to_string())
+}
+
+/// `-peersurvey`, `-peersurveyinterval`, `-peersurveyprobes` and
+/// `-peerflagpolicy` (see [`CliArgs::peer_survey_args`]).
 #[derive(Debug, Clone, Default)]
 pub struct PeerSurveyArgs {
     pub peersurvey: Option<bool>,
     pub peersurveyinterval: Option<u64>,
     pub peersurveyprobes: Option<bool>,
+    pub peerflagpolicy: Option<String>,
 }
 
 const PEER_SURVEY_ARG_SPECS: &[(&str, &str, StratumArgKind, &str)] = &[
@@ -8309,6 +8328,12 @@ const PEER_SURVEY_ARG_SPECS: &[(&str, &str, StratumArgKind, &str)] = &[
         "BOOL",
         StratumArgKind::Bool,
         "With -peersurvey, send a few harmless probes (ping, getheaders, getdata for an unknown transaction, an unknown message type) on each survey connection before it closes. They make survey connections recognisable (default: 1)",
+    ),
+    (
+        "peerflagpolicy",
+        "POLICY",
+        StratumArgKind::Text,
+        "What peer behaviour flags change: observe (nothing) or evict (inbound peers flagged crawler, spy or fingerprint mismatch lose eviction protection and are evicted first when an inbound slot is needed; never while slots are free, never a ban, never an outbound peer or one with noban or relay permission) (default: observe)",
     ),
 ];
 
@@ -8335,6 +8360,7 @@ impl clap::FromArgMatches for PeerSurveyArgs {
             peersurvey: m.remove_one("peersurvey"),
             peersurveyinterval: m.remove_one("peersurveyinterval"),
             peersurveyprobes: m.remove_one("peersurveyprobes"),
+            peerflagpolicy: m.remove_one("peerflagpolicy"),
         })
     }
 
@@ -8503,6 +8529,11 @@ fn resolve_alt_slots(
 }
 
 impl Config {
+    /// `-peerflagpolicy`, checked when the config was read.
+    pub fn flag_policy(&self) -> node::net::flags::FlagPolicy {
+        node::net::flags::FlagPolicy::parse(&self.peerflagpolicy).unwrap_or_default()
+    }
+
     /// The alt-slot settings as the peer manager takes them. Every value was
     /// checked when the config was read.
     pub fn alt_slot_config(&self) -> node::net::altslots::AltConfig {
@@ -9382,6 +9413,7 @@ pub fn normalize_args(args: Vec<String>) -> Vec<String> {
         "peersurvey",
         "peersurveyinterval",
         "peersurveyprobes",
+        "peerflagpolicy",
         "maxoutboundfullrelay",
         "enable-dangerously-large-outbound-peer-limit",
         "altslots",
@@ -10237,6 +10269,7 @@ pub const KNOWN_CONFIG_KEYS: &[&str] = &[
     "peersurvey",
     "peersurveyinterval",
     "peersurveyprobes",
+    "peerflagpolicy",
     "maxoutboundfullrelay",
     "enable-dangerously-large-outbound-peer-limit",
     "altslots",
@@ -11773,6 +11806,32 @@ blockmintxfee=0.00001
         std::fs::write(dir.path().join("bitcoin.conf"), "napmaxattestations=lots\n").unwrap();
         assert!(load(&[]).unwrap_err().contains("-napmaxattestations"));
         assert!(parse_cli(["satd", "--napmaxattestations=-1"]).is_err());
+    }
+
+    /// `-peerflagpolicy`: `observe` by default, `evict` from either source,
+    /// the command line winning, anything else refused; reported by
+    /// `getconfig`.
+    #[test]
+    fn peerflagpolicy() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let load = |extra: &[&str]| {
+            let mut args = vec!["satd", "--regtest", "--datadir", dir.path().to_str().unwrap()];
+            args.extend_from_slice(extra);
+            Config::from_cli(parse_cli(normalize_args(args.iter().map(|a| a.to_string()).collect())).unwrap())
+        };
+        let c = load(&[]).unwrap();
+        assert_eq!(c.flag_policy(), node::net::flags::FlagPolicy::Observe);
+        assert_eq!(c.effective_view()["p2p"]["peer_flag_policy"], "observe");
+        let c = load(&["-peerflagpolicy=EVICT"]).unwrap();
+        assert_eq!((c.peerflagpolicy.as_str(), c.flag_policy()), ("evict", node::net::flags::FlagPolicy::Evict));
+        assert!(load(&["-peerflagpolicy=ban"]).unwrap_err().contains("-peerflagpolicy must be observe or evict"));
+        std::fs::write(dir.path().join("bitcoin.conf"), "peerflagpolicy=evict\n").unwrap();
+        assert_eq!(load(&[]).unwrap().flag_policy(), node::net::flags::FlagPolicy::Evict, "from the file");
+        assert_eq!(
+            load(&["--peerflagpolicy=observe"]).unwrap().flag_policy(),
+            node::net::flags::FlagPolicy::Observe,
+            "the command line wins"
+        );
     }
 
     /// `-maxoutboundfullrelay` and the alt-slot options: Core's 8 and no

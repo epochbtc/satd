@@ -137,3 +137,65 @@ fn getpeerbehavior_reports_a_borrowed_user_agent_and_repeated_getaddr() {
     drop(peer);
     node.stop();
 }
+
+/// `-peerflagpolicy`: two inbound slots (`-maxconnections=13` less the 11
+/// automatic outbound ones, both open to transaction relay), one held by a peer flagged `F` (btcd's
+/// handshake under Core's agent), one by an honest btcd. Under `observe`
+/// Core's rules protect both and a third peer is turned away; under
+/// `evict` the flagged peer goes and the third takes its slot.
+#[test]
+fn peerflagpolicy_evict_takes_the_flagged_inbound_peer_first() {
+    for (policy, flagged_evicted) in [("observe", false), ("evict", true)] {
+        let mut node = TestNode::start(&[
+            "--maxconnections=13",
+            "--inboundrelaypercent=100",
+            "--maxinboundperip=10",
+            &format!("--peerflagpolicy={policy}"),
+        ]);
+        let port = node.p2p_port.expect("p2p port");
+        assert_eq!(node.rpc_ok("getconfig", vec![])["p2p"]["peer_flag_policy"], policy);
+
+        // btcd's capture ends its setup with one `getaddr`.
+        let mut flagged = Peer::btcd_shaped(port, "/Satoshi:31.2.0/");
+        flagged.send(NetworkMessage::GetAddr);
+        let mut honest = Peer::btcd_shaped(port, "/btcwire:0.5.0/btcd:0.24.2/");
+        honest.send(NetworkMessage::GetAddr);
+        let both = poll_until_json(
+            || node.rpc_ok("getpeerbehavior", vec![]),
+            |v| v.as_array().is_some_and(|a| a.len() == 2 && a.iter().any(|p| p["flag_codes"] == "F")),
+            test_timeout(30).as_secs(),
+        );
+        let flagged_id = both.as_array().unwrap().iter().find(|p| p["flag_codes"] == "F").unwrap()["id"].clone();
+        let honest_id = both.as_array().unwrap().iter().find(|p| p["flag_codes"] != "F").unwrap()["id"].clone();
+
+        // A third inbound peer, with both slots taken. A refused one is
+        // closed at once; an admitted one waits for us to speak first (the
+        // node gives up after 5 s), so 2 s of silence means admitted.
+        let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+        let mut third = TcpStream::connect_timeout(&addr, Duration::from_secs(5)).expect("connect");
+        third.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let mut byte = [0u8; 1];
+        let refused = match third.read(&mut byte) {
+            Ok(0) => true,
+            Err(e) if e.kind() == io::ErrorKind::ConnectionReset => true,
+            Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => false,
+            other => panic!("{policy}: unexpected read {other:?}"),
+        };
+
+        let ids: Vec<serde_json::Value> = poll_until_json(
+            || node.rpc_ok("getpeerbehavior", vec![]),
+            |v| v.as_array().is_some_and(|a| a.len() == 2),
+            test_timeout(30).as_secs(),
+        )
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["id"].clone())
+        .collect();
+        assert!(ids.contains(&honest_id), "{policy}: the honest peer stays: {ids:?}");
+        assert_eq!(!ids.contains(&flagged_id), flagged_evicted, "{policy}: {ids:?}");
+        assert_eq!(refused, !flagged_evicted, "{policy}: the third peer refused under observe only");
+        drop((flagged, honest, third));
+        node.stop();
+    }
+}
