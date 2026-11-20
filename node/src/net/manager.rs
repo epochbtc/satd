@@ -2318,7 +2318,7 @@ impl PeerManager {
                 .swap(false, std::sync::atomic::Ordering::Relaxed);
             if was {
                 let n = peers.len();
-                Self::drop_all_peers(&mut peers);
+                self.drop_all_peers(&mut peers, "network-inactive");
                 // Core logs "SetNetworkActive: false\n" — test harness
                 // `assert_debug_log` checks this exact substring including
                 // the trailing newline, so no structured fields may follow
@@ -5073,10 +5073,12 @@ impl PeerManager {
     /// leaving the socket open, and the peer feeding the node, after the
     /// caller claimed to have disconnected everyone. Same reasoning as
     /// `disconnect_by_id`, applied to the disconnect-all paths (shutdown,
-    /// `setnetworkactive false`).
-    fn drop_all_peers(peers: &mut HashMap<PeerId, PeerHandle>) {
-        for handle in peers.values() {
+    /// `setnetworkactive false`). Each peer's behaviour record is closed with
+    /// `reason`.
+    fn drop_all_peers(&self, peers: &mut HashMap<PeerId, PeerHandle>, reason: &'static str) {
+        for (id, handle) in peers.iter_mut() {
             handle.disconnect.notify_one();
+            self.retire_behavior(*id, &mut handle.info.behavior, reason);
         }
         peers.clear();
     }
@@ -7404,7 +7406,7 @@ impl PeerManager {
             if *shutdown.borrow() {
                 tracing::info!("P2P manager shutting down");
                 // Drop all peers to close connections
-                Self::drop_all_peers(&mut self.peers.write());
+                self.drop_all_peers(&mut self.peers.write(), "shutdown");
                 return;
             }
             // Process up to 64 events per iteration, then yield for sync

@@ -378,4 +378,10 @@ fn disconnect_reason_is_set_as_the_peer_goes() {
     assert!(pm.disconnect_on_request(7));
     pm.handle_peer_disconnected(8);
     assert_eq!(*pm.retired_behavior.lock(), vec![(7, Some("rpc_request")), (8, Some("peer-closed"))]);
+
+    // Turning networking off closes every record.
+    let _rx = handshaken(&pm, 9, Direction::Inbound);
+    pm.retired_behavior.lock().clear();
+    pm.set_network_active(false);
+    assert!(pm.retired_behavior.lock().contains(&(9, Some("network-inactive"))));
 }
