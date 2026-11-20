@@ -35,6 +35,7 @@ It includes every fix shipped in 0.7.1:
 - Mempool: a transaction version below 1 or above 3 is non-standard, reason `version`, as in Core (#1070).
 - Mining: a negative `prioritisetransaction` modified fee stays negative in template selection, as in Core, even at `-blockmintxfee=0` (#1274).
 - P2P: `getpeerbehavior [peer_id]` reports each peer's implementation family, judged from its handshake, and behaviour flags (crawler, spy, fingerprint mismatch, addr abuse, height lie, notfound pattern, stalling) with their evidence; `satd_peer_flagged` and `satd_peer_fingerprint` metrics and status-page flag counts. Flags only report; thresholds are provisional (#1351).
+- sat-tui: the peers tables show behaviour flags in a Flags column and `≠` after an agent whose fingerprint disagrees with it; `Enter` opens a peer detail overlay, `f` shows only flagged peers, and Peer clients counts observed families. Hidden against a node without `getpeerbehavior` (#1352).
 - P2P: the node's own disconnects are no longer logged as `reason="rpc_request"` (#1152).
 - P2P: onion peers are logged by their `.onion` address, not `0.0.0.0` (#1165).
 - P2P: during initial sync, blocks are downloaded no more than `-maxahead` above the tip, so a pruned node prunes during IBD instead of filling its disk (#1154).
