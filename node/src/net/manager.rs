@@ -17303,10 +17303,19 @@ impl PeerManager {
             NetworkMessage::Headers(_) => {
                 self.peers.read().get(&id).is_some_and(|h| h.last_getheaders_sent.is_some())
             }
+            // One lock at a time: a guard held across the next would set a
+            // lock order on this per-message path that nothing else keeps.
             NetworkMessage::NotFound(_) => {
-                self.tx_requests.lock().count_in_flight(id) > 0
-                    || self.in_flight_blocks.read().get(&id).is_some_and(|m| !m.is_empty())
-                    || self.ibd.read().as_ref().is_some_and(|s| !s.peer_inflight_heights(id).is_empty())
+                let txs_out = self.tx_requests.lock().count_in_flight(id) > 0;
+                if txs_out {
+                    return true;
+                }
+                let blocks_out = self.in_flight_blocks.read().get(&id).is_some_and(|m| !m.is_empty());
+                if blocks_out {
+                    return true;
+                }
+                let ibd = self.ibd.read();
+                ibd.as_ref().is_some_and(|s| !s.peer_inflight_heights(id).is_empty())
             }
             _ => false,
         }
