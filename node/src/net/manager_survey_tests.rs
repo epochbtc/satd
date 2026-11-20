@@ -249,6 +249,7 @@ async fn with_the_survey_off_nothing_is_dialled() {
     assert_eq!(json["enabled"], false);
     assert_eq!(json["addresses"], 0);
     assert!(pm.survey_metrics().is_none());
+    assert!(json.get("connections").is_none(), "no connection counts with the survey off");
 }
 
 // ---- The session ----
@@ -451,6 +452,9 @@ async fn a_survey_records_the_peer_and_marks_its_address_good() {
     let json = pm.get_peer_survey(false);
     assert_eq!(json["families"]["core"]["count"], 1);
     assert_eq!(json["connections"]["completed"], 1);
+    assert_eq!(json["connections"]["last"]["result"], "completed");
+    let when = json["connections"]["last"]["time"].as_u64().unwrap();
+    assert!(crate::time::now_secs().abs_diff(when) < 60, "{json}");
 }
 
 /// Each probe sends its message and records the answer: the `pong`'s
@@ -506,6 +510,7 @@ async fn a_failed_survey_dial_records_nothing() {
     wait_for(|| !pm.survey_open(), "the dial ends").await;
     assert!(pm.survey_store().unwrap().is_empty());
     assert!(pm.reconnect_backoff.read().get(&target).is_some_and(|s| s.attempts > 0));
+    assert_eq!(pm.get_peer_survey(false)["connections"]["last"]["result"], "failed");
 }
 
 /// A survey connection the node closes (`disconnectnode`, a ban,
