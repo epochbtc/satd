@@ -7731,6 +7731,10 @@ impl PeerManager {
                 let stated = version.services.to_u64();
                 handle.info.set_version(version);
                 handle.info.state = PeerState::Connected;
+                // Under the same lock as the state change, so a disconnect
+                // cannot come between the window counting the peer and
+                // the peer carrying its group's key.
+                self.note_inbound_netgroup_locked(&mut handle.info);
                 // Promote to the tried table in the persistent address book,
                 // but only for outbound peers: their address is one we dialed
                 // and can dial again. An inbound peer's address is its
@@ -7762,7 +7766,6 @@ impl PeerManager {
                 );
             }
         }
-        self.note_inbound_netgroup(id);
         // Core's first `SendMessages` pass for the peer starts its chain-sync
         // timer against the tip as it is now.
         self.consider_evictions(crate::time::now_secs());
@@ -15833,24 +15836,24 @@ impl PeerManager {
     /// the crawler flag's window, and keep the group's key on the peer. An
     /// onion or unroutable peer's address says nothing about it and is not
     /// counted.
-    fn note_inbound_netgroup(&self, id: PeerId) {
-        let Some(ip) = self
-            .peers
-            .read()
-            .get(&id)
-            .filter(|h| h.info.direction == Direction::Inbound && !h.info.inbound_onion)
-            .map(|h| h.info.addr.ip())
-        else {
-            return;
-        };
-        if !crate::net::is_routable(ip) {
+    /// Called with the peer table's write lock held (taken before the
+    /// address book's and the window's, as everywhere).
+    fn note_inbound_netgroup_locked(&self, info: &mut PeerInfo) {
+        let ip = info.addr.ip();
+        if info.direction != Direction::Inbound || info.inbound_onion || !crate::net::is_routable(ip) {
             return;
         }
         let group = self.addrman.read().group_key(ip);
         let key = bitcoin::hashes::siphash24::Hash::hash_to_u64_with_keys(self.netgroup_key.0, self.netgroup_key.1, &group);
+        info.flags.netgroup = Some(key);
         self.inbound_netgroups.lock().record(key, Instant::now());
+    }
+
+    /// [`Self::note_inbound_netgroup_locked`] for a test's peer.
+    #[cfg(test)]
+    fn note_inbound_netgroup(&self, id: PeerId) {
         if let Some(h) = self.peers.write().get_mut(&id) {
-            h.info.flags.netgroup = Some(key);
+            self.note_inbound_netgroup_locked(&mut h.info);
         }
     }
 
@@ -15864,7 +15867,7 @@ impl PeerManager {
         leaving: bool,
     ) -> Vec<(crate::net::flags::Flag, crate::net::flags::Evidence)> {
         use crate::net::{fingerprint, flags};
-        let session_secs = std::time::SystemTime::now().duration_since(info.conn_time).map_or(0, |d| d.as_secs());
+        let session_secs = flags::session_secs(info);
         let inbound = info.direction == Direction::Inbound;
         let b = &info.behavior;
         let settled = leaving || session_secs >= fingerprint::SETTLE_SECS;

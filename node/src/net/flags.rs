@@ -437,6 +437,13 @@ impl FlagCounts {
     }
 }
 
+/// Seconds since the peer connected, by the node clock: `conn_time` is set
+/// from it, so `setmocktime` moves both ends alike.
+pub fn session_secs(info: &crate::net::peer::PeerInfo) -> u64 {
+    let start = info.conn_time.duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    crate::time::now_secs().saturating_sub(start)
+}
+
 /// One peer as `getpeerbehavior` reports it: its id, fingerprint, flags
 /// with their evidence, and the raw counters. No address. The user agent is
 /// the sanitized one `getpeerinfo.subver` shows, escaped by JSON.
@@ -495,7 +502,7 @@ pub fn peer_json(info: &crate::net::peer::PeerInfo) -> serde_json::Value {
             "start_height": v.start_height,
         });
     }
-    let session_secs = std::time::SystemTime::now().duration_since(info.conn_time).map_or(0, |d| d.as_secs());
+    let session_secs = session_secs(info);
     json!({
         "id": info.id,
         "connection_type": info.conn_type.as_str(),

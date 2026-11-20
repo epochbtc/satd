@@ -1,12 +1,13 @@
 //! Behaviour flags (`crate::net::flags`) against a live `PeerManager`. For
 //! each flag, a scripted peer makes it fire with the expected evidence, and
 //! a peer of the same family behaving honestly does not. Each peer starts
-//! from a committed handshake capture, so its fingerprint is real.
+//! from a committed handshake capture, so its fingerprint is real. Every
+//! test holds the node clock (`MockClock`), since sessions are timed by it.
 
 use std::time::SystemTime;
 
 use super::p1c_tests::pm_with_coins;
-use super::txrequest_tests::add_peer_with;
+use super::txrequest_tests::{add_peer_with, MockClock};
 use super::*;
 use crate::net::behavior::replay_fixture;
 use crate::net::fingerprint::{Confidence, Family, Fingerprint};
@@ -23,7 +24,7 @@ fn scripted(pm: &PeerManager, id: PeerId, fixture: &str, addr: &str, session_sec
         if direction == Direction::Inbound {
             info.conn_type = ConnType::Inbound;
         }
-        info.conn_time = SystemTime::now() - Duration::from_secs(session_secs);
+        info.conn_time = SystemTime::UNIX_EPOCH + Duration::from_secs(crate::time::now_secs() - session_secs);
         info.behavior.handshake = r.capture.clone();
         info.behavior.version = r.version.clone();
     });
@@ -78,6 +79,7 @@ fn busy_netgroup(pm: &PeerManager) {
 /// flag: the shapes themselves are honest.
 #[test]
 fn no_capture_raises_a_flag_by_its_handshake_alone() {
+    let _clock = MockClock::install();
     let (pm, _dir) = pm_with_coins(&[]);
     for (i, name) in crate::net::behavior::fixture_names().iter().enumerate() {
         let id = 200 + i as PeerId;
@@ -90,6 +92,7 @@ fn no_capture_raises_a_flag_by_its_handshake_alone() {
 /// seconds in, from a group that keeps connecting.
 #[test]
 fn crawler_fires_on_a_short_getaddr_session_from_a_busy_netgroup() {
+    let _clock = MockClock::install();
     let (pm, _dir) = pm_with_coins(&[]);
     busy_netgroup(&pm);
     let _rx = scripted(&pm, 7, "bitcoin-seeder-92d2b46-inbound", "11.22.7.7:8333", 4);
@@ -108,6 +111,7 @@ fn crawler_fires_on_a_short_getaddr_session_from_a_busy_netgroup() {
 /// and `getheaders`; it syncs, so it is no crawler.
 #[test]
 fn crawler_spares_an_honest_core_peer_from_a_busy_netgroup() {
+    let _clock = MockClock::install();
     let (pm, _dir) = pm_with_coins(&[]);
     busy_netgroup(&pm);
     let _rx = scripted(&pm, 7, "core-31.2-inbound", "11.22.7.7:8333", 4);
@@ -121,6 +125,7 @@ fn crawler_spares_an_honest_core_peer_from_a_busy_netgroup() {
 /// flagged, nor is one past the session bound.
 #[test]
 fn crawler_needs_a_repeating_netgroup_and_a_short_session() {
+    let _clock = MockClock::install();
     let (pm, _dir) = pm_with_coins(&[]);
     let _rx = scripted(&pm, 7, "bitcoin-seeder-92d2b46-inbound", "11.22.7.7:8333", 4);
     pm.note_inbound_netgroup(7);
@@ -139,6 +144,7 @@ fn crawler_needs_a_repeating_netgroup_and_a_short_session() {
 /// block, not by header).
 #[test]
 fn crawler_spares_a_core_peer_that_has_not_asked_for_addresses_or_asks_for_blocks() {
+    let _clock = MockClock::install();
     let (pm, _dir) = pm_with_coins(&[]);
     busy_netgroup(&pm);
     let _rx = scripted(&pm, 7, "core-31.2-inbound", "11.22.7.7:8333", 2);
@@ -154,6 +160,7 @@ fn crawler_spares_a_core_peer_that_has_not_asked_for_addresses_or_asks_for_block
 /// a busy group, sending `getaddr` and nothing else, is spared.
 #[test]
 fn crawler_is_never_an_outbound_peer() {
+    let _clock = MockClock::install();
     let (pm, _dir) = pm_with_coins(&[]);
     busy_netgroup(&pm);
     let _rx = scripted(&pm, 9, "core-31.2-inbound", "11.22.9.9:8333", 2);
@@ -167,9 +174,28 @@ fn crawler_is_never_an_outbound_peer() {
     assert_eq!(codes(&flags_of(&pm, 9)), "", "and the inbound one has not asked for addresses");
 }
 
+/// Sessions are measured by the node clock, which `conn_time` is set
+/// from: under a mock time years in the past, a crawler four seconds in is
+/// still four seconds in, and a fresh peer is no spy.
+#[test]
+fn sessions_are_timed_by_the_node_clock() {
+    let _clock = MockClock::install();
+    crate::time::set_mock_time(Some(1_600_000_000));
+    let (pm, _dir) = pm_with_coins(&[]);
+    busy_netgroup(&pm);
+    let _rx = scripted(&pm, 7, "bitcoin-seeder-92d2b46-inbound", "11.22.7.7:8333", 4);
+    pm.note_inbound_netgroup(7);
+    deliver(&pm, 7, NetworkMessage::GetAddr);
+    let flags = flags_of(&pm, 7);
+    assert_eq!(codes(&flags), "C");
+    assert_eq!(evidence(&flags, Flag::Crawler)[0], ("session_secs", n(4)));
+    assert_eq!(pm.get_peer_behavior(Some(7)).unwrap()[0]["session_secs"], 4);
+}
+
 /// `C` on a peer gone before the next pass: it is judged as it leaves.
 #[test]
 fn a_crawler_gone_before_the_timer_is_judged_as_it_leaves() {
+    let _clock = MockClock::install();
     let (pm, _dir) = pm_with_coins(&[]);
     busy_netgroup(&pm);
     let _rx = scripted(&pm, 7, "bitcoin-seeder-92d2b46-inbound", "11.22.7.7:8333", 2);
@@ -200,6 +226,7 @@ fn announce_and_request(pm: &PeerManager, id: PeerId, count: u32, delay: Duratio
 /// millisecond, announces none, asks for no block.
 #[test]
 fn spy_fires_on_a_fast_one_way_transaction_listener() {
+    let _clock = MockClock::install();
     let (pm, _dir) = pm_with_coins(&[]);
     let _rx = scripted(&pm, 7, "core-31.2-inbound", "11.22.7.7:8333", 3 * 3_600);
     announce_and_request(&pm, 7, 600, Duration::from_micros(400));
@@ -223,6 +250,7 @@ fn spy_fires_on_a_fast_one_way_transaction_listener() {
 /// relays transactions of its own and asks for blocks.
 #[test]
 fn spy_spares_an_honest_relaying_core_peer() {
+    let _clock = MockClock::install();
     let (pm, _dir) = pm_with_coins(&[]);
     let _rx = scripted(&pm, 7, "core-31.2-inbound", "11.22.7.7:8333", 3 * 3_600);
     announce_and_request(&pm, 7, 600, Duration::from_micros(400));
@@ -241,6 +269,7 @@ fn spy_spares_an_honest_relaying_core_peer() {
 /// announcements.
 #[test]
 fn spy_needs_every_condition() {
+    let _clock = MockClock::install();
     let cases: [(&str, u64, u32, Duration, bool); 5] = [
         ("an hour connected", 3_600, 600, Duration::from_micros(400), true),
         ("too few announcements", 3 * 3_600, 100, Duration::from_micros(400), true),
@@ -271,6 +300,7 @@ fn spy_needs_every_condition() {
 /// `F`: btcd's handshake under Core's user agent.
 #[test]
 fn fingerprint_mismatch_fires_on_a_borrowed_user_agent() {
+    let _clock = MockClock::install();
     let (pm, _dir) = pm_with_coins(&[]);
     let _rx = scripted(&pm, 7, "btcd-0.27.0-inbound", "11.22.7.7:8333", 30);
     with_behavior(&pm, 7, |b| b.version.as_mut().unwrap().user_agent = "/Satoshi:31.2.0/".into());
@@ -285,6 +315,7 @@ fn fingerprint_mismatch_fires_on_a_borrowed_user_agent() {
 /// `F`, honest: btcd under its own user agent.
 #[test]
 fn fingerprint_mismatch_spares_btcd_under_its_own_agent() {
+    let _clock = MockClock::install();
     let (pm, _dir) = pm_with_coins(&[]);
     let _rx = scripted(&pm, 7, "btcd-0.27.0-inbound", "11.22.7.7:8333", 30);
     assert_eq!(codes(&flags_of(&pm, 7)), "");
@@ -294,6 +325,7 @@ fn fingerprint_mismatch_spares_btcd_under_its_own_agent() {
 /// `A`: a second `getaddr` in one connection.
 #[test]
 fn addr_abuse_fires_on_repeated_getaddr() {
+    let _clock = MockClock::install();
     let (pm, _dir) = pm_with_coins(&[]);
     let _rx = scripted(&pm, 7, "core-31.2-inbound", "11.22.7.7:8333", 120);
     deliver(&pm, 7, NetworkMessage::GetAddr);
@@ -306,6 +338,7 @@ fn addr_abuse_fires_on_repeated_getaddr() {
 /// `A`: addresses past what the token bucket takes.
 #[test]
 fn addr_abuse_fires_on_addresses_past_the_rate_limit() {
+    let _clock = MockClock::install();
     let (pm, _dir) = pm_with_coins(&[]);
     let _rx = scripted(&pm, 7, "core-31.2-inbound", "11.22.7.7:8333", 120);
     pm.peers.write().get_mut(&7).unwrap().info.addr_rate.rate_limited = 1_001;
@@ -317,6 +350,7 @@ fn addr_abuse_fires_on_addresses_past_the_rate_limit() {
 /// `A`, honest: one `getaddr`, and some addresses dropped by the limit.
 #[test]
 fn addr_abuse_spares_one_getaddr_and_a_few_dropped_addresses() {
+    let _clock = MockClock::install();
     let (pm, _dir) = pm_with_coins(&[]);
     let _rx = scripted(&pm, 7, "core-31.2-inbound", "11.22.7.7:8333", 120);
     deliver(&pm, 7, NetworkMessage::GetAddr);
@@ -327,6 +361,7 @@ fn addr_abuse_spares_one_getaddr_and_a_few_dropped_addresses() {
 /// `H`: claimed a chain 100 blocks taller than it served.
 #[test]
 fn height_lie_fires_on_a_claim_it_would_not_serve() {
+    let _clock = MockClock::install();
     let (pm, _dir) = pm_with_coins(&[]);
     let _rx = scripted(&pm, 7, "core-31.2-outbound", "11.22.7.7:8333", 120);
     with_behavior(&pm, 7, |b| {
@@ -342,6 +377,7 @@ fn height_lie_fires_on_a_claim_it_would_not_serve() {
 /// `H`, honest: served what it claimed, or a block short (a tip that moved).
 #[test]
 fn height_lie_spares_a_peer_that_served_its_claim() {
+    let _clock = MockClock::install();
     let (pm, _dir) = pm_with_coins(&[]);
     let _rx = scripted(&pm, 7, "core-31.2-outbound", "11.22.7.7:8333", 120);
     with_behavior(&pm, 7, |b| {
@@ -360,6 +396,7 @@ fn announce_from_peer(pm: &PeerManager, id: PeerId, count: u8) {
 /// `N`: twenty of fifty announced transactions answered `notfound`.
 #[test]
 fn notfound_pattern_fires_on_announcements_it_does_not_serve() {
+    let _clock = MockClock::install();
     let (pm, _dir) = pm_with_coins(&[]);
     let _rx = scripted(&pm, 7, "core-31.2-outbound", "11.22.7.7:8333", 120);
     announce_from_peer(&pm, 7, 50);
@@ -377,6 +414,7 @@ fn notfound_pattern_fires_on_announcements_it_does_not_serve() {
 /// great many announced.
 #[test]
 fn notfound_pattern_spares_an_occasional_notfound() {
+    let _clock = MockClock::install();
     let (pm, _dir) = pm_with_coins(&[]);
     let _rx = scripted(&pm, 7, "core-31.2-outbound", "11.22.7.7:8333", 120);
     announce_from_peer(&pm, 7, 50);
@@ -399,6 +437,7 @@ fn notfound_pattern_spares_an_occasional_notfound() {
 /// `T`: three block-download stalls.
 #[test]
 fn stalling_fires_on_repeated_stalls() {
+    let _clock = MockClock::install();
     let (pm, _dir) = pm_with_coins(&[]);
     let _rx = scripted(&pm, 7, "core-31.2-outbound", "11.22.7.7:8333", 120);
     pm.note_stalls([7, 7, 7]);
@@ -410,6 +449,7 @@ fn stalling_fires_on_repeated_stalls() {
 /// `T`, honest: one stall, as any peer may have on a slow link.
 #[test]
 fn stalling_spares_a_single_stall() {
+    let _clock = MockClock::install();
     let (pm, _dir) = pm_with_coins(&[]);
     let _rx = scripted(&pm, 7, "core-31.2-outbound", "11.22.7.7:8333", 120);
     pm.note_stalls([7]);
@@ -420,6 +460,7 @@ fn stalling_spares_a_single_stall() {
 /// status page read follow the last pass.
 #[test]
 fn flags_are_counted_per_connected_peer() {
+    let _clock = MockClock::install();
     let (pm, _dir) = pm_with_coins(&[]);
     pm.evaluate_peer_flags();
     // The fixture's own peers, with no transcript.
@@ -441,6 +482,7 @@ fn flags_are_counted_per_connected_peer() {
 /// counters, and no address anywhere in it.
 #[test]
 fn getpeerbehavior_reports_a_peer_without_its_address() {
+    let _clock = MockClock::install();
     let (pm, _dir) = pm_with_coins(&[]);
     let _rx = scripted(&pm, 7, "core-31.2-outbound", "11.22.7.7:8333", 120);
     pm.note_stalls([7, 7, 7]);
