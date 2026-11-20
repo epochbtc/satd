@@ -57,7 +57,7 @@ pub(super) struct AltState {
     next_trial: Option<Instant>,
     /// Since when an alt-slot has been neither matched nor held by a
     /// fallback.
-    empty_since: Option<Instant>,
+    pub(super) empty_since: Option<Instant>,
     /// Alt-slot dials in flight, by address, with the role their peer
     /// takes; `spawn_peer` takes the entry.
     pub(super) dials: Vec<(PeerAddr, AltRole)>,
@@ -141,8 +141,9 @@ impl PeerManager {
                 h.info.alt = None;
             }
         }
-        drop(peers);
-        self.alt_slots.state.lock().empty_since = None;
+        // The `-altfillwait` clock is left running: a reload that leaves a
+        // slot empty does not restart its wait, and the next pass clears it
+        // once every slot is held.
     }
 
     /// The alt-slot settings in effect.
@@ -311,8 +312,8 @@ impl PeerManager {
         (f.take().expect("once"))(&self.alt_slots.state.lock().results)
     }
 
-    /// The address a trial is dialled at, or `None`. First an address whose
-    /// record matches a rule with a slot left, verified agents before
+    /// The address a trial is dialled at, or `None`. First an address in the
+    /// book whose record matches a rule with a slot left, verified agents before
     /// unverified ones under `-altuatrust=consistent`, at random within
     /// each; then an address-book entry, drawn as any automatic dial is,
     /// whose stored services can meet such a rule and whose record (if any)
@@ -359,7 +360,10 @@ impl PeerManager {
             self.read_alt_results(|store| store.get(addr).map(|r| r.services)).unwrap_or(0)
         };
         for (_, addr) in known {
-            if dialled.contains(&addr) {
+            // Only an address still in the book: the book is where a failed
+            // dial's backoff and attempts are kept, and an address it dropped
+            // would otherwise be dialled again every trial.
+            if dialled.contains(&addr) || !self.addrman.read().contains(&addr) {
                 continue;
             }
             let c = DialCandidate { services: services_of(&addr), addr };

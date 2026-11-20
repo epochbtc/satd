@@ -4297,7 +4297,11 @@ impl PeerManager {
                 if in_flight.extra_network > 0 {
                     return Err("an extra network peer is already being dialled".to_string());
                 }
-                if self.full_relay_open(&in_flight) != self.max_outbound_full_relay() {
+                // Alt-slots still empty count as held, as they do against
+                // the automatic target; none with `-altslots=0`.
+                if self.full_relay_open(&in_flight) + self.alt_slots_reserved(&in_flight)
+                    != self.max_outbound_full_relay()
+                {
                     return Err("the full-relay target is not met exactly".to_string());
                 }
                 if self.block_relay_open(&in_flight) < self.max_outbound_block_relay() {
