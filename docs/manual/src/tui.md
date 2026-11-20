@@ -154,6 +154,35 @@ Plus a stats panel: Headers, Connected, Stored, In-Flight, Remaining.
 
 `Up` / `Down` highlights a row.
 
+#### Peer behaviour
+
+On a satd that serves [`getpeerbehavior`](./peer-behavior.md), polled
+about every 5 seconds, both peers tables (this one and the Steady
+view's) show what the node judged about each peer:
+
+- **Flags**, a 7-cell column right of **Agent**, holds the peer's flag
+  codes: `C` crawler, `S` spy, `F` fingerprint mismatch, `A` addr abuse,
+  `H` height lie, `N` notfound pattern, `T` stalling. One flag is
+  yellow; `S`, or two flags or more, is red; no flag leaves it empty. On
+  a terminal too narrow for every column, Flags takes the place of
+  **Recv**.
+- `≠` after the agent means the handshake matches another
+  implementation than the one the user agent names. The agent is the
+  peer's own text, escaped before it is drawn.
+- `Enter` opens the **Peer detail** overlay for the highlighted row:
+  connection type, transport (`v1` / `v2`), how long it has been
+  connected, the claimed agent, the observed family (with its
+  confidence, or the family the agent claimed on a mismatch), the
+  handshake commands, each flag with its evidence (`key=value`), and the
+  raw counters. `Esc` (or `q`) closes it.
+- `f` toggles a filter showing only flagged peers; the table title then
+  reads `Peers (N connected, M flagged)`.
+
+A node without the method answers "method not found": the column, the
+marker, the overlay and the filter key are not shown, and the tables are
+as described above. The flag thresholds are provisional; see
+[Peer Behaviour Flags](./peer-behavior.md).
+
 ### Steady view (`2`)
 
 Default view once `is_ibd=false`. Six stacked panels.
@@ -247,6 +276,10 @@ Same controls as IBD's table; columns differ:
 | **Agent** | Subversion. |
 | **Height** | Peer's best-known block height. |
 | **Recv** | Total bytes transferred with this peer. |
+
+The Flags column, the `≠` marker, the detail overlay (`Enter`) and the
+flagged-peers filter (`f`) work as in the IBD view; see
+[Peer behaviour](#peer-behaviour).
 
 #### Services row
 
@@ -444,6 +477,13 @@ Peer clients: distribution of peers by user-agent string. Top 5 agents,
 plus an "other" bucket. Useful for spotting an unusually homogeneous
 peer set or an unexpected dominant client.
 
+On a node that serves `getpeerbehavior`, the panel counts peers by the
+family their handshake matched instead (`core`, `btcd`, `bitcoin-seeder`,
+…; `unknown` while a peer's handshake is unsettled or matches no
+family): top 4 plus "other", then `fingerprint mismatches: N`. A peer
+whose agent names another family is counted under the observed one,
+with the claimed family in brackets: `btcd [core]`.
+
 Trivia: subsidy era name, halving date, next halving block height.
 Light reading.
 
@@ -501,7 +541,9 @@ Modals are drawn over the active view. `Esc` or the toggle key closes
 them.
 
 ### Help (`h` / `?`)
-Context-sensitive keybindings for the active view.
+Context-sensitive keybindings for the active view. `Enter` and `f` are
+listed in the IBD and Steady views only on a node with `getpeerbehavior`,
+as `5` is only while the node has NAP on.
 
 ### Reorg history (`r`)
 Last 7 days of reorg events from `getreorghistory`. Up to 40 entries.
@@ -541,7 +583,7 @@ the modal reappears.
 
 | Key | Effect |
 |---|---|
-| `q` | Quit. Closes Help / Reorg modal first if open. |
+| `q` | Quit. Closes Help / Reorg modal or the Peer detail overlay first if open. |
 | `Ctrl-C` | Quit. |
 | `h` or `?` | Toggle Help overlay. |
 | `r` | Toggle Reorg history. |
@@ -552,8 +594,10 @@ the modal reappears.
 | `5` | NAP view (or back to auto). Only while the node has NAP on. |
 | `a` | Acknowledge all visible warnings. |
 | `w` | Re-show dismissed warnings. |
-| `Esc` | Close Help or Reorg modal. |
+| `Esc` | Close Help or Reorg modal, or the Peer detail overlay. |
 | `Up` / `Down` | Scroll peers (IBD / Steady / Chain) or top-N (Mempool), or select a value (NAP). |
+| `Enter` | Peer detail overlay for the highlighted peer (IBD / Steady). Only on a node with `getpeerbehavior`. |
+| `f` | Show only flagged peers, or all again (IBD / Steady). Only on a node with `getpeerbehavior`. |
 
 ## Polling and refresh
 
@@ -565,7 +609,7 @@ even when RPC is slow.
 |---|---|
 | **1.5 s** | `getblockchaininfo`, `getpeerinfo`, `getmempoolinfo`, `getconnectioncount`, `getsysteminfo`, `getwarnings`. |
 | **3 s** | `getibdprogress`. During IBD only; the reply is heavy (full bitmap and per-peer breakdown). |
-| **~5 s** | `getsatdindexinfo`, `getserverstatus`, `getnetworkinfo`, plus the steady-state batch (`estimatefees`, `getmininginfo`, `getchaintxstats`, `uptime`, `getblockstats`, `getmempoolsummary`, `gettxoutsetinfo`, `getreorghistory`, `getmempoolhistory`, `getpolicyinfo`), and `getquarantineinfo` while `getpolicyinfo` reports a loaded ruleset; and `listnapattestations` and `getnapreport`, which also tell the TUI whether NAP is on. |
+| **~5 s** | `getsatdindexinfo`, `getserverstatus`, `getnetworkinfo`, `getpeerbehavior` (also during IBD), plus the steady-state batch (`estimatefees`, `getmininginfo`, `getchaintxstats`, `uptime`, `getblockstats`, `getmempoolsummary`, `gettxoutsetinfo`, `getreorghistory`, `getmempoolhistory`, `getpolicyinfo`), and `getquarantineinfo` while `getpolicyinfo` reports a loaded ruleset; and `listnapattestations` and `getnapreport`, which also tell the TUI whether NAP is on. |
 | **per epoch** | `getblockhash` + `getblockheader` to anchor the current 2,016-block epoch's start time. Refreshed only when the epoch floor advances. |
 
 If a steady-state RPC has not returned within about 3 s, the title bar

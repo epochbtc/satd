@@ -1868,10 +1868,11 @@ impl AppState {
             .and_then(|i| i.as_u64());
     }
 
-    /// The peer detail overlay to draw: open, in a view with a peers table,
-    /// on a node that serves behaviour data.
+    /// The peer detail overlay to draw: open, and in a view with a peers
+    /// table. A node that stops serving behaviour data closes it
+    /// ([`Self::update_peer_behavior`]).
     pub fn shown_peer_detail(&self) -> Option<u64> {
-        if self.peer_behavior.is_some() && self.peers_view() { self.peer_detail } else { None }
+        if self.peers_view() { self.peer_detail } else { None }
     }
 
     /// Active view mode (respects force override).
