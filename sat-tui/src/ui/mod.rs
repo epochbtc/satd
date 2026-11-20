@@ -4,6 +4,7 @@ pub mod help;
 pub mod ibd;
 pub mod mempool;
 pub mod nap;
+pub mod peer_detail;
 pub mod reorgs;
 pub mod startup;
 pub mod steady;
@@ -135,76 +136,171 @@ pub fn format_num(n: u64) -> String {
     result.chars().rev().collect()
 }
 
-/// Build a peer table for either view.
-pub fn peer_table<'a>(
-    peers: &'a [serde_json::Value],
-    ibd_stats: Option<&'a [crate::state::PeerDownloadStat]>,
-    peer_dl_rates: &'a std::collections::HashMap<u64, f64>,
-    selected: usize,
-    title: &'a str,
-) -> Table<'a> {
-    let (header, widths) = if ibd_stats.is_some() {
-        (
-            Row::new(vec!["Addr", "Agent", "Recv", "Assigned", "Rate"])
-                .style(Style::default().fg(Color::Cyan)),
-            vec![
-                Constraint::Min(22),
-                Constraint::Min(20),
-                Constraint::Min(10),
-                Constraint::Min(8),
-                Constraint::Min(10),
-            ],
-        )
+/// A column of the peers tables.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeerCol {
+    Addr,
+    Agent,
+    /// Behaviour flag codes; only while the node serves `getpeerbehavior`.
+    Flags,
+    Height,
+    /// Blocks received (IBD) or bytes received (steady).
+    Recv,
+    Assigned,
+    Rate,
+}
+
+impl PeerCol {
+    fn header(self) -> &'static str {
+        match self {
+            PeerCol::Addr => "Addr",
+            PeerCol::Agent => "Agent",
+            PeerCol::Flags => "Flags",
+            PeerCol::Height => "Height",
+            PeerCol::Recv => "Recv",
+            PeerCol::Assigned => "Assigned",
+            PeerCol::Rate => "Rate",
+        }
+    }
+
+    /// The narrowest the column is drawn.
+    fn min_width(self, ibd: bool) -> u16 {
+        match self {
+            PeerCol::Addr => 22,
+            PeerCol::Agent => if ibd { 20 } else { 22 },
+            PeerCol::Flags => crate::behavior::FLAGS_WIDTH,
+            PeerCol::Height => 12,
+            PeerCol::Recv => if ibd { 10 } else { 12 },
+            PeerCol::Assigned => 8,
+            PeerCol::Rate => 10,
+        }
+    }
+
+    fn constraint(self, ibd: bool) -> Constraint {
+        match self {
+            PeerCol::Flags => Constraint::Length(crate::behavior::FLAGS_WIDTH),
+            other => Constraint::Min(other.min_width(ibd)),
+        }
+    }
+}
+
+/// The columns of a peers table `width` cells wide (borders included). The
+/// Flags column sits right of Agent while the node serves behaviour data;
+/// on a terminal too narrow for every column at its minimum, it takes
+/// Recv's place.
+pub fn peer_columns(ibd: bool, flags: bool, width: u16) -> Vec<PeerCol> {
+    let mut cols = if ibd {
+        vec![PeerCol::Addr, PeerCol::Agent, PeerCol::Recv, PeerCol::Assigned, PeerCol::Rate]
     } else {
-        (
-            Row::new(vec!["Addr", "Agent", "Height", "Recv"])
-                .style(Style::default().fg(Color::Cyan)),
-            vec![
-                Constraint::Min(22),
-                Constraint::Min(22),
-                Constraint::Min(12),
-                Constraint::Min(12),
-            ],
-        )
+        vec![PeerCol::Addr, PeerCol::Agent, PeerCol::Height, PeerCol::Recv]
     };
+    if flags {
+        cols.insert(2, PeerCol::Flags);
+        // Each column at its minimum, one cell between columns, two borders.
+        let needed: u16 = cols.iter().map(|c| c.min_width(ibd)).sum::<u16>() + cols.len() as u16 - 1 + 2;
+        if width < needed {
+            cols.retain(|c| *c != PeerCol::Recv);
+        }
+    }
+    cols
+}
+
+/// The colour of a Flags cell.
+pub fn flags_color(tone: crate::behavior::FlagsTone) -> Color {
+    match tone {
+        crate::behavior::FlagsTone::None => Color::Reset,
+        crate::behavior::FlagsTone::Warn => Color::Yellow,
+        crate::behavior::FlagsTone::Alarm => Color::Red,
+    }
+}
+
+/// The peers table title: the count, and the filter when it is on.
+pub fn peer_title(state: &crate::state::AppState) -> String {
+    if state.flag_filter_active() {
+        format!("Peers ({} connected, {} flagged)", state.connections, state.visible_peers().len())
+    } else {
+        format!("Peers ({} connected)", state.connections)
+    }
+}
+
+/// Footer keys for the peers views, while the node serves behaviour data.
+pub fn peer_keys(state: &crate::state::AppState) -> Vec<Span<'static>> {
+    if state.peer_behavior.is_none() {
+        return Vec::new();
+    }
+    vec![
+        Span::styled("  Enter", Style::default().fg(Color::White)),
+        Span::styled(": detail  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("f", Style::default().fg(Color::White)),
+        Span::styled(
+            if state.flagged_only { ": all peers" } else { ": flagged" },
+            Style::default().fg(Color::DarkGray),
+        ),
+    ]
+}
+
+/// Build the peers table for the IBD view (`ibd_stats` set) or the steady
+/// view, `width` cells wide.
+pub fn peer_table<'a>(
+    state: &'a crate::state::AppState,
+    ibd_stats: Option<&'a [crate::state::PeerDownloadStat]>,
+    title: &'a str,
+    width: u16,
+) -> Table<'a> {
+    let ibd = ibd_stats.is_some();
+    let cols = peer_columns(ibd, state.peer_behavior.is_some(), width);
+    let header = Row::new(cols.iter().map(|c| c.header()).collect::<Vec<_>>())
+        .style(Style::default().fg(Color::Cyan));
+    let widths: Vec<Constraint> = cols.iter().map(|c| c.constraint(ibd)).collect();
 
     let ibd_map: std::collections::HashMap<u64, &crate::state::PeerDownloadStat> = ibd_stats
         .map(|stats| stats.iter().map(|s| (s.peer_id, s)).collect())
         .unwrap_or_default();
 
-    let rows: Vec<Row> = peers
-        .iter()
+    let rows: Vec<Row> = state
+        .visible_peers()
+        .into_iter()
         .enumerate()
         .map(|(i, p)| {
-            let addr = p.get("addr").and_then(|a| a.as_str()).unwrap_or("-");
-            let agent = p.get("subver").and_then(|a| a.as_str()).unwrap_or("-");
             let peer_id = p.get("id").and_then(|id| id.as_u64()).unwrap_or(0);
+            let behavior = state.behavior_for(peer_id);
+            let cells: Vec<Cell> = cols
+                .iter()
+                .map(|col| match col {
+                    PeerCol::Addr => Cell::from(p.get("addr").and_then(|a| a.as_str()).unwrap_or("-").to_string()),
+                    PeerCol::Agent => {
+                        let subver = p.get("subver").and_then(|a| a.as_str()).unwrap_or("-");
+                        Cell::from(crate::behavior::agent_cell(subver, behavior))
+                    }
+                    PeerCol::Flags => match behavior.map(crate::behavior::flags_cell) {
+                        Some((codes, tone)) => {
+                            Cell::from(codes).style(Style::default().fg(flags_color(tone)))
+                        }
+                        None => Cell::from(""),
+                    },
+                    PeerCol::Height => {
+                        let height = p.get("synced_headers").and_then(|h| h.as_u64())
+                            .or_else(|| p.get("startingheight").and_then(|h| h.as_u64()))
+                            .unwrap_or(0);
+                        Cell::from(format_num(height))
+                    }
+                    PeerCol::Recv if ibd => Cell::from(
+                        ibd_map.get(&peer_id).map(|s| format_num(s.blocks_received)).unwrap_or("-".into()),
+                    ),
+                    PeerCol::Recv => {
+                        Cell::from(format_bytes(p.get("bytesrecv").and_then(|b| b.as_u64()).unwrap_or(0)))
+                    }
+                    PeerCol::Assigned => Cell::from(
+                        ibd_map.get(&peer_id).map(|s| s.assigned.to_string()).unwrap_or("-".into()),
+                    ),
+                    PeerCol::Rate => {
+                        let rate = state.peer_dl_rates.get(&peer_id).copied().unwrap_or(0.0);
+                        Cell::from(if rate > 0.1 { format!("{:.1} blk/s", rate) } else { "-".into() })
+                    }
+                })
+                .collect();
 
-            let cells = if ibd_stats.is_some() {
-                let ibd = ibd_map.get(&peer_id);
-                let rate = peer_dl_rates.get(&peer_id).copied().unwrap_or(0.0);
-                let rate_str = if rate > 0.1 { format!("{:.1} blk/s", rate) } else { "-".into() };
-                vec![
-                    Cell::from(addr.to_string()),
-                    Cell::from(agent.to_string()),
-                    Cell::from(ibd.map(|s| format_num(s.blocks_received)).unwrap_or("-".into())),
-                    Cell::from(ibd.map(|s| s.assigned.to_string()).unwrap_or("-".into())),
-                    Cell::from(rate_str),
-                ]
-            } else {
-                let height = p.get("synced_headers").and_then(|h| h.as_u64())
-                    .or_else(|| p.get("startingheight").and_then(|h| h.as_u64()))
-                    .unwrap_or(0);
-                let recv = p.get("bytesrecv").and_then(|b| b.as_u64()).unwrap_or(0);
-                vec![
-                    Cell::from(addr.to_string()),
-                    Cell::from(agent.to_string()),
-                    Cell::from(format_num(height)),
-                    Cell::from(format_bytes(recv)),
-                ]
-            };
-
-            let style = if i == selected {
+            let style = if i == state.selected_peer {
                 Style::default().fg(Color::Yellow)
             } else {
                 Style::default()
@@ -329,6 +425,21 @@ pub fn render_loading_panel(f: &mut ratatui::Frame, area: ratatui::layout::Rect,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn flags_column_sits_right_of_agent_and_replaces_recv_when_narrow() {
+        use PeerCol::*;
+        // No behaviour data: the tables are as they were.
+        assert_eq!(peer_columns(false, false, 200), [Addr, Agent, Height, Recv]);
+        assert_eq!(peer_columns(true, false, 200), [Addr, Agent, Recv, Assigned, Rate]);
+        assert_eq!(peer_columns(false, false, 60), [Addr, Agent, Height, Recv]);
+        // With it, Flags right of Agent.
+        assert_eq!(peer_columns(false, true, 81), [Addr, Agent, Flags, Height, Recv]);
+        assert_eq!(peer_columns(true, true, 84), [Addr, Agent, Flags, Recv, Assigned, Rate]);
+        // One cell narrower, and Flags takes Recv's place.
+        assert_eq!(peer_columns(false, true, 80), [Addr, Agent, Flags, Height]);
+        assert_eq!(peer_columns(true, true, 83), [Addr, Agent, Flags, Assigned, Rate]);
+    }
 
     #[test]
     fn log_bar_edges() {

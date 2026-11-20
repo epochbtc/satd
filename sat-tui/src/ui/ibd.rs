@@ -44,13 +44,13 @@ pub fn draw(f: &mut Frame, state: &AppState) {
     draw_sparklines_and_stats(f, chunks[3], state);
 
     // Peers
-    let peer_title = format!("Peers ({} connected)", state.connections);
+    let peer_title = crate::ui::peer_title(state);
     let ibd_stats = state.ibd_bitmap.as_ref().map(|b| b.peer_stats.as_slice());
-    let table = peer_table(&state.peers, ibd_stats, &state.peer_dl_rates, state.selected_peer, &peer_title);
+    let table = peer_table(state, ibd_stats, &peer_title, chunks[4].width);
     f.render_widget(table, chunks[4]);
 
     // Footer
-    let footer = Line::from(vec![
+    let mut footer = vec![
         Span::styled("q", Style::default().fg(Color::White)),
         Span::styled(": quit  ", Style::default().fg(Color::DarkGray)),
         Span::styled("h", Style::default().fg(Color::White)),
@@ -59,8 +59,9 @@ pub fn draw(f: &mut Frame, state: &AppState) {
         Span::styled(": switch view  ", Style::default().fg(Color::DarkGray)),
         Span::raw("\u{2191}\u{2193}"),
         Span::styled(": scroll peers", Style::default().fg(Color::DarkGray)),
-    ]);
-    f.render_widget(Paragraph::new(footer), chunks[5]);
+    ];
+    footer.extend(crate::ui::peer_keys(state));
+    f.render_widget(Paragraph::new(Line::from(footer)), chunks[5]);
 }
 
 fn draw_progress(f: &mut Frame, area: Rect, state: &AppState) {

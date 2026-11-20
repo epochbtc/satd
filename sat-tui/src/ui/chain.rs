@@ -219,10 +219,40 @@ fn draw_security(f: &mut Frame, area: Rect, state: &AppState) {
 // ---- Peer Clients ----------------------------------------------------------
 
 fn draw_peer_clients(f: &mut Frame, area: Rect, state: &AppState) {
+    render_panel(f, area, " Peer Clients ", &peer_client_lines(state));
+}
+
+/// The Peer clients panel: peers by observed family while the node serves
+/// behaviour data (a mismatch labelled with its claimed family in
+/// brackets), then the mismatch count; by user agent otherwise.
+pub fn peer_client_lines(state: &AppState) -> Vec<Line<'static>> {
+    let row = |name: &str, count: usize, total: usize| {
+        let pct = (count as f64 / total.max(1) as f64) * 100.0;
+        Line::from(vec![
+            Span::styled(format!("  {:<24}", truncate(&crate::nap::printable(name), 24)), Style::default().fg(Color::White)),
+            Span::styled(format!("{:>3}", count), Style::default().fg(Color::Cyan)),
+            Span::styled(format!("  {:>5.1}%", pct), Style::default().fg(Color::Gray)),
+        ])
+    };
+
+    if let Some(map) = state.peer_behavior.as_ref().filter(|m| !m.is_empty()) {
+        // Six inner lines: four families, `other`, and the mismatch count.
+        let total = map.len();
+        let mut lines: Vec<Line<'static>> = crate::behavior::family_distribution(map, 4)
+            .iter()
+            .map(|(name, count)| row(name, *count, total))
+            .collect();
+        let mismatches = crate::behavior::mismatch_count(map);
+        lines.push(Line::from(Span::styled(
+            format!("  fingerprint mismatches: {mismatches}"),
+            Style::default().fg(if mismatches > 0 { Color::Red } else { Color::DarkGray }),
+        )));
+        return lines;
+    }
+
     let total: usize = state.peers.len();
     let dist = state.subver_distribution(5);
-
-    let lines: Vec<Line<'static>> = if total == 0 {
+    if total == 0 {
         vec![Line::from(Span::styled(
             "  no connected peers",
             Style::default().fg(Color::DarkGray),
@@ -233,25 +263,8 @@ fn draw_peer_clients(f: &mut Frame, area: Rect, state: &AppState) {
             Style::default().fg(Color::DarkGray),
         ))]
     } else {
-        dist.iter()
-            .map(|(name, count)| {
-                let pct = (*count as f64 / total as f64) * 100.0;
-                Line::from(vec![
-                    Span::styled(format!("  {:<24}", truncate(name, 24)), Style::default().fg(Color::White)),
-                    Span::styled(
-                        format!("{:>3}", count),
-                        Style::default().fg(Color::Cyan),
-                    ),
-                    Span::styled(
-                        format!("  {:>5.1}%", pct),
-                        Style::default().fg(Color::Gray),
-                    ),
-                ])
-            })
-            .collect()
-    };
-
-    render_panel(f, area, " Peer Clients ", &lines);
+        dist.iter().map(|(name, count)| row(name, *count, total)).collect()
+    }
 }
 
 // ---- Trivia ----------------------------------------------------------------
@@ -402,6 +415,43 @@ mod tests {
         // Distant future: 2200-01-01 ≈ 7_258_118_400
         let s2 = format_calendar_eta(7_258_118_400);
         assert!(s2.contains("2200") || s2.contains("2199"), "got {}", s2);
+    }
+
+    fn line_text(l: &Line<'_>) -> String {
+        l.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    /// With behaviour data the panel counts observed families, a mismatch
+    /// under its observed family with the claimed one in brackets, and ends
+    /// with the mismatch count; without it, user agents as before.
+    #[test]
+    fn peer_clients_by_observed_family() {
+        let mut st = AppState::new();
+        st.peers = vec![
+            serde_json::json!({"id": 3, "subver": "/Satoshi:27.0.0/"}),
+            serde_json::json!({"id": 7, "subver": "/bitcoin-seeder:0.01/"}),
+        ];
+        let before: Vec<String> = peer_client_lines(&st).iter().map(line_text).collect();
+        assert_eq!(before.len(), 2);
+        assert!(before[0].contains("/Satoshi:27.0.0/") || before[1].contains("/Satoshi:27.0.0/"));
+        assert!(!before.iter().any(|l| l.contains("mismatches")));
+
+        st.update_peer_behavior(crate::behavior::classify(Ok(crate::behavior::tests::reply())));
+        let after: Vec<String> = peer_client_lines(&st).iter().map(line_text).collect();
+        assert!(after.iter().any(|l| l.contains("btcd [core]") && l.contains("1")), "{after:?}");
+        assert!(after.iter().any(|l| l.contains("bitcoin-seeder")), "{after:?}");
+        assert!(!after.iter().any(|l| l.contains("/Satoshi:")), "{after:?}");
+        assert_eq!(after.last().map(String::as_str), Some("  fingerprint mismatches: 1"));
+        assert!(after.len() <= 6, "fits the panel's six lines: {after:?}");
+
+        // A node without the method: back to user agents.
+        let mnf = crate::rpc::RpcError::Rpc {
+            code: crate::rpc::JSONRPC_METHOD_NOT_FOUND,
+            message: "Method not found".into(),
+        };
+        st.update_peer_behavior(crate::behavior::classify(Err(mnf)));
+        let off: Vec<String> = peer_client_lines(&st).iter().map(line_text).collect();
+        assert_eq!(off, before);
     }
 
     #[test]
