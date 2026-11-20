@@ -26,6 +26,7 @@ pub fn draw(f: &mut Frame, state: &AppState) {
     draw_row_one(f, chunks[1], state);
     draw_row_two(f, chunks[2], state);
     draw_row_three(f, chunks[3], state);
+    draw_survey(f, chunks[4], state);
     draw_footer(f, chunks[5], state);
 }
 
@@ -267,6 +268,132 @@ pub fn peer_client_lines(state: &AppState) -> Vec<Line<'static>> {
     }
 }
 
+// ---- Network Survey --------------------------------------------------------
+
+/// How row four is drawn in the space below row three.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SurveyRow {
+    /// No survey data: the space stays empty.
+    Hidden,
+    /// Network survey | Survey detail, this many lines tall.
+    Panels(u16),
+    /// Too short for the panels: one summary line above the footer.
+    Line,
+}
+
+/// Row four's form for `space` lines below row three, when the panels
+/// need `needed` inner lines.
+pub fn survey_row(state: &AppState, space: u16, needed: usize) -> SurveyRow {
+    if state.peer_survey.is_none() || space == 0 {
+        return SurveyRow::Hidden;
+    }
+    let height = needed as u16 + 2;
+    if space >= height { SurveyRow::Panels(height) } else { SurveyRow::Line }
+}
+
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn draw_survey(f: &mut Frame, area: Rect, state: &AppState) {
+    let Some(survey) = state.peer_survey.as_ref() else { return };
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(area);
+    let left = survey_left_lines(survey, cols[0].width.saturating_sub(2));
+    let right = survey_right_lines(survey, now_unix());
+    match survey_row(state, area.height, left.len().max(right.len())) {
+        SurveyRow::Hidden => {}
+        SurveyRow::Panels(height) => {
+            let mut left_area = cols[0];
+            let mut right_area = cols[1];
+            left_area.height = height;
+            right_area.height = height;
+            render_panel(f, left_area, " Network Survey ", &left);
+            render_panel(f, right_area, " Survey Detail ", &right);
+        }
+        SurveyRow::Line => {
+            let line_area = Rect { y: area.y + area.height - 1, height: 1, ..area };
+            let line = Line::from(Span::styled(format!(" {}", survey.summary()), Style::default().fg(Color::Gray)));
+            f.render_widget(Paragraph::new(line), line_area);
+        }
+    }
+}
+
+/// The Network survey panel, `width` cells inside its border: the
+/// addresses and the window, a bar per family (the eight largest, then
+/// `other`), and the non-Core share.
+pub fn survey_left_lines(s: &crate::survey::Survey, width: u16) -> Vec<Line<'static>> {
+    const LABEL: usize = 14;
+    let mut lines = vec![Line::from(Span::styled(
+        format!("  {} addrs, last {} d", format_num(s.addresses), crate::survey::WINDOW_DAYS),
+        Style::default().fg(Color::White),
+    ))];
+    if s.addresses == 0 {
+        lines.push(Line::from(Span::styled("  no address reached yet", Style::default().fg(Color::DarkGray))));
+        return lines;
+    }
+    // Two-cell indent, label, space, bar, space, `100.0%`.
+    let bar_width = (width as usize).saturating_sub(2 + LABEL + 1 + 1 + 6).clamp(4, 30);
+    for (name, count) in s.family_bars() {
+        let pct = s.pct(count);
+        // A family with any record shows at least one cell.
+        let filled = ((pct / 100.0 * bar_width as f64).round() as usize).clamp(usize::from(count > 0), bar_width);
+        let color = match name.as_str() {
+            "core" => Color::Green,
+            "unknown" | "other" => Color::DarkGray,
+            _ => Color::Yellow,
+        };
+        lines.push(Line::from(vec![
+            Span::styled(format!("  {:<width$} ", truncate(&name, LABEL), width = LABEL), Style::default().fg(Color::White)),
+            Span::styled("\u{2588}".repeat(filled), Style::default().fg(color)),
+            Span::styled("\u{2591}".repeat(bar_width - filled), Style::default().fg(Color::DarkGray)),
+            Span::styled(format!(" {:>5.1}%", pct), Style::default().fg(Color::Gray)),
+        ]));
+    }
+    lines.push(Line::from(vec![
+        Span::styled("  non-Core ", Style::default().fg(Color::Gray)),
+        Span::styled(format!("{:.1} %", s.non_core_pct()), Style::default().fg(Color::Cyan)),
+    ]));
+    lines
+}
+
+/// The Survey detail panel: v2 and mismatch shares, the five largest
+/// autonomous systems, the last survey connection against `now` (Unix
+/// seconds), the connection counts and, with probes on, how many
+/// addresses carry a probe outcome.
+pub fn survey_right_lines(s: &crate::survey::Survey, now: u64) -> Vec<Line<'static>> {
+    let row = |label: &str, value: String| {
+        Line::from(vec![
+            Span::styled(format!("  {:<13}", label), Style::default().fg(Color::Gray)),
+            Span::styled(value, Style::default().fg(Color::White)),
+        ])
+    };
+    let mut lines = vec![
+        row("v2:", format!("{:.1} % ({})", s.pct(s.v2), format_num(s.v2))),
+        row("mismatches:", format!("{:.1} % ({})", s.pct(s.mismatches), format_num(s.mismatches))),
+    ];
+    if s.top_as.is_empty() {
+        let why = if s.addresses == 0 { "none" } else { "none (needs -asmap)" };
+        lines.push(row("top AS:", why.into()));
+    } else {
+        lines.push(row("top AS:", String::new()));
+        for (asn, count) in s.top_as.iter().take(crate::survey::TOP_AS) {
+            lines.push(row(&format!("  AS{asn}"), format!("{:.1} %", s.pct(*count))));
+        }
+    }
+    lines.push(row("last survey:", s.last_line(now)));
+    lines.push(row("connections:", format!("{} ok, {} failed", format_num(s.completed), format_num(s.failed))));
+    if s.probes {
+        lines.push(row("probed:", format!("{} addrs", format_num(s.probed))));
+    }
+    lines
+}
+
 // ---- Trivia ----------------------------------------------------------------
 
 fn draw_trivia(f: &mut Frame, area: Rect, state: &AppState) {
@@ -452,6 +579,105 @@ mod tests {
         st.update_peer_behavior(crate::behavior::classify(Err(mnf)));
         let off: Vec<String> = peer_client_lines(&st).iter().map(line_text).collect();
         assert_eq!(off, before);
+    }
+
+    fn survey_state() -> AppState {
+        let mut st = AppState::new();
+        st.update_peer_survey(crate::survey::classify(Ok(crate::survey::tests::reply())));
+        st
+    }
+
+    /// With the survey on, the left panel holds the addresses and window,
+    /// the eight largest families and `other` as bars, and the non-Core
+    /// share; the right, the v2 and mismatch shares, the top AS, the last
+    /// connection and the probe count.
+    #[test]
+    fn survey_panels() {
+        let st = survey_state();
+        let s = st.peer_survey.as_ref().unwrap();
+        let left: Vec<String> = survey_left_lines(s, 38).iter().map(line_text).collect();
+        assert_eq!(left[0], "  1,204 addrs, last 30 d");
+        assert!(left[1].starts_with("  core           ") && left[1].ends_with(" 89.7%"), "{left:?}");
+        assert!(left[9].starts_with("  other "), "{left:?}");
+        assert_eq!(left.last().map(String::as_str), Some("  non-Core 5.5 %"));
+        assert_eq!(left.len(), 11);
+        for l in &left {
+            assert!(l.chars().count() <= 38, "fits the panel: {l:?}");
+        }
+
+        let right: Vec<String> = survey_right_lines(s, 1_790_000_042).iter().map(line_text).collect();
+        assert_eq!(right[0], "  v2:          41.0 % (494)");
+        assert_eq!(right[1], "  mismatches:  0.4 % (5)");
+        assert_eq!(right[3], "    AS64496    7.0 %");
+        assert!(right.contains(&"  last survey: 42s ago, completed".to_string()), "{right:?}");
+        assert!(right.contains(&"  connections: 1,300 ok, 2,100 failed".to_string()), "{right:?}");
+        assert_eq!(right.last().map(String::as_str), Some("  probed:      600 addrs"));
+        for l in &right {
+            assert!(l.chars().count() <= 38, "fits an 80-column terminal's panel: {l:?}");
+        }
+
+        // Probes off: no probe line. No `-asmap`: no AS list.
+        let mut quiet = s.clone();
+        quiet.probes = false;
+        quiet.top_as.clear();
+        let right: Vec<String> = survey_right_lines(&quiet, 1_790_000_042).iter().map(line_text).collect();
+        assert!(!right.iter().any(|l| l.contains("probed")), "{right:?}");
+        assert!(right.contains(&"  top AS:      none (needs -asmap)".to_string()), "{right:?}");
+
+        // A survey that has reached nobody yet.
+        let empty = crate::survey::Survey::default();
+        let left: Vec<String> = survey_left_lines(&empty, 38).iter().map(line_text).collect();
+        assert_eq!(left, ["  0 addrs, last 30 d", "  no address reached yet"]);
+    }
+
+    /// Row four is drawn whole where it fits, collapses to the summary
+    /// line where it does not, and is not drawn at all without survey
+    /// data (the survey off, an older node, a refusal).
+    #[test]
+    fn survey_row_fits_collapses_or_hides() {
+        let st = survey_state();
+        assert_eq!(survey_row(&st, 20, 11), SurveyRow::Panels(13));
+        assert_eq!(survey_row(&st, 13, 11), SurveyRow::Panels(13));
+        assert_eq!(survey_row(&st, 12, 11), SurveyRow::Line);
+        assert_eq!(survey_row(&st, 1, 11), SurveyRow::Line);
+        assert_eq!(survey_row(&st, 0, 11), SurveyRow::Hidden, "no room at all");
+
+        let mut off = survey_state();
+        let mnf = crate::rpc::RpcError::Rpc { code: crate::rpc::JSONRPC_METHOD_NOT_FOUND, message: "no".into() };
+        off.update_peer_survey(crate::survey::classify(Err(mnf)));
+        assert_eq!(survey_row(&off, 20, 11), SurveyRow::Hidden);
+        assert_eq!(survey_row(&AppState::new(), 20, 11), SurveyRow::Hidden);
+    }
+
+    /// The whole view against a test backend: the survey row below the
+    /// three fixed rows on a tall terminal, the summary line above the
+    /// footer on a short one, nothing with the survey off. Trivia and Peer
+    /// clients stay in every case.
+    #[test]
+    fn chain_view_draws_the_survey_row() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let render = |st: &AppState, w: u16, h: u16| -> Vec<String> {
+            let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+            term.draw(|f| draw(f, st)).unwrap();
+            let buf = term.backend().buffer().clone();
+            (0..h).map(|y| (0..w).map(|x| buf[(x, y)].symbol().to_string()).collect()).collect()
+        };
+        let st = survey_state();
+
+        let tall = render(&st, 100, 40);
+        assert!(tall[25].contains("Network Survey") && tall[25].contains("Survey Detail"), "{tall:#?}");
+        assert!(tall.iter().any(|l| l.contains("1,204 addrs, last 30 d")));
+        assert!(tall.iter().any(|l| l.contains("Trivia")) && tall.iter().any(|l| l.contains("Peer Clients")));
+        assert!(!tall.iter().any(|l| l.contains("survey: 1,204")));
+
+        let short = render(&st, 80, 30);
+        assert!(short[28].contains("survey: 1,204 addrs, non-Core 5.5 %, v2 41 %"), "{short:#?}");
+        assert!(!short.iter().any(|l| l.contains("Network Survey")));
+        assert!(short.iter().any(|l| l.contains("Trivia")));
+
+        let none = render(&AppState::new(), 100, 40);
+        assert!(!none.iter().any(|l| l.contains("Network Survey") || l.contains("survey: 1,204")));
     }
 
     #[test]

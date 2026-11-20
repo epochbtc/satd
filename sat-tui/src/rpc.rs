@@ -280,6 +280,14 @@ impl RpcClient {
         self.call("getpeerbehavior", &[]).await
     }
 
+    /// satd's `getpeersurvey`, the aggregate only: never `verbose`, whose
+    /// rows hold peer addresses. A node without it answers "method not
+    /// found"; the read-only listener and a token without `rpc:write`
+    /// refuse it.
+    pub async fn get_peer_survey(&self) -> Result<serde_json::Value, RpcError> {
+        self.call("getpeersurvey", &[]).await
+    }
+
     pub async fn get_network_info(&self) -> Result<serde_json::Value, RpcError> {
         self.call("getnetworkinfo", &[]).await
     }
