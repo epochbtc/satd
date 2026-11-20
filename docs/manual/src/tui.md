@@ -487,6 +487,48 @@ with the claimed family in brackets: `btcd [core]`.
 Trivia: subsidy era name, halving date, next halving block height.
 Light reading.
 
+#### Network survey | Survey detail
+
+A fourth row, drawn only on a node running the
+[network survey](./peer-behavior.md#network-survey) (`-peersurvey=1`).
+The TUI polls `getpeersurvey` for its aggregate, about every 5 seconds,
+and never asks for the per-address rows (`getpeersurvey true`), which
+hold peer addresses.
+
+Network survey:
+
+- `1,204 addrs, last 30 d`: the addresses the survey reached that the
+  node still keeps (it drops a record not seen for 30 days).
+- One bar per observed family, the 8 largest, then "other", each with
+  its share of the addresses. `unknown` is a handshake that matched no
+  family.
+- **non-Core**: the share whose handshake matched a family other than
+  Core's. Core's forks, Knots among them, share its networking code and
+  count as Core; `unknown` is not counted either way.
+
+Survey detail:
+
+- **v2**: the share reached over BIP 324, with the count.
+- **mismatches**: the share whose user agent names one family while the
+  handshake matches another.
+- **top AS**: the 5 autonomous systems with the most addresses, by
+  number and share. Without `-asmap` the node knows none.
+- **last survey**: when the last survey connection ended, and whether
+  it completed or failed at the dial or the handshake.
+- **connections**: survey connections since the node started, completed
+  (`ok`) and failed.
+- **probed**: with `-peersurveyprobes` on, the addresses that carry at
+  least one probe outcome.
+
+On a terminal too short for the row it collapses to one line above the
+footer: `survey: 1,204 addrs, non-Core 6.1 %, v2 41 %`. The row is not
+drawn, and nothing is shown as failing, when the survey is off, when the
+node does not serve `getpeersurvey` ("method not found"), and when it
+refuses it: the method is operator control, so the read-only listener
+and a bearer token without `rpc:write` are refused it. The TUI keeps
+polling, so the row appears once the survey runs or the credentials
+allow it.
+
 ### NAP view (`5`)
 
 The [Node Attestation Protocol](nap.md) as this node runs it. The view is
@@ -609,7 +651,7 @@ even when RPC is slow.
 |---|---|
 | **1.5 s** | `getblockchaininfo`, `getpeerinfo`, `getmempoolinfo`, `getconnectioncount`, `getsysteminfo`, `getwarnings`. |
 | **3 s** | `getibdprogress`. During IBD only; the reply is heavy (full bitmap and per-peer breakdown). |
-| **~5 s** | `getsatdindexinfo`, `getserverstatus`, `getnetworkinfo`, `getpeerbehavior` (also during IBD), plus the steady-state batch (`estimatefees`, `getmininginfo`, `getchaintxstats`, `uptime`, `getblockstats`, `getmempoolsummary`, `gettxoutsetinfo`, `getreorghistory`, `getmempoolhistory`, `getpolicyinfo`), and `getquarantineinfo` while `getpolicyinfo` reports a loaded ruleset; and `listnapattestations` and `getnapreport`, which also tell the TUI whether NAP is on. |
+| **~5 s** | `getsatdindexinfo`, `getserverstatus`, `getnetworkinfo`, `getpeerbehavior` and `getpeersurvey` (both also during IBD), plus the steady-state batch (`estimatefees`, `getmininginfo`, `getchaintxstats`, `uptime`, `getblockstats`, `getmempoolsummary`, `gettxoutsetinfo`, `getreorghistory`, `getmempoolhistory`, `getpolicyinfo`), and `getquarantineinfo` while `getpolicyinfo` reports a loaded ruleset; and `listnapattestations` and `getnapreport`, which also tell the TUI whether NAP is on. |
 | **per epoch** | `getblockhash` + `getblockheader` to anchor the current 2,016-block epoch's start time. Refreshed only when the epoch floor advances. |
 
 If a steady-state RPC has not returned within about 3 s, the title bar

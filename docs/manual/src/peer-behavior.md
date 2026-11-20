@@ -199,7 +199,8 @@ node's own peers.
   "enabled": true,
   "probes": true,
   "interval": 60,
-  "connections": {"completed": 815, "failed": 1311}
+  "connections": {"completed": 815, "failed": 1311,
+                  "last": {"time": 1795000000, "result": "completed"}}
 }
 ```
 
@@ -212,7 +213,7 @@ node's own peers.
 | `top_as` | The ten autonomous systems with the most records. Empty without `-asmap`. |
 | `probed` | Records with at least one probe outcome. |
 | `enabled`, `probes`, `interval` | The survey's settings. With the survey off, `enabled` is false and every count is zero. |
-| `connections` | Survey connections since start: `completed`, and `failed` at the dial or the handshake. |
+| `connections` | Survey connections since start: `completed`, and `failed` at the dial or the handshake; `last`, the most recent to end, with its `time` (Unix seconds) and `result` (`completed` or `failed`), null until one ends. |
 
 `getpeersurvey true` adds `peers`, one row per address, most recently seen
 first: `addr`, `network`, `fingerprint` (as in `getpeerbehavior`, for
