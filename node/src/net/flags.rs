@@ -74,6 +74,41 @@ impl Flag {
     }
 }
 
+/// The flags `-peerflagpolicy=evict` acts on: crawler, spy and fingerprint
+/// mismatch.
+pub const EVICTION_FLAGS: [Flag; 3] = [Flag::Crawler, Flag::Spy, Flag::FingerprintMismatch];
+
+/// `-peerflagpolicy`: what the flags change.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum FlagPolicy {
+    /// Nothing: the flags are information only.
+    #[default]
+    Observe,
+    /// An inbound peer carrying one of [`EVICTION_FLAGS`], and neither the
+    /// `noban` nor the `relay` permission, loses its eviction protection and
+    /// is evicted first when an inbound slot is needed
+    /// ([`crate::net::eviction::EvictionCandidate::flagged`]). Nothing else:
+    /// no disconnect while slots are free, no ban, no outbound peer.
+    Evict,
+}
+
+impl FlagPolicy {
+    pub fn parse(s: &str) -> Result<FlagPolicy, String> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "observe" => Ok(FlagPolicy::Observe),
+            "evict" => Ok(FlagPolicy::Evict),
+            other => Err(format!("-peerflagpolicy must be observe or evict, not \"{other}\"")),
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            FlagPolicy::Observe => "observe",
+            FlagPolicy::Evict => "evict",
+        }
+    }
+}
+
 /// A set of flags.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct FlagSet(u8);
@@ -89,6 +124,17 @@ impl FlagSet {
 
     pub fn is_empty(self) -> bool {
         self.0 == 0
+    }
+
+    /// The flags of this set that `-peerflagpolicy=evict` acts on.
+    pub fn eviction_flags(self) -> FlagSet {
+        let mut s = FlagSet::default();
+        for f in EVICTION_FLAGS {
+            if self.contains(f) {
+                s.insert(f);
+            }
+        }
+        s
     }
 
     pub fn iter(self) -> impl Iterator<Item = Flag> {
@@ -546,6 +592,22 @@ mod tests {
         for (i, f) in Flag::ALL.iter().enumerate() {
             assert_eq!(*f as usize, i, "Flag::ALL is in discriminant order");
         }
+    }
+
+    /// `-peerflagpolicy` takes `observe` or `evict` in any case, and acts
+    /// on `C`, `S` and `F` only.
+    #[test]
+    fn the_flag_policy_parses_and_names_its_flags() {
+        assert_eq!(FlagPolicy::default(), FlagPolicy::Observe);
+        assert_eq!(FlagPolicy::parse(" Evict "), Ok(FlagPolicy::Evict));
+        assert_eq!(FlagPolicy::parse("observe").map(FlagPolicy::name), Ok("observe"));
+        assert!(FlagPolicy::parse("ban").is_err());
+        let mut all = FlagSet::default();
+        Flag::ALL.into_iter().for_each(|f| all.insert(f));
+        assert_eq!(all.eviction_flags().to_string(), "CSF");
+        let mut rest = FlagSet::default();
+        [Flag::AddrAbuse, Flag::HeightLie, Flag::NotfoundPattern, Flag::Stalling].into_iter().for_each(|f| rest.insert(f));
+        assert!(rest.eviction_flags().is_empty());
     }
 
     #[test]

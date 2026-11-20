@@ -1007,6 +1007,8 @@ fn field_specs() -> Vec<FieldSpec> {
         restart!("peersurvey", peersurvey),
         restart!("peersurveyinterval", peersurveyinterval),
         restart!("peersurveyprobes", peersurveyprobes),
+        // Read once at startup, like every option outside the alt-slot set.
+        restart!("peerflagpolicy", peerflagpolicy),
         // NOTE: `policyfile` is intentionally NOT a FieldSpec. Like the
         // `authfile` token store, its external file's *contents* are re-read on
         // every SIGHUP — even when the path is unchanged — by a dedicated handler

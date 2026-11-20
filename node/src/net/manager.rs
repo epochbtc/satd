@@ -50,6 +50,18 @@ const MAX_OUTBOUND_BLOCK_RELAY: usize = 2;
 const ADDR_FETCH_TIMEOUT_SECS: u64 = 10 * 30;
 const BAN_THRESHOLD: u32 = 100;
 
+/// What [`PeerManager::eviction_victim`] found.
+#[derive(Debug, PartialEq, Eq)]
+enum EvictionVictim {
+    /// There is room: nothing to evict.
+    NotNeeded,
+    /// Every candidate is protected.
+    None,
+    /// This peer, with the flags `-peerflagpolicy=evict` acted on (empty
+    /// when it was chosen by Core's rules alone).
+    Peer(PeerId, crate::net::flags::FlagSet),
+}
+
 /// What becomes of a peer whose misbehaviour reached [`BAN_THRESHOLD`]; see
 /// [`PeerManager::misbehaviour_action`].
 #[derive(Debug)]
@@ -1395,6 +1407,9 @@ pub struct PeerManager {
     survey: std::sync::OnceLock<survey_conn::SurveyRun>,
     /// `-maxoutboundfullrelay`.
     max_outbound_full_relay: AtomicUsize,
+    /// `-peerflagpolicy=evict`: flagged inbound peers are evicted first
+    /// ([`crate::net::flags::FlagPolicy`]). False, `observe`, by default.
+    flag_policy_evict: AtomicBool,
     /// The alt-slots (`-altslots`): their settings and fill state.
     alt_slots: altslot_conn::AltSlots,
     /// `-asmap`, for the survey's autonomous systems.
@@ -1954,6 +1969,7 @@ impl PeerManager {
             inbound_netgroups: Default::default(),
             survey: Default::default(),
             max_outbound_full_relay: AtomicUsize::new(MAX_OUTBOUND),
+            flag_policy_evict: AtomicBool::new(false),
             alt_slots: Default::default(),
             asmap: Default::default(),
             #[cfg(test)]
@@ -3919,6 +3935,22 @@ impl PeerManager {
             .store(n.clamp(1, crate::net::altslots::MAX_OUTBOUND_FULL_RELAY_CEILING), Ordering::Relaxed);
     }
 
+    /// `-peerflagpolicy`. Under `evict`, the inbound eviction
+    /// ([`Self::attempt_to_evict_connection`]) takes a flagged inbound peer
+    /// first; under `observe`, the default, it is Core's.
+    pub fn set_flag_policy(&self, policy: crate::net::flags::FlagPolicy) {
+        self.flag_policy_evict
+            .store(policy == crate::net::flags::FlagPolicy::Evict, Ordering::Relaxed);
+    }
+
+    pub fn flag_policy(&self) -> crate::net::flags::FlagPolicy {
+        if self.flag_policy_evict.load(Ordering::Relaxed) {
+            crate::net::flags::FlagPolicy::Evict
+        } else {
+            crate::net::flags::FlagPolicy::Observe
+        }
+    }
+
     /// Core's `m_max_inbound`: the connection budget past the automatic
     /// outbound slots, `max(0, max_connections - m_max_automatic_outbound)`
     /// (v32.1 `src/net.h:1131`).
@@ -3970,6 +4002,12 @@ impl PeerManager {
     /// rules themselves never pick an outbound, manual or `noban` peer.
     /// Returns false when they find no peer to evict.
     ///
+    /// Under `-peerflagpolicy=evict` an inbound candidate flagged `C`, `S`
+    /// or `F`, without the `noban` or `relay` (or `forcerelay`) permission,
+    /// is marked [`crate::net::eviction::EvictionCandidate::flagged`], which
+    /// takes it first; its disconnect reason is then `evicted-flagged`.
+    /// Under `observe` nothing is marked.
+    ///
     /// `needed` is checked under the same read of the peers as the
     /// candidates are taken from; when it is false there is room already,
     /// nothing is evicted and the result is true.
@@ -3980,6 +4018,31 @@ impl PeerManager {
         needed: &dyn Fn(&HashMap<PeerId, PeerHandle>) -> bool,
         reason: &'static str,
     ) -> bool {
+        let (victim, flags) = match self.eviction_victim(evict_tx_relay_peer_only, protect_peer, needed) {
+            EvictionVictim::NotNeeded => return true,
+            EvictionVictim::None => return false,
+            EvictionVictim::Peer(victim, flags) => (victim, flags),
+        };
+        tracing::debug!("selected inbound connection for eviction, disconnecting peer={victim}");
+        // A victim that left in the meantime freed its slot all the same.
+        if flags.is_empty() {
+            self.disconnect_peer(victim, reason);
+        } else {
+            tracing::info!("peer={victim} evicted first under -peerflagpolicy=evict, flagged {flags} ({reason})");
+            self.disconnect_peer(victim, "evicted-flagged");
+        }
+        true
+    }
+
+    /// The choice [`Self::attempt_to_evict_connection`] acts on, with the
+    /// victim's flags that `-peerflagpolicy=evict` weighed (empty when they
+    /// played no part).
+    fn eviction_victim(
+        &self,
+        evict_tx_relay_peer_only: bool,
+        protect_peer: Option<PeerId>,
+        needed: &dyn Fn(&HashMap<PeerId, PeerHandle>) -> bool,
+    ) -> EvictionVictim {
         struct Seen {
             id: PeerId,
             addr: SocketAddr,
@@ -3990,11 +4053,15 @@ impl PeerManager {
             connected: u64,
             has_all_wanted_services: bool,
             stats: Arc<PeerStats>,
+            /// The flags `-peerflagpolicy=evict` acts on; empty under
+            /// `observe` and for an exempt peer.
+            evict_flags: crate::net::flags::FlagSet,
         }
+        let evict_policy = self.flag_policy_evict.load(Ordering::Relaxed);
         let seen: Vec<Seen> = {
             let peers = self.peers.read();
             if !needed(&peers) {
-                return true;
+                return EvictionVictim::NotNeeded;
             }
             peers
                 .values()
@@ -4015,9 +4082,20 @@ impl PeerManager {
                         .map_or(0, |d| d.as_secs()),
                     has_all_wanted_services: h.info.has_all_wanted_services,
                     stats: h.stats.clone(),
+                    evict_flags: if evict_policy
+                        && h.info.conn_type == ConnType::Inbound
+                        && !h.info.permissions.noban
+                        && !h.info.permissions.relays_txes()
+                    {
+                        h.info.flags.set().eviction_flags()
+                    } else {
+                        crate::net::flags::FlagSet::default()
+                    },
                 })
                 .collect()
         };
+        let flagged: HashMap<PeerId, crate::net::flags::FlagSet> =
+            seen.iter().filter(|p| !p.evict_flags.is_empty()).map(|p| (p.id, p.evict_flags)).collect();
         let candidates: Vec<crate::net::eviction::EvictionCandidate> = {
             let reachable = self.reachable.read();
             let addrman = self.addrman.read();
@@ -4053,17 +4131,15 @@ impl PeerManager {
                         network,
                         noban: p.noban,
                         inbound: p.inbound,
+                        flagged: !p.evict_flags.is_empty(),
                     }
                 })
                 .collect()
         };
-        let Some(victim) = crate::net::eviction::select_node_to_evict(candidates) else {
-            return false;
-        };
-        tracing::debug!("selected inbound connection for eviction, disconnecting peer={victim}");
-        // A victim that left in the meantime freed its slot all the same.
-        self.disconnect_peer(victim, reason);
-        true
+        match crate::net::eviction::select_node_to_evict(candidates) {
+            Some(victim) => EvictionVictim::Peer(victim, flagged.get(&victim).copied().unwrap_or_default()),
+            None => EvictionVictim::None,
+        }
     }
 
     /// Core's `m_max_outbound_block_relay`: 2, or what `-maxconnections`
@@ -17850,6 +17926,10 @@ mod survey_tests;
 #[cfg(test)]
 #[path = "manager_altslots_tests.rs"]
 mod altslots_tests;
+
+#[cfg(test)]
+#[path = "manager_flagpolicy_tests.rs"]
+mod flagpolicy_tests;
 
 /// Reconsider orphans whose missing parent was just confirmed in `block`.
 ///
