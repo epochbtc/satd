@@ -5048,7 +5048,7 @@ impl Config {
             "v2_max_channels": if self.stratum { Some(self.stratum_v2_max_channels) } else { None },
             "v2_jd": if self.stratum { Some(self.stratum_v2_jd) } else { None },
         });
-        serde_json::json!({
+        let mut out = serde_json::json!({
             "network": self.network.to_string(),
             "datadir": self.datadir.display().to_string(),
             "prune": self.prune,
@@ -5092,13 +5092,6 @@ impl Config {
                 "listen": self.listen,
                 "port": self.port,
                 "max_connections": self.maxconnections,
-                "max_outbound_full_relay": self.maxoutboundfullrelay,
-                "alt_slots": {
-                    "slots": self.altslots,
-                    "prefer": self.altprefer,
-                    "ua_trust": self.altuatrust,
-                    "fill_wait_secs": self.altfillwait,
-                },
                 "max_inbound_per_ip": self.maxinboundperip,
                 "inbound_relay_percent": self.inboundrelaypercent,
                 "block_reconstruction_extra_txn": self.blockreconstructionextratxn,
@@ -5218,7 +5211,17 @@ impl Config {
                 "enabled": self.blockfilterindex,
                 "peer_serve": self.peerblockfilters,
             },
-        })
+        });
+        // Set apart: more keys inside the macro above pass its recursion
+        // limit.
+        out["p2p"]["max_outbound_full_relay"] = serde_json::json!(self.maxoutboundfullrelay);
+        out["p2p"]["alt_slots"] = serde_json::json!({
+            "slots": self.altslots,
+            "prefer": self.altprefer,
+            "ua_trust": self.altuatrust,
+            "fill_wait_secs": self.altfillwait,
+        });
+        out
     }
 
     /// Returns the network-specific data directory (e.g. ~/.bitcoin/regtest/).
@@ -11770,6 +11773,45 @@ blockmintxfee=0.00001
         std::fs::write(dir.path().join("bitcoin.conf"), "napmaxattestations=lots\n").unwrap();
         assert!(load(&[]).unwrap_err().contains("-napmaxattestations"));
         assert!(parse_cli(["satd", "--napmaxattestations=-1"]).is_err());
+    }
+
+    /// `-maxoutboundfullrelay` and the alt-slot options: Core's 8 and no
+    /// alt-slots by default; the limits refused as startup errors; rules
+    /// from both sources, canonicalized, the command line winning.
+    #[test]
+    fn maxoutboundfullrelay_and_altslots() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let load = |extra: &[&str]| {
+            let mut args = vec!["satd", "--regtest", "--datadir", dir.path().to_str().unwrap()];
+            args.extend_from_slice(extra);
+            Config::from_cli(parse_cli(normalize_args(args.iter().map(|a| a.to_string()).collect())).unwrap())
+        };
+        let c = load(&[]).unwrap();
+        assert_eq!((c.maxoutboundfullrelay, c.altslots, c.altfillwait), (8, 0, 600));
+        assert_eq!(c.altuatrust, "consistent");
+        assert_eq!(c.alt_slot_config().rules.len(), 1, "family:non-core");
+        assert_eq!(load(&["-maxoutboundfullrelay=16"]).unwrap().maxoutboundfullrelay, 16);
+        assert!(load(&["-maxoutboundfullrelay=17"]).unwrap_err().contains("-enable-dangerously-large-outbound-peer-limit"));
+        let c = load(&["-maxoutboundfullrelay=17", "-enable-dangerously-large-outbound-peer-limit"]).unwrap();
+        assert!(c.dangerous_outbound_limit && c.maxoutboundfullrelay == 17);
+        assert!(load(&["-maxoutboundfullrelay=65", "-enable-dangerously-large-outbound-peer-limit"]).is_err());
+        assert!(load(&["-maxoutboundfullrelay=0"]).is_err());
+        assert!(load(&["-altslots=9"]).unwrap_err().contains("-altslots"));
+        assert!(load(&["-altslots=4", "-maxconnections=3"]).unwrap_err().contains("-maxconnections"));
+        assert!(load(&["-altslots=2", "-altprefer=family:knots"]).unwrap_err().contains("unknown family"));
+        assert!(load(&["-altuatrust=sometimes"]).is_err());
+        let c = load(&["-altslots=3", "-altprefer=FAMILY:btcd@1", "-altprefer=svc:COMPACT_FILTERS", "-altuatrust=strict", "-altfillwait=30"])
+            .unwrap();
+        assert_eq!(c.altprefer, vec!["family:btcd@1".to_string(), "svc:compact_filters".to_string()]);
+        let alt = c.alt_slot_config();
+        assert_eq!((alt.slots, alt.rules.len(), alt.ua_trust), (3, 2, node::net::altslots::UaTrust::Strict));
+        assert_eq!(alt.fill_wait, std::time::Duration::from_secs(30));
+        std::fs::write(dir.path().join("bitcoin.conf"), "altslots=2\naltprefer=family:floresta\naltprefer=family:btcd\n").unwrap();
+        let c = load(&[]).unwrap();
+        assert_eq!((c.altslots, c.altprefer.len()), (2, 2), "from the file, repeatable");
+        assert_eq!(load(&["-altprefer=family:bcoin"]).unwrap().altprefer, vec!["family:bcoin".to_string()]);
+        std::fs::write(dir.path().join("bitcoin.conf"), "altslots=lots\n").unwrap();
+        assert!(load(&[]).is_err());
     }
 
     /// `-napstorerecover`: off by default, on from the command line in either
