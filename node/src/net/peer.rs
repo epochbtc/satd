@@ -375,6 +375,10 @@ pub struct PeerInfo {
     /// The last fingerprint and behaviour flags judged from `behavior`; see
     /// [`crate::net::flags`].
     pub flags: crate::net::flags::PeerFlags,
+    /// What this outbound full-relay peer is to the alt-slots
+    /// (`-altslots`); `None` for an ordinary one. Its connection type stays
+    /// `outbound-full-relay` either way.
+    pub alt: Option<crate::net::altslots::AltRole>,
 }
 
 /// Render a per-message-type byte tally as `getpeerinfo` reports it.
@@ -438,6 +442,7 @@ impl PeerInfo {
             has_all_wanted_services: false,
             behavior: Default::default(),
             flags: Default::default(),
+            alt: None,
         }
     }
 
