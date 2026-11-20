@@ -256,6 +256,11 @@ pub struct PeerInfo {
     /// Core's `hashLastUnknownBlock`, promoted to
     /// [`Self::best_known_block`] once the header is indexed.
     pub last_unknown_block: Option<bitcoin::BlockHash>,
+    /// The height a low-work headers sync with this peer has reached in its
+    /// PRESYNC phase, or -1 when none is in progress: Core's
+    /// `CNodeStateStats::presync_height`, `getpeerinfo`'s
+    /// `presynced_headers`.
+    pub presync_height: i64,
     /// The nonce of the `version` we sent on this outbound connection, so an
     /// inbound `version` carrying it can be recognised as ourselves.
     pub local_nonce: Option<u64>,
@@ -385,6 +390,7 @@ impl PeerInfo {
             best_known_height: None,
             best_known_block: None,
             last_unknown_block: None,
+            presync_height: -1,
             local_nonce: None,
             user_agent: String::new(),
             ban_score: 0,
@@ -606,7 +612,7 @@ impl PeerInfo {
             "network": network,
             "transport_protocol_type": self.transport.as_str(),
             "startingheight": self.best_height,
-            "presynced_headers": -1,
+            "presynced_headers": self.presync_height,
             "synced_headers": -1,
             "synced_blocks": -1,
             // Core's `NetPermissions::ToStrings` of the flags actually

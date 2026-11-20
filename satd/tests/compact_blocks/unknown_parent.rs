@@ -31,10 +31,9 @@ fn an_unrequested_block_on_an_unknown_parent_is_dropped_and_headers_are_asked_fo
     let parent = build_block(&tip, height(&node) + 1, vec![], true, 81);
     let child = build_block(&parent, height(&node) + 2, vec![], true, 82);
 
-    // The node also sends every peer a `getheaders` every ten seconds. Start
-    // right after one, so the next one cannot land in the window below.
+    // No `getheaders` goes out on a timer (#1122), so the opening one is the
+    // only one before the block under test.
     peer.recv_until(is_getheaders, test_timeout(30)).expect("the opening getheaders");
-    peer.recv_until(is_getheaders, test_timeout(30)).expect("a periodic getheaders");
     // Answer it, as a peer with nothing new does. An unanswered getheaders
     // is outstanding for two minutes, and holds back the one under test
     // (Core's `MaybeSendGetHeaders`, #1262).

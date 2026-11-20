@@ -69,30 +69,13 @@ impl Peer {
             deserialize(&buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
         Ok(raw.into_payload())
     }
-
-    /// Whether the node announces `block`, by `inv`, `headers` or
-    /// `cmpctblock`, within `timeout`.
-    fn hears_of(&mut self, block: BlockHash, timeout: Duration) -> bool {
-        let deadline = Instant::now() + timeout;
-        loop {
-            let left = deadline.saturating_duration_since(Instant::now());
-            if left.is_zero() {
-                return false;
-            }
-            match self.recv(left) {
-                Ok(NetworkMessage::Ping(n)) => self.send(NetworkMessage::Pong(n)),
-                Ok(NetworkMessage::Inv(inv)) if inv.contains(&Inventory::Block(block)) => return true,
-                Ok(NetworkMessage::Headers(h)) if h.iter().any(|h| h.block_hash() == block) => return true,
-                Ok(NetworkMessage::CmpctBlock(c)) if c.compact_block.header.block_hash() == block => return true,
-                Ok(_) => {}
-                Err(_) => return false,
-            }
-        }
-    }
 }
 
+/// The raw peer serves no blocks (no `NODE_NETWORK`): it only listens. A
+/// peer that serves blocks and has none would hold the one header-sync slot
+/// against A until Core's header-download timeout (#1122).
 fn version() -> VersionMessage {
-    let services = ServiceFlags::NETWORK | ServiceFlags::WITNESS;
+    let services = ServiceFlags::WITNESS;
     let zero: SocketAddr = "0.0.0.0:0".parse().unwrap();
     VersionMessage {
         version: 70016,
@@ -125,13 +108,35 @@ fn a_catch_up_announces_the_tip_it_reaches() {
     let port_b = find_available_port();
     let node_b = TestNode::start(&[&format!("--port={port_b}")]);
     let mut peer = Peer::connect(port_b);
+    // A reader thread answers pings and listens for the announcement while
+    // B catches up.
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let reader = {
+        let stop = stop.clone();
+        std::thread::spawn(move || {
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                match peer.recv(Duration::from_millis(200)) {
+                    Ok(NetworkMessage::Ping(n)) => peer.send(NetworkMessage::Pong(n)),
+                    Ok(NetworkMessage::Inv(inv)) if inv.contains(&Inventory::Block(tip)) => return true,
+                    Ok(NetworkMessage::Headers(h)) if h.iter().any(|h| h.block_hash() == tip) => return true,
+                    Ok(NetworkMessage::CmpctBlock(c)) if c.compact_block.header.block_hash() == tip => return true,
+                    Ok(_) => {}
+                    Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {}
+                    Err(_) => return false,
+                }
+            }
+            false
+        })
+    };
 
     // 200 blocks behind: B catches up by the parallel download.
     node_b.rpc_ok("addnode", vec![json!(format!("127.0.0.1:{port_a}")), json!("onetry")]);
     poll_until(|| best_hash(&node_b) == tip, test_timeout(180), "B did not catch up to A");
 
-    assert!(
-        peer.hears_of(tip, test_timeout(30)),
-        "B never announced the tip its catch-up reached"
-    );
+    let deadline = Instant::now() + test_timeout(30);
+    while !reader.is_finished() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    assert!(reader.join().unwrap(), "B never announced the tip its catch-up reached");
 }

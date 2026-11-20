@@ -488,6 +488,65 @@ pub fn check_future_timestamp(header: &Header, now: u64) -> Result<(), Validatio
     Ok(())
 }
 
+/// Core's `fPowAllowMinDifficultyBlocks`: testnet3, testnet4 and regtest,
+/// where a block may fall back to the minimum difficulty.
+pub fn allows_min_difficulty_blocks(network: Network) -> bool {
+    matches!(network, Network::Testnet | Network::Testnet4 | Network::Regtest)
+}
+
+/// Core's `consensus.powLimit` as a full 256-bit value, big-endian. On
+/// mainnet it is `00000000ffff…ff`, which the compact form `0x1d00ffff`
+/// rounds down; everywhere else the compact form is exact.
+fn pow_limit_target(network: Network) -> [u8; 32] {
+    match network {
+        Network::Bitcoin => {
+            let mut limit = [0xffu8; 32];
+            limit[..4].fill(0);
+            limit
+        }
+        _ => target_from_compact(CompactTarget::from_consensus(pow_limit_bits(network))),
+    }
+}
+
+/// Core's `PermittedDifficultyTransition` (v32.1 `pow.cpp`): whether a
+/// header at `height` may carry `new_bits` after a parent with `old_bits`,
+/// judged without the parent's ancestors. Off a retarget boundary the bits
+/// may not change; on one the target may move by at most the factor of four
+/// the retarget clamp allows. Networks that allow minimum-difficulty blocks
+/// skip the check. Headers presync runs it on headers it does not store
+/// ([`crate::net::headerssync`]), so a chain cannot pack its work into a few
+/// blocks of very high difficulty.
+pub fn permitted_difficulty_transition(network: Network, height: u32, old_bits: u32, new_bits: u32) -> bool {
+    use crate::storage::blockindex::{div_u256_u32, mul_u256_u32};
+    if allows_min_difficulty_blocks(network) {
+        return true;
+    }
+    if height.is_multiple_of(difficulty_adjustment_interval(network)) {
+        let pow_limit = pow_limit_target(network);
+        let observed = target_from_compact(CompactTarget::from_consensus(new_bits));
+        let old = target_from_compact(CompactTarget::from_consensus(old_bits));
+        // The target the bits round to after scaling by `timespan`, capped
+        // at the limit: Core's `SetCompact(target.GetCompact())`.
+        let bound = |timespan: u32| {
+            let mut scaled = div_u256_u32(&mul_u256_u32(&old, timespan), TARGET_TIMESPAN);
+            if scaled > pow_limit {
+                scaled = pow_limit;
+            }
+            target_from_compact(CompactTarget::from_consensus(compact_from_target(&scaled)))
+        };
+        // Both big-endian, so byte order is numeric order.
+        if bound(TARGET_TIMESPAN * 4) < observed {
+            return false;
+        }
+        if bound(TARGET_TIMESPAN / 4) > observed {
+            return false;
+        }
+    } else if old_bits != new_bits {
+        return false;
+    }
+    true
+}
+
 #[cfg(test)]
 #[path = "pow_hdrsync_tests.rs"]
 mod hdrsync_tests;

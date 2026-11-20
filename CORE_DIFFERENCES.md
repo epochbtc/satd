@@ -625,9 +625,17 @@ preserved; the satd extension is opt-in per request or per flag.
   - `decodepsbt` on a version 2 PSBT returns a different shape, with
     `psbt_version`, `tx_version`, `fallback_locktime`, per-input
     `previous_txid` / `previous_vout` / `sequence`, per-output `amount`
-    and `script`, a `silent_payments` object, and an `unknown` object
-    per map. Field names follow Core v32's where it has one. `tx` and `tx_hex` appear only once every output has a
-    script: a silent payment output whose script has not been computed
+    and `script`, and a `silent_payments` object. Every field Core
+    v32.1 writes is there, in Core's shape (for both versions; `unknown`
+    is Core's, BIP 375's pairs among it). Beyond Core's, satd always
+    writes `inputs_modifiable`, `outputs_modifiable`,
+    `has_sighash_single` and `fallback_locktime` (`null` when unset),
+    and adds `locktime`, `unique_id`, `required_time_locktime` /
+    `required_height_locktime` where Core writes `time_locktime` /
+    `height_locktime`, and the silent payment fields. In both versions
+    `tx_hex` and each input's `has_utxo` and `is_final` are satd's own.
+    In version 2, `tx` (which Core does not write) and `tx_hex` appear
+    only once every output has a script: a silent payment output whose script has not been computed
     yet describes no transaction, and emitting an empty script instead
     would read as an output paying nobody.
   - `combinepsbt` **refuses** two PSBTs that give different values for
@@ -996,6 +1004,21 @@ silently returning an empty or wrong answer.
   at zero; these two fields do not, so for such a transaction the chunk
   they report can be larger than the one the order lists.
 
+- **`getmempoolcluster` and `getmempoolfeeratediagram`** — from that
+  same fresh linearization, with signed fees as the chunk fields have, so
+  a chunk a negative `prioritisetransaction` delta takes below zero is
+  reported negative, as Core reports it, and the diagram's cumulative fee
+  can fall. On a tangled cluster the chunks, and so the diagram's points,
+  can differ from Core's; on chains and other simple clusters they agree.
+
+- **`bip125-replaceable`** (`getmempoolentry`, `getrawmempool true`,
+  `getmempoolancestors` / `getmempooldescendants` verbose) — always present.
+  Core v32.1 writes it only under `-deprecatedrpc=bip125`
+  (`src/rpc/mempool.cpp`, `entryToJSON`), since full RBF makes every
+  transaction replaceable. satd keeps it so clients that read it don't break;
+  it reports BIP 125 signalling (the transaction or an unconfirmed ancestor)
+  as before.
+
 - **`getindexinfo` / `getsatdindexinfo`: `txindex.synced`** — reports whether
   `-txindex` is on, not whether the index covers the whole chain. satd writes
   txindex entries inline during `connect_block`, so with the flag set the index
@@ -1093,7 +1116,8 @@ default behavior set the corresponding flag.
 | `--peerblockfilters` | off | off | Matches Core; opt in to advertise `NODE_COMPACT_FILTERS`. |
 | `--mempoolfullrbf` | on (Core v28+) | on | Matches Core post-v28. |
 | Outbound full-relay target during initial block download | 8, whatever the sync state (`MAX_OUTBOUND_FULL_RELAY_CONNECTIONS`) | 64 while the tip is more than 24 blocks behind the best header (or no header is known yet, on a node still at genesis), 8 otherwise | More peers to download blocks from in parallel. Once the node leaves IBD it disconnects the surplus one peer per 10-second reconnect pass, in the order of Core's `EvictExtraOutboundPeers` (least recent block announcement first; manual, block-relay-only and chain-sync-protected peers and the only peer on a network are kept). Automatic outbound peers keep Core's one-per-network-group rule throughout; on regtest, addresses that are not publicly routable, which Core's address book never holds, are outside that rule. While the target is 64 the node opens no extra peer to reach a network it has none on, which Core does every 5 minutes on average at its target of 8, nor its 2 block-relay-only peers, which Core opens once its 8 full-relay peers are up. |
-| Block checkpoints (`-checkpoints`) | removed in v30, which keeps the option only to warn that it has no effect; headers presync guards against low-work header floods instead | on: mainnet and the default signet carry built-in checkpoints, a block at a checkpoint height must match it, and a new header forking below the highest checkpoint in the block index is refused as `bad-fork-prior-to-checkpoint` and its sender banned, as in Core up to v29. `-checkpoints=0` turns both off | satd has no headers presync yet, so the v29 rule is what stops a peer filling the block index with early-chain headers that cost almost nothing to mine. It does not cover testnet4, regtest or a custom signet, which have no checkpoints. |
+| Block checkpoints (`-checkpoints`) | removed in v30, which keeps the option only to warn that it has no effect; headers presync guards against low-work header floods instead | on: mainnet and the default signet carry built-in checkpoints, a block at a checkpoint height must match it, and a new header forking below the highest checkpoint in the block index is refused as `bad-fork-prior-to-checkpoint` and its sender banned, as in Core up to v29. `-checkpoints=0` turns both off | satd keeps Core v29's rule alongside headers presync, which it now runs as Core does (#1132). |
+| Clock more than two hours behind the block a headers presync would start from | logs `Failure when attempting to initiate headers sync: System clock is more than 120 minutes behind chain start MTP` and aborts the process (`TryLowWorkHeadersSync`) | logs the same error and shuts down cleanly | The node stops either way until its clock is fixed; a clean shutdown flushes the datadir first. |
 | Invalid header in a `cmpctblock` | penalised for most classes of header invalidity (`MaybePunishNodeForBlock` with `via_compact_block`) | ignored, never penalised | A compact block is pushed, not requested, and a header that fails validation leaves no state behind; the block is simply not reconstructed. A `headers` message is still penalised as in Core. |
 | `cmpctblock` prefill (`-cmpctblockprefill`) | not available (proposed in #35558) | off; opt in | An extension Core does not ship yet. With it on, a block is announced with the transactions this node lacked when it arrived prefilled, up to `-cmpctblockprefillbytes` (default 8192); receivers need nothing new, since BIP 152 already requires accepting any well-formed prefill. Off, satd prefills the coinbase only, as Core does. |
 | `sendheaders` to an outbound peer | once the peer has shown a block past the minimum chain work (`MaybeSendSendHeaders`) | in the handshake | satd answers a block `inv` with a `getdata` for the block before it has the header, where Core sends `getheaders`, so a peer that mines while satd syncs from it would hand it blocks out of order until header announcements start. Inbound peers are sent it on Core's condition, and every peer at most once. |

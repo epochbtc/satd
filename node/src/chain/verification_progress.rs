@@ -1,7 +1,7 @@
 //! `verificationprogress`, computed the way Bitcoin Core computes it.
 //!
 //! Core's `ChainstateManager::GuessVerificationProgress` (`validation.cpp`,
-//! v31.1) estimates the share of all transactions ever confirmed that the
+//! v32.1) estimates the share of all transactions ever confirmed that the
 //! chain up to a block contains. Each network carries a `ChainTxData`
 //! snapshot, a cumulative transaction count at a known time plus the rate
 //! transactions have arrived at since. The count at the block comes from the
@@ -30,39 +30,40 @@ const POW_TARGET_SPACING: i64 = 10 * 60;
 /// The window inside which a block is positioned by height, not timestamp.
 const RECENT_WINDOW_SECS: i64 = 2 * 60 * 60;
 
-/// Each network's `ChainTxData`, copied from Bitcoin Core v31.1
-/// `src/kernel/chainparams.cpp`. A custom signet (`-signetchallenge`) has no
+/// Each network's `ChainTxData`, copied from Bitcoin Core v32.1
+/// `src/kernel/chainparams.cpp` (`git show v32.1:src/kernel/chainparams.cpp`).
+/// Regtest's is unchanged since v31.1. A custom signet (`-signetchallenge`) has no
 /// data, as in Core, and so does not estimate from a snapshot.
 pub fn chain_tx_data(network: Network, custom_signet: bool) -> ChainTxData {
     match network {
-        // getchaintxstats 4096 00000000000000000000ccebd6d74d9194d8dcdc1d177c478e094bfad51ba5ac
+        // getchaintxstats 4096 00000000000000000000748969ec33043c0e52a763c6dd5193861f559f2c72e3
         Network::Bitcoin => ChainTxData {
-            time: 1772055173,
-            tx_count: 1315805869,
-            tx_rate: 5.40111006496122,
+            time: 1788925573,
+            tx_count: 1434982600,
+            tx_rate: 7.851784479579372,
         },
-        // getchaintxstats 4096 000000007a61e4230b28ac5cb6b5e5a0130de37ac1faf2f8987d2fa6505b67f4
+        // getchaintxstats 4096 00000000b318a3703d14a844c55ef507f4c2fc8f8766e24271fd43c180c51637
         Network::Testnet => ChainTxData {
-            time: 1772051651,
-            tx_count: 536108416,
-            tx_rate: 0.02691479016257117,
+            time: 1788932318,
+            tx_count: 536748780,
+            tx_rate: 0.02306697351149596,
         },
-        // getchaintxstats 4096 0000000002368b1e4ee27e2e85676ae6f9f9e69579b29093e9a82c170bf7cf8a
+        // getchaintxstats 4096 0000000021df65b91665a342e26ceb05e54826ad7d8fcd40316230058fa3b865
         Network::Testnet4 => ChainTxData {
-            time: 1772013387,
-            tx_count: 14191421,
-            tx_rate: 0.01848579579528412,
+            time: 1788932739,
+            tx_count: 14825119,
+            tx_rate: 0.1148250171344748,
         },
         Network::Signet if custom_signet => ChainTxData {
             time: 0,
             tx_count: 0,
             tx_rate: 0.0,
         },
-        // getchaintxstats 4096 00000008414aab61092ef93f1aacc54cf9e9f16af29ddad493b908a01ff5c329
+        // getchaintxstats 4096 00000002a5e0ba0498f1e9f4591af0b66b63c654665efe65206fd0ae7bbaf923
         Network::Signet => ChainTxData {
-            time: 1772055248,
-            tx_count: 28676833,
-            tx_rate: 0.06736623436338929,
+            time: 1788925860,
+            tx_count: 32273793,
+            tx_rate: 0.3977566114505673,
         },
         // Core: "Set a non-zero rate to make it testable".
         _ => ChainTxData {
@@ -160,7 +161,7 @@ mod tests {
         let data = chain_tx_data(Network::Bitcoin, false);
         let now = 1789000000;
         let p = guess_verification_progress(data, at(0, 1231006505, 1), 0, now);
-        let projected = 1315805869.0 + (now - 1772055173) as f64 * 5.40111006496122;
+        let projected = 1434982600.0 + (now - 1788925573) as f64 * 7.851784479579372;
         assert_eq!(p, 1.0 / projected);
     }
 
@@ -174,6 +175,38 @@ mod tests {
         assert!(guess_verification_progress(data, tip, 200, 1_700_000_000 + 7201) < 1.0);
         // A header above the tip moves it back by one spacing.
         assert!(guess_verification_progress(data, tip, 201, 1_700_000_000) < 1.0);
+    }
+
+    /// Every network's data, pinned to Bitcoin Core v32.1
+    /// (`src/kernel/chainparams.cpp` at tag `v32.1`, each `chainTxData`).
+    #[test]
+    fn chain_tx_data_is_core_v32_1() {
+        let pinned = [
+            (Network::Bitcoin, 1788925573, 1434982600, 7.851784479579372),
+            (Network::Testnet, 1788932318, 536748780, 0.02306697351149596),
+            (Network::Testnet4, 1788932739, 14825119, 0.1148250171344748),
+            (Network::Signet, 1788925860, 32273793, 0.3977566114505673),
+            (Network::Regtest, 0, 0, 0.001),
+        ];
+        for (network, time, tx_count, tx_rate) in pinned {
+            assert_eq!(
+                chain_tx_data(network, false),
+                ChainTxData {
+                    time,
+                    tx_count,
+                    tx_rate,
+                },
+                "{network:?}"
+            );
+        }
+        assert_eq!(
+            chain_tx_data(Network::Signet, true),
+            ChainTxData {
+                time: 0,
+                tx_count: 0,
+                tx_rate: 0.0,
+            }
+        );
     }
 
     #[test]

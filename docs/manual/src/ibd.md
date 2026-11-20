@@ -41,6 +41,54 @@ pipeline that keeps the network, the disk, and the CPU busy at the same time.
 Network I/O, block pre-processing, script verification, and chainstate writes
 overlap instead of running one after another.
 
+### Header sync
+
+While the best header is more than a day old, headers come from one peer,
+preferably an outbound one, as in Bitcoin Core. That peer has 15 minutes, plus
+1 ms for each header still expected, to bring the best header within a day of
+now. If it doesn't, and another outbound or `noban` peer could take over, it
+is disconnected (a `noban` peer only loses the sync), and another peer takes
+the sync over. No `getheaders` goes out on a timer. Header sync continues
+from each `headers` reply, and after IBD new headers come from block
+announcements.
+
+Two of Core's checks keep the node's view of the chain honest:
+
+- An outbound full-relay or block-relay-only peer whose best block has less
+  work than our tip for 20 minutes is sent one `getheaders`. If it has not
+  shown that much work 2 minutes later, it is disconnected. Up to four
+  full-relay peers that have shown our tip's work are exempt.
+- When the tip has not moved for 30 minutes and no block is being
+  downloaded, the node opens one extra full-relay outbound peer, checked
+  every 10 minutes. Once that peer has connected, the full-relay peer that
+  least recently announced a block is disconnected, as for any surplus
+  outbound peer. Not under `-connect`.
+
+### Header presync
+
+As in Bitcoin Core, a header chain is stored only once it has shown enough
+work: the larger of the network's minimum chain work (`-minimumchainwork`
+overrides it) and the tip's work less 144 blocks' worth. A `headers` message
+below that is ignored if it is not full. A full one starts a *presync* with
+the peer: the headers are checked and their work summed, and only a salted
+one-bit commitment every few hundred headers is kept. Once the chain reaches
+the threshold, the node downloads the same headers again, checks them
+against the commitments, and stores them. A fresh node therefore downloads
+the header chain twice. `getpeerinfo` reports a presync's height as
+`presynced_headers`, and the log shows `Pre-synchronizing blockheaders,
+height: N (~P%)` during IBD. Headers from a `noban` peer skip the check.
+
+The same threshold applies to blocks. A block or `cmpctblock` whose header
+claims less work is ignored, header included. A block the node did not ask
+for is stored only if its chain has at least the tip's work, it is no more
+than 288 blocks above the tip, and its chain has the minimum chain work;
+otherwise only its header is indexed. Both rules are Core's.
+
+If the clock is more than two hours behind the block a presync would start
+from, the node logs `Failure when attempting to initiate headers sync:
+System clock is more than 120 minutes behind chain start MTP` and shuts down
+cleanly. Core aborts at this point.
+
 ## AssumeUTXO fast sync
 
 AssumeUTXO makes a node usable in minutes instead of days. The node loads a
@@ -91,8 +139,8 @@ does not skip validation.
 
 satd hosts none, and does not name one for you. The anchors compiled into
 the binary decide which snapshots are loadable at all — currently mainnet
-heights 840,000, 880,000, 910,000 and 935,000, copied verbatim from Bitcoin
-Core's `m_assumeutxo_data`. Signet, testnet and regtest have no anchors, so
+heights 840,000, 880,000, 910,000, 935,000 and 965,000, copied verbatim from
+Bitcoin Core v32.1's `m_assumeutxo_data`. Signet, testnet and regtest have no anchors, so
 fast-start is mainnet-only.
 
 Several people publish the `utxo-<height>.dat` files Core's `dumptxoutset`

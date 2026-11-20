@@ -39,6 +39,9 @@ It includes every fix shipped in 0.7.1:
 - P2P: during initial sync, blocks are downloaded no more than `-maxahead` above the tip, so a pruned node prunes during IBD instead of filling its disk (#1154).
 - P2P: during initial sync, a block that arrives while another is being connected no longer stops all peer message handling until the connect finishes (#875).
 - P2P: a `headers` message is accepted on a thread of its own, so a batch waiting for a block connect no longer stops peer handling (#1187).
+- P2P: header sync stores a header chain only once it has shown enough work, through Core's headers presync; `getpeerinfo` reports `presynced_headers` (#1132).
+- P2P: a block or `cmpctblock` whose header claims too little chain work is ignored, and an unrequested block is stored only when it could soon become the tip, as in Core (#1247).
+- P2P: header sync follows Core: one sync peer with Core's header-download timeout and no `getheaders` on a timer; outbound peers that stay behind our tip are disconnected (`CHAIN_SYNC_TIMEOUT`); a stale tip opens one extra outbound peer (#1122).
 - P2P: a `getheaders` with an empty locator gets only the header it names, and only if Core's `BlockRequestAllowed` admits it (#1298).
 - P2P: a new block is not announced to a peer whose chain already has it, as in Core (#1299).
 - P2P: with inbound full, a new inbound peer evicts one by Core's eviction rules instead of being refused; inbound slots are `-maxconnections` less 11, not 8 (#1293).
@@ -74,6 +77,7 @@ It includes every fix shipped in 0.7.1:
 - Release tooling: `contrib/release/sign-tarballs.sh` keeps a per-tag working directory across failed runs and reuses only the files whose hashes still match the release (#903).
 - Consensus: `-reindex` applies header sync's rules (difficulty, median time past, version, checkpoints) to every stored block and skips a failing block and its descendants (#506).
 - Operator: AssumeUTXO background validation retries a failed connect, its alerts reach every alert surface, and new `satd_assumeutxo_*` gauges show progress (#557).
+- AssumeUTXO: Bitcoin Core v32.1's mainnet snapshot at height 965,000 loads with `loadtxoutset` and `--fast-start` (#1313).
 - Streaming: a `satd-head-cursor` header lets the Go and Rust resilient watches resume after a drop before their first confirmed event (#777).
 - Packaging: Nix builds and x86_64 Linux tarballs no longer depend on the build CPU (jemalloc constants pinned), and `flake.lock` is committed (#321).
 - RPC: `estimatesmartfee` takes Core 32.1's shape (`options`, `estimator`, answered `blocks`, no-data `errors`), and every fee surface floors at the rolling mempool minimum (#1200).
@@ -111,11 +115,15 @@ It includes every fix shipped in 0.7.1:
 - RPC: integer and verbosity arguments are parsed and range-checked as in Core; out-of-type values are `-1 JSON integer out of range` (#1267).
 - CLI: `sat-cli` converts arguments by Core's per-method table, as `bitcoin-cli` does; adds `-stdinrpcpass`, and `-stdin` keeps empty lines (#1268).
 - IBD: the default `-assumevalid` and the minimum chain work of every network are Bitcoin Core v32.1's; mainnet's default block moves from height 840,000 to 966,143 and signet's from 218,000 to 321,295 (#1217).
+- IBD: `verificationprogress` estimates from Bitcoin Core v32.1's `ChainTxData` on mainnet, testnet3, testnet4 and signet (#1312).
 - RPC: `getblockstats`' `total_out` leaves out the coinbase, `utxo_size_inc` sums the real output and prevout sizes, and `utxo_increase_actual` and `utxo_size_inc_actual` are reported, as in Core (#1208).
 - Operator: a custom signet frames its `blk*.dat` records and `dumptxoutset` snapshots with its own message start, as Core does, not the default signet's; a pre-0.8.0 custom-signet blocks directory mixes both and needs a fresh sync before Core can read it (#1283).
 - RPC: `getchaintxstats` defaults to one month of blocks (4320) and accepts `nblocks=0`, as in Core (#1297).
+- RPC: `getmempoolcluster` and the hidden `getmempoolfeeratediagram`, Core v31's cluster-mempool RPCs, with Core's signed fees (#1327).
 - RPC: `decodepsbt`'s `tx` is the transaction as `decoderawtransaction` decodes it, and its script objects carry Core's `asm`, `hex`, `type` and, for a scriptPubKey, `desc` and `address` (#1296).
+- RPC: `decodepsbt` writes every field Core v32.1 does, in Core's shape: `partial_signatures` is an object, `sighash` a name, `fee` is absent rather than `null` when unknown, and version 0 gains `psbt_version`, `global_xpubs`, `proprietary`, `unknown` and the per-input and per-output derivation, taproot, MuSig2 and preimage fields (#1311).
 - RPC: `getmempoolentry`, `getrawmempool true` and `getmempoolancestors`/`getmempooldescendants true` report Core v31's `chunkweight` and `fees.chunk` (#1068).
+- RPC: mempool entries, `testmempoolaccept` and `submitpackage` report Core v32.1's `vsize_bip141` and `vsize_adjusted`; `getorphantxs` adds `vsize_bip141` and `getrawtransaction` a mempool transaction's `vsize_adjusted` (#1326).
 - RPC: `getnetworkinfo` reports `version` 320000 (Bitcoin Core v32), up from 280000, so clients with a Core v29 or v31 floor (Bark, Eclair) start (#1068).
 - P2P: `-maxconnections` above 2000 is lowered to 2000 with a warning, as in Core v32.1 (#1295).
 - P2P: a peer is no longer penalised for a transaction it relays, as in Core v30 and later; satd charged 10 points for a script failure or an overspend and 1 for an oversized orphan, so ten such transactions disconnected or banned the peer.
