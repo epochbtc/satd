@@ -302,7 +302,7 @@ pub fn get_block_template(chain_state: &ChainState, mempool: &Mempool) -> Result
             json!({
                 "data": hex::encode(&raw),
                 "txid": txid.to_string(),
-                "hash": ttx.tx.compute_wtxid().to_string(),
+                "hash": crate::validation::decode::wtxid(&ttx.tx).to_string(),
                 "depends": depends,
                 "fee": ttx.fee,
                 // Core reports each transaction's sigop cost so a client that

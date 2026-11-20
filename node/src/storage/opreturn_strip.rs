@@ -440,7 +440,7 @@ impl StripRecord {
             .into_iter()
             .map(|(i, vouts)| {
                 let tx = &block.txdata[i];
-                let wtxid = tx.compute_wtxid();
+                let wtxid = crate::validation::decode::wtxid(tx);
                 let txid = tx.compute_txid();
                 StrippedTx {
                     tx_index: i as u32,
@@ -795,7 +795,7 @@ impl StoredBlock {
     pub fn wtxid(&self, i: usize) -> Wtxid {
         match self.stripped_tx(i) {
             Some(t) => t.wtxid.unwrap_or_else(|| Wtxid::from_raw_hash(t.txid.to_raw_hash())),
-            None => self.block.txdata[i].compute_wtxid(),
+            None => crate::validation::decode::wtxid(&self.block.txdata[i]),
         }
     }
 

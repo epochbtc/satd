@@ -491,7 +491,7 @@ fn cmpctblock_that_fails_merkle_check_is_refetched_in_full_without_ban() {
     // Simulate a collision: announce T' under T's short ID, so the node fills
     // the slot with T and the merkle root no longer matches.
     let keys = ShortId::calculate_siphash_keys(&compact.header, compact.nonce);
-    compact.short_ids[0] = ShortId::with_siphash_keys(&t.compute_wtxid().to_raw_hash(), keys);
+    compact.short_ids[0] = ShortId::with_siphash_keys(&node::validation::decode::wtxid(&t).to_raw_hash(), keys);
     peer.send(cmpct(compact));
 
     let got = peer.recv_until(is_getdata_for(hash), Duration::from_secs(15));
@@ -1512,7 +1512,7 @@ fn a_fetched_cmpctblock_that_fails_reconstruction_falls_back_to_the_full_block()
 
     let mut compact = HeaderAndShortIds::from_block(&b, 0x4321, 2, &[]).unwrap();
     let keys = ShortId::calculate_siphash_keys(&compact.header, compact.nonce);
-    compact.short_ids[0] = ShortId::with_siphash_keys(&t.compute_wtxid().to_raw_hash(), keys);
+    compact.short_ids[0] = ShortId::with_siphash_keys(&node::validation::decode::wtxid(&t).to_raw_hash(), keys);
     peer.send(cmpct(compact));
 
     let fallback = collect_until(&mut peer, is_getdata_for(hash), test_timeout(20), "a full getdata");

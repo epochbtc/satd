@@ -779,7 +779,7 @@ pub fn transaction_get(state: &ElectrumState, params: Value, pin: &Pin) -> Resul
         {
             let tx = entry.tx;
             (
-                StoredTx { txid, wtxid: tx.compute_wtxid(), stripped: None, tx },
+                StoredTx { txid, wtxid: node::validation::decode::wtxid(&tx), stripped: None, tx },
                 None,
             )
         } else if let Some(stored) = state.electrum_extras.stored_tx(&txid) {

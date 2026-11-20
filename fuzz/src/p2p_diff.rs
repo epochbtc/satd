@@ -469,7 +469,9 @@ pub fn satd_observed(msg: &NetworkMessage) -> Observed {
         NetworkMessage::AddrV2(a) => o.count = Some(a.len()),
         NetworkMessage::Inv(i) | NetworkMessage::GetData(i) => o.count = Some(i.len()),
         NetworkMessage::Headers(h) => o.count = Some(h.len()),
-        NetworkMessage::Tx(tx) => o.tx = Some((tx.compute_txid().to_string(), tx.compute_wtxid().to_string())),
+        NetworkMessage::Tx(tx) => {
+            o.tx = Some((tx.compute_txid().to_string(), node::validation::decode::wtxid(tx).to_string()))
+        }
         NetworkMessage::Block(b) => o.block = Some(b.block_hash().to_string()),
         _ => {}
     }
@@ -1424,6 +1426,15 @@ pub fn seed_payloads() -> Vec<(&'static str, &'static str, Vec<u8>)> {
     headers.push(0);
     seeds.push(("headers", "headers-one", headers));
     seeds.push(("headers", "headers-none", compact_size(0)));
+    // Core reads each header's tx count as a CompactSize and ignores it.
+    let mut headers = compact_size(1);
+    headers.extend(enc(&genesis.header));
+    headers.push(1);
+    seeds.push(("headers", "headers-tx-count-one", headers));
+    let mut headers = compact_size(1);
+    headers.extend(enc(&genesis.header));
+    headers.extend(compact_size(256));
+    seeds.push(("headers", "headers-tx-count-3-byte", headers));
 
     // cmpctblock: header, nonce, one short id, the coinbase prefilled.
     let mut cmpct = enc(&genesis.header);
@@ -1446,6 +1457,13 @@ pub fn seed_payloads() -> Vec<(&'static str, &'static str, Vec<u8>)> {
     getblocktxn.extend(compact_size(0));
     getblocktxn.extend(compact_size(1));
     seeds.push(("getblocktxn", "getblocktxn-two", getblocktxn));
+    // Core's indexes are 16-bit: 65535 is read, 65536 is refused.
+    for (name, diff) in [("getblocktxn-index-65535", 65535), ("getblocktxn-index-65536", 65536)] {
+        let mut getblocktxn = enc(&gh);
+        getblocktxn.extend(compact_size(1));
+        getblocktxn.extend(compact_size(diff));
+        seeds.push(("getblocktxn", name, getblocktxn));
+    }
 
     seeds.push(("feefilter", "feefilter-1000", 1000i64.to_le_bytes().to_vec()));
     seeds.push(("feefilter", "feefilter-negative", (-1i64).to_le_bytes().to_vec()));
@@ -1458,6 +1476,8 @@ pub fn seed_payloads() -> Vec<(&'static str, &'static str, Vec<u8>)> {
 
     seeds.push(("tx", "tx-witness", enc(&sample_tx(true))));
     seeds.push(("tx", "tx-legacy", enc(&sample_tx(false))));
+    // No inputs: Core's wtxid is the txid.
+    seeds.push(("tx", "tx-no-inputs", vec![2, 0, 0, 0, 0, 0, 0, 0, 0, 0]));
     seeds.push(("block", "block-genesis", enc(&genesis)));
     seeds
 }

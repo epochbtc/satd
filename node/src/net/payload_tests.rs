@@ -307,3 +307,75 @@ fn a_transaction_with_no_inputs_reads_as_core_reads_it() {
         other => panic!("not a block: {other:?}"),
     }
 }
+
+/// `headers`: one genesis header followed by `tx_count` as given.
+fn headers_with_tx_count(tx_count: &[u8]) -> Vec<u8> {
+    let mut p = vec![1u8];
+    p.extend(encode::serialize(&bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest).header));
+    p.extend_from_slice(tx_count);
+    p
+}
+
+/// Core reads each header's transaction count as a CompactSize and ignores
+/// it (`net_processing.cpp`, `HEADERS`), whatever its value (#1346). Its
+/// read is range-checked and canonical, as every `ReadCompactSize` is.
+#[test]
+fn a_headers_tx_count_is_read_as_a_compact_size_and_ignored() {
+    let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest).header;
+    for count in [&[0u8][..], &[1], &[0xfc], &[0xfd, 0x00, 0x01], &[0xfe, 0x00, 0x00, 0x00, 0x02]] {
+        match decode_payload(cmd("headers"), &headers_with_tx_count(count)) {
+            Ok(NetworkMessage::Headers(h)) => assert_eq!(h, vec![genesis], "tx count {count:02x?}"),
+            other => panic!("tx count {count:02x?}: {other:?}"),
+        }
+    }
+    // Two headers, the first with a three-byte count: the second is read
+    // after all three bytes.
+    let mut two = headers_with_tx_count(&[0xfd, 0x00, 0x01]);
+    two[0] = 2;
+    two.extend(encode::serialize(&genesis));
+    two.push(0);
+    match decode_payload(cmd("headers"), &two) {
+        Ok(NetworkMessage::Headers(h)) => assert_eq!(h, vec![genesis, genesis]),
+        other => panic!("{other:?}"),
+    }
+    // Refused, as Core's `ReadCompactSize` refuses them: non-canonical,
+    // above MAX_SIZE, truncated.
+    for count in [&[0xfd, 0x01, 0x00][..], &[0xfe, 0x01, 0x00, 0x00, 0x02], &[0xfd, 0x01]] {
+        assert!(decode_payload(cmd("headers"), &headers_with_tx_count(count)).is_err(), "tx count {count:02x?}");
+    }
+}
+
+/// `getblocktxn` with `diffs` as the differentially encoded indexes.
+fn getblocktxn(diffs: &[u64]) -> Vec<u8> {
+    let mut p = vec![0x11u8; 32];
+    p.extend(encode::serialize(&encode::VarInt(diffs.len() as u64)));
+    for d in diffs {
+        p.extend(encode::serialize(&encode::VarInt(*d)));
+    }
+    p
+}
+
+fn read_indexes(payload: &[u8]) -> Result<Vec<u64>, encode::Error> {
+    match decode_payload(cmd("getblocktxn"), payload)? {
+        NetworkMessage::GetBlockTxn(g) => Ok(g.txs_request.indexes),
+        other => panic!("not a getblocktxn: {other:?}"),
+    }
+}
+
+/// Core's `BlockTransactionsRequest` holds `uint16_t` indexes, and
+/// `DifferenceFormatter` refuses a running index past 65535 (#1347).
+#[test]
+fn getblocktxn_indexes_are_bounded_to_16_bits() {
+    assert_eq!(read_indexes(&getblocktxn(&[0, 1])).unwrap(), vec![0, 2]);
+    assert_eq!(read_indexes(&getblocktxn(&[65535])).unwrap(), vec![65535]);
+    assert_eq!(read_indexes(&getblocktxn(&[65534, 0])).unwrap(), vec![65534, 65535]);
+    for refused in [&[65536][..], &[65535, 0], &[65534, 1], &[0, 65535], &[u64::MAX]] {
+        assert!(read_indexes(&getblocktxn(refused)).is_err(), "diffs {refused:?}");
+        // What rust-bitcoin's decoder made of it (it overflows only past u64).
+        if refused != [u64::MAX] {
+            assert!(deserialize::<GetBlockTxn>(&getblocktxn(refused)).is_ok(), "premise: {refused:?}");
+        }
+    }
+    // A step above MAX_SIZE is refused by `ReadCompactSize` itself.
+    assert!(read_indexes(&getblocktxn(&[0x0200_0001])).is_err());
+}

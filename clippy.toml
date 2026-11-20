@@ -1,0 +1,8 @@
+# rust-bitcoin's wtxid hashes a transaction with no inputs in the BIP 141
+# extended form; Core's `CTransaction::ComputeWitnessHash` returns the txid
+# for any transaction without a witness. satd computes wtxids only through
+# `node::validation::decode::wtxid`, which agrees with Core (#1348).
+disallowed-methods = [
+    { path = "bitcoin::blockdata::transaction::Transaction::compute_wtxid", reason = "use node::validation::decode::wtxid, Core's ComputeWitnessHash (#1348)" },
+    { path = "bitcoin::blockdata::transaction::Transaction::wtxid", reason = "use node::validation::decode::wtxid, Core's ComputeWitnessHash (#1348)" },
+]

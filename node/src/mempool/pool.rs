@@ -1036,7 +1036,7 @@ impl EntryMap {
     /// Insert or replace the entry for `txid`. A replaced entry with another
     /// witness gives up its wtxid.
     fn insert(&mut self, txid: Txid, entry: MempoolEntry) -> Option<MempoolEntry> {
-        let wtxid = entry.tx.compute_wtxid();
+        let wtxid = crate::validation::decode::wtxid(&entry.tx);
         self.time_floor = self.time_floor.min(entry.time);
         let old = self.by_txid.insert(txid, entry);
         if let Some(old) = &old {
@@ -1055,7 +1055,7 @@ impl EntryMap {
     }
 
     fn unindex(&mut self, txid: Txid, entry: &MempoolEntry) {
-        let wtxid = entry.tx.compute_wtxid();
+        let wtxid = crate::validation::decode::wtxid(&entry.tx);
         if self.by_wtxid.get(&wtxid) == Some(&txid) {
             self.by_wtxid.remove(&wtxid);
         }
@@ -1098,7 +1098,7 @@ impl EntryMap {
         if !self.by_txid.contains_key(txid) {
             return Ok(());
         }
-        if self.by_wtxid.contains_key(&tx.compute_wtxid()) {
+        if self.by_wtxid.contains_key(&crate::validation::decode::wtxid(tx)) {
             Err(MempoolError::AlreadyExists)
         } else {
             Err(MempoolError::SameNonWitnessData)
@@ -3520,7 +3520,7 @@ impl Mempool {
                 return Err(MempoolError::MissingEphemeralSpends(format!(
                     "missing-ephemeral-spends, tx {txid} (wtxid={}) did not spend parent's \
                      ephemeral dust",
-                    tx.compute_wtxid()
+                    crate::validation::decode::wtxid(&tx)
                 )));
             }
         }
@@ -6457,7 +6457,7 @@ impl Mempool {
         let entry_weight = entry.weight;
         let entry_time = entry.time;
         let entry_height = entry.height;
-        let entry_wtxid = entry.tx.compute_wtxid();
+        let entry_wtxid = crate::validation::decode::wtxid(&entry.tx);
         let entry_tx_inputs: Vec<_> = entry.tx.input.clone();
         let is_unbroadcast = inner.unbroadcast.contains_key(txid);
         drop(inner);
@@ -7220,7 +7220,7 @@ impl Mempool {
                         MempoolError::MissingEphemeralSpends(format!(
                             "missing-ephemeral-spends, tx {} (wtxid={}) did not spend parent's ephemeral dust",
                             tx.compute_txid(),
-                            tx.compute_wtxid()
+                            crate::validation::decode::wtxid(tx)
                         )),
                     ));
                 }
@@ -7725,7 +7725,7 @@ impl Mempool {
             {
                 let inner = self.inner.read();
                 if let Some(entry) = inner.entries.get(&ptx.txid) {
-                    let resident_wtxid = entry.tx.compute_wtxid();
+                    let resident_wtxid = crate::validation::decode::wtxid(&entry.tx);
                     if resident_wtxid != ptx.wtxid {
                         same_txid_other_witness.insert(ptx.txid, resident_wtxid);
                     } else {
@@ -8248,7 +8248,7 @@ impl Mempool {
                 None => continue,
             };
             let dust_indices = Self::dust_output_indices(parent_tx, cfg.dust_relay_fee);
-            let wtxid = parent_tx.compute_wtxid();
+            let wtxid = crate::validation::decode::wtxid(parent_tx);
 
             // Check that a child in the package (accepted or deferred) spends
             // ALL dust outputs.
@@ -8366,7 +8366,7 @@ impl Mempool {
                 Some(tx) => tx,
                 None => continue,
             };
-            let wtxid = child_tx.compute_wtxid();
+            let wtxid = crate::validation::decode::wtxid(child_tx);
 
             // Already refused above, for a reason that describes the package
             // rather than the transaction: the child left one of its parent's
@@ -9311,7 +9311,7 @@ impl Mempool {
                 let e = entries.get(txid)?;
                 e.scope
                     .assists_relay()
-                    .then(|| (*txid, e.tx.compute_wtxid(), e.fee_rate))
+                    .then(|| (*txid, crate::validation::decode::wtxid(&e.tx), e.fee_rate))
             })
             .collect();
         self.sync_unbroadcast_len(&inner);

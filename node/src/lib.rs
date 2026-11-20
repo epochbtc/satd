@@ -1,3 +1,7 @@
+// Test fixtures all have inputs, where rust-bitcoin's wtxid is Core's;
+// production code goes through `validation::decode::wtxid` (clippy.toml).
+#![cfg_attr(test, allow(clippy::disallowed_methods))]
+
 pub mod adaptive_cache;
 pub mod bip322;
 pub mod chain;

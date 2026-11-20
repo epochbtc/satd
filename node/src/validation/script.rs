@@ -41,7 +41,7 @@ impl ScriptError {
         Some(format!(
             "input {input} of {} (wtxid {}), spending {}:{}",
             tx.compute_txid(),
-            tx.compute_wtxid(),
+            crate::validation::decode::wtxid(tx),
             txin.previous_output.txid,
             txin.previous_output.vout,
         ))
