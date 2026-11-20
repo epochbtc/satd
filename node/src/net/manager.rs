@@ -15939,7 +15939,7 @@ impl PeerManager {
         if info.alt == Some(crate::net::altslots::AltRole::Trial) {
             // A trial that left unjudged, or matched nothing: the next
             // waits its turn.
-            self.note_alt_trial_ended(Instant::now());
+            self.note_alt_trial_ended(info, Instant::now());
         }
         let gained = Self::judge_peer(info, &self.netgroup_counts(), true);
         Self::log_gained_flags(id, info, &gained);

@@ -552,3 +552,31 @@ fn an_alt_dial_entry_goes_with_its_dial() {
     assert!(pm.alt_slots.state.lock().dials.is_empty());
     assert_eq!(pm.take_alt_dial(&a, None), None);
 }
+
+/// A trial that leaves before it is judged is passed over too.
+#[test]
+fn a_trial_gone_before_judgement_is_not_drawn_again() {
+    let (pm, _dir) = mk_pm();
+    alt(&pm, 1, &["family:btcd"], UaTrust::Consistent);
+    let addr = own_group(1);
+    learn(&pm, &[addr]);
+    let mut info = settled(1, addr, Some(AltRole::Trial), Fingerprint::Unknown, BTCD);
+    info.flags.settled = false;
+    add_peer(&pm, info);
+    let config = pm.alt_slot_config();
+    pm.disconnect_peer(1, "peer-closed");
+    assert_eq!(pm.pick_alt_trial(Instant::now(), &[], &config), None);
+    pm.alt_slots.state.lock().rejected.clear();
+    assert_eq!(pm.pick_alt_trial(Instant::now(), &[], &config), Some(PeerAddr::Socket(addr)), "otherwise drawn");
+}
+
+/// A trial never takes the connection count past `-maxconnections`.
+#[test]
+fn a_trial_stays_under_maxconnections() {
+    let (pm, _dir) = mk_pm();
+    pm.set_max_connections(1);
+    alt(&pm, 1, &[], UaTrust::Consistent);
+    assert!(pm.check_alt_trial(&pm.dials_in_flight.lock()).is_ok());
+    add_peer(&pm, settled(1, own_group(1), Some(AltRole::Fallback), known(Family::Core), CORE));
+    assert!(pm.check_alt_trial(&pm.dials_in_flight.lock()).is_err());
+}
