@@ -865,7 +865,7 @@ fn c_overweight_block(ctx: &Ctx, _u: &mut Vec<usize>) -> Submission {
         output: outputs,
     };
     let mut preimage = [0u8; 64];
-    preimage[32..].copy_from_slice(big.compute_wtxid().to_raw_hash().as_byte_array());
+    preimage[32..].copy_from_slice(node::validation::decode::wtxid(&big).to_raw_hash().as_byte_array());
     let witness_root = bitcoin::hashes::sha256d::Hash::hash(&preimage).to_byte_array();
     let mut cb = coinbase(h, block_subsidy(Network::Regtest, h), op_true());
     cb.output.push(commitment_output(witness_root, [0u8; 32]));

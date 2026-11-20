@@ -303,7 +303,7 @@ pub fn try_reconstruct(
     let mut by_short_id: Candidates = mempool.with_entries(|entries| {
         let mut matched = Candidates::new();
         for entry in entries.values() {
-            let wtxid = entry.tx.compute_wtxid();
+            let wtxid = crate::validation::decode::wtxid(&entry.tx);
             if prefilled_wtxids.contains(&wtxid) {
                 redundant.insert(wtxid);
             }

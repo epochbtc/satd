@@ -5760,7 +5760,7 @@ fn orphan_to_json<F: serde::Serialize>(tx: &bitcoin::Transaction, from: &F, verb
     }
     let mut o = serde_json::json!({
         "txid": tx.compute_txid().to_string(),
-        "wtxid": tx.compute_wtxid().to_string(),
+        "wtxid": crate::validation::decode::wtxid(tx).to_string(),
         "bytes": tx.total_size(),
         // Both are the BIP 141 vsize in Core; `vsize` is the deprecated one.
         "vsize": tx.vsize(),

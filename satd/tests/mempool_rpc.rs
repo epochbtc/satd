@@ -519,7 +519,7 @@ fn with_duplicated_input(hex: &str) -> (String, String, String) {
     (
         hex::encode(bitcoin::consensus::serialize(&tx)),
         tx.compute_txid().to_string(),
-        tx.compute_wtxid().to_string(),
+        node::validation::decode::wtxid(&tx).to_string(),
     )
 }
 
@@ -544,7 +544,7 @@ fn a_member_spending_one_outpoint_twice_is_refused_as_core_refuses_it() {
     let (parent, parent_txid, kp, spk) = spend_coinbase_to_taproot(&node, &wallet, 10_000);
     let parent_tx: bitcoin::Transaction =
         bitcoin::consensus::deserialize(&hex::decode(&parent).unwrap()).unwrap();
-    let parent_wtxid = parent_tx.compute_wtxid().to_string();
+    let parent_wtxid = node::validation::decode::wtxid(&parent_tx).to_string();
     let parent_value = parent_tx.output[0].value.to_sat();
     let parent_out = bitcoin::OutPoint::new(bitcoin::Txid::from_str(&parent_txid).unwrap(), 0);
     let (child, _) =
@@ -559,7 +559,7 @@ fn a_member_spending_one_outpoint_twice_is_refused_as_core_refuses_it() {
     let other_wtxid = {
         let tx: bitcoin::Transaction =
             bitcoin::consensus::deserialize(&hex::decode(&other).unwrap()).unwrap();
-        tx.compute_wtxid().to_string()
+        node::validation::decode::wtxid(&tx).to_string()
     };
     let refusal = |txid: &str, wtxid: &str| {
         json!({
@@ -609,7 +609,7 @@ fn a_member_spending_one_outpoint_twice_is_refused_as_core_refuses_it() {
     let spends_3_again_wtxid = {
         let tx: bitcoin::Transaction =
             bitcoin::consensus::deserialize(&hex::decode(&spends_3_again).unwrap()).unwrap();
-        tx.compute_wtxid().to_string()
+        node::validation::decode::wtxid(&tx).to_string()
     };
     let conflict = |txid: &str, wtxid: &str| {
         json!({"txid": txid, "wtxid": wtxid, "package-error": "conflict-in-package"})

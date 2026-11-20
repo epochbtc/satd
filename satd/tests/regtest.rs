@@ -4103,7 +4103,7 @@ fn wtxid_relay_is_negotiated_and_announces_by_wtxid() {
     let (raw_hex, _) = common::build_signed_p2wpkh_spend_from_block1_coinbase(&node, &wallet, dest, 1_000);
     let tx: bitcoin::Transaction =
         bitcoin::consensus::deserialize(&hex::decode(&raw_hex).unwrap()).unwrap();
-    let (txid, wtxid) = (tx.compute_txid(), tx.compute_wtxid());
+    let (txid, wtxid) = (tx.compute_txid(), node::validation::decode::wtxid(&tx));
     assert_ne!(txid.to_raw_hash(), wtxid.to_raw_hash(), "fixture: a segwit spend");
     node.rpc_call_with_params("sendrawtransaction", vec![serde_json::json!(raw_hex)])
         .unwrap();
@@ -4125,7 +4125,7 @@ fn wtxid_relay_is_negotiated_and_announces_by_wtxid() {
         NetworkMessage::Tx(t) => Some(t.clone()),
         _ => None,
     });
-    assert_eq!(served.compute_wtxid(), wtxid);
+    assert_eq!(node::validation::decode::wtxid(&served), wtxid);
 
     by_txid.send(NetworkMessage::WtxidRelay);
     assert!(
@@ -23780,7 +23780,7 @@ fn sv2_declared_coinbase(
 ) -> (Vec<u8>, Vec<u8>, Vec<bitcoin::TxOut>) {
     use bitcoin::hashes::{Hash, sha256d};
     let mut leaves = vec![[0u8; 32]];
-    leaves.extend(txs.iter().map(|t| t.compute_wtxid().to_raw_hash().to_byte_array()));
+    leaves.extend(txs.iter().map(|t| node::validation::decode::wtxid(t).to_raw_hash().to_byte_array()));
     while leaves.len() > 1 {
         if leaves.len() % 2 == 1 {
             leaves.push(*leaves.last().unwrap());
@@ -23879,7 +23879,7 @@ fn stratum_v2_jd_declared_job_mines_a_block() {
                 version: 0x2000_0000,
                 coinbase_tx_prefix: B064K::try_from(prefix).unwrap(),
                 coinbase_tx_suffix: B064K::try_from(suffix).unwrap(),
-                wtxid_list: Seq064K::new(vec![U256::from(tx.compute_wtxid().to_raw_hash().to_byte_array())]).unwrap(),
+                wtxid_list: Seq064K::new(vec![U256::from(node::validation::decode::wtxid(&tx).to_raw_hash().to_byte_array())]).unwrap(),
                 excess_data: B064K::try_from(Vec::new()).unwrap(),
             },
         )
@@ -25910,7 +25910,7 @@ fn stratum_v2_jd_push_solution_connects_block() {
                 version: 0x2000_0000,
                 coinbase_tx_prefix: B064K::try_from(prefix.clone()).unwrap(),
                 coinbase_tx_suffix: B064K::try_from(suffix.clone()).unwrap(),
-                wtxid_list: Seq064K::new(vec![U256::from(tx.compute_wtxid().to_raw_hash().to_byte_array())]).unwrap(),
+                wtxid_list: Seq064K::new(vec![U256::from(node::validation::decode::wtxid(&tx).to_raw_hash().to_byte_array())]).unwrap(),
                 excess_data: B064K::try_from(Vec::new()).unwrap(),
             },
         )
@@ -26899,7 +26899,7 @@ fn truc_limits_hold_over_rpc_and_a_second_child_evicts_the_first() {
     };
     let hex = |tx: &Transaction| hex::encode(bitcoin::consensus::serialize(tx));
     let send = |node: &TestNode, tx: &Transaction| node.rpc_call_with_params("sendrawtransaction", vec![json!(hex(tx))]).unwrap();
-    let id = |tx: &Transaction| format!("{} (wtxid={})", tx.compute_txid(), tx.compute_wtxid());
+    let id = |tx: &Transaction| format!("{} (wtxid={})", tx.compute_txid(), node::validation::decode::wtxid(tx));
     let pool = |node: &TestNode| -> std::collections::HashSet<String> {
         node.rpc_ok("getrawmempool", vec![]).as_array().unwrap().iter().map(|t| t.as_str().unwrap().to_string()).collect()
     };

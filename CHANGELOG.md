@@ -130,6 +130,7 @@ It includes every fix shipped in 0.7.1:
 - P2P: at startup satd raises its soft file-descriptor limit and fits `-maxconnections` to it with Core's warning, shrinks caps left at their defaults to fit what is left, or refuses to start with "Not enough file descriptors available." when the fixed needs and the caps the operator set do not fit (#1294).
 - P2P: a `headers` message's per-header transaction count is read as a CompactSize and ignored, as in Core; satd refused a non-zero count (#1346).
 - P2P: a `getblocktxn` index above 65535 fails to decode, as Core's 16-bit indexes do; satd read it (#1347).
+- P2P: the wtxid of a transaction with no inputs is its txid, as in Core, wherever satd computes one (#1348).
 
 ## Releases
 

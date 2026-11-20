@@ -261,7 +261,7 @@ fn zmq_mempool_accept() {
     let tx: Transaction = deserialize(&m[1].body).unwrap();
     assert_eq!(
         sha256d::Hash::hash(&m[1].body).to_byte_array(),
-        tx.compute_wtxid().to_byte_array(),
+        node::validation::decode::wtxid(&tx).to_byte_array(),
         "rawtx carries the witness"
     );
     assert_eq!(m[2].sequence(), (txid, 'A', Some(before)));

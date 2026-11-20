@@ -70,7 +70,7 @@ pub(crate) fn single_truc_checks(
     direct_conflicts: &HashSet<Txid>,
 ) -> Option<SingleTrucFailure> {
     let txid = tx.compute_txid();
-    let wtxid = tx.compute_wtxid();
+    let wtxid = crate::validation::decode::wtxid(tx);
     let fail = |detail: String| Some(SingleTrucFailure { detail, sibling: None });
 
     // Inheritance: a TRUC transaction spends only TRUC parents, and the
@@ -85,7 +85,7 @@ pub(crate) fn single_truc_checks(
             };
             return fail(format!(
                 "{child} tx {txid} (wtxid={wtxid}) cannot spend from {parent_kind} tx {parent_txid} (wtxid={})",
-                parent.compute_wtxid()
+                crate::validation::decode::wtxid(parent)
             ));
         }
     }
@@ -132,7 +132,7 @@ pub(crate) fn single_truc_checks(
         };
         let parent_wtxid = view
             .mempool_tx(parent_txid)
-            .map(|p| p.compute_wtxid().to_string())
+            .map(|p| crate::validation::decode::wtxid(p).to_string())
             .unwrap_or_default();
         return Some(SingleTrucFailure {
             detail: format!(
@@ -156,7 +156,7 @@ pub(crate) fn package_truc_checks(
     mempool_parents: &[Txid],
 ) -> Option<String> {
     let txid = tx.compute_txid();
-    let wtxid = tx.compute_wtxid();
+    let wtxid = crate::validation::decode::wtxid(tx);
 
     // The members ahead of `tx` that it spends: a sorted package puts every
     // parent first.
@@ -176,7 +176,7 @@ pub(crate) fn package_truc_checks(
                 return Some(format!(
                     "non-version=3 tx {txid} (wtxid={wtxid}) cannot spend from version=3 tx {} (wtxid={})",
                     parent.compute_txid(),
-                    parent.compute_wtxid()
+                    crate::validation::decode::wtxid(parent)
                 ));
             }
         }
@@ -218,7 +218,7 @@ pub(crate) fn package_truc_checks(
     }
 
     let parent_txid = parent.compute_txid();
-    let parent_wtxid = parent.compute_wtxid();
+    let parent_wtxid = crate::validation::decode::wtxid(parent);
     if !is_truc(parent) {
         return Some(format!(
             "version=3 tx {txid} (wtxid={wtxid}) cannot spend from non-version=3 tx {parent_txid} (wtxid={parent_wtxid})"
@@ -239,7 +239,7 @@ pub(crate) fn package_truc_checks(
                 return Some(format!(
                     "tx {} (wtxid={}) would have too many ancestors",
                     other.compute_txid(),
-                    other.compute_wtxid()
+                    crate::validation::decode::wtxid(other)
                 ));
             }
         }

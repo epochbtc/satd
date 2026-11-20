@@ -1126,7 +1126,7 @@ fn extend_record(stored: &StoredBlock, record: &StripRecord, threshold: u64) -> 
                 let (i, vouts) = new.next().unwrap();
                 let tx = &stored.block.txdata[i];
                 let txid = tx.compute_txid();
-                let wtxid = tx.compute_wtxid();
+                let wtxid = crate::validation::decode::wtxid(tx);
                 txs.push(StrippedTx {
                     tx_index: i as u32,
                     txid,

@@ -9022,7 +9022,7 @@ impl PeerManager {
         }
         for tx in &block.txdata {
             tracker.forget_tx_hash(&tx.compute_txid().to_byte_array());
-            tracker.forget_tx_hash(&tx.compute_wtxid().to_byte_array());
+            tracker.forget_tx_hash(&crate::validation::decode::wtxid(tx).to_byte_array());
         }
     }
 
@@ -13041,7 +13041,7 @@ impl PeerManager {
             Err(e) => {
                 tracing::debug!(
                     "{txid} (wtxid={}) from peer={id} was not accepted: {}",
-                    tx.compute_wtxid(),
+                    crate::validation::decode::wtxid(&tx),
                     e.state_string()
                 );
                 self.record_rejection(&tx, &e, validated_at);
@@ -13109,12 +13109,13 @@ impl PeerManager {
     /// out with fakes. The newest goes first. A pairing already refused as
     /// a package, or a child refused outright, is passed over.
     fn find_1p1c_package(&self, parent: &bitcoin::Transaction, peer: PeerId) -> Option<bitcoin::Transaction> {
-        let parent_wtxid = parent.compute_wtxid();
+        let parent_wtxid = crate::validation::decode::wtxid(parent);
         let tip = self.chain_state.tip_hash();
         let candidates = self.orphanage.children_from_peer(&parent.compute_txid(), peer);
         let mut rejects = self.recent_rejects.lock();
         candidates.into_iter().find(|child| {
-            let hash = crate::net::recent_rejects::package_hash(&[parent_wtxid, child.compute_wtxid()]);
+            let child_wtxid = crate::validation::decode::wtxid(child);
+            let hash = crate::net::recent_rejects::package_hash(&[parent_wtxid, child_wtxid]);
             !rejects.contains_reconsiderable(tip, &hash)
                 && !rejects.contains(tip, child.compute_txid().as_byte_array(), false)
         })
@@ -13131,7 +13132,7 @@ impl PeerManager {
         let validated_at = self.chain_state.tip_hash();
         let members = [parent, child];
         let ids: Vec<(bitcoin::Txid, bitcoin::Wtxid)> =
-            members.iter().map(|tx| (tx.compute_txid(), tx.compute_wtxid())).collect();
+            members.iter().map(|tx| (tx.compute_txid(), crate::validation::decode::wtxid(tx))).collect();
         let result = self.mempool.accept_package_from(
             members.to_vec(),
             &self.chain_state,
@@ -13342,7 +13343,7 @@ impl PeerManager {
         if !entry.scope.assists_relay() {
             return;
         }
-        let wtxid = entry.tx.compute_wtxid();
+        let wtxid = crate::validation::decode::wtxid(&entry.tx);
         let mut peers = self.peers.write();
         for handle in peers.values_mut() {
             let hash = if handle.info.wtxid_relay { wtxid.to_byte_array() } else { txid.to_byte_array() };
@@ -14732,7 +14733,7 @@ impl PeerManager {
         let mut txs = HashMap::with_capacity(block.txdata.len() * 2);
         for (i, tx) in block.txdata.iter().enumerate() {
             txs.insert(tx.compute_txid().to_byte_array(), i);
-            txs.insert(tx.compute_wtxid().to_byte_array(), i);
+            txs.insert(crate::validation::decode::wtxid(tx).to_byte_array(), i);
         }
         *recent = Some(RecentBlock {
             hash,

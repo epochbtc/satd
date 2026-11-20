@@ -425,7 +425,7 @@ pub fn compute_witness_commitment(txs: &[TemplateTx]) -> [u8; 32] {
     // Coinbase wtxid = 0x00...00, then wtxids of included transactions
     let mut hashes: Vec<[u8; 32]> = vec![[0u8; 32]];
     for ttx in txs {
-        hashes.push(ttx.tx.compute_wtxid().to_raw_hash().to_byte_array());
+        hashes.push(crate::validation::decode::wtxid(&ttx.tx).to_raw_hash().to_byte_array());
     }
     let witness_root = merkle_root(&hashes);
 

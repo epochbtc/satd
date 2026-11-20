@@ -143,6 +143,10 @@ fn whole<T>(
 /// from Core's ten-byte form. A block's witness commitment has to see Core's
 /// value for it, or a block Core refuses as `bad-txns-vin-empty` is judged
 /// mutated instead.
+///
+/// Every wtxid satd computes comes from here; `clippy.toml` refuses
+/// rust-bitcoin's `compute_wtxid` elsewhere (#1348).
+#[allow(clippy::disallowed_methods)] // the one call allowed; see clippy.toml
 pub fn wtxid(tx: &Transaction) -> Wtxid {
     if tx.input.is_empty() {
         Wtxid::from_raw_hash(tx.compute_txid().to_raw_hash())

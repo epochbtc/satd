@@ -222,7 +222,7 @@ impl WtxidIndex {
                 state.by_wtxid.retain(|_, txid| entries.contains_key(txid));
                 for (txid, entry) in entries {
                     if !state.by_txid.contains_key(txid) {
-                        let wtxid = entry.tx.compute_wtxid();
+                        let wtxid = crate::validation::decode::wtxid(&entry.tx);
                         state.by_txid.insert(*txid, wtxid);
                         state.by_wtxid.insert(wtxid, *txid);
                     }
@@ -260,7 +260,7 @@ impl MempoolView {
                 let Some(entry) = txid.and_then(|txid| entries.get(&txid)) else { continue };
                 if !entry.scope.assists_template()
                     || view.by_wtxid.contains_key(wtxid)
-                    || entry.tx.compute_wtxid() != *wtxid
+                    || crate::validation::decode::wtxid(&entry.tx) != *wtxid
                 {
                     continue;
                 }

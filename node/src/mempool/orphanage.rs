@@ -248,7 +248,7 @@ impl TxOrphanage {
         if weight as usize > MAX_STANDARD_TX_WEIGHT {
             return Err(OrphanReject::TooLarge);
         }
-        let wtxid = tx.compute_wtxid();
+        let wtxid = crate::validation::decode::wtxid(&tx);
         let mut inner = self.inner.lock();
         if inner.by_wtxid.contains_key(&wtxid) {
             if Self::announce_locked(&mut inner, &wtxid, from_peer) {
