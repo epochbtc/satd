@@ -614,7 +614,17 @@ impl<'a> Reader<'a> {
 /// `getpeersurvey`'s answer: the aggregate, and with `verbose` a row per
 /// address. `completed` and `failed` count this run's survey connections.
 pub fn survey_json(store: &SurveyStore, verbose: bool, settings: &serde_json::Value) -> serde_json::Value {
-    let agg = store.aggregate();
+    let mut out = aggregate_json(&store.aggregate(), settings);
+    if verbose {
+        let mut rows: Vec<(&PeerAddr, &SurveyRecord)> = store.rows().collect();
+        rows.sort_unstable_by(|a, b| b.1.last_seen.cmp(&a.1.last_seen).then(a.0.cmp(b.0)));
+        out["peers"] = rows.into_iter().map(|(addr, r)| row_json(addr, r)).collect();
+    }
+    out
+}
+
+/// [`survey_json`] without the rows, from an aggregate already taken.
+pub fn aggregate_json(agg: &Aggregate, settings: &serde_json::Value) -> serde_json::Value {
     let share = |n: usize| if agg.addresses == 0 { 0.0 } else { n as f64 / agg.addresses as f64 };
     let mut families = serde_json::Map::new();
     for (f, n) in Family::ALL.iter().zip(agg.families) {
@@ -633,11 +643,6 @@ pub fn survey_json(store: &SurveyStore, verbose: bool, settings: &serde_json::Va
         for (k, v) in s {
             o.insert(k.clone(), v.clone());
         }
-    }
-    if verbose {
-        let mut rows: Vec<(&PeerAddr, &SurveyRecord)> = store.rows().collect();
-        rows.sort_unstable_by(|a, b| b.1.last_seen.cmp(&a.1.last_seen).then(a.0.cmp(b.0)));
-        out["peers"] = rows.into_iter().map(|(addr, r)| row_json(addr, r)).collect();
     }
     out
 }

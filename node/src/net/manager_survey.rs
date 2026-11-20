@@ -45,6 +45,9 @@ pub struct SurveyConfig {
 pub(super) struct SurveyRun {
     config: SurveyConfig,
     store: parking_lot::Mutex<SurveyStore>,
+    /// The store's aggregate as of its last change, for the metrics and
+    /// `getpeersurvey` without `verbose`: neither walks the store.
+    aggregate: parking_lot::Mutex<survey::Aggregate>,
     /// A survey dial is under way. With a [`ConnType::Survey`] peer in the
     /// table, this makes the one connection at a time.
     dialing: AtomicBool,
@@ -88,6 +91,35 @@ impl Drop for DialingGuard {
     }
 }
 
+/// What a survey session's next read brought.
+enum Next {
+    Msg(NetworkMessage),
+    /// The wait ran out.
+    Timeout,
+    /// The peer closed the connection.
+    Closed,
+    /// The node closed it: `disconnectnode`, a ban, `setnetworkactive
+    /// false` or shutdown signalled the peer's handle.
+    Aborted,
+}
+
+/// The next message, the deadline, the peer's close or the node's,
+/// whichever comes first.
+async fn next_message(
+    read_rx: &mut mpsc::Receiver<NetworkMessage>,
+    deadline: tokio::time::Instant,
+    abort: &tokio::sync::Notify,
+) -> Next {
+    tokio::select! {
+        r = tokio::time::timeout_at(deadline, read_rx.recv()) => match r {
+            Err(_) => Next::Timeout,
+            Ok(None) => Next::Closed,
+            Ok(Some(msg)) => Next::Msg(msg),
+        },
+        _ = abort.notified() => Next::Aborted,
+    }
+}
+
 fn outcome_slot(o: ProbeOutcome) -> usize {
     match o {
         ProbeOutcome::Answered(_) => 0,
@@ -124,6 +156,7 @@ impl PeerManager {
         };
         let run = SurveyRun {
             config,
+            aggregate: parking_lot::Mutex::new(store.aggregate()),
             store: parking_lot::Mutex::new(store),
             dialing: AtomicBool::new(false),
             completed: AtomicU64::new(0),
@@ -164,18 +197,23 @@ impl PeerManager {
             // The first tick is immediate; the first survey waits a whole
             // interval, as the node is still finding its peers.
             tick.tick().await;
-            let mut saved = Instant::now();
+            // The store is written on a timer of its own, whatever the
+            // survey's interval.
+            let mut save = tokio::time::interval(survey::SAVE_INTERVAL);
+            save.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            save.tick().await;
             loop {
-                tokio::select! {
-                    _ = tick.tick() => {}
-                    _ = shutdown.changed() => {}
-                }
+                let dial = tokio::select! {
+                    _ = tick.tick() => true,
+                    _ = save.tick() => false,
+                    _ = shutdown.changed() => false,
+                };
                 if *shutdown.borrow() {
                     return;
                 }
-                pm.survey_tick();
-                if saved.elapsed() >= survey::SAVE_INTERVAL {
-                    saved = Instant::now();
+                if dial {
+                    pm.survey_tick();
+                } else {
                     let pm = Arc::clone(&pm);
                     let _ = tokio::task::spawn_blocking(move || pm.dump_survey()).await;
                 }
@@ -291,10 +329,12 @@ impl PeerManager {
         }
 
         let (mut reader, mut writer) = conn.split();
-        if let Some(stats) = self.peers.read().get(&id).map(|h| h.stats.clone()) {
-            reader.set_counters(stats.clone());
-            writer.set_counters(stats);
-        }
+        let Some((stats, abort)) = self.peers.read().get(&id).map(|h| (h.stats.clone(), h.disconnect.clone())) else {
+            // Closed by the node already.
+            return;
+        };
+        reader.set_counters(stats.clone());
+        writer.set_counters(stats);
         // The read side in a task of its own, as `peer_task` reads: a
         // `recv` cancelled mid-message would lose the bytes it had taken.
         let (read_tx, mut read_rx) = mpsc::channel::<NetworkMessage>(64);
@@ -306,11 +346,11 @@ impl PeerManager {
             }
         });
 
-        let closed = self.survey_listen(id, &mut writer, &mut read_rx).await;
+        let closed = self.survey_listen(id, &mut writer, &mut read_rx, &abort).await;
         let mut probes = ProbeResults::default();
         let closed = closed
             || (self.survey.get().is_some_and(|run| run.config.probes)
-                && self.survey_probe(id, &mut writer, &mut read_rx, &mut probes).await);
+                && self.survey_probe(id, &mut writer, &mut read_rx, &abort, &mut probes).await);
         read_task.abort();
         drop(writer);
 
@@ -355,19 +395,25 @@ impl PeerManager {
             last_seen: now,
             probes,
         };
-        run.store.lock().insert(addr, record, now);
+        let aggregate = {
+            let mut store = run.store.lock();
+            store.insert(addr, record, now);
+            store.aggregate()
+        };
+        *run.aggregate.lock() = aggregate;
     }
 
     /// The passive wait: send what a full-relay outbound sends after its
     /// `verack` (less `getaddr`, `getheaders` and our addresses), then take
     /// the peer's messages into its handshake transcript until it closes or
     /// [`PASSIVE_WAIT`] passes, answering a `ping`. Returns whether the
-    /// peer closed the connection.
+    /// connection closed, at the peer's end or the node's (`abort`).
     async fn survey_listen(
         &self,
         id: PeerId,
         writer: &mut crate::net::connection::ConnectionWriter,
         read_rx: &mut mpsc::Receiver<NetworkMessage>,
+        abort: &tokio::sync::Notify,
     ) -> bool {
         // `peer_task`'s, in its order: compact blocks in low-bandwidth mode,
         // then the fee filter.
@@ -385,10 +431,10 @@ impl PeerManager {
         }
         let deadline = tokio::time::Instant::now() + PASSIVE_WAIT;
         loop {
-            let msg = match tokio::time::timeout_at(deadline, read_rx.recv()).await {
-                Err(_) => return false,
-                Ok(None) => return true,
-                Ok(Some(msg)) => msg,
+            let msg = match next_message(read_rx, deadline, abort).await {
+                Next::Msg(msg) => msg,
+                Next::Timeout => return false,
+                Next::Closed | Next::Aborted => return true,
             };
             log_received(id, &msg);
             let open = self.capture_handshake(id, &msg);
@@ -398,20 +444,23 @@ impl PeerManager {
                 return true;
             }
             if !open {
-                return false;
+                // A transcript reads as closed, too, once the node has
+                // dropped the peer's handle.
+                return !self.peers.read().contains_key(&id);
             }
         }
     }
 
     /// The probes: a random subset of [`Probe::ALL`] in random order, each
     /// waiting for its answer. Records each outcome in `probes`; returns
-    /// whether the peer closed the connection, after which no probe is
-    /// sent.
+    /// whether the connection closed, at the peer's end or the node's
+    /// (`abort`), after which no probe is sent.
     async fn survey_probe(
         &self,
         id: PeerId,
         writer: &mut crate::net::connection::ConnectionWriter,
         read_rx: &mut mpsc::Receiver<NetworkMessage>,
+        abort: &tokio::sync::Notify,
         probes: &mut ProbeResults,
     ) -> bool {
         #[cfg(test)]
@@ -434,10 +483,12 @@ impl PeerManager {
                 let wait = if probe == Probe::Unknown { UNKNOWN_PROBE_WAIT } else { PROBE_REPLY_WAIT };
                 let deadline = tokio::time::Instant::now() + wait;
                 loop {
-                    let msg = match tokio::time::timeout_at(deadline, read_rx.recv()).await {
-                        Err(_) => break ProbeOutcome::Silent,
-                        Ok(None) => break ProbeOutcome::Disconnected,
-                        Ok(Some(msg)) => msg,
+                    let msg = match next_message(read_rx, deadline, abort).await {
+                        Next::Msg(msg) => msg,
+                        Next::Timeout => break ProbeOutcome::Silent,
+                        Next::Closed => break ProbeOutcome::Disconnected,
+                        // Not the peer's doing: nothing to record.
+                        Next::Aborted => return true,
                     };
                     log_received(id, &msg);
                     match (probe, &msg) {
@@ -501,14 +552,19 @@ impl PeerManager {
                 "failed": run.failed.load(Ordering::Relaxed),
             },
         });
-        let store = run.store.lock();
-        survey::survey_json(&store, verbose, &settings)
+        if verbose {
+            // Copied under the lock, serialized outside it.
+            let store = run.store.lock().clone();
+            survey::survey_json(&store, true, &settings)
+        } else {
+            survey::aggregate_json(&run.aggregate.lock(), &settings)
+        }
     }
 
     /// The survey's counts for the metrics; `None` with the survey off.
     pub fn survey_metrics(&self) -> Option<SurveyMetrics> {
         let run = self.survey.get()?;
-        let agg = run.store.lock().aggregate();
+        let agg = run.aggregate.lock().clone();
         let mut probe_outcomes = [[0u64; 3]; 4];
         for (row, counters) in probe_outcomes.iter_mut().zip(&run.probe_outcomes) {
             for (n, c) in row.iter_mut().zip(counters) {
