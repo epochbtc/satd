@@ -454,21 +454,24 @@ async fn a_survey_records_the_peer_and_marks_its_address_good() {
 }
 
 /// Each probe sends its message and records the answer: the `pong`'s
-/// round trip, the header count, the `notfound` naming our transaction,
-/// and silence after the unknown message.
+/// round trip, the `notfound` naming our transaction, and silence after
+/// the unknown message. At genesis the `getheaders` probe is not sent: no
+/// stop hash lies past the locator, so a peer would answer with 2,000
+/// headers.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn probes_send_the_vetted_messages_and_record_the_answers() {
     let order = vec![Probe::Unknown, Probe::GetData, Probe::GetHeaders, Probe::Ping];
     let (got, pm, target, _dir) = survey_one(core_script(), Some(order)).await;
+    assert_eq!(pm.chain_state.tip_height(), 0, "fixture: at genesis");
     let cmds = commands(&got);
     let tail: Vec<&str> = cmds.iter().map(String::as_str).skip_while(|c| *c != "pong").skip(1).collect();
-    assert_eq!(tail.len(), 4, "{cmds:?}");
+    assert_eq!(tail.len(), 3, "{cmds:?}");
     assert!(tail[0].len() >= 6 && tail[0].bytes().all(|b| b.is_ascii_lowercase()), "an unknown type: {tail:?}");
-    assert_eq!(&tail[1..], ["getdata", "getheaders", "ping"]);
+    assert_eq!(&tail[1..], ["getdata", "ping"]);
     let r = pm.survey_store().unwrap().get(&PeerAddr::Socket(target)).cloned().unwrap();
     assert_eq!(r.probes.get(Probe::Unknown), Some(ProbeOutcome::Silent));
     assert_eq!(r.probes.get(Probe::GetData), Some(ProbeOutcome::Answered(1)));
-    assert_eq!(r.probes.get(Probe::GetHeaders), Some(ProbeOutcome::Answered(0)));
+    assert_eq!(r.probes.get(Probe::GetHeaders), None, "not sent at genesis");
     assert!(matches!(r.probes.get(Probe::Ping), Some(ProbeOutcome::Answered(_))));
     let m = pm.survey_metrics().unwrap();
     assert_eq!(m.probe_outcomes[0][0], 1, "ping answered");
@@ -533,4 +536,25 @@ async fn a_survey_connection_the_node_closes_ends_at_once() {
         assert!(!cmds.iter().any(|c| c == probe), "no {probe} after the close: {cmds:?}");
     }
     assert!(pm.survey_store().unwrap().is_empty(), "nothing recorded");
+}
+
+/// Past genesis the `getheaders` probe's locator is the tip's parent and
+/// its stop the tip, so a peer on our chain answers with one header.
+#[test]
+fn the_getheaders_probe_asks_for_one_header_past_genesis() {
+    use crate::chain::state::tests::{build_test_block, make_chain_state};
+    let (cs, _dir) = make_chain_state();
+    let genesis = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
+    let pm = PeerManager::new(
+        Arc::new(cs),
+        Arc::new(Mempool::new(1_000_000, 0)),
+        Arc::new(FeeEstimator::new()),
+        Network::Regtest,
+        tokio::sync::watch::channel(false).1,
+    );
+    assert_eq!(pm.survey_locator(), None, "none at genesis");
+    let time = (crate::time::now_secs() - 600) as u32;
+    let block = build_test_block(genesis, 1, time);
+    let tip = pm.chain_state.accept_block(&block).expect("connect fixture block").hash();
+    assert_eq!(pm.survey_locator(), Some((genesis, tip)));
 }
