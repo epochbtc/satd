@@ -1039,6 +1039,7 @@ mod tests {
     #[test]
     fn steady_peers_table_shows_flags_and_the_mismatch_marker() {
         let mut st = AppState::new();
+        st.connected = true;
         st.force_mode = Some(crate::state::ViewMode::Steady);
         st.peers = [(3, "/Satoshi:27.0.0/"), (7, "/bitcoin-seeder:0.01/"), (11, "/Satoshi:28.1.0/")]
             .iter()
