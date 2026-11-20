@@ -580,3 +580,56 @@ fn a_trial_stays_under_maxconnections() {
     add_peer(&pm, settled(1, own_group(1), Some(AltRole::Fallback), known(Family::Core), CORE));
     assert!(pm.check_alt_trial(&pm.dials_in_flight.lock()).is_err());
 }
+
+/// A trial and a fallback that both match with one slot: the trial takes
+/// it and the fallback goes. A trial with no slot left is not passed over.
+#[test]
+fn a_trial_is_judged_before_a_fallback() {
+    let (pm, _dir) = mk_pm();
+    alt(&pm, 1, &["family:btcd"], UaTrust::Consistent);
+    add_peer(&pm, settled(1, own_group(1), Some(AltRole::Fallback), known(Family::Btcd), BTCD));
+    add_peer(&pm, settled(2, own_group(2), Some(AltRole::Trial), known(Family::Btcd), BTCD));
+    pm.judge_alt_slot_peers();
+    assert!(matches!(role(&pm, 2), Some(AltRole::Matched { .. })));
+    assert!(!connected(&pm, 1), "the fallback is surplus");
+
+    let m = AltRole::Matched { rule: "family:btcd".into(), trust: Trust::Verified };
+    let (pm, _dir) = mk_pm();
+    alt(&pm, 1, &["family:btcd"], UaTrust::Consistent);
+    add_peer(&pm, settled(1, own_group(1), Some(m), known(Family::Btcd), BTCD));
+    let addr = own_group(2);
+    learn(&pm, &[addr]);
+    add_peer(&pm, settled(2, addr, Some(AltRole::Trial), known(Family::Btcd), BTCD));
+    pm.judge_alt_slot_peers();
+    assert!(!connected(&pm, 2));
+    assert!(pm.retired_behavior.lock().contains(&(2, Some("alt-slot-filled"))));
+    assert!(pm.alt_slots.state.lock().rejected.is_empty(), "not passed over");
+}
+
+/// A trial's record keeps the probe outcomes a survey connection stored.
+#[test]
+fn a_trial_result_keeps_the_survey_probes() {
+    let (pm, _dir) = mk_pm();
+    pm.enable_survey(SurveyConfig { interval: Duration::from_secs(60), probes: true, path: None });
+    alt(&pm, 1, &["family:btcd"], UaTrust::Consistent);
+    let addr = own_group(1);
+    let now = crate::time::now_secs();
+    let mut probes = crate::net::survey::ProbeResults::default();
+    probes.set(crate::net::survey::Probe::Ping, crate::net::survey::ProbeOutcome::Answered(12));
+    let record = crate::net::survey::SurveyRecord {
+        fingerprint: known(Family::Btcd),
+        user_agent: BTCD.into(),
+        protocol_version: 70016,
+        services: 1 | 8 | 1024,
+        v2: false,
+        asn: None,
+        first_seen: now,
+        last_seen: now,
+        probes,
+    };
+    assert!(pm.insert_survey_record(PeerAddr::Socket(addr), record, now));
+    add_peer(&pm, settled(1, addr, Some(AltRole::Trial), known(Family::Btcd), BTCD));
+    pm.judge_alt_slot_peers();
+    let kept = pm.read_survey_store(|s| s.get(&PeerAddr::Socket(addr)).map(|r| r.probes)).flatten();
+    assert_eq!(kept, Some(probes));
+}
