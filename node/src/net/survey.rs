@@ -130,8 +130,8 @@ pub struct ProbeContext {
     pub nonce: u64,
     /// The `getheaders` locator: one block hash of our active chain.
     pub locator: BlockHash,
-    /// The `getheaders` stop hash: the block after [`Self::locator`], or
-    /// the locator itself at the genesis tip.
+    /// The `getheaders` stop hash: the block after [`Self::locator`]. At
+    /// the genesis tip there is none and the probe is not sent.
     pub stop: BlockHash,
     /// The transaction asked for: random, so no peer has it.
     pub txid: [u8; 32],
