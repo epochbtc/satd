@@ -540,7 +540,8 @@ mod tests {
         let mut rng = rand::rngs::StdRng::seed_from_u64(4);
         for n in 1..=40usize {
             let first = |c: &EvictionCandidate| c.id == 0;
-            let setups: [&dyn Fn(&mut EvictionCandidate, usize); 7] = [
+            type Setup = dyn Fn(&mut EvictionCandidate, usize);
+            let setups: [&Setup; 7] = [
                 &|c, n| c.keyed_net_group = n as u64 - c.id,
                 &|c, _| c.min_ping_us = c.id,
                 &|c, n| c.last_tx_time = n as u64 - c.id,
@@ -579,7 +580,7 @@ mod tests {
                 c.flagged = c.id % 3 != 2;
             }
             let unflagged: Vec<EvictionCandidate> =
-                candidates.iter().cloned().map(|c| EvictionCandidate { flagged: false, ..c }).collect();
+                candidates.iter().map(|c| EvictionCandidate { flagged: false, ..c.clone() }).collect();
             assert_eq!(select_node_to_evict(candidates), select_node_to_evict(unflagged));
         }
     }
