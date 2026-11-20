@@ -359,6 +359,9 @@ pub struct PeerInfo {
     /// Core's `CNode::m_has_all_wanted_services`, an inbound eviction
     /// protection.
     pub has_all_wanted_services: bool,
+    /// What the peer has done on the wire, in fixed-size counters. Recorded
+    /// only; see [`crate::net::behavior`].
+    pub behavior: crate::net::behavior::PeerBehavior,
 }
 
 /// Render a per-message-type byte tally as `getpeerinfo` reports it.
@@ -420,6 +423,7 @@ impl PeerInfo {
             chain_sync_protect: false,
             tx_relay_requested: false,
             has_all_wanted_services: false,
+            behavior: Default::default(),
         }
     }
 

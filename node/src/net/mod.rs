@@ -4,6 +4,7 @@ pub mod addrv2;
 pub mod addrman;
 pub mod ban;
 pub mod asmap;
+pub mod behavior;
 pub mod bg_catchup;
 pub mod block_source;
 pub mod compact;

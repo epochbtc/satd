@@ -673,9 +673,28 @@ impl IbdScheduler {
     /// Register `peer` as having just delivered a block: the other peer a
     /// stall judgement needs (see [`Self::take_stalled_peer`]).
     #[cfg(test)]
-    fn note_delivering_peer(&mut self, peer: PeerId) {
+    pub(crate) fn note_delivering_peer(&mut self, peer: PeerId) {
         self.register_peer(peer);
         self.peer_slots.get_mut(&peer).unwrap().last_delivery = Some(Instant::now());
+    }
+
+    /// Move `peer`'s clocks back by `by`: its last activity and quiet start
+    /// when `activity`, and the requests of the heights it holds when
+    /// `requests`. Lets a test reach a stall without waiting for one.
+    #[cfg(test)]
+    pub(crate) fn backdate_for_test(&mut self, peer: PeerId, by: Duration, activity: bool, requests: bool) {
+        if activity && let Some(slots) = self.peer_slots.get_mut(&peer) {
+            slots.last_activity -= by;
+            slots.quiet_since -= by;
+        }
+        if requests {
+            let held: Vec<u32> = self.in_flight.iter().filter(|(_, p)| **p == peer).map(|(h, _)| *h).collect();
+            for h in held {
+                for at in [self.requested_at.get_mut(&h), self.in_flight_at.get_mut(&h)].into_iter().flatten() {
+                    *at -= by;
+                }
+            }
+        }
     }
 
     /// The current stall timeout; see [`Self::take_stalled_peer`].
@@ -704,6 +723,17 @@ impl IbdScheduler {
         timeout: Duration,
         near_cursor_timeout: Duration,
     ) -> usize {
+        self.release_stale_inflight_charging(timeout, near_cursor_timeout).0
+    }
+
+    /// [`Self::release_stale_inflight`], also naming the holder charged with
+    /// each failed height (one entry per height), for its behaviour record.
+    pub fn release_stale_inflight_charging(
+        &mut self,
+        timeout: Duration,
+        near_cursor_timeout: Duration,
+    ) -> (usize, Vec<PeerId>) {
+        let mut charged = Vec::new();
         let now = Instant::now();
         let near_cursor_end = self.connect_cursor + 10;
         // Two clocks. The holder's own request: the near-cursor timeout (and
@@ -756,6 +786,7 @@ impl IbdScheduler {
             // another peer rather than straight back to it.
             if holder_failed {
                 self.record_failure(peer_id, h);
+                charged.push(peer_id);
             } else if holder_timed_out {
                 self.bar_from_height(peer_id, h);
             }
@@ -763,7 +794,7 @@ impl IbdScheduler {
                 slots.timed_out_since_delivery = true;
             }
         }
-        count
+        (count, charged)
     }
 
     /// Notify the scheduler that the connect cursor has advanced.

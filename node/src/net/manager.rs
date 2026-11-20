@@ -1368,6 +1368,11 @@ pub struct PeerManager {
     /// [`MAX_IN_FLIGHT_BLOCKS_PER_PEER`], which bounds the whole table by the
     /// connection limit no matter what peers announce.
     in_flight_blocks: RwLock<HashMap<PeerId, HashMap<bitcoin::BlockHash, BlockRequest>>>,
+    /// The disconnect reason each departed peer's behaviour record was
+    /// closed with, in order: what a test reads, since the record itself
+    /// leaves with the peer.
+    #[cfg(test)]
+    retired_behavior: parking_lot::Mutex<Vec<(PeerId, Option<&'static str>)>>,
     /// Peers that answered a full-block request from the sweep with
     /// `notfound`, by block. The sweep asks them for that block again only
     /// when no other peer can be asked, so a `NODE_INTACT_BLOCKS` peer that
@@ -1915,6 +1920,8 @@ impl PeerManager {
             event_rx: tokio::sync::Mutex::new(event_rx),
             headers_tip: AtomicU64::new(headers_tip_height as u64),
             in_flight_blocks: RwLock::new(HashMap::new()),
+            #[cfg(test)]
+            retired_behavior: Default::default(),
             sweep_not_found: RwLock::new(HashMap::new()),
             compact_in_progress: RwLock::new(HashMap::new()),
             block_refetch: RwLock::new(HashMap::new()),
@@ -5034,7 +5041,7 @@ impl PeerManager {
     fn disconnect_peer(&self, id: PeerId, reason: &'static str) -> bool {
         let removed = self.peers.write().remove(&id);
         match removed {
-            Some(handle) => {
+            Some(mut handle) => {
                 // Signal before the handle drops. Dropping it closes `msg_rx`
                 // only when the last sender goes, and a `getcfilters` stream
                 // task can be holding a clone -- in which case the RPC would
@@ -5052,6 +5059,7 @@ impl PeerManager {
                     reason,
                     "Disconnecting peer"
                 );
+                self.retire_behavior(id, &mut handle.info.behavior, reason);
                 true
             }
             None => false,
@@ -5908,7 +5916,9 @@ impl PeerManager {
             .collect();
         for id in waiting {
             if self.start_header_sync(id) {
-                self.send_to_peer(id, sync::make_initial_getheaders(&self.chain_state));
+                let getheaders = sync::make_initial_getheaders(&self.chain_state);
+                self.note_getheaders_sent(id, &getheaders);
+                self.send_to_peer(id, getheaders);
             }
         }
     }
@@ -7493,29 +7503,7 @@ impl PeerManager {
             if has_ibd {
                 // Every 4 ticks (2s): stall detection and reassignment
                 if ticks.is_multiple_of(4) {
-                    let (stalled, stale_heights, silent) = {
-                        let mut ibd = self.ibd.write();
-                        if let Some(scheduler) = ibd.as_mut() {
-                            let mut stalled = Vec::new();
-                            while let Some(peer_id) = scheduler.take_stalled_peer() {
-                                stalled.push(peer_id);
-                            }
-                            // Per-height timeout: catch heights stuck with an active peer
-                            let stale = scheduler.release_stale_inflight(
-                                Duration::from_secs(60),
-                                Duration::from_secs(15),
-                            );
-                            // Silent peers are scanned AFTER releases so a
-                            // peer that hit its third release on this pass
-                            // gets dropped on the same tick.
-                            let silent = scheduler.silent_peers(
-                                crate::net::ibd::SILENT_PEER_FAILURE_THRESHOLD,
-                            );
-                            (stalled, stale, silent)
-                        } else {
-                            (Vec::new(), 0, Vec::new())
-                        }
-                    };
+                    let (stalled, stale_heights, silent) = self.take_download_stalls();
                     // Core disconnects a peer stalling block download. The
                     // scheduler has already taken its blocks back; closing
                     // the connection stops the ones it is still sending from
@@ -7780,8 +7768,9 @@ impl PeerManager {
     fn handle_peer_disconnected(&self, id: PeerId) {
         let mut peers = self.peers.write();
         let mut nap_pull = None;
-        if let Some(handle) = peers.remove(&id) {
+        if let Some(mut handle) = peers.remove(&id) {
             tracing::info!(id, addr = %handle.info.addr_string(), "Peer disconnected");
+            self.retire_behavior(id, &mut handle.info.behavior, "peer-closed");
             tracing::debug!("Cleared nodestate for peer={id}");
             if handle.info.conn_type == ConnType::NapPull {
                 nap_pull = Some(handle.info.addr_string());
@@ -7896,6 +7885,13 @@ impl PeerManager {
         msg: NetworkMessage,
         in_flight: crate::net::flow::InFlight,
     ) {
+        // The peer's behaviour record counts what it sent, before any
+        // handler judges it.
+        if crate::net::behavior::PeerBehavior::counts(&msg)
+            && let Some(h) = self.peers.write().get_mut(&id)
+        {
+            h.info.behavior.note_received(&msg, Instant::now());
+        }
         match msg {
             // Neither `Ping` nor `Pong` reaches here: the peer's write loop
             // answers the one and matches the other against that peer's
@@ -8079,14 +8075,20 @@ impl PeerManager {
                     let addrs: Vec<bitcoin::p2p::address::AddrV2Message> =
                         entries.iter().filter_map(GetAddrEntry::to_addrv2).collect();
                     if !addrs.is_empty() {
-                        self.send_to_peer(id, NetworkMessage::AddrV2(addrs));
+                        let count = addrs.len();
+                        if self.send_to_peer(id, NetworkMessage::AddrV2(addrs)) {
+                            self.note_addrs_sent(id, count);
+                        }
                     }
                 } else {
                     // Legacy addr carries no onion.
                     let addrs: Vec<(u32, bitcoin::p2p::Address)> =
                         entries.iter().filter_map(GetAddrEntry::to_addr).collect();
                     if !addrs.is_empty() {
-                        self.send_to_peer(id, NetworkMessage::Addr(addrs));
+                        let count = addrs.len();
+                        if self.send_to_peer(id, NetworkMessage::Addr(addrs)) {
+                            self.note_addrs_sent(id, count);
+                        }
                     }
                 }
             }
@@ -8205,11 +8207,16 @@ impl PeerManager {
                 // the request expires. A `notfound` for something never asked
                 // of this peer changes nothing.
                 if !tx_hashes.is_empty() {
-                    {
+                    let answered = {
                         let mut tracker = self.tx_requests.lock();
-                        for hash in &tx_hashes {
-                            tracker.received_response(id, hash);
-                        }
+                        tx_hashes.iter().filter(|hash| tracker.received_response(id, hash)).count()
+                    };
+                    // Each was announced by this peer: it is asked only for
+                    // what it announced.
+                    if answered > 0
+                        && let Some(h) = self.peers.write().get_mut(&id)
+                    {
+                        h.info.behavior.note_notfound_after_inv(answered);
                     }
                     self.send_all_tx_requests();
                 }
@@ -9062,7 +9069,44 @@ impl PeerManager {
 
     /// [`Self::handle_headers`] at the time `now`, seconds since the epoch,
     /// which a headers sync started here measures its clock bound against.
-    fn handle_headers_at(&self, id: PeerId, mut headers: Vec<bitcoin::block::Header>, now: u64) {
+    fn handle_headers_at(&self, id: PeerId, headers: Vec<bitcoin::block::Header>, now: u64) {
+        // An answer to our `getheaders` with fewer than a full batch is the
+        // peer saying its chain ends there: what the behaviour record holds
+        // its `start_height` against, once the headers are taken.
+        let short_reply = headers.len() < crate::net::limits::MAX_HEADERS_RESULTS
+            && headers.first().is_none_or(|first| self.chain_state.get_block_index(&first.prev_blockhash).is_some())
+            && self.peers.read().get(&id).is_some_and(|h| h.last_getheaders_sent.is_some());
+        let last = headers.last().map(|h| h.block_hash());
+        self.process_headers_at(id, headers, now);
+        if short_reply {
+            self.note_headers_served(id, last);
+        }
+    }
+
+    /// The behaviour record: the peer answered a `getheaders` short, so its
+    /// chain ends at the most it has shown us. That is the highest of: the
+    /// header of its we have indexed furthest along (`best_known_height`),
+    /// the last header of the answer, its PRESYNC height, and, for an empty
+    /// answer, the top of the locator we sent, which it then holds.
+    fn note_headers_served(&self, id: PeerId, last: Option<bitcoin::BlockHash>) {
+        let last_height = last.and_then(|h| self.chain_state.get_block_index(&h)).map(|e| e.height);
+        let mut peers = self.peers.write();
+        let Some(h) = peers.get_mut(&id) else {
+            return;
+        };
+        let info = &mut h.info;
+        let presync = u32::try_from(info.presync_height).ok();
+        let locator_top = if last.is_none() { info.behavior.last_locator_top } else { None };
+        let served = [info.best_known_height, last_height, presync, locator_top]
+            .into_iter()
+            .flatten()
+            .max()
+            .unwrap_or(0);
+        info.behavior.note_headers_served(served);
+    }
+
+    /// [`Self::handle_headers_at`], past the behaviour record.
+    fn process_headers_at(&self, id: PeerId, mut headers: Vec<bitcoin::block::Header>, now: u64) {
         let count = headers.len();
         // Core's `ProcessHeadersMessage`: an empty `headers` cannot be an
         // announcement, and headers whose first one connects to the block
@@ -13500,7 +13544,9 @@ impl PeerManager {
                 delivered += chunk.len();
             }
             let failed = &picked[delivered..];
+            let announced_at = Instant::now();
             for (_, _, hash) in &picked[..delivered] {
+                h.info.behavior.note_tx_announced(hash, announced_at);
                 h.tx_relay.add_known(hash);
                 if !failed.is_empty() {
                     h.tx_relay.announced_out_of_sequence(hash);
@@ -15304,8 +15350,22 @@ impl PeerManager {
             }
             handle.last_getheaders_sent = Some(now);
         }
-        self.send_to_peer(id, msg());
+        let msg = msg();
+        self.note_getheaders_sent(id, &msg);
+        self.send_to_peer(id, msg);
         true
+    }
+
+    /// The behaviour record: where the locator of a `getheaders` to the
+    /// peer starts, which is where an empty answer says its chain ends.
+    fn note_getheaders_sent(&self, id: PeerId, msg: &NetworkMessage) {
+        let NetworkMessage::GetHeaders(m) = msg else {
+            return;
+        };
+        let top = m.locator_hashes.first().and_then(|h| self.chain_state.get_block_index(h)).map(|e| e.height);
+        if let Some(h) = self.peers.write().get_mut(&id) {
+            h.info.behavior.last_locator_top = top;
+        }
     }
 
     /// Send a `getheaders` that is not gated on an outstanding one (header
@@ -15317,6 +15377,7 @@ impl PeerManager {
         if let Some(h) = self.peers.write().get_mut(&id) {
             h.last_getheaders_sent = Some(Instant::now());
         }
+        self.note_getheaders_sent(id, &msg);
         self.send_to_peer(id, msg);
     }
 
@@ -15695,6 +15756,61 @@ impl PeerManager {
         match peers.get(&id) {
             Some(handle) => handle.msg_tx.try_send(msg).is_ok(),
             None => false,
+        }
+    }
+
+    /// The scheduler's stall checks, run every 2 s during IBD: peers to
+    /// disconnect for stalling, how many in-flight heights went back to
+    /// pending, and peers that keep failing to deliver. Each stall disconnect
+    /// and each height a peer is charged with counts in its behaviour
+    /// record, before the caller disconnects anyone.
+    fn take_download_stalls(&self) -> (Vec<PeerId>, usize, Vec<PeerId>) {
+        let (stalled, stale, charged, silent) = {
+            let mut ibd = self.ibd.write();
+            let Some(scheduler) = ibd.as_mut() else {
+                return (Vec::new(), 0, Vec::new());
+            };
+            let mut stalled = Vec::new();
+            while let Some(peer_id) = scheduler.take_stalled_peer() {
+                stalled.push(peer_id);
+            }
+            // Per-height timeout: catch heights stuck with an active peer
+            let (stale, charged) =
+                scheduler.release_stale_inflight_charging(Duration::from_secs(60), Duration::from_secs(15));
+            // Silent peers are scanned AFTER releases so a
+            // peer that hit its third release on this pass
+            // gets dropped on the same tick.
+            let silent = scheduler.silent_peers(crate::net::ibd::SILENT_PEER_FAILURE_THRESHOLD);
+            (stalled, stale, charged, silent)
+        };
+        self.note_stalls(charged.iter().chain(&stalled).copied());
+        (stalled, stale, silent)
+    }
+
+    /// Close a departing peer's behaviour record with `reason` and write it
+    /// to the debug log, without the peer's address: the id names it.
+    fn retire_behavior(&self, id: PeerId, behavior: &mut crate::net::behavior::PeerBehavior, reason: &'static str) {
+        behavior.disconnect_reason = Some(reason);
+        tracing::debug!("peer behavior peer={id} {behavior}");
+        #[cfg(test)]
+        self.retired_behavior.lock().push((id, behavior.disconnect_reason));
+    }
+
+    /// The behaviour record: each peer named was charged with one
+    /// block-download stall.
+    fn note_stalls(&self, ids: impl IntoIterator<Item = PeerId>) {
+        let mut peers = self.peers.write();
+        for id in ids {
+            if let Some(h) = peers.get_mut(&id) {
+                h.info.behavior.note_stall();
+            }
+        }
+    }
+
+    /// The peer's behaviour record: `count` addresses went to it.
+    fn note_addrs_sent(&self, id: PeerId, count: usize) {
+        if let Some(h) = self.peers.write().get_mut(&id) {
+            h.info.behavior.note_addrs_sent(count);
         }
     }
 
@@ -16247,6 +16363,7 @@ impl PeerManager {
             // node far behind starts with one peer only; the sync loop starts
             // the rest (`start_header_syncs`).
             let getheaders = sync::make_initial_getheaders(&self.chain_state);
+            self.note_getheaders_sent(id, &getheaders);
             writer.send(getheaders)
                 .await
                 .map_err(|e| e.to_string())?;
@@ -16321,9 +16438,16 @@ impl PeerManager {
             && conn_type != ConnType::AddrFetch
             && !quiet
             && let Some(msg) = self.self_advertise_externals_given(id, our_onion.as_ref())
-            && let Err(e) = writer.send(msg).await
         {
-            tracing::debug!(id, "self-advertise addr send failed: {}", e);
+            let count = match &msg {
+                NetworkMessage::Addr(a) => a.len(),
+                NetworkMessage::AddrV2(a) => a.len(),
+                _ => 0,
+            };
+            match writer.send(msg).await {
+                Ok(()) => self.note_addrs_sent(id, count),
+                Err(e) => tracing::debug!(id, "self-advertise addr send failed: {}", e),
+            }
         }
 
         if !quiet && let Some(addr_msg) = self.self_advertise_addrv2_given(id, our_onion.clone()) {
@@ -16336,8 +16460,9 @@ impl PeerManager {
                 let host = crate::net::peer::torv3_to_onion_host(pubkey);
                 tracing::debug!("Advertising address {host}:{} to peer={id}", addr_msg.port);
             }
-            if let Err(e) = writer.send(NetworkMessage::AddrV2(vec![addr_msg])).await {
-                tracing::debug!(id, "self-advertise addrv2 send failed: {}", e);
+            match writer.send(NetworkMessage::AddrV2(vec![addr_msg])).await {
+                Ok(()) => self.note_addrs_sent(id, 1),
+                Err(e) => tracing::debug!(id, "self-advertise addrv2 send failed: {}", e),
             }
         }
 
@@ -16346,6 +16471,10 @@ impl PeerManager {
         let (read_tx, mut read_rx) = mpsc::channel::<NetworkMessage>(64);
         let read_manager = Arc::clone(self);
         let read_task = tokio::spawn(async move {
+            // The behaviour record's handshake transcript runs on past the
+            // peer's `verack` while it announces what it supports; once it
+            // closes, the peer's lock is no longer taken here.
+            let mut capturing = true;
             loop {
                 match tokio::time::timeout(
                     std::time::Duration::from_secs(600),
@@ -16355,6 +16484,9 @@ impl PeerManager {
                 {
                     Ok(Ok(msg)) => {
                         log_received(id, &msg);
+                        if capturing {
+                            capturing = read_manager.capture_handshake(id, &msg);
+                        }
                         // Past the handshake, so any `verack` repeats one.
                         if matches!(msg, NetworkMessage::Verack) {
                             tracing::debug!("ignoring redundant verack message from peer={id}");
@@ -16971,6 +17103,13 @@ impl PeerManager {
             }
         };
 
+        // The behaviour record's transcript starts at the `version` taken.
+        let our_tip = self.chain_state.tip_height();
+        if let Some(h) = self.peers.write().get_mut(&id) {
+            h.info.behavior.note_version(&their_version, our_tip);
+            h.info.behavior.handshake.observe("version", false);
+        }
+
         if direction == Direction::Inbound {
             // Core's `CheckIncomingNonce`: our own outbound version coming back.
             let to_self = self.peers.read().values().any(|h| {
@@ -17083,7 +17222,9 @@ impl PeerManager {
         // Between `version` and `verack` Core takes only the negotiation
         // messages; anything else is ignored with a line naming it.
         loop {
-            match self.recv_handshake(id, conn, connected_at).await? {
+            let msg = self.recv_handshake(id, conn, connected_at).await?;
+            self.capture_handshake(id, &msg);
+            match msg {
                 NetworkMessage::Verack => break,
                 NetworkMessage::SendAddrV2 => peer_wants_addrv2 = true,
                 // Core's `WTXIDRELAY` handler, with its log lines.
@@ -17137,6 +17278,36 @@ impl PeerManager {
         }
 
         Ok(their_version)
+    }
+
+    /// The behaviour record: one message received from the peer during or
+    /// just after its handshake, for the transcript. Returns whether the
+    /// transcript is still open.
+    fn capture_handshake(&self, id: PeerId, msg: &NetworkMessage) -> bool {
+        let reply = self.is_reply_to_us(id, msg);
+        self.peers
+            .write()
+            .get_mut(&id)
+            .is_some_and(|h| h.info.behavior.handshake.observe(crate::net::behavior::wire_command(msg), reply))
+    }
+
+    /// Whether `msg` answers a request of ours: a `pong`, a `headers` while
+    /// a `getheaders` is out to the peer, or a `notfound` while a
+    /// transaction or block request is. The handshake transcript leaves
+    /// these out, since where they fall depends on when we asked.
+    fn is_reply_to_us(&self, id: PeerId, msg: &NetworkMessage) -> bool {
+        match msg {
+            NetworkMessage::Pong(_) => true,
+            NetworkMessage::Headers(_) => {
+                self.peers.read().get(&id).is_some_and(|h| h.last_getheaders_sent.is_some())
+            }
+            NetworkMessage::NotFound(_) => {
+                self.tx_requests.lock().count_in_flight(id) > 0
+                    || self.in_flight_blocks.read().get(&id).is_some_and(|m| !m.is_empty())
+                    || self.ibd.read().as_ref().is_some_and(|s| !s.peer_inflight_heights(id).is_empty())
+            }
+            _ => false,
+        }
     }
 
     /// `wtxidrelay` (BIP 339) then `sendaddrv2` (BIP 155), Core's order, when
@@ -17362,6 +17533,10 @@ mod orphan_tests;
 #[cfg(test)]
 #[path = "manager_trickle_tests.rs"]
 mod trickle_tests;
+
+#[cfg(test)]
+#[path = "manager_behavior_tests.rs"]
+mod behavior_tests;
 
 /// Reconsider orphans whose missing parent was just confirmed in `block`.
 ///
