@@ -325,8 +325,9 @@ earlier trials, kept in memory), or else an address-book entry, drawn as
 any automatic dial is, whose recorded services can meet such a rule. Once
 the trial's handshake has settled (at most about 15 seconds), it takes the
 slot under the first rule it matches, with one `net` log line naming the
-rule; otherwise it is disconnected (`alt-slot-no-match`) and the next trial
-waits 30 seconds. One trial at a time. Every alt-slot dial obeys the same
+rule; otherwise it is disconnected (`alt-slot-no-match`), its address is
+passed over by trials for 24 hours, and the next trial waits 30 seconds, as
+it does when no candidate is found. One trial at a time. Every alt-slot dial obeys the same
 network-group rule as every other outbound.
 
 A slot still empty after `-altfillwait` seconds (600) gets an ordinary
