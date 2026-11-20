@@ -225,6 +225,7 @@ impl MetricsContext {
             peer_count_v2,
         );
         render_peer_flags(&mut out, &self.peer_manager.peer_flag_counts());
+        render_peer_survey(&mut out, self.peer_manager.survey_metrics().as_ref());
         metric(
             &mut out,
             "satd_net_bytes_sent_total",
@@ -945,6 +946,72 @@ fn render_peer_flags(out: &mut String, counts: &crate::net::flags::FlagCounts) {
         metric_sample(out, "satd_peer_fingerprint", &[("family", family.name())], n as u64);
     }
     metric_sample(out, "satd_peer_fingerprint", &[("family", "unknown")], counts.unknown as u64);
+}
+
+/// The network survey (`-peersurvey`): `satd_peer_survey_enabled`, and with
+/// the survey on, its records by observed family, mismatches and v2, the
+/// survey connections and the probe outcomes this run. Counts only, no
+/// address.
+fn render_peer_survey(out: &mut String, m: Option<&crate::net::manager::SurveyMetrics>) {
+    use crate::net::fingerprint::Family;
+    use crate::net::survey::Probe;
+    metric(
+        out,
+        "satd_peer_survey_enabled",
+        "1 when the network survey (-peersurvey) runs.",
+        "gauge",
+        &[],
+        u64::from(m.is_some()),
+    );
+    let Some(m) = m else {
+        return;
+    };
+    metric(
+        out,
+        "satd_peer_survey_records",
+        "Addresses in the network survey's store (peersurvey.dat).",
+        "gauge",
+        &[],
+        m.records as u64,
+    );
+    metric_header(
+        out,
+        "satd_peer_survey_family",
+        "Survey records by the implementation family the handshake matched; unknown when none matched.",
+        "gauge",
+    );
+    for (family, n) in Family::ALL.iter().zip(m.families) {
+        metric_sample(out, "satd_peer_survey_family", &[("family", family.name())], n as u64);
+    }
+    metric_sample(out, "satd_peer_survey_family", &[("family", "unknown")], m.unknown as u64);
+    metric(
+        out,
+        "satd_peer_survey_mismatches",
+        "Survey records whose user agent names one family and handshake matches another.",
+        "gauge",
+        &[],
+        m.mismatches as u64,
+    );
+    metric(out, "satd_peer_survey_v2", "Survey records reached over BIP 324.", "gauge", &[], m.v2 as u64);
+    metric_header(
+        out,
+        "satd_peer_survey_connections_total",
+        "Survey connections since start: completed, or failed at the dial or the handshake.",
+        "counter",
+    );
+    metric_sample(out, "satd_peer_survey_connections_total", &[("result", "completed")], m.completed);
+    metric_sample(out, "satd_peer_survey_connections_total", &[("result", "failed")], m.failed);
+    metric_header(
+        out,
+        "satd_peer_survey_probes_total",
+        "Survey probes since start, by probe and outcome (answered, silent, disconnected).",
+        "counter",
+    );
+    for (probe, row) in Probe::ALL.iter().zip(m.probe_outcomes) {
+        for (outcome, n) in ["answered", "silent", "disconnected"].iter().zip(row) {
+            metric_sample(out, "satd_peer_survey_probes_total", &[("probe", probe.name()), ("outcome", outcome)], n);
+        }
+    }
 }
 
 /// Emit the `# HELP` / `# TYPE` pair for a metric family, once.

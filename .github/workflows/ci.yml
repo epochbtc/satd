@@ -669,7 +669,7 @@ jobs:
             build: cargo build --release --locked --bin satd --bin sat-cli
           - leg: core-block-diff
             key: core-block-diff-target
-            build: cargo test -p satd --test core_block_differential --test core_p2p_differential --features core-block-differential,core-p2p-differential --no-run --locked
+            build: cargo test -p satd --test core_block_differential --test core_p2p_differential --test core_survey_probes --features core-block-differential,core-p2p-differential --no-run --locked
     env:
       # canary.yml's RUST_TOOLCHAIN: the same compiler, or the restored target
       # directory is rebuilt from scratch.
