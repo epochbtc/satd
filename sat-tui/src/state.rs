@@ -1839,9 +1839,10 @@ impl AppState {
         }
     }
 
-    /// Whether the active view has a peers table.
+    /// Whether a peers table is on screen: the node is answering and the
+    /// active view has one.
     fn peers_view(&self) -> bool {
-        matches!(self.active_mode(), ViewMode::Ibd | ViewMode::Steady)
+        self.connected && matches!(self.active_mode(), ViewMode::Ibd | ViewMode::Steady)
     }
 
     /// `f`: toggle the flagged-peers filter. Does nothing without behaviour
@@ -1868,8 +1869,8 @@ impl AppState {
             .and_then(|i| i.as_u64());
     }
 
-    /// The peer detail overlay to draw: open, and in a view with a peers
-    /// table. A node that stops serving behaviour data closes it
+    /// The peer detail overlay to draw: open, and with a peers table on
+    /// screen. A node that stops serving behaviour data closes it
     /// ([`Self::update_peer_behavior`]).
     pub fn shown_peer_detail(&self) -> Option<u64> {
         if self.peers_view() { self.peer_detail } else { None }
@@ -2718,6 +2719,7 @@ mod tests {
     /// behaviour (ids 3 F, 7 C, 9 ST, 11 none).
     fn behaviour_state() -> AppState {
         let mut st = AppState::new();
+        st.connected = true;
         st.force_mode = Some(ViewMode::Steady);
         st.peers = [3, 7, 9, 11]
             .iter()
@@ -2772,6 +2774,20 @@ mod tests {
         assert_eq!(st.shown_peer_detail(), None);
         st.force_mode = Some(ViewMode::Steady);
         assert_eq!(st.shown_peer_detail(), Some(7));
+
+        // While the node is unreachable no peers table is drawn: the
+        // overlay is not shown (so `q` quits), and `Enter` and `f` do
+        // nothing. It comes back with the connection.
+        st.connected = false;
+        assert_eq!(st.shown_peer_detail(), None);
+        st.peer_detail = None;
+        st.open_peer_detail();
+        st.toggle_flag_filter();
+        assert_eq!(st.peer_detail, None);
+        assert!(st.flagged_only, "the filter set before is untouched");
+        st.connected = true;
+        st.open_peer_detail();
+        assert!(st.shown_peer_detail().is_some());
     }
 
     /// A node without `getpeerbehavior` answers "method not found": the
@@ -2803,6 +2819,7 @@ mod tests {
 
         // A node that never served it: same, from the start.
         let mut fresh = AppState::new();
+        fresh.connected = true;
         fresh.force_mode = Some(ViewMode::Steady);
         fresh.peers = vec![json!({"id": 1})];
         fresh.update_peer_behavior(mnf());

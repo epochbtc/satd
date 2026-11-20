@@ -31,13 +31,16 @@ fn heading(text: &str) -> Line<'static> {
 /// escaped: the behaviour parser escapes its own, and the transport and
 /// user agent from `getpeerinfo` are escaped here.
 pub fn lines(state: &AppState, id: u64) -> Vec<Line<'static>> {
-    let Some(b) = state.behavior_for(id) else {
-        return vec![Line::from(Span::styled(
-            format!("  peer {id} is no longer connected"),
-            Style::default().fg(Color::DarkGray),
-        ))];
-    };
     let info = state.peers.iter().find(|p| p.get("id").and_then(|i| i.as_u64()) == Some(id));
+    let Some(b) = state.behavior_for(id) else {
+        // Connected since the last `getpeerbehavior` poll, or gone.
+        let msg = if info.is_some() {
+            format!("  peer {id} has no behaviour data yet; it arrives within about 5 s")
+        } else {
+            format!("  peer {id} is no longer connected")
+        };
+        return vec![Line::from(Span::styled(msg, Style::default().fg(Color::DarkGray)))];
+    };
     let info_str = |key: &str| {
         info.and_then(|p| p.get(key)).and_then(|v| v.as_str()).map(printable)
     };
@@ -144,5 +147,8 @@ mod tests {
         assert!(has("inv_tx_in") && has("version.start_height"), "{t:?}");
 
         assert!(text(&lines(&st, 99))[0].contains("no longer connected"));
+        // Listed by getpeerinfo, not yet judged: not "gone".
+        st.peers.push(json!({"id": 42}));
+        assert!(text(&lines(&st, 42))[0].contains("no behaviour data yet"), "{:?}", text(&lines(&st, 42)));
     }
 }
