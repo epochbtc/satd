@@ -31,6 +31,14 @@ use rand::seq::SliceRandom as _;
 /// addresses already found not to match. In memory only.
 const ALT_RESULTS_KEPT: usize = 4_096;
 
+/// How long an address whose trial did not take a slot is passed over by
+/// later trials. Its record alone may not say why (a crawler or spy flag is
+/// a judgement of the session, not part of the record).
+const ALT_REJECT_FOR: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// How many such addresses are remembered; past it the oldest go first.
+const ALT_REJECTS_KEPT: usize = 4_096;
+
 /// The alt-slots' settings and fill state.
 pub(super) struct AltSlots {
     config: RwLock<Arc<AltConfig>>,
@@ -47,6 +55,7 @@ impl Default for AltSlots {
                 empty_since: None,
                 dials: Vec::new(),
                 results: SurveyStore::with_limit(ALT_RESULTS_KEPT),
+                rejected: HashMap::new(),
             }),
         }
     }
@@ -63,6 +72,38 @@ pub(super) struct AltState {
     pub(super) dials: Vec<(PeerAddr, AltRole)>,
     /// Trial results with the survey off.
     pub(super) results: SurveyStore,
+    /// Addresses whose trial did not take a slot, and when.
+    pub(super) rejected: HashMap<PeerAddr, Instant>,
+}
+
+impl AltState {
+    fn reject(&mut self, addr: PeerAddr, now: Instant) {
+        self.rejected.retain(|_, at| now.saturating_duration_since(*at) < ALT_REJECT_FOR);
+        if self.rejected.len() >= ALT_REJECTS_KEPT
+            && let Some(oldest) = self.rejected.iter().min_by_key(|(_, at)| **at).map(|(a, _)| a.clone())
+        {
+            self.rejected.remove(&oldest);
+        }
+        self.rejected.insert(addr, now);
+    }
+
+    fn rejected_recently(&self, addr: &PeerAddr, now: Instant) -> bool {
+        self.rejected.get(addr).is_some_and(|at| now.saturating_duration_since(*at) < ALT_REJECT_FOR)
+    }
+}
+
+/// Takes an alt-slot dial's entry off [`AltState::dials`] when the dial
+/// ends, however it ends: a later dial to the address must not inherit the
+/// role.
+pub(super) struct AltDialEntry {
+    pm: Arc<PeerManager>,
+    target: PeerAddr,
+}
+
+impl Drop for AltDialEntry {
+    fn drop(&mut self) {
+        self.pm.alt_slots.state.lock().dials.retain(|(a, _)| *a != self.target);
+    }
 }
 
 /// The alt-slots' fill, as `getpeersurvey` and the metrics report it.
@@ -253,13 +294,17 @@ impl PeerManager {
             )
         };
         let mut out = Vec::new();
-        if trial_due
-            && let Ok(slot) = self.reserve_dial(DialBudget::AltTrial)
-            && let Some(target) = self.pick_alt_trial(now, dialled, &config)
-        {
-            tracing::debug!(%target, "Making alt-slot trial connection");
-            self.spawn_alt_dial(target.clone(), AltRole::Trial, slot);
-            out.push(target);
+        if trial_due && let Ok(slot) = self.reserve_dial(DialBudget::AltTrial) {
+            match self.pick_alt_trial(now, dialled, &config) {
+                Some(target) => {
+                    tracing::debug!(%target, "Making alt-slot trial connection");
+                    self.spawn_alt_dial(target.clone(), AltRole::Trial, slot);
+                    out.push(target);
+                }
+                // No candidate: look again after the trial interval, not
+                // every pass.
+                None => self.alt_slots.state.lock().next_trial = Some(now + ALT_TRIAL_INTERVAL),
+            }
         }
         if fallback_due && let Ok(slot) = self.reserve_dial(DialBudget::AltFallback) {
             let mut taken = dialled.to_vec();
@@ -275,18 +320,26 @@ impl PeerManager {
 
     /// Dial `target` for an alt-slot, holding `slot`; its peer takes `role`.
     fn spawn_alt_dial(self: &Arc<Self>, target: PeerAddr, role: AltRole, slot: DialSlot) {
-        self.alt_slots.state.lock().dials.push((target.clone(), role.clone()));
+        let entry = self.alt_dial_entry(target.clone(), role.clone());
         let pm = Arc::clone(self);
         tokio::spawn(async move {
             let _slot = slot;
+            let _entry = entry;
             let connected = pm.dial_book_target(&target, None, AUTOMATIC_RECONNECT_MAX_BACKOFF).await;
-            let mut state = pm.alt_slots.state.lock();
-            // Still listed when no peer took the role.
-            state.dials.retain(|(a, _)| *a != target);
             if !connected && role == AltRole::Trial {
-                state.next_trial = Some(Instant::now() + ALT_TRIAL_INTERVAL);
+                let now = Instant::now();
+                let mut state = pm.alt_slots.state.lock();
+                state.next_trial = Some(now + ALT_TRIAL_INTERVAL);
+                state.reject(target.clone(), now);
             }
         });
+    }
+
+    /// List an alt-slot dial to `target`, whose peer takes `role`, until the
+    /// returned entry drops.
+    pub(super) fn alt_dial_entry(self: &Arc<Self>, target: PeerAddr, role: AltRole) -> AltDialEntry {
+        self.alt_slots.state.lock().dials.push((target.clone(), role));
+        AltDialEntry { pm: Arc::clone(self), target }
     }
 
     /// How many matched peers each rule (by its text) holds.
@@ -350,6 +403,10 @@ impl PeerManager {
         known.sort_unstable_by(|a, b| a.1.cmp(&b.1));
         known.shuffle(&mut rng);
         known.sort_by_key(|(trust, _)| *trust);
+        let rejected: HashSet<PeerAddr> = {
+            let state = self.alt_slots.state.lock();
+            state.rejected.keys().filter(|a| state.rejected_recently(a, now)).cloned().collect()
+        };
         let (tip_depth, restore_pending) = self.desirable_services_inputs();
         let mut groups = self.outbound_netgroups();
         groups.extend(dialled.iter().filter_map(|a| match a {
@@ -363,7 +420,7 @@ impl PeerManager {
             // Only an address still in the book: the book is where a failed
             // dial's backoff and attempts are kept, and an address it dropped
             // would otherwise be dialled again every trial.
-            if dialled.contains(&addr) || !self.addrman.read().contains(&addr) {
+            if dialled.contains(&addr) || rejected.contains(&addr) || !self.addrman.read().contains(&addr) {
                 continue;
             }
             let c = DialCandidate { services: services_of(&addr), addr };
@@ -378,7 +435,9 @@ impl PeerManager {
             return Some(c.addr);
         }
         self.pick_automatic_dial(now, dialled, &mut rng, |c| {
-            !ruled_out.contains(&c.addr) && open.iter().any(|r| r.services_may_match(c.services))
+            !ruled_out.contains(&c.addr)
+                && !rejected.contains(&c.addr)
+                && open.iter().any(|r| r.services_may_match(c.services))
         })
     }
 
@@ -427,6 +486,7 @@ impl PeerManager {
         let (mut matched, _, _) = self.alt_peer_counts();
         let mut fills = Vec::new();
         let mut unmatched = Vec::new();
+        let mut rejects = Vec::new();
         let mut results = Vec::new();
         let mut pending = pending;
         pending.sort_unstable_by_key(|p| p.id);
@@ -443,7 +503,12 @@ impl PeerManager {
                     *used.entry(rule.clone()).or_default() += 1;
                     fills.push((p.id, rule, c.trust(), p.fingerprint, p.role.clone()));
                 }
-                None if p.role == AltRole::Trial => unmatched.push(p.id),
+                None if p.role == AltRole::Trial => {
+                    unmatched.push(p.id);
+                    if let Some((addr, _)) = &p.record {
+                        rejects.push(addr.clone());
+                    }
+                }
                 None => {}
             }
             if let Some(r) = p.record {
@@ -463,6 +528,13 @@ impl PeerManager {
                     if *was == AltRole::Fallback { " (was its fallback)" } else { "" }
                 );
                 h.info.alt = Some(AltRole::Matched { rule: rule.clone(), trust: *trust });
+            }
+        }
+        if !rejects.is_empty() {
+            let now = Instant::now();
+            let mut state = self.alt_slots.state.lock();
+            for addr in rejects {
+                state.reject(addr, now);
             }
         }
         for id in unmatched {
