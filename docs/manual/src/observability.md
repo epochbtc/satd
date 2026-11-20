@@ -74,7 +74,9 @@ The `GET /metrics` endpoint serves native Prometheus metrics covering P2P
 traffic, block validation times, mempool depth, and RocksDB performance. P2P
 wire volume is exported as the `satd_net_bytes_sent_total` and
 `satd_net_bytes_recv_total` counters, and peer count as
-`satd_peer_connections`. The `GET /healthz` and `GET /readyz` endpoints exist
+`satd_peer_connections`. `satd_peer_flagged{flag}` and
+`satd_peer_fingerprint{family}` count connected peers per behaviour flag and
+per implementation family ([Peer Behaviour Flags](peer-behavior.md)). The `GET /healthz` and `GET /readyz` endpoints exist
 for load balancer and orchestrator integration.
 
 See the [Packaging](packaging.md#health-and-readiness) chapter for how to wire
@@ -188,7 +190,8 @@ is 1 is the stall that
 `--statuspage=1` adds a browser page to the metrics listener, a simplified,
 single-page `sat-tui`: whether the node is syncing or ready, sync progress and
 its ETA, AssumeUTXO background validation, each index and whether a wallet can
-connect yet, the latest block, the mempool, fee estimates and peer counts. It
+connect yet, the latest block, the mempool, fee estimates, peer counts and how
+many peers carry each [behaviour flag](peer-behavior.md). It
 is off by default, and it needs `--metricsport`, since that is the listener it
 is served on.
 

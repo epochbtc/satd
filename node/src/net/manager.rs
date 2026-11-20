@@ -1373,6 +1373,12 @@ pub struct PeerManager {
     /// leaves with the peer.
     #[cfg(test)]
     retired_behavior: parking_lot::Mutex<Vec<(PeerId, Option<&'static str>)>>,
+    /// Recent inbound connections by keyed network group, for the crawler
+    /// flag. A salted hash of the group only; no address.
+    inbound_netgroups: parking_lot::Mutex<crate::net::flags::NetgroupWindow>,
+    /// The flags each departed peer carried as it left, for tests.
+    #[cfg(test)]
+    retired_flags: parking_lot::Mutex<Vec<(PeerId, crate::net::flags::FlagSet)>>,
     /// Peers that answered a full-block request from the sweep with
     /// `notfound`, by block. The sweep asks them for that block again only
     /// when no other peer can be asked, so a `NODE_INTACT_BLOCKS` peer that
@@ -1922,6 +1928,9 @@ impl PeerManager {
             in_flight_blocks: RwLock::new(HashMap::new()),
             #[cfg(test)]
             retired_behavior: Default::default(),
+            inbound_netgroups: Default::default(),
+            #[cfg(test)]
+            retired_flags: Default::default(),
             sweep_not_found: RwLock::new(HashMap::new()),
             compact_in_progress: RwLock::new(HashMap::new()),
             block_refetch: RwLock::new(HashMap::new()),
@@ -5059,7 +5068,7 @@ impl PeerManager {
                     reason,
                     "Disconnecting peer"
                 );
-                self.retire_behavior(id, &mut handle.info.behavior, reason);
+                self.retire_behavior(id, &mut handle.info, reason);
                 true
             }
             None => false,
@@ -5078,7 +5087,7 @@ impl PeerManager {
     fn drop_all_peers(&self, peers: &mut HashMap<PeerId, PeerHandle>, reason: &'static str) {
         for (id, handle) in peers.iter_mut() {
             handle.disconnect.notify_one();
-            self.retire_behavior(*id, &mut handle.info.behavior, reason);
+            self.retire_behavior(*id, &mut handle.info, reason);
         }
         peers.clear();
     }
@@ -7694,6 +7703,13 @@ impl PeerManager {
                 self.expire_compact_state();
             }
 
+            // Every 10 ticks (5 seconds), judge every peer's behaviour
+            // record: its fingerprint and flags. On a timer rather than per
+            // message, so a busy peer costs no more than a quiet one.
+            if ticks.is_multiple_of(crate::net::flags::EVALUATE_INTERVAL_SECS * 2) {
+                self.evaluate_peer_flags();
+            }
+
             // Back to a queue the last drain left full. Otherwise yield to
             // the tokio runtime, waking early when a peer is waiting on the
             // drain above to answer a ping.
@@ -7715,6 +7731,10 @@ impl PeerManager {
                 let stated = version.services.to_u64();
                 handle.info.set_version(version);
                 handle.info.state = PeerState::Connected;
+                // Under the same lock as the state change, so a disconnect
+                // cannot come between the window counting the peer and
+                // the peer carrying its group's key.
+                self.note_inbound_netgroup_locked(&mut handle.info);
                 // Promote to the tried table in the persistent address book,
                 // but only for outbound peers: their address is one we dialed
                 // and can dial again. An inbound peer's address is its
@@ -7772,7 +7792,7 @@ impl PeerManager {
         let mut nap_pull = None;
         if let Some(mut handle) = peers.remove(&id) {
             tracing::info!(id, addr = %handle.info.addr_string(), "Peer disconnected");
-            self.retire_behavior(id, &mut handle.info.behavior, "peer-closed");
+            self.retire_behavior(id, &mut handle.info, "peer-closed");
             tracing::debug!("Cleared nodestate for peer={id}");
             if handle.info.conn_type == ConnType::NapPull {
                 nap_pull = Some(handle.info.addr_string());
@@ -15791,11 +15811,131 @@ impl PeerManager {
 
     /// Close a departing peer's behaviour record with `reason` and write it
     /// to the debug log, without the peer's address: the id names it.
-    fn retire_behavior(&self, id: PeerId, behavior: &mut crate::net::behavior::PeerBehavior, reason: &'static str) {
-        behavior.disconnect_reason = Some(reason);
+    /// Its flags are judged once more first, on the whole session, so a
+    /// peer gone before the next evaluation (a crawler) still gets its line.
+    fn retire_behavior(&self, id: PeerId, info: &mut PeerInfo, reason: &'static str) {
+        info.behavior.disconnect_reason = Some(reason);
+        let gained = Self::judge_peer(info, &self.netgroup_counts(), true);
+        Self::log_gained_flags(id, info, &gained);
+        let behavior = &info.behavior;
         tracing::debug!("peer behavior peer={id} {behavior}");
         #[cfg(test)]
         self.retired_behavior.lock().push((id, behavior.disconnect_reason));
+        #[cfg(test)]
+        self.retired_flags.lock().push((id, info.flags.set()));
+    }
+
+    /// Inbound connections per keyed network group within the crawler
+    /// flag's window.
+    fn netgroup_counts(&self) -> HashMap<u64, u32> {
+        let window = Duration::from_secs(crate::net::flags::THRESHOLDS.crawler_netgroup_window_secs);
+        self.inbound_netgroups.lock().counts(Instant::now(), window)
+    }
+
+    /// An inbound peer finished its handshake: count its network group in
+    /// the crawler flag's window, and keep the group's key on the peer. An
+    /// onion or unroutable peer's address says nothing about it and is not
+    /// counted.
+    /// Called with the peer table's write lock held (taken before the
+    /// address book's and the window's, as everywhere).
+    fn note_inbound_netgroup_locked(&self, info: &mut PeerInfo) {
+        let ip = info.addr.ip();
+        if info.direction != Direction::Inbound || info.inbound_onion || !crate::net::is_routable(ip) {
+            return;
+        }
+        let group = self.addrman.read().group_key(ip);
+        let key = bitcoin::hashes::siphash24::Hash::hash_to_u64_with_keys(self.netgroup_key.0, self.netgroup_key.1, &group);
+        info.flags.netgroup = Some(key);
+        self.inbound_netgroups.lock().record(key, Instant::now());
+    }
+
+    /// [`Self::note_inbound_netgroup_locked`] for a test's peer.
+    #[cfg(test)]
+    fn note_inbound_netgroup(&self, id: PeerId) {
+        if let Some(h) = self.peers.write().get_mut(&id) {
+            self.note_inbound_netgroup_locked(&mut h.info);
+        }
+    }
+
+    /// Judge one peer: its fingerprint and flags, from its record and what
+    /// the manager knows of it. `leaving` when the connection has ended,
+    /// which settles its transcript. Returns the flags it carries for the
+    /// first time this connection.
+    fn judge_peer(
+        info: &mut PeerInfo,
+        netgroups: &HashMap<u64, u32>,
+        leaving: bool,
+    ) -> Vec<(crate::net::flags::Flag, crate::net::flags::Evidence)> {
+        use crate::net::{fingerprint, flags};
+        let session_secs = flags::session_secs(info);
+        let inbound = info.direction == Direction::Inbound;
+        let b = &info.behavior;
+        let settled = leaving || session_secs >= fingerprint::SETTLE_SECS;
+        let fp = fingerprint::classify(inbound, &b.handshake, b.version.as_ref(), settled);
+        let inputs = flags::Inputs {
+            behavior: b,
+            inbound,
+            session_secs,
+            netgroup_seen: info.flags.netgroup.and_then(|k| netgroups.get(&k).copied()).unwrap_or(0),
+            addr_rate_limited: info.addr_rate.rate_limited,
+            fingerprint: fp,
+        };
+        let found = flags::evaluate(&inputs, &flags::THRESHOLDS);
+        let settled = settled || !b.handshake.is_open();
+        info.flags.update(fp, settled, found)
+    }
+
+    /// One `net` line per flag a peer gains, with its evidence. The peer is
+    /// named by id; its user agent is quoted and escaped.
+    fn log_gained_flags(id: PeerId, info: &PeerInfo, gained: &[(crate::net::flags::Flag, crate::net::flags::Evidence)]) {
+        for (flag, evidence) in gained {
+            tracing::debug!(
+                "peer={id} flagged {} ({}): {} fingerprint={} subver={:?}",
+                flag.code(),
+                flag.name(),
+                crate::net::flags::EvidenceDisplay(evidence),
+                info.flags.fingerprint,
+                info.behavior.version.as_ref().map_or("", |v| v.user_agent.as_str()),
+            );
+        }
+    }
+
+    /// Re-judge every connected peer: run every
+    /// [`crate::net::flags::EVALUATE_INTERVAL_SECS`] by the manager loop.
+    pub(crate) fn evaluate_peer_flags(&self) {
+        let netgroups = self.netgroup_counts();
+        let mut peers = self.peers.write();
+        for (id, h) in peers.iter_mut() {
+            if h.info.state != PeerState::Connected {
+                continue;
+            }
+            let gained = Self::judge_peer(&mut h.info, &netgroups, false);
+            Self::log_gained_flags(*id, &h.info, &gained);
+        }
+    }
+
+    /// Connected peers per flag and per observed family, from the last
+    /// evaluation. No addresses.
+    pub fn peer_flag_counts(&self) -> crate::net::flags::FlagCounts {
+        let mut counts = crate::net::flags::FlagCounts::default();
+        for h in self.peers.read().values() {
+            if h.info.state == PeerState::Connected {
+                counts.add(&h.info.flags);
+            }
+        }
+        counts
+    }
+
+    /// `getpeerbehavior`: every peer's record and last judgement, or one
+    /// peer's. `None` when `id` names no peer.
+    pub fn get_peer_behavior(&self, id: Option<PeerId>) -> Option<Vec<serde_json::Value>> {
+        let peers = self.peers.read();
+        let mut out: Vec<(PeerId, serde_json::Value)> = match id {
+            Some(id) => vec![(id, crate::net::flags::peer_json(&peers.get(&id)?.info))],
+            None => peers.iter().map(|(id, h)| (*id, crate::net::flags::peer_json(&h.info))).collect(),
+        };
+        out.sort_by_key(|(id, _)| *id);
+        Some(out.into_iter().map(|(_, v)| v).collect())
     }
 
     /// The behaviour record: each peer named was charged with one
@@ -17548,6 +17688,10 @@ mod trickle_tests;
 #[cfg(test)]
 #[path = "manager_behavior_tests.rs"]
 mod behavior_tests;
+
+#[cfg(test)]
+#[path = "manager_flags_tests.rs"]
+mod flags_tests;
 
 /// Reconsider orphans whose missing parent was just confirmed in `block`.
 ///

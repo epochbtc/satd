@@ -224,6 +224,7 @@ impl MetricsContext {
             &[],
             peer_count_v2,
         );
+        render_peer_flags(&mut out, &self.peer_manager.peer_flag_counts());
         metric(
             &mut out,
             "satd_net_bytes_sent_total",
@@ -915,6 +916,35 @@ fn metric(
 ) {
     metric_header(out, name, help, kind);
     metric_sample(out, name, labels, value);
+}
+
+/// `satd_peer_flagged{flag}` and `satd_peer_fingerprint{family}`: connected
+/// peers per behaviour flag and per observed implementation family, from
+/// the last evaluation. Every series is emitted, zeros included, so an
+/// alert on one never reads "no data". No addresses.
+fn render_peer_flags(out: &mut String, counts: &crate::net::flags::FlagCounts) {
+    use crate::net::fingerprint::Family;
+    use crate::net::flags::Flag;
+    metric_header(
+        out,
+        "satd_peer_flagged",
+        "Connected peers carrying each behaviour flag (C crawler, S spy, F fingerprint mismatch, A addr abuse, H height lie, N notfound pattern, T stalling).",
+        "gauge",
+    );
+    for (flag, n) in Flag::ALL.iter().zip(counts.flagged) {
+        let code = flag.code().to_string();
+        metric_sample(out, "satd_peer_flagged", &[("flag", code.as_str())], n as u64);
+    }
+    metric_header(
+        out,
+        "satd_peer_fingerprint",
+        "Connected peers by the implementation family their handshake matched; unknown when none matched.",
+        "gauge",
+    );
+    for (family, n) in Family::ALL.iter().zip(counts.families) {
+        metric_sample(out, "satd_peer_fingerprint", &[("family", family.name())], n as u64);
+    }
+    metric_sample(out, "satd_peer_fingerprint", &[("family", "unknown")], counts.unknown as u64);
 }
 
 /// Emit the `# HELP` / `# TYPE` pair for a metric family, once.

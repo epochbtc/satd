@@ -34,6 +34,7 @@ It includes every fix shipped in 0.7.1:
 - Chain: the node leaves initial block download only once its tip has the network's minimum chain work as well as a recent timestamp, and does not re-enter it when the tip goes stale, as in Core (#1071).
 - Mempool: a transaction version below 1 or above 3 is non-standard, reason `version`, as in Core (#1070).
 - Mining: a negative `prioritisetransaction` modified fee stays negative in template selection, as in Core, even at `-blockmintxfee=0` (#1274).
+- P2P: `getpeerbehavior [peer_id]` reports each peer's implementation family, judged from its handshake, and behaviour flags (crawler, spy, fingerprint mismatch, addr abuse, height lie, notfound pattern, stalling) with their evidence; `satd_peer_flagged` and `satd_peer_fingerprint` metrics and status-page flag counts. Flags only report; thresholds are provisional (#1351).
 - P2P: the node's own disconnects are no longer logged as `reason="rpc_request"` (#1152).
 - P2P: onion peers are logged by their `.onion` address, not `0.0.0.0` (#1165).
 - P2P: during initial sync, blocks are downloaded no more than `-maxahead` above the tip, so a pruned node prunes during IBD instead of filling its disk (#1154).

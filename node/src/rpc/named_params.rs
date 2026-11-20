@@ -193,6 +193,8 @@ pub fn arg_names(method: &str) -> Option<&'static [ArgSpec]> {
         "getopreturnpruneinfo" => &[],
         "getorphaninfo" => &[],
         "getorphantxs" => &[("verbosity", false)],
+        // SATD_ONLY: getpeerbehavior
+        "getpeerbehavior" => &[("peer_id", false)],
         "getpeerinfo" => &[],
         "getpolicyinfo" => &[],
         "getprioritisedtransactions" => &[],
@@ -365,7 +367,7 @@ pub(crate) const ALL_METHODS: &[&str] = &[
     "getmempoolancestors", "getmempoolcluster", "getmempooldescendants", "getmempoolentry",
     "getmempoolfeeratediagram", "getmempoolhistory", "getmempoolinfo", "getmempoolsummary",
     "getmininginfo", "getnapreport", "getnettotals",
-    "getnetworkhashps", "getnetworkinfo", "getnodeaddresses", "getopreturnpruneinfo", "getorphaninfo", "getorphantxs", "getpeerinfo",
+    "getnetworkhashps", "getnetworkinfo", "getnodeaddresses", "getopreturnpruneinfo", "getorphaninfo", "getorphantxs", "getpeerbehavior", "getpeerinfo",
     "getpolicyinfo", "getprioritisedtransactions", "getquarantineentry",
     "getquarantineinfo", "getrawaddrman", "getrawmempool",
     "getrawtransaction", "getreorghistory", "getrpcinfo", "getserverstatus",

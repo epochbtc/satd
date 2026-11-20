@@ -314,6 +314,13 @@ of each key in the collected set, and `replaynapsnapshot` the same for a
 snapshot that `exportnapsnapshot` wrote. They have a chapter of their own:
 [Node Attestation (NAP)](nap.md).
 
+## Peer behaviour
+
+`getpeerbehavior [peer_id]` reports, per peer and by id only, which
+implementation its handshake matches, the behaviour flags it carries with
+the numbers behind each, and the raw counters they are judged from.
+`getpeerinfo` is unchanged. See [Peer Behaviour Flags](peer-behavior.md).
+
 ## BIP 322 message verification
 
 `verifybip322 "address" "signature" "message"` verifies a

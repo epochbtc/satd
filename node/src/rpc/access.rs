@@ -117,6 +117,8 @@ pub fn classify(method: &str) -> Option<RpcAccess> {
         | "getorphaninfo"
         | "getorphantxs"
         | "getpeerinfo"
+        // Counters and judgements by peer id; no address.
+        | "getpeerbehavior"
         | "getpolicyinfo"
         | "getquarantineentry"
         | "getquarantineinfo"

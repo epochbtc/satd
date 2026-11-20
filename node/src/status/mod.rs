@@ -237,6 +237,16 @@ pub struct Peers {
     pub outbound: usize,
     /// Peers per client version, most common first.
     pub clients: Vec<ClientCount>,
+    /// Connected peers per behaviour flag, for the flags some peer carries,
+    /// in code order. Counts only.
+    pub flagged: Vec<FlagCount>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct FlagCount {
+    pub code: char,
+    pub name: &'static str,
+    pub count: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -449,6 +459,7 @@ fn build_at(ctx: &MetricsContext, sources: &StatusSources, now: u64) -> StatusSn
             inbound: peer_summary.inbound,
             outbound: peer_summary.outbound,
             clients,
+            flagged: flag_counts(&ctx.peer_manager.peer_flag_counts()),
         },
         mempool: MempoolStatus {
             transactions: info.size,
@@ -462,6 +473,16 @@ fn build_at(ctx: &MetricsContext, sources: &StatusSources, now: u64) -> StatusSn
             latest_block(ctx, sources, tip_hash, tip_height)
         },
     }
+}
+
+/// The flags some connected peer carries, with how many carry each.
+pub fn flag_counts(counts: &crate::net::flags::FlagCounts) -> Vec<FlagCount> {
+    crate::net::flags::Flag::ALL
+        .iter()
+        .zip(counts.flagged)
+        .filter(|(_, n)| *n > 0)
+        .map(|(f, count)| FlagCount { code: f.code(), name: f.name(), count })
+        .collect()
 }
 
 fn index_states(ctx: &MetricsContext, sources: &StatusSources) -> Vec<NamedIndex> {
