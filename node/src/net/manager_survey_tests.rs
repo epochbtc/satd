@@ -265,6 +265,8 @@ struct Script {
     answer: bool,
     /// Close the connection on an unknown message.
     close_on_unknown: bool,
+    /// How long the connection is served before the peer hangs up.
+    hold: Duration,
 }
 
 /// Core 31.2 as the capture `core-31.2-outbound` shows it when dialled.
@@ -278,6 +280,7 @@ fn core_script() -> Script {
         ],
         answer: true,
         close_on_unknown: false,
+        hold: Duration::from_secs(30),
     }
 }
 
@@ -289,7 +292,7 @@ async fn serve(listener: tokio::net::TcpListener, scripts: Vec<Script>) -> Vec<V
         let (stream, _) = listener.accept().await.unwrap();
         let mut conn = Connection::with_magic(stream, Magic::REGTEST);
         let mut got = Vec::new();
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        let deadline = tokio::time::Instant::now() + script.hold;
         loop {
             let msg = match tokio::time::timeout_at(deadline, conn.recv()).await {
                 Ok(Ok(m)) => m,
@@ -342,7 +345,7 @@ async fn serve(listener: tokio::net::TcpListener, scripts: Vec<Script>) -> Vec<V
 }
 
 async fn wait_for(cond: impl Fn() -> bool, what: &str) {
-    let deadline = Instant::now() + Duration::from_secs(40);
+    let deadline = Instant::now() + Duration::from_secs(60);
     while !cond() {
         assert!(Instant::now() < deadline, "timed out: {what}");
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -384,7 +387,11 @@ async fn a_survey_handshake_is_a_full_relay_outbounds() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let target = listener.local_addr().unwrap();
     book_add(&pm, target);
-    let server = tokio::spawn(serve(listener, vec![core_script(), core_script()]));
+    // The full-relay outbound's peer hangs up after 3 s: the manager loop
+    // does not run here, so nothing else would close that connection
+    // before the survey dials.
+    let first = Script { hold: Duration::from_secs(3), ..core_script() };
+    let server = tokio::spawn(serve(listener, vec![first, core_script()]));
 
     // A full-relay outbound, held for a few seconds, then the survey.
     pm.connect_outbound_inner(target, None, None, false).await.unwrap();

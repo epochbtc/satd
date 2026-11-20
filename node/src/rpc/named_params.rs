@@ -195,9 +195,9 @@ pub fn arg_names(method: &str) -> Option<&'static [ArgSpec]> {
         "getorphantxs" => &[("verbosity", false)],
         // SATD_ONLY: getpeerbehavior
         "getpeerbehavior" => &[("peer_id", false)],
+        "getpeerinfo" => &[],
         // SATD_ONLY: getpeersurvey
         "getpeersurvey" => &[("verbose", false)],
-        "getpeerinfo" => &[],
         "getpolicyinfo" => &[],
         "getprioritisedtransactions" => &[],
         "getquarantineentry" => &[("txid", false)],
