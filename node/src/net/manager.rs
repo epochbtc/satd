@@ -1376,6 +1376,10 @@ pub struct PeerManager {
     /// Recent inbound connections by keyed network group, for the crawler
     /// flag. A salted hash of the group only; no address.
     inbound_netgroups: parking_lot::Mutex<crate::net::flags::NetgroupWindow>,
+    /// The network survey (`-peersurvey`), when it is on.
+    survey: std::sync::OnceLock<survey_conn::SurveyRun>,
+    /// `-asmap`, for the survey's autonomous systems.
+    asmap: std::sync::OnceLock<Arc<crate::net::asmap::AsMap>>,
     /// The flags each departed peer carried as it left, for tests.
     #[cfg(test)]
     retired_flags: parking_lot::Mutex<Vec<(PeerId, crate::net::flags::FlagSet)>>,
@@ -1929,6 +1933,8 @@ impl PeerManager {
             #[cfg(test)]
             retired_behavior: Default::default(),
             inbound_netgroups: Default::default(),
+            survey: Default::default(),
+            asmap: Default::default(),
             #[cfg(test)]
             retired_flags: Default::default(),
             sweep_not_found: RwLock::new(HashMap::new()),
@@ -3761,7 +3767,7 @@ impl PeerManager {
     fn note_addr_fetch_answered(&self, id: PeerId, count: usize) {
         if count > 1 && self.conn_type_of(id) == ConnType::AddrFetch {
             tracing::debug!(id, count, "addrfetch connection completed, disconnecting");
-            self.disconnect_by_id(id);
+            self.disconnect_peer(id, "addr-fetch-done");
         }
     }
 
@@ -3798,7 +3804,7 @@ impl PeerManager {
             ConnType::AddrFetch | ConnType::Feeler => None,
             // Core returns false rather than opening one of these. A NAP pull
             // is satd's own, and opened only by the aggregator.
-            ConnType::Inbound | ConnType::Manual | ConnType::NapPull => {
+            ConnType::Inbound | ConnType::Manual | ConnType::NapPull | ConnType::Survey => {
                 return Err(format!(
                     "cannot open a {} connection this way",
                     conn_type.as_str()
@@ -3843,8 +3849,9 @@ impl PeerManager {
             .filter(|h| h.info.conn_type != ConnType::Inbound)
             // Core exempts MANUAL: `-addnode` peers have their own semaphore
             // (`semAddnode`) and do not consume an automatic slot. Nor does a
-            // NAP pull, which the aggregator bounds itself.
-            .filter(|h| !matches!(h.info.conn_type, ConnType::Manual | ConnType::NapPull))
+            // NAP pull, which the aggregator bounds itself, nor a survey
+            // connection, which is outside every budget.
+            .filter(|h| !matches!(h.info.conn_type, ConnType::Manual | ConnType::NapPull | ConnType::Survey))
             .count()
             + pending.len()
             // The reconnect loop's dials in flight hold grants too.
@@ -4039,10 +4046,10 @@ impl PeerManager {
 
     /// Outbound peers that count against the automatic target: every one
     /// but the manual connections, which Core counts apart (`semAddnode`,
-    /// or no limit at all), NAP pulls, which take no outbound slot, and
-    /// feelers and block-relay-only peers, which have slots of their own
-    /// (Core's `m_max_feeler` and `m_max_outbound_block_relay`); connected
-    /// or still in the handshake.
+    /// or no limit at all), NAP pulls and survey connections, which take no
+    /// outbound slot, and feelers and block-relay-only peers, which have
+    /// slots of their own (Core's `m_max_feeler` and
+    /// `m_max_outbound_block_relay`); connected or still in the handshake.
     fn automatic_outbound_peers(&self) -> usize {
         self.peers
             .read()
@@ -4051,7 +4058,11 @@ impl PeerManager {
                 h.info.direction == Direction::Outbound
                     && !matches!(
                         h.info.conn_type,
-                        ConnType::Manual | ConnType::NapPull | ConnType::Feeler | ConnType::BlockRelay
+                        ConnType::Manual
+                            | ConnType::NapPull
+                            | ConnType::Feeler
+                            | ConnType::BlockRelay
+                            | ConnType::Survey
                     )
                     && h.info.state != PeerState::Disconnected
             })
@@ -4112,7 +4123,7 @@ impl PeerManager {
     }
 
     /// The outbound sockets Core's `semOutbound` holds a grant for: every
-    /// outbound peer but the manual ones and NAP pulls (as
+    /// outbound peer but the manual ones, NAP pulls and survey connections (as
     /// [`Self::check_outbound_limit_for`] counts them), `addconnection`'s
     /// reservations, and the reconnect loop's dials in flight.
     fn automatic_sockets_open(&self, in_flight: &DialsInFlight) -> usize {
@@ -4122,7 +4133,7 @@ impl PeerManager {
             .values()
             .filter(|h| {
                 h.info.direction == Direction::Outbound
-                    && !matches!(h.info.conn_type, ConnType::Manual | ConnType::NapPull)
+                    && !matches!(h.info.conn_type, ConnType::Manual | ConnType::NapPull | ConnType::Survey)
                     && h.info.state != PeerState::Disconnected
             })
             .count();
@@ -5033,9 +5044,11 @@ impl PeerManager {
         self.disconnect_peer(id, "rpc_request")
     }
 
-    /// Disconnect a peer by its `getpeerinfo` id, for the node's own reasons.
-    /// Returns whether one matched. The caller logs why; this logs that the
-    /// peer went, as `reason="internal"`.
+    /// Disconnect a peer by its `getpeerinfo` id, for a reason the caller
+    /// does not name. Returns whether one matched. This logs that the peer
+    /// went, as `reason="internal"`; the manager's own disconnects name
+    /// their reason with [`Self::disconnect_peer`], which the behaviour
+    /// record and the log line carry.
     ///
     /// Dropping the `PeerHandle` is what actually closes the connection: it
     /// closes the peer task's `msg_rx`, which the write loop treats as
@@ -5106,7 +5119,9 @@ impl PeerManager {
     /// A `HashMap` gives no ordering guarantee, so sort explicitly.
     pub fn get_peer_info(&self) -> Vec<serde_json::Value> {
         let peers = self.peers.read();
-        let mut entries: Vec<_> = peers.iter().collect();
+        // A survey connection is not one of the node's peers: it is open
+        // for seconds and outside every connection budget (`survey_conn`).
+        let mut entries: Vec<_> = peers.iter().filter(|(_, h)| h.info.conn_type != ConnType::Survey).collect();
         entries.sort_by_key(|(id, _)| **id);
         // `inflight` was a hardcoded `[]`, which reads as "this peer owes us
         // nothing" — the opposite of the answer when the question is which
@@ -5173,8 +5188,9 @@ impl PeerManager {
         // `getpeerinfo` (`m_nodes`), so the count and the list agree.
         // Filtering on `Connected` here while `get_peer_info` lists every
         // state made them disagree for as long as a handshake was in
-        // flight — which is exactly when a caller polling both notices.
-        self.peers.read().len()
+        // flight — which is exactly when a caller polling both notices. Survey
+        // connections are left out of both.
+        self.peers.read().values().filter(|h| h.info.conn_type != ConnType::Survey).count()
     }
 
     /// Number of connected peers using the BIP 324 v2 encrypted transport.
@@ -5323,7 +5339,7 @@ impl PeerManager {
                 .collect()
         };
         for id in ids_to_disconnect {
-            self.disconnect_by_id(id);
+            self.disconnect_peer(id, "banned");
         }
     }
 
@@ -7169,7 +7185,13 @@ impl PeerManager {
     /// The dial behind [`Self::spawn_redial`], and a feeler's: `conn_type`
     /// is `None` for a dial `spawn_peer` types, `Some(Feeler)` for a
     /// feeler. The caller holds the dial's place in its limit.
-    async fn dial_book_target(self: &Arc<Self>, target: &PeerAddr, conn_type: Option<ConnType>, max_backoff: Duration) {
+    /// Returns whether the connection was made.
+    async fn dial_book_target(
+        self: &Arc<Self>,
+        target: &PeerAddr,
+        conn_type: Option<ConnType>,
+        max_backoff: Duration,
+    ) -> bool {
         let result = match target {
             PeerAddr::Socket(sa) => self.connect_outbound_inner(*sa, conn_type, None, false).await,
             PeerAddr::Onion { host, port } => {
@@ -7214,6 +7236,7 @@ impl PeerManager {
                 }
             }
         }
+        connected
     }
 
     /// Whether the node holds a connection to the book entry `addr` itself.
@@ -7528,7 +7551,7 @@ impl PeerManager {
                             next_timeout_secs = timeout_secs,
                             "IBD: peer is stalling block download, disconnecting"
                         );
-                        self.disconnect_by_id(peer_id);
+                        self.disconnect_peer(peer_id, "block-download-stall");
                     }
                     if stale_heights > 0 {
                         tracing::info!(stale_heights, "IBD: stale in-flight heights returned to pending");
@@ -8003,7 +8026,7 @@ impl PeerManager {
                     "{} received despite not offering bloom services, disconnecting peer={id}",
                     msg.cmd()
                 );
-                self.disconnect_by_id(id);
+                self.disconnect_peer(id, "bloom-not-offered");
             }
             NetworkMessage::Addr(addrs) => {
                 tracing::debug!(id, count = addrs.len(), "Received addr");
@@ -8193,7 +8216,7 @@ impl PeerManager {
             // `wtxidrelay` after its verack.
             NetworkMessage::WtxidRelay => {
                 tracing::debug!("wtxidrelay received after verack, disconnecting peer={id}");
-                self.disconnect_by_id(id);
+                self.disconnect_peer(id, "wtxidrelay-after-verack");
             }
             NetworkMessage::NotFound(inventory) => {
                 // Core looks at a `notfound` only up to
@@ -8338,7 +8361,7 @@ impl PeerManager {
             #[cfg(not(feature = "block-filter-index"))]
             NetworkMessage::GetCFilters(_) | NetworkMessage::GetCFHeaders(_) | NetworkMessage::GetCFCheckpt(_) => {
                 tracing::debug!("peer requested unsupported block filter type, disconnecting peer={id}");
-                self.disconnect_by_id(id);
+                self.disconnect_peer(id, "unsupported-filter-type");
             }
             NetworkMessage::Unknown { command, payload } if command.as_ref() == crate::nap::p2p::GETNAPATT => {
                 self.handle_getnapatt(id, &payload)
@@ -8391,7 +8414,7 @@ impl PeerManager {
         if !publishes {
             if pull_connection {
                 tracing::debug!(target: "nap", "nap-pull peer={id} does not publish; disconnecting");
-                self.disconnect_by_id(id);
+                self.disconnect_peer(id, "nap-not-publishing");
             }
             return;
         }
@@ -8401,7 +8424,7 @@ impl PeerManager {
                 self.send_raw_message(id, crate::nap::p2p::GETNAPATT, req);
             }
             None if pull_connection => {
-                self.disconnect_by_id(id);
+                self.disconnect_peer(id, "nap-pull-not-started");
             }
             None => {}
         }
@@ -8432,7 +8455,7 @@ impl PeerManager {
             Next::Done { close } => {
                 tracing::debug!(target: "nap", "NAP: pull from peer={id} done");
                 if close {
-                    self.disconnect_by_id(id);
+                    self.disconnect_peer(id, "nap-pull-done");
                 }
             }
             Next::Misbehaved(reason) => {
@@ -8441,7 +8464,7 @@ impl PeerManager {
                 // A manual peer is not punished, but a pull connection ends
                 // with its pull whatever the peer is.
                 if pull_connection {
-                    self.disconnect_by_id(id);
+                    self.disconnect_peer(id, "nap-misbehaved");
                 }
             }
         }
@@ -8478,7 +8501,7 @@ impl PeerManager {
         for (id, close) in puller.expire(now) {
             tracing::debug!(target: "nap", "NAP: pull from peer={id} timed out");
             if close {
-                self.disconnect_by_id(id);
+                self.disconnect_peer(id, "nap-pull-timeout");
             }
         }
         // Behind the publishers' tips, a deferred attestation's anchor may
@@ -8655,7 +8678,7 @@ impl PeerManager {
                 tracing::debug!(id, "ignoring mempool request from peer without mempool permission");
             } else {
                 tracing::debug!(id, "mempool request with bloom filters disabled, disconnecting peer={id}");
-                self.disconnect_by_id(id);
+                self.disconnect_peer(id, "mempool-not-permitted");
             }
             return;
         }
@@ -8726,7 +8749,7 @@ impl PeerManager {
                     tracing::debug!(
                         "transaction ({hash}) inv sent in violation of protocol, disconnecting peer={id}"
                     );
-                    self.disconnect_by_id(id);
+                    self.disconnect_peer(id, "tx-inv-violation");
                     return;
                 }
             }
@@ -12933,7 +12956,7 @@ impl PeerManager {
         // violating the protocol by sending one, and Core disconnects it.
         if self.rejects_incoming_txs(id) {
             tracing::debug!("transaction sent in violation of protocol, disconnecting peer={id}");
-            self.disconnect_by_id(id);
+            self.disconnect_peer(id, "tx-violation");
             return;
         }
         // During IBD, ignore relayed transactions — our UTXO set is incomplete
@@ -13951,7 +13974,7 @@ impl PeerManager {
             tracing::debug!(
                 "peer requested unsupported block filter type: {filter_type}, disconnecting peer={id}"
             );
-            self.disconnect_by_id(id);
+            self.disconnect_peer(id, "unsupported-filter-type");
             return None;
         }
         let stop_height = match self.chain_state.get_block_index(&stop_hash) {
@@ -13962,7 +13985,7 @@ impl PeerManager {
             }
             _ => {
                 tracing::debug!("peer requested invalid block hash: {stop_hash}, disconnecting peer={id}");
-                self.disconnect_by_id(id);
+                self.disconnect_peer(id, "invalid-filter-request");
                 return None;
             }
         };
@@ -13971,7 +13994,7 @@ impl PeerManager {
                 "peer sent invalid getcfilters/getcfheaders with start height {start_height} and \
                  stop height {stop_height}, disconnecting peer={id}"
             );
-            self.disconnect_by_id(id);
+            self.disconnect_peer(id, "invalid-filter-request");
             return None;
         }
         if stop_height - start_height >= max_height_diff {
@@ -13979,7 +14002,7 @@ impl PeerManager {
                 "peer requested too many cfilters/cfheaders: {} / {max_height_diff}, disconnecting peer={id}",
                 u64::from(stop_height - start_height) + 1
             );
-            self.disconnect_by_id(id);
+            self.disconnect_peer(id, "too-many-filters");
             return None;
         }
         // Core: "Filter index for supported type not found", no disconnect.
@@ -14198,7 +14221,7 @@ impl PeerManager {
             // `pfrom.fDisconnect = true` and returns, with no misbehaviour
             // score. Banning the address here would refuse the peer's next
             // connection too, which Core allows.
-            self.disconnect_by_id(id);
+            self.disconnect_peer(id, "oversized-locator");
             return;
         }
 
@@ -14261,7 +14284,7 @@ impl PeerManager {
             // `pfrom.fDisconnect = true` and returns, with no misbehaviour
             // score. Banning the address here would refuse the peer's next
             // connection too, which Core allows.
-            self.disconnect_by_id(id);
+            self.disconnect_peer(id, "oversized-locator");
             return;
         }
 
@@ -14474,7 +14497,7 @@ impl PeerManager {
             tracing::debug!(
                 "filtered block request received when NODE_BLOOM service disabled, disconnecting peer={id}"
             );
-            self.disconnect_by_id(id);
+            self.disconnect_peer(id, "bloom-not-offered");
             return false;
         }
         match inv {
@@ -14493,7 +14516,7 @@ impl PeerManager {
                     Some(BlockRefusal::Ignore) => return true,
                     // The peer is gone; the entry is left where it is.
                     Some(BlockRefusal::Disconnect) => {
-                        self.disconnect_by_id(id);
+                        self.disconnect_peer(id, "block-request-refused");
                         return false;
                     }
                     None => {}
@@ -15214,7 +15237,7 @@ impl PeerManager {
     ) {
         if request.indexes.is_empty() {
             tracing::debug!(id, hash = %request.block_hash, "getblocktxn received with no transaction indexes; disconnecting");
-            self.disconnect_by_id(id);
+            self.disconnect_peer(id, "empty-getblocktxn");
             return;
         }
         // The tip cache first, as Core does: the block a peer is most likely
@@ -15931,8 +15954,14 @@ impl PeerManager {
     pub fn get_peer_behavior(&self, id: Option<PeerId>) -> Option<Vec<serde_json::Value>> {
         let peers = self.peers.read();
         let mut out: Vec<(PeerId, serde_json::Value)> = match id {
-            Some(id) => vec![(id, crate::net::flags::peer_json(&peers.get(&id)?.info))],
-            None => peers.iter().map(|(id, h)| (*id, crate::net::flags::peer_json(&h.info))).collect(),
+            Some(id) => vec![(id, crate::net::flags::peer_json(
+                &peers.get(&id).filter(|h| h.info.conn_type != ConnType::Survey)?.info,
+            ))],
+            None => peers
+                .iter()
+                .filter(|(_, h)| h.info.conn_type != ConnType::Survey)
+                .map(|(id, h)| (*id, crate::net::flags::peer_json(&h.info)))
+                .collect(),
         };
         out.sort_by_key(|(id, _)| *id);
         Some(out.into_iter().map(|(_, v)| v).collect())
@@ -16413,6 +16442,12 @@ impl PeerManager {
         // `verack` in `bytessent_per_msg` / `bytesrecv_per_msg`.
         if let Some(stats) = self.peers.read().get(&id).map(|h| h.stats.clone()) {
             conn.set_counters(stats);
+        }
+
+        // A survey connection runs a session of its own past the handshake
+        // and never joins the connected peers (`survey_conn`).
+        if self.conn_type_of(id) == ConnType::Survey {
+            return self.run_survey_connection(id, conn, connected_at).await;
         }
 
         // Perform handshake with timeout
@@ -17497,7 +17532,7 @@ impl PeerManager {
             .collect();
         for id in stale {
             tracing::debug!(id, "addrfetch connection timeout, disconnecting");
-            self.disconnect_by_id(id);
+            self.disconnect_peer(id, "addr-fetch-timeout");
         }
     }
 
@@ -17620,7 +17655,7 @@ fn nap_pull_via(conn_type: ConnType) -> Option<crate::nap::pull::Via> {
         ConnType::NapPull => Some(Via::Pull),
         ConnType::OutboundFullRelay | ConnType::Manual => Some(Via::Outbound),
         ConnType::Inbound => Some(Via::Inbound),
-        ConnType::BlockRelay | ConnType::AddrFetch | ConnType::Feeler => None,
+        ConnType::BlockRelay | ConnType::AddrFetch | ConnType::Feeler | ConnType::Survey => None,
     }
 }
 
@@ -17692,6 +17727,14 @@ mod behavior_tests;
 #[cfg(test)]
 #[path = "manager_flags_tests.rs"]
 mod flags_tests;
+
+#[path = "manager_survey.rs"]
+mod survey_conn;
+pub use survey_conn::{SurveyConfig, SurveyMetrics};
+
+#[cfg(test)]
+#[path = "manager_survey_tests.rs"]
+mod survey_tests;
 
 /// Reconsider orphans whose missing parent was just confirmed in `block`.
 ///

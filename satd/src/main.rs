@@ -3003,6 +3003,7 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
         match node::net::asmap::AsMap::load(asmap_path) {
             Ok(map) => {
                 let map = std::sync::Arc::new(map);
+                peer_manager.set_asmap(map.clone());
                 peer_manager.set_addrman_group_fn(Box::new(move |ip| map.group_key(ip)));
                 tracing::info!(path = %asmap_path.display(), "Loaded asmap for ASN-based peer bucketing");
             }
@@ -3028,6 +3029,22 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
     // first (#1150). Read before RPC answers, as Core reads them before its
     // warmup ends: the file is gone by the time a client can see the node.
     peer_manager.load_anchors(&net_datadir.join(node::net::anchors::ANCHORS_FILE));
+
+    // The network survey (#1353), off unless asked for: its store, then its
+    // loop, whose first connection waits one interval.
+    if config.peersurvey {
+        peer_manager.enable_survey(node::net::manager::SurveyConfig {
+            interval: std::time::Duration::from_secs(config.peersurveyinterval),
+            probes: config.peersurveyprobes,
+            path: Some(net_datadir.join(node::net::survey::SURVEY_FILE)),
+        });
+        peer_manager.spawn_survey();
+        tracing::info!(
+            interval_secs = config.peersurveyinterval,
+            probes = config.peersurveyprobes,
+            "Network survey enabled"
+        );
+    }
 
     // Load the persistent ban list (banlist.json). A file that cannot be read
     // or parsed is recreated, as Core's `BanMan::LoadBanlist` does — never a
@@ -5637,6 +5654,9 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
     // (#1150). Core writes them with the address book, in `StopNodes`, and
     // only there: a node that crashes, or is killed, leaves no anchors.
     peer_manager.dump_anchors(&net_datadir.join(node::net::anchors::ANCHORS_FILE));
+
+    // The network survey's records (#1353), when it ran.
+    peer_manager.dump_survey();
 
     // Core dumps the ban list in `~BanMan()`. Every mutator flushes inline, so
     // the only state that can still be pending here is a re-armed dirty flag

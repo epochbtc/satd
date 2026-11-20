@@ -610,6 +610,13 @@ preserved; the satd extension is opt-in per request or per flag.
   pattern, stalling) with their evidence, and the raw counters. Core has no
   equivalent; `getpeerinfo` is unchanged. Flags only report.
 
+- **`getpeersurvey [verbose]` and `-peersurvey`** — an opt-in network
+  survey: one short `survey` connection at a time, outside every connection
+  budget and left out of `getpeerinfo`, to an address drawn uniformly from
+  the address book, recording the implementation family it runs in
+  `peersurvey.dat`. With `-peersurveyprobes` (on with the survey) it sends a
+  few probes Core neither punishes nor disconnects for. Core has no survey.
+
 - **Native Tor v3** — `ADD_ONION` / `DEL_ONION` via control port, with
   `PROTOCOLINFO`-negotiated auth (SAFECOOKIE by default, password, or null) and
   hardcoded `.onion` seeds. No external torification daemon.

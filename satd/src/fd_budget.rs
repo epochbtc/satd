@@ -21,6 +21,7 @@
 //!          + max(1, bind + whitebind)           P2P listeners
 //!          + 1 with -listenonion                Tor control (the onion listener is a bind)
 //!          + 2 with -nap                        attestation pulls
+//!          + 1 with -peersurvey                 the survey connection
 //!          + per RPC listener (plain, TLS,
 //!            read-only, read-only TLS):  1 + RPC_MAX_CONNECTIONS (100)
 //!          + Esplora:   listeners + esploramaxsockets
@@ -247,6 +248,10 @@ pub fn needs(config: &Config) -> Vec<(&'static str, Need)> {
     }
     if config.nap {
         items.push(("nap pulls", fixed(node::nap::pull::MAX_PULL_CONNECTIONS as u64)));
+    }
+    // One survey connection at a time, outside the peer budget.
+    if config.peersurvey {
+        items.push(("survey connection", fixed(1)));
     }
     let rpc_listeners = config.rpcbind.len()
         + usize::from(config.rpc_tls_bind.is_some())
