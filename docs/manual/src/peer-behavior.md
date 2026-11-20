@@ -169,7 +169,7 @@ listening and before it closes:
 | Probe | Sends | Records |
 |---|---|---|
 | `ping` | `ping` with a random nonce | the `pong`'s round trip, in milliseconds |
-| `getheaders` | `getheaders` with the parent of the node's tip as the locator and the tip as the stop | how many headers come back |
+| `getheaders` | `getheaders` with the parent of the node's tip as the locator and the tip as the stop; not sent while the node is at genesis, where a peer would answer with 2,000 headers | how many headers come back |
 | `getdata` | `getdata` for a random transaction id (by wtxid to a peer that relays by wtxid) | whether `notfound` names it |
 | `unknown` | a message of a random type no implementation defines, empty | whether the peer closes the connection over it |
 

@@ -471,11 +471,16 @@ impl PeerManager {
             .unwrap_or_else(|| survey::choose_probes(&mut rand::thread_rng()));
         #[cfg(not(test))]
         let chosen = survey::choose_probes(&mut rand::thread_rng());
-        let (locator, stop) = self.survey_locator();
+        let locator = self.survey_locator();
+        let zero = bitcoin::BlockHash::all_zeros();
+        let (locator_top, stop) = locator.unwrap_or((zero, zero));
         let wtxid_relay = self.peers.read().get(&id).is_some_and(|h| h.info.wtxid_relay);
-        let ctx = ProbeContext::new(&mut rand::thread_rng(), locator, stop, wtxid_relay);
+        let ctx = ProbeContext::new(&mut rand::thread_rng(), locator_top, stop, wtxid_relay);
         let wanted = survey::probe_inventory(&ctx);
         for probe in chosen {
+            if probe == Probe::GetHeaders && locator.is_none() {
+                continue;
+            }
             let sent_at = Instant::now();
             let outcome = if writer.send(survey::probe_message(probe, &ctx)).await.is_err() {
                 ProbeOutcome::Disconnected
@@ -524,16 +529,13 @@ impl PeerManager {
     }
 
     /// The `getheaders` probe's locator and stop: our tip's parent and our
-    /// tip, so a peer on our chain answers with one header. At genesis,
-    /// genesis for both.
-    fn survey_locator(&self) -> (bitcoin::BlockHash, bitcoin::BlockHash) {
+    /// tip, so a peer on our chain answers with one header. `None` at
+    /// genesis, where no stop hash lies past the locator and a peer would
+    /// answer with a full batch of 2,000: the probe is not sent then.
+    pub(super) fn survey_locator(&self) -> Option<(bitcoin::BlockHash, bitcoin::BlockHash)> {
         let tip = self.chain_state.tip_hash();
-        let parent = self
-            .chain_state
-            .get_block_index(&tip)
-            .filter(|e| e.height > 0)
-            .map_or(tip, |e| e.header.prev_blockhash);
-        (parent, tip)
+        let parent = self.chain_state.get_block_index(&tip).filter(|e| e.height > 0)?.header.prev_blockhash;
+        Some((parent, tip))
     }
 
     /// `getpeersurvey`: the aggregate, and with `verbose` a row per
