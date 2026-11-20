@@ -142,6 +142,13 @@ pub enum ConnType {
     /// transactions or addresses. Not a Bitcoin Core type, so `addconnection`
     /// cannot open one.
     NapPull,
+    /// A network-survey connection (`-peersurvey`): the handshake a
+    /// full-relay outbound runs, a few seconds of listening and, under
+    /// `-peersurveyprobes`, a few probes, then closed. It takes no slot of
+    /// any budget, never reaches `getpeerinfo`, and carries no blocks,
+    /// transactions or addresses. Not a Bitcoin Core type, so
+    /// `addconnection` cannot open one.
+    Survey,
 }
 
 impl ConnType {
@@ -156,6 +163,7 @@ impl ConnType {
             ConnType::AddrFetch => "addr-fetch",
             ConnType::Feeler => "feeler",
             ConnType::NapPull => "nap-pull",
+            ConnType::Survey => "survey",
         }
     }
 
@@ -175,6 +183,8 @@ impl ConnType {
     /// Whether we ask this peer to relay transactions to us — the `fRelay`
     /// flag in the `version` we send. Core clears it for block-relay-only and
     /// feeler connections (`CNode::IsBlockOnlyConn() || IsFeelerConn()`).
+    /// A survey connection sets it as a full-relay outbound does, so that its
+    /// `version` is a full-relay one's.
     pub fn wants_tx_relay(self) -> bool {
         !matches!(self, ConnType::BlockRelay | ConnType::Feeler | ConnType::NapPull)
     }
@@ -182,7 +192,7 @@ impl ConnType {
     /// Whether we relay addresses over this connection. Core sets up a peer's
     /// address-relay state for everything except block-relay-only.
     pub fn relays_addrs(self) -> bool {
-        !matches!(self, ConnType::BlockRelay | ConnType::NapPull)
+        !matches!(self, ConnType::BlockRelay | ConnType::NapPull | ConnType::Survey)
     }
 }
 

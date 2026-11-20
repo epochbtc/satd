@@ -321,6 +321,12 @@ implementation its handshake matches, the behaviour flags it carries with
 the numbers behind each, and the raw counters they are judged from.
 `getpeerinfo` is unchanged. See [Peer Behaviour Flags](peer-behavior.md).
 
+`getpeersurvey [verbose]` reports the opt-in network survey (`-peersurvey`):
+the share of each implementation family among the addresses it reached,
+mismatches, BIP 324 share and the busiest autonomous systems. With
+`verbose`, one row per address, so its output holds peer addresses. See
+[Network survey](peer-behavior.md#network-survey).
+
 ## BIP 322 message verification
 
 `verifybip322 "address" "signature" "message"` verifies a

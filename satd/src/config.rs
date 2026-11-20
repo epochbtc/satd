@@ -761,6 +761,17 @@ pub struct Config {
     /// collected set holds; past it new `(outpoint, key)` pairs are refused
     /// and counted. Default 1,000,000. satd-only.
     pub napaggregatormax: usize,
+    /// `-peersurvey`: open one short survey connection at a time, every
+    /// `-peersurveyinterval`, to an address drawn uniformly from the address
+    /// book, and keep what each peer showed in `peersurvey.dat`. Default
+    /// false. satd-only.
+    pub peersurvey: bool,
+    /// `-peersurveyinterval`: seconds between survey connections. Default
+    /// 60. satd-only.
+    pub peersurveyinterval: u64,
+    /// `-peersurveyprobes`: with `-peersurvey`, send the vetted probes on
+    /// each survey connection before it closes. Default true. satd-only.
+    pub peersurveyprobes: bool,
     /// Bitcoin Core's `-networkactive`: start with P2P networking enabled.
     /// Default true; `-networkactive=0` boots with networking paused (no
     /// inbound accepts, no outbound dials) until `setnetworkactive true`.
@@ -4389,6 +4400,13 @@ impl Config {
                 node::nap::aggregate::DEFAULT_MAX_ATTESTATIONS,
                 &file_get,
             )?,
+            peersurvey: resolve_nap(&cli.peer_survey_args.peersurvey, "peersurvey", &file_get),
+            peersurveyinterval: resolve_survey_interval(&cli.peer_survey_args.peersurveyinterval, &file_get)?,
+            peersurveyprobes: cli
+                .peer_survey_args
+                .peersurveyprobes
+                .or_else(|| file_get("peersurveyprobes").and_then(|v| parse_bool(&v)))
+                .unwrap_or(true),
             networkactive,
             txindex,
             addressindex,
@@ -5092,6 +5110,11 @@ impl Config {
                 "max_attestations": self.napmaxattestations,
                 "aggregator": self.napaggregator,
                 "aggregator_max": self.napaggregatormax,
+            },
+            "peer_survey": {
+                "enabled": self.peersurvey,
+                "interval_secs": self.peersurveyinterval,
+                "probes": self.peersurveyprobes,
             },
             "storage": {
                 "txindex": self.txindex,
@@ -6239,6 +6262,11 @@ pub struct CliArgs {
     /// [`StratumArgs`].
     #[command(flatten)]
     pub nap_args: NapArgs,
+
+    /// `-peersurvey`, `-peersurveyinterval` and `-peersurveyprobes`,
+    /// hand-built for the same stack-frame reason as [`StratumArgs`].
+    #[command(flatten)]
+    pub peer_survey_args: PeerSurveyArgs,
 
     /// Bitcoin Core's `-zmqpub<topic>` and `-zmqpub<topic>hwm` flags,
     /// hand-built for the same stack-frame reason as [`StratumArgs`].
@@ -8195,6 +8223,91 @@ impl clap::FromArgMatches for NapArgs {
     }
 }
 
+/// `-peersurveyinterval`, out of `CliArgs` for the same reason as
+/// [`resolve_nap`]. Whole seconds, at least one; a config-file value that
+/// is not one is refused, as the command line refuses one.
+#[inline(never)]
+fn resolve_survey_interval(cli: &Option<u64>, file_get: &dyn Fn(&str) -> Option<String>) -> Result<u64, String> {
+    let secs = match (cli, file_get("peersurveyinterval")) {
+        (Some(n), _) => *n,
+        (None, Some(v)) => v
+            .trim()
+            .parse()
+            .map_err(|_| format!("-peersurveyinterval must be a whole number of seconds, not \"{v}\""))?,
+        (None, None) => node::net::survey::DEFAULT_INTERVAL_SECS,
+    };
+    if secs == 0 {
+        return Err("-peersurveyinterval must be at least 1 second".to_string());
+    }
+    Ok(secs)
+}
+
+/// `-peersurvey`, `-peersurveyinterval` and `-peersurveyprobes` (see
+/// [`CliArgs::peer_survey_args`]).
+#[derive(Debug, Clone, Default)]
+pub struct PeerSurveyArgs {
+    pub peersurvey: Option<bool>,
+    pub peersurveyinterval: Option<u64>,
+    pub peersurveyprobes: Option<bool>,
+}
+
+const PEER_SURVEY_ARG_SPECS: &[(&str, &str, StratumArgKind, &str)] = &[
+    (
+        "peersurvey",
+        "BOOL",
+        StratumArgKind::Bool,
+        "Survey the network: one short outbound connection at a time to an address drawn uniformly from the address book, recording which implementation each peer runs in peersurvey.dat, which holds peer addresses. See getpeersurvey (default: 0)",
+    ),
+    (
+        "peersurveyinterval",
+        "SECS",
+        StratumArgKind::U64,
+        "With -peersurvey, seconds between survey connections (default: 60)",
+    ),
+    (
+        "peersurveyprobes",
+        "BOOL",
+        StratumArgKind::Bool,
+        "With -peersurvey, send a few harmless probes (ping, getheaders, getdata for an unknown transaction, an unknown message type) on each survey connection before it closes. They make survey connections recognisable (default: 1)",
+    ),
+];
+
+impl clap::Args for PeerSurveyArgs {
+    fn augment_args(mut cmd: clap::Command) -> clap::Command {
+        for spec in PEER_SURVEY_ARG_SPECS {
+            cmd = cmd.arg(stratum_arg(spec));
+        }
+        cmd
+    }
+
+    fn augment_args_for_update(cmd: clap::Command) -> clap::Command {
+        Self::augment_args(cmd)
+    }
+}
+
+impl clap::FromArgMatches for PeerSurveyArgs {
+    fn from_arg_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
+        Self::from_arg_matches_mut(&mut matches.clone())
+    }
+
+    fn from_arg_matches_mut(m: &mut clap::ArgMatches) -> Result<Self, clap::Error> {
+        Ok(Self {
+            peersurvey: m.remove_one("peersurvey"),
+            peersurveyinterval: m.remove_one("peersurveyinterval"),
+            peersurveyprobes: m.remove_one("peersurveyprobes"),
+        })
+    }
+
+    fn update_from_arg_matches(&mut self, matches: &clap::ArgMatches) -> Result<(), clap::Error> {
+        self.update_from_arg_matches_mut(&mut matches.clone())
+    }
+
+    fn update_from_arg_matches_mut(&mut self, m: &mut clap::ArgMatches) -> Result<(), clap::Error> {
+        *self = Self::from_arg_matches_mut(m)?;
+        Ok(())
+    }
+}
+
 /// The address-index limits (see [`CliArgs::addrindex_args`]).
 #[derive(Debug, Clone, Default)]
 pub struct AddrIndexArgs {
@@ -8848,6 +8961,8 @@ const NEGATABLE_BOOL_FLAGS: &[&str] = &[
     "nap",
     "napstorerecover",
     "napaggregator",
+    "peersurvey",
+    "peersurveyprobes",
     "networkactive",
     "esplora",
     "esploramtls",
@@ -9055,6 +9170,9 @@ pub fn normalize_args(args: Vec<String>) -> Vec<String> {
         "nap",
         "napstorerecover",
         "napaggregator",
+        "peersurvey",
+        "peersurveyinterval",
+        "peersurveyprobes",
         "minrelaytxfee",
         "dustrelayfee",
         "datacarriersize",
@@ -9901,6 +10019,9 @@ pub const KNOWN_CONFIG_KEYS: &[&str] = &[
     "napmaxattestations",
     "napaggregator",
     "napaggregatormax",
+    "peersurvey",
+    "peersurveyinterval",
+    "peersurveyprobes",
     "networkactive",
     // Esplora
     "esplora",
@@ -12802,6 +12923,7 @@ testactivationheight=bip34@2
             tx_announce_args: TxAnnounceArgs::default(),
             opreturn_prune_args: OpReturnPruneArgs::default(),
             nap_args: NapArgs::default(),
+            peer_survey_args: PeerSurveyArgs::default(),
             peertimeout: None,
             cjdnsreachable: None,
             datadir: Some(PathBuf::from("/tmp/satd-test")),
@@ -13126,6 +13248,7 @@ testactivationheight=bip34@2
             tx_announce_args: TxAnnounceArgs::default(),
             opreturn_prune_args: OpReturnPruneArgs::default(),
             nap_args: NapArgs::default(),
+            peer_survey_args: PeerSurveyArgs::default(),
             peertimeout: None,
             cjdnsreachable: None,
             datadir: Some(PathBuf::from("/tmp/satd-test")),

@@ -771,6 +771,30 @@ impl Peer {
         }
     }
 
+    /// Send a `ping` and read until its `pong`, answering Core's pings and
+    /// returning the type of every other message read on the way.
+    fn exchange(&mut self, nonce: u64) -> Result<Vec<String>, String> {
+        self.send(NetworkMessage::Ping(nonce))?;
+        let deadline = Instant::now() + IO_TIMEOUT;
+        let mut seen = Vec::new();
+        loop {
+            if Instant::now() > deadline {
+                return Err("no pong".into());
+            }
+            let (cmd, payload) = self.recv()?;
+            match cmd.as_str() {
+                "ping" if payload.len() >= 8 => {
+                    let n = u64::from_le_bytes(payload[..8].try_into().expect("8 bytes"));
+                    self.send(NetworkMessage::Pong(n))?;
+                }
+                "pong" if payload.len() >= 8 && u64::from_le_bytes(payload[..8].try_into().expect("8 bytes")) == nonce => {
+                    return Ok(seen);
+                }
+                _ => seen.push(cmd),
+            }
+        }
+    }
+
     /// Complete the handshake: our `version`, Core's `verack`, ours, and a
     /// `sendcmpct` (version 2) so Core reads the `cmpctblock`s it is sent
     /// (`net_processing.cpp:4795`).
@@ -819,6 +843,38 @@ fn version_at(timestamp: i64, nonce: u64, user_agent: &str) -> VersionMessage {
     v
 }
 
+/// What Core did with one survey probe ([`CoreOracle::probe`]).
+#[derive(Debug)]
+pub struct ProbeVerdict {
+    /// Core's id for the connection, as its log lines name it.
+    pub core_id: u64,
+    /// The message types Core sent between the probe and the `pong`.
+    pub replies: Vec<String>,
+    /// Core's log lines from the probe on.
+    pub log: Vec<String>,
+    /// Core still holds the connection.
+    pub still_connected: bool,
+    /// Entries in Core's `listbanned`.
+    pub banned: usize,
+}
+
+impl ProbeVerdict {
+    /// Lines about this connection that mark a misbehaviour or a disconnect:
+    /// Core's `Misbehaving` and every line ending a connection name the
+    /// peer as `peer=<id>`.
+    pub fn punishment(&self) -> Vec<&String> {
+        let me = format!("peer={}", self.core_id);
+        self.log
+            .iter()
+            .filter(|l| {
+                let m = core_message(l);
+                l.split(|c: char| !c.is_ascii_alphanumeric() && c != '=').any(|w| w == me)
+                    && (m.starts_with("Misbehaving") || m.contains("disconnecting") || m.contains("Disconnecting"))
+            })
+            .collect()
+    }
+}
+
 /// A resident regtest `bitcoind` and a v1 and a v2 connection to it.
 pub struct CoreOracle {
     daemon: Daemon,
@@ -850,9 +906,20 @@ impl CoreOracle {
     /// The ports are picked free and then handed to `bitcoind`, so another
     /// process can take one in between; startup is tried three times.
     pub fn start() -> Result<CoreOracle, String> {
+        Self::start_with(true)
+    }
+
+    /// [`Self::start`] without `-whitelist=noban@127.0.0.1`: Core judges
+    /// this harness's connections as it judges any peer's, so misbehaviour
+    /// costs the connection. For the survey probes (#1353).
+    pub fn start_without_whitelist() -> Result<CoreOracle, String> {
+        Self::start_with(false)
+    }
+
+    fn start_with(whitelist: bool) -> Result<CoreOracle, String> {
         let mut last = String::new();
         for attempt in 1..=3 {
-            match Self::start_once() {
+            match Self::start_once(whitelist) {
                 Ok(oracle) => return Ok(oracle),
                 Err(e) => {
                     eprintln!("p2p-differential: starting Bitcoin Core, attempt {attempt}: {e}");
@@ -863,7 +930,7 @@ impl CoreOracle {
         Err(last)
     }
 
-    fn start_once() -> Result<CoreOracle, String> {
+    fn start_once(whitelist: bool) -> Result<CoreOracle, String> {
         let work = scratch_root().join(format!("satd-p2pdiff-{}-{}", std::process::id(), free_port().map_err(|e| e.to_string())?));
         std::fs::create_dir_all(&work).map_err(|e| format!("{}: {e}", work.display()))?;
         // Removed on every early return below, and with the oracle.
@@ -888,12 +955,15 @@ impl CoreOracle {
         args.extend(
             [
                 "-listen=1", "-connect=0", "-dnsseed=0", "-fixedseeds=0", "-discover=0", "-listenonion=0",
-                "-natpmp=0", "-v2transport=1", "-whitelist=noban@127.0.0.1", "-debug=net", "-debug=mempool",
+                "-natpmp=0", "-v2transport=1", "-debug=net", "-debug=mempool",
                 "-debug=mempoolrej", "-debug=cmpctblock", "-printtoconsole=0", "-shrinkdebugfile=0",
                 "-logthreadnames=0", "-logtimestamps=0",
             ]
             .map(String::from),
         );
+        if whitelist {
+            args.push("-whitelist=noban@127.0.0.1".into());
+        }
         let mut daemon = Daemon::spawn(&bitcoind, &args, &work.0)?;
         let rpc = Client::new(&format!("http://127.0.0.1:{rpc_port}"), Auth::UserPass(user.into(), pass))
             .map_err(|e| format!("rpc client: {e}"))?;
@@ -1075,6 +1145,53 @@ impl CoreOracle {
                 "version neither read nor refused".into()
             })
         }))
+    }
+
+    /// Send `msg` on a fresh connection, as a survey probe goes out after
+    /// the handshake, then a `ping`: Core handles a peer's messages in
+    /// order (and answers a `getdata` before it reads on), so once the
+    /// `pong` is back the probe has been handled. Reports what Core sent in
+    /// between, what it logged, and whether it still holds the connection
+    /// and has banned or discouraged anything.
+    pub fn probe(&mut self, v2: bool, msg: NetworkMessage) -> Result<ProbeVerdict, String> {
+        let nonce = self.next_nonce();
+        let mut peer = Peer::connect(self.p2p_port, v2)?;
+        peer.handshake(nonce)?;
+        let local_port = peer.local_port;
+        let core_id = self
+            .core_peer(local_port)
+            .and_then(|p| p["id"].as_u64())
+            .ok_or("Core does not list the connection after the handshake")?;
+        self.skip_log();
+        let sync_nonce = self.next_nonce();
+        let replies = peer.send(msg).and_then(|()| peer.exchange(sync_nonce));
+        // Core logs a misbehaviour as it handles the message: by the pong
+        // the line is written, but give the logger a moment.
+        std::thread::sleep(Duration::from_millis(200));
+        let log = self.read_log();
+        let still_connected = !peer.closed_by_core() && self.core_peer(local_port).is_some();
+        let banned: serde_json::Value = self.rpc.call("listbanned", &[]).map_err(|e| format!("listbanned: {e}"))?;
+        drop(peer);
+        Ok(ProbeVerdict {
+            core_id,
+            replies: replies?,
+            log,
+            still_connected,
+            banned: banned.as_array().map_or(0, Vec::len),
+        })
+    }
+
+    /// The active chain's genesis and first block, from Core.
+    pub fn first_blocks(&self) -> Result<(bitcoin::BlockHash, bitcoin::BlockHash), String> {
+        let genesis = self.rpc.get_block_hash(0).map_err(|e| format!("getblockhash 0: {e}"))?;
+        let first = self.rpc.get_block_hash(1).map_err(|e| format!("getblockhash 1: {e}"))?;
+        Ok((genesis, first))
+    }
+
+    fn core_peer(&self, local_port: u16) -> Option<serde_json::Value> {
+        let peers: serde_json::Value = self.rpc.call("getpeerinfo", &[]).ok()?;
+        let want = format!("127.0.0.1:{local_port}");
+        peers.as_array()?.iter().find(|p| p["addr"].as_str() == Some(want.as_str())).cloned()
     }
 
     fn peer_services(&self, local_port: u16) -> Option<u64> {

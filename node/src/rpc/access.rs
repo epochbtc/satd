@@ -231,7 +231,11 @@ pub fn classify(method: &str) -> Option<RpcAccess> {
         | "syncwithvalidationinterfacequeue"
         // NAP: what this node publishes to its peers is the operator's call.
         | "submitnapattestation"
-        | "removenapattestation" => Control,
+        | "removenapattestation"
+        // The network survey's records: with `verbose`, the address of every
+        // peer the survey reached. An operator's diagnostic, kept off the
+        // read-only listener and away from read-only tokens.
+        | "getpeersurvey" => Control,
 
         // --- Control: index management ---
         "backfillindex" | "pauseindex" | "resumeindex" | "cancelindex" => Control,
@@ -321,6 +325,7 @@ mod tests {
             "setnetworkactive",
             "logging",
             "getblockfrompeer",
+            "getpeersurvey",
             "prioritisetransaction",
             "getprioritisedtransactions",
             "savemempool",
