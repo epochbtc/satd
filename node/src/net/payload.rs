@@ -26,6 +26,9 @@
 //!   Core's `UnserializeTransaction` reads them ([`crate::validation::decode`]):
 //!   `version | 00 00 | lock_time` is a transaction with no inputs, which the
 //!   mempool or block validation then refuses, not an undecodable message.
+//! - `headers` reads each header's transaction count as a CompactSize and
+//!   ignores it (`net_processing.cpp`, `HEADERS`); rust-bitcoin reads one
+//!   byte and refuses a non-zero count.
 //! - `feefilter`'s value is read whole, whatever it is. Core reads the
 //!   `CAmount` and then ignores a value outside `MoneyRange`
 //!   (`net_processing.cpp:5035-5045`); the handler does the same
@@ -109,17 +112,31 @@ fn read_version(payload: &[u8]) -> Result<VersionMessage, encode::Error> {
     Ok(msg)
 }
 
-/// `headers`: a count, then each header followed by a one-byte tx count
-/// that must be zero, as rust-bitcoin reads it.
+/// Core's `MAX_SIZE` (`src/serialize.h`): the range check on a CompactSize
+/// read as a size or count.
+const MAX_SIZE: u64 = 0x0200_0000;
+
+/// Core's `ReadCompactSize` with its range check (`src/serialize.h`):
+/// canonical (rust-bitcoin's `VarInt` checks that) and at most `MAX_SIZE`.
+fn read_compact_size(r: &mut &[u8]) -> Result<u64, encode::Error> {
+    let n = encode::VarInt::consensus_decode(r)?.0;
+    if n > MAX_SIZE {
+        return Err(encode::Error::ParseFailed("ReadCompactSize(): size too large"));
+    }
+    Ok(n)
+}
+
+/// `headers`, as Core's handler reads it (`net_processing.cpp`, `HEADERS`):
+/// a count, then each header followed by a CompactSize transaction count
+/// that is read and ignored ("ignore tx count; assume it is 0"). rust-bitcoin
+/// reads the count as one byte and refuses it unless it is zero.
 fn read_headers(payload: &[u8]) -> Result<Vec<bitcoin::block::Header>, encode::Error> {
     let mut r = payload;
-    let count = encode::VarInt::consensus_decode(&mut r)?.0;
+    let count = read_compact_size(&mut r)?;
     let mut out = Vec::with_capacity((count as usize).min(payload.len() / 81));
     for _ in 0..count {
         out.push(bitcoin::block::Header::consensus_decode(&mut r)?);
-        if u8::consensus_decode(&mut r)? != 0 {
-            return Err(encode::Error::ParseFailed("Headers message should not contain transactions"));
-        }
+        read_compact_size(&mut r)?;
     }
     Ok(out)
 }

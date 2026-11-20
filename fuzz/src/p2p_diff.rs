@@ -1424,6 +1424,16 @@ pub fn seed_payloads() -> Vec<(&'static str, &'static str, Vec<u8>)> {
     headers.push(0);
     seeds.push(("headers", "headers-one", headers));
     seeds.push(("headers", "headers-none", compact_size(0)));
+    // Core reads each header's tx count as a CompactSize and ignores it.
+    let mut headers = compact_size(1);
+    headers.extend(enc(&genesis.header));
+    headers.push(1);
+    seeds.push(("headers", "headers-tx-count-one", headers));
+    let mut headers = compact_size(1);
+    headers.extend(enc(&genesis.header));
+    headers.extend(compact_size(256));
+    seeds.push(("headers", "headers-tx-count-3-byte", headers));
+
 
     // cmpctblock: header, nonce, one short id, the coinbase prefilled.
     let mut cmpct = enc(&genesis.header);

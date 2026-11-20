@@ -307,3 +307,40 @@ fn a_transaction_with_no_inputs_reads_as_core_reads_it() {
         other => panic!("not a block: {other:?}"),
     }
 }
+
+/// `headers`: one genesis header followed by `tx_count` as given.
+fn headers_with_tx_count(tx_count: &[u8]) -> Vec<u8> {
+    let mut p = vec![1u8];
+    p.extend(encode::serialize(&bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest).header));
+    p.extend_from_slice(tx_count);
+    p
+}
+
+/// Core reads each header's transaction count as a CompactSize and ignores
+/// it (`net_processing.cpp`, `HEADERS`), whatever its value (#1346). Its
+/// read is range-checked and canonical, as every `ReadCompactSize` is.
+#[test]
+fn a_headers_tx_count_is_read_as_a_compact_size_and_ignored() {
+    let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest).header;
+    for count in [&[0u8][..], &[1], &[0xfc], &[0xfd, 0x00, 0x01], &[0xfe, 0x00, 0x00, 0x00, 0x02]] {
+        match decode_payload(cmd("headers"), &headers_with_tx_count(count)) {
+            Ok(NetworkMessage::Headers(h)) => assert_eq!(h, vec![genesis], "tx count {count:02x?}"),
+            other => panic!("tx count {count:02x?}: {other:?}"),
+        }
+    }
+    // Two headers, the first with a three-byte count: the second is read
+    // after all three bytes.
+    let mut two = headers_with_tx_count(&[0xfd, 0x00, 0x01]);
+    two[0] = 2;
+    two.extend(encode::serialize(&genesis));
+    two.push(0);
+    match decode_payload(cmd("headers"), &two) {
+        Ok(NetworkMessage::Headers(h)) => assert_eq!(h, vec![genesis, genesis]),
+        other => panic!("{other:?}"),
+    }
+    // Refused, as Core's `ReadCompactSize` refuses them: non-canonical,
+    // above MAX_SIZE, truncated.
+    for count in [&[0xfd, 0x01, 0x00][..], &[0xfe, 0x01, 0x00, 0x00, 0x02], &[0xfd, 0x01]] {
+        assert!(decode_payload(cmd("headers"), &headers_with_tx_count(count)).is_err(), "tx count {count:02x?}");
+    }
+}
