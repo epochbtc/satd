@@ -3047,6 +3047,15 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
         );
     }
 
+    // `-peerflagpolicy` (#1356). Under `observe`, the default, the flags
+    // change nothing and the inbound eviction is Core's.
+    peer_manager.set_flag_policy(config.flag_policy());
+    if config.flag_policy() == node::net::flags::FlagPolicy::Evict {
+        tracing::info!(
+            "Peer flag policy evict: inbound peers flagged C, S or F are evicted first when an inbound slot is needed"
+        );
+    }
+
     // The network survey (#1353), off unless asked for: its store, then its
     // loop, whose first connection waits one interval.
     if config.peersurvey {

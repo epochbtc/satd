@@ -6,6 +6,11 @@
 //! privacy networks), then evicts the youngest peer of the network group with
 //! the most connections among those left. `None` means every candidate is
 //! protected.
+//!
+//! One satd addition: under `-peerflagpolicy=evict` a candidate the manager
+//! marks [`EvictionCandidate::flagged`] gets none of those protections and is
+//! evicted before any other. Under the default `observe` no candidate is
+//! marked and the selection is Core's, step for step.
 
 use std::cmp::Ordering;
 use std::collections::HashMap;
@@ -52,6 +57,10 @@ pub struct EvictionCandidate {
     /// An inbound connection; every other type is protected
     /// (`m_conn_type == ConnectionType::INBOUND`).
     pub inbound: bool,
+    /// satd: the peer carries a flag `-peerflagpolicy=evict` acts on (`C`,
+    /// `S` or `F`) and no permission that exempts it. Always false under
+    /// `observe`. Not in Core.
+    pub flagged: bool,
 }
 
 /// A strict-weak "less than" turned into the `Ordering` Rust's sort takes.
@@ -237,6 +246,16 @@ pub fn select_node_to_evict(mut candidates: Vec<EvictionCandidate>) -> Option<Pe
     // `ProtectNoBanConnections`, `ProtectOutboundConnections`.
     candidates.retain(|c| !c.noban && c.inbound);
 
+    // satd, `-peerflagpolicy=evict`: flagged candidates lose the protections
+    // below and go first. The two above still hold, so a flagged `noban` or
+    // outbound peer is never chosen. Among the flagged, Core's last step
+    // picks: the youngest of the network group with the most of them.
+    if candidates.iter().any(|c| c.flagged) {
+        candidates.retain(|c| c.flagged);
+        candidates.sort_by(|a, b| ordering(reverse_compare_node_time_connected, a, b));
+        return youngest_of_largest_group(&candidates);
+    }
+
     // Four peers by keyed netgroup: an attacker cannot predict which.
     erase_last_k_elements(&mut candidates, compare_net_group_keyed, 4, |_| true);
     // The eight with the lowest minimum ping: hard to fake without moving.
@@ -261,14 +280,20 @@ pub fn select_node_to_evict(mut candidates: Vec<EvictionCandidate>) -> Option<Pe
         candidates.retain(|c| c.prefer_evict);
     }
 
-    // The network group with the most connections and the youngest member.
     // `candidates` is sorted by reverse connect time (youngest first) by the
     // last step of the ratio protection.
+    youngest_of_largest_group(&candidates)
+}
+
+/// The last step of Core's `SelectNodeToEvict`: the network group with the
+/// most connections (on a tie, the one whose youngest member is youngest),
+/// and its youngest member. `candidates` must be sorted youngest first.
+fn youngest_of_largest_group(candidates: &[EvictionCandidate]) -> Option<PeerId> {
     let mut groups: HashMap<u64, Vec<&EvictionCandidate>> = HashMap::new();
     let mut most_connections = 0usize;
     let mut most_connections_time = 0u64;
     let mut most_connections_group = 0u64;
-    for c in &candidates {
+    for c in candidates {
         let group = groups.entry(c.keyed_net_group).or_default();
         group.push(c);
         let group_time = group[0].connected;
@@ -309,6 +334,7 @@ mod tests {
                 network: Some(NETS[rng.gen_range(0..NETS.len())]),
                 noban: false,
                 inbound: true,
+                flagged: false,
             })
             .collect()
     }
@@ -477,6 +503,7 @@ mod tests {
             network: Some(Network::Ipv4),
             noban: false,
             inbound: true,
+            flagged: false,
         };
         let mut candidates = Vec::new();
         // Twenty peers the fixed protections take: four by netgroup, eight by
@@ -503,5 +530,83 @@ mod tests {
         // The ratio step keeps the seven oldest of the 14 left (group 2's
         // first seven), leaving three of group 2 and all four of group 1.
         assert_eq!(select_node_to_evict(candidates), Some(4));
+    }
+
+    /// `-peerflagpolicy=evict`: a flagged candidate is chosen even when each
+    /// of Core's protections would keep it, and with twenty candidates, a
+    /// set Core never evicts from.
+    #[test]
+    fn a_flagged_candidate_loses_every_protection() {
+        let mut rng = rand::rngs::StdRng::seed_from_u64(4);
+        for n in 1..=40usize {
+            let first = |c: &EvictionCandidate| c.id == 0;
+            let setups: [&dyn Fn(&mut EvictionCandidate, usize); 7] = [
+                &|c, n| c.keyed_net_group = n as u64 - c.id,
+                &|c, _| c.min_ping_us = c.id,
+                &|c, n| c.last_tx_time = n as u64 - c.id,
+                &|c, n| {
+                    c.last_block_time = n as u64 - c.id;
+                    c.relay_txs = false;
+                    c.relevant_services = true;
+                },
+                &|c, n| c.last_block_time = n as u64 - c.id,
+                &|c, _| c.connected = c.id,
+                &|c, _| c.network = Some(if c.id == 0 { Network::Onion } else { Network::Ipv4 }),
+            ];
+            for setup in setups {
+                let mut candidates = random_candidates(n, &mut rng);
+                for c in candidates.iter_mut() {
+                    setup(c, n);
+                    c.flagged = first(c);
+                }
+                candidates.shuffle(&mut rng);
+                assert_eq!(select_node_to_evict(candidates), Some(0), "{n}");
+            }
+        }
+    }
+
+    /// The protections Core never lifts still hold for a flagged candidate:
+    /// a flagged `noban` or outbound peer is never chosen, and Core's own
+    /// selection runs among the rest.
+    #[test]
+    fn a_flagged_noban_or_outbound_candidate_is_never_evicted() {
+        let mut rng = rand::rngs::StdRng::seed_from_u64(5);
+        for _ in 0..50 {
+            let mut candidates = random_candidates(60, &mut rng);
+            for c in candidates.iter_mut() {
+                c.noban = c.id % 3 == 0;
+                c.inbound = c.id % 3 != 1;
+                c.flagged = c.id % 3 != 2;
+            }
+            let unflagged: Vec<EvictionCandidate> =
+                candidates.iter().cloned().map(|c| EvictionCandidate { flagged: false, ..c }).collect();
+            assert_eq!(select_node_to_evict(candidates), select_node_to_evict(unflagged));
+        }
+    }
+
+    /// Among several flagged candidates Core's last step picks: the youngest
+    /// of the network group with the most of them. Unflagged peers, older or
+    /// younger, are left alone.
+    #[test]
+    fn among_the_flagged_the_youngest_of_the_largest_group_goes() {
+        let mut rng = rand::rngs::StdRng::seed_from_u64(6);
+        let mut candidates = random_candidates(60, &mut rng);
+        for c in candidates.iter_mut() {
+            c.prefer_evict = false;
+            c.connected = 1_000 + c.id;
+            match c.id {
+                10..=12 => {
+                    c.flagged = true;
+                    c.keyed_net_group = 7;
+                }
+                20 | 21 => {
+                    c.flagged = true;
+                    c.keyed_net_group = 8;
+                }
+                _ => {}
+            }
+        }
+        candidates.shuffle(&mut rng);
+        assert_eq!(select_node_to_evict(candidates), Some(12));
     }
 }
