@@ -717,6 +717,15 @@ pub struct AppState {
     /// Selected value row in the NAP view, over [`crate::nap::Report::value_rows`].
     pub selected_nap_row: usize,
 
+    /// Each connected peer's behaviour from `getpeerbehavior`, by id.
+    /// `None` until the node answers, and for good on a node that does not
+    /// serve the method: every behaviour surface is hidden while `None`.
+    pub peer_behavior: Option<crate::behavior::BehaviorMap>,
+    /// `f`: the peers tables show only flagged peers.
+    pub flagged_only: bool,
+    /// The peer whose detail overlay is open (`Enter`), by id.
+    pub peer_detail: Option<u64>,
+
     // Internal tracking
     prev_blocks: u32,
     prev_headers: u32,
@@ -940,6 +949,9 @@ impl AppState {
             nap_publisher: crate::nap::Half::Unknown,
             nap_report: crate::nap::Half::Unknown,
             selected_nap_row: 0,
+            peer_behavior: None,
+            flagged_only: false,
+            peer_detail: None,
 
             prev_blocks: 0,
             prev_headers: 0,
@@ -1073,6 +1085,7 @@ impl AppState {
             }
 
             self.peers = arr.clone();
+            self.clamp_peer_selection();
         }
     }
 
@@ -1758,6 +1771,107 @@ impl AppState {
             self.force_mode = Some(mode);
             self.mode = mode;
         }
+    }
+
+    /// Apply one poll of `getpeerbehavior`. A node that does not serve the
+    /// method hides every behaviour surface, and its filter and overlay go
+    /// with them; any other failure keeps the last answer and is shown in
+    /// the title bar like any other method's.
+    pub fn update_peer_behavior(&mut self, poll: crate::behavior::Poll) {
+        use crate::behavior::Poll;
+        match poll {
+            Poll::Answered(map) => {
+                self.rpc_failures.remove("getpeerbehavior");
+                self.peer_behavior = Some(map);
+            }
+            Poll::NotServed => {
+                self.rpc_failures.remove("getpeerbehavior");
+                self.peer_behavior = None;
+                self.flagged_only = false;
+                self.peer_detail = None;
+            }
+            Poll::Failed(msg) => {
+                self.rpc_failures.insert("getpeerbehavior", msg);
+            }
+        }
+        self.clamp_peer_selection();
+    }
+
+    /// A peer's behaviour, while the node serves it.
+    pub fn behavior_for(&self, id: u64) -> Option<&crate::behavior::PeerBehavior> {
+        self.peer_behavior.as_ref()?.get(&id)
+    }
+
+    /// Whether the flag filter is in force: on, and the node serves
+    /// behaviour data.
+    pub fn flag_filter_active(&self) -> bool {
+        self.flagged_only && self.peer_behavior.is_some()
+    }
+
+    /// The rows of the peers tables: every peer, or with the `f` filter on
+    /// only the flagged ones.
+    pub fn visible_peers(&self) -> Vec<&serde_json::Value> {
+        if !self.flag_filter_active() {
+            return self.peers.iter().collect();
+        }
+        self.peers
+            .iter()
+            .filter(|p| {
+                let id = p.get("id").and_then(|i| i.as_u64());
+                id.and_then(|id| self.behavior_for(id)).is_some_and(|b| b.is_flagged())
+            })
+            .collect()
+    }
+
+    fn clamp_peer_selection(&mut self) {
+        let n = self.visible_peers().len();
+        if self.selected_peer >= n {
+            self.selected_peer = n.saturating_sub(1);
+        }
+    }
+
+    /// Move the highlighted peer row by one.
+    pub fn move_peer_selection(&mut self, delta: isize) {
+        let n = self.visible_peers().len();
+        let next = self.selected_peer.saturating_add_signed(delta);
+        if next < n {
+            self.selected_peer = next;
+        }
+    }
+
+    /// Whether the active view has a peers table.
+    fn peers_view(&self) -> bool {
+        matches!(self.active_mode(), ViewMode::Ibd | ViewMode::Steady)
+    }
+
+    /// `f`: toggle the flagged-peers filter. Does nothing without behaviour
+    /// data or outside the views with a peers table.
+    pub fn toggle_flag_filter(&mut self) {
+        if self.peer_behavior.is_none() || !self.peers_view() {
+            return;
+        }
+        self.flagged_only = !self.flagged_only;
+        self.selected_peer = 0;
+    }
+
+    /// `Enter`: open the detail overlay on the highlighted peer. Does
+    /// nothing without behaviour data or outside the views with a peers
+    /// table.
+    pub fn open_peer_detail(&mut self) {
+        if self.peer_behavior.is_none() || !self.peers_view() {
+            return;
+        }
+        self.peer_detail = self
+            .visible_peers()
+            .get(self.selected_peer)
+            .and_then(|p| p.get("id"))
+            .and_then(|i| i.as_u64());
+    }
+
+    /// The peer detail overlay to draw: open, in a view with a peers table,
+    /// on a node that serves behaviour data.
+    pub fn shown_peer_detail(&self) -> Option<u64> {
+        if self.peer_behavior.is_some() && self.peers_view() { self.peer_detail } else { None }
     }
 
     /// Active view mode (respects force override).
@@ -2597,6 +2711,102 @@ mod tests {
         let dist2 = st.subver_distribution(10);
         let total: usize = dist2.iter().map(|(_, c)| c).sum();
         assert_eq!(total, 8); // unchanged — empty was filtered out
+    }
+
+    /// A steady-state view with four peers from `getpeerinfo` and their
+    /// behaviour (ids 3 F, 7 C, 9 ST, 11 none).
+    fn behaviour_state() -> AppState {
+        let mut st = AppState::new();
+        st.force_mode = Some(ViewMode::Steady);
+        st.peers = [3, 7, 9, 11]
+            .iter()
+            .map(|id| json!({"id": id, "subver": "/Satoshi:27.0.0/", "transport_protocol_type": "v2"}))
+            .collect();
+        st.update_peer_behavior(crate::behavior::classify(Ok(crate::behavior::tests::reply())));
+        st
+    }
+
+    fn mnf() -> crate::behavior::Poll {
+        crate::behavior::classify(Err(crate::rpc::RpcError::Rpc {
+            code: crate::rpc::JSONRPC_METHOD_NOT_FOUND,
+            message: "Method not found".into(),
+        }))
+    }
+
+    fn visible_ids(st: &AppState) -> Vec<u64> {
+        st.visible_peers().iter().filter_map(|p| p["id"].as_u64()).collect()
+    }
+
+    #[test]
+    fn flag_filter_shows_only_flagged_peers() {
+        let mut st = behaviour_state();
+        assert_eq!(visible_ids(&st), [3, 7, 9, 11]);
+        st.selected_peer = 3;
+        st.toggle_flag_filter();
+        assert!(st.flag_filter_active());
+        assert_eq!(visible_ids(&st), [3, 7, 9], "peer 11 has no flag");
+        assert_eq!(st.selected_peer, 0, "the selection restarts at the top");
+        st.move_peer_selection(1);
+        st.move_peer_selection(1);
+        st.move_peer_selection(1);
+        assert_eq!(st.selected_peer, 2, "the selection stays inside the filtered rows");
+        st.toggle_flag_filter();
+        assert_eq!(visible_ids(&st), [3, 7, 9, 11]);
+
+        // Outside the peers views `f` does nothing.
+        st.force_mode = Some(ViewMode::Mempool);
+        st.toggle_flag_filter();
+        assert!(!st.flagged_only);
+    }
+
+    #[test]
+    fn enter_opens_the_detail_of_the_highlighted_peer() {
+        let mut st = behaviour_state();
+        st.toggle_flag_filter();
+        st.move_peer_selection(1);
+        st.open_peer_detail();
+        assert_eq!(st.shown_peer_detail(), Some(7), "the second flagged row is peer 7");
+        // Another view hides it; coming back shows it again.
+        st.force_mode = Some(ViewMode::Chain);
+        assert_eq!(st.shown_peer_detail(), None);
+        st.force_mode = Some(ViewMode::Steady);
+        assert_eq!(st.shown_peer_detail(), Some(7));
+    }
+
+    /// A node without `getpeerbehavior` answers "method not found": the
+    /// filter, the overlay and every behaviour surface go, and nothing is
+    /// recorded as failing. Any other failure keeps the last answer.
+    #[test]
+    fn method_not_found_hides_peer_behaviour() {
+        let mut st = behaviour_state();
+        st.toggle_flag_filter();
+        st.open_peer_detail();
+        assert!(st.shown_peer_detail().is_some());
+
+        st.update_peer_behavior(crate::behavior::Poll::Failed("timed out".into()));
+        assert!(st.peer_behavior.is_some(), "a failure keeps the last answer");
+        assert!(st.rpc_failures.contains_key("getpeerbehavior"));
+
+        st.update_peer_behavior(mnf());
+        assert!(st.peer_behavior.is_none());
+        assert!(!st.rpc_failures.contains_key("getpeerbehavior"));
+        assert!(!st.flag_filter_active());
+        assert_eq!(st.shown_peer_detail(), None);
+        assert_eq!(visible_ids(&st), [3, 7, 9, 11]);
+
+        // With no data, `f` and `Enter` do nothing.
+        st.toggle_flag_filter();
+        st.open_peer_detail();
+        assert!(!st.flagged_only);
+        assert_eq!(st.peer_detail, None);
+
+        // A node that never served it: same, from the start.
+        let mut fresh = AppState::new();
+        fresh.force_mode = Some(ViewMode::Steady);
+        fresh.peers = vec![json!({"id": 1})];
+        fresh.update_peer_behavior(mnf());
+        fresh.open_peer_detail();
+        assert_eq!(fresh.shown_peer_detail(), None);
     }
 
     #[test]

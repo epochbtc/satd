@@ -274,6 +274,12 @@ impl RpcClient {
         self.call("getserverstatus", &[]).await
     }
 
+    /// satd's `getpeerbehavior`: every peer's fingerprint and flags. A node
+    /// without it answers "method not found".
+    pub async fn get_peer_behavior(&self) -> Result<serde_json::Value, RpcError> {
+        self.call("getpeerbehavior", &[]).await
+    }
+
     pub async fn get_network_info(&self) -> Result<serde_json::Value, RpcError> {
         self.call("getnetworkinfo", &[]).await
     }

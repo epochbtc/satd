@@ -96,11 +96,7 @@ pub fn draw(f: &mut Frame, state: &AppState) {
         ViewMode::Nap => nap_help(),
     };
     let mut lines = lines;
-    // Every view's help ends with its keys; `5` does nothing, and is not
-    // listed, unless the node has NAP on.
-    if state.nap_available() {
-        lines.push(label("5", "Force the NAP view (press again for auto)"));
-    }
+    lines.extend(extra_keys(state));
 
     let help = Paragraph::new(lines).wrap(Wrap { trim: false });
     f.render_widget(help, inner);
@@ -127,6 +123,35 @@ fn label(key: &str, desc: &str) -> Line<'static> {
     Line::from(vec![
         Span::styled(format!("  {:<14}", key), Style::default().fg(Color::Cyan)),
         Span::styled(desc.to_string(), Style::default().fg(Color::White)),
+    ])
+}
+
+/// Keys listed only while they do something, after each view's own: `5`
+/// while the node has NAP on, and in the peers views `Enter` and `f` while
+/// the node serves peer behaviour data.
+fn extra_keys(state: &AppState) -> Vec<Line<'static>> {
+    let mut out = Vec::new();
+    if state.peer_behavior.is_some() && matches!(state.active_mode(), ViewMode::Ibd | ViewMode::Steady) {
+        out.push(label("Enter", "Peer detail: fingerprint, flags with evidence, counters (Esc closes)"));
+        out.push(label("f", "Show only flagged peers / all peers"));
+    }
+    if state.nap_available() {
+        out.push(label("5", "Force the NAP view (press again for auto)"));
+    }
+    out
+}
+
+/// The Flags column and the mismatch marker, as one wrapped line: both
+/// peers views list them.
+fn peer_behaviour_lines() -> Line<'static> {
+    Line::from(vec![
+        Span::styled(format!("  {:<14}", "Flags"), Style::default().fg(Color::Cyan)),
+        Span::styled(
+            "Behaviour flags (C crawler, S spy, F fingerprint mismatch, A addr abuse, H height lie, \
+             N notfound, T stalling): yellow one, red S or two or more. '≠' after the agent: \
+             the fingerprint disagrees with it. Only on a satd with getpeerbehavior.",
+            Style::default().fg(Color::White),
+        ),
     ])
 }
 
@@ -233,6 +258,7 @@ fn ibd_help() -> Vec<Line<'static>> {
         label("Recv", "Total blocks received from this peer during IBD."),
         label("Assigned", "Blocks currently assigned to this peer for download."),
         label("Rate", "Per-peer download rate in blocks/second."),
+        peer_behaviour_lines(),
         blank(),
         heading("Keyboard"),
         label("q", "Quit (or close help / reorgs)"),
@@ -277,6 +303,12 @@ fn chain_help() -> Vec<Line<'static>> {
         ]),
         Line::from(vec![
             Span::styled("  Long tail collapses into 'other'.", Style::default().fg(Color::Gray)),
+        ]),
+        Line::from(vec![
+            Span::styled("  With peer behaviour data: by observed family instead, a mismatch as", Style::default().fg(Color::Gray)),
+        ]),
+        Line::from(vec![
+            Span::styled("  'observed [claimed]', then the number of fingerprint mismatches.", Style::default().fg(Color::Gray)),
         ]),
         blank(),
         heading("Trivia Panel"),
@@ -332,6 +364,11 @@ fn steady_help() -> Vec<Line<'static>> {
         label("Supply", "Percentage of 21M BTC cap currently in UTXOs."),
         label("Age Dist", "Sparkline: UTXO count by age (<1h to 3y+)."),
         blank(),
+        heading("Peer Table"),
+        label("Height", "Peer's best-known block height."),
+        label("Recv", "Bytes received from this peer."),
+        peer_behaviour_lines(),
+        blank(),
         heading("Network Panel"),
         label("Peers", "Connected peers (inbound accepting / outbound initiated)."),
         label("Recv / Sent", "Total bytes transferred with all peers."),
@@ -343,4 +380,31 @@ fn steady_help() -> Vec<Line<'static>> {
         label("1 / 2 / 3 / 4", "Force IBD / Steady / Mempool / Chain view (press again for auto)"),
         label("Up / Down", "Scroll the peer table"),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn keys(state: &AppState) -> Vec<String> {
+        extra_keys(state)
+            .iter()
+            .map(|l| l.spans[0].content.trim().to_string())
+            .collect()
+    }
+
+    /// `h` lists `Enter` and `f` in the peers views of a node that serves
+    /// peer behaviour, and not otherwise.
+    #[test]
+    fn help_lists_the_peer_keys_only_while_they_work() {
+        let mut st = AppState::new();
+        st.force_mode = Some(ViewMode::Steady);
+        assert!(keys(&st).is_empty(), "no behaviour data");
+        st.update_peer_behavior(crate::behavior::classify(Ok(crate::behavior::tests::reply())));
+        assert_eq!(keys(&st), ["Enter", "f"]);
+        st.force_mode = Some(ViewMode::Ibd);
+        assert_eq!(keys(&st), ["Enter", "f"]);
+        st.force_mode = Some(ViewMode::Mempool);
+        assert!(keys(&st).is_empty(), "no peers table in the mempool view");
+    }
 }

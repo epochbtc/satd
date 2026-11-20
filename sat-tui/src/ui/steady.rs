@@ -69,8 +69,8 @@ pub fn draw(f: &mut Frame, state: &AppState) {
     draw_bottom_row(f, chunks[3], state);
 
     // Peers
-    let peer_title = format!("Peers ({} connected)", state.connections);
-    let table = peer_table(&state.peers, None, &state.peer_dl_rates, state.selected_peer, &peer_title);
+    let peer_title = crate::ui::peer_title(state);
+    let table = peer_table(state, None, &peer_title, chunks[4].width);
     f.render_widget(table, chunks[4]);
 
     // Services row — always visible. Shows addr-index, Esplora and
@@ -95,6 +95,7 @@ pub fn draw(f: &mut Frame, state: &AppState) {
         Span::raw("\u{2191}\u{2193}"),
         Span::styled(": peers", Style::default().fg(Color::DarkGray)),
     ];
+    spans.extend(crate::ui::peer_keys(state));
     if state.last_shutdown.as_deref() == Some("dirty") {
         spans.push(Span::styled(
             "   ⚠ previous shutdown was unclean",
@@ -1030,6 +1031,48 @@ mod tests {
                 assert!(bar_rows >= 4, "{ctx}");
             }
         }
+    }
+
+    /// The peers table through the real draw path: a Flags column right of
+    /// Agent with each peer's codes, `≠` after a mismatched agent, the
+    /// filter, and none of it from a node without `getpeerbehavior`.
+    #[test]
+    fn steady_peers_table_shows_flags_and_the_mismatch_marker() {
+        let mut st = AppState::new();
+        st.force_mode = Some(crate::state::ViewMode::Steady);
+        st.peers = [(3, "/Satoshi:27.0.0/"), (7, "/bitcoin-seeder:0.01/"), (11, "/Satoshi:28.1.0/")]
+            .iter()
+            .map(|(id, ua)| serde_json::json!({"id": id, "addr": format!("10.0.0.{id}:8333"), "subver": ua}))
+            .collect();
+        st.connections = 3;
+        let peer_row = |rows: &[String], addr: &str| rows.iter().find(|r| r.contains(addr)).cloned();
+
+        let plain = render_steady(120, 50, &st);
+        assert!(!plain.iter().any(|r| r.contains("Flags")), "no data, no column");
+        assert!(!plain.iter().any(|r| r.contains('≠')));
+
+        st.update_peer_behavior(crate::behavior::classify(Ok(crate::behavior::tests::reply())));
+        let rows = render_steady(120, 50, &st);
+        let header = rows.iter().find(|r| r.contains("Agent")).unwrap();
+        let (agent_at, flags_at) = (header.find("Agent").unwrap(), header.find("Flags").expect("Flags column"));
+        assert!(agent_at < flags_at && flags_at < header.find("Height").unwrap(), "{header}");
+        assert!(header.contains("Recv"), "wide enough to keep Recv: {header}");
+        let mismatched = peer_row(&rows, "10.0.0.3:").unwrap();
+        assert!(mismatched.contains("/Satoshi:27.0.0/ ≠"), "{mismatched}");
+        assert!(peer_row(&rows, "10.0.0.7:").unwrap().contains(" C "), "crawler flag shown");
+        assert!(!peer_row(&rows, "10.0.0.11:").unwrap().contains('≠'));
+
+        // Narrow: Flags takes Recv's place.
+        let narrow = render_steady(80, 50, &st);
+        let header = narrow.iter().find(|r| r.contains("Agent")).unwrap();
+        assert!(header.contains("Flags") && !header.contains("Recv"), "{header}");
+
+        // `f`: only the flagged peers.
+        st.toggle_flag_filter();
+        let filtered = render_steady(120, 50, &st);
+        assert!(peer_row(&filtered, "10.0.0.3:").is_some());
+        assert!(peer_row(&filtered, "10.0.0.11:").is_none(), "unflagged peer hidden");
+        assert!(filtered.iter().any(|r| r.contains("Peers (3 connected, 2 flagged)")));
     }
 
     #[test]
