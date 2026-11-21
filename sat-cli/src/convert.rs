@@ -410,6 +410,7 @@ pub static SATD_CONVERT_PARAMS: &[Param] = &[
     p("getaddressutxos", 0, "address", JsonOrString),
     p("estimatefees", 0, "targets", Json),
     p("estimatefees", 1, "mode", Str),
+    p("getcrawlnodes", 0, "verbose", Json),
     p("getmempoolhistory", 0, "since_secs", Json),
     p("getmempoolsummary", 0, "top_n", Json),
     p("getpeerbehavior", 0, "peer_id", Json),
@@ -490,7 +491,7 @@ pub static CORE_METHODS: &[&str] = &[
 pub static SATD_METHODS: &[&str] = &[
     "backfillindex", "cancelindex", "createnapattestation", "estimatefees", "exportnapsnapshot",
     "getaddressbalance", "getaddresshistory", "getaddressutxos", "getblockfileaudit", "getconfig",
-    "getibdprogress", "getmempoolhistory", "getmempoolsummary", "getnapreport",
+    "getcrawlinfo", "getcrawlnodes", "getibdprogress", "getmempoolhistory", "getmempoolsummary", "getnapreport",
     "getopreturnpruneinfo", "getorphaninfo", "getpeerbehavior", "getpeersurvey", "getpolicyinfo", "getquarantineentry",
     "getquarantineinfo", "getreorghistory", "getsatdindexinfo", "getserverstatus",
     "getsilentpaymentblockdata", "getstoragefootprint", "getstratuminfo", "getsysteminfo",
@@ -790,6 +791,9 @@ mod tests {
             positional("verifybip322", &["a", "AkcwRA==", "123"]),
             json!(["a", "AkcwRA==", "123"])
         );
+        // `getcrawlnodes true` asks for the verbose rows: a bool, not "true".
+        assert_eq!(positional("getcrawlnodes", &["true"]), json!([true]));
+        assert_eq!(named("getcrawlnodes", &["verbose=true"]), r#"{"verbose":true}"#);
         // A satd RPC with string arguments only.
         assert_eq!(positional("getquarantineentry", &["0011"]), json!(["0011"]));
         // The Operator Manual's `sendrawtransaction hexstring allowquarantined=true`.

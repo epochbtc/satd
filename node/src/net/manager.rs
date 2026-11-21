@@ -17930,6 +17930,7 @@ mod crawl_conn;
 #[path = "manager_altslots.rs"]
 mod altslot_conn;
 pub use survey_conn::{SurveyConfig, SurveyMetrics};
+pub use crawl_conn::{CrawlHold, CrawlMetrics};
 pub use altslot_conn::AltSlotCounts;
 
 #[cfg(test)]

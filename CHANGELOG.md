@@ -142,6 +142,7 @@ Bound for **0.9.0**, written up in
 [`docs/release-notes/0.9.0-pre.md`](docs/release-notes/0.9.0-pre.md):
 
 - P2P: opt-in crawl, `-crawl` (with `-crawlconcurrency`, `-crawltorconcurrency`, `-crawlrate`, `-crawlliveness`, `-crawlmaxage`, `-crawlnet`, `-crawlbind`, `-crawlseed`, `-crawluacomment`, `-crawlprobes`): short sessions as a declared crawler, BIP 324 first and v1 after, to every address nodes name, recorded in `crawlbook.dat`; outside every connection budget, never written to the address book, never under `-connect` or in initial block download; supersedes `-peersurvey`.
+- RPC: `getcrawlinfo` (the crawl's state, limits, book and sessions, and its count of the reachable network by network, transport, v2-only and family; counts only) and `getcrawlnodes [verbose]` (its book, raw addresses, operator control); `satd_crawl_*` metrics and a Crawl card on the status page, counts only; a Network Crawl chapter in the Operator Manual.
 
 ## Releases
 

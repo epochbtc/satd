@@ -1,8 +1,9 @@
 //! The crawl (`-crawl`) against running regtest nodes: a small cluster of
 //! real satd nodes and scripted peers on loopback, crawled to completion and
 //! the book checked exactly; the book and its timers across a restart; the
-//! address book's file unchanged by a crawl; and no session before the node
-//! leaves initial block download. A regtest book admits loopback addresses
+//! address book's file unchanged by a crawl; no session before the node
+//! leaves initial block download; and what `getcrawlinfo`, `getcrawlnodes`,
+//! the metrics and the status page report of it. A regtest book admits loopback addresses
 //! (mainnet, testnet4 and signet never do), and every address here is one,
 //! so nothing is dialled off the host.
 
@@ -13,7 +14,7 @@ use bitcoin::p2p::address::{AddrV2, AddrV2Message};
 use bitcoin::p2p::message::{NetworkMessage, RawNetworkMessage};
 use bitcoin::p2p::message_network::VersionMessage;
 use bitcoin::p2p::{Address, Magic, ServiceFlags};
-use common::{TestNode, test_timeout};
+use common::{TestNode, find_available_port, test_timeout};
 use node::net::crawlbook::{BookParams, CrawlAddr, CrawlBook, GetaddrResult, CRAWL_FILE};
 use node::net::peer::PeerAddr;
 use serde_json::json;
@@ -188,6 +189,10 @@ fn read_book(node: &TestNode) -> CrawlBook {
 /// on the v1 recheck, none v2-only. No crawl connection is ever a peer of
 /// the crawler, and the survey reports itself superseded. Across a restart
 /// the book and its timers are kept: nothing is due, so nothing changes.
+///
+/// `getcrawlinfo` counts the cluster exactly, `getcrawlnodes` lists it, and
+/// neither `getcrawlinfo`, the metrics nor the status page names an
+/// address.
 #[test]
 fn a_regtest_cluster_is_crawled_to_completion() {
     let mut x = TestNode::start(&[]);
@@ -198,11 +203,14 @@ fn a_regtest_cluster_is_crawled_to_completion() {
     let s2_accepts = scripted(l2, btcd(vec![yp, dead]));
     let (l1, s1) = bind();
     let s1_accepts = scripted(l1, core(vec![xp, s2, dead]));
+    let metrics_port = find_available_port();
     let args = [
         "--maxconnections=0".to_string(),
         "--crawl=1".to_string(),
         format!("--crawlseed=127.0.0.1:{s1}"),
         "--loglevel=debug".to_string(),
+        format!("--metricsport={metrics_port}"),
+        "--statuspage=1".to_string(),
     ];
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     let mut c = TestNode::start(&args);
@@ -225,6 +233,7 @@ fn a_regtest_cluster_is_crawled_to_completion() {
     assert!(s1_accepts.load(Ordering::SeqCst) >= 2 && s2_accepts.load(Ordering::SeqCst) >= 2, "v2, then v1");
     let survey = c.rpc_ok("getpeersurvey", vec![]);
     assert_eq!(survey["superseded_by_crawl"], true, "{survey}");
+    check_reports(&c, metrics_port, &[s1, s2, dead, xp, yp]);
     c.stop();
 
     let book = read_book(&c);
@@ -270,6 +279,77 @@ fn a_regtest_cluster_is_crawled_to_completion() {
     y.stop();
 }
 
+/// What the RPCs, the metrics and the status page say of the crawled
+/// cluster: five addresses on IPv4, four reachable (the scripted peers over
+/// v1 only, the satd nodes over both), and no address anywhere but in
+/// `getcrawlnodes`.
+fn check_reports(c: &TestNode, metrics_port: u16, ports: &[u16]) {
+    let info = c.rpc_ok("getcrawlinfo", vec![]);
+    assert_eq!(info["enabled"], true, "{info}");
+    assert_eq!(info["state"], "running", "{info}");
+    assert_eq!(info["held_by"], json!([]));
+    assert_eq!(info["peersurvey_superseded"], false);
+    assert_eq!(info["limits"]["networks"], json!(["ipv4", "ipv6"]), "no proxy, so no onion");
+    assert_eq!(info["book"]["entries"], 5, "{info}");
+    assert_eq!(info["book"]["learned"]["ipv4"], 5);
+    assert_eq!(info["book"]["ever_reached"]["ipv4"], 4);
+    assert_eq!(info["reachable"], json!({ "total": 4, "ipv4": 4, "ipv6": 0, "onion": 0 }), "{info}");
+    assert_eq!(info["transport"]["v1_only"]["count"], 2, "{info}");
+    assert_eq!(info["transport"]["v2_and_v1"]["count"], 2, "{info}");
+    assert_eq!(info["transport"]["v2_only"]["count"], 0);
+    let families = info["families"].as_object().unwrap();
+    // Every reachable address in one family or unknown; which family the
+    // classifier gives a crawl session's transcript is its own test's.
+    assert_eq!(families.values().map(|f| f["count"].as_u64().unwrap()).sum::<u64>(), 4, "{info}");
+    assert!(info["sessions"]["reached"].as_u64().unwrap() >= 6);
+    assert!(info["totals"]["totalbytesrecv"].as_u64().unwrap() > 0);
+    let text = info.to_string();
+    assert!(!text.contains("127.0.0.1") && !text.contains("Satoshi"), "counts only: {text}");
+
+    let rows = c.rpc_ok("getcrawlnodes", vec![]);
+    let rows = rows.as_array().unwrap();
+    assert_eq!(rows.len(), 5);
+    for port in ports {
+        let addr = format!("127.0.0.1:{port}");
+        let row = rows.iter().find(|r| r["addr"] == addr).unwrap_or_else(|| panic!("{addr} in {rows:?}"));
+        assert!(row.get("observation").is_none(), "no observation without verbose");
+    }
+    let verbose = c.rpc_call_with_named_params("getcrawlnodes", json!({ "verbose": true })).unwrap();
+    let rows = verbose["result"].as_array().unwrap_or_else(|| panic!("{verbose}"));
+    let s1 = rows.iter().find(|r| r["addr"] == format!("127.0.0.1:{}", ports[0])).unwrap();
+    assert_eq!(s1["observation"]["subver"], "/Satoshi:32.1.0/");
+    assert_eq!(s1["observation"]["getaddr"]["entries"], 3);
+    let help = c.rpc_ok("help", vec![]);
+    let help = help.as_str().unwrap();
+    assert!(help.contains("getcrawlinfo") && help.contains("getcrawlnodes"));
+
+    let base = format!("http://127.0.0.1:{metrics_port}");
+    let body = reqwest::blocking::get(format!("{base}/metrics")).unwrap().text().unwrap();
+    for line in [
+        "satd_crawl_enabled 1",
+        "satd_crawl_running 1",
+        "satd_crawl_book_entries{network=\"ipv4\"} 5",
+        "satd_crawl_reachable{network=\"ipv4\"} 4",
+        "satd_crawl_transport{class=\"v1_only\"} 2",
+    ] {
+        assert!(body.lines().any(|l| l == line), "missing `{line}`");
+    }
+    assert!(!body.contains("127.0.0.1"), "no address in the metrics");
+    let status: serde_json::Value = reqwest::blocking::get(format!("{base}/status.json")).unwrap().json().unwrap();
+    let crawl = &status["snapshot"]["crawl"];
+    assert_eq!(crawl["state"], "running", "{status}");
+    assert_eq!(crawl["book_entries"], 5);
+    assert_eq!(crawl["reachable_ipv4"], 4);
+    assert_eq!(crawl["v1_only"], 2);
+    let page = reqwest::blocking::get(format!("{base}/status")).unwrap().text().unwrap();
+    for text in [status.to_string(), page] {
+        assert!(!text.contains("127.0.0.1"), "no address on the status page");
+        for port in ports {
+            assert!(!text.contains(&format!(":{port}")), "no crawled port on the status page");
+        }
+    }
+}
+
 /// The crawl reads the address book and never writes it: `peers.dat` is
 /// the same bytes before and after a crawl of the address in it and of the
 /// addresses that peer names. The node is out of initial block download
@@ -313,7 +393,13 @@ fn nothing_is_dialled_in_initial_block_download() {
     let log = std::fs::read_to_string(&node.stderr_log).unwrap_or_default();
     assert!(log.contains("The crawl waits for the node to leave initial block download"), "{log}");
     assert!(log.contains("Crawl enabled: it will dial tens of thousands of addresses"), "the startup warning");
+    let info = node.rpc_ok("getcrawlinfo", vec![]);
+    assert_eq!((info["state"].clone(), info["held_by"].clone()), (json!("held"), json!(["initial_block_download"])));
+    assert_eq!(info["started"], false);
     node.rpc_ok("generatetoaddress", vec![json!(1), json!(ADDR)]);
     wait_for("the first crawl session", 60, || accepts.load(Ordering::SeqCst) >= 1);
+    let info = node.rpc_ok("getcrawlinfo", vec![]);
+    assert_eq!((info["state"].clone(), info["held_by"].clone()), (json!("running"), json!([])));
+    assert_eq!(info["started"], true);
     node.stop();
 }

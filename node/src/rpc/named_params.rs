@@ -169,6 +169,9 @@ pub fn arg_names(method: &str) -> Option<&'static [ArgSpec]> {
         "getchaintxstats" => &[("nblocks", false), ("blockhash", false)],
         "getconfig" => &[],
         "getconnectioncount" => &[],
+        "getcrawlinfo" => &[],
+        // SATD_ONLY: getcrawlnodes
+        "getcrawlnodes" => &[("verbose", false)],
         "getdeploymentinfo" => &[("blockhash", false)],
         "getdescriptorinfo" => &[("descriptor", false)],
         "getdifficulty" => &[],
@@ -363,7 +366,7 @@ pub(crate) const ALL_METHODS: &[&str] = &[
     "getblockcount", "getblockfileaudit", "getblockfilter", "getblockfrompeer",
     "getblockhash", "getblockheader", "getblockstats", "getblocktemplate",
     "getchainstates", "getchaintips", "getchaintxstats", "getconfig",
-    "getconnectioncount", "getdeploymentinfo", "getdescriptorinfo", "getdifficulty",
+    "getconnectioncount", "getcrawlinfo", "getcrawlnodes", "getdeploymentinfo", "getdescriptorinfo", "getdifficulty",
     "getibdprogress", "getindexinfo",
     "getmemoryinfo",
     "getmempoolancestors", "getmempoolcluster", "getmempooldescendants", "getmempoolentry",

@@ -55,8 +55,9 @@ use super::survey_conn::{listen_passive, next_message, send_probes, Listened, Ne
 use crate::net::behavior::PeerBehavior;
 use crate::net::crawl::{self, CrawlConfig, Scheduler};
 use crate::net::crawlbook::{
-    Attempt, BookParams, CrawlBook, GetaddrResult, Observation, SessionKind, SessionResult,
+    Attempt, BookParams, CrawlBook, GetaddrResult, Network, Observation, SessionKind, SessionResult,
 };
+use crate::net::crawlreport;
 use crate::net::survey::{self, ProbeContext, ProbeResults};
 use bitcoin::p2p::address::{AddrV2, AddrV2Message};
 use rand::seq::SliceRandom as _;
@@ -82,6 +83,9 @@ pub(super) struct CrawlRun {
     /// Sessions that ended, reached or not, this run.
     pub(super) reached: AtomicU64,
     pub(super) unreached: AtomicU64,
+    /// The aggregate the metrics and the status page read, and when it was
+    /// taken: they are polled often, and a walk of a full book is not free.
+    aggregate: parking_lot::Mutex<Option<(Instant, crawlreport::Aggregate)>>,
     /// Every target dialled, in order: for tests.
     #[cfg(test)]
     pub(super) dialled: parking_lot::Mutex<Vec<PeerAddr>>,
@@ -102,6 +106,48 @@ impl CrawlRun {
     fn now_ms(&self) -> u64 {
         self.epoch.elapsed().as_millis() as u64
     }
+}
+
+/// How long the metrics and the status page reuse an aggregate before they
+/// take a new one. `getcrawlinfo` always takes a new one.
+pub(super) const AGGREGATE_MAX_AGE: Duration = Duration::from_secs(10);
+
+/// Why the crawl starts no session now, as `getcrawlinfo` names it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CrawlHold {
+    /// The node is in initial block download.
+    InitialBlockDownload,
+    /// `-connect`: the node makes no automatic connection.
+    Connect,
+    /// Networking is off (`setnetworkactive false`, `-networkactive=0`).
+    NetworkInactive,
+}
+
+impl CrawlHold {
+    pub fn name(self) -> &'static str {
+        match self {
+            CrawlHold::InitialBlockDownload => "initial_block_download",
+            CrawlHold::Connect => "connect",
+            CrawlHold::NetworkInactive => "network_inactive",
+        }
+    }
+}
+
+/// What the metrics and the status page read: counts only, no address.
+#[derive(Debug, Clone, Default)]
+pub struct CrawlMetrics {
+    /// Sessions may start now: not held and not stopped.
+    pub running: bool,
+    /// Stopped after a panic in a crawl task.
+    pub stopped: bool,
+    pub aggregate: crawlreport::Aggregate,
+    /// Sessions that ended this run: a handshake completed, or not.
+    pub reached: u64,
+    pub unreached: u64,
+    /// Sessions open: clearnet, then Tor.
+    pub in_flight: (usize, usize),
+    pub bytes_sent: u64,
+    pub bytes_recv: u64,
 }
 
 /// Removes a session's nonce once its handshake is over, however it ends.
@@ -209,6 +255,7 @@ impl PeerManager {
             stopped: AtomicBool::new(false),
             reached: AtomicU64::new(0),
             unreached: AtomicU64::new(0),
+            aggregate: parking_lot::Mutex::new(None),
             #[cfg(test)]
             dialled: Default::default(),
             #[cfg(test)]
@@ -281,13 +328,149 @@ impl PeerManager {
     /// connections (not under `-connect`).
     pub(super) fn crawl_may_run(&self) -> bool {
         let Some(run) = self.crawl.get() else { return false };
+        !run.stopped.load(Ordering::Relaxed) && self.crawl_holds().is_empty()
+    }
+
+    /// Why sessions may not start now, in the order `getcrawlinfo` lists
+    /// them; empty while they may. A stopped crawl is not held: it is
+    /// stopped.
+    pub fn crawl_holds(&self) -> Vec<CrawlHold> {
+        if self.crawl.get().is_none() {
+            return Vec::new();
+        }
         let ibd = self.chain_state.is_initial_block_download();
         #[cfg(test)]
-        let ibd = ibd && !run.out_of_ibd.load(Ordering::Relaxed);
-        !run.stopped.load(Ordering::Relaxed)
-            && !ibd
-            && self.is_network_active()
-            && self.automatic_outbound.load(Ordering::Relaxed)
+        let ibd = ibd && !self.crawl.get().is_some_and(|run| run.out_of_ibd.load(Ordering::Relaxed));
+        let mut holds = Vec::new();
+        if ibd {
+            holds.push(CrawlHold::InitialBlockDownload);
+        }
+        if !self.automatic_outbound.load(Ordering::Relaxed) {
+            holds.push(CrawlHold::Connect);
+        }
+        if !self.is_network_active() {
+            holds.push(CrawlHold::NetworkInactive);
+        }
+        holds
+    }
+
+    /// The networks the crawl dials: those the node's dialer reaches,
+    /// `-crawlnet` kept, and clearnet only when it does not go through the
+    /// proxy.
+    pub fn crawl_networks(&self) -> Vec<Network> {
+        use crate::net::reachable::Network as Reach;
+        let Some(run) = self.crawl.get() else { return Vec::new() };
+        crawlreport::DIALLED
+            .into_iter()
+            .filter(|n| run.config.networks.as_ref().is_none_or(|nets| nets.contains(n)))
+            .filter(|n| match n {
+                Network::Ipv4 => self.proxy.is_none() && self.network_reachable(Reach::Ipv4),
+                Network::Ipv6 => self.proxy.is_none() && self.network_reachable(Reach::Ipv6),
+                Network::Onion => self.network_reachable(Reach::Onion),
+                Network::I2p | Network::Cjdns => false,
+            })
+            .collect()
+    }
+
+    /// A fresh aggregate of the book, kept for [`Self::crawl_metrics`].
+    fn crawl_aggregate_now(&self, run: &CrawlRun) -> crawlreport::Aggregate {
+        let agg = crawlreport::aggregate(&run.book.lock(), crate::time::now_secs());
+        *run.aggregate.lock() = Some((Instant::now(), agg.clone()));
+        agg
+    }
+
+    /// `getcrawlinfo`: the crawl's state, its limits, its book's size, its
+    /// sessions and traffic, and the aggregate. Counts only: no address.
+    /// With the crawl off, `enabled` is false and the counts are zero.
+    pub fn get_crawl_info(&self) -> serde_json::Value {
+        let Some(run) = self.crawl.get() else {
+            let mut out = crawlreport::aggregate_json(&crawlreport::Aggregate::default(), 0);
+            out["enabled"] = serde_json::json!(false);
+            out["state"] = serde_json::json!("off");
+            out["held_by"] = serde_json::json!([]);
+            out["peersurvey_superseded"] = serde_json::json!(false);
+            return out;
+        };
+        let agg = self.crawl_aggregate_now(run);
+        let max_entries = run.book.lock().params().max_entries;
+        let mut out = crawlreport::aggregate_json(&agg, max_entries);
+        let stopped = run.stopped.load(Ordering::Relaxed);
+        let holds = self.crawl_holds();
+        let state = if stopped {
+            "stopped"
+        } else if !holds.is_empty() {
+            "held"
+        } else {
+            "running"
+        };
+        let limits = run.scheduler.lock().limits();
+        let (clearnet, tor) = run.scheduler.lock().open();
+        let settings = serde_json::json!({
+            "enabled": true,
+            "state": state,
+            "held_by": holds.iter().map(|h| h.name()).collect::<Vec<_>>(),
+            "stopped_by": stopped.then_some("panic"),
+            "started": run.started.load(Ordering::Relaxed),
+            "peersurvey_superseded": self.survey_enabled(),
+            "limits": {
+                "concurrency": limits.clearnet,
+                "tor_concurrency": limits.tor,
+                "rate": limits.rate,
+                "liveness": run.config.liveness_secs,
+                "max_age": run.config.max_age_secs,
+                "probes": run.config.probes,
+                "networks": self.crawl_networks().iter().map(|n| n.name()).collect::<Vec<_>>(),
+                "bind": run.config.bind_v4.is_some() || run.config.bind_v6.is_some(),
+            },
+            "sessions": {
+                "reached": run.reached.load(Ordering::Relaxed),
+                "unreached": run.unreached.load(Ordering::Relaxed),
+                "in_flight": { "clearnet": clearnet, "tor": tor },
+            },
+            "totals": {
+                "totalbytessent": run.totals.bytes_sent(),
+                "totalbytesrecv": run.totals.bytes_recv(),
+            },
+        });
+        if let (Some(o), Some(s)) = (out.as_object_mut(), settings.as_object()) {
+            for (k, v) in s {
+                o.insert(k.clone(), v.clone());
+            }
+        }
+        out
+    }
+
+    /// `getcrawlnodes`: a row per address in the book, raw addresses
+    /// included; with `verbose` every field. An empty list with the crawl
+    /// off.
+    pub fn get_crawl_nodes(&self, verbose: bool) -> serde_json::Value {
+        let Some(run) = self.crawl.get() else { return serde_json::json!([]) };
+        // Copied under the lock, serialized outside it.
+        let book = run.book.lock().clone();
+        crawlreport::nodes_json(&book, crate::time::now_secs(), verbose)
+    }
+
+    /// The crawl's counts for the metrics and the status page; `None` with
+    /// the crawl off. The aggregate is reused for up to
+    /// [`AGGREGATE_MAX_AGE`].
+    pub fn crawl_metrics(&self) -> Option<CrawlMetrics> {
+        let run = self.crawl.get()?;
+        let cached = run.aggregate.lock().clone().filter(|(at, _)| at.elapsed() < AGGREGATE_MAX_AGE);
+        let aggregate = match cached {
+            Some((_, agg)) => agg,
+            None => self.crawl_aggregate_now(run),
+        };
+        let stopped = run.stopped.load(Ordering::Relaxed);
+        Some(CrawlMetrics {
+            running: !stopped && self.crawl_holds().is_empty(),
+            stopped,
+            aggregate,
+            reached: run.reached.load(Ordering::Relaxed),
+            unreached: run.unreached.load(Ordering::Relaxed),
+            in_flight: run.scheduler.lock().open(),
+            bytes_sent: run.totals.bytes_sent(),
+            bytes_recv: run.totals.bytes_recv(),
+        })
     }
 
     async fn crawl_loop(self: Arc<Self>) {

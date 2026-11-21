@@ -79,6 +79,8 @@ wire volume is exported as the `satd_net_bytes_sent_total` and
 per implementation family ([Peer Behaviour Flags](peer-behavior.md)), and
 the `satd_peer_survey_*` series count the opt-in network survey's records,
 connections and probes ([Network survey](peer-behavior.md#network-survey)),
+the `satd_crawl_*` series the opt-in network crawl's book, reachable
+addresses, sessions and traffic ([Network Crawl](crawl.md#metrics-and-the-status-page)),
 and `satd_peer_alt_slots{state}` the alt-slots matched, held by a fallback
 or empty ([Alt-slots](peer-behavior.md#alt-slots)). The `GET /healthz` and `GET /readyz` endpoints exist
 for load balancer and orchestrator integration.
@@ -195,7 +197,8 @@ is 1 is the stall that
 single-page `sat-tui`: whether the node is syncing or ready, sync progress and
 its ETA, AssumeUTXO background validation, each index and whether a wallet can
 connect yet, the latest block, the mempool, fee estimates, peer counts and how
-many peers carry each [behaviour flag](peer-behavior.md). It
+many peers carry each [behaviour flag](peer-behavior.md), and with `-crawl`
+the [network crawl](crawl.md)'s counts. It
 is off by default, and it needs `--metricsport`, since that is the listener it
 is served on.
 

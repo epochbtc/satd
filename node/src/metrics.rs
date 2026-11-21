@@ -226,6 +226,7 @@ impl MetricsContext {
         );
         render_peer_flags(&mut out, &self.peer_manager.peer_flag_counts());
         render_peer_survey(&mut out, self.peer_manager.survey_metrics().as_ref());
+        render_crawl(&mut out, self.peer_manager.crawl_metrics().as_ref());
         render_alt_slots(&mut out, &self.peer_manager.alt_slot_counts());
         metric(
             &mut out,
@@ -1013,6 +1014,112 @@ fn render_peer_survey(out: &mut String, m: Option<&crate::net::manager::SurveyMe
             metric_sample(out, "satd_peer_survey_probes_total", &[("probe", probe.name()), ("outcome", outcome)], n);
         }
     }
+}
+
+/// The network crawl (`-crawl`): `satd_crawl_enabled`, and with the crawl on
+/// whether it runs, its book per network, the reachable addresses per
+/// network, transport class and observed family, its sessions this run and
+/// its own traffic (apart from `satd_net_bytes_*`). Counts only, no address.
+fn render_crawl(out: &mut String, m: Option<&crate::net::manager::CrawlMetrics>) {
+    use crate::net::crawlbook::Network;
+    use crate::net::crawlreport::{Transport, DIALLED};
+    use crate::net::fingerprint::Family;
+    metric(out, "satd_crawl_enabled", "1 when the network crawl (-crawl) is on.", "gauge", &[], u64::from(m.is_some()));
+    let Some(m) = m else {
+        return;
+    };
+    metric(
+        out,
+        "satd_crawl_running",
+        "1 when crawl sessions may start: not held (initial block download, -connect, networking off) and not stopped.",
+        "gauge",
+        &[],
+        u64::from(m.running),
+    );
+    metric(
+        out,
+        "satd_crawl_stopped",
+        "1 when the crawl stopped after a panic in one of its tasks.",
+        "gauge",
+        &[],
+        u64::from(m.stopped),
+    );
+    let a = &m.aggregate;
+    metric_header(out, "satd_crawl_book_entries", "Addresses in the crawl's book (crawlbook.dat), by network.", "gauge");
+    for (n, c) in Network::ALL.iter().zip(a.learned) {
+        metric_sample(out, "satd_crawl_book_entries", &[("network", n.name())], c as u64);
+    }
+    metric_header(
+        out,
+        "satd_crawl_reachable",
+        "Addresses with a completed crawl handshake within the liveness window, by network.",
+        "gauge",
+    );
+    for (n, c) in DIALLED.iter().zip(a.reachable) {
+        metric_sample(out, "satd_crawl_reachable", &[("network", n.name())], c as u64);
+    }
+    metric_header(
+        out,
+        "satd_crawl_transport",
+        "Reachable addresses by transport: v2_and_v1, v1_only, v2_only, v2_unconfirmed.",
+        "gauge",
+    );
+    for (t, c) in Transport::ALL.iter().zip(a.transport) {
+        metric_sample(out, "satd_crawl_transport", &[("class", t.name())], c as u64);
+    }
+    metric(
+        out,
+        "satd_crawl_v2_advertised",
+        "Reachable addresses advertised with NODE_P2P_V2.",
+        "gauge",
+        &[],
+        a.v2_advertised as u64,
+    );
+    metric_header(
+        out,
+        "satd_crawl_family",
+        "Reachable addresses by the implementation family the handshake matched; unknown when none matched.",
+        "gauge",
+    );
+    for (family, n) in Family::ALL.iter().zip(a.families) {
+        metric_sample(out, "satd_crawl_family", &[("family", family.name())], n as u64);
+    }
+    metric_sample(out, "satd_crawl_family", &[("family", "unknown")], a.unknown as u64);
+    metric(
+        out,
+        "satd_crawl_mismatches",
+        "Reachable addresses whose user agent names one family and handshake matches another.",
+        "gauge",
+        &[],
+        a.mismatches as u64,
+    );
+    metric_header(
+        out,
+        "satd_crawl_sessions_total",
+        "Crawl sessions since start: a handshake completed (reached) or not.",
+        "counter",
+    );
+    metric_sample(out, "satd_crawl_sessions_total", &[("result", "reached")], m.reached);
+    metric_sample(out, "satd_crawl_sessions_total", &[("result", "unreached")], m.unreached);
+    metric_header(out, "satd_crawl_sessions_in_flight", "Crawl sessions open, clearnet and Tor.", "gauge");
+    metric_sample(out, "satd_crawl_sessions_in_flight", &[("network", "clearnet")], m.in_flight.0 as u64);
+    metric_sample(out, "satd_crawl_sessions_in_flight", &[("network", "tor")], m.in_flight.1 as u64);
+    metric(
+        out,
+        "satd_crawl_bytes_sent_total",
+        "Bytes the crawl's sessions sent, not counted in satd_net_bytes_sent_total.",
+        "counter",
+        &[],
+        m.bytes_sent,
+    );
+    metric(
+        out,
+        "satd_crawl_bytes_recv_total",
+        "Bytes the crawl's sessions received, not counted in satd_net_bytes_recv_total.",
+        "counter",
+        &[],
+        m.bytes_recv,
+    );
 }
 
 /// The alt-slots (`-altslots`): `satd_peer_alt_slots{state}`, matched,

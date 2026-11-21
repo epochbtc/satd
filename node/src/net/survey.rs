@@ -659,16 +659,6 @@ fn row_json(addr: &PeerAddr, r: &SurveyRecord) -> serde_json::Value {
         Fingerprint::Mismatch { claimed, .. } => (Some(claimed.name()), true),
         _ => (None, false),
     };
-    let mut probes = serde_json::Map::new();
-    for p in Probe::ALL {
-        if let Some(o) = r.probes.get(p) {
-            let mut v = serde_json::json!({ "result": o.name() });
-            if let ProbeOutcome::Answered(n) = o {
-                v["value"] = serde_json::json!(n);
-            }
-            probes.insert(p.name().to_string(), v);
-        }
-    }
     let addr_text = match addr {
         PeerAddr::Socket(sa) => sa.to_string(),
         PeerAddr::Onion { host, port } => format!("{host}:{port}"),
@@ -687,8 +677,24 @@ fn row_json(addr: &PeerAddr, r: &SurveyRecord) -> serde_json::Value {
         "asn": r.asn,
         "first_seen": r.first_seen,
         "last_seen": r.last_seen,
-        "probes": probes,
+        "probes": probes_json(&r.probes),
     })
+}
+
+/// The probe outcomes as a row reports them: by probe name, its result and,
+/// for an answer, its value. A probe not sent is absent.
+pub fn probes_json(results: &ProbeResults) -> serde_json::Value {
+    let mut probes = serde_json::Map::new();
+    for p in Probe::ALL {
+        if let Some(o) = results.get(p) {
+            let mut v = serde_json::json!({ "result": o.name() });
+            if let ProbeOutcome::Answered(n) = o {
+                v["value"] = serde_json::json!(n);
+            }
+            probes.insert(p.name().to_string(), v);
+        }
+    }
+    serde_json::Value::Object(probes)
 }
 
 #[cfg(test)]

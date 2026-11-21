@@ -287,6 +287,7 @@ SATD_ONLY = {
     # meaningful and a future argument cannot be added without a row.
     "getblockfileaudit": [],
     "getconfig": [],
+    "getcrawlinfo": [],
     "getibdprogress": [],
     "getopreturnpruneinfo": [],
     "getorphaninfo": [],
@@ -310,6 +311,7 @@ SATD_ONLY = {
     "getreorghistory": [["since_secs", False]],
     "getpeerbehavior": [["peer_id", False]],
     "getpeersurvey": [["verbose", False]],
+    "getcrawlnodes": [["verbose", False]],
     "getsilentpaymentblockdata": [
         ["blockhash", False], ["verbosity", False], ["dust_limit", False],
     ],

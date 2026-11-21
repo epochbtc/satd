@@ -57,6 +57,19 @@ fn snapshot() -> StatusSnapshot {
             }],
             flagged: vec![FlagCount { code: 'C', name: "crawler", count: 3 }],
         },
+        crawl: Some(CrawlStatus {
+            state: "held",
+            book_entries: 12_345,
+            reachable_ipv4: 7,
+            reachable_ipv6: 2,
+            reachable_onion: 1,
+            learned_i2p: 4,
+            learned_cjdns: 0,
+            v2_and_v1: 5,
+            v1_only: 3,
+            v2_only: 1,
+            v2_unconfirmed: 1,
+        }),
         mempool: MempoolStatus {
             transactions: 4321,
             bytes: 2_500_000,
@@ -195,6 +208,38 @@ fn status_shows_flag_counts_only() {
     let counts = crate::net::flags::FlagCounts { flagged: [0, 2, 0, 0, 0, 0, 1], ..Default::default() };
     let shown: Vec<(char, usize)> = flag_counts(&counts).iter().map(|f| (f.code, f.count)).collect();
     assert_eq!(shown, [('S', 2), ('T', 1)], "only the flags some peer carries");
+}
+
+/// The crawl card shows the crawl's counts and its state, and nothing
+/// else: no address, no user agent. It is hidden with the crawl off.
+#[test]
+fn status_shows_crawl_counts_only() {
+    let s = snapshot();
+    let v = view(&s, 1_780_000_300);
+    assert!(v.show["crawl"]);
+    let rows = &v.lists["crawl"];
+    let get = |label: &str| rows.iter().find(|i| i.label == label).unwrap_or_else(|| panic!("{label}")).clone();
+    assert_eq!((get("State").value.as_str(), get("State").state), ("held", WAIT));
+    assert_eq!(get("Addresses in the book").value, "12,345");
+    assert_eq!(get("Reachable over IPv4").value, "7");
+    assert_eq!(get("I2P learned (never dialled)").value, "4");
+    assert_eq!(get("BIP 324 only").value, "1");
+    // Every value is a count, bar the state.
+    for i in rows.iter().filter(|i| i.label != "State") {
+        assert!(i.value.chars().all(|c| c.is_ascii_digit() || c == ','), "{i:?}");
+    }
+    let page = html(&v);
+    assert!(page.contains("<h2>Crawl</h2>"));
+    assert!(page.contains("<span>Reachable onions</span><code>1</code>"));
+
+    let mut off = snapshot();
+    off.crawl = None;
+    let v = view(&off, 1_780_000_300);
+    assert!(!v.show["crawl"]);
+    assert!(v.lists["crawl"].is_empty());
+    assert!(html(&v).contains("data-s=\"crawl\" hidden"));
+    let body: serde_json::Value = serde_json::from_str(&json(&off, &v)).unwrap();
+    assert!(body["snapshot"].get("crawl").is_none());
 }
 
 #[test]
