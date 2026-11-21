@@ -81,7 +81,7 @@ the summary above).
 
 No third-party dependencies.
 """
-import argparse, hashlib, io, json, os, random, socket, struct, sys, time
+import argparse, hashlib, io, ipaddress, json, os, random, socket, struct, sys, time
 
 MAGIC = {
     "mainnet": "f9beb4d9",
@@ -371,7 +371,12 @@ def ip16(host):
 def dial_target(args):
     """--dial as (host, port), with IPv6 brackets removed: "[::1]:18444"."""
     host, port = args.dial.rsplit(":", 1)
-    return host.strip("[]"), port
+    host = host.strip("[]")
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        sys.exit(f"--dial needs an IP address, not {host!r}: the version message carries it")
+    return host, port
 
 
 def crawl_version_payload(args):
