@@ -295,8 +295,12 @@ pub struct CrawlEntry {
     pub failing_since: Option<u64>,
     /// No session before this, while failing.
     pub retry_at: Option<u64>,
-    /// When the open session started; `None` with none open.
-    in_flight: Option<u64>,
+    /// When the open session started, and its token; `None` with none
+    /// open.
+    in_flight: Option<(u64, u64)>,
+    /// The last session token handed out: a counter, so two sessions
+    /// opened in the same second never share one.
+    sessions: u64,
 
     // Transport.
     /// The last v2 attempt's outcome.
@@ -333,6 +337,7 @@ impl CrawlEntry {
             failing_since: None,
             retry_at: None,
             in_flight: None,
+            sessions: 0,
             v2_ok: None,
             v1_ok: None,
             last_v2_ok: None,
@@ -363,7 +368,7 @@ impl CrawlEntry {
     /// Whether a session is open to it at `now`: one opened and neither
     /// reported nor abandoned ([`ABANDONED_AFTER_SECS`]).
     pub fn in_flight(&self, now: u64) -> bool {
-        self.in_flight.is_some_and(|opened| now.saturating_sub(opened) < ABANDONED_AFTER_SECS)
+        self.in_flight.is_some_and(|(opened, _)| now.saturating_sub(opened) < ABANDONED_AFTER_SECS)
     }
 
     fn named(&mut self, source: u64, services: u64, time: u32, now: u64) {
@@ -720,14 +725,15 @@ impl CrawlBook {
     }
 
     /// Note a session opened to `addr`: it is not due again until
-    /// [`Self::record_result`] with the token returned here (the open
-    /// time). `None` when the address is not in the book, cannot be
+    /// [`Self::record_result`] with the token returned here (a
+    /// per-entry counter). `None` when the address is not in the book, cannot be
     /// dialled, or already has a session open.
     pub fn mark_dialling(&mut self, addr: &PeerAddr, now: u64) -> Option<u64> {
         match self.entries.get_mut(&CrawlAddr::Peer(addr.clone())) {
             Some(e) if !e.in_flight(now) => {
-                e.in_flight = Some(now);
-                Some(now)
+                e.sessions = e.sessions.wrapping_add(1);
+                e.in_flight = Some((now, e.sessions));
+                Some(e.sessions)
             }
             _ => None,
         }
@@ -754,7 +760,7 @@ impl CrawlBook {
     ) -> bool {
         let key = CrawlAddr::Peer(addr.clone());
         match self.entries.get(&key) {
-            Some(e) if e.in_flight == session => {}
+            Some(e) if e.in_flight.map(|(_, token)| token) == session => {}
             _ => return false,
         }
         let liveness = self.params.liveness_secs;
@@ -1137,6 +1143,7 @@ fn decode_entry(r: &mut Reader) -> Result<CrawlEntry, String> {
         failing_since: get_opt_u64(r)?,
         retry_at: get_opt_u64(r)?,
         in_flight: None,
+        sessions: 0,
         v2_ok: get_opt_bool(r)?,
         v1_ok: get_opt_bool(r)?,
         last_v2_ok: get_opt_u64(r)?,

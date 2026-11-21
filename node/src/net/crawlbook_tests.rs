@@ -767,3 +767,18 @@ fn a_late_result_from_an_abandoned_session_is_ignored() {
     assert!(!book.record_result(&a, first, SessionKind::Discovery, down(), later + 3));
     assert_eq!(book.get(&CrawlAddr::Peer(a)).unwrap().last_reachable(), Some(later + 2));
 }
+
+#[test]
+fn two_sessions_in_one_second_have_different_tokens() {
+    // Discovery then a v1 recheck in the same second is the normal flow: a
+    // duplicated report of the first must not match the second.
+    let a = v4(1);
+    let mut book = CrawlBook::default();
+    book.seed(a.clone(), 0, NOW);
+    let first = book.mark_dialling(&a, NOW);
+    assert!(book.record_result(&a, first, SessionKind::Discovery, v2_ok(NOW), NOW));
+    let second = book.mark_dialling(&a, NOW);
+    assert!(second.is_some() && second != first);
+    assert!(!book.record_result(&a, first, SessionKind::Discovery, v2_ok(NOW), NOW), "duplicate");
+    assert!(book.mark_dialling(&a, NOW).is_none(), "the second is still open");
+}
