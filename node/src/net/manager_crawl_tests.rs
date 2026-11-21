@@ -799,3 +799,30 @@ fn getcrawlinfo_networks_agree_with_what_the_crawl_dials_under_a_proxy() {
     assert!(pm.crawl_may_dial(&local), "a local address is dialled direct");
     assert_eq!(pm.get_crawl_info()["limits"]["networks"], serde_json::json!(["ipv4"]));
 }
+
+/// With the crawl off, `getcrawlinfo` has every key it has with the crawl
+/// on, counts zero: a client reads one schema.
+#[test]
+fn getcrawlinfo_off_has_the_same_keys() {
+    fn keys(v: &serde_json::Value, prefix: &str, out: &mut Vec<String>) {
+        if let Some(o) = v.as_object() {
+            for (k, v) in o {
+                let path = format!("{prefix}{k}");
+                out.push(path.clone());
+                keys(v, &format!("{path}."), out);
+            }
+        }
+    }
+    let (off, _d1) = mk_pm_with(None);
+    let (on, _d2) = mk_pm_with(None);
+    enable(&on, config());
+    let (mut a, mut b) = (Vec::new(), Vec::new());
+    keys(&off.get_crawl_info(), "", &mut a);
+    keys(&on.get_crawl_info(), "", &mut b);
+    a.sort();
+    b.sort();
+    assert_eq!(a, b);
+    let info = off.get_crawl_info();
+    assert_eq!(info["sessions"]["reached"], 0);
+    assert_eq!(info["totals"]["totalbytessent"], 0);
+}

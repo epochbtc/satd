@@ -406,6 +406,15 @@ impl PeerManager {
             out["state"] = serde_json::json!("off");
             out["held_by"] = serde_json::json!([]);
             out["peersurvey_superseded"] = serde_json::json!(false);
+            // The same keys as with the crawl on, every count zero.
+            out["stopped_by"] = serde_json::Value::Null;
+            out["started"] = serde_json::json!(false);
+            out["limits"] = serde_json::json!({
+                "concurrency": 0, "tor_concurrency": 0, "rate": 0, "liveness": 0, "max_age": 0,
+                "probes": false, "networks": [], "bind": false,
+            });
+            out["sessions"] = serde_json::json!({ "reached": 0, "unreached": 0, "in_flight": { "clearnet": 0, "tor": 0 } });
+            out["totals"] = serde_json::json!({ "totalbytessent": 0, "totalbytesrecv": 0 });
             return out;
         };
         let agg = self.crawl_aggregate(run, INFO_AGGREGATE_MAX_AGE);
