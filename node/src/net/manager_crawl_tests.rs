@@ -55,6 +55,8 @@ struct Script {
     garbage: bool,
     /// Close a connection that opens with anything but v1.
     v1_only: bool,
+    /// The `version` timestamp; three seconds behind the clock when `None`.
+    timestamp: Option<i64>,
 }
 
 fn core_script() -> Script {
@@ -71,6 +73,7 @@ fn core_script() -> Script {
         silent: false,
         garbage: false,
         v1_only: true,
+        timestamp: None,
     }
 }
 
@@ -164,7 +167,7 @@ async fn serve(mut stream: TcpStream, script: Script, log: Log, i: usize) {
                     .send(NetworkMessage::Version(VersionMessage {
                         version: 70016,
                         services,
-                        timestamp: crate::time::now_secs() as i64 - 3,
+                        timestamp: script.timestamp.unwrap_or(crate::time::now_secs() as i64 - 3),
                         receiver: Address::new(&zero, ServiceFlags::NONE),
                         sender: Address::new(&zero, services),
                         nonce: 0x5eed,
@@ -627,4 +630,19 @@ async fn a_crawl_nonce_is_known_during_its_handshake_only() {
     assert_eq!(out.result.v1, Attempt::Failed);
     assert!(!pm.is_crawl_nonce(v.nonce));
     let _ = SessionResult::default();
+}
+
+/// A peer's `version` timestamp is its own to set: `i64::MIN` saturates the
+/// clock offset instead of overflowing (a panic, which stops the crawl, in
+/// a debug build; a wrapped offset written to the book in release).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_extreme_version_timestamp_does_not_overflow_the_clock_offset() {
+    let (pm, _dir) = mk_pm_with(None);
+    enable(&pm, config());
+    let script = Script { timestamp: Some(i64::MIN), ..core_script() };
+    let (target, _log) = scripted("127.0.0.1", script).await;
+    let out = pm.crawl_session(&target, SessionKind::Liveness).await;
+    assert_eq!(out.result.v1, Attempt::Ok);
+    let obs = out.result.observation.expect("an observation");
+    assert_eq!(obs.clock_offset_secs, Some(i64::MIN));
 }

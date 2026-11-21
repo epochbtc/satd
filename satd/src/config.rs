@@ -8660,9 +8660,14 @@ fn resolve_crawl(
     let port = node::net::peer::default_p2p_port(network);
     let mut seeds = Vec::new();
     for v in list(&cli.crawlseed, "crawlseed") {
-        let v = v.trim().to_string();
+        let mut v = v.trim().to_string();
         if node::net::dns::is_name_target(&v) {
             return Err(format!("-crawlseed={v}: an IP address or onion, not a name"));
+        }
+        // An onion with no port takes the network's, as a bare IP does: the
+        // shared parser (also -connect's) asks for a port on an onion.
+        if v.ends_with(".onion") {
+            v = format!("{v}:{port}");
         }
         node::net::peer::PeerAddr::parse_with_default_port(&v, port).map_err(|e| format!("-crawlseed={v}: {e}"))?;
         seeds.push(v);
@@ -12288,6 +12293,10 @@ blockmintxfee=0.00001
             assert!(load(&[bad]).is_err(), "{bad} accepted");
         }
         assert!(load(&["-crawlbind=192.0.2.1", "-crawlbind=192.0.2.2"]).unwrap_err().contains("second IPv4"));
+        // An onion with no port takes the network's, as a bare IP does.
+        let onion = "pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.onion";
+        let c = load(&[&format!("-crawlseed={onion}")]).expect("a portless onion seed");
+        assert_eq!(c.crawlseed, vec![format!("{onion}:18444")], "the regtest port");
 
         let c = load(&[
             "-crawl=1",

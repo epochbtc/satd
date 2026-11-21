@@ -617,7 +617,8 @@ impl PeerManager {
         if their.nonce == ours.nonce {
             return Err("connected to self".into());
         }
-        let clock_offset_secs = their.timestamp - crate::time::now_secs() as i64;
+        // The peer's timestamp is its own to set: i64::MIN must not overflow.
+        let clock_offset_secs = their.timestamp.saturating_sub(crate::time::now_secs() as i64);
         let our_height = self.chain_state.tip_height();
         let mut behavior = PeerBehavior::default();
         behavior.note_version(&their, our_height);
