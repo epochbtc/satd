@@ -109,7 +109,8 @@ pub struct Thresholds {
     /// `C`: the session is shorter than this.
     pub crawler_session_max_secs: u64,
     /// `C`: at least this many inbound connections from the peer's network
-    /// group, this one included, within the window.
+    /// group, this one included, within the window. A peer fingerprinted as
+    /// bitnodes or bitcoin-seeder needs none.
     pub crawler_netgroup_min: u32,
     /// `C`: the window the network-group count covers.
     pub crawler_netgroup_window_secs: u64,
@@ -144,7 +145,7 @@ pub struct Thresholds {
 /// before this ships. Until then they are deliberately loose, so that a
 /// flag says more about the threshold than about the peer only rarely.
 pub const THRESHOLDS: Thresholds = Thresholds {
-    crawler_session_max_secs: 60,
+    crawler_session_max_secs: 300,
     crawler_netgroup_min: 3,
     crawler_netgroup_window_secs: 3_600,
     spy_announced_min: 500,
@@ -224,23 +225,28 @@ pub fn evaluate(i: &Inputs, t: &Thresholds) -> Vec<(Flag, Evidence)> {
     let num = Value::Num;
     let mut out = Vec::new();
 
+    // A peer whose handshake is a known crawler's needs no busy network
+    // group: crawlers that return only every hour or two never make one.
+    let crawler_family = i.fingerprint.observed().filter(|f| matches!(f, Family::Bitnodes | Family::BitcoinSeeder));
+    let busy_netgroup = i.netgroup_seen >= t.crawler_netgroup_min;
     if i.inbound
         && i.session_secs < t.crawler_session_max_secs
         && b.getaddr_in > 0
         && b.headers_req == 0
         && b.blocks_req == 0
-        && i.netgroup_seen >= t.crawler_netgroup_min
+        && (busy_netgroup || crawler_family.is_some())
     {
-        out.push((
-            Flag::Crawler,
-            vec![
-                ("session_secs", num(i.session_secs)),
-                ("getaddr_in", num(b.getaddr_in)),
-                ("headers_req", num(b.headers_req)),
-                ("blocks_req", num(b.blocks_req)),
-                ("netgroup_seen", num(u64::from(i.netgroup_seen))),
-            ],
-        ));
+        let mut evidence = vec![
+            ("session_secs", num(i.session_secs)),
+            ("getaddr_in", num(b.getaddr_in)),
+            ("headers_req", num(b.headers_req)),
+            ("blocks_req", num(b.blocks_req)),
+            ("netgroup_seen", num(u64::from(i.netgroup_seen))),
+        ];
+        if let (false, Some(f)) = (busy_netgroup, crawler_family) {
+            evidence.push(("fingerprint", Value::Name(f.name())));
+        }
+        out.push((Flag::Crawler, evidence));
     }
 
     let relay = b.version.as_ref().is_some_and(|v| v.relay);

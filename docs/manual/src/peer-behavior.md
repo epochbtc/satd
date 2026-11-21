@@ -31,7 +31,7 @@ implementation against a local node, committed with the sources
 
 | Code | Name | Raised when |
 |---|---|---|
-| `C` | `crawler` | An inbound peer connected for under 60 s has sent `getaddr` and no `getheaders` or block request, and its network group has opened at least 3 inbound connections in the last hour. Onion and unroutable peers have no network group to count and never get `C`. |
+| `C` | `crawler` | An inbound peer connected for under 300 s has sent `getaddr` and no `getheaders` or block request, and either its handshake is a known crawler's (`bitnodes`, `bitcoin-seeder`) or its network group has opened at least 3 inbound connections in the last hour. Onion and unroutable peers have no network group to count, so they get `C` only by the crawler handshake. |
 | `S` | `spy` | A peer that asked for transaction relay has been sent at least 500 transaction announcements, asked for at least 90% of them, with a 10th-percentile delay of 5 ms or less, announced none itself, asked for no block, and been connected at least 2 hours. |
 | `F` | `fingerprint-mismatch` | The fingerprint is a `mismatch`. |
 | `A` | `addr-abuse` | More than one `getaddr` in the connection (Core answers one), or more than 1,000 of its addresses dropped by the address rate limit. |

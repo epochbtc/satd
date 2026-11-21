@@ -107,6 +107,38 @@ fn crawler_fires_on_a_short_getaddr_session_from_a_busy_netgroup() {
     assert_eq!(pm.peers.read()[&7].info.flags.fingerprint.observed(), Some(Family::BitcoinSeeder));
 }
 
+/// `C` still fires two minutes in: crawlers seen on a live node held the
+/// connection for 80 to 122 s after their `getaddr`.
+#[test]
+fn crawler_fires_on_a_two_minute_getaddr_session() {
+    let _clock = MockClock::install();
+    let (pm, _dir) = pm_with_coins(&[]);
+    busy_netgroup(&pm);
+    let _rx = scripted(&pm, 7, "bitcoin-seeder-92d2b46-inbound", "11.22.7.7:8333", 122);
+    pm.note_inbound_netgroup(7);
+    deliver(&pm, 7, NetworkMessage::GetAddr);
+    let flags = flags_of(&pm, 7);
+    assert_eq!(codes(&flags), "C");
+    assert_eq!(evidence(&flags, Flag::Crawler)[0], ("session_secs", n(122)));
+}
+
+/// `C` for a known crawler alone in its group: a bitnodes handshake that
+/// sent `getaddr` and nothing else is flagged on its first visit, with the
+/// fingerprint as the evidence in place of the busy group.
+#[test]
+fn crawler_fires_on_a_crawler_fingerprint_without_a_busy_netgroup() {
+    let _clock = MockClock::install();
+    let (pm, _dir) = pm_with_coins(&[]);
+    let _rx = scripted(&pm, 7, "bitnodes-036dc5c-inbound", "11.22.7.7:8333", 122);
+    pm.note_inbound_netgroup(7);
+    deliver(&pm, 7, NetworkMessage::GetAddr);
+    let flags = flags_of(&pm, 7);
+    assert_eq!(codes(&flags), "C");
+    let ev = evidence(&flags, Flag::Crawler);
+    assert_eq!(ev[4], ("netgroup_seen", n(1)));
+    assert_eq!(ev[5], ("fingerprint", Value::Name("bitnodes")));
+}
+
 /// `C`, honest: Core dialing us from the same busy group sends `getaddr`
 /// and `getheaders`; it syncs, so it is no crawler.
 #[test]
@@ -121,13 +153,14 @@ fn crawler_spares_an_honest_core_peer_from_a_busy_netgroup() {
     assert_eq!(codes(&flags_of(&pm, 7)), "");
 }
 
-/// `C` needs the group to repeat: one seeder alone in its group is not
-/// flagged, nor is one past the session bound.
+/// `C` needs the group to repeat for a peer that is not a known crawler:
+/// a Core peer alone in its group that sent only `getaddr` is not flagged,
+/// nor is a seeder past the session bound.
 #[test]
 fn crawler_needs_a_repeating_netgroup_and_a_short_session() {
     let _clock = MockClock::install();
     let (pm, _dir) = pm_with_coins(&[]);
-    let _rx = scripted(&pm, 7, "bitcoin-seeder-92d2b46-inbound", "11.22.7.7:8333", 4);
+    let _rx = scripted(&pm, 7, "core-31.2-inbound", "11.22.7.7:8333", 4);
     pm.note_inbound_netgroup(7);
     deliver(&pm, 7, NetworkMessage::GetAddr);
     assert_eq!(codes(&flags_of(&pm, 7)), "", "alone in its group");
