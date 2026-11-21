@@ -1,0 +1,58 @@
+{
+  "capture_format": 1,
+  "shape": "crawl",
+  "label": "rbitcoin-0.8.99-outbound-crawl",
+  "implementation": "rbitcoin",
+  "implementation_version": "0.8.99",
+  "network": "regtest",
+  "connection": "outbound",
+  "peer_state": {
+    "ibd": "no",
+    "height": 1,
+    "note": "",
+    "address_book": {
+      "method": "addpeeraddress",
+      "offered": 1000,
+      "accepted": 1000
+    }
+  },
+  "recorder": {
+    "greeting": "crawl",
+    "protocol_version": 70016,
+    "services": 0,
+    "relay": false,
+    "start_height": 1,
+    "user_agent": "/satd:0.8.0-pre(crawler)/",
+    "passive_wait_s": 10.0,
+    "getaddr_wait_s": 90.0,
+    "probe_wait_s": 5.0
+  },
+  "transport": "v1",
+  "v2_attempted": false,
+  "v2_failure": null,
+  "v2_transport": null,
+  "version": null,
+  "commands": [],
+  "getaddr": null,
+  "addr_after_getaddr": [],
+  "received": [],
+  "sent": [
+    {
+      "t_ms": 0,
+      "phase": "handshake",
+      "command": "version"
+    },
+    {
+      "t_ms": 0,
+      "phase": "handshake",
+      "command": "wtxidrelay"
+    }
+  ],
+  "probes": [],
+  "closed_by_peer": {
+    "t_ms": 0,
+    "phase": "handshake"
+  },
+  "error": null,
+  "session": 1
+}

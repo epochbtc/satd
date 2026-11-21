@@ -25,6 +25,10 @@ a client behaves.
   is from our side: `inbound` means the peer dialed us. When listening, the
   recorder also takes the node's next connection, if it opens one within
   20 s, as `…-s2.json`.
+- `fixtures/crawl/` holds the crawl-shape captures (below):
+  `<name>-<version>-outbound-crawl[-v2].json`. They sit in a directory of
+  their own so the classifier's fixture tests, which read every
+  `fixtures/*.json` and expect a table row for each, do not pick them up.
 
 The fixtures hold commands, sizes, timings and decoded fields. They never
 hold an address: the version message's address fields and nonce are
@@ -68,6 +72,74 @@ implementation that speaks both.
   unknown message as `Unknown message type` and nothing else: no
   misbehaviour, no disconnect.
 
+## Crawl-shape captures
+
+`capture.py --crawl` (with `--dial`) greets a node as an optional crawl
+mode would: a declared crawler that only asks for addresses. Its `version`
+carries protocol 70016, services 0, relay 0, `start_height` the node's real
+tip, a random nonce, the dialed address in `addr_recv`, a dummy
+`addr_from`, and the user agent `/satd:<version>(crawler)/` (the version
+from the workspace `Cargo.toml`). It sends `version` and `wtxidrelay` at
+once, `sendaddrv2` and `verack` on the node's `version`, and nothing else
+unsolicited; it answers `ping` and `getheaders` as before. After the
+handshake and the 10 s passive window it sends one `getaddr`, waits up to
+90 s for the answer (the first `addr`/`addrv2` with more than one entry),
+then runs the same four probes.
+
+The `getaddr` answer is kept as summary numbers only (`getaddr` in the
+fixture): message kind, entry count, delay from `getaddr`, networks,
+service bits, whether the node lists itself, and the age spread of the
+entries' `nTime`. With `--v2` the recorder dials v2 first and records the
+node's BIP324 transport before any message (`v2_transport`: garbage
+length, decoy packets before its version packet, the version packet's
+length and contents, decoys afterwards, short vs 12-byte message IDs, and
+`v2_id` on each message). When the v2 attempt fails it records how
+(`v2_failure`: reset, end of stream or timeout, the time, and how many
+bytes came back, never the bytes) and redials over v1, as a crawler falls
+back.
+
+`run-captures.py --crawl` runs this against each implementation that
+accepts connections. It first seeds the node's address book with 1,000
+random routable IPv4 addresses on the regtest port through
+`addpeeraddress` (`--seed-addrs`), and starts the node with no outbound
+connections of its own (`-connect=0`; rbitcoin, whose `--max-outbound`
+must be at least 1, dials only a closed local port), so nothing it was
+given is ever dialled. `peer_state.address_book` records how many it
+accepted.
+
+| Implementation | Version | v1 | v2 | Opening messages after `verack` | `getaddr` answer (v1 / v2) | v2 transport | Our v2 attempt, if refused |
+|---|---|---|---|---|---|---|---|
+| Bitcoin Core | 32.1 | yes | yes | `sendcmpct ping feefilter` | `addrv2`, 227 of 990 / 228 of 992, 1 ms / 5 ms | garbage 1729 B, no decoys, empty version packet | n/a |
+| Bitcoin Core | 24.0.1 | yes | no | `sendcmpct ping feefilter` | `addrv2`, 227 of 991 / 228 of 992, 1 ms / 119 ms | n/a | closed (end of stream) after 73 ms, 0 bytes back; v1 redial works |
+| satd | 0.8.0-pre | yes | yes | `sendcmpct feefilter ping` | `addrv2`, 230 of 1000, 2 ms / 8 ms | garbage 2731 B, no decoys, empty version packet | n/a |
+| rbitcoin | 0.8.99 | no | yes | `sendheaders sendcmpct ping` | — / `addrv2`, 230 of 1000, 11 ms | garbage 3570 B, no decoys, empty version packet | n/a |
+
+"227 of 990" is the entry count of the answer out of the addresses the
+node accepted. What the table shows:
+
+- **No `getheaders`.** Against the normal outbound shape Core (31.2 in
+  the fixtures above, and 32.1 when re-checked) and satd 0.7.0 send
+  `getheaders` after `verack`; against services 0 no implementation asks
+  for headers. rbitcoin still sends
+  `sendheaders`.
+- **`notfound` depends on `relay`.** Core (32.1 and 24.0.1) leaves the
+  `getdata` probe for an unknown txid unanswered on a connection that set
+  relay 0; satd and rbitcoin send `notfound` as they do on a normal one.
+  No implementation disconnected on any probe or on `getaddr`.
+- **Answer size.** Every answer is 23 % of the address book, as Core's
+  `MAX_PCT_ADDR_TO_SEND`, in `addrv2` (all were sent `sendaddrv2`); none
+  lists the node itself. In rbitcoin's answer every entry's `nTime` is the
+  time of the answer (age 0) and its services are 0x809; in Core's and
+  satd's, `nTime` is when the address was added and services are 0x9.
+- **v2 transport.** Garbage length is random per connection (BIP324:
+  0–4095 bytes), so one capture shows only that a node sends some. No node
+  sent decoy packets or a non-empty version packet, and every node used
+  the short ID wherever BIP324 defines one (`version`, `verack`,
+  `wtxidrelay`, `sendaddrv2` and `sendheaders` have none), so message IDs
+  do not tell these implementations apart.
+- **rbitcoin refuses v1:** it closes our v1 connection before sending
+  anything, as in the outbound fixtures.
+
 ## Limits
 
 - **IBD state.** btcd and bcoin report no IBD field over RPC; their
@@ -85,6 +157,22 @@ implementation that speaks both.
   it), and `unset WITH_BITCOIN_CONSENSUS` for its `unset -f` bug. `bs`
   cannot choose its listen address, so it runs in a container with only
   its P2P port published to 127.0.0.1.
+- **Crawl captures: four families.** Knots, btcd, bcoin and
+  libbitcoin-server have no crawl-shape capture yet: their builds were not
+  available where these were captured. Core 24.0.1, which predates BIP324,
+  stands in for how a v1-only node refuses our v2 attempt; btcd, bcoin and
+  libbitcoin may refuse differently. The Core, satd and rbitcoin versions
+  are the ones available there (Core 32.1 and 24.0.1, satd at this tree's
+  version, an rbitcoin 0.8.99 development build), not those of the
+  fixtures above.
+- **Crawl captures: regtest address books.** Each answer comes from about
+  1,000 addresses added over RPC seconds before, all IPv4 on one port, so
+  the answer's networks, service bits and `nTime` spread say little about a
+  mainnet node's. The delay is from `getaddr` to the answer: it rides the
+  address trickle (Core: an exponential timer averaging 30 s), and sent
+  10 s after the handshake it mostly found the timer already due, so the
+  regtest delays are short. A node's own address on 127.0.0.1 is never in
+  its address book, so `lists_itself` is false by construction here.
 - **Regtest, one block.** A node on mainnet with a full chain, peers and a
   mempool may announce more. The classifier's thresholds are calibrated on
   a synced mainnet node before they ship.
@@ -105,3 +193,12 @@ Each node runs with `HOME` set to its own scratch directory and binds to
 127.0.0.1 (libbitcoin: in a container, see above). btcd creates an empty `~/.btcd` from the passwd entry whatever
 its flags say; the script removes it again. When satd's own greeting
 changes, capture satd and update `capture.py`'s greeting to match.
+
+The crawl-shape captures:
+
+```sh
+SATD=… SATCLI=… CORE_BIN=…/bin RBITCOIN=… \
+./run-captures.py --crawl --workdir /path/to/scratch --out fixtures/crawl \
+  --transport v1,v2 --core-functional /path/to/bitcoin/test/functional \
+  --version satd=0.8.0-pre --version core=32.1 --version rbitcoin=0.8.99
+```
