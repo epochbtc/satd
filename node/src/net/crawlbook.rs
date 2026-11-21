@@ -360,11 +360,17 @@ impl CrawlEntry {
 
     fn named(&mut self, source: u64, services: u64, time: u32, now: u64) {
         self.last_named = self.last_named.max(now);
+        self.seeded(source, services);
+        self.best_time = self.best_time.max(time);
+    }
+
+    /// Note `source` among its sources without counting as a naming: a
+    /// seed handed in again does not keep a failing address in the book.
+    fn seeded(&mut self, source: u64, services: u64) {
         if self.sources.len() < MAX_SOURCES && !self.sources.contains(&source) {
             self.sources.push(source);
         }
         self.advertised_services = services;
-        self.best_time = self.best_time.max(time);
     }
 
     /// The recency LRU eviction goes by.
@@ -476,17 +482,22 @@ enum Prefix {
     V6([u8; 8]),
 }
 
-fn prefix(addr: &CrawlAddr) -> Option<Prefix> {
+/// The IP of a socket address, canonical.
+fn socket_ip(addr: &CrawlAddr) -> Option<IpAddr> {
     let CrawlAddr::Peer(PeerAddr::Socket(sa)) = addr else {
         return None;
     };
-    Some(match sa.ip().to_canonical() {
+    Some(sa.ip().to_canonical())
+}
+
+fn prefix(ip: IpAddr) -> Prefix {
+    match ip {
         IpAddr::V4(v4) => {
             let o = v4.octets();
             Prefix::V4([o[0], o[1], o[2]])
         }
         IpAddr::V6(v6) => Prefix::V6(v6.octets()[..8].try_into().expect("8 bytes")),
-    })
+    }
 }
 
 /// Whether a crawl may admit `ip`: routable as Core judges it
@@ -548,8 +559,10 @@ pub struct CrawlBook {
     entries: HashMap<CrawlAddr, CrawlEntry>,
     /// Every entry by [`CrawlEntry::lru_key`], least recent first.
     lru: BTreeSet<(u64, CrawlAddr)>,
-    /// Entries per IPv4 `/24` and IPv6 `/64`.
+    /// Distinct IPs per IPv4 `/24` and IPv6 `/64`.
     prefixes: HashMap<Prefix, u32>,
+    /// Entries (one per port) per IP.
+    ips: HashMap<IpAddr, u32>,
     params: BookParams,
 }
 
@@ -561,7 +574,7 @@ impl Default for CrawlBook {
 
 impl CrawlBook {
     pub fn new(params: BookParams) -> Self {
-        CrawlBook { entries: HashMap::new(), lru: BTreeSet::new(), prefixes: HashMap::new(), params }
+        CrawlBook { entries: HashMap::new(), lru: BTreeSet::new(), prefixes: HashMap::new(), ips: HashMap::new(), params }
     }
 
     pub fn params(&self) -> &BookParams {
@@ -627,7 +640,9 @@ impl CrawlBook {
                 report.over_source_cap += 1;
                 continue;
             }
-            match prefix(&addr) {
+            // The caps count IPs: another port of an IP already in the
+            // book takes no prefix slot.
+            match socket_ip(&addr).filter(|ip| !self.ips.contains_key(ip)).map(prefix) {
                 Some(p @ Prefix::V6(_)) if self.prefix_count(p) >= IPV6_PER_64 => {
                     report.ipv6_prefix_full += 1;
                     continue;
@@ -647,8 +662,14 @@ impl CrawlBook {
     /// Add a seed (a DNS seed's answer, a fixed seed, an address-manager
     /// sample, `-crawlseed`). The address rules hold, the answer and prefix
     /// caps do not: a seed is not gossip. Seeds count as one source between
-    /// them. Returns whether the address is in the book afterwards.
+    /// them. Seeding an address already in the book is not a source naming
+    /// it again: it does not hold off the drop of an address that keeps
+    /// failing. Returns whether the address is in the book afterwards.
     pub fn seed(&mut self, addr: PeerAddr, services: u64, now: u64) -> bool {
+        let addr = match addr {
+            PeerAddr::Socket(sa) => PeerAddr::Socket(std::net::SocketAddr::new(sa.ip().to_canonical(), sa.port())),
+            onion @ PeerAddr::Onion { .. } => onion,
+        };
         let usable = match &addr {
             PeerAddr::Socket(sa) => is_public_unicast(sa.ip()),
             PeerAddr::Onion { .. } => true,
@@ -658,7 +679,7 @@ impl CrawlBook {
         }
         let addr = CrawlAddr::Peer(addr);
         if self.entries.contains_key(&addr) {
-            self.update(&addr, |e| e.named(SEED_SOURCE, services, 0, now));
+            self.update(&addr, |e| e.seeded(SEED_SOURCE, services));
         } else {
             self.insert(addr, CrawlEntry::new(now, SEED_SOURCE, services, 0));
         }
@@ -799,10 +820,15 @@ impl CrawlBook {
         c
     }
 
-    /// Drop every entry past [`DROP_AFTER_SECS`] as of `now`.
+    /// Drop every entry past [`DROP_AFTER_SECS`] as of `now`, except one
+    /// with a session open: its result decides.
     pub fn expire(&mut self, now: u64) {
-        let gone: Vec<CrawlAddr> =
-            self.entries.iter().filter(|(a, e)| e.droppable(a.dialable(), now)).map(|(a, _)| a.clone()).collect();
+        let gone: Vec<CrawlAddr> = self
+            .entries
+            .iter()
+            .filter(|(a, e)| !e.in_flight && e.droppable(a.dialable(), now))
+            .map(|(a, _)| a.clone())
+            .collect();
         for addr in gone {
             self.remove(&addr);
         }
@@ -812,14 +838,22 @@ impl CrawlBook {
         self.prefixes.get(&p).copied().unwrap_or(0)
     }
 
+    /// Past the bound the least recently used entry without a session open
+    /// goes. The entry just inserted has none open, so one always can.
     fn insert(&mut self, addr: CrawlAddr, entry: CrawlEntry) {
-        if let Some(p) = prefix(&addr) {
-            *self.prefixes.entry(p).or_default() += 1;
+        if let Some(ip) = socket_ip(&addr) {
+            let n = self.ips.entry(ip).or_default();
+            *n += 1;
+            if *n == 1 {
+                *self.prefixes.entry(prefix(ip)).or_default() += 1;
+            }
         }
         self.lru.insert((entry.lru_key(), addr.clone()));
         self.entries.insert(addr, entry);
         while self.entries.len() > self.params.max_entries {
-            let Some((_, oldest)) = self.lru.first().cloned() else { break };
+            let Some(oldest) = self.lru.iter().map(|(_, a)| a).find(|a| !self.entries[*a].in_flight).cloned() else {
+                break;
+            };
             self.remove(&oldest);
         }
     }
@@ -827,9 +861,15 @@ impl CrawlBook {
     fn remove(&mut self, addr: &CrawlAddr) {
         let Some(e) = self.entries.remove(addr) else { return };
         self.lru.remove(&(e.lru_key(), addr.clone()));
-        if let Some(p) = prefix(addr)
-            && let Some(n) = self.prefixes.get_mut(&p)
-        {
+        let Some(ip) = socket_ip(addr) else { return };
+        let Some(n) = self.ips.get_mut(&ip) else { return };
+        *n -= 1;
+        if *n > 0 {
+            return;
+        }
+        self.ips.remove(&ip);
+        let p = prefix(ip);
+        if let Some(n) = self.prefixes.get_mut(&p) {
             *n -= 1;
             if *n == 0 {
                 self.prefixes.remove(&p);

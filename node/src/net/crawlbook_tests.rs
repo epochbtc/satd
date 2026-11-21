@@ -624,3 +624,85 @@ fn seeds_skip_the_answer_rules_but_not_the_address_rules() {
     let e = book.get(&CrawlAddr::Peer(PeerAddr::Socket("5.6.7.1:8333".parse().unwrap()))).unwrap();
     assert_eq!(e.source_count(), 1);
 }
+
+#[test]
+fn a_mapped_seed_is_the_entry_its_gossip_names() {
+    let mut book = CrawlBook::default();
+    assert!(book.seed(PeerAddr::Socket("[::ffff:5.6.7.1]:8333".parse().unwrap()), 0, NOW));
+    let r = book.admit(&source(1), &[ip_entry("5.6.7.1", 8333)], NOW);
+    assert_eq!((r.admitted, r.named_again), (0, 1));
+    assert_eq!(book.len(), 1);
+    let e = book.get(&CrawlAddr::Peer(PeerAddr::Socket("5.6.7.1:8333".parse().unwrap()))).unwrap();
+    assert_eq!(e.source_count(), 2);
+}
+
+#[test]
+fn a_session_open_is_never_evicted_or_expired() {
+    // Eviction: the least recently used entry has a session open.
+    let a = v4(0);
+    let mut book = CrawlBook::new(BookParams { max_entries: 2, ..BookParams::default() });
+    book.seed(a.clone(), 0, NOW);
+    assert!(book.mark_dialling(&a));
+    book.admit(&source(1), &v4_answer(1, 1), NOW + 1);
+    book.admit(&source(1), &v4_answer(2, 1), NOW + 2);
+    assert_eq!(book.len(), 2);
+    assert!(book.get(&CrawlAddr::Peer(v4(1))).is_none(), "the oldest without a session went");
+    book.record_result(&a, SessionKind::Discovery, v2_ok(NOW + 3), NOW + 3);
+    assert_eq!(book.get(&CrawlAddr::Peer(a.clone())).unwrap().last_reachable(), Some(NOW + 3), "its result counts");
+
+    // Expiry: failing and unnamed for 30 days, with a session open.
+    let mut book = CrawlBook::default();
+    book.seed(a.clone(), 0, NOW);
+    book.record_result(&a, SessionKind::Discovery, down(), NOW);
+    let later = NOW + DROP_AFTER_SECS + DAY;
+    assert!(book.mark_dialling(&a));
+    book.expire(later);
+    assert!(book.get(&CrawlAddr::Peer(a.clone())).is_some(), "not expired mid-session");
+    book.record_result(&a, SessionKind::Discovery, v2_ok(later), later);
+    assert_eq!(book.get(&CrawlAddr::Peer(a)).unwrap().last_reachable(), Some(later));
+}
+
+#[test]
+fn the_prefix_caps_count_ips_not_ports() {
+    let mut book = CrawlBook::default();
+    let ports: Vec<AddrV2Message> = (0..8).map(|p| ip_entry("5.6.7.1", 8333 + p)).collect();
+    assert_eq!(book.admit(&source(1), &ports, NOW).admitted, 8);
+    let others: Vec<AddrV2Message> = (2..=8).map(|i| ip_entry(&format!("5.6.7.{i}"), 8333)).collect();
+    let r = book.admit(&source(1), &others, NOW);
+    assert_eq!((r.admitted, r.ipv4_prefix_full), (7, 0), "one host on eight ports takes one slot");
+    assert_eq!(book.admit(&source(1), &[ip_entry("5.6.7.9", 8333)], NOW).ipv4_prefix_full, 1);
+
+    let r = book.admit(&source(1), &[ip_entry("2a01:4f8:1:2::1", 8333), ip_entry("2a01:4f8:1:2::1", 8334)], NOW);
+    assert_eq!(r.admitted, 2, "another port of the /64's one IP");
+    assert_eq!(book.admit(&source(1), &[ip_entry("2a01:4f8:1:2::2", 8333)], NOW).ipv6_prefix_full, 1);
+
+    // The slot frees when the IP's last entry goes.
+    let mut book = CrawlBook::new(BookParams { max_entries: 2, ipv4_per_24: 1, ..BookParams::default() });
+    book.admit(&source(1), &[ip_entry("5.6.7.1", 8333)], NOW);
+    book.admit(&source(1), &[ip_entry("5.6.7.1", 8334)], NOW + 1);
+    book.admit(&source(1), &[ip_entry("9.9.9.1", 8333)], NOW + 2);
+    assert_eq!(book.len(), 2);
+    assert_eq!(book.admit(&source(1), &[ip_entry("5.6.7.2", 8333)], NOW + 3).ipv4_prefix_full, 1, "5.6.7.1:8334 holds it");
+    book.admit(&source(1), &[ip_entry("9.9.10.1", 8333)], NOW + 4);
+    assert!(book.get(&CrawlAddr::Peer(PeerAddr::Socket("5.6.7.1:8334".parse().unwrap()))).is_none());
+    assert_eq!(book.admit(&source(1), &[ip_entry("5.6.7.2", 8333)], NOW + 5).admitted, 1);
+}
+
+#[test]
+fn seeding_again_does_not_hold_off_the_drop() {
+    let a = v4(1);
+    let mut book = CrawlBook::default();
+    book.seed(a.clone(), 0, NOW);
+    let mut t = NOW;
+    while t < NOW + 31 * DAY {
+        // Seeded again every day until day 29: no source names it.
+        if t < NOW + 29 * DAY && (t - NOW).is_multiple_of(DAY) {
+            book.seed(a.clone(), 0, t);
+        }
+        if due_kind(&book, &a, t).is_some() {
+            book.record_result(&a, SessionKind::Discovery, down(), t);
+        }
+        t += HOUR;
+    }
+    assert!(book.get(&CrawlAddr::Peer(a)).is_none(), "dropped after 30 days of failures");
+}
