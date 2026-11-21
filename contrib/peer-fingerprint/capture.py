@@ -781,7 +781,8 @@ def capture(args, srv=None):
                 # The v1 redial failed too: record how, as every other
                 # failure path here does, instead of writing no fixture.
                 d = fixture_head(args, "outbound", v2_attempts)
-                d.update({"transport": None, "v2_failure": v2_failure,
+                d.update({"transport": None, "v2_attempted": bool(args.v2), "v2_failure": v2_failure,
+                          "v2_transport": None, "getaddr": None, "addr_after_getaddr": None,
                           "version": None, "commands": [], "received": [], "sent": [], "probes": [],
                           "closed_by_peer": None,
                           "error": f"v1 redial failed: {type(e).__name__} {e}".strip()})
