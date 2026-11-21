@@ -680,6 +680,20 @@ mod tests {
         assert_eq!(dispatched.load(Ordering::SeqCst), 2);
     }
 
+    /// A read-only token cannot export the crawl, keyed (the default) or
+    /// raw; the operator can.
+    #[tokio::test]
+    async fn read_token_cannot_export_the_crawl() {
+        let (svc, dispatched) = filter();
+        let rp = svc.call(req_with("dumpcrawlsnapshot", Some(read_only_token()))).await;
+        assert!(rp.is_error());
+        assert!(rp.as_json().get().contains("rpc:write"), "{}", rp.as_json().get());
+        assert_eq!(dispatched.load(Ordering::SeqCst), 0, "dumpcrawlsnapshot never reached the handler");
+        let rp = svc.call(req_with("dumpcrawlsnapshot", Some(Principal::operator()))).await;
+        assert!(rp.is_success());
+        assert_eq!(dispatched.load(Ordering::SeqCst), 1);
+    }
+
     #[tokio::test]
     async fn read_token_is_forbidden_on_a_submit_method() {
         let (svc, dispatched) = filter();

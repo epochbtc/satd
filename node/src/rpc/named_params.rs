@@ -134,6 +134,8 @@ pub fn arg_names(method: &str) -> Option<&'static [ArgSpec]> {
         // SATD_ONLY: deriveaddresses, getdescriptorinfo
         "deriveaddresses" => &[("descriptor", false), ("range", false)],
         "disconnectnode" => &[("address", false), ("nodeid", false)],
+        // SATD_ONLY: dumpcrawlsnapshot
+        "dumpcrawlsnapshot" => &[("raw", false)],
         "dumptxoutset" => &[("path", false), ("type", false), ("rollback", true), ("in_memory", true), ("options", false)],
         "echo" => &[("arg0", false), ("arg1", false), ("arg2", false), ("arg3", false), ("arg4", false), ("arg5", false), ("arg6", false), ("arg7", false), ("arg8", false), ("arg9", false)],
         "echoipc" => &[("arg", false)],
@@ -356,7 +358,7 @@ pub(crate) const ALL_METHODS: &[&str] = &[
     "addconnection", "addnode", "addpeeraddress", "analyzepsbt", "backfillindex", "cancelindex", "clearbanned",
     "combinepsbt", "combinerawtransaction", "converttopsbt", "createnapattestation", "createpsbt",
     "createrawtransaction", "decodepsbt", "decoderawtransaction", "decodescript",
-    "deriveaddresses", "disconnectnode", "dumptxoutset",
+    "deriveaddresses", "disconnectnode", "dumpcrawlsnapshot", "dumptxoutset",
     "echo", "echoipc", "echojson",
     "estimatefees", "estimaterawfee", "estimatesmartfee", "exportnapsnapshot",
     "finalizepsbt", "generate", "generateblock", "generatetoaddress",

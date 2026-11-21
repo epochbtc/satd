@@ -1020,6 +1020,8 @@ fn field_specs() -> Vec<FieldSpec> {
         restart!("crawlseed", crawlseed),
         restart!("crawluacomment", crawluacomment),
         restart!("crawlprobes", crawlprobes),
+        restart!("crawlexportkeyfile", crawlexportkeyfile),
+        restart!("crawlexportmink", crawlexportmink),
         // Read once at startup, like every option outside the alt-slot set.
         restart!("peerflagpolicy", peerflagpolicy),
         // NOTE: `policyfile` is intentionally NOT a FieldSpec. Like the

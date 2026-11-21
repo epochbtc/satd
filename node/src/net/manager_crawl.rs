@@ -58,6 +58,7 @@ use crate::net::crawlbook::{
     Attempt, BookParams, CrawlBook, GetaddrResult, Network, Observation, SessionKind, SessionResult,
 };
 use crate::net::crawlreport;
+use crate::net::crawlsnapshot::{self, SnapshotStore};
 use crate::net::survey::{self, ProbeContext, ProbeResults};
 use bitcoin::p2p::address::{AddrV2, AddrV2Message};
 use rand::seq::SliceRandom as _;
@@ -86,6 +87,8 @@ pub(super) struct CrawlRun {
     /// The aggregate the metrics and the status page read, and when it was
     /// taken: they are polled often, and a walk of a full book is not free.
     pub(super) aggregate: parking_lot::Mutex<Option<(Instant, crawlreport::Aggregate)>>,
+    /// The hourly snapshots; `None` without a data directory.
+    snapshots: Option<parking_lot::Mutex<SnapshotStore>>,
     /// Every target dialled, in order: for tests.
     #[cfg(test)]
     pub(super) dialled: parking_lot::Mutex<Vec<PeerAddr>>,
@@ -248,6 +251,7 @@ impl PeerManager {
             None => CrawlBook::new(params),
         };
         let epoch = Instant::now();
+        let snapshots = config.snapshot_dir.clone().map(|dir| parking_lot::Mutex::new(SnapshotStore::open(dir)));
         let run = CrawlRun {
             scheduler: parking_lot::Mutex::new(Scheduler::new(config.limits, 0)),
             config,
@@ -261,6 +265,7 @@ impl PeerManager {
             reached: AtomicU64::new(0),
             unreached: AtomicU64::new(0),
             aggregate: parking_lot::Mutex::new(None),
+            snapshots,
             #[cfg(test)]
             dialled: Default::default(),
             #[cfg(test)]
@@ -476,6 +481,57 @@ impl PeerManager {
         crawlreport::nodes_json(&book, crate::time::now_secs(), verbose)
     }
 
+    /// What an export states besides the book, as of `now`.
+    fn crawl_export_context(&self, now: u64) -> crawlsnapshot::ExportContext<'static> {
+        crawlsnapshot::ExportContext {
+            now,
+            latest_height: self.chain_state.tip_height(),
+            default_port: crate::net::peer::default_p2p_port(self.chain_state.network),
+            chain: self.chain_state.network.to_core_arg(),
+        }
+    }
+
+    /// Write the hourly snapshot if one is due at `now`, and prune the old
+    /// ones. Whether one was written.
+    pub(super) fn crawl_snapshot_tick(&self, now: u64) -> bool {
+        let Some(run) = self.crawl.get() else { return false };
+        let Some(store) = &run.snapshots else { return false };
+        let mut store = store.lock();
+        if !store.due(now) {
+            return false;
+        }
+        // The reachable set's lines are built under the book's lock: a
+        // copy of the whole book would cost more.
+        let ctx = self.crawl_export_context(now);
+        let lines = crawlsnapshot::snapshot_lines(&run.book.lock(), &ctx);
+        match store.write(now, &lines) {
+            Ok(w) => {
+                tracing::debug!(file = %w.path.display(), bytes = w.bytes, pruned = w.pruned, "Wrote a crawl snapshot");
+                true
+            }
+            Err(e) => {
+                tracing::warn!(dir = %store.dir().display(), "Could not write a crawl snapshot: {e}");
+                false
+            }
+        }
+    }
+
+    /// `dumpcrawlsnapshot`: the reachable set now, shaped as a Bitnodes
+    /// snapshot. Keyed unless `raw`; the first keyed export creates the
+    /// default key file. An error with the crawl off, or when the key does
+    /// not read.
+    pub fn dump_crawl_snapshot(&self, raw: bool) -> Result<serde_json::Value, String> {
+        let run = self.crawl.get().ok_or("The crawl is off (-crawl)")?;
+        let mode = if raw {
+            crawlsnapshot::Mode::Raw
+        } else {
+            let source = run.config.export_key.as_ref().ok_or("No export key: the crawl keeps no files")?;
+            crawlsnapshot::Mode::Keyed { key: crawlsnapshot::load_key(source)?, min_k: run.config.export_min_k }
+        };
+        let ctx = self.crawl_export_context(crate::time::now_secs());
+        Ok(crawlsnapshot::export_json(&run.book.lock(), &ctx, &mode))
+    }
+
     /// The crawl's counts for the metrics and the status page; `None` with
     /// the crawl off. The aggregate is reused for up to
     /// [`AGGREGATE_MAX_AGE`].
@@ -536,6 +592,10 @@ impl PeerManager {
         let mut seed = tokio::time::interval(crawl::SEED_INTERVAL);
         seed.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         seed.tick().await;
+        // Its first tick is now: a snapshot is due unless one was written
+        // this hour.
+        let mut snapshot = tokio::time::interval(crawlsnapshot::CHECK_INTERVAL);
+        snapshot.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut sessions = tokio::task::JoinSet::new();
         loop {
             tokio::select! {
@@ -559,6 +619,10 @@ impl PeerManager {
                     let _ = tokio::task::spawn_blocking(move || pm.dump_crawl()).await;
                 }
                 _ = seed.tick() => self.crawl_seed_round().await,
+                _ = snapshot.tick() => {
+                    let pm = Arc::clone(&self);
+                    let _ = tokio::task::spawn_blocking(move || pm.crawl_snapshot_tick(crate::time::now_secs())).await;
+                }
             }
         }
         sessions.abort_all();

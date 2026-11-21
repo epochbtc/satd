@@ -13,6 +13,7 @@ pub mod connection;
 pub mod crawl;
 pub mod crawlbook;
 pub mod crawlreport;
+pub mod crawlsnapshot;
 pub mod dns;
 pub mod eviction;
 pub mod fingerprint;
