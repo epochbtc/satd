@@ -417,12 +417,12 @@ fn one_session_at_a_time() {
     let a = v4(1);
     let mut book = CrawlBook::default();
     book.seed(a.clone(), 0, NOW);
-    assert!(book.mark_dialling(&a));
-    assert!(!book.mark_dialling(&a), "already open");
+    assert!(book.mark_dialling(&a, NOW));
+    assert!(!book.mark_dialling(&a, NOW), "already open");
     assert_eq!(due_kind(&book, &a, NOW), None);
     book.record_result(&a, SessionKind::Discovery, v2_ok(NOW), NOW);
-    assert!(!book.get(&CrawlAddr::Peer(a.clone())).unwrap().in_flight());
-    assert!(!book.mark_dialling(&v4(99)), "not in the book");
+    assert!(!book.get(&CrawlAddr::Peer(a.clone())).unwrap().in_flight(NOW));
+    assert!(!book.mark_dialling(&v4(99), NOW), "not in the book");
 }
 
 #[test]
@@ -642,7 +642,7 @@ fn a_session_open_is_never_evicted_or_expired() {
     let a = v4(0);
     let mut book = CrawlBook::new(BookParams { max_entries: 2, ..BookParams::default() });
     book.seed(a.clone(), 0, NOW);
-    assert!(book.mark_dialling(&a));
+    assert!(book.mark_dialling(&a, NOW));
     book.admit(&source(1), &v4_answer(1, 1), NOW + 1);
     book.admit(&source(1), &v4_answer(2, 1), NOW + 2);
     assert_eq!(book.len(), 2);
@@ -655,7 +655,7 @@ fn a_session_open_is_never_evicted_or_expired() {
     book.seed(a.clone(), 0, NOW);
     book.record_result(&a, SessionKind::Discovery, down(), NOW);
     let later = NOW + DROP_AFTER_SECS + DAY;
-    assert!(book.mark_dialling(&a));
+    assert!(book.mark_dialling(&a, later));
     book.expire(later);
     assert!(book.get(&CrawlAddr::Peer(a.clone())).is_some(), "not expired mid-session");
     book.record_result(&a, SessionKind::Discovery, v2_ok(later), later);
@@ -705,4 +705,43 @@ fn seeding_again_does_not_hold_off_the_drop() {
         t += HOUR;
     }
     assert!(book.get(&CrawlAddr::Peer(a)).is_none(), "dropped after 30 days of failures");
+}
+
+#[test]
+fn an_abandoned_session_ages_out() {
+    // A session that never reports (its task cancelled) does not pin the
+    // address: after ABANDONED_AFTER_SECS it is due, evictable and
+    // droppable again.
+    let a = v4(1);
+    let mut book = CrawlBook::default();
+    book.seed(a.clone(), 0, NOW);
+    assert!(book.mark_dialling(&a, NOW));
+    let gone = NOW + ABANDONED_AFTER_SECS;
+    assert_eq!(due_kind(&book, &a, gone - 1), None);
+    assert!(!book.mark_dialling(&a, gone - 1), "still open");
+    assert!(due_kind(&book, &a, gone).is_some(), "abandoned: due again");
+    assert!(book.mark_dialling(&a, gone), "and can be dialled again");
+
+    // Eviction no longer skips it.
+    let mut book = CrawlBook::new(BookParams { max_entries: 1, ..BookParams::default() });
+    book.seed(a.clone(), 0, NOW);
+    assert!(book.mark_dialling(&a, NOW));
+    let r = book.admit(&source(1), &v4_answer(2, 1), gone);
+    assert_eq!(r.admitted, 1, "{r:?}");
+    assert!(book.get(&CrawlAddr::Peer(a)).is_none(), "the abandoned entry went");
+}
+
+#[test]
+fn an_entry_evicted_at_once_is_not_reported_kept() {
+    // Full, and every older entry has a session open: the new entry is the
+    // one that goes, and neither admit nor seed says it was kept.
+    let a = v4(0);
+    let mut book = CrawlBook::new(BookParams { max_entries: 1, ..BookParams::default() });
+    book.seed(a.clone(), 0, NOW);
+    assert!(book.mark_dialling(&a, NOW));
+    let r = book.admit(&source(1), &v4_answer(1, 1), NOW + 1);
+    assert_eq!((r.admitted, r.not_kept), (0, 1));
+    assert!(!book.seed(v4(2), 0, NOW + 1));
+    assert_eq!(book.len(), 1);
+    assert!(book.get(&CrawlAddr::Peer(a)).is_some());
 }

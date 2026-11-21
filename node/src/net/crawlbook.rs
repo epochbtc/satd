@@ -106,6 +106,12 @@ pub const DROP_AFTER_SECS: u64 = 30 * 24 * 60 * 60;
 /// The most distinct sources an entry remembers; past it the count stays.
 pub const MAX_SOURCES: usize = 16;
 
+/// A session open this long with no result is taken as abandoned (its
+/// task cancelled or gone without reporting): the address is due, droppable
+/// and evictable again. Far above the longest session a crawl runs (a Tor
+/// connect, the handshake, the `getaddr` wait and the probes).
+pub const ABANDONED_AFTER_SECS: u64 = 10 * 60;
+
 /// The source [`CrawlBook::seed`] records: seeds are one source between
 /// them.
 const SEED_SOURCE: u64 = 0;
@@ -289,7 +295,8 @@ pub struct CrawlEntry {
     pub failing_since: Option<u64>,
     /// No session before this, while failing.
     pub retry_at: Option<u64>,
-    in_flight: bool,
+    /// When the open session started; `None` with none open.
+    in_flight: Option<u64>,
 
     // Transport.
     /// The last v2 attempt's outcome.
@@ -325,7 +332,7 @@ impl CrawlEntry {
             failures: 0,
             failing_since: None,
             retry_at: None,
-            in_flight: false,
+            in_flight: None,
             v2_ok: None,
             v1_ok: None,
             last_v2_ok: None,
@@ -353,9 +360,10 @@ impl CrawlEntry {
         self.last_success
     }
 
-    /// Whether a session is open to it now.
-    pub fn in_flight(&self) -> bool {
-        self.in_flight
+    /// Whether a session is open to it at `now`: one opened and neither
+    /// reported nor abandoned ([`ABANDONED_AFTER_SECS`]).
+    pub fn in_flight(&self, now: u64) -> bool {
+        self.in_flight.is_some_and(|opened| now.saturating_sub(opened) < ABANDONED_AFTER_SECS)
     }
 
     fn named(&mut self, source: u64, services: u64, time: u32, now: u64) {
@@ -390,7 +398,7 @@ impl CrawlEntry {
 
     /// When it is due and for what; `None` while not due.
     fn due(&self, now: u64, liveness_secs: u64) -> Option<(u64, SessionKind)> {
-        if self.in_flight {
+        if self.in_flight(now) {
             return None;
         }
         if self.retry_at.is_some_and(|retry| now < retry) {
@@ -466,6 +474,9 @@ pub struct AdmitReport {
     pub ipv4_prefix_full: usize,
     /// New addresses past [`MAX_ADMITTED_PER_ANSWER`].
     pub over_source_cap: usize,
+    /// Admitted, then evicted at once: the book is full and every older
+    /// entry has a session open.
+    pub not_kept: usize,
 }
 
 /// Entries per network, and how many of them were ever reached.
@@ -653,8 +664,11 @@ impl CrawlBook {
                 }
                 _ => {}
             }
-            self.insert(addr, CrawlEntry::new(now, source, m.services.to_u64(), m.time));
-            report.admitted += 1;
+            if self.insert(addr, CrawlEntry::new(now, source, m.services.to_u64(), m.time), now) {
+                report.admitted += 1;
+            } else {
+                report.not_kept += 1;
+            }
         }
         report
     }
@@ -680,10 +694,10 @@ impl CrawlBook {
         let addr = CrawlAddr::Peer(addr);
         if self.entries.contains_key(&addr) {
             self.update(&addr, |e| e.seeded(SEED_SOURCE, services));
+            true
         } else {
-            self.insert(addr, CrawlEntry::new(now, SEED_SOURCE, services, 0));
+            self.insert(addr, CrawlEntry::new(now, SEED_SOURCE, services, 0), now)
         }
-        true
     }
 
     /// At most `limit` of the addresses due a session at `now`, in the
@@ -708,10 +722,10 @@ impl CrawlBook {
     /// Note a session opened to `addr`: it is not due again until
     /// [`Self::record_result`]. False when the address is not in the book,
     /// cannot be dialled, or already has a session open.
-    pub fn mark_dialling(&mut self, addr: &PeerAddr) -> bool {
+    pub fn mark_dialling(&mut self, addr: &PeerAddr, now: u64) -> bool {
         match self.entries.get_mut(&CrawlAddr::Peer(addr.clone())) {
-            Some(e) if !e.in_flight => {
-                e.in_flight = true;
+            Some(e) if !e.in_flight(now) => {
+                e.in_flight = Some(now);
                 true
             }
             _ => false,
@@ -730,7 +744,7 @@ impl CrawlBook {
         let liveness = self.params.liveness_secs;
         let mut drop = false;
         self.update(&key, |e| {
-            e.in_flight = false;
+            e.in_flight = None;
             e.attempts = e.attempts.saturating_add(1);
             e.last_attempt = Some(now);
             let within = |t: Option<u64>| t.is_some_and(|t| now.saturating_sub(t) <= liveness);
@@ -826,7 +840,7 @@ impl CrawlBook {
         let gone: Vec<CrawlAddr> = self
             .entries
             .iter()
-            .filter(|(a, e)| !e.in_flight && e.droppable(a.dialable(), now))
+            .filter(|(a, e)| !e.in_flight(now) && e.droppable(a.dialable(), now))
             .map(|(a, _)| a.clone())
             .collect();
         for addr in gone {
@@ -839,8 +853,10 @@ impl CrawlBook {
     }
 
     /// Past the bound the least recently used entry without a session open
-    /// goes. The entry just inserted has none open, so one always can.
-    fn insert(&mut self, addr: CrawlAddr, entry: CrawlEntry) {
+    /// goes. The entry just inserted has none open, so one always can; when
+    /// every older entry has one, that is the new entry itself. Returns
+    /// whether the new entry was kept.
+    fn insert(&mut self, addr: CrawlAddr, entry: CrawlEntry, now: u64) -> bool {
         if let Some(ip) = socket_ip(&addr) {
             let n = self.ips.entry(ip).or_default();
             *n += 1;
@@ -849,13 +865,15 @@ impl CrawlBook {
             }
         }
         self.lru.insert((entry.lru_key(), addr.clone()));
-        self.entries.insert(addr, entry);
+        self.entries.insert(addr.clone(), entry);
         while self.entries.len() > self.params.max_entries {
-            let Some(oldest) = self.lru.iter().map(|(_, a)| a).find(|a| !self.entries[*a].in_flight).cloned() else {
+            let Some(oldest) = self.lru.iter().map(|(_, a)| a).find(|a| !self.entries[*a].in_flight(now)).cloned()
+            else {
                 break;
             };
             self.remove(&oldest);
         }
+        self.entries.contains_key(&addr)
     }
 
     fn remove(&mut self, addr: &CrawlAddr) {
@@ -947,7 +965,7 @@ impl CrawlBook {
         let mut rows: Vec<(CrawlAddr, CrawlEntry)> = entries.into_iter().collect();
         rows.sort_unstable_by(|a, b| (a.1.lru_key(), &a.0).cmp(&(b.1.lru_key(), &b.0)));
         for (addr, entry) in rows {
-            book.insert(addr, entry);
+            book.insert(addr, entry, 0); // nothing loaded has a session open: any time will do
         }
         book.expire(now);
         Ok(book)
@@ -1101,7 +1119,7 @@ fn decode_entry(r: &mut Reader) -> Result<CrawlEntry, String> {
         failures: r.u32()?,
         failing_since: get_opt_u64(r)?,
         retry_at: get_opt_u64(r)?,
-        in_flight: false,
+        in_flight: None,
         v2_ok: get_opt_bool(r)?,
         v1_ok: get_opt_bool(r)?,
         last_v2_ok: get_opt_u64(r)?,
