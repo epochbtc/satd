@@ -208,12 +208,14 @@ fn crawler_is_never_an_outbound_peer() {
 }
 
 /// Sessions are measured by the node clock, which `conn_time` is set
-/// from: under a mock time years in the past, a crawler four seconds in is
-/// still four seconds in, and a fresh peer is no spy.
+/// from: under a mock time a minute in the past, a crawler four seconds in
+/// is still four seconds in, not sixty-four. Only just in the past, as
+/// `time::tests` requires: a mock years back makes every block a test
+/// running alongside builds `TimeTooNew`.
 #[test]
 fn sessions_are_timed_by_the_node_clock() {
     let _clock = MockClock::install();
-    crate::time::set_mock_time(Some(1_600_000_000));
+    crate::time::set_mock_time(Some(crate::time::now_secs() - 60));
     let (pm, _dir) = pm_with_coins(&[]);
     busy_netgroup(&pm);
     let _rx = scripted(&pm, 7, "bitcoin-seeder-92d2b46-inbound", "11.22.7.7:8333", 4);
