@@ -104,8 +104,8 @@ impl Drop for DialingGuard {
     }
 }
 
-/// What a survey session's next read brought.
-enum Next {
+/// What a survey or crawl session's next read brought.
+pub(super) enum Next {
     Msg(NetworkMessage),
     /// The wait ran out.
     Timeout,
@@ -118,7 +118,7 @@ enum Next {
 
 /// The next message, the deadline, the peer's close or the node's,
 /// whichever comes first.
-async fn next_message(
+pub(super) async fn next_message(
     read_rx: &mut mpsc::Receiver<NetworkMessage>,
     deadline: tokio::time::Instant,
     abort: &tokio::sync::Notify,
@@ -131,6 +131,120 @@ async fn next_message(
         },
         _ = abort.notified() => Next::Aborted,
     }
+}
+
+/// How [`listen_passive`] ended.
+pub(super) enum Listened {
+    /// The wait ran out with the transcript still open.
+    Timeout,
+    /// The transcript closed.
+    Settled,
+    /// The connection closed, at the peer's end or the node's.
+    Closed,
+}
+
+/// The passive wait of a survey or crawl session: take the peer's messages
+/// until `observe` (which records each in the handshake transcript) says
+/// the transcript has closed, or `deadline`, answering a `ping` with a
+/// `pong`. Nothing else is sent.
+pub(super) async fn listen_passive(
+    id: PeerId,
+    writer: &mut crate::net::connection::ConnectionWriter,
+    read_rx: &mut mpsc::Receiver<NetworkMessage>,
+    abort: &tokio::sync::Notify,
+    deadline: tokio::time::Instant,
+    mut observe: impl FnMut(&NetworkMessage) -> bool,
+) -> Listened {
+    loop {
+        let msg = match next_message(read_rx, deadline, abort).await {
+            Next::Msg(msg) => msg,
+            Next::Timeout => return Listened::Timeout,
+            Next::Closed | Next::Aborted => return Listened::Closed,
+        };
+        log_received(id, &msg);
+        let open = observe(&msg);
+        if let NetworkMessage::Ping(nonce) = msg
+            && writer.send(NetworkMessage::Pong(nonce)).await.is_err()
+        {
+            return Listened::Closed;
+        }
+        if !open {
+            return Listened::Settled;
+        }
+    }
+}
+
+/// Send the probes `chosen`, in order, each waiting for its answer:
+/// `waits` is the wait of every probe but the unknown message's, then the
+/// unknown message's. A `getheaders` probe is skipped without
+/// `has_locator`. With `deadline`, no probe waits past it and none is sent
+/// after it. Each outcome goes to `on_outcome`. Returns whether the
+/// connection closed, at the peer's end or the node's (`abort`), after
+/// which no probe is sent. A `ping` from the peer is answered; anything
+/// else is ignored.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn send_probes(
+    id: PeerId,
+    writer: &mut crate::net::connection::ConnectionWriter,
+    read_rx: &mut mpsc::Receiver<NetworkMessage>,
+    abort: &tokio::sync::Notify,
+    chosen: Vec<Probe>,
+    ctx: &ProbeContext,
+    has_locator: bool,
+    waits: (Duration, Duration),
+    deadline: Option<tokio::time::Instant>,
+    mut on_outcome: impl FnMut(Probe, ProbeOutcome),
+) -> bool {
+    let wanted = survey::probe_inventory(ctx);
+    for probe in chosen {
+        if probe == Probe::GetHeaders && !has_locator {
+            continue;
+        }
+        let now = tokio::time::Instant::now();
+        if deadline.is_some_and(|d| now >= d) {
+            break;
+        }
+        let sent_at = Instant::now();
+        let outcome = if writer.send(survey::probe_message(probe, ctx)).await.is_err() {
+            ProbeOutcome::Disconnected
+        } else {
+            let wait = if probe == Probe::Unknown { waits.1 } else { waits.0 };
+            let probe_deadline = deadline.map_or(now + wait, |d| d.min(now + wait));
+            loop {
+                let msg = match next_message(read_rx, probe_deadline, abort).await {
+                    Next::Msg(msg) => msg,
+                    Next::Timeout => break ProbeOutcome::Silent,
+                    Next::Closed => break ProbeOutcome::Disconnected,
+                    // Not the peer's doing: nothing to record.
+                    Next::Aborted => return true,
+                };
+                log_received(id, &msg);
+                match (probe, &msg) {
+                    (Probe::Ping, NetworkMessage::Pong(n)) if *n == ctx.nonce => {
+                        let ms = u32::try_from(sent_at.elapsed().as_millis()).unwrap_or(u32::MAX);
+                        break ProbeOutcome::Answered(ms);
+                    }
+                    (Probe::GetHeaders, NetworkMessage::Headers(h)) => {
+                        break ProbeOutcome::Answered(h.len() as u32);
+                    }
+                    (Probe::GetData, NetworkMessage::NotFound(inv)) if inv.contains(&wanted) => {
+                        break ProbeOutcome::Answered(inv.iter().filter(|i| **i == wanted).count() as u32);
+                    }
+                    (_, NetworkMessage::Ping(n)) => {
+                        if writer.send(NetworkMessage::Pong(*n)).await.is_err() {
+                            break ProbeOutcome::Disconnected;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        };
+        on_outcome(probe, outcome);
+        if outcome == ProbeOutcome::Disconnected {
+            return true;
+        }
+    }
+    false
 }
 
 fn outcome_slot(o: ProbeOutcome) -> usize {
@@ -189,6 +303,14 @@ impl PeerManager {
         self.survey.get().is_some()
     }
 
+    /// Whether the crawl (`-crawl`) has taken the survey's place: it
+    /// measures everything the survey would, from more addresses, so the
+    /// survey opens no connection while it is on. Its store is still read
+    /// and reported.
+    pub fn survey_superseded(&self) -> bool {
+        self.crawl_enabled()
+    }
+
     /// `-asmap`'s map, for the survey records' autonomous systems.
     pub fn set_asmap(&self, map: Arc<crate::net::asmap::AsMap>) {
         let _ = self.asmap.set(map);
@@ -197,11 +319,15 @@ impl PeerManager {
     /// Start the survey's loop: a survey connection every
     /// `-peersurveyinterval` while none is open, and the store written every
     /// [`survey::SAVE_INTERVAL`]. Ends at shutdown. Nothing without
-    /// [`Self::enable_survey`].
+    /// [`Self::enable_survey`], and nothing while the crawl supersedes it.
     pub fn spawn_survey(self: &Arc<Self>) {
         let Some(run) = self.survey.get() else {
             return;
         };
+        if self.survey_superseded() {
+            tracing::info!("The network survey is superseded by the crawl and opens no connection");
+            return;
+        }
         let interval = run.config.interval.max(Duration::from_secs(1));
         let pm = Arc::clone(self);
         let mut shutdown = self.shutdown.clone();
@@ -258,11 +384,16 @@ impl PeerManager {
     }
 
     /// One turn of the survey's loop: dial a survey connection unless one
-    /// is open, networking is off, or the node makes no automatic
-    /// connections (`-connect`). Returns the address dialled.
+    /// is open, networking is off, the node makes no automatic connections
+    /// (`-connect`), or the crawl supersedes the survey. Returns the
+    /// address dialled.
     pub(super) fn survey_tick(self: &Arc<Self>) -> Option<PeerAddr> {
         let run = self.survey.get()?;
-        if !self.is_network_active() || !self.automatic_outbound.load(Ordering::Relaxed) || self.survey_open() {
+        if self.survey_superseded()
+            || !self.is_network_active()
+            || !self.automatic_outbound.load(Ordering::Relaxed)
+            || self.survey_open()
+        {
             return None;
         }
         let target = self.draw_survey_target()?;
@@ -444,24 +575,12 @@ impl PeerManager {
             return true;
         }
         let deadline = tokio::time::Instant::now() + PASSIVE_WAIT;
-        loop {
-            let msg = match next_message(read_rx, deadline, abort).await {
-                Next::Msg(msg) => msg,
-                Next::Timeout => return false,
-                Next::Closed | Next::Aborted => return true,
-            };
-            log_received(id, &msg);
-            let open = self.capture_handshake(id, &msg);
-            if let NetworkMessage::Ping(nonce) = msg
-                && writer.send(NetworkMessage::Pong(nonce)).await.is_err()
-            {
-                return true;
-            }
-            if !open {
-                // A transcript reads as closed, too, once the node has
-                // dropped the peer's handle.
-                return !self.peers.read().contains_key(&id);
-            }
+        match listen_passive(id, writer, read_rx, abort, deadline, |msg| self.capture_handshake(id, msg)).await {
+            Listened::Timeout => false,
+            Listened::Closed => true,
+            // A transcript reads as closed, too, once the node has dropped
+            // the peer's handle.
+            Listened::Settled => !self.peers.read().contains_key(&id),
         }
     }
 
@@ -490,56 +609,15 @@ impl PeerManager {
         let (locator_top, stop) = locator.unwrap_or((zero, zero));
         let wtxid_relay = self.peers.read().get(&id).is_some_and(|h| h.info.wtxid_relay);
         let ctx = ProbeContext::new(&mut rand::thread_rng(), locator_top, stop, wtxid_relay);
-        let wanted = survey::probe_inventory(&ctx);
-        for probe in chosen {
-            if probe == Probe::GetHeaders && locator.is_none() {
-                continue;
-            }
-            let sent_at = Instant::now();
-            let outcome = if writer.send(survey::probe_message(probe, &ctx)).await.is_err() {
-                ProbeOutcome::Disconnected
-            } else {
-                let wait = if probe == Probe::Unknown { UNKNOWN_PROBE_WAIT } else { PROBE_REPLY_WAIT };
-                let deadline = tokio::time::Instant::now() + wait;
-                loop {
-                    let msg = match next_message(read_rx, deadline, abort).await {
-                        Next::Msg(msg) => msg,
-                        Next::Timeout => break ProbeOutcome::Silent,
-                        Next::Closed => break ProbeOutcome::Disconnected,
-                        // Not the peer's doing: nothing to record.
-                        Next::Aborted => return true,
-                    };
-                    log_received(id, &msg);
-                    match (probe, &msg) {
-                        (Probe::Ping, NetworkMessage::Pong(n)) if *n == ctx.nonce => {
-                            let ms = u32::try_from(sent_at.elapsed().as_millis()).unwrap_or(u32::MAX);
-                            break ProbeOutcome::Answered(ms);
-                        }
-                        (Probe::GetHeaders, NetworkMessage::Headers(h)) => {
-                            break ProbeOutcome::Answered(h.len() as u32);
-                        }
-                        (Probe::GetData, NetworkMessage::NotFound(inv)) if inv.contains(&wanted) => {
-                            break ProbeOutcome::Answered(inv.iter().filter(|i| **i == wanted).count() as u32);
-                        }
-                        (_, NetworkMessage::Ping(n)) => {
-                            if writer.send(NetworkMessage::Pong(*n)).await.is_err() {
-                                break ProbeOutcome::Disconnected;
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            };
+        let waits = (PROBE_REPLY_WAIT, UNKNOWN_PROBE_WAIT);
+        send_probes(id, writer, read_rx, abort, chosen, &ctx, locator.is_some(), waits, None, |probe, outcome| {
             probes.set(probe, outcome);
             if let Some(run) = self.survey.get() {
                 let i = Probe::ALL.iter().position(|p| *p == probe).expect("in ALL");
                 run.probe_outcomes[i][outcome_slot(outcome)].fetch_add(1, Ordering::Relaxed);
             }
-            if outcome == ProbeOutcome::Disconnected {
-                return true;
-            }
-        }
-        false
+        })
+        .await
     }
 
     /// The `getheaders` probe's locator and stop: our tip's parent and our
@@ -560,11 +638,16 @@ impl PeerManager {
             return survey::survey_json(
                 &SurveyStore::default(),
                 verbose,
-                &serde_json::json!({ "enabled": false, "alt_slots": self.alt_slots_json() }),
+                &serde_json::json!({
+                    "enabled": false,
+                    "superseded_by_crawl": self.survey_superseded(),
+                    "alt_slots": self.alt_slots_json(),
+                }),
             );
         };
         let settings = serde_json::json!({
-            "enabled": true,
+            "enabled": !self.survey_superseded(),
+            "superseded_by_crawl": self.survey_superseded(),
             "probes": run.config.probes,
             "interval": run.config.interval.as_secs(),
             "connections": {

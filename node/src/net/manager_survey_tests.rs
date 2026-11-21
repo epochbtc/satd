@@ -12,7 +12,27 @@ fn mk_pm() -> (Arc<PeerManager>, tempfile::TempDir) {
 }
 
 /// A regtest manager; with `proxy`, onions are reachable through it.
-fn mk_pm_with(proxy: Option<&str>) -> (Arc<PeerManager>, tempfile::TempDir) {
+pub(super) fn mk_pm_with(proxy: Option<&str>) -> (Arc<PeerManager>, tempfile::TempDir) {
+    let (pm, dir, _shutdown) = mk_pm_live(proxy);
+    (pm, dir)
+}
+
+/// [`mk_pm_with`], and the sender of its shutdown signal, which a task the
+/// manager runs (a loop that ends at shutdown) needs alive.
+pub(super) fn mk_pm_live(proxy: Option<&str>) -> (Arc<PeerManager>, tempfile::TempDir, tokio::sync::watch::Sender<bool>) {
+    mk_pm_proxies(None, proxy)
+}
+
+/// A regtest manager under `-proxy`: every routable dial goes through it.
+pub(super) fn mk_pm_proxied(proxy: &str) -> (Arc<PeerManager>, tempfile::TempDir) {
+    let (pm, dir, _shutdown) = mk_pm_proxies(Some(proxy), None);
+    (pm, dir)
+}
+
+fn mk_pm_proxies(
+    proxy: Option<&str>,
+    onion_proxy: Option<&str>,
+) -> (Arc<PeerManager>, tempfile::TempDir, tokio::sync::watch::Sender<bool>) {
     use crate::chain::state::AssumeValid;
     use crate::storage::db::InMemoryStore;
     use crate::storage::flatfile::FlatFileManager;
@@ -34,7 +54,7 @@ fn mk_pm_with(proxy: Option<&str>) -> (Arc<PeerManager>, tempfile::TempDir) {
         )
         .unwrap(),
     );
-    let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let pm = PeerManager::with_config(
         chain_state,
         Arc::new(Mempool::new(1_000_000, 0)),
@@ -45,14 +65,14 @@ fn mk_pm_with(proxy: Option<&str>) -> (Arc<PeerManager>, tempfile::TempDir) {
         125,
         DEFAULT_MAX_INBOUND_PER_IP,
         86400,
-        None,
         proxy.map(str::to_string),
+        onion_proxy.map(str::to_string),
         1,
         50_000,
         0,
         None,
     );
-    (pm, dir)
+    (pm, dir, shutdown_tx)
 }
 
 fn enable(pm: &PeerManager, probes: bool) {
@@ -85,11 +105,11 @@ fn outbound(id: PeerId, addr: SocketAddr, conn_type: ConnType, state: PeerState)
     info
 }
 
-fn book_add(pm: &PeerManager, addr: SocketAddr) {
+pub(super) fn book_add(pm: &PeerManager, addr: SocketAddr) {
     pm.addrman.write().add_from(addr, now_unix_secs(), 1 | 8, "198.51.100.7".parse::<IpAddr>().unwrap());
 }
 
-const ONION: &str = "pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.onion";
+pub(super) const ONION: &str = "pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.onion";
 
 // ---- Budgets and visibility ----
 

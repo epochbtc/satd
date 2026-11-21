@@ -229,6 +229,7 @@ without restarting the relevant socket, engine, or process:
     and `napaggregator`, the aggregator
 *   `peersurvey`, `peersurveyinterval` and `peersurveyprobes`, the network
     survey
+*   `crawl` and every `crawl*` option, the network crawl
 *   `uacomment` — the user agent is sent once per connection, in the version
     message, so a change reaches a peer only on a new connection
 

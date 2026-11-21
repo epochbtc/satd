@@ -1007,6 +1007,19 @@ fn field_specs() -> Vec<FieldSpec> {
         restart!("peersurvey", peersurvey),
         restart!("peersurveyinterval", peersurveyinterval),
         restart!("peersurveyprobes", peersurveyprobes),
+        // The crawl's loop, book and limits exist from startup or not at
+        // all.
+        restart!("crawl", crawl),
+        restart!("crawlconcurrency", crawlconcurrency),
+        restart!("crawltorconcurrency", crawltorconcurrency),
+        restart!("crawlrate", crawlrate),
+        restart!("crawlliveness", crawlliveness),
+        restart!("crawlmaxage", crawlmaxage),
+        restart!("crawlnet", crawlnet),
+        restart!("crawlbind", crawlbind),
+        restart!("crawlseed", crawlseed),
+        restart!("crawluacomment", crawluacomment),
+        restart!("crawlprobes", crawlprobes),
         // Read once at startup, like every option outside the alt-slot set.
         restart!("peerflagpolicy", peerflagpolicy),
         // NOTE: `policyfile` is intentionally NOT a FieldSpec. Like the

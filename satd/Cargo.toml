@@ -67,6 +67,13 @@ name = "core_survey_probes"
 path = "tests/core_survey_probes.rs"
 required-features = ["core-p2p-differential"]
 
+# The crawl's whole session against a live Core, on the same harness and
+# feature.
+[[test]]
+name = "core_crawl_session"
+path = "tests/core_crawl_session.rs"
+required-features = ["core-p2p-differential"]
+
 [dependencies]
 node = { path = "../node", default-features = false }
 node-index = { path = "../node-index" }

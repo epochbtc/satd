@@ -138,6 +138,11 @@ It includes every fix shipped in 0.7.1:
 - P2P: a `getblocktxn` index above 65535 fails to decode, as Core's 16-bit indexes do; satd read it (#1347).
 - P2P: the wtxid of a transaction with no inputs is its txid, as in Core, wherever satd computes one (#1348).
 
+Bound for **0.9.0**, written up in
+[`docs/release-notes/0.9.0-pre.md`](docs/release-notes/0.9.0-pre.md):
+
+- P2P: opt-in crawl, `-crawl` (with `-crawlconcurrency`, `-crawltorconcurrency`, `-crawlrate`, `-crawlliveness`, `-crawlmaxage`, `-crawlnet`, `-crawlbind`, `-crawlseed`, `-crawluacomment`, `-crawlprobes`): short sessions as a declared crawler, BIP 324 first and v1 after, to every address nodes name, recorded in `crawlbook.dat`; outside every connection budget, never written to the address book, never under `-connect` or in initial block download; supersedes `-peersurvey`.
+
 ## Releases
 
 | Version | Date | Notes |

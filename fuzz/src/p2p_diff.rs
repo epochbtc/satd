@@ -1018,6 +1018,21 @@ impl CoreOracle {
         &self.work.0
     }
 
+    /// Core's P2P port on 127.0.0.1, for a node under test to dial.
+    pub fn p2p_port(&self) -> u16 {
+        self.p2p_port
+    }
+
+    /// One RPC call to Core.
+    pub fn call(&self, method: &str, params: &[serde_json::Value]) -> Result<serde_json::Value, String> {
+        self.rpc.call(method, params).map_err(|e| format!("{method}: {e}"))
+    }
+
+    /// The complete lines Core has written to its log since the last read.
+    pub fn new_log_lines(&mut self) -> Vec<String> {
+        self.read_log()
+    }
+
     fn next_nonce(&mut self) -> u64 {
         self.nonce = self.nonce.wrapping_add(1);
         self.nonce ^ 0x7032_7064_6966_6600

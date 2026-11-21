@@ -162,6 +162,16 @@ impl ConnectionWriter {
         }
     }
 
+    /// Close our side of the connection (a TCP FIN): the peer reads what we
+    /// sent, then the end of the stream, where dropping the socket with
+    /// bytes still unread would reset it.
+    pub async fn shutdown(&mut self) -> io::Result<()> {
+        match self {
+            ConnectionWriter::V1(w) => w.stream.shutdown().await,
+            ConnectionWriter::V2(w) => w.shutdown().await,
+        }
+    }
+
     /// Attach the per-peer byte/activity counters, recorded on every send.
     /// Called once after [`Connection::split`], when the peer's `PeerStats`
     /// is known.

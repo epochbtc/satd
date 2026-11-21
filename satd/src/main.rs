@@ -3056,6 +3056,33 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
         );
     }
 
+    // The crawl, off unless asked for: its book, then its loop, which waits
+    // for the node to leave initial block download. Enabled before the
+    // survey, which it supersedes.
+    if config.crawl {
+        let crawl_config = config.crawl_config(Some(net_datadir.join(node::net::crawlbook::CRAWL_FILE)));
+        let limits = crawl_config.limits;
+        if limits.clearnet == 0 && limits.tor == 0 {
+            tracing::warn!("The crawl is off: the file-descriptor limit leaves no room for a crawl session");
+        } else if let Err(e) = peer_manager.enable_crawl(crawl_config) {
+            tracing::warn!("The crawl is off: {e}");
+        } else {
+            peer_manager.spawn_crawl();
+            let from = match config.crawlbind.as_slice() {
+                [] => "this host's IP address".to_string(),
+                binds => binds.iter().map(|ip| ip.to_string()).collect::<Vec<_>>().join(" and "),
+            };
+            tracing::warn!(
+                "Crawl enabled: it will dial tens of thousands of addresses from {from}; other operators' monitors \
+                 will record that address as a crawler, and hosting providers may receive abuse reports. A dedicated \
+                 host, or -crawlbind, keeps the node's own address out of it."
+            );
+            if config.peersurvey {
+                tracing::info!("-peersurvey is superseded by -crawl: the survey opens no connection");
+            }
+        }
+    }
+
     // The network survey (#1353), off unless asked for: its store, then its
     // loop, whose first connection waits one interval.
     if config.peersurvey {
@@ -5683,6 +5710,9 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
 
     // The network survey's records (#1353), when it ran.
     peer_manager.dump_survey();
+
+    // The crawl's book, when it ran.
+    peer_manager.dump_crawl();
 
     // Core dumps the ban list in `~BanMan()`. Every mutator flushes inline, so
     // the only state that can still be pending here is a re-armed dirty flag

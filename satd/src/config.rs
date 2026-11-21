@@ -772,6 +772,33 @@ pub struct Config {
     /// `-peersurveyprobes`: with `-peersurvey`, send the vetted probes on
     /// each survey connection before it closes. Default true. satd-only.
     pub peersurveyprobes: bool,
+    /// `-crawl`: walk the reachable network with short crawl sessions,
+    /// keeping what each address showed in `crawlbook.dat`. Default false.
+    /// satd-only. The other `crawl*` fields are its options, checked when
+    /// the config was read; [`Config::crawl_config`] hands them over.
+    pub crawl: bool,
+    /// `-crawlconcurrency`: clearnet crawl sessions open at once.
+    pub crawlconcurrency: usize,
+    /// `-crawltorconcurrency`: onion crawl sessions open at once.
+    pub crawltorconcurrency: usize,
+    /// `-crawlrate`: new crawl sessions a second, all networks.
+    pub crawlrate: u32,
+    /// `-crawlliveness`: seconds between liveness checks of a reachable
+    /// address.
+    pub crawlliveness: u64,
+    /// `-crawlmaxage`: seconds past which an answer's entry is ignored.
+    pub crawlmaxage: u64,
+    /// `-crawlnet`: the networks the crawl may dial, in canonical names;
+    /// empty is every one the node reaches.
+    pub crawlnet: Vec<String>,
+    /// `-crawlbind`: the crawl's source addresses, at most one per family.
+    pub crawlbind: Vec<std::net::IpAddr>,
+    /// `-crawlseed`: addresses the crawl starts from.
+    pub crawlseed: Vec<String>,
+    /// `-crawluacomment`: a comment for the crawl's user agent.
+    pub crawluacomment: Option<String>,
+    /// `-crawlprobes`: send the vetted probes on discovery sessions.
+    pub crawlprobes: bool,
     /// `-peerflagpolicy`: `observe` (default), flags are information only,
     /// or `evict`, inbound peers flagged `C`, `S` or `F` are evicted first
     /// when an inbound slot is needed. satd-only.
@@ -4324,6 +4351,7 @@ impl Config {
         };
 
         let alt_slots = resolve_alt_slots(&cli.alt_slot_args, &file_get, &file_get_all, maxconnections)?;
+        let crawl = resolve_crawl(&cli.crawl_args, &file_get, &file_get_all, network)?;
 
         Ok(Config {
             network,
@@ -4431,6 +4459,17 @@ impl Config {
                 .or_else(|| file_get("peersurveyprobes").and_then(|v| parse_bool(&v)))
                 .unwrap_or(true),
             peerflagpolicy: resolve_flag_policy(&cli.peer_survey_args.peerflagpolicy, &file_get)?,
+            crawl: crawl.crawl,
+            crawlconcurrency: crawl.concurrency,
+            crawltorconcurrency: crawl.tor_concurrency,
+            crawlrate: crawl.rate,
+            crawlliveness: crawl.liveness,
+            crawlmaxage: crawl.max_age,
+            crawlnet: crawl.nets,
+            crawlbind: crawl.binds,
+            crawlseed: crawl.seeds,
+            crawluacomment: crawl.ua_comment,
+            crawlprobes: crawl.probes,
             maxoutboundfullrelay: alt_slots.maxoutboundfullrelay,
             dangerous_outbound_limit: alt_slots.dangerous_outbound_limit,
             altslots: alt_slots.altslots,
@@ -5219,6 +5258,19 @@ impl Config {
         });
         // Set apart: more keys inside the macro above pass its recursion
         // limit.
+        out["crawl"] = serde_json::json!({
+            "enabled": self.crawl,
+            "concurrency": self.crawlconcurrency,
+            "tor_concurrency": self.crawltorconcurrency,
+            "rate": self.crawlrate,
+            "liveness_secs": self.crawlliveness,
+            "max_age_secs": self.crawlmaxage,
+            "networks": self.crawlnet,
+            "bind": self.crawlbind.iter().map(|ip| ip.to_string()).collect::<Vec<_>>(),
+            "seeds": self.crawlseed.len(),
+            "uacomment": self.crawluacomment,
+            "probes": self.crawlprobes,
+        });
         out["p2p"]["max_outbound_full_relay"] = serde_json::json!(self.maxoutboundfullrelay);
         out["p2p"]["peer_flag_policy"] = serde_json::json!(self.peerflagpolicy);
         out["p2p"]["alt_slots"] = serde_json::json!({
@@ -6309,6 +6361,11 @@ pub struct CliArgs {
     /// [`StratumArgs`].
     #[command(flatten)]
     pub peer_survey_args: PeerSurveyArgs,
+
+    /// `-crawl` and its options, hand-built for the same stack-frame reason
+    /// as [`StratumArgs`].
+    #[command(flatten)]
+    pub crawl_args: CrawlArgs,
 
     /// `-maxoutboundfullrelay` and the alt-slot options, hand-built for the
     /// same stack-frame reason as [`StratumArgs`].
@@ -8374,6 +8431,298 @@ impl clap::FromArgMatches for PeerSurveyArgs {
     }
 }
 
+/// `-crawl` and its options (see [`CliArgs::crawl_args`]).
+#[derive(Debug, Clone, Default)]
+pub struct CrawlArgs {
+    pub crawl: Option<bool>,
+    pub crawlconcurrency: Option<usize>,
+    pub crawltorconcurrency: Option<usize>,
+    pub crawlrate: Option<u64>,
+    pub crawlliveness: Option<u64>,
+    pub crawlmaxage: Option<u64>,
+    pub crawlnet: Vec<String>,
+    pub crawlbind: Vec<String>,
+    pub crawlseed: Vec<String>,
+    pub crawluacomment: Option<String>,
+    pub crawlprobes: Option<bool>,
+}
+
+const CRAWL_ARG_SPECS: &[(&str, &str, StratumArgKind, &str)] = &[
+    (
+        "crawl",
+        "BOOL",
+        StratumArgKind::Bool,
+        "Crawl the reachable network: short sessions, as a declared crawler, to every address nodes name, recording which complete a handshake in crawlbook.dat, which holds peer addresses. It dials tens of thousands of addresses from this host's IP; other operators' monitors record that IP as a crawler. Supersedes -peersurvey (default: 0)",
+    ),
+    (
+        "crawlconcurrency",
+        "N",
+        StratumArgKind::Usize,
+        "With -crawl, clearnet crawl sessions open at once, 1 to 256 (default: 32)",
+    ),
+    (
+        "crawltorconcurrency",
+        "N",
+        StratumArgKind::Usize,
+        "With -crawl, onion crawl sessions open at once, 1 to 256 (default: 8)",
+    ),
+    (
+        "crawlrate",
+        "N",
+        StratumArgKind::U64,
+        "With -crawl, new crawl sessions a second, all networks, 1 to 100 (default: 10)",
+    ),
+    (
+        "crawlliveness",
+        "SECS",
+        StratumArgKind::U64,
+        "With -crawl, seconds between handshake-only checks of a reachable address, at least 7200 (default: 7200)",
+    ),
+    (
+        "crawlmaxage",
+        "SECS",
+        StratumArgKind::U64,
+        "With -crawl, ignore an address in an answer whose time is older than this, at least 3600 (default: 432000)",
+    ),
+    (
+        "crawlnet",
+        "NET",
+        StratumArgKind::TextList,
+        "With -crawl, dial only these networks (ipv4, ipv6, onion; repeatable), within those the node reaches (default: every one the node reaches)",
+    ),
+    (
+        "crawlbind",
+        "IP",
+        StratumArgKind::TextList,
+        "With -crawl, the source address of direct crawl dials, at most one IPv4 and one IPv6 (repeatable) (default: the system's choice)",
+    ),
+    (
+        "crawlseed",
+        "ADDR",
+        StratumArgKind::TextList,
+        "With -crawl, an IP address or onion to start the crawl from (repeatable)",
+    ),
+    (
+        "crawluacomment",
+        "TEXT",
+        StratumArgKind::Text,
+        "With -crawl, a comment for the crawler's user agent, /satd:<version>(crawler; TEXT)/",
+    ),
+    (
+        "crawlprobes",
+        "BOOL",
+        StratumArgKind::Bool,
+        "With -crawl, send the survey's harmless probes on each discovery session (default: 1)",
+    ),
+];
+
+impl clap::Args for CrawlArgs {
+    fn augment_args(mut cmd: clap::Command) -> clap::Command {
+        for spec in CRAWL_ARG_SPECS {
+            cmd = cmd.arg(stratum_arg(spec));
+        }
+        cmd
+    }
+
+    fn augment_args_for_update(cmd: clap::Command) -> clap::Command {
+        Self::augment_args(cmd)
+    }
+}
+
+impl clap::FromArgMatches for CrawlArgs {
+    fn from_arg_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
+        Self::from_arg_matches_mut(&mut matches.clone())
+    }
+
+    fn from_arg_matches_mut(m: &mut clap::ArgMatches) -> Result<Self, clap::Error> {
+        let list = |m: &mut clap::ArgMatches, key: &str| -> Vec<String> {
+            m.remove_many::<String>(key).map(Iterator::collect).unwrap_or_default()
+        };
+        Ok(Self {
+            crawl: m.remove_one("crawl"),
+            crawlconcurrency: m.remove_one("crawlconcurrency"),
+            crawltorconcurrency: m.remove_one("crawltorconcurrency"),
+            crawlrate: m.remove_one("crawlrate"),
+            crawlliveness: m.remove_one("crawlliveness"),
+            crawlmaxage: m.remove_one("crawlmaxage"),
+            crawlnet: list(m, "crawlnet"),
+            crawlbind: list(m, "crawlbind"),
+            crawlseed: list(m, "crawlseed"),
+            crawluacomment: m.remove_one("crawluacomment"),
+            crawlprobes: m.remove_one("crawlprobes"),
+        })
+    }
+
+    fn update_from_arg_matches(&mut self, matches: &clap::ArgMatches) -> Result<(), clap::Error> {
+        self.update_from_arg_matches_mut(&mut matches.clone())
+    }
+
+    fn update_from_arg_matches_mut(&mut self, m: &mut clap::ArgMatches) -> Result<(), clap::Error> {
+        *self = Self::from_arg_matches_mut(m)?;
+        Ok(())
+    }
+}
+
+/// The crawl options as read, each checked.
+struct CrawlSettings {
+    crawl: bool,
+    concurrency: usize,
+    tor_concurrency: usize,
+    rate: u32,
+    liveness: u64,
+    max_age: u64,
+    nets: Vec<String>,
+    binds: Vec<std::net::IpAddr>,
+    seeds: Vec<String>,
+    ua_comment: Option<String>,
+    probes: bool,
+}
+
+/// `-crawl` and its options. Each limit is refused past its ceiling
+/// (concurrency 256, rate 100 a second), which no option lifts; the
+/// liveness interval below two hours (more than 14 sessions a target a
+/// day), a `-crawlnet` that names a network the crawl never dials, two
+/// `-crawlbind` addresses of one family, a `-crawlseed` that is not an IP
+/// address or onion, and a `-crawluacomment` that cannot go in a user agent
+/// are refused too. Command-line lists replace the config file's.
+#[inline(never)]
+fn resolve_crawl(
+    cli: &CrawlArgs,
+    file_get: &dyn Fn(&str) -> Option<String>,
+    file_get_all: &dyn Fn(&str) -> Vec<String>,
+    network: Network,
+) -> Result<CrawlSettings, String> {
+    use node::net::crawl;
+    let number = |cli: Option<u64>, key: &str, default: u64, lo: u64, hi: u64| -> Result<u64, String> {
+        let n = match (cli, file_get(key)) {
+            (Some(n), _) => n,
+            (None, Some(v)) => v.trim().parse().map_err(|_| format!("-{key} must be a whole number, not \"{v}\""))?,
+            (None, None) => default,
+        };
+        if n < lo || n > hi {
+            return Err(format!("-{key}={n} is out of range: {lo} to {hi}"));
+        }
+        Ok(n)
+    };
+    let max = crawl::MAX_CONCURRENCY as u64;
+    let concurrency = number(
+        cli.crawlconcurrency.map(|n| n as u64),
+        "crawlconcurrency",
+        crawl::DEFAULT_CONCURRENCY as u64,
+        1,
+        max,
+    )? as usize;
+    let tor_concurrency = number(
+        cli.crawltorconcurrency.map(|n| n as u64),
+        "crawltorconcurrency",
+        crawl::DEFAULT_TOR_CONCURRENCY as u64,
+        1,
+        max,
+    )? as usize;
+    let rate = number(cli.crawlrate, "crawlrate", u64::from(crawl::DEFAULT_RATE), 1, u64::from(crawl::MAX_RATE))? as u32;
+    let liveness = number(
+        cli.crawlliveness,
+        "crawlliveness",
+        node::net::crawlbook::DEFAULT_LIVENESS_SECS,
+        crawl::MIN_LIVENESS_SECS,
+        u64::from(u32::MAX),
+    )?;
+    let max_age = number(
+        cli.crawlmaxage,
+        "crawlmaxage",
+        node::net::crawlbook::DEFAULT_MAX_AGE_SECS,
+        crawl::MIN_MAX_AGE_SECS,
+        u64::from(u32::MAX),
+    )?;
+    let list = |cli: &Vec<String>, key: &str| if cli.is_empty() { file_get_all(key) } else { cli.clone() };
+    let mut nets = Vec::new();
+    for v in list(&cli.crawlnet, "crawlnet") {
+        for part in v.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+            let name = crawl::parse_network(part)?.name().to_string();
+            if !nets.contains(&name) {
+                nets.push(name);
+            }
+        }
+    }
+    let mut binds: Vec<std::net::IpAddr> = Vec::new();
+    for v in list(&cli.crawlbind, "crawlbind") {
+        let ip: std::net::IpAddr = v
+            .trim()
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .parse()
+            .map_err(|_| format!("-crawlbind={v}: not an IP address"))?;
+        if binds.iter().any(|b| b.is_ipv4() == ip.is_ipv4()) {
+            return Err(format!("-crawlbind={v}: a second {} address", if ip.is_ipv4() { "IPv4" } else { "IPv6" }));
+        }
+        binds.push(ip);
+    }
+    let port = node::net::peer::default_p2p_port(network);
+    let mut seeds = Vec::new();
+    for v in list(&cli.crawlseed, "crawlseed") {
+        let v = v.trim().to_string();
+        if node::net::dns::is_name_target(&v) {
+            return Err(format!("-crawlseed={v}: an IP address or onion, not a name"));
+        }
+        node::net::peer::PeerAddr::parse_with_default_port(&v, port).map_err(|e| format!("-crawlseed={v}: {e}"))?;
+        seeds.push(v);
+    }
+    let ua_comment = cli.crawluacomment.clone().or_else(|| file_get("crawluacomment"));
+    if let Some(c) = &ua_comment {
+        crawl::user_agent(Some(c))?;
+    }
+    Ok(CrawlSettings {
+        crawl: resolve_nap(&cli.crawl, "crawl", file_get),
+        concurrency,
+        tor_concurrency,
+        rate,
+        liveness,
+        max_age,
+        nets,
+        binds,
+        seeds,
+        ua_comment,
+        probes: cli.crawlprobes.or_else(|| file_get("crawlprobes").and_then(|v| parse_bool(&v))).unwrap_or(true),
+    })
+}
+
+impl Config {
+    /// The crawl's settings as the peer manager takes them. Every value was
+    /// checked when the config was read; `path` is where the book is kept.
+    pub fn crawl_config(&self, path: Option<std::path::PathBuf>) -> node::net::crawl::CrawlConfig {
+        use node::net::crawl;
+        let networks = (!self.crawlnet.is_empty())
+            .then(|| self.crawlnet.iter().filter_map(|n| crawl::parse_network(n).ok()).collect());
+        let port = node::net::peer::default_p2p_port(self.network);
+        crawl::CrawlConfig {
+            limits: crawl::Limits::new(self.crawlconcurrency, self.crawltorconcurrency, self.crawlrate),
+            liveness_secs: self.crawlliveness,
+            max_age_secs: self.crawlmaxage,
+            networks,
+            bind_v4: self.crawlbind.iter().find_map(|ip| match ip {
+                std::net::IpAddr::V4(v4) => Some(*v4),
+                _ => None,
+            }),
+            bind_v6: self.crawlbind.iter().find_map(|ip| match ip {
+                std::net::IpAddr::V6(v6) => Some(*v6),
+                _ => None,
+            }),
+            seeds: self
+                .crawlseed
+                .iter()
+                .filter_map(|s| node::net::peer::PeerAddr::parse_with_default_port(s, port).ok())
+                .collect(),
+            ua_comment: self.crawluacomment.clone(),
+            probes: self.crawlprobes,
+            dns_seeds: self.dns && self.dnsseed,
+            fixed_seeds: self.fixedseeds,
+            signet_seeds: self.signet_seed_nodes.clone(),
+            path,
+            timings: crawl::Timings::DEFAULT,
+        }
+    }
+}
+
 /// `-maxoutboundfullrelay`, `-enable-dangerously-large-outbound-peer-limit`,
 /// `-altslots`, `-altprefer`, `-altuatrust` and `-altfillwait` (see
 /// [`CliArgs::alt_slot_args`]).
@@ -9202,6 +9551,8 @@ const NEGATABLE_BOOL_FLAGS: &[&str] = &[
     "napaggregator",
     "peersurvey",
     "peersurveyprobes",
+    "crawl",
+    "crawlprobes",
     "enable-dangerously-large-outbound-peer-limit",
     "networkactive",
     "esplora",
@@ -9414,6 +9765,17 @@ pub fn normalize_args(args: Vec<String>) -> Vec<String> {
         "peersurveyinterval",
         "peersurveyprobes",
         "peerflagpolicy",
+        "crawl",
+        "crawlconcurrency",
+        "crawltorconcurrency",
+        "crawlrate",
+        "crawlliveness",
+        "crawlmaxage",
+        "crawlnet",
+        "crawlbind",
+        "crawlseed",
+        "crawluacomment",
+        "crawlprobes",
         "maxoutboundfullrelay",
         "enable-dangerously-large-outbound-peer-limit",
         "altslots",
@@ -10270,6 +10632,17 @@ pub const KNOWN_CONFIG_KEYS: &[&str] = &[
     "peersurveyinterval",
     "peersurveyprobes",
     "peerflagpolicy",
+    "crawl",
+    "crawlconcurrency",
+    "crawltorconcurrency",
+    "crawlrate",
+    "crawlliveness",
+    "crawlmaxage",
+    "crawlnet",
+    "crawlbind",
+    "crawlseed",
+    "crawluacomment",
+    "crawlprobes",
     "maxoutboundfullrelay",
     "enable-dangerously-large-outbound-peer-limit",
     "altslots",
@@ -11873,6 +12246,86 @@ blockmintxfee=0.00001
         assert!(load(&[]).is_err());
     }
 
+    /// `-crawl` and its options: off by default with the plan's defaults;
+    /// every limit refused past its ceiling, which no option lifts; the
+    /// networks, source addresses, seeds and user-agent comment checked;
+    /// the config file read, the command line winning.
+    #[test]
+    fn crawl_options() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let load = |extra: &[&str]| {
+            let mut args = vec!["satd", "--regtest", "--datadir", dir.path().to_str().unwrap()];
+            args.extend_from_slice(extra);
+            Config::from_cli(parse_cli(normalize_args(args.iter().map(|a| a.to_string()).collect())).unwrap())
+        };
+        let c = load(&[]).unwrap();
+        assert!(!c.crawl);
+        assert_eq!((c.crawlconcurrency, c.crawltorconcurrency, c.crawlrate), (32, 8, 10));
+        assert_eq!((c.crawlliveness, c.crawlmaxage), (7200, 432000));
+        assert!(c.crawlprobes && c.crawlnet.is_empty() && c.crawlbind.is_empty() && c.crawlseed.is_empty());
+        let cc = c.crawl_config(None);
+        assert_eq!(cc.limits, node::net::crawl::Limits::new(32, 8, 10));
+        assert_eq!(cc.networks, None);
+
+        assert!(load(&["-crawl"]).unwrap().crawl);
+        assert!(!load(&["-nocrawl"]).unwrap().crawl);
+        assert_eq!(load(&["-crawlconcurrency=256"]).unwrap().crawlconcurrency, 256);
+        for bad in [
+            "-crawlconcurrency=257",
+            "-crawlconcurrency=0",
+            "-crawltorconcurrency=257",
+            "-crawlrate=101",
+            "-crawlrate=0",
+            "-crawlliveness=3600",
+            "-crawlmaxage=60",
+            "-crawlnet=i2p",
+            "-crawlnet=cjdns",
+            "-crawlnet=tor",
+            "-crawlbind=not-an-ip",
+            "-crawlseed=seed.example.com",
+            "-crawluacomment=a/b",
+        ] {
+            assert!(load(&[bad]).is_err(), "{bad} accepted");
+        }
+        assert!(load(&["-crawlbind=192.0.2.1", "-crawlbind=192.0.2.2"]).unwrap_err().contains("second IPv4"));
+
+        let c = load(&[
+            "-crawl=1",
+            "-crawlnet=IPv4,onion",
+            "-crawlbind=192.0.2.1",
+            "-crawlbind=[2001:db8::1]",
+            "-crawlseed=203.0.113.9",
+            "-crawlseed=pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.onion:8333",
+            "-crawluacomment=census",
+            "-crawlprobes=0",
+            "-crawlliveness=10800",
+        ])
+        .unwrap();
+        assert_eq!(c.crawlnet, vec!["ipv4".to_string(), "onion".to_string()]);
+        let cc = c.crawl_config(None);
+        use node::net::crawlbook::Network as Net;
+        assert_eq!(cc.networks, Some(vec![Net::Ipv4, Net::Onion]));
+        assert_eq!(cc.bind_v4, Some("192.0.2.1".parse().unwrap()));
+        assert_eq!(cc.bind_v6, Some("2001:db8::1".parse().unwrap()));
+        assert_eq!(cc.seeds.len(), 2);
+        assert_eq!(cc.seeds[0].port(), 18444, "the network's port by default");
+        assert_eq!(cc.ua_comment.as_deref(), Some("census"));
+        assert!(!cc.probes);
+        assert_eq!(cc.liveness_secs, 10800);
+
+        std::fs::write(dir.path().join("bitcoin.conf"), "crawl=1\ncrawlrate=20\ncrawlseed=203.0.113.1\ncrawlseed=203.0.113.2\n")
+            .unwrap();
+        let c = load(&[]).unwrap();
+        assert!(c.crawl);
+        assert_eq!((c.crawlrate, c.crawlseed.len()), (20, 2), "from the file, repeatable");
+        let c = load(&["-crawlrate=5", "-crawlseed=203.0.113.3"]).unwrap();
+        assert_eq!((c.crawlrate, c.crawlseed.len()), (5, 1), "the command line wins");
+        std::fs::write(dir.path().join("bitcoin.conf"), "crawlrate=1000\n").unwrap();
+        assert!(load(&[]).is_err(), "the ceiling holds in the file too");
+        std::fs::write(dir.path().join("bitcoin.conf"), "crawlnope=1\n").unwrap();
+        assert!(load(&[]).is_err(), "an unknown crawl key is refused");
+    }
+
     /// `-napstorerecover`: off by default, on from the command line in either
     /// spelling or from the file, and independent of `-nap`.
     #[test]
@@ -13243,6 +13696,7 @@ testactivationheight=bip34@2
             opreturn_prune_args: OpReturnPruneArgs::default(),
             nap_args: NapArgs::default(),
             peer_survey_args: PeerSurveyArgs::default(),
+            crawl_args: CrawlArgs::default(),
             alt_slot_args: AltSlotArgs::default(),
             peertimeout: None,
             cjdnsreachable: None,
@@ -13569,6 +14023,7 @@ testactivationheight=bip34@2
             opreturn_prune_args: OpReturnPruneArgs::default(),
             nap_args: NapArgs::default(),
             peer_survey_args: PeerSurveyArgs::default(),
+            crawl_args: CrawlArgs::default(),
             alt_slot_args: AltSlotArgs::default(),
             peertimeout: None,
             cjdnsreachable: None,
