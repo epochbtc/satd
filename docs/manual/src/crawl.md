@@ -326,5 +326,6 @@ The [status page](observability.md#status-page) shows a Crawl card with the craw
 its state, the book's size, reachable addresses per network, I2P and CJDNS
 learned, and the transport classes. None of these, nor the metrics, carries
 an address. The metrics and the status page reuse an aggregate for up to 10
-seconds, so a full book is not walked on every scrape; `getcrawlinfo` always
-takes a fresh one.
+seconds, so a full book is not walked on every scrape; `getcrawlinfo` reuses
+one for up to a second, so a client polling it cannot keep the crawl's
+sessions waiting on the book.

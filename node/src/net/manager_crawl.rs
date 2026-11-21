@@ -85,7 +85,7 @@ pub(super) struct CrawlRun {
     pub(super) unreached: AtomicU64,
     /// The aggregate the metrics and the status page read, and when it was
     /// taken: they are polled often, and a walk of a full book is not free.
-    aggregate: parking_lot::Mutex<Option<(Instant, crawlreport::Aggregate)>>,
+    pub(super) aggregate: parking_lot::Mutex<Option<(Instant, crawlreport::Aggregate)>>,
     /// Every target dialled, in order: for tests.
     #[cfg(test)]
     pub(super) dialled: parking_lot::Mutex<Vec<PeerAddr>>,
@@ -109,8 +109,13 @@ impl CrawlRun {
 }
 
 /// How long the metrics and the status page reuse an aggregate before they
-/// take a new one. `getcrawlinfo` always takes a new one.
+/// take a new one.
 pub(super) const AGGREGATE_MAX_AGE: Duration = Duration::from_secs(10);
+
+/// How long `getcrawlinfo` reuses one. The aggregate walks the whole book
+/// under its lock, which the sessions need too; `getcrawlinfo` is a read
+/// call, so a client polling it in a loop must not keep the crawl waiting.
+pub(super) const INFO_AGGREGATE_MAX_AGE: Duration = Duration::from_secs(1);
 
 /// Why the crawl starts no session now, as `getcrawlinfo` names it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -356,23 +361,35 @@ impl PeerManager {
 
     /// The networks the crawl dials: those the node's dialer reaches,
     /// `-crawlnet` kept, and clearnet only when it does not go through the
-    /// proxy.
+    /// proxy. As [`Self::crawl_may_dial`]: only a routable address goes
+    /// through the proxy, so where the book admits local addresses
+    /// (regtest) clearnet is dialled with a proxy set too.
     pub fn crawl_networks(&self) -> Vec<Network> {
         use crate::net::reachable::Network as Reach;
         let Some(run) = self.crawl.get() else { return Vec::new() };
+        let direct = self.proxy.is_none() || run.book.lock().params().allow_local;
         crawlreport::DIALLED
             .into_iter()
             .filter(|n| run.config.networks.as_ref().is_none_or(|nets| nets.contains(n)))
             .filter(|n| match n {
-                Network::Ipv4 => self.proxy.is_none() && self.network_reachable(Reach::Ipv4),
-                Network::Ipv6 => self.proxy.is_none() && self.network_reachable(Reach::Ipv6),
+                Network::Ipv4 => direct && self.network_reachable(Reach::Ipv4),
+                Network::Ipv6 => direct && self.network_reachable(Reach::Ipv6),
                 Network::Onion => self.network_reachable(Reach::Onion),
                 Network::I2p | Network::Cjdns => false,
             })
             .collect()
     }
 
-    /// A fresh aggregate of the book, kept for [`Self::crawl_metrics`].
+    /// The last aggregate if younger than `max_age`, else a fresh one.
+    fn crawl_aggregate(&self, run: &CrawlRun, max_age: Duration) -> crawlreport::Aggregate {
+        let cached = run.aggregate.lock().clone().filter(|(at, _)| at.elapsed() < max_age);
+        match cached {
+            Some((_, agg)) => agg,
+            None => self.crawl_aggregate_now(run),
+        }
+    }
+
+    /// A fresh aggregate of the book, kept for reuse.
     fn crawl_aggregate_now(&self, run: &CrawlRun) -> crawlreport::Aggregate {
         let agg = crawlreport::aggregate(&run.book.lock(), crate::time::now_secs());
         *run.aggregate.lock() = Some((Instant::now(), agg.clone()));
@@ -391,7 +408,7 @@ impl PeerManager {
             out["peersurvey_superseded"] = serde_json::json!(false);
             return out;
         };
-        let agg = self.crawl_aggregate_now(run);
+        let agg = self.crawl_aggregate(run, INFO_AGGREGATE_MAX_AGE);
         let max_entries = run.book.lock().params().max_entries;
         let mut out = crawlreport::aggregate_json(&agg, max_entries);
         let stopped = run.stopped.load(Ordering::Relaxed);
@@ -455,11 +472,7 @@ impl PeerManager {
     /// [`AGGREGATE_MAX_AGE`].
     pub fn crawl_metrics(&self) -> Option<CrawlMetrics> {
         let run = self.crawl.get()?;
-        let cached = run.aggregate.lock().clone().filter(|(at, _)| at.elapsed() < AGGREGATE_MAX_AGE);
-        let aggregate = match cached {
-            Some((_, agg)) => agg,
-            None => self.crawl_aggregate_now(run),
-        };
+        let aggregate = self.crawl_aggregate(run, AGGREGATE_MAX_AGE);
         let stopped = run.stopped.load(Ordering::Relaxed);
         Some(CrawlMetrics {
             running: !stopped && self.crawl_holds().is_empty(),

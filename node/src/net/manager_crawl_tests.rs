@@ -768,8 +768,8 @@ async fn getcrawlinfo_and_getcrawlnodes_after_a_session() {
 }
 
 /// The metrics and the status page reuse an aggregate for
-/// [`crawl_conn::AGGREGATE_MAX_AGE`]; `getcrawlinfo` always takes a new one
-/// and refreshes theirs.
+/// [`crawl_conn::AGGREGATE_MAX_AGE`]; `getcrawlinfo` for
+/// [`crawl_conn::INFO_AGGREGATE_MAX_AGE`], and a new one refreshes theirs.
 #[test]
 fn the_metrics_reuse_a_recent_aggregate() {
     let (pm, _dir) = mk_pm_with(None);
@@ -778,6 +778,24 @@ fn the_metrics_reuse_a_recent_aggregate() {
     let now = crate::time::now_secs();
     assert!(run.book.lock().seed(PeerAddr::Socket(SocketAddr::from(([23, 1, 1, 7], 8333))), 0, now));
     assert_eq!(pm.crawl_metrics().unwrap().aggregate.entries, 0, "within the window: the aggregate taken before");
-    assert_eq!(pm.get_crawl_info()["book"]["entries"], 1, "getcrawlinfo takes a new one");
+    assert_eq!(pm.get_crawl_info()["book"]["entries"], 0, "getcrawlinfo reuses one under a second old");
+    // Age the kept aggregate past getcrawlinfo's window, not the metrics'.
+    if let Some((at, _)) = run.aggregate.lock().as_mut() {
+        *at -= crawl_conn::INFO_AGGREGATE_MAX_AGE;
+    }
+    assert_eq!(pm.get_crawl_info()["book"]["entries"], 1, "older: getcrawlinfo takes a new one");
     assert_eq!(pm.crawl_metrics().unwrap().aggregate.entries, 1, "and the metrics read it");
+}
+
+/// With `-proxy` set, only a routable address goes through the proxy, so
+/// where the book admits local addresses (regtest) the crawl still dials
+/// clearnet, and `getcrawlinfo` says so: the networks it reports are the
+/// ones `crawl_may_dial` lets through.
+#[test]
+fn getcrawlinfo_networks_agree_with_what_the_crawl_dials_under_a_proxy() {
+    let (pm, _dir) = mk_pm_proxied("127.0.0.1:9");
+    enable(&pm, CrawlConfig { networks: Some(vec![crate::net::crawlbook::Network::Ipv4]), ..config() });
+    let local = PeerAddr::Socket(SocketAddr::from(([127, 0, 0, 1], 18444)));
+    assert!(pm.crawl_may_dial(&local), "a local address is dialled direct");
+    assert_eq!(pm.get_crawl_info()["limits"]["networks"], serde_json::json!(["ipv4"]));
 }
