@@ -113,8 +113,11 @@ class Impl:
 
     # --crawl: the node starts with no outbound connections of its own
     # (no_outbound), and seed(addrs) adds addresses to its address book;
-    # an implementation without an RPC for that returns None.
+    # an implementation without an RPC for that returns None. Only an
+    # implementation whose argv() honours no_outbound may be seeded, so a
+    # seeded address can never be dialled.
     no_outbound = False
+    honours_no_outbound = False
 
     def seed(self, addrs):
         return None
@@ -136,6 +139,7 @@ class Impl:
 
 
 class CoreLike(Impl):
+    honours_no_outbound = True
     family = "core"
     bin_env = None
 
@@ -184,6 +188,7 @@ class Knots(CoreLike):
 
 
 class Satd(Impl):
+    honours_no_outbound = True
     family = name = "satd"
     env = ("SATD", "SATCLI")
 
@@ -300,6 +305,7 @@ class Bcoin(Impl):
 
 
 class Rbitcoin(Impl):
+    honours_no_outbound = True
     family = name = "rbitcoin"
     env = ("RBITCOIN",)
 
@@ -406,6 +412,7 @@ conn.close()
 
 
 class Libbitcoin(Impl):
+    honours_no_outbound = True
     """libbitcoin-server's bs, run in a container: bs 3.8 cannot choose the
     address it listens on, so it gets a network namespace of its own with
     only its P2P port published to the host's loopback. bs cannot mine and
@@ -472,8 +479,10 @@ IMPLS = [Satd, Core, Knots, Btcd, Bcoin, Rbitcoin, Floresta, Libbitcoin, Seeder,
 
 
 def seed_addresses(n, port=18444):
-    """n distinct random routable IPv4 addresses. Never dialled: the node
-    under test runs with no outbound connections."""
+    """n distinct random routable IPv4 addresses on the regtest default
+    port (as a real node would advertise them, not the test node's own
+    port). Never dialled: only a node started with no outbound connections
+    is seeded."""
     rng = random.Random(0x5eed)
     out = set()
     while len(out) < n:
@@ -610,10 +619,12 @@ def run_crawl(impl, outdir, version, extra, suffix, seed_n):
         wait_for(impl.ready, f"{impl.name} RPC")
         if impl.can_mine:
             impl.mine()
-        book = impl.seed(seed_addresses(seed_n)) if seed_n else None
+        book = impl.seed(seed_addresses(seed_n)) if seed_n and impl.honours_no_outbound else None
         if book is None:
-            book = {"method": None, "offered": 0, "accepted": 0,
-                    "note": "no RPC adds to its address book" if seed_n else "not seeded"}
+            why = ("not seeded" if not seed_n
+                   else "not seeded: it is not started without outbound connections"
+                   if not impl.honours_no_outbound else "no RPC adds to its address book")
+            book = {"method": None, "offered": 0, "accepted": 0, "note": why}
         _, height = impl.state()
         wait_for(lambda: __import__("socket").create_connection(("127.0.0.1", NODE_P2P), 2).close(),
                  f"{impl.name} P2P port")

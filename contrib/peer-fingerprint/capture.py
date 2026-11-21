@@ -368,12 +368,18 @@ def ip16(host):
         return socket.inet_pton(socket.AF_INET6, host)
 
 
+def dial_target(args):
+    """--dial as (host, port), with IPv6 brackets removed: "[::1]:18444"."""
+    host, port = args.dial.rsplit(":", 1)
+    return host.strip("[]"), port
+
+
 def crawl_version_payload(args):
     """--crawl: services 0, relay 0, the node's real tip, a random nonce,
     the dialed address in addr_recv (services 0) and a dummy addr_from,
     as satd builds its version message."""
-    host, port = args.dial.rsplit(":", 1)
-    recv = struct.pack("<Q", 0) + ip16(host.strip("[]")) + struct.pack(">H", int(port))
+    host, port = dial_target(args)
+    recv = struct.pack("<Q", 0) + ip16(host) + struct.pack(">H", int(port))
     dummy = struct.pack("<Q", CRAWL_SERVICES) + bytes(16) + struct.pack(">H", 0)
     p = struct.pack("<iQq", PROTOCOL_VERSION, CRAWL_SERVICES, int(time.time()))
     p += recv + dummy + struct.pack("<Q", random.getrandbits(64))
@@ -755,7 +761,7 @@ def capture(args, srv=None):
         sys.path.insert(0, args.core_functional)
     if args.crawl:
         # v2 first, then v1 if the v2 attempt fails, as a crawler dials.
-        host, port = args.dial.rsplit(":", 1)
+        host, port = dial_target(args)
         conn = None
         if args.v2:
             started = time.monotonic()
@@ -769,7 +775,17 @@ def capture(args, srv=None):
                 sock.close()
                 conn = None
         if conn is None:
-            sock = socket.create_connection((host, int(port)), timeout=10)
+            try:
+                sock = socket.create_connection((host, int(port)), timeout=10)
+            except OSError as e:
+                # The v1 redial failed too: record how, as every other
+                # failure path here does, instead of writing no fixture.
+                d = fixture_head(args, "outbound", v2_attempts)
+                d.update({"transport": None, "v2_failure": v2_failure,
+                          "version": None, "commands": [], "received": [], "sent": [], "probes": [],
+                          "closed_by_peer": None,
+                          "error": f"v1 redial failed: {type(e).__name__} {e}".strip()})
+                return d
             conn = Conn(sock, magic)
         connection = "outbound"
     elif args.v2 and args.listen is not None:
@@ -786,7 +802,7 @@ def capture(args, srv=None):
             return d
         connection = "inbound"
     elif args.v2:
-        host, port = args.dial.rsplit(":", 1)
+        host, port = dial_target(args)
         sock = socket.create_connection((host, int(port)), timeout=10)
         conn = V2Conn(sock, args.network, initiating=True)
         try:
@@ -825,15 +841,15 @@ def capture(args, srv=None):
                 sock.close()
         connection = "inbound"
     else:
-        host, port = args.dial.rsplit(":", 1)
+        host, port = dial_target(args)
         sock = socket.create_connection((host, int(port)), timeout=10)
         conn = Conn(sock, magic)
         connection = "outbound"
 
     rec = Recorder(conn, args)
     if args.crawl:
-        host, port = args.dial.rsplit(":", 1)
-        rec.target = (ip16(host.strip("[]")), int(port))
+        host, port = dial_target(args)
+        rec.target = (ip16(host), int(port))
     probes = []
     error = None
     try:
