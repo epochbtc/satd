@@ -720,15 +720,16 @@ impl CrawlBook {
     }
 
     /// Note a session opened to `addr`: it is not due again until
-    /// [`Self::record_result`]. False when the address is not in the book,
-    /// cannot be dialled, or already has a session open.
-    pub fn mark_dialling(&mut self, addr: &PeerAddr, now: u64) -> bool {
+    /// [`Self::record_result`] with the token returned here (the open
+    /// time). `None` when the address is not in the book, cannot be
+    /// dialled, or already has a session open.
+    pub fn mark_dialling(&mut self, addr: &PeerAddr, now: u64) -> Option<u64> {
         match self.entries.get_mut(&CrawlAddr::Peer(addr.clone())) {
             Some(e) if !e.in_flight(now) => {
                 e.in_flight = Some(now);
-                true
+                Some(now)
             }
-            _ => false,
+            _ => None,
         }
     }
 
@@ -736,10 +737,25 @@ impl CrawlBook {
     /// fails is not a reachability failure; any other session that
     /// completes no handshake backs the address off, and drops it once it
     /// has failed for [`DROP_AFTER_SECS`] with no source naming it.
-    pub fn record_result(&mut self, addr: &PeerAddr, kind: SessionKind, result: SessionResult, now: u64) {
+    ///
+    /// `session` is the token [`Self::mark_dialling`] returned (`None` for
+    /// a result with no session marked). A result whose token is not the
+    /// session open now is stale, from a session abandoned and since
+    /// replaced or already superseded, and is ignored: it neither clears
+    /// the newer session's marker nor counts as the current outcome.
+    /// Returns whether the result was applied.
+    pub fn record_result(
+        &mut self,
+        addr: &PeerAddr,
+        session: Option<u64>,
+        kind: SessionKind,
+        result: SessionResult,
+        now: u64,
+    ) -> bool {
         let key = CrawlAddr::Peer(addr.clone());
-        if !self.entries.contains_key(&key) {
-            return;
+        match self.entries.get(&key) {
+            Some(e) if e.in_flight == session => {}
+            _ => return false,
         }
         let liveness = self.params.liveness_secs;
         let mut drop = false;
@@ -810,6 +826,7 @@ impl CrawlBook {
         if drop {
             self.remove(&key);
         }
+        true
     }
 
     /// The reachable set: addresses whose last completed handshake is

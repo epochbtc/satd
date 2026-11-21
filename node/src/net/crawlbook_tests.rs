@@ -76,8 +76,8 @@ fn due_kind(book: &CrawlBook, addr: &PeerAddr, now: u64) -> Option<SessionKind> 
 fn reached_book(addr: &PeerAddr, at: u64) -> CrawlBook {
     let mut book = CrawlBook::default();
     assert!(book.seed(addr.clone(), 0, at));
-    book.record_result(addr, SessionKind::Discovery, v2_ok(at), at);
-    book.record_result(addr, SessionKind::V1Recheck, SessionResult { v1: Attempt::Ok, ..Default::default() }, at);
+    book.record_result(addr, None, SessionKind::Discovery, v2_ok(at), at);
+    book.record_result(addr, None, SessionKind::V1Recheck, SessionResult { v1: Attempt::Ok, ..Default::default() }, at);
     book
 }
 
@@ -275,7 +275,7 @@ fn first_contact_is_a_discovery_then_a_v1_recheck() {
     let mut book = CrawlBook::default();
     book.admit(&source(1), &v4_answer(1, 1), NOW);
     assert_eq!(due_kind(&book, &a, NOW), Some(SessionKind::Discovery));
-    book.record_result(&a, SessionKind::Discovery, v2_ok(NOW), NOW);
+    book.record_result(&a, None, SessionKind::Discovery, v2_ok(NOW), NOW);
     assert_eq!(due_kind(&book, &a, NOW), Some(SessionKind::V1Recheck), "v1 recheck on first contact");
 }
 
@@ -286,13 +286,13 @@ fn liveness_is_due_every_interval() {
     assert_eq!(due_kind(&book, &a, NOW + 2 * HOUR - 1), None);
     assert_eq!(due_kind(&book, &a, NOW + 2 * HOUR), Some(SessionKind::Liveness));
     let mut book = book;
-    book.record_result(&a, SessionKind::Liveness, v2_ok(NOW + 2 * HOUR), NOW + 2 * HOUR);
+    book.record_result(&a, None, SessionKind::Liveness, v2_ok(NOW + 2 * HOUR), NOW + 2 * HOUR);
     assert_eq!(due_kind(&book, &a, NOW + 4 * HOUR - 1), None);
     assert_eq!(due_kind(&book, &a, NOW + 4 * HOUR), Some(SessionKind::Liveness));
 
     let mut fast = CrawlBook::new(BookParams { liveness_secs: HOUR, ..BookParams::default() });
     fast.seed(a.clone(), 0, NOW);
-    fast.record_result(&a, SessionKind::Discovery, SessionResult { v1: Attempt::Ok, v2: Attempt::Failed, observation: None }, NOW);
+    fast.record_result(&a, None, SessionKind::Discovery, SessionResult { v1: Attempt::Ok, v2: Attempt::Failed, observation: None }, NOW);
     assert_eq!(due_kind(&fast, &a, NOW + HOUR), Some(SessionKind::Liveness), "the interval is a parameter");
 }
 
@@ -302,10 +302,10 @@ fn discovery_is_due_once_per_day() {
     let mut book = reached_book(&a, NOW);
     for t in (1..12).map(|i| NOW + i * 2 * HOUR) {
         assert_eq!(due_kind(&book, &a, t), Some(SessionKind::Liveness), "at +{}h", (t - NOW) / HOUR);
-        book.record_result(&a, SessionKind::Liveness, v2_ok(t), t);
+        book.record_result(&a, None, SessionKind::Liveness, v2_ok(t), t);
     }
     assert_eq!(due_kind(&book, &a, NOW + DAY), Some(SessionKind::Discovery));
-    book.record_result(&a, SessionKind::Discovery, v2_ok(NOW + DAY), NOW + DAY);
+    book.record_result(&a, None, SessionKind::Discovery, v2_ok(NOW + DAY), NOW + DAY);
     assert_eq!(book.get(&CrawlAddr::Peer(a.clone())).unwrap().last_discovery, Some(NOW + DAY));
     assert_eq!(due_kind(&book, &a, NOW + 2 * DAY - 1), Some(SessionKind::Liveness));
 }
@@ -316,10 +316,10 @@ fn v1_recheck_is_on_first_contact_then_weekly_and_marks_v2_only() {
     let key = CrawlAddr::Peer(a.clone());
     let mut book = CrawlBook::default();
     book.seed(a.clone(), 0, NOW);
-    book.record_result(&a, SessionKind::Discovery, v2_ok(NOW), NOW);
+    book.record_result(&a, None, SessionKind::Discovery, v2_ok(NOW), NOW);
     assert_eq!(due_kind(&book, &a, NOW), Some(SessionKind::V1Recheck));
     let v1_fail = SessionResult { v1: Attempt::Failed, ..Default::default() };
-    book.record_result(&a, SessionKind::V1Recheck, v1_fail.clone(), NOW + 5);
+    book.record_result(&a, None, SessionKind::V1Recheck, v1_fail.clone(), NOW + 5);
     let e = book.get(&key).unwrap();
     assert!(e.v2_only, "v1 failed next to a v2 success");
     assert_eq!((e.failures, e.retry_at), (0, None), "a v1 refusal is not unreachability");
@@ -330,18 +330,18 @@ fn v1_recheck_is_on_first_contact_then_weekly_and_marks_v2_only() {
         t += 2 * HOUR;
         let kind = due_kind(&book, &a, t).expect("something is due");
         assert_ne!(kind, SessionKind::V1Recheck, "at +{}h", (t - NOW) / HOUR);
-        book.record_result(&a, kind, v2_ok(t), t);
+        book.record_result(&a, None, kind, v2_ok(t), t);
     }
     t = NOW + 5 + V1_RECHECK_INTERVAL_SECS;
     assert_eq!(due_kind(&book, &a, t), Some(SessionKind::V1Recheck), "weekly");
     // v1 works now: no longer v2-only.
-    book.record_result(&a, SessionKind::V1Recheck, SessionResult { v1: Attempt::Ok, ..Default::default() }, t);
+    book.record_result(&a, None, SessionKind::V1Recheck, SessionResult { v1: Attempt::Ok, ..Default::default() }, t);
     assert!(!book.get(&key).unwrap().v2_only);
 
     // A target reached over v1 after v2 failed never gets a recheck.
     let b = v4(2);
     book.seed(b.clone(), 0, NOW);
-    book.record_result(&b, SessionKind::Discovery, SessionResult { v2: Attempt::Failed, v1: Attempt::Ok, observation: None }, NOW);
+    book.record_result(&b, None, SessionKind::Discovery, SessionResult { v2: Attempt::Failed, v1: Attempt::Ok, observation: None }, NOW);
     for t in [NOW, NOW + 2 * HOUR, NOW + 8 * DAY] {
         assert_ne!(due_kind(&book, &b, t), Some(SessionKind::V1Recheck));
     }
@@ -352,7 +352,7 @@ fn v1_recheck_is_on_first_contact_then_weekly_and_marks_v2_only() {
 fn a_node_down_on_both_transports_is_not_v2_only() {
     let a = v4(1);
     let mut book = reached_book(&a, NOW);
-    book.record_result(&a, SessionKind::Liveness, down(), NOW + 2 * HOUR);
+    book.record_result(&a, None, SessionKind::Liveness, down(), NOW + 2 * HOUR);
     let e = book.get(&CrawlAddr::Peer(a)).unwrap();
     assert!(!e.v2_only);
     assert_eq!(e.failures, 1);
@@ -366,14 +366,14 @@ fn unreachable_backs_off_one_four_and_24_hours_then_daily() {
     let mut t = NOW;
     for wait in [HOUR, 4 * HOUR, DAY, DAY, DAY] {
         assert!(due_kind(&book, &a, t).is_some());
-        book.record_result(&a, SessionKind::Discovery, down(), t);
+        book.record_result(&a, None, SessionKind::Discovery, down(), t);
         assert_eq!(due_kind(&book, &a, t + wait - 1), None, "waits {}h", wait / HOUR);
         assert_eq!(due_kind(&book, &a, t + wait), Some(SessionKind::Discovery));
         t += wait;
     }
     // A success resets it.
-    book.record_result(&a, SessionKind::Discovery, v2_ok(t), t);
-    book.record_result(&a, SessionKind::Liveness, down(), t + 2 * HOUR);
+    book.record_result(&a, None, SessionKind::Discovery, v2_ok(t), t);
+    book.record_result(&a, None, SessionKind::Liveness, down(), t + 2 * HOUR);
     assert_eq!(book.get(&CrawlAddr::Peer(a.clone())).unwrap().retry_at, Some(t + 3 * HOUR));
 }
 
@@ -387,7 +387,7 @@ fn an_address_failing_for_30_days_that_no_source_names_is_dropped() {
     while t < NOW + 31 * DAY {
         for x in [&a, &b] {
             if due_kind(&book, x, t).is_some() {
-                book.record_result(x, SessionKind::Discovery, down(), t);
+                book.record_result(x, None, SessionKind::Discovery, down(), t);
             }
         }
         // b keeps being named.
@@ -417,12 +417,13 @@ fn one_session_at_a_time() {
     let a = v4(1);
     let mut book = CrawlBook::default();
     book.seed(a.clone(), 0, NOW);
-    assert!(book.mark_dialling(&a, NOW));
-    assert!(!book.mark_dialling(&a, NOW), "already open");
+    let session = book.mark_dialling(&a, NOW);
+    assert!(session.is_some());
+    assert!(book.mark_dialling(&a, NOW).is_none(), "already open");
     assert_eq!(due_kind(&book, &a, NOW), None);
-    book.record_result(&a, SessionKind::Discovery, v2_ok(NOW), NOW);
+    assert!(book.record_result(&a, session, SessionKind::Discovery, v2_ok(NOW), NOW));
     assert!(!book.get(&CrawlAddr::Peer(a.clone())).unwrap().in_flight(NOW));
-    assert!(!book.mark_dialling(&v4(99), NOW), "not in the book");
+    assert!(book.mark_dialling(&v4(99), NOW).is_none(), "not in the book");
 }
 
 #[test]
@@ -434,8 +435,8 @@ fn liveness_sessions_keep_the_last_discoverys_findings() {
     obs.getaddr = Some(GetaddrResult::Answered { entries: 812, delay_ms: 21_000 });
     obs.chain_check = Some(ChainCheck::OnChain);
     obs.probes.set(Probe::Ping, ProbeOutcome::Answered(40));
-    book.record_result(&a, SessionKind::Discovery, SessionResult { v2: Attempt::Ok, v1: Attempt::NotTried, observation: Some(obs) }, NOW);
-    book.record_result(&a, SessionKind::Liveness, v2_ok(NOW + 2 * HOUR), NOW + 2 * HOUR);
+    book.record_result(&a, None, SessionKind::Discovery, SessionResult { v2: Attempt::Ok, v1: Attempt::NotTried, observation: Some(obs) }, NOW);
+    book.record_result(&a, None, SessionKind::Liveness, v2_ok(NOW + 2 * HOUR), NOW + 2 * HOUR);
     let o = book.get(&CrawlAddr::Peer(a)).unwrap().observation.clone().unwrap();
     assert_eq!(o.at, NOW + 2 * HOUR);
     assert_eq!(o.getaddr, Some(GetaddrResult::Answered { entries: 812, delay_ms: 21_000 }));
@@ -450,9 +451,9 @@ fn the_snapshot_is_the_handshakes_within_the_liveness_window() {
     for i in 0..3 {
         book.seed(v4(i), 0, NOW);
     }
-    book.record_result(&v4(0), SessionKind::Discovery, v2_ok(NOW), NOW);
-    book.record_result(&v4(1), SessionKind::Discovery, v2_ok(NOW + HOUR), NOW + HOUR);
-    book.record_result(&v4(2), SessionKind::Discovery, down(), NOW + HOUR);
+    book.record_result(&v4(0), None, SessionKind::Discovery, v2_ok(NOW), NOW);
+    book.record_result(&v4(1), None, SessionKind::Discovery, v2_ok(NOW + HOUR), NOW + HOUR);
+    book.record_result(&v4(2), None, SessionKind::Discovery, down(), NOW + HOUR);
     let at = |now| {
         let mut v: Vec<PeerAddr> = book.snapshot(now).map(|(a, _)| a.clone()).collect();
         v.sort();
@@ -470,7 +471,7 @@ fn past_the_cap_the_least_recently_used_goes() {
         book.admit(&source(1), &v4_answer(i, 1), NOW + u64::from(i));
     }
     // Reaching the oldest makes it the most recent.
-    book.record_result(&v4(0), SessionKind::Discovery, v2_ok(NOW + 10), NOW + 10);
+    book.record_result(&v4(0), None, SessionKind::Discovery, v2_ok(NOW + 10), NOW + 10);
     book.admit(&source(1), &v4_answer(3, 1), NOW + 11);
     assert_eq!(book.len(), 3);
     assert!(book.get(&CrawlAddr::Peer(v4(1))).is_none(), "the least recently used went");
@@ -507,13 +508,13 @@ fn full_book() -> CrawlBook {
     obs.clock_offset_secs = None;
     obs.probes.set(Probe::Unknown, ProbeOutcome::Disconnected);
     obs.probes.set(Probe::GetData, ProbeOutcome::Silent);
-    book.record_result(&v4(0), SessionKind::Discovery, SessionResult { v2: Attempt::Ok, v1: Attempt::NotTried, observation: Some(obs) }, NOW + 2);
-    book.record_result(&v4(0), SessionKind::V1Recheck, SessionResult { v1: Attempt::Failed, ..Default::default() }, NOW + 3);
-    book.record_result(&v4(1), SessionKind::Discovery, down(), NOW + 4);
+    book.record_result(&v4(0), None, SessionKind::Discovery, SessionResult { v2: Attempt::Ok, v1: Attempt::NotTried, observation: Some(obs) }, NOW + 2);
+    book.record_result(&v4(0), None, SessionKind::V1Recheck, SessionResult { v1: Attempt::Failed, ..Default::default() }, NOW + 3);
+    book.record_result(&v4(1), None, SessionKind::Discovery, down(), NOW + 4);
     let mut nogetaddr = observation(NOW + 5);
     nogetaddr.getaddr = Some(GetaddrResult::NoAnswer);
     nogetaddr.height = -1;
-    book.record_result(&v4(2), SessionKind::Discovery, SessionResult { v2: Attempt::Failed, v1: Attempt::Ok, observation: Some(nogetaddr) }, NOW + 5);
+    book.record_result(&v4(2), None, SessionKind::Discovery, SessionResult { v2: Attempt::Failed, v1: Attempt::Ok, observation: Some(nogetaddr) }, NOW + 5);
     book
 }
 
@@ -642,23 +643,23 @@ fn a_session_open_is_never_evicted_or_expired() {
     let a = v4(0);
     let mut book = CrawlBook::new(BookParams { max_entries: 2, ..BookParams::default() });
     book.seed(a.clone(), 0, NOW);
-    assert!(book.mark_dialling(&a, NOW));
+    let session = book.mark_dialling(&a, NOW);
     book.admit(&source(1), &v4_answer(1, 1), NOW + 1);
     book.admit(&source(1), &v4_answer(2, 1), NOW + 2);
     assert_eq!(book.len(), 2);
     assert!(book.get(&CrawlAddr::Peer(v4(1))).is_none(), "the oldest without a session went");
-    book.record_result(&a, SessionKind::Discovery, v2_ok(NOW + 3), NOW + 3);
+    book.record_result(&a, session, SessionKind::Discovery, v2_ok(NOW + 3), NOW + 3);
     assert_eq!(book.get(&CrawlAddr::Peer(a.clone())).unwrap().last_reachable(), Some(NOW + 3), "its result counts");
 
     // Expiry: failing and unnamed for 30 days, with a session open.
     let mut book = CrawlBook::default();
     book.seed(a.clone(), 0, NOW);
-    book.record_result(&a, SessionKind::Discovery, down(), NOW);
+    book.record_result(&a, None, SessionKind::Discovery, down(), NOW);
     let later = NOW + DROP_AFTER_SECS + DAY;
-    assert!(book.mark_dialling(&a, later));
+    let session = book.mark_dialling(&a, later);
     book.expire(later);
     assert!(book.get(&CrawlAddr::Peer(a.clone())).is_some(), "not expired mid-session");
-    book.record_result(&a, SessionKind::Discovery, v2_ok(later), later);
+    book.record_result(&a, session, SessionKind::Discovery, v2_ok(later), later);
     assert_eq!(book.get(&CrawlAddr::Peer(a)).unwrap().last_reachable(), Some(later));
 }
 
@@ -700,7 +701,7 @@ fn seeding_again_does_not_hold_off_the_drop() {
             book.seed(a.clone(), 0, t);
         }
         if due_kind(&book, &a, t).is_some() {
-            book.record_result(&a, SessionKind::Discovery, down(), t);
+            book.record_result(&a, None, SessionKind::Discovery, down(), t);
         }
         t += HOUR;
     }
@@ -715,17 +716,17 @@ fn an_abandoned_session_ages_out() {
     let a = v4(1);
     let mut book = CrawlBook::default();
     book.seed(a.clone(), 0, NOW);
-    assert!(book.mark_dialling(&a, NOW));
+    assert!(book.mark_dialling(&a, NOW).is_some());
     let gone = NOW + ABANDONED_AFTER_SECS;
     assert_eq!(due_kind(&book, &a, gone - 1), None);
-    assert!(!book.mark_dialling(&a, gone - 1), "still open");
+    assert!(book.mark_dialling(&a, gone - 1).is_none(), "still open");
     assert!(due_kind(&book, &a, gone).is_some(), "abandoned: due again");
-    assert!(book.mark_dialling(&a, gone), "and can be dialled again");
+    assert!(book.mark_dialling(&a, gone).is_some(), "and can be dialled again");
 
     // Eviction no longer skips it.
     let mut book = CrawlBook::new(BookParams { max_entries: 1, ..BookParams::default() });
     book.seed(a.clone(), 0, NOW);
-    assert!(book.mark_dialling(&a, NOW));
+    assert!(book.mark_dialling(&a, NOW).is_some());
     let r = book.admit(&source(1), &v4_answer(2, 1), gone);
     assert_eq!(r.admitted, 1, "{r:?}");
     assert!(book.get(&CrawlAddr::Peer(a)).is_none(), "the abandoned entry went");
@@ -738,10 +739,31 @@ fn an_entry_evicted_at_once_is_not_reported_kept() {
     let a = v4(0);
     let mut book = CrawlBook::new(BookParams { max_entries: 1, ..BookParams::default() });
     book.seed(a.clone(), 0, NOW);
-    assert!(book.mark_dialling(&a, NOW));
+    assert!(book.mark_dialling(&a, NOW).is_some());
     let r = book.admit(&source(1), &v4_answer(1, 1), NOW + 1);
     assert_eq!((r.admitted, r.not_kept), (0, 1));
     assert!(!book.seed(v4(2), 0, NOW + 1));
     assert_eq!(book.len(), 1);
     assert!(book.get(&CrawlAddr::Peer(a)).is_some());
+}
+
+#[test]
+fn a_late_result_from_an_abandoned_session_is_ignored() {
+    // Session A is abandoned, B opens; A reporting late neither clears
+    // B's marker (a third session could open) nor counts as the outcome.
+    let a = v4(1);
+    let mut book = CrawlBook::default();
+    book.seed(a.clone(), 0, NOW);
+    let first = book.mark_dialling(&a, NOW);
+    let later = NOW + ABANDONED_AFTER_SECS;
+    let second = book.mark_dialling(&a, later);
+    assert!(second.is_some() && second != first);
+    assert!(!book.record_result(&a, first, SessionKind::Discovery, down(), later + 1), "stale");
+    assert!(book.mark_dialling(&a, later + 1).is_none(), "B is still open");
+    assert_eq!(book.get(&CrawlAddr::Peer(a.clone())).unwrap().last_reachable(), None);
+    assert!(book.record_result(&a, second, SessionKind::Discovery, v2_ok(later + 2), later + 2));
+    assert_eq!(book.get(&CrawlAddr::Peer(a.clone())).unwrap().last_reachable(), Some(later + 2));
+    // And once B has reported, A's result is stale too.
+    assert!(!book.record_result(&a, first, SessionKind::Discovery, down(), later + 3));
+    assert_eq!(book.get(&CrawlAddr::Peer(a)).unwrap().last_reachable(), Some(later + 2));
 }
