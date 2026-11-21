@@ -782,3 +782,44 @@ fn two_sessions_in_one_second_have_different_tokens() {
     assert!(!book.record_result(&a, first, SessionKind::Discovery, v2_ok(NOW), NOW), "duplicate");
     assert!(book.mark_dialling(&a, NOW).is_none(), "the second is still open");
 }
+
+/// On regtest the book admits loopback and private addresses, so a crawl
+/// can walk nodes on one host; on every other network it refuses them, as
+/// [`BookParams::default`] does.
+#[test]
+fn local_addresses_are_admitted_on_regtest_only() {
+    use bitcoin::Network as Net;
+    let local = ["127.0.0.1", "10.0.0.1", "192.168.1.1", "::1"];
+    let answer: Vec<AddrV2Message> = local.iter().map(|ip| ip_entry(ip, 18444)).collect();
+    for network in [Net::Bitcoin, Net::Testnet4, Net::Signet] {
+        let params = BookParams::for_network(network);
+        assert!(!params.allow_local, "{network}");
+        let mut book = CrawlBook::new(params);
+        let r = book.admit(&source(1), &answer, NOW);
+        assert_eq!((r.admitted, r.not_public), (0, local.len()), "{network}: {r:?}");
+        assert!(!book.seed(PeerAddr::Socket("127.0.0.1:18444".parse().unwrap()), 0, NOW), "{network}");
+        assert!(book.is_empty(), "{network}");
+    }
+    let mut book = CrawlBook::new(BookParams::for_network(Net::Regtest));
+    let r = book.admit(&source(1), &answer, NOW);
+    assert_eq!(r.admitted, local.len(), "{r:?}");
+    assert!(book.seed(PeerAddr::Socket("127.0.0.2:18444".parse().unwrap()), 0, NOW));
+    // An address that names no host stays out even there.
+    let r = book.admit(&source(1), &[ip_entry("0.0.0.0", 18444), ip_entry("::", 18444)], NOW);
+    assert_eq!((r.admitted, r.not_public), (0, 2), "{r:?}");
+}
+
+/// The engine's filter leaves the addresses it cannot dial out of the
+/// list before the limit is applied, so they cannot crowd out the rest.
+#[test]
+fn next_due_where_applies_the_filter_before_the_limit() {
+    let mut book = CrawlBook::default();
+    for i in 0..10 {
+        assert!(book.seed(v4(i), 0, NOW));
+    }
+    let onion = PeerAddr::Onion { host: "pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.onion".into(), port: 8333 };
+    assert!(book.seed(onion.clone(), 0, NOW + 1));
+    assert!(!book.next_due(NOW + 2, 3).iter().any(|(a, _)| *a == onion), "the onion is due last");
+    let due = book.next_due_where(NOW + 2, 3, PeerAddr::is_onion);
+    assert_eq!(due, vec![(onion, SessionKind::Discovery)]);
+}
