@@ -763,9 +763,18 @@ def capture(args, srv=None):
         # v2 first, then v1 if the v2 attempt fails, as a crawler dials.
         host, port = dial_target(args)
         conn = None
+        sock = None
         if args.v2:
             started = time.monotonic()
-            sock = socket.create_connection((host, int(port)), timeout=10)
+            try:
+                sock = socket.create_connection((host, int(port)), timeout=10)
+            except OSError as e:
+                # Refused or reset before any v2 byte: recorded as a v2
+                # failure of kind "connect", then the v1 redial below.
+                sock = None
+                v2_failure = {"kind": "connect", "after_ms": int((time.monotonic() - started) * 1000),
+                              "bytes_returned": 0, "error": f"{type(e).__name__} {e}".strip()}
+        if args.v2 and sock is not None:
             conn = V2Conn(sock, args.network, initiating=True, record=True)
             try:
                 conn.handshake(time.monotonic() + 30)
