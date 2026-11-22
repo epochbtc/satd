@@ -57,6 +57,13 @@ struct Script {
     v1_only: bool,
     /// The `version` timestamp; three seconds behind the clock when `None`.
     timestamp: Option<i64>,
+    /// The answer to `getheaders`.
+    headers: Vec<bitcoin::block::Header>,
+    /// Answer `getdata` with `notfound` (as satd does); stay silent when
+    /// false (as Core does on a connection that set relay off).
+    notfound: bool,
+    /// Close the connection on a `getdata`.
+    hang_up_on_getdata: bool,
 }
 
 fn core_script() -> Script {
@@ -74,6 +81,9 @@ fn core_script() -> Script {
         garbage: false,
         v1_only: true,
         timestamp: None,
+        headers: Vec::new(),
+        notfound: true,
+        hang_up_on_getdata: false,
     }
 }
 
@@ -197,9 +207,10 @@ async fn serve(mut stream: TcpStream, script: Script, log: Log, i: usize) {
                 }
             }
             NetworkMessage::GetHeaders(_) => {
-                let _ = conn.send(NetworkMessage::Headers(vec![])).await;
+                let _ = conn.send(NetworkMessage::Headers(script.headers.clone())).await;
             }
-            NetworkMessage::GetData(inv) => {
+            NetworkMessage::GetData(_) if script.hang_up_on_getdata => return,
+            NetworkMessage::GetData(inv) if script.notfound => {
                 let _ = conn.send(NetworkMessage::NotFound(inv)).await;
             }
             _ => {}
@@ -918,4 +929,133 @@ fn dumpcrawlsnapshot_honours_crawlexportkeyfile() {
     let PeerAddr::Socket(sa) = peer else { unreachable!() };
     let id = crawlsnapshot::node_id(&crawlsnapshot::ExportKey([7; 32]), &sa);
     assert_eq!(out["nodes"][&id][13]["port"], "default", "{out}");
+}
+
+// ---- The chain check and the crawl classifier ----
+
+/// Mine `n` blocks on the manager's chain.
+fn mine(pm: &PeerManager, n: u32) {
+    let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+    crate::mining::miner::mine_blocks(&pm.chain_state, &pm.mempool, addr, n, crate::mining::miner::DEFAULT_MAX_TRIES).unwrap();
+}
+
+/// The header of our block at `height`.
+fn our_header(pm: &PeerManager, height: u32) -> bitcoin::block::Header {
+    let hash = pm.chain_state.active_chain_hash_at_height(height).unwrap();
+    pm.chain_state.get_block_index(&hash).unwrap().header
+}
+
+/// A discovery session from `pm` to a scripted peer that answers
+/// `getheaders` with `headers`: its chain check, and the `getheaders` the
+/// peer received.
+async fn chain_check_against(
+    pm: &Arc<PeerManager>,
+    headers: Vec<bitcoin::block::Header>,
+) -> (Option<crate::net::crawlbook::ChainCheck>, Vec<NetworkMessage>) {
+    let (target, log) = scripted("127.0.0.1", Script { headers, answer: Some(answer(3)), ..core_script() }).await;
+    let out = pm.crawl_session(&target, SessionKind::Discovery).await;
+    let obs = out.result.observation.expect("an observation");
+    let sent = log.lock()[1].iter().filter(|m| m.cmd() == "getheaders").cloned().collect();
+    (obs.chain_check, sent)
+}
+
+/// The chain check is the `getheaders` probe: one, with our tip's parent
+/// as its locator and our tip as its stop hash. A peer that answers with
+/// our tip is on chain; one with nothing past our locator, or our blocks
+/// from its genesis, is behind; one with another block after our locator
+/// is on a fork; one whose answer starts from a block we do not know is
+/// on another chain.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_chain_check_tells_the_four_outcomes_apart() {
+    use crate::net::crawlbook::ChainCheck;
+    let (pm, _dir) = mk_pm_with(None);
+    mine(&pm, 3);
+    let run = enable(&pm, config());
+    *run.forced_probes.lock() = Some(vec![Probe::GetHeaders]);
+    let (b1, b2, b3) = (our_header(&pm, 1), our_header(&pm, 2), our_header(&pm, 3));
+    let mut sibling = b3;
+    sibling.nonce ^= 1;
+    let mut stranger = b1;
+    stranger.prev_blockhash = bitcoin::BlockHash::from_byte_array([7; 32]);
+    let cases = [
+        (vec![b3], ChainCheck::OnChain),
+        (vec![], ChainCheck::Behind),
+        (vec![b1], ChainCheck::Behind),
+        (vec![sibling], ChainCheck::Fork),
+        (vec![stranger], ChainCheck::OtherChain),
+    ];
+    for (headers, want) in cases {
+        let (got, sent) = chain_check_against(&pm, headers.clone()).await;
+        assert_eq!(got, Some(want), "{headers:?}");
+        assert_eq!(sent.len(), 1, "one getheaders: {sent:?}");
+        let NetworkMessage::GetHeaders(g) = &sent[0] else { unreachable!() };
+        assert_eq!((g.locator_hashes.as_slice(), g.stop_hash), ([b2.block_hash()].as_slice(), b3.block_hash()));
+    }
+}
+
+/// No chain check without probes (`-crawlprobes=0`) or on a liveness
+/// session: no `getheaders` is sent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn no_chain_check_without_probes_or_on_a_liveness_session() {
+    let (pm, _dir) = mk_pm_with(None);
+    mine(&pm, 3);
+    enable(&pm, CrawlConfig { probes: false, ..config() });
+    let tip = our_header(&pm, 3);
+    let (target, log) = scripted("127.0.0.1", Script { headers: vec![tip], answer: Some(answer(3)), ..core_script() }).await;
+    for kind in [SessionKind::Discovery, SessionKind::Liveness] {
+        let out = pm.crawl_session(&target, kind).await;
+        assert_eq!(out.result.observation.expect("an observation").chain_check, None, "{kind:?}");
+    }
+    assert!(log.lock().iter().flatten().all(|m| m.cmd() != "getheaders"));
+}
+
+/// A crawl session is judged against the crawl rows: a peer that greets
+/// the crawler as Core does is Core with high confidence; the same
+/// transcript closing the connection on a probe is no capture's shape, and
+/// its raw features are kept.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_crawl_session_is_judged_on_its_crawl_features() {
+    use crate::net::fingerprint::{AddrKind, Confidence, Family, Fingerprint};
+    let (pm, _dir) = mk_pm_with(None);
+    enable(&pm, config());
+    let core = Script { notfound: false, answer: Some(answer(3)), ..core_script() };
+    let (target, _log) = scripted("127.0.0.1", core.clone()).await;
+    let obs = pm.crawl_session(&target, SessionKind::Discovery).await.result.observation.unwrap();
+    assert_eq!(obs.probes.get(Probe::GetData), Some(ProbeOutcome::Silent));
+    assert_eq!(obs.fingerprint, Fingerprint::Known(Family::Core, Confidence::High));
+    assert_eq!(obs.shape, None, "a known shape keeps no raw features");
+
+    // Answering with `notfound` is Core too (relay granted by its operator).
+    let (target, _log) = scripted("127.0.0.1", Script { notfound: true, ..core.clone() }).await;
+    let obs = pm.crawl_session(&target, SessionKind::Discovery).await.result.observation.unwrap();
+    assert_eq!(obs.fingerprint, Fingerprint::Known(Family::Core, Confidence::High));
+
+    let (target, _log) = scripted("127.0.0.1", Script { hang_up_on_getdata: true, ..core }).await;
+    let obs = pm.crawl_session(&target, SessionKind::Discovery).await.result.observation.unwrap();
+    assert_eq!(obs.fingerprint, Fingerprint::Unknown);
+    let shape = obs.shape.expect("an unknown shape keeps its raw features");
+    assert_eq!(shape.commands, ["version", "wtxidrelay", "sendaddrv2", "verack", "sendcmpct", "ping"]);
+    assert!(shape.relay);
+    assert_eq!(shape.v2, None, "a v1 session");
+    assert_eq!(shape.getaddr, Some(AddrKind::AddrV2));
+}
+
+/// A session that sends no probe is judged with the probe answers the
+/// book keeps from the last one that did, so a liveness session does not
+/// undo what a discovery session found.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_session_without_probes_is_judged_with_the_last_answers() {
+    use crate::net::fingerprint::Fingerprint;
+    let (pm, _dir) = mk_pm_with(None);
+    let run = enable(&pm, config());
+    // Core's transcript, closing the connection on a probe: no row.
+    // (An answer to `getaddr`, so the probes go out before the session's bound.)
+    let script = Script { answer: Some(answer(3)), hang_up_on_getdata: true, ..core_script() };
+    let (target, _log) = scripted("127.0.0.1", script).await;
+    assert!(run.book.lock().seed(target.clone(), 0, crate::time::now_secs()));
+    pm.run_crawl_session(target.clone(), SessionKind::Discovery, None).await;
+    let fp = |pm: &PeerManager| pm.crawl_book().unwrap().get(&CrawlAddr::Peer(target.clone())).unwrap().observation.clone().unwrap().fingerprint;
+    assert_eq!(fp(&pm), Fingerprint::Unknown);
+    pm.run_crawl_session(target.clone(), SessionKind::Liveness, None).await;
+    assert_eq!(fp(&pm), Fingerprint::Unknown, "the liveness session is judged with the disconnect");
 }

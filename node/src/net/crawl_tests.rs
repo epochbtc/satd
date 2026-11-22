@@ -164,3 +164,146 @@ fn crawlnet_names_ipv4_ipv6_and_onion_only() {
     assert!(parse_network("cjdns").is_err());
     assert!(parse_network("tor").is_err());
 }
+
+// ---- The chain check ----
+
+fn header(prev: bitcoin::BlockHash, nonce: u32) -> bitcoin::block::Header {
+    bitcoin::block::Header {
+        version: bitcoin::block::Version::from_consensus(4),
+        prev_blockhash: prev,
+        merkle_root: bitcoin::hashes::Hash::all_zeros(),
+        time: 1_700_000_000,
+        bits: bitcoin::CompactTarget::from_consensus(0x207f_ffff),
+        nonce,
+    }
+}
+
+/// `n` headers from `from`, each on the one before.
+fn branch(from: bitcoin::BlockHash, n: usize, salt: u32) -> Vec<bitcoin::block::Header> {
+    let mut out: Vec<bitcoin::block::Header> = Vec::with_capacity(n);
+    for i in 0..n {
+        let prev = out.last().map_or(from, |h| h.block_hash());
+        out.push(header(prev, salt.wrapping_mul(1_000_003).wrapping_add(i as u32)));
+    }
+    out
+}
+
+/// Our chain: a genesis and `n` blocks on it, and a stale block off it.
+struct Ours {
+    chain: Vec<bitcoin::block::Header>,
+    stale: bitcoin::block::Header,
+    asked: std::cell::Cell<u32>,
+}
+
+impl Ours {
+    fn new(n: usize) -> Ours {
+        let genesis = header(bitcoin::hashes::Hash::all_zeros(), 7);
+        let mut chain = vec![genesis];
+        chain.extend(branch(genesis.block_hash(), n, 1));
+        let stale = header(chain[1].block_hash(), 99);
+        Ours { chain, stale, asked: Default::default() }
+    }
+
+    fn hash(&self, h: usize) -> bitcoin::BlockHash {
+        self.chain[h].block_hash()
+    }
+
+    fn tip(&self) -> usize {
+        self.chain.len() - 1
+    }
+
+    fn lookup(&self, hash: &bitcoin::BlockHash) -> OurBlock {
+        self.asked.set(self.asked.get() + 1);
+        if let Some(h) = self.chain.iter().position(|c| c.block_hash() == *hash) {
+            OurBlock::Active(h as u32)
+        } else if self.stale.block_hash() == *hash {
+            OurBlock::Stale
+        } else {
+            OurBlock::Unknown
+        }
+    }
+
+    /// The chain check of the probe a crawl session sends: the tip's parent
+    /// as locator, the tip as stop hash.
+    fn check(&self, headers: &[bitcoin::block::Header], peer_height: i32) -> ChainCheck {
+        let tip = self.tip();
+        self.asked.set(0);
+        let got = chain_check(&self.hash(tip - 1), (tip - 1) as u32, &self.hash(tip), headers, peer_height, |h| {
+            self.lookup(h)
+        });
+        assert!(self.asked.get() <= 2, "asked about {} hashes", self.asked.get());
+        got
+    }
+}
+
+/// A node with our tip answers with it: on chain. One whose block after
+/// our locator is another is on a fork. One that does not know our
+/// locator's block on its chain answers from its genesis: behind if what
+/// it shows is ours.
+#[test]
+fn the_chain_check_tells_on_chain_behind_and_fork_apart() {
+    let ours = Ours::new(5);
+    let tip = ours.tip();
+    assert_eq!(ours.check(&[ours.chain[tip]], tip as i32), ChainCheck::OnChain);
+    // At our locator's block, nothing past it.
+    assert_eq!(ours.check(&[], (tip - 1) as i32), ChainCheck::Behind);
+    // A sibling of our tip.
+    let sibling = header(ours.hash(tip - 1), 12345);
+    assert_eq!(ours.check(&[sibling], tip as i32), ChainCheck::Fork);
+    // From its genesis, our blocks up to its tip below our locator.
+    assert_eq!(ours.check(&ours.chain[1..3], 2), ChainCheck::Behind);
+    // From its genesis, leaving our chain.
+    let mut leaving = ours.chain[1..3].to_vec();
+    leaving.extend(branch(leaving[1].block_hash(), 2, 2));
+    assert_eq!(ours.check(&leaving, 4), ChainCheck::Fork);
+    // From a block we hold off our chain.
+    assert_eq!(ours.check(&branch(ours.stale.block_hash(), 2, 3), 4), ChainCheck::Fork);
+    // From a block past our locator on our chain: it has the locator's.
+    assert_eq!(ours.check(&branch(ours.hash(tip), 1, 4), tip as i32 + 1), ChainCheck::OnChain);
+}
+
+/// A node whose genesis is not ours (another chain under this network's
+/// magic and port) answers from its own genesis, which we do not know.
+#[test]
+fn the_chain_check_names_another_chain() {
+    let ours = Ours::new(5);
+    let theirs = branch(header(bitcoin::hashes::Hash::all_zeros(), 8).block_hash(), 3, 5);
+    assert_eq!(ours.check(&theirs, 3), ChainCheck::OtherChain);
+}
+
+/// A full answer from its genesis that is all ours shows only the start of
+/// its chain: a node that states our locator's height or more leaves our
+/// chain past it (a fork); one that states less is behind. A short answer
+/// is the whole chain and is believed over the stated height.
+#[test]
+fn a_full_answer_of_our_blocks_is_judged_with_the_stated_height() {
+    let max = crate::net::limits::MAX_HEADERS_RESULTS;
+    let ours = Ours::new(max + 5);
+    let locator_height = (ours.tip() - 1) as i32;
+    let shown = &ours.chain[1..=max];
+    assert_eq!(ours.check(shown, locator_height), ChainCheck::Fork);
+    assert_eq!(ours.check(shown, locator_height - 1), ChainCheck::Behind);
+    assert_eq!(ours.check(&shown[..max - 1], locator_height + 10), ChainCheck::Behind);
+}
+
+/// An answer whose headers stop linking is judged by the part that links.
+#[test]
+fn the_chain_check_reads_the_linked_part_of_an_answer() {
+    let ours = Ours::new(5);
+    let mut broken = ours.chain[1..3].to_vec();
+    broken.push(header(bitcoin::hashes::Hash::all_zeros(), 4242));
+    assert_eq!(ours.check(&broken, 2), ChainCheck::Behind);
+}
+
+/// An answer that starts with a genesis header itself is judged by that
+/// genesis: ours, and the rest is our chain below the locator, is behind;
+/// another chain's is another chain.
+#[test]
+fn the_chain_check_reads_an_answer_that_starts_at_genesis() {
+    let ours = Ours::new(5);
+    assert_eq!(ours.check(&ours.chain[0..3], 2), ChainCheck::Behind);
+    let genesis = header(bitcoin::hashes::Hash::all_zeros(), 8);
+    let mut theirs = vec![genesis];
+    theirs.extend(branch(genesis.block_hash(), 2, 5));
+    assert_eq!(ours.check(&theirs, 2), ChainCheck::OtherChain);
+}

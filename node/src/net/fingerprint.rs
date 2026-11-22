@@ -17,6 +17,8 @@
 use std::fmt;
 
 use crate::net::behavior::{HandshakeCapture, VersionFields};
+use crate::net::survey::{Probe, ProbeOutcome, ProbeResults};
+use crate::net::v2transport::V2Greeting;
 
 /// An implementation family.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -355,6 +357,239 @@ pub fn classify(
     }
 }
 
+// ---- Crawl sessions ----
+//
+// A crawl session's `version` is not a node's (services 0, relay off, a
+// crawler's user agent), and peers answer it differently: none sends
+// `getheaders` to services 0, and Core leaves a `getdata` unanswered on a
+// connection that set relay off. So crawl sessions are judged against rows
+// of their own, from captures of each implementation greeted as a crawl
+// greets it (`contrib/peer-fingerprint/fixtures/crawl`). A crawl session
+// also sees more than the survey's transcript: the BIP 324 greeting, the
+// probes' answers and the `getaddr` answer, and its rows pin what every
+// capture showed of them.
+
+/// The message a `getaddr` answer came in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AddrKind {
+    Addr,
+    AddrV2,
+}
+
+impl AddrKind {
+    pub fn name(self) -> &'static str {
+        match self {
+            AddrKind::Addr => "addr",
+            AddrKind::AddrV2 => "addrv2",
+        }
+    }
+}
+
+/// What a crawl session saw beyond the transcript and the `version`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CrawlFeatures {
+    /// What the peer sent inside BIP 324 before its first message; `None`
+    /// over v1.
+    pub v2: Option<V2Greeting>,
+    /// The probes' outcomes; a probe not sent is `None`.
+    pub probes: ProbeResults,
+    /// The message the `getaddr` answer came in; `None` when no `getaddr`
+    /// was sent or no answer came.
+    pub getaddr: Option<AddrKind>,
+}
+
+/// The transports a crawl row's implementation completed the handshake on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Transports {
+    /// v1 and BIP 324, with the same shape.
+    Both,
+    /// BIP 324 only: it closed our v1 connection before its `version`.
+    V2Only,
+}
+
+impl Transports {
+    fn admits(self, v2: bool) -> bool {
+        match self {
+            Transports::Both => true,
+            Transports::V2Only => v2,
+        }
+    }
+}
+
+/// How a probe was answered in a crawl row's captures. A disconnect
+/// matches no row: no capture shows one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Answer {
+    Answered,
+    Silent,
+    /// Not pinned: whether an answer comes depends on the peer's state or
+    /// on timing (`getheaders` from a node in initial block download, a
+    /// `pong` over a slow path), not on its implementation.
+    Either,
+}
+
+impl Answer {
+    fn admits(self, outcome: ProbeOutcome) -> bool {
+        matches!(
+            (self, outcome),
+            (Answer::Answered, ProbeOutcome::Answered(_))
+                | (Answer::Silent, ProbeOutcome::Silent)
+                | (Answer::Either, ProbeOutcome::Answered(_) | ProbeOutcome::Silent)
+        )
+    }
+}
+
+/// One shape measured against the crawl's `version`. Every feature is as
+/// its captures show it; a feature the session did not measure (no probes
+/// on a liveness session, no BIP 324 greeting over v1, no `getaddr`
+/// answer) is not held against a row.
+#[derive(Debug)]
+pub struct CrawlRow {
+    /// The captures it comes from, as names under `fixtures/crawl` without
+    /// `.json`.
+    pub captures: &'static [&'static str],
+    pub family: Family,
+    pub commands: &'static [&'static str],
+    pub relay: bool,
+    pub services_zero: bool,
+    pub protocol_version: Option<u32>,
+    pub transports: Transports,
+    /// Inside BIP 324: decoy packets before the version packet.
+    pub v2_decoys: bool,
+    /// Inside BIP 324: a version packet with contents.
+    pub v2_version_contents: bool,
+    /// The probes' answers, in [`Probe::ALL`]'s order.
+    pub probes: [Answer; 4],
+    /// The message the `getaddr` answer comes in.
+    pub getaddr: AddrKind,
+}
+
+impl CrawlRow {
+    fn matches_version(&self, v: &VersionFields) -> bool {
+        v.relay == self.relay
+            && (v.services == 0) == self.services_zero
+            && self.protocol_version.is_none_or(|p| p == v.protocol_version)
+    }
+
+    /// Everything but the `version` fields agrees with this row.
+    fn admits_session(&self, capture: &HandshakeCapture, f: &CrawlFeatures) -> bool {
+        capture.commands().eq(self.commands.iter().copied()) && self.admits_features(f)
+    }
+
+    /// The BIP 324 greeting, the probes and the `getaddr` answer agree.
+    fn admits_features(&self, f: &CrawlFeatures) -> bool {
+        self.transports.admits(f.v2.is_some())
+            && f.v2.is_none_or(|g| (g.decoys > 0) == self.v2_decoys && (g.version_len > 0) == self.v2_version_contents)
+            && Probe::ALL
+                .iter()
+                .zip(self.probes)
+                .all(|(p, answer)| f.probes.get(*p).is_none_or(|o| answer.admits(o)))
+            && f.getaddr.is_none_or(|k| k == self.getaddr)
+    }
+}
+
+/// The shapes measured against the crawl's `version`. Captures with no
+/// row: those in which the implementation sent no `version` (rbitcoin
+/// closing our v1 connection). Knots, btcd, bcoin and libbitcoin have no
+/// crawl-shape capture yet, so no row: a crawl session to one is unknown.
+#[rustfmt::skip]
+pub const CRAWL_TABLE: &[CrawlRow] = &[
+    CrawlRow {
+        captures: &[
+            "core-32.1-outbound-crawl", "core-32.1-outbound-crawl-v2",
+            "core-24.0.1-outbound-crawl", "core-24.0.1-outbound-crawl-v2",
+        ],
+        family: Family::Core,
+        commands: &["version", "wtxidrelay", "sendaddrv2", "verack", "sendcmpct", "ping"],
+        relay: true, services_zero: false, protocol_version: None,
+        transports: Transports::Both,
+        v2_decoys: false, v2_version_contents: false,
+        // Core leaves the unknown transaction unanswered when we set relay
+        // off, as every capture shows, but not when its operator grants us
+        // relay (`-whitelist` with the relay permission): live Core nodes
+        // of 30.x to 32.1 answered it. So it is not pinned.
+        probes: [Answer::Either, Answer::Either, Answer::Either, Answer::Silent],
+        getaddr: AddrKind::AddrV2,
+    },
+    CrawlRow {
+        captures: &["satd-0.8.0-pre-outbound-crawl", "satd-0.8.0-pre-outbound-crawl-v2"],
+        family: Family::Satd,
+        commands: &["version", "wtxidrelay", "sendaddrv2", "verack", "sendcmpct", "feefilter", "ping"],
+        relay: true, services_zero: false, protocol_version: None,
+        transports: Transports::Both,
+        v2_decoys: false, v2_version_contents: false,
+        probes: [Answer::Either, Answer::Either, Answer::Answered, Answer::Silent],
+        getaddr: AddrKind::AddrV2,
+    },
+    CrawlRow {
+        // The v1 capture shows rbitcoin closing the connection before its
+        // `version`: hence v2 only.
+        captures: &["rbitcoin-0.8.99-outbound-crawl-v2"],
+        family: Family::Rbitcoin,
+        commands: &["version", "wtxidrelay", "sendaddrv2", "verack", "sendheaders", "sendcmpct", "ping"],
+        relay: true, services_zero: false, protocol_version: None,
+        transports: Transports::V2Only,
+        v2_decoys: false, v2_version_contents: false,
+        probes: [Answer::Either, Answer::Either, Answer::Answered, Answer::Silent],
+        getaddr: AddrKind::AddrV2,
+    },
+];
+
+/// The crawl row a session matches, if any.
+pub fn matching_crawl_row(
+    capture: &HandshakeCapture,
+    version: &VersionFields,
+    features: &CrawlFeatures,
+) -> Option<&'static CrawlRow> {
+    matching_crawl_row_in(CRAWL_TABLE, capture, version, features)
+}
+
+fn matching_crawl_row_in<'t>(
+    table: &'t [CrawlRow],
+    capture: &HandshakeCapture,
+    version: &VersionFields,
+    features: &CrawlFeatures,
+) -> Option<&'t CrawlRow> {
+    table.iter().find(|row| row.admits_session(capture, features) && row.matches_version(version))
+}
+
+/// Judge a crawl session, once it has ended, against [`CRAWL_TABLE`]. The
+/// result is read as [`classify`]'s is, except that `high` also covers a
+/// shape another family's row shares the commands of when the session's
+/// BIP 324 greeting, probes or `getaddr` answer ruled that row out; `low`
+/// is left for the shapes only the `version` fields told apart.
+pub fn classify_crawl(
+    capture: &HandshakeCapture,
+    version: Option<&VersionFields>,
+    features: &CrawlFeatures,
+) -> Fingerprint {
+    classify_crawl_in(CRAWL_TABLE, capture, version, features)
+}
+
+fn classify_crawl_in(
+    table: &[CrawlRow],
+    capture: &HandshakeCapture,
+    version: Option<&VersionFields>,
+    features: &CrawlFeatures,
+) -> Fingerprint {
+    let Some(version) = version else {
+        return Fingerprint::Unknown;
+    };
+    let Some(row) = matching_crawl_row_in(table, capture, version, features) else {
+        return Fingerprint::Unknown;
+    };
+    let observed = row.family;
+    match Family::claimed_by(&version.user_agent) {
+        Some(claimed) if claimed != observed => Fingerprint::Mismatch { claimed, observed },
+        _ => {
+            let only_version_tells = table.iter().any(|other| {
+                other.family != observed && other.commands == row.commands && other.admits_features(features)
+            });
+            Fingerprint::Known(observed, if only_version_tells { Confidence::Low } else { Confidence::High })
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -474,6 +709,188 @@ mod tests {
         assert_eq!(classify(true, &r.capture, Some(&v), true).observed(), Some(Family::BitcoinSeeder));
         v.protocol_version = 70015;
         assert_eq!(classify(true, &r.capture, Some(&v), true), Fingerprint::Unknown);
+    }
+
+    // ---- Crawl rows ----
+
+    use crate::net::behavior::{crawl_fixture_names, replay_crawl_fixture};
+
+    fn crawl(name: &str) -> Fingerprint {
+        let (r, f) = replay_crawl_fixture(name);
+        classify_crawl(&r.capture, r.version.as_ref(), &f)
+    }
+
+    /// Crawl fixture replay: every crawl-shape capture with a `version` is
+    /// named by exactly one crawl row and classifies as that row's family
+    /// with high confidence, no other row admits it, and a capture with no
+    /// `version` (the node refused us) is named by none and is unknown.
+    /// Every name a row lists is a crawl capture.
+    #[test]
+    fn every_crawl_capture_classifies_as_its_own_family_and_no_other() {
+        let names = crawl_fixture_names();
+        assert!(names.len() >= 8, "the crawl captures: {names:?}");
+        for row in CRAWL_TABLE {
+            for capture in row.captures {
+                assert!(names.iter().any(|n| n == capture), "crawl row names {capture}, which is not a crawl capture");
+            }
+        }
+        for name in &names {
+            let (r, f) = replay_crawl_fixture(name);
+            let got = classify_crawl(&r.capture, r.version.as_ref(), &f);
+            let own: Vec<&CrawlRow> = CRAWL_TABLE.iter().filter(|row| row.captures.contains(&name.as_str())).collect();
+            let Some(v) = r.version.as_ref() else {
+                assert!(own.is_empty(), "{name} has no version, so no row");
+                assert_eq!(got, Fingerprint::Unknown, "{name}");
+                continue;
+            };
+            assert_eq!(own.len(), 1, "{name} is named by {} crawl rows", own.len());
+            assert_eq!(got, Fingerprint::Known(own[0].family, Confidence::High), "{name}");
+            let hits = CRAWL_TABLE.iter().filter(|row| row.admits_session(&r.capture, &f) && row.matches_version(v)).count();
+            assert_eq!(hits, 1, "{name} matches {hits} crawl rows");
+        }
+    }
+
+    /// The crawl rows are the crawl's: the survey's table does not know
+    /// satd greeted as a crawler (no `getheaders` to services 0), and the
+    /// crawl's table does not know a node greeted as a node.
+    #[test]
+    fn crawl_shapes_and_node_shapes_are_judged_by_their_own_tables() {
+        let (r, _) = replay_crawl_fixture("satd-0.8.0-pre-outbound-crawl");
+        assert_eq!(classify(false, &r.capture, r.version.as_ref(), true), Fingerprint::Unknown);
+        assert_eq!(crawl("satd-0.8.0-pre-outbound-crawl"), Fingerprint::Known(Family::Satd, Confidence::High));
+        let r = replay_fixture("satd-0.7.0-outbound");
+        assert_eq!(classify_crawl(&r.capture, r.version.as_ref(), &CrawlFeatures::default()), Fingerprint::Unknown);
+    }
+
+    /// The `getdata` probe pins the satd and rbitcoin rows, which send
+    /// `notfound`, silence is no capture of theirs. Core's row leaves it
+    /// open: Core is silent on a connection that set relay off unless its
+    /// operator grants relay, and then answers.
+    #[test]
+    fn a_crawl_shape_with_a_probe_answer_its_captures_never_gave_is_unknown() {
+        for name in ["core-32.1-outbound-crawl", "core-24.0.1-outbound-crawl-v2"] {
+            let (r, mut f) = replay_crawl_fixture(name);
+            f.probes.set(Probe::GetData, ProbeOutcome::Answered(1));
+            assert_eq!(classify_crawl(&r.capture, r.version.as_ref(), &f), Fingerprint::Known(Family::Core, Confidence::High), "{name}");
+        }
+        for (name, flipped) in [
+            ("satd-0.8.0-pre-outbound-crawl", ProbeOutcome::Silent),
+            ("rbitcoin-0.8.99-outbound-crawl-v2", ProbeOutcome::Silent),
+        ] {
+            let (r, mut f) = replay_crawl_fixture(name);
+            f.probes.set(Probe::GetData, flipped);
+            assert_eq!(classify_crawl(&r.capture, r.version.as_ref(), &f), Fingerprint::Unknown, "{name}");
+        }
+        // The unknown message: every capture leaves it unanswered.
+        let (r, mut f) = replay_crawl_fixture("core-32.1-outbound-crawl-v2");
+        f.probes.set(Probe::Unknown, ProbeOutcome::Answered(0));
+        assert_eq!(classify_crawl(&r.capture, r.version.as_ref(), &f), Fingerprint::Unknown);
+        // A disconnect on any probe matches no row.
+        for p in Probe::ALL {
+            let (r, mut f) = replay_crawl_fixture("core-32.1-outbound-crawl-v2");
+            f.probes.set(p, ProbeOutcome::Disconnected);
+            assert_eq!(classify_crawl(&r.capture, r.version.as_ref(), &f), Fingerprint::Unknown, "{}", p.name());
+        }
+        // `ping` and `getheaders` are not pinned: a slow pong or a node in
+        // initial block download keeping quiet is no other implementation.
+        let (r, mut f) = replay_crawl_fixture("core-32.1-outbound-crawl-v2");
+        f.probes.set(Probe::Ping, ProbeOutcome::Silent);
+        f.probes.set(Probe::GetHeaders, ProbeOutcome::Silent);
+        assert_eq!(classify_crawl(&r.capture, r.version.as_ref(), &f), Fingerprint::Known(Family::Core, Confidence::High));
+        // A session that sent no probe is judged on the rest.
+        let (r, mut f) = replay_crawl_fixture("satd-0.8.0-pre-outbound-crawl-v2");
+        f.probes = ProbeResults::default();
+        assert_eq!(classify_crawl(&r.capture, r.version.as_ref(), &f), Fingerprint::Known(Family::Satd, Confidence::High));
+    }
+
+    /// No capture shows a decoy packet or a version packet with contents;
+    /// the garbage length is random per connection and is not pinned.
+    #[test]
+    fn a_v2_greeting_its_captures_never_showed_is_unknown() {
+        for name in ["core-32.1-outbound-crawl-v2", "satd-0.8.0-pre-outbound-crawl-v2", "rbitcoin-0.8.99-outbound-crawl-v2"] {
+            let (r, f) = replay_crawl_fixture(name);
+            let mut g = f.v2.expect("a v2 capture");
+            g.decoys = 1;
+            let decoy = CrawlFeatures { v2: Some(g), ..f };
+            assert_eq!(classify_crawl(&r.capture, r.version.as_ref(), &decoy), Fingerprint::Unknown, "{name}");
+            let mut g = f.v2.unwrap();
+            g.version_len = 4;
+            let contents = CrawlFeatures { v2: Some(g), ..f };
+            assert_eq!(classify_crawl(&r.capture, r.version.as_ref(), &contents), Fingerprint::Unknown, "{name}");
+            for garbage_len in [0, 4095] {
+                let mut g = f.v2.unwrap();
+                g.garbage_len = garbage_len;
+                let any = CrawlFeatures { v2: Some(g), ..f };
+                assert!(matches!(classify_crawl(&r.capture, r.version.as_ref(), &any), Fingerprint::Known(..)), "{name}");
+            }
+        }
+    }
+
+    /// rbitcoin closes a v1 connection before its `version`, so its shape
+    /// over v1 is no capture's; Core's and satd's are the same over both.
+    #[test]
+    fn a_v2_only_shape_over_v1_is_unknown() {
+        let (r, f) = replay_crawl_fixture("rbitcoin-0.8.99-outbound-crawl-v2");
+        let v1 = CrawlFeatures { v2: None, ..f };
+        assert_eq!(classify_crawl(&r.capture, r.version.as_ref(), &v1), Fingerprint::Unknown);
+        let (r, f) = replay_crawl_fixture("core-32.1-outbound-crawl-v2");
+        let v1 = CrawlFeatures { v2: None, ..f };
+        assert_eq!(classify_crawl(&r.capture, r.version.as_ref(), &v1), Fingerprint::Known(Family::Core, Confidence::High));
+    }
+
+    /// Every capture answered `getaddr` in `addrv2`, as it was asked to;
+    /// a legacy `addr` answer is no capture's.
+    #[test]
+    fn a_legacy_addr_answer_is_unknown() {
+        for name in ["core-24.0.1-outbound-crawl", "satd-0.8.0-pre-outbound-crawl", "rbitcoin-0.8.99-outbound-crawl-v2"] {
+            let (r, f) = replay_crawl_fixture(name);
+            let addr = CrawlFeatures { getaddr: Some(AddrKind::Addr), ..f };
+            assert_eq!(classify_crawl(&r.capture, r.version.as_ref(), &addr), Fingerprint::Unknown, "{name}");
+            let none = CrawlFeatures { getaddr: None, ..f };
+            assert!(matches!(classify_crawl(&r.capture, r.version.as_ref(), &none), Fingerprint::Known(..)), "{name}");
+        }
+    }
+
+    /// A user agent naming another family on a crawl shape is a mismatch.
+    #[test]
+    fn a_crawl_shape_under_another_familys_user_agent_is_a_mismatch() {
+        let (r, f) = replay_crawl_fixture("core-32.1-outbound-crawl-v2");
+        let mut v = r.version.clone().unwrap();
+        v.user_agent = "/satd:0.8.0/".into();
+        assert_eq!(
+            classify_crawl(&r.capture, Some(&v), &f),
+            Fingerprint::Mismatch { claimed: Family::Satd, observed: Family::Core }
+        );
+        v.user_agent = "/Satoshi:29.4.3/Knots:20260508/".into();
+        assert_eq!(classify_crawl(&r.capture, Some(&v), &f), Fingerprint::Known(Family::Core, Confidence::High));
+    }
+
+    /// Where two families' crawl rows share the commands, a session whose
+    /// probe answers rule one out is `high`: the survey, which sends no
+    /// probe before it judges, can only be `low` there. Only the `version`
+    /// fields telling them apart is `low`. (A table built for the test: no
+    /// two captured families share crawl commands.)
+    #[test]
+    fn a_probe_answer_that_tells_families_apart_is_high_confidence() {
+        let base = &CRAWL_TABLE[1];
+        let table = [
+            CrawlRow { captures: &[], family: Family::Satd, ..*base },
+            CrawlRow { captures: &[], family: Family::Btcd, probes: [Answer::Either, Answer::Either, Answer::Silent, Answer::Silent], ..*base },
+            CrawlRow { captures: &[], family: Family::Bcoin, protocol_version: Some(1), ..*base },
+        ];
+        let (r, f) = replay_crawl_fixture("satd-0.8.0-pre-outbound-crawl");
+        // btcd's row is ruled out by the notfound, bcoin's only by the protocol version.
+        assert_eq!(classify_crawl_in(&table, &r.capture, r.version.as_ref(), &f), Fingerprint::Known(Family::Satd, Confidence::Low));
+        assert_eq!(
+            classify_crawl_in(&table[..2], &r.capture, r.version.as_ref(), &f),
+            Fingerprint::Known(Family::Satd, Confidence::High)
+        );
+        // Without the probe nothing but the version could tell them apart.
+        let unprobed = CrawlFeatures { probes: ProbeResults::default(), ..f };
+        assert_eq!(
+            classify_crawl_in(&table[..2], &r.capture, r.version.as_ref(), &unprobed),
+            Fingerprint::Known(Family::Satd, Confidence::Low)
+        );
     }
 
     #[test]

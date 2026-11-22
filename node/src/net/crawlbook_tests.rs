@@ -1,7 +1,8 @@
 //! `CrawlBook`: admission, timers, the snapshot, the bound and the file.
 
 use super::*;
-use crate::net::fingerprint::{Confidence, Family};
+use crate::net::fingerprint::{AddrKind, Confidence, Family};
+use crate::net::v2transport::V2Greeting;
 use std::net::{Ipv4Addr, SocketAddr};
 
 const MAGIC: [u8; 4] = [0xfa, 0xbf, 0xb5, 0xda];
@@ -56,6 +57,17 @@ fn observation(at: u64) -> Observation {
         clock_offset_secs: Some(-3),
         handshake_rtt_ms: Some(120),
         getaddr: None,
+        shape: None,
+    }
+}
+
+/// An unknown shape, with an odd command and a BIP 324 greeting.
+fn shape() -> UnknownShape {
+    UnknownShape {
+        commands: ["version", "verack", "addrv2", "zzzzzzzzzzzz"].map(str::to_string).to_vec(),
+        relay: false,
+        v2: Some(V2Greeting { garbage_len: 4095, decoys: 2, version_len: 7 }),
+        getaddr: Some(AddrKind::Addr),
     }
 }
 
@@ -514,6 +526,8 @@ fn full_book() -> CrawlBook {
     let mut nogetaddr = observation(NOW + 5);
     nogetaddr.getaddr = Some(GetaddrResult::NoAnswer);
     nogetaddr.height = -1;
+    nogetaddr.fingerprint = Fingerprint::Unknown;
+    nogetaddr.shape = Some(shape());
     book.record_result(&v4(2), None, SessionKind::Discovery, SessionResult { v2: Attempt::Failed, v1: Attempt::Ok, observation: Some(nogetaddr) }, NOW + 5);
     book
 }
@@ -563,8 +577,9 @@ fn a_bad_file_is_refused() {
     wrong_magic[..8].copy_from_slice(b"satdsrv1");
     assert!(err(&reseal(wrong_magic)).contains("not a crawl book"));
     let mut wrong_version = body.clone();
-    wrong_version[8..12].copy_from_slice(&2u32.to_le_bytes());
-    assert!(err(&reseal(wrong_version)).contains("version 2"));
+    // Version 1 had no shapes: set aside, not misread.
+    wrong_version[8..12].copy_from_slice(&1u32.to_le_bytes());
+    assert!(err(&reseal(wrong_version)).contains("version 1"));
     assert!(err(&reseal(body[..body.len() - 3].to_vec())).contains("truncated"));
     let mut trailing = body.clone();
     trailing.push(0);
@@ -588,6 +603,27 @@ fn a_bad_file_is_refused() {
         NOW,
     );
     assert!(CrawlBook::decode(&survey.encode(MAGIC), MAGIC, NOW, p).is_err());
+}
+
+/// An unknown shape is bounded on the way in: more commands than a
+/// transcript holds, or a command longer than the wire's field, is a bad
+/// file; and on the way out, a longer one is cut to the bound.
+#[test]
+fn an_unknown_shape_is_bounded() {
+    let mut buf = Vec::new();
+    encode_shape(&mut buf, &shape());
+    assert_eq!(decode_shape(&mut Reader(&buf)).unwrap(), shape());
+    let mut many = vec![17u8];
+    many.extend(std::iter::repeat_n([1u8, b'a'], 17).flatten());
+    assert!(decode_shape(&mut Reader(&many)).unwrap_err().contains("17 commands"));
+    let mut long = vec![1u8, 13];
+    long.extend([b'a'; 13]);
+    assert!(decode_shape(&mut Reader(&long)).unwrap_err().contains("13 bytes"));
+    let big = UnknownShape { commands: vec!["x".repeat(40); 40], ..shape() };
+    let mut buf = Vec::new();
+    encode_shape(&mut buf, &big);
+    let back = decode_shape(&mut Reader(&buf)).unwrap();
+    assert_eq!(back.commands, vec!["x".repeat(SHAPE_COMMAND_LEN); crate::net::behavior::HANDSHAKE_CAPTURE_MAX]);
 }
 
 #[test]

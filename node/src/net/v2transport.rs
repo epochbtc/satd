@@ -343,9 +343,23 @@ async fn send_v2<S: AsyncWrite + Unpin>(
     Ok(packet.len())
 }
 
+/// What the remote sent inside the v2 handshake before its first message:
+/// how a crawl session tells implementations' transports apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct V2Greeting {
+    /// Garbage bytes before its terminator (BIP 324 allows 0 to 4095).
+    pub garbage_len: u16,
+    /// Decoy packets before its version packet.
+    pub decoys: u32,
+    /// The length of its version packet's contents (empty under BIP 324
+    /// as written).
+    pub version_len: u32,
+}
+
 /// Drive a full BIP 324 v2 handshake to completion on `stream`, returning
-/// the established cipher session and any bytes read past the remote's
-/// version packet (carried into the steady-state read path).
+/// the established cipher session, any bytes read past the remote's
+/// version packet (carried into the steady-state read path), and what the
+/// remote sent before it.
 ///
 /// `prefetch` is bytes already consumed off the socket that belong to the
 /// front of the remote's ElligatorSwift key — used by the responder, which
@@ -360,7 +374,20 @@ async fn drive_handshake<S: AsyncRead + AsyncWrite + Unpin>(
     role: Role,
     prefetch: &[u8],
     peer: u64,
-) -> io::Result<(CipherSession, Vec<u8>)> {
+) -> io::Result<(CipherSession, Vec<u8>, V2Greeting)> {
+    drive_handshake_with(stream, network, role, prefetch, peer, None).await
+}
+
+/// [`drive_handshake`], sending `decoys` before our version packet: for
+/// tests, since satd sends none.
+async fn drive_handshake_with<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
+    network: Network,
+    role: Role,
+    prefetch: &[u8],
+    peer: u64,
+    decoys: Option<&[&[u8]]>,
+) -> io::Result<(CipherSession, Vec<u8>, V2Greeting)> {
     let handshake = Handshake::new(network, role).map_err(handshake_io_err)?;
 
     // Send our ElligatorSwift public key and garbage. The garbage is
@@ -381,10 +408,10 @@ async fn drive_handshake<S: AsyncRead + AsyncWrite + Unpin>(
     stream.read_exact(&mut their_key[prefetch.len()..]).await?;
     let handshake = handshake.receive_key(their_key).map_err(handshake_io_err)?;
 
-    // Send our garbage terminator + version packet (no decoys).
-    let mut version_buf = vec![0u8; Handshake::<ReceivedKey>::send_version_len(None)];
+    // Send our garbage terminator + version packet (no decoys outside tests).
+    let mut version_buf = vec![0u8; Handshake::<ReceivedKey>::send_version_len(decoys)];
     let handshake = handshake
-        .send_version(&mut version_buf, None)
+        .send_version(&mut version_buf, decoys)
         .map_err(handshake_io_err)?;
     stream.write_all(&version_buf).await?;
     stream.flush().await?;
@@ -422,6 +449,10 @@ async fn drive_handshake<S: AsyncRead + AsyncWrite + Unpin>(
     // Process packets after the garbage terminator until the version
     // packet completes the handshake; decoys advance the cipher and loop.
     let mut leftover: Vec<u8> = garbage_buf[consumed..].to_vec();
+    let mut greeting = V2Greeting {
+        garbage_len: u16::try_from(consumed.saturating_sub(GARBAGE_TERMINATOR_LEN)).unwrap_or(u16::MAX),
+        ..V2Greeting::default()
+    };
     loop {
         let len_bytes = read_exact_buffered(stream, &mut leftover, LENGTH_FIELD_LEN).await?;
         let packet_len = received_garbage
@@ -438,8 +469,14 @@ async fn drive_handshake<S: AsyncRead + AsyncWrite + Unpin>(
             .receive_version(&mut packet)
             .map_err(handshake_io_err)?
         {
-            VersionResult::Complete { cipher } => return Ok((cipher, leftover)),
-            VersionResult::Decoy(h) => received_garbage = h,
+            VersionResult::Complete { cipher } => {
+                greeting.version_len = u32::try_from(packet_len.saturating_sub(MIN_PACKET_LEN)).unwrap_or(u32::MAX);
+                return Ok((cipher, leftover, greeting));
+            }
+            VersionResult::Decoy(h) => {
+                greeting.decoys = greeting.decoys.saturating_add(1);
+                received_garbage = h;
+            }
         }
     }
 }
@@ -454,7 +491,8 @@ pub async fn responder_handshake(
     peer: u64,
     counters: Option<&Arc<PeerStats>>,
 ) -> io::Result<(CipherSession, Vec<u8>)> {
-    counted_handshake(stream, network, Role::Responder, prefetch, peer, counters).await
+    let (cipher, leftover, _) = counted_handshake(stream, network, Role::Responder, prefetch, peer, counters).await?;
+    Ok((cipher, leftover))
 }
 
 /// Run the initiator (outbound) side of a v2 handshake.
@@ -464,6 +502,18 @@ pub async fn initiator_handshake(
     peer: u64,
     counters: Option<&Arc<PeerStats>>,
 ) -> io::Result<(CipherSession, Vec<u8>)> {
+    let (cipher, leftover, _) = initiator_handshake_observed(stream, network, peer, counters).await?;
+    Ok((cipher, leftover))
+}
+
+/// [`initiator_handshake`], with what the remote sent before its first
+/// message.
+pub async fn initiator_handshake_observed(
+    stream: &mut TcpStream,
+    network: Network,
+    peer: u64,
+    counters: Option<&Arc<PeerStats>>,
+) -> io::Result<(CipherSession, Vec<u8>, V2Greeting)> {
     counted_handshake(stream, network, Role::Initiator, &[], peer, counters).await
 }
 
@@ -474,15 +524,15 @@ async fn counted_handshake(
     prefetch: &[u8],
     peer: u64,
     counters: Option<&Arc<PeerStats>>,
-) -> io::Result<(CipherSession, Vec<u8>)> {
+) -> io::Result<(CipherSession, Vec<u8>, V2Greeting)> {
     let mut counted = CountingStream { inner: stream, counters };
-    let (cipher, leftover) = drive_handshake(&mut counted, network, role, prefetch, peer).await?;
+    let (cipher, leftover, greeting) = drive_handshake(&mut counted, network, role, prefetch, peer).await?;
     // Bytes read past the version packet belong to the next packet, which
     // the steady-state reader counts whole when it frames it.
     if let Some(c) = counters {
         c.discount_recv(leftover.len());
     }
-    Ok((cipher, leftover))
+    Ok((cipher, leftover, greeting))
 }
 
 /// Encrypted v2 P2P connection (pre-split).
@@ -824,7 +874,7 @@ mod tests {
             // (which are the start of the initiator's ellswift key here).
             let mut first = [0u8; 4];
             sock.read_exact(&mut first).await.unwrap();
-            let (cipher, leftover) = drive_handshake(&mut sock, net, Role::Responder, &first, 0)
+            let (cipher, leftover, _) = drive_handshake(&mut sock, net, Role::Responder, &first, 0)
                 .await
                 .unwrap();
             let mut conn = V2Connection::new(sock, cipher, leftover);
@@ -869,6 +919,45 @@ mod tests {
             initiator_handshake(&mut client, net, 2, Some(&client_stats)).await.unwrap();
         let client = V2Connection::new(client, cipher, leftover);
         (server.await.unwrap(), client, server_stats, client_stats)
+    }
+
+    /// The initiator reports what the responder sent before its first
+    /// message: satd's own garbage (the bytes it sent less its key, the
+    /// terminator and its 20-byte empty version packet), no decoy, and an
+    /// empty version packet.
+    #[tokio::test]
+    async fn the_initiator_reports_the_responders_greeting() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_stats = PeerStats::new(crate::net::stats::NetTotals::new());
+        let ss = server_stats.clone();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let (cipher, leftover) = responder_handshake(&mut sock, Network::Regtest, &[], 1, Some(&ss)).await.unwrap();
+            V2Connection::new(sock, cipher, leftover)
+        });
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        let (_, _, greeting) = initiator_handshake_observed(&mut client, Network::Regtest, 2, None).await.unwrap();
+        let _server = server.await.unwrap();
+        assert_eq!(greeting.decoys, 0);
+        assert_eq!(greeting.version_len, 0);
+        assert_eq!(u64::from(greeting.garbage_len), server_stats.bytes_sent() - 100, "{greeting:?}");
+    }
+
+    /// Decoy packets before the version packet are counted.
+    #[tokio::test]
+    async fn the_initiator_counts_the_responders_decoys() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let decoys: [&[u8]; 2] = [b"decoy", b""];
+            drive_handshake_with(&mut sock, Network::Regtest, Role::Responder, &[], 1, Some(&decoys)).await.unwrap()
+        });
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        let (_, _, greeting) = initiator_handshake_observed(&mut client, Network::Regtest, 2, None).await.unwrap();
+        server.await.unwrap();
+        assert_eq!((greeting.decoys, greeting.version_len), (2, 0), "{greeting:?}");
     }
 
     /// Every byte one side of the handshake writes, the other counts as read.

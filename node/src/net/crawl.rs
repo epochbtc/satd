@@ -32,7 +32,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::PathBuf;
 use std::time::Duration;
 
-use crate::net::crawlbook::{Network, SessionKind};
+use crate::net::crawlbook::{ChainCheck, Network, SessionKind};
 use crate::net::peer::PeerAddr;
 use crate::net::survey::{PASSIVE_WAIT, PROBE_REPLY_WAIT, UNKNOWN_PROBE_WAIT};
 
@@ -403,6 +403,92 @@ impl Scheduler {
     pub fn budget(&mut self, now_ms: u64) -> usize {
         self.refill(now_ms);
         (self.tokens / 1000) as usize
+    }
+}
+
+// ---- The chain check ----
+
+/// Where a block stands on our side, for the chain check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OurBlock {
+    /// On our active chain, at this height.
+    Active(u32),
+    /// Known to us, off our active chain.
+    Stale,
+    /// Not a block we know.
+    Unknown,
+}
+
+/// The chain check: what the answer to the `getheaders` probe says of the
+/// peer's chain. The probe's locator is `locator`, a recent block of our
+/// active chain at `locator_height`, and its stop hash `stop`, the block
+/// after it; `peer_height` is the peer's `start_height`. `ours` places a
+/// block hash on our side. It is asked about two hashes at most, so the
+/// check costs a few index reads whatever the answer holds.
+///
+/// A node answers with the headers after the last locator block on its
+/// active chain, up to the stop hash, and with the headers from its genesis
+/// when it has none of them (Core's `FindForkInGlobalIndex`):
+///
+/// - no header: it has our locator's block and nothing past it, so it is
+///   behind (by a block);
+/// - a header after our locator: our stop block is on chain, another one a
+///   fork;
+/// - headers from a block of ours below our locator: it does not have our
+///   locator's block on its chain. If its headers end on our active chain
+///   it is behind, unless the answer was a full one
+///   ([`MAX_HEADERS_RESULTS`](crate::net::limits::MAX_HEADERS_RESULTS)) and
+///   it states a height of at least our locator's: then its chain leaves
+///   ours past what it showed, a fork. If they leave our chain, a fork;
+/// - headers from a block we hold off our chain: a fork;
+/// - headers from a block we do not know: another chain under this
+///   network's magic (its genesis is not ours).
+pub fn chain_check(
+    locator: &bitcoin::BlockHash,
+    locator_height: u32,
+    stop: &bitcoin::BlockHash,
+    headers: &[bitcoin::block::Header],
+    peer_height: i32,
+    ours: impl Fn(&bitcoin::BlockHash) -> OurBlock,
+) -> ChainCheck {
+    let Some(first) = headers.first() else {
+        return ChainCheck::Behind;
+    };
+    if first.prev_blockhash == *locator {
+        return if first.block_hash() == *stop { ChainCheck::OnChain } else { ChainCheck::Fork };
+    }
+    // An answer may start with a genesis header itself (no parent): judge
+    // it by the genesis, which is ours or another chain's.
+    let anchor = if first.prev_blockhash == <bitcoin::BlockHash as bitcoin::hashes::Hash>::all_zeros() {
+        first.block_hash()
+    } else {
+        first.prev_blockhash
+    };
+    match ours(&anchor) {
+        OurBlock::Unknown => ChainCheck::OtherChain,
+        OurBlock::Stale => ChainCheck::Fork,
+        // Past our locator on our chain: it has the locator's block.
+        OurBlock::Active(h) if h >= locator_height => ChainCheck::OnChain,
+        OurBlock::Active(_) => {
+            // The last header that links to the one before it.
+            let mut last = first;
+            for h in &headers[1..] {
+                if h.prev_blockhash != last.block_hash() {
+                    break;
+                }
+                last = h;
+            }
+            match ours(&last.block_hash()) {
+                OurBlock::Active(_)
+                    if headers.len() >= crate::net::limits::MAX_HEADERS_RESULTS
+                        && i64::from(peer_height) >= i64::from(locator_height) =>
+                {
+                    ChainCheck::Fork
+                }
+                OurBlock::Active(_) => ChainCheck::Behind,
+                OurBlock::Stale | OurBlock::Unknown => ChainCheck::Fork,
+            }
+        }
     }
 }
 

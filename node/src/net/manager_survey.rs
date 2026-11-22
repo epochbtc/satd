@@ -178,7 +178,8 @@ pub(super) async fn listen_passive(
 /// `waits` is the wait of every probe but the unknown message's, then the
 /// unknown message's. A `getheaders` probe is skipped without
 /// `has_locator`. With `deadline`, no probe waits past it and none is sent
-/// after it. Each outcome goes to `on_outcome`. Returns whether the
+/// after it. Each outcome goes to `on_outcome`; with `headers`, the
+/// `getheaders` probe's answer is kept there too. Returns whether the
 /// connection closed, at the peer's end or the node's (`abort`), after
 /// which no probe is sent. A `ping` from the peer is answered; anything
 /// else is ignored.
@@ -193,6 +194,7 @@ pub(super) async fn send_probes(
     has_locator: bool,
     waits: (Duration, Duration),
     deadline: Option<tokio::time::Instant>,
+    mut headers: Option<&mut Option<Vec<bitcoin::block::Header>>>,
     mut on_outcome: impl FnMut(Probe, ProbeOutcome),
 ) -> bool {
     let wanted = survey::probe_inventory(ctx);
@@ -225,7 +227,11 @@ pub(super) async fn send_probes(
                         break ProbeOutcome::Answered(ms);
                     }
                     (Probe::GetHeaders, NetworkMessage::Headers(h)) => {
-                        break ProbeOutcome::Answered(h.len() as u32);
+                        let n = h.len() as u32;
+                        if let Some(keep) = headers.as_deref_mut() {
+                            *keep = Some(h.clone());
+                        }
+                        break ProbeOutcome::Answered(n);
                     }
                     (Probe::GetData, NetworkMessage::NotFound(inv)) if inv.contains(&wanted) => {
                         break ProbeOutcome::Answered(inv.iter().filter(|i| **i == wanted).count() as u32);
@@ -610,7 +616,7 @@ impl PeerManager {
         let wtxid_relay = self.peers.read().get(&id).is_some_and(|h| h.info.wtxid_relay);
         let ctx = ProbeContext::new(&mut rand::thread_rng(), locator_top, stop, wtxid_relay);
         let waits = (PROBE_REPLY_WAIT, UNKNOWN_PROBE_WAIT);
-        send_probes(id, writer, read_rx, abort, chosen, &ctx, locator.is_some(), waits, None, |probe, outcome| {
+        send_probes(id, writer, read_rx, abort, chosen, &ctx, locator.is_some(), waits, None, None, |probe, outcome| {
             probes.set(probe, outcome);
             if let Some(run) = self.survey.get() {
                 let i = Probe::ALL.iter().position(|p| *p == probe).expect("in ALL");

@@ -475,8 +475,19 @@ fn fixture_dir() -> std::path::PathBuf {
 /// The fixtures' names, without `.json`, sorted.
 #[cfg(test)]
 pub(crate) fn fixture_names() -> Vec<String> {
-    let dir = fixture_dir();
-    let mut names: Vec<String> = std::fs::read_dir(&dir)
+    fixture_names_in(&fixture_dir())
+}
+
+/// The crawl-shape captures (`fixtures/crawl`): the peer's replies to a
+/// crawl session's `version`.
+#[cfg(test)]
+pub(crate) fn crawl_fixture_names() -> Vec<String> {
+    fixture_names_in(&fixture_dir().join("crawl"))
+}
+
+#[cfg(test)]
+fn fixture_names_in(dir: &std::path::Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
         .unwrap_or_else(|e| panic!("reading {}: {e}", dir.display()))
         .filter_map(|e| e.ok()?.file_name().into_string().ok())
         .filter_map(|n| n.strip_suffix(".json").map(str::to_string))
@@ -490,8 +501,64 @@ pub(crate) fn fixture_names() -> Vec<String> {
 /// `getdata` was unanswered is a reply, as is every `pong`.
 #[cfg(test)]
 pub(crate) fn replay_fixture(name: &str) -> Replayed {
-    let text = std::fs::read_to_string(fixture_dir().join(format!("{name}.json"))).unwrap();
-    let fixture: serde_json::Value = serde_json::from_str(&text).unwrap();
+    replay_value(&read_fixture(&fixture_dir().join(format!("{name}.json"))))
+}
+
+#[cfg(test)]
+fn read_fixture(path: &std::path::Path) -> serde_json::Value {
+    let text = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("reading {}: {e}", path.display()));
+    serde_json::from_str(&text).unwrap()
+}
+
+/// Replay one crawl-shape capture: its transcript and `version` as
+/// [`replay_fixture`] reads them, and what the crawl classifier reads
+/// besides (the BIP 324 greeting, the probes' answers, the `getaddr`
+/// answer's message).
+#[cfg(test)]
+pub(crate) fn replay_crawl_fixture(name: &str) -> (Replayed, crate::net::fingerprint::CrawlFeatures) {
+    use crate::net::fingerprint::{AddrKind, CrawlFeatures};
+    use crate::net::survey::{Probe, ProbeOutcome};
+    let fixture = read_fixture(&fixture_dir().join("crawl").join(format!("{name}.json")));
+    let replayed = replay_value(&fixture);
+    let mut features = CrawlFeatures::default();
+    let t = &fixture["v2_transport"];
+    if fixture["transport"] == "v2" {
+        features.v2 = Some(crate::net::v2transport::V2Greeting {
+            garbage_len: t["garbage_len"].as_u64().unwrap() as u16,
+            decoys: t["decoys_before_version"].as_array().unwrap().len() as u32,
+            version_len: t["version_packet_len"].as_u64().unwrap() as u32,
+        });
+    }
+    for p in fixture["probes"].as_array().unwrap() {
+        let probe = match p["probe"].as_str().unwrap() {
+            "ping" => Probe::Ping,
+            "getheaders" => Probe::GetHeaders,
+            "getdata_unknown_tx" => Probe::GetData,
+            "unknown_message" => Probe::Unknown,
+            other => panic!("{name}: probe {other}"),
+        };
+        let outcome = if p["disconnected"].as_bool().unwrap() {
+            ProbeOutcome::Disconnected
+        } else if p["answered"].as_bool().unwrap() {
+            // `ping`'s value is its round trip, the others' a count.
+            let value = if probe == Probe::Ping { &p["latency_ms"] } else { &p["reply_fields"]["count"] };
+            ProbeOutcome::Answered(value.as_u64().unwrap_or(0) as u32)
+        } else {
+            ProbeOutcome::Silent
+        };
+        features.probes.set(probe, outcome);
+    }
+    features.getaddr = match fixture["getaddr"]["kind"].as_str() {
+        Some("addrv2") => Some(AddrKind::AddrV2),
+        Some("addr") => Some(AddrKind::Addr),
+        None => None,
+        Some(other) => panic!("{name}: getaddr kind {other}"),
+    };
+    (replayed, features)
+}
+
+#[cfg(test)]
+fn replay_value(fixture: &serde_json::Value) -> Replayed {
     // (time, sent first on a tie, command)
     let mut events: Vec<(u64, bool, String)> = Vec::new();
     for (key, sent) in [("sent", true), ("received", false)] {
