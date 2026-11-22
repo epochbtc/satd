@@ -294,3 +294,16 @@ fn the_chain_check_reads_the_linked_part_of_an_answer() {
     broken.push(header(bitcoin::hashes::Hash::all_zeros(), 4242));
     assert_eq!(ours.check(&broken, 2), ChainCheck::Behind);
 }
+
+/// An answer that starts with a genesis header itself is judged by that
+/// genesis: ours, and the rest is our chain below the locator, is behind;
+/// another chain's is another chain.
+#[test]
+fn the_chain_check_reads_an_answer_that_starts_at_genesis() {
+    let ours = Ours::new(5);
+    assert_eq!(ours.check(&ours.chain[0..3], 2), ChainCheck::Behind);
+    let genesis = header(bitcoin::hashes::Hash::all_zeros(), 8);
+    let mut theirs = vec![genesis];
+    theirs.extend(branch(genesis.block_hash(), 2, 5));
+    assert_eq!(ours.check(&theirs, 2), ChainCheck::OtherChain);
+}

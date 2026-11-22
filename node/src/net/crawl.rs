@@ -457,7 +457,14 @@ pub fn chain_check(
     if first.prev_blockhash == *locator {
         return if first.block_hash() == *stop { ChainCheck::OnChain } else { ChainCheck::Fork };
     }
-    match ours(&first.prev_blockhash) {
+    // An answer may start with a genesis header itself (no parent): judge
+    // it by the genesis, which is ours or another chain's.
+    let anchor = if first.prev_blockhash == <bitcoin::BlockHash as bitcoin::hashes::Hash>::all_zeros() {
+        first.block_hash()
+    } else {
+        first.prev_blockhash
+    };
+    match ours(&anchor) {
         OurBlock::Unknown => ChainCheck::OtherChain,
         OurBlock::Stale => ChainCheck::Fork,
         // Past our locator on our chain: it has the locator's block.
