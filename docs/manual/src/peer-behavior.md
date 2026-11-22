@@ -5,6 +5,9 @@ which implementation the peer runs and whether it behaves like a crawler, a
 transaction spy or a peer that lies about its chain, and reports the result.
 It only reports: no flag changes how a peer is treated.
 
+An opt-in [network survey](#network-survey) applies the same judgement to
+short connections of its own, across the address book.
+
 ## What is judged
 
 Every 5 seconds the node judges each connected peer, and once more when a
@@ -111,3 +114,135 @@ clients by observed family. See [sat-tui](tui.md#peer-behaviour).
   connection, with its evidence, fingerprint and quoted user agent.
 
 None of these carries an address, and a user agent appears only escaped.
+
+## Network survey
+
+**Off by default.** With `-peersurvey=1` the node surveys the network: which
+implementations are reachable, and how many of each.
+
+> **The survey's file holds peer addresses.** `peersurvey.dat` in the data
+> directory keeps one record per address the survey reached, and
+> `getpeersurvey true` returns them. The file is written with the data
+> directory's permissions, execute bits dropped, and nothing serves it but
+> the authenticated RPC. **Probing makes survey connections recognisable**:
+> no ordinary connection sends an unknown message or asks for a transaction
+> that does not exist, so a peer that logs them can tell a satd surveyor
+> from an ordinary node, and follow it across address changes. The node's
+> own peers are never probed. `-peersurveyprobes=0` turns the probes off.
+
+### What a survey connection does
+
+Every `-peersurveyinterval` seconds (60 by default), if no survey connection
+is open, the node draws an address uniformly from its whole address book,
+new and tried entries alike, and opens a survey connection to it. Nothing
+about the address weighs the draw. It passes over what an automatic dial
+passes over: an address the operator named, a banned one, one on a network
+the node does not reach, one connected or being dialled, one backing off
+after failed dials, and a bad port. It is dialled as any automatic
+connection is, so `-onlynet`, `-proxy` and `-onion` apply: a node that only
+reaches Tor surveys only over Tor. It tries BIP 324 first under
+`-v2transport`, as an ordinary outbound does.
+
+The connection is outside every connection budget: it takes no outbound
+slot, at most one is open at a time, and `getpeerinfo` and
+`getconnectioncount` leave it out. It does not run under `-connect` or with
+networking off.
+
+It sends the same `version` (with `relay` set), `wtxidrelay`, `sendaddrv2`,
+`verack`, `sendheaders`, `sendcmpct` and `feefilter` an ordinary full-relay
+outbound sends, and answers a `ping`. It sends no `getaddr`, no
+`getheaders` and none of the node's addresses. It listens for up to 10
+seconds while the peer announces what it supports, until the handshake
+transcript the fingerprint is judged on is complete, then sends the probes
+and closes. It carries no blocks, transactions or addresses either way.
+
+The address book learns what a feeler would teach it: a completed handshake
+moves the address to the tried table, the peer's `version` updates its
+services, and a failed dial counts as an attempt. Nothing else.
+
+### Probes
+
+With `-peersurveyprobes=1` (the default with the survey), each survey
+connection sends a random subset of these, in random order, after the
+listening and before it closes:
+
+| Probe | Sends | Records |
+|---|---|---|
+| `ping` | `ping` with a random nonce | the `pong`'s round trip, in milliseconds |
+| `getheaders` | `getheaders` with the parent of the node's tip as the locator and the tip as the stop; not sent while the node is at genesis, where a peer would answer with 2,000 headers | how many headers come back |
+| `getdata` | `getdata` for a random transaction id (by wtxid to a peer that relays by wtxid) | whether `notfound` names it |
+| `unknown` | a message of a random type no implementation defines, empty | whether the peer closes the connection over it |
+
+Each was checked against Bitcoin Core v32.1: none raises a misbehaviour
+score or costs the connection. Nothing Core punishes is sent (`mempool`
+without `NODE_BLOOM`, filter requests to a peer that does not serve them, a
+second `getaddr`). Probes are sent on survey connections only, never to the
+node's own peers.
+
+### `getpeersurvey`
+
+`getpeersurvey [verbose]` returns the aggregate of what the store holds:
+
+```json
+{
+  "addresses": 812,
+  "families": {
+    "core": {"count": 690, "share": 0.8497},
+    "btcd": {"count": 9, "share": 0.0111},
+    "...": "...",
+    "unknown": {"count": 41, "share": 0.0505}
+  },
+  "mismatches": 3,
+  "v2": {"count": 402, "share": 0.495},
+  "top_as": [{"asn": 64496, "count": 57}],
+  "probed": 405,
+  "enabled": true,
+  "probes": true,
+  "interval": 60,
+  "connections": {"completed": 815, "failed": 1311}
+}
+```
+
+| Field | What |
+|---|---|
+| `addresses` | Records in the store: addresses the survey reached in the last 30 days. |
+| `families` | Records per observed family (a mismatch counts under the family its handshake matched), with each one's share of `addresses`. |
+| `mismatches` | Records whose user agent names one family and handshake matches another. |
+| `v2` | Records reached over BIP 324. |
+| `top_as` | The ten autonomous systems with the most records. Empty without `-asmap`. |
+| `probed` | Records with at least one probe outcome. |
+| `enabled`, `probes`, `interval` | The survey's settings. With the survey off, `enabled` is false and every count is zero. |
+| `connections` | Survey connections since start: `completed`, and `failed` at the dial or the handshake. |
+
+`getpeersurvey true` adds `peers`, one row per address, most recently seen
+first: `addr`, `network`, `fingerprint` (as in `getpeerbehavior`, for
+example `core/high`), `family`, `claimed` (the family the user agent names),
+`mismatch`, `subver` (sanitized peer text), `version`, `services`, `v2`,
+`asn`, `first_seen`, `last_seen` (Unix seconds) and `probes`, each probe
+sent with its `result` (`answered`, `silent` or `disconnected`) and, when
+answered, its `value`.
+
+The RPC is operator control: it is refused on the read-only listener, and
+for a bearer token it needs `rpc:write`.
+
+### The store
+
+`peersurvey.dat` keeps one record per address: the fingerprint, user agent,
+protocol version, services, whether it spoke v2, its autonomous system, when
+it was first and last seen, and the last probe outcomes. A record not seen
+for 30 days is dropped, and past 250,000 records (about 25 MB) the least
+recently seen go first. It is written every 10 minutes and at shutdown, and
+read at startup; a file that does not read is renamed with a `.bad-<unix time>` suffix, with a warning, and
+the survey starts empty.
+
+### Metrics
+
+- `satd_peer_survey_enabled`: 1 while the survey runs.
+- `satd_peer_survey_records`, `satd_peer_survey_family{family}`,
+  `satd_peer_survey_mismatches` and `satd_peer_survey_v2`: the store's
+  counts.
+- `satd_peer_survey_connections_total{result}`: `completed` and `failed`
+  survey connections.
+- `satd_peer_survey_probes_total{probe,outcome}`: probe outcomes.
+
+None carries an address.

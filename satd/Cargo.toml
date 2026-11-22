@@ -60,6 +60,13 @@ name = "core_p2p_differential"
 path = "tests/core_p2p_differential.rs"
 required-features = ["core-p2p-differential"]
 
+# The network survey's probes against a live Core (#1353), on the same
+# harness and feature.
+[[test]]
+name = "core_survey_probes"
+path = "tests/core_survey_probes.rs"
+required-features = ["core-p2p-differential"]
+
 [dependencies]
 node = { path = "../node", default-features = false }
 node-index = { path = "../node-index" }

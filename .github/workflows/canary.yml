@@ -202,7 +202,7 @@ jobs:
           echo "Changed files:"; printf '%s\n' "$changed"
           # `p2p_decode` = the P2P message decoders, or the differential that
           # replays them against Core, changed: run that replay.
-          if printf '%s\n' "$changed" | grep -qE '^node/src/net/(payload|addrv2|v2transport)\.rs$|^fuzz/src/p2p_diff\.rs$|^fuzz/fuzz_targets/p2p_differential\.rs$|^fuzz/seeds/p2p_differential/|^satd/tests/core_p2p_differential\.rs$'; then
+          if printf '%s\n' "$changed" | grep -qE '^node/src/net/(payload|addrv2|v2transport|survey|manager_survey)\.rs$|^fuzz/src/p2p_diff\.rs$|^fuzz/fuzz_targets/p2p_differential\.rs$|^fuzz/seeds/p2p_differential/|^satd/tests/core_(p2p_differential|survey_probes)\.rs$'; then
             echo "p2p_decode=true" >> "$GITHUB_OUTPUT"
           else
             echo "p2p_decode=false" >> "$GITHUB_OUTPUT"
@@ -692,6 +692,13 @@ jobs:
       - name: Run P2P decoding differential (seed replay)
         if: needs.changes.outputs.p2p_decode == 'true'
         run: cargo test -p satd --test core_p2p_differential --features core-block-differential,core-p2p-differential -- --nocapture
+
+      # The network survey's probes (#1353): each against the same Core, for
+      # no misbehaviour and no disconnect. When the probes or the harness
+      # changed.
+      - name: Run survey probes against Core
+        if: needs.changes.outputs.p2p_decode == 'true'
+        run: cargo test -p satd --test core_survey_probes --features core-block-differential,core-p2p-differential -- --nocapture
 
       # A pull request's cache is visible to that pull request alone, and at
       # ~1.4 GB a target directory it pushed the repository past its 10 GB

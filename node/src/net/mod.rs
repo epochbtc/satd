@@ -34,6 +34,7 @@ pub mod stats;
 pub mod tor;
 pub mod txrequest;
 pub mod tx_relay;
+pub mod survey;
 pub mod sync;
 pub mod v2transport;
 

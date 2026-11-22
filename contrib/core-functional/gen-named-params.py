@@ -309,6 +309,7 @@ SATD_ONLY = {
     "getquarantineentry": [["txid", False]],
     "getreorghistory": [["since_secs", False]],
     "getpeerbehavior": [["peer_id", False]],
+    "getpeersurvey": [["verbose", False]],
     "getsilentpaymentblockdata": [
         ["blockhash", False], ["verbosity", False], ["dust_limit", False],
     ],

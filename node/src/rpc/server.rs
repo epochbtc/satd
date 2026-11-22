@@ -142,6 +142,7 @@ const HELP_METHODS: &[(&str, &str)] = &[
     ("getnodeaddresses", "Network"),
     ("getorphaninfo", "Network"),
     ("getpeerbehavior", "Network"),
+    ("getpeersurvey", "Network"),
     ("getpeerinfo", "Network"),
     ("listbanned", "Network"),
     ("ping", "Network"),
@@ -3135,6 +3136,15 @@ pub async fn start(
         ctx.peer_manager.get_peer_behavior(peer_id).map(serde_json::Value::from).ok_or_else(|| {
             ErrorObjectOwned::owned(-8, format!("peer_id {} not found", peer_id.unwrap_or_default()), None::<()>)
         })
+    })?;
+
+    // satd: the network survey (`-peersurvey`): the aggregate, and with
+    // `verbose` a row per surveyed address.
+    module.register_method("getpeersurvey", |params, ctx, _extensions| {
+        let mut args = Args::new(&params);
+        let verbose: Option<bool> = args.optional("verbose")?;
+        args.check()?;
+        Ok::<_, ErrorObjectOwned>(ctx.peer_manager.get_peer_survey(verbose.unwrap_or(false)))
     })?;
 
     module.register_method("getconnectioncount", |_params, ctx, _extensions| {
