@@ -3,7 +3,10 @@
 satd keeps a small record of what each peer does on the wire, judges from it
 which implementation the peer runs and whether it behaves like a crawler, a
 transaction spy or a peer that lies about its chain, and reports the result.
-It only reports: no flag changes how a peer is treated.
+By default it only reports: no flag changes how a peer is treated. With
+[`-peerflagpolicy=evict`](#soft-enforcement--peerflagpolicy) some flags
+decide which inbound peer goes first when an inbound slot is needed, and
+nothing else.
 
 An opt-in [network survey](#network-survey) applies the same judgement to
 short connections of its own, across the address book.
@@ -115,6 +118,43 @@ clients by observed family. See [sat-tui](tui.md#peer-behaviour).
   connection, with its evidence, fingerprint and quoted user agent.
 
 None of these carries an address, and a user agent appears only escaped.
+
+## Soft enforcement (`-peerflagpolicy`)
+
+`-peerflagpolicy=observe|evict`, default `observe`.
+
+- **`observe`**: the flags are information only. The inbound eviction is
+  Bitcoin Core's, unchanged.
+- **`evict`**: an inbound peer flagged `C`, `S` or `F` loses the protection
+  Core's eviction gives it (network group, ping time, recent transactions
+  and blocks, privacy network, uptime) and is the first evicted when an
+  inbound slot is needed. Among several flagged peers, Core's last rule
+  picks: the youngest of the network group with the most of them.
+
+`evict` only reorders an eviction that would happen anyway:
+
+- Nothing is disconnected while an inbound slot is free, nor because a
+  peer gained a flag. An eviction happens, as in Core, when a new inbound
+  connection arrives with every inbound slot taken, or when a
+  transaction-relaying inbound peer arrives past the transaction-relay
+  share of them.
+- Nothing is banned or discouraged; an evicted peer may connect again.
+- Peers with the `noban`, `relay` or `forcerelay` permission
+  (`-whitelist`, `-whitebind`) are exempt and keep Core's protection.
+  `noban` peers are never evicted at all, as in Core.
+- Outbound peers, manual connections and alt-slot peers are never touched:
+  the surplus outbound eviction after IBD ignores the flags.
+- The `A`, `H`, `N` and `T` flags play no part.
+
+An eviction the policy decided is logged (`peer=<id> evicted first under
+-peerflagpolicy=evict, flagged <codes>`), and the peer's disconnect reason
+is `evicted-flagged`. A node that does not accept inbound connections
+(`-listen=0`) never evicts, so the policy has nothing to act on there.
+
+The flag thresholds are provisional (see above), so under `evict` a
+threshold change in a later release changes which peers go first. The
+policy is read at startup; a reload that changes it reports it as needing
+a restart. `getconfig` reports it as `p2p.peer_flag_policy`.
 
 ## Network survey
 
