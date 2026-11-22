@@ -71,6 +71,18 @@ pub struct PeerBehavior {
     pub flags: Vec<Flag>,
     /// The raw counters, flattened to `(name, value)` lines.
     pub counters: Vec<(String, String)>,
+    /// The peer's alt-slot (`-altslots`), if it holds one.
+    pub alt_slot: Option<AltSlot>,
+}
+
+/// An alt-slot peer as `getpeerbehavior`'s `alt_slot` describes it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AltSlot {
+    /// Matched `rule`; its user agent was `trust` (verified, unverified,
+    /// contradicted).
+    Matched { rule: String, trust: String },
+    /// An ordinary peer holding an empty alt-slot.
+    Fallback,
 }
 
 impl PeerBehavior {
@@ -195,6 +207,13 @@ fn parse_peer(v: &Value) -> Option<PeerBehavior> {
         flag_codes: text(v, "flag_codes"),
         flags,
         counters: v.get("counters").map(flatten_counters).unwrap_or_default(),
+        alt_slot: v.get("alt_slot").filter(|a| a.is_object()).map(|a| {
+            if a.get("fallback").and_then(Value::as_bool).unwrap_or(false) {
+                AltSlot::Fallback
+            } else {
+                AltSlot::Matched { rule: text(a, "rule"), trust: text(a, "trust") }
+            }
+        }),
     })
 }
 
@@ -219,9 +238,15 @@ pub enum FlagsTone {
     Alarm,
 }
 
-/// The Flags cell for a peer: its codes, cut to the column, and the tone.
+/// The Flags cell for a peer: `alt` for an alt-slot peer (`alt*` for a
+/// fallback), then its codes, cut to the column, and the tone of the codes.
 pub fn flags_cell(p: &PeerBehavior) -> (String, FlagsTone) {
-    let codes: String = p.flag_codes.chars().take(FLAGS_WIDTH as usize).collect();
+    let tag = match p.alt_slot {
+        Some(AltSlot::Matched { .. }) => "alt ",
+        Some(AltSlot::Fallback) => "alt* ",
+        None => "",
+    };
+    let codes: String = format!("{tag}{}", p.flag_codes).trim_end().chars().take(FLAGS_WIDTH as usize).collect();
     let n = p.flag_codes.chars().count();
     let tone = if n == 0 {
         FlagsTone::None
@@ -273,6 +298,16 @@ pub fn family_distribution(map: &BehaviorMap, top_n: usize) -> Vec<(String, usiz
     sorted.truncate(top_n);
     sorted.push(("other".into(), other));
     sorted
+}
+
+/// The alt-slot peers: (matched, fallback). Peer clients shows them when
+/// any are connected.
+pub fn alt_slot_counts(map: &BehaviorMap) -> (usize, usize) {
+    map.values().fold((0, 0), |(m, f), p| match p.alt_slot {
+        Some(AltSlot::Matched { .. }) => (m + 1, f),
+        Some(AltSlot::Fallback) => (m, f + 1),
+        None => (m, f),
+    })
 }
 
 /// Peers whose fingerprint is a mismatch.
@@ -383,6 +418,27 @@ pub(crate) mod tests {
         assert_eq!(flags_cell(&spy), ("S".into(), FlagsTone::Alarm), "S alone is red");
         let many = PeerBehavior { flag_codes: "CSFAHNT".into(), ..Default::default() };
         assert_eq!(flags_cell(&many).0.chars().count(), FLAGS_WIDTH as usize);
+    }
+
+    /// An alt-slot peer carries `alt` in the Flags column, a fallback
+    /// `alt*`, ahead of its codes; a reply without `alt_slot` has neither.
+    #[test]
+    fn alt_slot_tags() {
+        let mut v = reply();
+        v[0]["alt_slot"] = json!({"rule": "family:btcd@2", "trust": "verified", "fallback": false});
+        v[1]["alt_slot"] = json!({"rule": null, "trust": null, "fallback": true});
+        let map = parse(&v).unwrap();
+        assert_eq!(
+            map[&3].alt_slot,
+            Some(AltSlot::Matched { rule: "family:btcd@2".into(), trust: "verified".into() })
+        );
+        assert_eq!(flags_cell(&map[&3]).0, "alt F");
+        assert_eq!(flags_cell(&map[&7]).0, "alt* C");
+        assert_eq!(flags_cell(&map[&11]).0, "", "no tag without an alt_slot");
+        let quiet = PeerBehavior { alt_slot: Some(AltSlot::Fallback), ..Default::default() };
+        assert_eq!(flags_cell(&quiet), ("alt*".into(), FlagsTone::None));
+        assert_eq!(alt_slot_counts(&map), (1, 1));
+        assert_eq!(alt_slot_counts(&parse(&reply()).unwrap()), (0, 0));
     }
 
     #[test]

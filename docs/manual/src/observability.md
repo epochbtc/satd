@@ -78,7 +78,9 @@ wire volume is exported as the `satd_net_bytes_sent_total` and
 `satd_peer_fingerprint{family}` count connected peers per behaviour flag and
 per implementation family ([Peer Behaviour Flags](peer-behavior.md)), and
 the `satd_peer_survey_*` series count the opt-in network survey's records,
-connections and probes ([Network survey](peer-behavior.md#network-survey)). The `GET /healthz` and `GET /readyz` endpoints exist
+connections and probes ([Network survey](peer-behavior.md#network-survey)),
+and `satd_peer_alt_slots{state}` the alt-slots matched, held by a fallback
+or empty ([Alt-slots](peer-behavior.md#alt-slots)). The `GET /healthz` and `GET /readyz` endpoints exist
 for load balancer and orchestrator integration.
 
 See the [Packaging](packaging.md#health-and-readiness) chapter for how to wire

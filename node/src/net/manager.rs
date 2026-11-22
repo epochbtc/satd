@@ -32,8 +32,12 @@ use crate::net::stats::{NetTotals, PeerStats};
 use crate::net::sync;
 use crate::net::txrequest::{AnnouncerInfo, GenTxid, GETDATA_TX_INTERVAL, MAX_GETDATA_SZ};
 
-const MAX_OUTBOUND: usize = 8;
-const MAX_OUTBOUND_IBD: usize = 64;
+/// The full-relay outbound target's default, `-maxoutboundfullrelay`'s:
+/// Core's `MAX_OUTBOUND_FULL_RELAY_CONNECTIONS`.
+const MAX_OUTBOUND: usize = crate::net::altslots::DEFAULT_MAX_OUTBOUND_FULL_RELAY;
+/// The full-relay target during initial block download, whatever
+/// `-maxoutboundfullrelay` is: its ceiling.
+const MAX_OUTBOUND_IBD: usize = crate::net::altslots::MAX_OUTBOUND_FULL_RELAY_CEILING;
 /// Block-relay-only slots, counted separately from full-relay ones. Bitcoin
 /// Core's `m_max_outbound_block_relay` (2 by default): these connections exist
 /// so a tx-graph observer cannot learn the full topology, which only works if
@@ -878,6 +882,13 @@ enum DialBudget {
     /// `ThreadOpenConnections`; [`PeerManager::evict_extra_outbound_peer`]
     /// later drops a full-relay peer to bring the count back.
     StaleTip,
+    /// A trial dial for an alt-slot (`-altslots`): one at a time, while an
+    /// alt-slot is not filled by a match. Judged once its handshake
+    /// settles, and disconnected if it matches no rule.
+    AltTrial,
+    /// An ordinary peer for an alt-slot left empty past `-altfillwait`: one
+    /// at a time, within the automatic target.
+    AltFallback,
 }
 
 /// Outbound dials in flight, per [`DialBudget`].
@@ -889,6 +900,8 @@ struct DialsInFlight {
     block_relay: usize,
     extra_block_relay: usize,
     stale_tip: usize,
+    alt_trial: usize,
+    alt_fallback: usize,
 }
 
 /// A dial's place in its [`DialBudget`], given back when dropped. Owned, so
@@ -915,6 +928,8 @@ impl Drop for DialSlot {
                 in_flight.extra_block_relay = in_flight.extra_block_relay.saturating_sub(1)
             }
             DialBudget::StaleTip => in_flight.stale_tip = in_flight.stale_tip.saturating_sub(1),
+            DialBudget::AltTrial => in_flight.alt_trial = in_flight.alt_trial.saturating_sub(1),
+            DialBudget::AltFallback => in_flight.alt_fallback = in_flight.alt_fallback.saturating_sub(1),
             DialBudget::Unlimited => {}
         }
     }
@@ -1378,6 +1393,10 @@ pub struct PeerManager {
     inbound_netgroups: parking_lot::Mutex<crate::net::flags::NetgroupWindow>,
     /// The network survey (`-peersurvey`), when it is on.
     survey: std::sync::OnceLock<survey_conn::SurveyRun>,
+    /// `-maxoutboundfullrelay`.
+    max_outbound_full_relay: AtomicUsize,
+    /// The alt-slots (`-altslots`): their settings and fill state.
+    alt_slots: altslot_conn::AltSlots,
     /// `-asmap`, for the survey's autonomous systems.
     asmap: std::sync::OnceLock<Arc<crate::net::asmap::AsMap>>,
     /// The flags each departed peer carried as it left, for tests.
@@ -1934,6 +1953,8 @@ impl PeerManager {
             retired_behavior: Default::default(),
             inbound_netgroups: Default::default(),
             survey: Default::default(),
+            max_outbound_full_relay: AtomicUsize::new(MAX_OUTBOUND),
+            alt_slots: Default::default(),
             asmap: Default::default(),
             #[cfg(test)]
             retired_flags: Default::default(),
@@ -3798,7 +3819,7 @@ impl PeerManager {
         // here.
         let max = match conn_type {
             ConnType::OutboundFullRelay => {
-                Some(self.max_connections.load(Ordering::Relaxed).min(MAX_OUTBOUND))
+                Some(self.max_connections.load(Ordering::Relaxed).min(self.max_outbound_full_relay()))
             }
             ConnType::BlockRelay => Some(self.max_outbound_block_relay()),
             ConnType::AddrFetch | ConnType::Feeler => None,
@@ -3858,25 +3879,44 @@ impl PeerManager {
             + in_flight.automatic
             + in_flight.extra_network
             + in_flight.block_relay
-            + in_flight.extra_block_relay;
-        if total_outbound >= Self::max_automatic_outbound(&self.max_connections) {
+            + in_flight.extra_block_relay
+            + in_flight.alt_trial
+            + in_flight.alt_fallback;
+        if total_outbound >= self.max_automatic_outbound() {
             return Err("Error: Already at capacity for specified connection type.".to_string());
         }
         Ok(())
     }
 
     /// Core's `m_max_automatic_outbound`, capped by the connection budget:
-    /// `min(full_relay + block_relay + feeler, max_connections)` (`net.h`).
+    /// `min(full_relay + block_relay + feeler, max_connections)` (`net.h`),
+    /// with `full_relay` from `-maxoutboundfullrelay` (8 unless set).
     ///
     /// The IBD figure is deliberately *not* used here. It raises the
     /// full-relay target while the node catches up; the semaphore Core sizes
     /// this way is about how many automatic outbound sockets may exist at
     /// once, which does not change with sync state.
-    fn max_automatic_outbound(max_connections: &std::sync::atomic::AtomicUsize) -> usize {
+    fn max_automatic_outbound(&self) -> usize {
         // One feeler slot, as Core's `m_max_feeler`.
         const MAX_FEELER: usize = 1;
-        (MAX_OUTBOUND + MAX_OUTBOUND_BLOCK_RELAY + MAX_FEELER)
-            .min(max_connections.load(Ordering::Relaxed))
+        (self.max_outbound_full_relay() + MAX_OUTBOUND_BLOCK_RELAY + MAX_FEELER)
+            .min(self.max_connections.load(Ordering::Relaxed))
+    }
+
+    /// `-maxoutboundfullrelay`: the full-relay outbound target out of IBD
+    /// before `-maxconnections` caps it. 8 unless set, Core's
+    /// `MAX_OUTBOUND_FULL_RELAY_CONNECTIONS`.
+    pub fn max_outbound_full_relay(&self) -> usize {
+        self.max_outbound_full_relay.load(Ordering::Relaxed)
+    }
+
+    /// Set `-maxoutboundfullrelay`. The caller has checked it against its
+    /// limits ([`crate::net::altslots::check_outbound_limits`]). A lower
+    /// value disconnects nothing at once: the surplus full-relay peers go
+    /// one at a time, as after IBD ([`Self::evict_extra_outbound_peer`]).
+    pub fn set_max_outbound_full_relay(&self, n: usize) {
+        self.max_outbound_full_relay
+            .store(n.clamp(1, crate::net::altslots::MAX_OUTBOUND_FULL_RELAY_CEILING), Ordering::Relaxed);
     }
 
     /// Core's `m_max_inbound`: the connection budget past the automatic
@@ -3885,7 +3925,7 @@ impl PeerManager {
     fn max_inbound(&self) -> usize {
         self.max_connections
             .load(Ordering::Relaxed)
-            .saturating_sub(Self::max_automatic_outbound(&self.max_connections))
+            .saturating_sub(self.max_automatic_outbound())
     }
 
     /// Core's `m_max_inbound_full_relay`: how many inbound peers may relay
@@ -4027,20 +4067,22 @@ impl PeerManager {
     }
 
     /// Core's `m_max_outbound_block_relay`: 2, or what `-maxconnections`
-    /// leaves past the full-relay target of 8, whichever is fewer (v31.1
-    /// `src/net.h:1116`). None at 8 or fewer, 1 at 9.
+    /// leaves past the full-relay target of 8 (`-maxoutboundfullrelay`),
+    /// whichever is fewer (v31.1 `src/net.h:1116`). None at 8 or fewer, 1 at
+    /// 9.
     fn max_outbound_block_relay(&self) -> usize {
         let max_connections = self.max_connections.load(Ordering::Relaxed);
-        MAX_OUTBOUND_BLOCK_RELAY.min(max_connections.saturating_sub(max_connections.min(MAX_OUTBOUND)))
+        MAX_OUTBOUND_BLOCK_RELAY
+            .min(max_connections.saturating_sub(max_connections.min(self.max_outbound_full_relay())))
     }
 
-    /// The automatic outbound target: 8, capped by `-maxconnections`, or 64
-    /// during IBD.
+    /// The automatic outbound target: 8 (`-maxoutboundfullrelay`), capped
+    /// by `-maxconnections`, or 64 during IBD.
     fn automatic_outbound_target(&self) -> usize {
         if self.is_ibd() {
             MAX_OUTBOUND_IBD
         } else {
-            self.max_connections.load(Ordering::Relaxed).min(MAX_OUTBOUND)
+            self.max_connections.load(Ordering::Relaxed).min(self.max_outbound_full_relay())
         }
     }
 
@@ -4070,12 +4112,22 @@ impl PeerManager {
     }
 
     /// The automatic connections open or being opened, against the
-    /// automatic target: the peers [`Self::automatic_outbound_peers`]
-    /// counts, the reconnect loop's dials in flight, and `addconnection`'s
-    /// reservations but a feeler's or a block-relay-only one's.
+    /// automatic target: [`Self::automatic_open_unreserved`], and the
+    /// alt-slots still empty ([`Self::alt_slots_reserved`]), which ordinary
+    /// dials leave to the alt-slot dials. None with `-altslots=0`.
     fn automatic_open(&self, in_flight: &DialsInFlight) -> usize {
+        self.automatic_open_unreserved(in_flight) + self.alt_slots_reserved(in_flight)
+    }
+
+    /// The automatic connections open or being opened: the peers
+    /// [`Self::automatic_outbound_peers`] counts, the reconnect loop's dials
+    /// in flight (an alt-slot's among them), and `addconnection`'s
+    /// reservations but a feeler's or a block-relay-only one's.
+    fn automatic_open_unreserved(&self, in_flight: &DialsInFlight) -> usize {
         self.automatic_outbound_peers()
             + in_flight.automatic
+            + in_flight.alt_trial
+            + in_flight.alt_fallback
             + self
                 .pending_typed_dials
                 .read()
@@ -4119,7 +4171,13 @@ impl PeerManager {
             .filter(|h| h.info.conn_type == ConnType::OutboundFullRelay && h.info.state != PeerState::Disconnected)
             .count();
         let typed = self.pending_typed_dials.read().iter().filter(|t| **t == ConnType::OutboundFullRelay).count();
-        peers + in_flight.automatic + in_flight.extra_network + in_flight.stale_tip + typed
+        peers
+            + in_flight.automatic
+            + in_flight.extra_network
+            + in_flight.stale_tip
+            + in_flight.alt_trial
+            + in_flight.alt_fallback
+            + typed
     }
 
     /// The outbound sockets Core's `semOutbound` holds a grant for: every
@@ -4144,6 +4202,8 @@ impl PeerManager {
             + in_flight.block_relay
             + in_flight.extra_block_relay
             + in_flight.stale_tip
+            + in_flight.alt_trial
+            + in_flight.alt_fallback
     }
 
     /// The added nodes the operator listed, at the addresses they resolve to.
@@ -4237,7 +4297,11 @@ impl PeerManager {
                 if in_flight.extra_network > 0 {
                     return Err("an extra network peer is already being dialled".to_string());
                 }
-                if self.full_relay_open(&in_flight) != MAX_OUTBOUND {
+                // Alt-slots still empty count as held, as they do against
+                // the automatic target; none with `-altslots=0`.
+                if self.full_relay_open(&in_flight) + self.alt_slots_reserved(&in_flight)
+                    != self.max_outbound_full_relay()
+                {
                     return Err("the full-relay target is not met exactly".to_string());
                 }
                 if self.block_relay_open(&in_flight) < self.max_outbound_block_relay() {
@@ -4245,7 +4309,7 @@ impl PeerManager {
                 }
                 // Core's extra peer takes a `semOutbound` grant, so it is
                 // never opened past that bound (`-maxconnections` 8, say).
-                if self.automatic_sockets_open(&in_flight) >= Self::max_automatic_outbound(&self.max_connections) {
+                if self.automatic_sockets_open(&in_flight) >= self.max_automatic_outbound() {
                     return Err("no outbound grant free".to_string());
                 }
                 in_flight.extra_network += 1;
@@ -4258,7 +4322,7 @@ impl PeerManager {
                 if self.block_relay_open(&in_flight) >= self.max_outbound_block_relay() {
                     return Err("block-relay-only target reached".to_string());
                 }
-                if self.automatic_sockets_open(&in_flight) >= Self::max_automatic_outbound(&self.max_connections) {
+                if self.automatic_sockets_open(&in_flight) >= self.max_automatic_outbound() {
                     return Err("no outbound grant free".to_string());
                 }
                 in_flight.block_relay += 1;
@@ -4268,7 +4332,7 @@ impl PeerManager {
                 if self.block_relay_open(&in_flight) >= self.max_outbound_block_relay() {
                     return Err("block-relay-only target reached".to_string());
                 }
-                if self.automatic_sockets_open(&in_flight) >= Self::max_automatic_outbound(&self.max_connections) {
+                if self.automatic_sockets_open(&in_flight) >= self.max_automatic_outbound() {
                     return Err("no outbound grant free".to_string());
                 }
                 in_flight.block_relay += 1;
@@ -4280,7 +4344,7 @@ impl PeerManager {
                 if !self.outbound_targets_met(&in_flight) {
                     return Err("the outbound targets are not met".to_string());
                 }
-                if self.automatic_sockets_open(&in_flight) >= Self::max_automatic_outbound(&self.max_connections) {
+                if self.automatic_sockets_open(&in_flight) >= self.max_automatic_outbound() {
                     return Err("no outbound grant free".to_string());
                 }
                 in_flight.extra_block_relay += 1;
@@ -4294,10 +4358,28 @@ impl PeerManager {
                 if !self.outbound_targets_met(&in_flight) {
                     return Err("the outbound targets are not met".to_string());
                 }
-                if self.automatic_sockets_open(&in_flight) >= Self::max_automatic_outbound(&self.max_connections) {
+                if self.automatic_sockets_open(&in_flight) >= self.max_automatic_outbound() {
                     return Err("no outbound grant free".to_string());
                 }
                 in_flight.stale_tip += 1;
+            }
+            DialBudget::AltTrial => {
+                self.check_alt_trial(&in_flight)?;
+                in_flight.alt_trial += 1;
+            }
+            DialBudget::AltFallback => {
+                if in_flight.alt_fallback > 0 {
+                    return Err("an alt-slot fallback is already being dialled".to_string());
+                }
+                if self.alt_slots_reserved(&in_flight) == 0 {
+                    return Err("no alt-slot is empty".to_string());
+                }
+                // The fallback fills a reserved slot, so the target is
+                // checked without the reservation.
+                if self.automatic_open_unreserved(&in_flight) >= self.automatic_outbound_target() {
+                    return Err("max outbound connections reached".to_string());
+                }
+                in_flight.alt_fallback += 1;
             }
             DialBudget::Unlimited => {}
         }
@@ -6038,6 +6120,7 @@ impl PeerManager {
         self.resolve_tried_collisions();
         let mut dialled = self.open_anchor_peers(now);
         dialled.extend(self.dial_automatic_peers(now, &dialled));
+        dialled.extend(self.open_alt_slot_peers(now, &dialled));
         dialled.extend(self.open_block_relay_peer(now, &dialled));
         // The last four each need the one outbound grant the targets leave
         // free (the feeler's place), so at most one of them dials per pass.
@@ -6426,7 +6509,9 @@ impl PeerManager {
         now: Instant,
         dialled: &[PeerAddr],
     ) -> Option<(PeerAddr, crate::net::reachable::Network, DialSlot)> {
-        if !self.automatic_outbound.load(Ordering::Relaxed) || self.automatic_outbound_target() != MAX_OUTBOUND {
+        if !self.automatic_outbound.load(Ordering::Relaxed)
+            || self.automatic_outbound_target() != self.max_outbound_full_relay()
+        {
             return None;
         }
         if now <= *self.next_extra_network_peer.lock() {
@@ -7039,7 +7124,9 @@ impl PeerManager {
     /// - a manual or block-relay-only connection (only full-relay peers are
     ///   candidates);
     /// - a peer protected by the chain-sync rule (`chain_sync_protect`);
-    /// - the only manual or full-relay connection on its network.
+    /// - the only manual or full-relay connection on its network;
+    /// - a peer that fills an alt-slot by its rules, or an alt-slot trial
+    ///   (which is not counted either).
     ///
     /// When some candidates share a network group with another outbound
     /// peer, one of those goes first. Core needs no such step, since its dial
@@ -7059,6 +7146,7 @@ impl PeerManager {
             last_block_announcement: u64,
             protected: bool,
             conn_secs: u64,
+            alt: Option<crate::net::altslots::AltRole>,
         }
         let target = self.automatic_outbound_target();
         // A snapshot, so the address book is not read with `peers` held.
@@ -7085,13 +7173,16 @@ impl PeerManager {
                     .conn_time
                     .duration_since(std::time::UNIX_EPOCH)
                     .map_or(0, |d| d.as_secs()),
+                alt: h.info.alt.clone(),
             })
             .collect();
         // Core's `GetExtraFullOutboundCount`: full-relay peers past the
-        // handshake.
+        // handshake. An alt-slot trial is not counted: it is judged within
+        // seconds, and either takes a slot or leaves.
+        use crate::net::altslots::AltRole;
         let full_relay = outbound
             .iter()
-            .filter(|p| p.conn_type == ConnType::OutboundFullRelay && p.connected)
+            .filter(|p| p.conn_type == ConnType::OutboundFullRelay && p.connected && p.alt != Some(AltRole::Trial))
             .count();
         if full_relay <= target {
             return None;
@@ -7117,6 +7208,10 @@ impl PeerManager {
                     && p.connected
                     && !p.protected
                     && per_network.get(p.network).copied().unwrap_or(0) > 1
+                    // Never a peer that fills an alt-slot by its rules, nor
+                    // a trial: a match over the target makes room by
+                    // dropping an ordinary or fallback peer.
+                    && !matches!(p.alt, Some(AltRole::Trial | AltRole::Matched { .. }))
             })
             .collect();
         let duplicates: Vec<usize> = candidates.iter().copied().filter(|&i| shares_group(i)).collect();
@@ -7731,6 +7826,9 @@ impl PeerManager {
             // message, so a busy peer costs no more than a quiet one.
             if ticks.is_multiple_of(crate::net::flags::EVALUATE_INTERVAL_SECS * 2) {
                 self.evaluate_peer_flags();
+                // The alt-slot trials and fallbacks whose fingerprints have
+                // settled, judged on what was just evaluated.
+                self.judge_alt_slot_peers();
             }
 
             // Back to a queue the last drain left full. Otherwise yield to
@@ -15838,6 +15936,11 @@ impl PeerManager {
     /// peer gone before the next evaluation (a crawler) still gets its line.
     fn retire_behavior(&self, id: PeerId, info: &mut PeerInfo, reason: &'static str) {
         info.behavior.disconnect_reason = Some(reason);
+        if info.alt == Some(crate::net::altslots::AltRole::Trial) {
+            // A trial that left unjudged, or matched nothing: the next
+            // waits its turn.
+            self.note_alt_trial_ended(info, Instant::now());
+        }
         let gained = Self::judge_peer(info, &self.netgroup_counts(), true);
         Self::log_gained_flags(id, info, &gained);
         let behavior = &info.behavior;
@@ -16068,6 +16171,10 @@ impl PeerManager {
         if direction == Direction::Outbound {
             info.conn_type = conn_type
                 .unwrap_or_else(|| self.untyped_outbound_conn_type(&addr, onion_host));
+            // An alt-slot dial's peer: a trial or a fallback.
+            if info.conn_type == ConnType::OutboundFullRelay {
+                info.alt = self.take_alt_dial(&addr, onion_host);
+            }
         }
         // `-whitelist` permissions, scoped to the direction this peer was
         // reached in. Core consults its *outgoing* whitelist only for a
@@ -17730,11 +17837,19 @@ mod flags_tests;
 
 #[path = "manager_survey.rs"]
 mod survey_conn;
+
+#[path = "manager_altslots.rs"]
+mod altslot_conn;
 pub use survey_conn::{SurveyConfig, SurveyMetrics};
+pub use altslot_conn::AltSlotCounts;
 
 #[cfg(test)]
 #[path = "manager_survey_tests.rs"]
 mod survey_tests;
+
+#[cfg(test)]
+#[path = "manager_altslots_tests.rs"]
+mod altslots_tests;
 
 /// Reconsider orphans whose missing parent was just confirmed in `block`.
 ///

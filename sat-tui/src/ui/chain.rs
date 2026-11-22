@@ -237,9 +237,12 @@ pub fn peer_client_lines(state: &AppState) -> Vec<Line<'static>> {
     };
 
     if let Some(map) = state.peer_behavior.as_ref().filter(|m| !m.is_empty()) {
-        // Six inner lines: four families, `other`, and the mismatch count.
+        // Six inner lines: four families, `other`, and the mismatch count;
+        // with alt-slot peers connected, three families and their line.
         let total = map.len();
-        let mut lines: Vec<Line<'static>> = crate::behavior::family_distribution(map, 4)
+        let (alt_matched, alt_fallback) = crate::behavior::alt_slot_counts(map);
+        let alt = alt_matched + alt_fallback > 0;
+        let mut lines: Vec<Line<'static>> = crate::behavior::family_distribution(map, if alt { 3 } else { 4 })
             .iter()
             .map(|(name, count)| row(name, *count, total))
             .collect();
@@ -248,6 +251,12 @@ pub fn peer_client_lines(state: &AppState) -> Vec<Line<'static>> {
             format!("  fingerprint mismatches: {mismatches}"),
             Style::default().fg(if mismatches > 0 { Color::Red } else { Color::DarkGray }),
         )));
+        if alt {
+            lines.push(Line::from(Span::styled(
+                format!("  alt-slots: {alt_matched} matched, {alt_fallback} fallback"),
+                Style::default().fg(Color::Gray),
+            )));
+        }
         return lines;
     }
 
@@ -678,6 +687,19 @@ mod tests {
 
         let none = render(&AppState::new(), 100, 40);
         assert!(!none.iter().any(|l| l.contains("Network Survey") || l.contains("survey: 1,204")));
+    }
+
+    /// With alt-slot peers connected, Peer clients adds their line and
+    /// still fits its six lines.
+    #[test]
+    fn peer_clients_alt_slot_line() {
+        let mut st = AppState::new();
+        let mut v = crate::behavior::tests::reply();
+        v[0]["alt_slot"] = serde_json::json!({"rule": "family:non-core", "trust": "unverified", "fallback": false});
+        st.update_peer_behavior(crate::behavior::classify(Ok(v)));
+        let lines: Vec<String> = peer_client_lines(&st).iter().map(line_text).collect();
+        assert_eq!(lines.last().map(String::as_str), Some("  alt-slots: 1 matched, 0 fallback"));
+        assert!(lines.len() <= 6, "{lines:?}");
     }
 
     #[test]

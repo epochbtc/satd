@@ -772,6 +772,23 @@ pub struct Config {
     /// `-peersurveyprobes`: with `-peersurvey`, send the vetted probes on
     /// each survey connection before it closes. Default true. satd-only.
     pub peersurveyprobes: bool,
+    /// `-maxoutboundfullrelay`: the full-relay outbound target out of IBD.
+    /// Default 8 (Core's `MAX_OUTBOUND_FULL_RELAY_CONNECTIONS`); above 16
+    /// only with `-enable-dangerously-large-outbound-peer-limit`, never
+    /// above 64. satd-only.
+    pub maxoutboundfullrelay: usize,
+    /// `-enable-dangerously-large-outbound-peer-limit`. satd-only.
+    pub dangerous_outbound_limit: bool,
+    /// `-altslots`: full-relay outbound slots filled by `-altprefer`'s
+    /// rules. Default 0. satd-only.
+    pub altslots: usize,
+    /// `-altprefer`, each rule in its canonical text, in priority order.
+    pub altprefer: Vec<String>,
+    /// `-altuatrust`: `strict`, `consistent` (default) or `any`.
+    pub altuatrust: String,
+    /// `-altfillwait`: seconds an alt-slot waits for a match before an
+    /// ordinary fallback peer takes it. Default 600.
+    pub altfillwait: u64,
     /// Bitcoin Core's `-networkactive`: start with P2P networking enabled.
     /// Default true; `-networkactive=0` boots with networking paused (no
     /// inbound accepts, no outbound dials) until `setnetworkactive true`.
@@ -4302,6 +4319,8 @@ impl Config {
             parsed
         };
 
+        let alt_slots = resolve_alt_slots(&cli.alt_slot_args, &file_get, &file_get_all, maxconnections)?;
+
         Ok(Config {
             network,
             datadir: base_datadir,
@@ -4407,6 +4426,12 @@ impl Config {
                 .peersurveyprobes
                 .or_else(|| file_get("peersurveyprobes").and_then(|v| parse_bool(&v)))
                 .unwrap_or(true),
+            maxoutboundfullrelay: alt_slots.maxoutboundfullrelay,
+            dangerous_outbound_limit: alt_slots.dangerous_outbound_limit,
+            altslots: alt_slots.altslots,
+            altprefer: alt_slots.altprefer,
+            altuatrust: alt_slots.altuatrust,
+            altfillwait: alt_slots.altfillwait,
             networkactive,
             txindex,
             addressindex,
@@ -5023,7 +5048,7 @@ impl Config {
             "v2_max_channels": if self.stratum { Some(self.stratum_v2_max_channels) } else { None },
             "v2_jd": if self.stratum { Some(self.stratum_v2_jd) } else { None },
         });
-        serde_json::json!({
+        let mut out = serde_json::json!({
             "network": self.network.to_string(),
             "datadir": self.datadir.display().to_string(),
             "prune": self.prune,
@@ -5186,7 +5211,17 @@ impl Config {
                 "enabled": self.blockfilterindex,
                 "peer_serve": self.peerblockfilters,
             },
-        })
+        });
+        // Set apart: more keys inside the macro above pass its recursion
+        // limit.
+        out["p2p"]["max_outbound_full_relay"] = serde_json::json!(self.maxoutboundfullrelay);
+        out["p2p"]["alt_slots"] = serde_json::json!({
+            "slots": self.altslots,
+            "prefer": self.altprefer,
+            "ua_trust": self.altuatrust,
+            "fill_wait_secs": self.altfillwait,
+        });
+        out
     }
 
     /// Returns the network-specific data directory (e.g. ~/.bitcoin/regtest/).
@@ -6267,6 +6302,11 @@ pub struct CliArgs {
     /// hand-built for the same stack-frame reason as [`StratumArgs`].
     #[command(flatten)]
     pub peer_survey_args: PeerSurveyArgs,
+
+    /// `-maxoutboundfullrelay` and the alt-slot options, hand-built for the
+    /// same stack-frame reason as [`StratumArgs`].
+    #[command(flatten)]
+    pub alt_slot_args: AltSlotArgs,
 
     /// Bitcoin Core's `-zmqpub<topic>` and `-zmqpub<topic>hwm` flags,
     /// hand-built for the same stack-frame reason as [`StratumArgs`].
@@ -8308,6 +8348,174 @@ impl clap::FromArgMatches for PeerSurveyArgs {
     }
 }
 
+/// `-maxoutboundfullrelay`, `-enable-dangerously-large-outbound-peer-limit`,
+/// `-altslots`, `-altprefer`, `-altuatrust` and `-altfillwait` (see
+/// [`CliArgs::alt_slot_args`]).
+#[derive(Debug, Clone, Default)]
+pub struct AltSlotArgs {
+    pub maxoutboundfullrelay: Option<usize>,
+    pub dangerous_outbound_limit: Option<bool>,
+    pub altslots: Option<usize>,
+    pub altprefer: Vec<String>,
+    pub altuatrust: Option<String>,
+    pub altfillwait: Option<u64>,
+}
+
+const ALT_SLOT_ARG_SPECS: &[(&str, &str, StratumArgKind, &str)] = &[
+    (
+        "maxoutboundfullrelay",
+        "N",
+        StratumArgKind::Usize,
+        "Full-relay outbound connections to keep once synced (default: 8). Above 8 a warning; above 16 needs -enable-dangerously-large-outbound-peer-limit; never above 64",
+    ),
+    (
+        "enable-dangerously-large-outbound-peer-limit",
+        "BOOL",
+        StratumArgKind::Bool,
+        "Allow -maxoutboundfullrelay above 16 (up to 64). Each outbound connection takes an inbound slot on another node (default: 0)",
+    ),
+    (
+        "altslots",
+        "N",
+        StratumArgKind::Usize,
+        "Fill N of the full-relay outbound slots with peers matching -altprefer instead of plain address-book selection, at most -maxoutboundfullrelay. The matching peers are a far smaller pool than the address book, which eases an eclipse attack on transaction and address relay (default: 0)",
+    ),
+    (
+        "altprefer",
+        "RULE",
+        StratumArgKind::TextList,
+        "An alt-slot preference rule, repeatable, earlier first: terms family:<name> (or family:non-core), ua:<glob>, svc:<service> joined by +, with an optional @k cap (default with -altslots: family:non-core)",
+    ),
+    (
+        "altuatrust",
+        "MODE",
+        StratumArgKind::Text,
+        "How far a ua: term trusts the user agent: strict (the fingerprint confirms it), consistent (confirmed or unknown) or any (default: consistent)",
+    ),
+    (
+        "altfillwait",
+        "SECS",
+        StratumArgKind::U64,
+        "Seconds an alt-slot waits for a matching peer before an ordinary peer fills it, until a match turns up (default: 600)",
+    ),
+];
+
+impl clap::Args for AltSlotArgs {
+    fn augment_args(mut cmd: clap::Command) -> clap::Command {
+        for spec in ALT_SLOT_ARG_SPECS {
+            cmd = cmd.arg(stratum_arg(spec));
+        }
+        cmd
+    }
+
+    fn augment_args_for_update(cmd: clap::Command) -> clap::Command {
+        Self::augment_args(cmd)
+    }
+}
+
+impl clap::FromArgMatches for AltSlotArgs {
+    fn from_arg_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
+        Self::from_arg_matches_mut(&mut matches.clone())
+    }
+
+    fn from_arg_matches_mut(m: &mut clap::ArgMatches) -> Result<Self, clap::Error> {
+        Ok(Self {
+            maxoutboundfullrelay: m.remove_one("maxoutboundfullrelay"),
+            dangerous_outbound_limit: m.remove_one("enable-dangerously-large-outbound-peer-limit"),
+            altslots: m.remove_one("altslots"),
+            altprefer: m.remove_many("altprefer").map(|v| v.collect()).unwrap_or_default(),
+            altuatrust: m.remove_one("altuatrust"),
+            altfillwait: m.remove_one("altfillwait"),
+        })
+    }
+
+    fn update_from_arg_matches(&mut self, matches: &clap::ArgMatches) -> Result<(), clap::Error> {
+        self.update_from_arg_matches_mut(&mut matches.clone())
+    }
+
+    fn update_from_arg_matches_mut(&mut self, m: &mut clap::ArgMatches) -> Result<(), clap::Error> {
+        *self = Self::from_arg_matches_mut(m)?;
+        Ok(())
+    }
+}
+
+/// The resolved alt-slot settings, before they go into [`Config`].
+struct AltSlotSettings {
+    maxoutboundfullrelay: usize,
+    dangerous_outbound_limit: bool,
+    altslots: usize,
+    altprefer: Vec<String>,
+    altuatrust: String,
+    altfillwait: u64,
+}
+
+/// `-maxoutboundfullrelay` and the alt-slot options, the command line over
+/// the file, checked against their limits and `-maxconnections`
+/// ([`node::net::altslots::check_outbound_limits`]). A bad value is a
+/// startup error, and a reload carrying one is refused whole.
+#[inline(never)]
+fn resolve_alt_slots(
+    cli: &AltSlotArgs,
+    file_get: &dyn Fn(&str) -> Option<String>,
+    file_get_all: &dyn Fn(&str) -> Vec<String>,
+    maxconnections: usize,
+) -> Result<AltSlotSettings, String> {
+    use node::net::altslots;
+    let count = |cli: Option<usize>, key: &str, default: usize| -> Result<usize, String> {
+        match (cli, file_get(key)) {
+            (Some(n), _) => Ok(n),
+            (None, Some(v)) => v.trim().parse().map_err(|_| format!("-{key} must be a whole number, not \"{v}\"")),
+            (None, None) => Ok(default),
+        }
+    };
+    let maxoutboundfullrelay = count(
+        cli.maxoutboundfullrelay,
+        "maxoutboundfullrelay",
+        altslots::DEFAULT_MAX_OUTBOUND_FULL_RELAY,
+    )?;
+    let dangerous_outbound_limit = resolve_nap(
+        &cli.dangerous_outbound_limit,
+        "enable-dangerously-large-outbound-peer-limit",
+        file_get,
+    );
+    let slots = count(cli.altslots, "altslots", 0)?;
+    altslots::check_outbound_limits(maxoutboundfullrelay, dangerous_outbound_limit, slots, maxconnections)?;
+    let raw = if cli.altprefer.is_empty() { file_get_all("altprefer") } else { cli.altprefer.clone() };
+    let mut altprefer = Vec::with_capacity(raw.len());
+    for v in &raw {
+        altprefer.push(altslots::Rule::parse(v)?.to_string());
+    }
+    let altuatrust = match cli.altuatrust.clone().or_else(|| file_get("altuatrust")) {
+        Some(v) => altslots::UaTrust::parse(&v)?,
+        None => altslots::UaTrust::default(),
+    }
+    .name()
+    .to_string();
+    let altfillwait = match (cli.altfillwait, file_get("altfillwait")) {
+        (Some(n), _) => n,
+        (None, Some(v)) => v
+            .trim()
+            .parse()
+            .map_err(|_| format!("-altfillwait must be a whole number of seconds, not \"{v}\""))?,
+        (None, None) => altslots::DEFAULT_ALT_FILL_WAIT_SECS,
+    };
+    Ok(AltSlotSettings { maxoutboundfullrelay, dangerous_outbound_limit, altslots: slots, altprefer, altuatrust, altfillwait })
+}
+
+impl Config {
+    /// The alt-slot settings as the peer manager takes them. Every value was
+    /// checked when the config was read.
+    pub fn alt_slot_config(&self) -> node::net::altslots::AltConfig {
+        use node::net::altslots;
+        altslots::AltConfig::new(
+            self.altslots,
+            self.altprefer.iter().filter_map(|r| altslots::Rule::parse(r).ok()).collect(),
+            altslots::UaTrust::parse(&self.altuatrust).unwrap_or_default(),
+            std::time::Duration::from_secs(self.altfillwait),
+        )
+    }
+}
+
 /// The address-index limits (see [`CliArgs::addrindex_args`]).
 #[derive(Debug, Clone, Default)]
 pub struct AddrIndexArgs {
@@ -8963,6 +9171,7 @@ const NEGATABLE_BOOL_FLAGS: &[&str] = &[
     "napaggregator",
     "peersurvey",
     "peersurveyprobes",
+    "enable-dangerously-large-outbound-peer-limit",
     "networkactive",
     "esplora",
     "esploramtls",
@@ -9173,6 +9382,12 @@ pub fn normalize_args(args: Vec<String>) -> Vec<String> {
         "peersurvey",
         "peersurveyinterval",
         "peersurveyprobes",
+        "maxoutboundfullrelay",
+        "enable-dangerously-large-outbound-peer-limit",
+        "altslots",
+        "altprefer",
+        "altuatrust",
+        "altfillwait",
         "minrelaytxfee",
         "dustrelayfee",
         "datacarriersize",
@@ -10022,6 +10237,12 @@ pub const KNOWN_CONFIG_KEYS: &[&str] = &[
     "peersurvey",
     "peersurveyinterval",
     "peersurveyprobes",
+    "maxoutboundfullrelay",
+    "enable-dangerously-large-outbound-peer-limit",
+    "altslots",
+    "altprefer",
+    "altuatrust",
+    "altfillwait",
     "networkactive",
     // Esplora
     "esplora",
@@ -11554,6 +11775,45 @@ blockmintxfee=0.00001
         assert!(parse_cli(["satd", "--napmaxattestations=-1"]).is_err());
     }
 
+    /// `-maxoutboundfullrelay` and the alt-slot options: Core's 8 and no
+    /// alt-slots by default; the limits refused as startup errors; rules
+    /// from both sources, canonicalized, the command line winning.
+    #[test]
+    fn maxoutboundfullrelay_and_altslots() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let load = |extra: &[&str]| {
+            let mut args = vec!["satd", "--regtest", "--datadir", dir.path().to_str().unwrap()];
+            args.extend_from_slice(extra);
+            Config::from_cli(parse_cli(normalize_args(args.iter().map(|a| a.to_string()).collect())).unwrap())
+        };
+        let c = load(&[]).unwrap();
+        assert_eq!((c.maxoutboundfullrelay, c.altslots, c.altfillwait), (8, 0, 600));
+        assert_eq!(c.altuatrust, "consistent");
+        assert_eq!(c.alt_slot_config().rules.len(), 1, "family:non-core");
+        assert_eq!(load(&["-maxoutboundfullrelay=16"]).unwrap().maxoutboundfullrelay, 16);
+        assert!(load(&["-maxoutboundfullrelay=17"]).unwrap_err().contains("-enable-dangerously-large-outbound-peer-limit"));
+        let c = load(&["-maxoutboundfullrelay=17", "-enable-dangerously-large-outbound-peer-limit"]).unwrap();
+        assert!(c.dangerous_outbound_limit && c.maxoutboundfullrelay == 17);
+        assert!(load(&["-maxoutboundfullrelay=65", "-enable-dangerously-large-outbound-peer-limit"]).is_err());
+        assert!(load(&["-maxoutboundfullrelay=0"]).is_err());
+        assert!(load(&["-altslots=9"]).unwrap_err().contains("-altslots"));
+        assert!(load(&["-altslots=4", "-maxconnections=3"]).unwrap_err().contains("-maxconnections"));
+        assert!(load(&["-altslots=2", "-altprefer=family:knots"]).unwrap_err().contains("unknown family"));
+        assert!(load(&["-altuatrust=sometimes"]).is_err());
+        let c = load(&["-altslots=3", "-altprefer=FAMILY:btcd@1", "-altprefer=svc:COMPACT_FILTERS", "-altuatrust=strict", "-altfillwait=30"])
+            .unwrap();
+        assert_eq!(c.altprefer, vec!["family:btcd@1".to_string(), "svc:compact_filters".to_string()]);
+        let alt = c.alt_slot_config();
+        assert_eq!((alt.slots, alt.rules.len(), alt.ua_trust), (3, 2, node::net::altslots::UaTrust::Strict));
+        assert_eq!(alt.fill_wait, std::time::Duration::from_secs(30));
+        std::fs::write(dir.path().join("bitcoin.conf"), "altslots=2\naltprefer=family:floresta\naltprefer=family:btcd\n").unwrap();
+        let c = load(&[]).unwrap();
+        assert_eq!((c.altslots, c.altprefer.len()), (2, 2), "from the file, repeatable");
+        assert_eq!(load(&["-altprefer=family:bcoin"]).unwrap().altprefer, vec!["family:bcoin".to_string()]);
+        std::fs::write(dir.path().join("bitcoin.conf"), "altslots=lots\n").unwrap();
+        assert!(load(&[]).is_err());
+    }
+
     /// `-napstorerecover`: off by default, on from the command line in either
     /// spelling or from the file, and independent of `-nap`.
     #[test]
@@ -12924,6 +13184,7 @@ testactivationheight=bip34@2
             opreturn_prune_args: OpReturnPruneArgs::default(),
             nap_args: NapArgs::default(),
             peer_survey_args: PeerSurveyArgs::default(),
+            alt_slot_args: AltSlotArgs::default(),
             peertimeout: None,
             cjdnsreachable: None,
             datadir: Some(PathBuf::from("/tmp/satd-test")),
@@ -13249,6 +13510,7 @@ testactivationheight=bip34@2
             opreturn_prune_args: OpReturnPruneArgs::default(),
             nap_args: NapArgs::default(),
             peer_survey_args: PeerSurveyArgs::default(),
+            alt_slot_args: AltSlotArgs::default(),
             peertimeout: None,
             cjdnsreachable: None,
             datadir: Some(PathBuf::from("/tmp/satd-test")),

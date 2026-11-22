@@ -107,6 +107,13 @@ pub fn webhook_target_from(c: &Config) -> Option<WebhookTarget> {
 /// reflects that they take effect without a restart.
 fn consumed_from_reloaded_config(_c: &Config, _h: &ReloadHandles) {}
 
+/// Push `-maxoutboundfullrelay` and the alt-slot settings to the peer
+/// manager.
+fn apply_outbound_slots(c: &Config, h: &ReloadHandles) {
+    h.peer_manager.set_max_outbound_full_relay(c.maxoutboundfullrelay);
+    h.peer_manager.set_alt_slots(c.alt_slot_config());
+}
+
 /// The entries of a peer list present in `new` but not in `old`. Only these
 /// act on a reload: existing peers are left alone, so a reload that merely
 /// appends a peer doesn't churn live connections. Removing an entry from the
@@ -822,6 +829,28 @@ fn field_specs() -> Vec<FieldSpec> {
             }
             h.peer_manager.set_max_connections(n)
         }),
+        // `-maxoutboundfullrelay` and the alt-slots. Each apply pushes all of
+        // them, so the order the keys change in does not matter. A value
+        // past its limits fails `Config::from_cli`, and the whole reload is
+        // refused with the running values kept. Lowering either disconnects
+        // no peer: surplus full-relay peers go one at a time, as after IBD,
+        // and peers past a lowered `-altslots` become ordinary outbounds.
+        live!("maxoutboundfullrelay", maxoutboundfullrelay, |c, h| {
+            for w in node::net::altslots::outbound_limit_warnings(c.maxoutboundfullrelay, 0) {
+                tracing::warn!("{w}");
+            }
+            apply_outbound_slots(c, h)
+        }),
+        live!("enable-dangerously-large-outbound-peer-limit", dangerous_outbound_limit, consumed_from_reloaded_config),
+        live!("altslots", altslots, |c, h| {
+            for w in node::net::altslots::outbound_limit_warnings(0, c.altslots) {
+                tracing::warn!("{w}");
+            }
+            apply_outbound_slots(c, h)
+        }),
+        live!("altprefer", altprefer, apply_outbound_slots),
+        live!("altuatrust", altuatrust, apply_outbound_slots),
+        live!("altfillwait", altfillwait, apply_outbound_slots),
         live!("maxinboundperip", maxinboundperip, |c, h| {
             h.peer_manager.set_max_inbound_per_ip(c.maxinboundperip)
         }),
