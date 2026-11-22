@@ -623,7 +623,9 @@ preserved; the satd extension is opt-in per request or per flag.
   `crawlbook.dat`, outside every connection budget and never written to the
   address book. Supersedes `-peersurvey` while on. `getcrawlinfo` reports
   its state and counts (no address); `getcrawlnodes [verbose]` its book,
-  raw addresses included. Core has no crawler.
+  raw addresses included; `dumpcrawlsnapshot [raw]` a Bitnodes-shaped
+  snapshot, keyed node IDs unless `raw`. Hourly snapshots go to `crawl/`.
+  Core has no crawler.
 
 - **`-maxoutboundfullrelay` and alt-slots (`-altslots`, `-altprefer`)** —
   the full-relay outbound count, fixed at 8 in Core, is configurable (above

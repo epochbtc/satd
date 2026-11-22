@@ -799,6 +799,12 @@ pub struct Config {
     pub crawluacomment: Option<String>,
     /// `-crawlprobes`: send the vetted probes on discovery sessions.
     pub crawlprobes: bool,
+    /// `-crawlexportkeyfile`: the keyed export's key, as given; relative
+    /// to the network's data directory. `None` is `crawlexport.key` there.
+    pub crawlexportkeyfile: Option<std::path::PathBuf>,
+    /// `-crawlexportmink`: an ASN with fewer nodes in a keyed export is
+    /// `"other"`.
+    pub crawlexportmink: u32,
     /// `-peerflagpolicy`: `observe` (default), flags are information only,
     /// or `evict`, inbound peers flagged `C`, `S` or `F` are evicted first
     /// when an inbound slot is needed. satd-only.
@@ -4470,6 +4476,8 @@ impl Config {
             crawlseed: crawl.seeds,
             crawluacomment: crawl.ua_comment,
             crawlprobes: crawl.probes,
+            crawlexportkeyfile: crawl.export_key_file,
+            crawlexportmink: crawl.export_min_k,
             maxoutboundfullrelay: alt_slots.maxoutboundfullrelay,
             dangerous_outbound_limit: alt_slots.dangerous_outbound_limit,
             altslots: alt_slots.altslots,
@@ -5270,6 +5278,8 @@ impl Config {
             "seeds": self.crawlseed.len(),
             "uacomment": self.crawluacomment,
             "probes": self.crawlprobes,
+            "export_key_file": self.crawlexportkeyfile.is_some(),
+            "export_min_k": self.crawlexportmink,
         });
         out["p2p"]["max_outbound_full_relay"] = serde_json::json!(self.maxoutboundfullrelay);
         out["p2p"]["peer_flag_policy"] = serde_json::json!(self.peerflagpolicy);
@@ -8445,6 +8455,8 @@ pub struct CrawlArgs {
     pub crawlseed: Vec<String>,
     pub crawluacomment: Option<String>,
     pub crawlprobes: Option<bool>,
+    pub crawlexportkeyfile: Option<String>,
+    pub crawlexportmink: Option<u64>,
 }
 
 const CRAWL_ARG_SPECS: &[(&str, &str, StratumArgKind, &str)] = &[
@@ -8514,6 +8526,18 @@ const CRAWL_ARG_SPECS: &[(&str, &str, StratumArgKind, &str)] = &[
         StratumArgKind::Bool,
         "With -crawl, send the survey's harmless probes on each discovery session (default: 1)",
     ),
+    (
+        "crawlexportkeyfile",
+        "PATH",
+        StratumArgKind::Text,
+        "With -crawl, the 32-byte key dumpcrawlsnapshot's node IDs are computed under; never created or rotated by satd. Relative paths are under the network's data directory (default: crawlexport.key, created by the first keyed export)",
+    ),
+    (
+        "crawlexportmink",
+        "N",
+        StratumArgKind::U64,
+        "With -crawl, an autonomous system with fewer nodes than this in a keyed dumpcrawlsnapshot is listed as \"other\", 1 to 100000 (default: 10)",
+    ),
 ];
 
 impl clap::Args for CrawlArgs {
@@ -8550,6 +8574,8 @@ impl clap::FromArgMatches for CrawlArgs {
             crawlseed: list(m, "crawlseed"),
             crawluacomment: m.remove_one("crawluacomment"),
             crawlprobes: m.remove_one("crawlprobes"),
+            crawlexportkeyfile: m.remove_one("crawlexportkeyfile"),
+            crawlexportmink: m.remove_one("crawlexportmink"),
         })
     }
 
@@ -8576,6 +8602,8 @@ struct CrawlSettings {
     seeds: Vec<String>,
     ua_comment: Option<String>,
     probes: bool,
+    export_key_file: Option<std::path::PathBuf>,
+    export_min_k: u32,
 }
 
 /// `-crawl` and its options. Each limit is refused past its ceiling
@@ -8676,6 +8704,17 @@ fn resolve_crawl(
     if let Some(c) = &ua_comment {
         crawl::user_agent(Some(c))?;
     }
+    let export_key_file = cli.crawlexportkeyfile.clone().or_else(|| file_get("crawlexportkeyfile"));
+    if export_key_file.as_deref().is_some_and(|f| f.trim().is_empty()) {
+        return Err("-crawlexportkeyfile: an empty path".to_string());
+    }
+    let export_min_k = number(
+        cli.crawlexportmink,
+        "crawlexportmink",
+        u64::from(node::net::crawlsnapshot::DEFAULT_EXPORT_MIN_K),
+        1,
+        u64::from(node::net::crawlsnapshot::MAX_EXPORT_MIN_K),
+    )? as u32;
     Ok(CrawlSettings {
         crawl: resolve_nap(&cli.crawl, "crawl", file_get),
         concurrency,
@@ -8688,14 +8727,19 @@ fn resolve_crawl(
         seeds,
         ua_comment,
         probes: cli.crawlprobes.or_else(|| file_get("crawlprobes").and_then(|v| parse_bool(&v))).unwrap_or(true),
+        export_key_file: export_key_file.map(|f| std::path::PathBuf::from(f.trim())),
+        export_min_k,
     })
 }
 
 impl Config {
     /// The crawl's settings as the peer manager takes them. Every value was
-    /// checked when the config was read; `path` is where the book is kept.
-    pub fn crawl_config(&self, path: Option<std::path::PathBuf>) -> node::net::crawl::CrawlConfig {
-        use node::net::crawl;
+    /// checked when the config was read. `datadir`, the network's data
+    /// directory, holds the book, the snapshots and the default export key,
+    /// and is where a relative `-crawlexportkeyfile` is read; without it the
+    /// crawl keeps no file.
+    pub fn crawl_config(&self, datadir: Option<&std::path::Path>) -> node::net::crawl::CrawlConfig {
+        use node::net::{crawl, crawlsnapshot};
         let networks = (!self.crawlnet.is_empty())
             .then(|| self.crawlnet.iter().filter_map(|n| crawl::parse_network(n).ok()).collect());
         let port = node::net::peer::default_p2p_port(self.network);
@@ -8722,7 +8766,13 @@ impl Config {
             dns_seeds: self.dns && self.dnsseed,
             fixed_seeds: self.fixedseeds,
             signet_seeds: self.signet_seed_nodes.clone(),
-            path,
+            path: datadir.map(|d| d.join(node::net::crawlbook::CRAWL_FILE)),
+            snapshot_dir: datadir.map(|d| d.join(crawlsnapshot::SNAPSHOT_DIR)),
+            export_key: datadir.map(|d| match &self.crawlexportkeyfile {
+                Some(f) => crawlsnapshot::KeySource::Supplied(d.join(f)),
+                None => crawlsnapshot::KeySource::Default(d.join(crawlsnapshot::EXPORT_KEY_FILE)),
+            }),
+            export_min_k: self.crawlexportmink,
             timings: crawl::Timings::DEFAULT,
         }
     }
@@ -9781,6 +9831,8 @@ pub fn normalize_args(args: Vec<String>) -> Vec<String> {
         "crawlseed",
         "crawluacomment",
         "crawlprobes",
+        "crawlexportkeyfile",
+        "crawlexportmink",
         "maxoutboundfullrelay",
         "enable-dangerously-large-outbound-peer-limit",
         "altslots",
@@ -10648,6 +10700,8 @@ pub const KNOWN_CONFIG_KEYS: &[&str] = &[
     "crawlseed",
     "crawluacomment",
     "crawlprobes",
+    "crawlexportkeyfile",
+    "crawlexportmink",
     "maxoutboundfullrelay",
     "enable-dangerously-large-outbound-peer-limit",
     "altslots",
@@ -12333,6 +12387,47 @@ blockmintxfee=0.00001
         assert!(load(&[]).is_err(), "the ceiling holds in the file too");
         std::fs::write(dir.path().join("bitcoin.conf"), "crawlnope=1\n").unwrap();
         assert!(load(&[]).is_err(), "an unknown crawl key is refused");
+    }
+
+    /// The crawl's export options: `crawlexportkeyfile` relative to the
+    /// network's data directory and never the default file, which the
+    /// first keyed export creates; `crawlexportmink` 10 by default, 1 to
+    /// 100000; the book, the snapshots and the key all under the data
+    /// directory, and none without one.
+    #[test]
+    fn crawl_export_options() {
+        use node::net::crawlsnapshot::KeySource;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let load = |extra: &[&str]| {
+            let mut args = vec!["satd", "--regtest", "--datadir", dir.path().to_str().unwrap()];
+            args.extend_from_slice(extra);
+            Config::from_cli(parse_cli(normalize_args(args.iter().map(|a| a.to_string()).collect())).unwrap())
+        };
+        let net = std::path::Path::new("/data/regtest");
+        let c = load(&[]).unwrap();
+        assert_eq!((c.crawlexportkeyfile.as_ref(), c.crawlexportmink), (None, 10));
+        let cc = c.crawl_config(Some(net));
+        assert_eq!(cc.path, Some(net.join("crawlbook.dat")));
+        assert_eq!(cc.snapshot_dir, Some(net.join("crawl")));
+        assert_eq!(cc.export_key, Some(KeySource::Default(net.join("crawlexport.key"))));
+        assert_eq!(cc.export_min_k, 10);
+        let none = c.crawl_config(None);
+        assert!(none.path.is_none() && none.snapshot_dir.is_none() && none.export_key.is_none());
+
+        let c = load(&["-crawlexportkeyfile=census.key", "-crawlexportmink=25"]).unwrap();
+        let cc = c.crawl_config(Some(net));
+        assert_eq!(cc.export_key, Some(KeySource::Supplied(net.join("census.key"))), "relative to the data directory");
+        assert_eq!(cc.export_min_k, 25);
+        let c = load(&["-crawlexportkeyfile=/keys/census.key"]).unwrap();
+        assert_eq!(c.crawl_config(Some(net)).export_key, Some(KeySource::Supplied("/keys/census.key".into())));
+        for bad in ["-crawlexportmink=0", "-crawlexportmink=100001", "-crawlexportkeyfile="] {
+            assert!(load(&[bad]).is_err(), "{bad} accepted");
+        }
+        assert_eq!(load(&["-crawlexportmink=1"]).unwrap().crawlexportmink, 1);
+        std::fs::write(dir.path().join("bitcoin.conf"), "crawlexportmink=12\ncrawlexportkeyfile=k\n").unwrap();
+        let c = load(&[]).unwrap();
+        assert_eq!((c.crawlexportmink, c.crawlexportkeyfile), (12, Some("k".into())), "from the file");
+        assert_eq!(load(&["-crawlexportmink=3"]).unwrap().crawlexportmink, 3, "the command line wins");
     }
 
     /// `-napstorerecover`: off by default, on from the command line in either

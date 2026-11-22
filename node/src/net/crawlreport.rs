@@ -191,7 +191,7 @@ pub fn addr_text(addr: &CrawlAddr) -> String {
     }
 }
 
-fn chain_check_name(c: ChainCheck) -> &'static str {
+pub(crate) fn chain_check_name(c: ChainCheck) -> &'static str {
     match c {
         ChainCheck::OnChain => "on_chain",
         ChainCheck::Behind => "behind",

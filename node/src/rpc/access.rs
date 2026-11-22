@@ -242,7 +242,13 @@ pub fn classify(method: &str) -> Option<RpcAccess> {
         // The crawl's book: the raw address of every node it learned or
         // reached. Kept off the read-only listener and away from read-only
         // tokens, as the survey's rows are.
-        | "getcrawlnodes" => Control,
+        | "getcrawlnodes"
+        // The crawl's export, keyed or raw. Raw, it is every reachable
+        // node's address. Keyed, it is the deliberate act of publishing the
+        // crawl, it creates the export key on first use, and every ID it
+        // gives out is only as safe as that key: so it is the operator's
+        // too, never a read-only token's.
+        | "dumpcrawlsnapshot" => Control,
 
         // --- Control: index management ---
         "backfillindex" | "pauseindex" | "resumeindex" | "cancelindex" => Control,
@@ -334,6 +340,7 @@ mod tests {
             "getblockfrompeer",
             "getpeersurvey",
             "getcrawlnodes",
+            "dumpcrawlsnapshot",
             "prioritisetransaction",
             "getprioritisedtransactions",
             "savemempool",

@@ -826,3 +826,96 @@ fn getcrawlinfo_off_has_the_same_keys() {
     assert_eq!(info["sessions"]["reached"], 0);
     assert_eq!(info["totals"]["totalbytessent"], 0);
 }
+
+// ---- the hourly snapshots and dumpcrawlsnapshot ----
+
+/// A config whose snapshots and export key are under `dir`.
+fn with_files(dir: &std::path::Path) -> CrawlConfig {
+    use crate::net::crawlsnapshot::{KeySource, EXPORT_KEY_FILE, SNAPSHOT_DIR};
+    CrawlConfig {
+        snapshot_dir: Some(dir.join(SNAPSHOT_DIR)),
+        export_key: Some(KeySource::Default(dir.join(EXPORT_KEY_FILE))),
+        ..config()
+    }
+}
+
+/// With the crawl off, `dumpcrawlsnapshot` is an error and writes no key.
+#[test]
+fn dumpcrawlsnapshot_with_the_crawl_off() {
+    let (pm, dir) = mk_pm_with(None);
+    assert!(pm.dump_crawl_snapshot(false).unwrap_err().contains("crawl is off"));
+    assert!(pm.dump_crawl_snapshot(true).is_err());
+    assert!(!dir.path().join(crate::net::crawlsnapshot::EXPORT_KEY_FILE).exists());
+    assert!(!pm.crawl_snapshot_tick(crate::time::now_secs()));
+}
+
+/// After a session to a scripted peer: the keyed export lists it by node
+/// ID under the key it created, with no address and no port; the raw one
+/// by its address. The hourly tick writes one snapshot an hour, with the
+/// peer's raw address in it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dumpcrawlsnapshot_and_the_hourly_snapshot_after_a_session() {
+    use crate::net::crawlsnapshot;
+    let (pm, dir) = mk_pm_with(None);
+    let run = enable(&pm, with_files(dir.path()));
+    let (target, _log) = scripted("127.0.0.1", core_script()).await;
+    assert!(run.book.lock().seed(target.clone(), 0, crate::time::now_secs()));
+    pm.run_crawl_session(target.clone(), SessionKind::Liveness, None).await;
+    let PeerAddr::Socket(sa) = target else { unreachable!() };
+
+    let keyed = pm.dump_crawl_snapshot(false).unwrap();
+    assert_eq!(keyed["total_nodes"], 1, "{keyed}");
+    let key = crawlsnapshot::read_key(&dir.path().join(crawlsnapshot::EXPORT_KEY_FILE)).expect("created");
+    let node = &keyed["nodes"][crawlsnapshot::node_id(&key, &sa)];
+    assert_eq!(node[1], "/Satoshi:32.1.0/", "{keyed}");
+    assert_eq!(node[13]["port"], "other");
+    let text = keyed.to_string();
+    assert!(!text.contains("127.0.0.1") && !text.contains(&format!(":{}", sa.port())), "{text}");
+    assert_eq!(keyed["satd"]["chain"], "regtest");
+    assert_eq!(pm.dump_crawl_snapshot(false).unwrap()["nodes"], keyed["nodes"], "the same key, the same IDs");
+
+    let raw = pm.dump_crawl_snapshot(true).unwrap();
+    assert!(raw["nodes"].get(sa.to_string()).is_some(), "{raw}");
+
+    let hour = crawl_hour();
+    assert!(pm.crawl_snapshot_tick(hour + 5));
+    assert!(!pm.crawl_snapshot_tick(hour + 1800), "one an hour");
+    let snaps = dir.path().join(crawlsnapshot::SNAPSHOT_DIR);
+    let files = crawlsnapshot::list_snapshots(&snaps).unwrap();
+    assert_eq!(files, vec![hour + 5]);
+    let gz = std::fs::read(snaps.join(crawlsnapshot::snapshot_file_name(hour + 5))).unwrap();
+    let lines = String::from_utf8(crawlsnapshot::gunzip(&gz).unwrap()).unwrap();
+    assert_eq!(lines.lines().count(), 1, "{lines}");
+    assert!(lines.contains(&sa.to_string()), "the hourly snapshot holds the raw address");
+}
+
+/// The start of the current UTC hour, a few minutes back so the session
+/// above is within the liveness window of every time the test uses.
+fn crawl_hour() -> u64 {
+    let now = crate::time::now_secs();
+    now - now % 3600
+}
+
+/// A `-crawlexportkeyfile` key is the one used, and never created when it
+/// is missing: the keyed export is refused, the raw one is not.
+#[test]
+fn dumpcrawlsnapshot_honours_crawlexportkeyfile() {
+    use crate::net::crawlsnapshot::{self, KeySource};
+    let (pm, dir) = mk_pm_with(None);
+    let path = dir.path().join("census.key");
+    let run = enable(&pm, CrawlConfig { export_key: Some(KeySource::Supplied(path.clone())), ..config() });
+    let now = crate::time::now_secs();
+    let peer = PeerAddr::Socket(SocketAddr::from(([127, 0, 0, 1], 18444)));
+    assert!(run.book.lock().seed(peer.clone(), 0, now));
+    let ok = crate::net::crawlbook::SessionResult { v2: Attempt::Failed, v1: Attempt::Ok, observation: None };
+    run.book.lock().record_result(&peer, None, SessionKind::Liveness, ok, now);
+    assert!(pm.dump_crawl_snapshot(false).unwrap_err().contains("census.key"));
+    assert!(!path.exists(), "never created");
+    assert!(!dir.path().join(crawlsnapshot::EXPORT_KEY_FILE).exists(), "nor the default");
+    assert!(pm.dump_crawl_snapshot(true).is_ok());
+    std::fs::write(&path, [7u8; 32]).unwrap();
+    let out = pm.dump_crawl_snapshot(false).unwrap();
+    let PeerAddr::Socket(sa) = peer else { unreachable!() };
+    let id = crawlsnapshot::node_id(&crawlsnapshot::ExportKey([7; 32]), &sa);
+    assert_eq!(out["nodes"][&id][13]["port"], "default", "{out}");
+}

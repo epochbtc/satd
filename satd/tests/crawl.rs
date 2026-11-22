@@ -236,6 +236,20 @@ fn a_regtest_cluster_is_crawled_to_completion() {
     check_reports(&c, metrics_port, &[s1, s2, dead, xp, yp]);
     c.stop();
 
+    // The hourly snapshot: written when the crawl started, with the book's
+    // file permissions.
+    let snaps = c.datadir.join("regtest").join("crawl");
+    let files = node::net::crawlsnapshot::list_snapshots(&snaps).unwrap();
+    assert_eq!(files.len(), 1, "one this hour: {files:?}");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let snap = snaps.join(node::net::crawlsnapshot::snapshot_file_name(files[0]));
+        assert_eq!(mode(&snap), mode(&c.datadir.join("regtest").join(CRAWL_FILE)));
+        assert_eq!(mode(&snap) & 0o077, 0o077 & mode(&c.datadir.join("regtest")) & 0o666);
+    }
+
     let book = read_book(&c);
     assert_eq!(book.len(), 5, "{:?}", book.rows().map(|(a, _)| a.clone()).collect::<Vec<_>>());
     let counts = book.counts();
@@ -321,7 +335,33 @@ fn check_reports(c: &TestNode, metrics_port: u16, ports: &[u16]) {
     assert_eq!(s1["observation"]["getaddr"]["entries"], 3);
     let help = c.rpc_ok("help", vec![]);
     let help = help.as_str().unwrap();
-    assert!(help.contains("getcrawlinfo") && help.contains("getcrawlnodes"));
+    assert!(help.contains("getcrawlinfo") && help.contains("getcrawlnodes") && help.contains("dumpcrawlsnapshot"));
+
+    // The export: keyed by default, no address and no crawled port in it,
+    // under a key created 0600 on first use; raw only when asked.
+    let keyed = c.rpc_ok("dumpcrawlsnapshot", vec![]);
+    assert_eq!(keyed["total_nodes"], 4, "{keyed}");
+    assert_eq!(keyed["latest_height"], 1);
+    let text = keyed.to_string();
+    assert!(!text.contains("127.0.0.1"), "keyed: {text}");
+    for port in ports {
+        assert!(!text.contains(&format!(":{port}")), "keyed: no crawled port in {text}");
+    }
+    for (id, node) in keyed["nodes"].as_object().unwrap() {
+        assert_eq!(id.len(), 32, "{id}");
+        assert_eq!(node.as_array().unwrap().len(), 14);
+    }
+    let key = c.datadir.join("regtest").join("crawlexport.key");
+    assert_eq!(std::fs::read(&key).unwrap().len(), 32);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        assert_eq!(std::fs::metadata(&key).unwrap().permissions().mode() & 0o777, 0o600);
+    }
+    let raw = c.rpc_call_with_named_params("dumpcrawlsnapshot", json!({ "raw": true })).unwrap();
+    let raw = &raw["result"];
+    assert_eq!(raw["total_nodes"], 4, "{raw}");
+    assert!(raw["nodes"].get(format!("127.0.0.1:{}", ports[0])).is_some(), "raw: {raw}");
 
     let base = format!("http://127.0.0.1:{metrics_port}");
     let body = reqwest::blocking::get(format!("{base}/metrics")).unwrap().text().unwrap();

@@ -101,6 +101,8 @@ restart-only).
 | `-crawlseed` | none | An IP address or onion to start from, at the network's port unless one is given (repeatable). No names. |
 | `-crawluacomment` | none | A comment for the crawler's user agent: `/satd:<version>(crawler; <comment>)/`. Use one that tells other operators who runs the crawl. |
 | `-crawlprobes` | on | Send the four [survey probes](peer-behavior.md#probes) on each discovery session. |
+| `-crawlexportkeyfile` | `crawlexport.key` | The key a keyed `dumpcrawlsnapshot` computes node IDs under: a 32-byte file, relative paths under the network's data directory. See [Snapshots and export](#snapshots-and-export). |
+| `-crawlexportmink` | 10 | In a keyed export, an autonomous system with fewer nodes than this is `"other"`; 1 to 100000. |
 
 The limits hold whatever the options say: no option lifts concurrency past
 256 or the rate past 100 a second. On top of them, the crawl never opens
@@ -194,6 +196,9 @@ back (`getcrawlnodes`). Retention is bounded: an address that fails for 30
 days and that no node names in that time is dropped, and the book's size is
 capped.
 
+The hourly snapshots in `crawl/` hold raw IP addresses too; see
+[Snapshots and export](#snapshots-and-export).
+
 ## Privacy
 
 Nothing leaves the node by default. The data stays in the data directory,
@@ -203,9 +208,13 @@ behind the RPC's authentication:
   an address, never a user agent.
 - `getcrawlnodes` returns raw addresses. It is operator control: refused on
   the read-only listener, and a bearer token needs `rpc:write` for it.
+- `dumpcrawlsnapshot` exports the reachable set keyed by default: no
+  clearnet address and no port number in it. Only `raw=true` gives
+  addresses. Both forms are operator control.
 
-Treat `crawlbook.dat`, `getcrawlnodes` output and any copy of them as
-personal data where clearnet IP addresses of home nodes are.
+Treat `crawlbook.dat`, the snapshots in `crawl/`, `getcrawlnodes` and
+`dumpcrawlsnapshot raw=true` output, and any copy of them, as personal data
+where clearnet IP addresses of home nodes are.
 
 ## Risks to the operator
 
@@ -307,6 +316,123 @@ time any answer gave it), `attempts`, `last_attempt`, `last_discovery`,
 peer's height), `chain_check`, `clock_offset` (seconds), `handshake_rtt_ms`,
 `getaddr` (`answered` with `entries` and `delay_ms`, or `no_answer`) and
 `probes` as in `getpeersurvey`.
+
+## Snapshots and export
+
+A **snapshot** is the crawl's reachable set: every address with a completed
+handshake within the liveness window (`-crawlliveness`, 2 hours). It is the
+same set `getcrawlinfo` counts under `reachable`.
+
+### Hourly snapshots
+
+Once an hour the crawl writes a snapshot to `crawl/<unix time>.jsonl.gz` in
+the network's data directory: gzip-compressed JSON lines, one line per
+reachable node, with raw addresses:
+
+```json
+{"timestamp": 1790006400, "latest_height": 900002, "addr": "203.0.113.7:8333", "node": [70016, "/Satoshi:32.1.0/", null, 3081, 900000, null, null, null, null, null, null, "AS64496", null, {"network": "ipv4", "...": "..."}]}
+```
+
+`node` is the node as a raw `dumpcrawlsnapshot` lists it. Read one with
+`zcat crawl/<time>.jsonl.gz`.
+
+Each write prunes the directory: every snapshot of the last 7 days is
+kept, of older ones only the first of each UTC day, and none older than 90
+days. On mainnet a snapshot is around 1 MB compressed, so about 170 MB of
+hourly and 90 MB of daily snapshots. A restart within the hour writes no
+second snapshot for it. Files in `crawl/` other than snapshots are left
+alone.
+
+**The snapshots hold raw IP addresses.** `crawl/` is created with the data
+directory's permissions, and each snapshot is written as `crawlbook.dat` is
+(the directory's permissions, execute bits dropped: 0600 under a 0700 data
+directory). Nothing reads them back over RPC.
+
+### `dumpcrawlsnapshot [raw]`
+
+`dumpcrawlsnapshot` returns the reachable set now, shaped as a Bitnodes
+snapshot, so tools that read those read this:
+
+```json
+{
+  "timestamp": 1790006412,
+  "total_nodes": 21000,
+  "latest_height": 900002,
+  "nodes": {
+    "adccb55f12feb805aab99ac4145f6109": [70016, "/Satoshi:32.1.0/", null, 3081, 900000,
+      null, null, null, null, null, null, "AS64496", null,
+      {"network": "ipv4", "port": "default", "transport": "v2_and_v1",
+       "v2_advertised": true, "family": "core", "confidence": "high",
+       "mismatch": false, "chain_check": null, "last_seen": 1790005980}],
+    "pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.onion": ["..."]
+  },
+  "satd": {"export": "keyed", "chain": "main", "liveness": 7200,
+           "learned_not_dialled": {"i2p": 200, "cjdns": 34},
+           "node_id": "hmac-sha256-128", "asn_min_count": 10}
+}
+```
+
+| Field | What |
+|---|---|
+| `timestamp` | When the snapshot was taken, Unix seconds. |
+| `total_nodes` | Nodes in `nodes`. |
+| `latest_height` | This node's tip height. |
+| `nodes` | One entry per reachable node: keyed by node ID (or onion), or with `raw=true` by address. |
+| `satd` | `export` (`keyed` or `raw`), `chain`, `liveness` (the window, seconds), `learned_not_dialled` (I2P and CJDNS addresses learned: the crawl never dials them, so they are counts only); keyed, `node_id` (how IDs are made) and `asn_min_count`. |
+
+Each node is Bitnodes' thirteen fields, then a `satd` object:
+
+| # | Bitnodes field | Here |
+|---|---|---|
+| 0 | protocol version | from its `version` |
+| 1 | user agent | sanitized, as `getpeerinfo`'s `subver` |
+| 2 | connected since | null: the crawl holds no long-lived connection to measure it |
+| 3 | services | from its `version` |
+| 4 | height | its `start_height` |
+| 5 | hostname | null: no reverse lookup |
+| 6–10 | city, country, latitude, longitude, timezone | null: no geolocation |
+| 11 | ASN | `AS<n>` from `-asmap`; null without one |
+| 12 | organization | null |
+| 13 | `satd` | `network` (`ipv4`, `ipv6`, `onion`), `port` (`default` or `other`), `transport` (as in `getcrawlinfo`), `v2_advertised`, `family`, `confidence` (`high` or `low`; null unless the family is known), `mismatch`, `chain_check`, `last_seen` (its last completed handshake) |
+
+**Keyed, the default.** A clearnet node is listed by its node ID:
+HMAC-SHA256 under the export key of its address as `ip:port` (an IPv6
+address as `[ipv6]:port`, an IPv4-mapped one as IPv4), the first 16 bytes
+in hex. 128 bits leave no realistic chance of two nodes sharing an ID over
+years of snapshots. The same key gives a node the same ID in every export,
+so its history can be followed; without the key, an ID cannot be tested
+against a guessed address, as a plain hash could across the whole IPv4
+space. And in a keyed export:
+
+- onion addresses are listed as they are (the host, with `:port` added
+  only when it is not the network's port, so one onion's two services are
+  two nodes), since their operators publish them to be dialled and they say
+  nothing about location;
+- I2P and CJDNS addresses appear only as counts;
+- the port is only `default` or `other`;
+- an ASN with fewer than `-crawlexportmink` (10) nodes in the export is
+  `"other"`, since a lone node on a small network is otherwise nearly
+  identified;
+- the user agent and height are given per node.
+
+**The key** is `crawlexport.key` in the network's data directory: 32
+random bytes, created with mode 0600 by the first keyed export, and read as
+it stands by every export after. `-crawlexportkeyfile` names another file
+instead, which satd reads and never creates: a census operator who merges
+several crawlers' exports gives them one key that way. satd never rotates
+the key. Rotating is replacing the file: IDs from the next export on differ
+from all earlier ones, which protects later exports if the key leaked and
+breaks the per-node history. **If the key leaks, every ID exported under it
+can be reversed**: keep it off any host that publishes the export.
+
+**`raw=true`** lists every node by its address and gives every ASN as it
+is. It holds raw IP addresses.
+
+`dumpcrawlsnapshot` is operator control, keyed or raw: refused on the
+read-only listener, and a bearer token needs `rpc:write`. A keyed export is
+the act of publishing the crawl and creates the key on first use, so a
+read-only token gets neither form. With the crawl off, or a key file that
+is missing or not 32 bytes, it returns an error.
 
 ## Metrics and the status page
 

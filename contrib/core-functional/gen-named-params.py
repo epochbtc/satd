@@ -312,6 +312,7 @@ SATD_ONLY = {
     "getpeerbehavior": [["peer_id", False]],
     "getpeersurvey": [["verbose", False]],
     "getcrawlnodes": [["verbose", False]],
+    "dumpcrawlsnapshot": [["raw", False]],
     "getsilentpaymentblockdata": [
         ["blockhash", False], ["verbosity", False], ["dust_limit", False],
     ],

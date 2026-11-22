@@ -3060,7 +3060,7 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
     // for the node to leave initial block download. Enabled before the
     // survey, which it supersedes.
     if config.crawl {
-        let crawl_config = config.crawl_config(Some(net_datadir.join(node::net::crawlbook::CRAWL_FILE)));
+        let crawl_config = config.crawl_config(Some(&net_datadir));
         let limits = crawl_config.limits;
         if limits.clearnet == 0 && limits.tor == 0 {
             tracing::warn!("The crawl is off: the file-descriptor limit leaves no room for a crawl session");

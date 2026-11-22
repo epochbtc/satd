@@ -332,7 +332,10 @@ or why it is held, the limits in force, the size of its book, its sessions
 and traffic, and its count of the reachable network by network, transport
 (including nodes that speak BIP 324 only) and implementation family. Counts
 only. `getcrawlnodes [verbose]` returns one row per address in the crawl's
-book, so its output holds raw peer addresses; it is operator control. See
+book, so its output holds raw peer addresses; it is operator control.
+`dumpcrawlsnapshot [raw]` returns the crawl's reachable set shaped as a
+Bitnodes snapshot: keyed by default (clearnet nodes by an HMAC node ID, no
+address or port), raw addresses only with `raw=true`; operator control. See
 [Network Crawl](crawl.md).
 
 ## BIP 322 message verification

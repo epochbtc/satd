@@ -185,6 +185,13 @@ pub struct CrawlConfig {
     pub signet_seeds: Vec<String>,
     /// Where the book is kept (`crawlbook.dat`); `None` keeps it in memory.
     pub path: Option<PathBuf>,
+    /// Where the hourly snapshots go (`crawl/`); `None` writes none.
+    pub snapshot_dir: Option<PathBuf>,
+    /// The keyed export's key: `crawlexport.key`, or
+    /// `-crawlexportkeyfile`. `None` refuses keyed exports.
+    pub export_key: Option<crate::net::crawlsnapshot::KeySource>,
+    /// `-crawlexportmink`.
+    pub export_min_k: u32,
     pub timings: Timings,
 }
 
@@ -204,6 +211,9 @@ impl Default for CrawlConfig {
             fixed_seeds: true,
             signet_seeds: Vec::new(),
             path: None,
+            snapshot_dir: None,
+            export_key: None,
+            export_min_k: crate::net::crawlsnapshot::DEFAULT_EXPORT_MIN_K,
             timings: Timings::DEFAULT,
         }
     }

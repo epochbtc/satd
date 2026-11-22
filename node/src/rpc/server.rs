@@ -139,6 +139,7 @@ const HELP_METHODS: &[(&str, &str)] = &[
     ("getconnectioncount", "Network"),
     ("getcrawlinfo", "Network"),
     ("getcrawlnodes", "Network"),
+    ("dumpcrawlsnapshot", "Network"),
     ("getnettotals", "Network"),
     ("getnetworkinfo", "Network"),
     ("getnodeaddresses", "Network"),
@@ -3162,6 +3163,17 @@ pub async fn start(
         let verbose: Option<bool> = args.optional("verbose")?;
         args.check()?;
         Ok::<_, ErrorObjectOwned>(ctx.peer_manager.get_crawl_nodes(verbose.unwrap_or(false)))
+    })?;
+
+    // satd: the crawl's reachable set now, shaped as a Bitnodes snapshot:
+    // keyed node IDs unless `raw`.
+    module.register_method("dumpcrawlsnapshot", |params, ctx, _extensions| {
+        let mut args = Args::new(&params);
+        let raw: Option<bool> = args.optional("raw")?;
+        args.check()?;
+        ctx.peer_manager
+            .dump_crawl_snapshot(raw.unwrap_or(false))
+            .map_err(|e| ErrorObjectOwned::owned(-1, e, None::<()>))
     })?;
 
     module.register_method("getconnectioncount", |_params, ctx, _extensions| {

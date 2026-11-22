@@ -411,6 +411,7 @@ pub static SATD_CONVERT_PARAMS: &[Param] = &[
     p("estimatefees", 0, "targets", Json),
     p("estimatefees", 1, "mode", Str),
     p("getcrawlnodes", 0, "verbose", Json),
+    p("dumpcrawlsnapshot", 0, "raw", Json),
     p("getmempoolhistory", 0, "since_secs", Json),
     p("getmempoolsummary", 0, "top_n", Json),
     p("getpeerbehavior", 0, "peer_id", Json),
@@ -489,7 +490,7 @@ pub static CORE_METHODS: &[&str] = &[
 /// (`index_name`), `getquarantineentry` (`txid`), `policytest` (`rawtx`).
 #[rustfmt::skip]
 pub static SATD_METHODS: &[&str] = &[
-    "backfillindex", "cancelindex", "createnapattestation", "estimatefees", "exportnapsnapshot",
+    "backfillindex", "cancelindex", "createnapattestation", "dumpcrawlsnapshot", "estimatefees", "exportnapsnapshot",
     "getaddressbalance", "getaddresshistory", "getaddressutxos", "getblockfileaudit", "getconfig",
     "getcrawlinfo", "getcrawlnodes", "getibdprogress", "getmempoolhistory", "getmempoolsummary", "getnapreport",
     "getopreturnpruneinfo", "getorphaninfo", "getpeerbehavior", "getpeersurvey", "getpolicyinfo", "getquarantineentry",
@@ -794,6 +795,9 @@ mod tests {
         // `getcrawlnodes true` asks for the verbose rows: a bool, not "true".
         assert_eq!(positional("getcrawlnodes", &["true"]), json!([true]));
         assert_eq!(named("getcrawlnodes", &["verbose=true"]), r#"{"verbose":true}"#);
+        // `dumpcrawlsnapshot raw=true` asks for raw addresses: a bool.
+        assert_eq!(positional("dumpcrawlsnapshot", &["true"]), json!([true]));
+        assert_eq!(named("dumpcrawlsnapshot", &["raw=true"]), r#"{"raw":true}"#);
         // A satd RPC with string arguments only.
         assert_eq!(positional("getquarantineentry", &["0011"]), json!(["0011"]));
         // The Operator Manual's `sendrawtransaction hexstring allowquarantined=true`.
