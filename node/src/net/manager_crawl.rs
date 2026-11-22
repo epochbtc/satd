@@ -55,10 +55,13 @@ use super::survey_conn::{listen_passive, next_message, send_probes, Listened, Ne
 use crate::net::behavior::PeerBehavior;
 use crate::net::crawl::{self, CrawlConfig, Scheduler};
 use crate::net::crawlbook::{
-    Attempt, BookParams, CrawlBook, GetaddrResult, Network, Observation, SessionKind, SessionResult,
+    Attempt, BookParams, CrawlAddr, CrawlBook, GetaddrResult, Network, Observation, SessionKind, SessionResult,
+    UnknownShape,
 };
 use crate::net::crawlreport;
 use crate::net::crawlsnapshot::{self, SnapshotStore};
+use crate::net::fingerprint::{AddrKind, CrawlFeatures, Fingerprint};
+use crate::net::v2transport::V2Greeting;
 use crate::net::survey::{self, ProbeContext, ProbeResults};
 use bitcoin::p2p::address::{AddrV2, AddrV2Message};
 use rand::seq::SliceRandom as _;
@@ -176,7 +179,9 @@ enum Opened {
     V1Only,
     /// It failed some other way.
     Failed,
-    Open(Box<Connection>),
+    /// Open, with what the peer sent inside BIP 324 before its first
+    /// message when `v2`.
+    Open(Box<Connection>, Option<V2Greeting>),
 }
 
 /// What the handshake showed.
@@ -196,6 +201,10 @@ pub(super) struct SessionOutput {
     pub(super) result: SessionResult,
     pub(super) answer: Option<Vec<AddrV2Message>>,
 }
+
+/// A `getaddr` answer: its entries, the message it came in, and its delay
+/// in milliseconds.
+type GetaddrAnswer = (Vec<AddrV2Message>, AddrKind, u32);
 
 /// The next message on a connection still in its handshake, by `deadline`.
 async fn recv_by(conn: &mut Connection, deadline: tokio::time::Instant) -> Result<NetworkMessage, String> {
@@ -711,12 +720,18 @@ impl PeerManager {
             }
         };
         let reached = out.result.v2 == Attempt::Ok || out.result.v1 == Attempt::Ok;
+        let obs = out.result.observation.as_ref();
         tracing::debug!(
             %addr,
             kind = ?kind,
             v2 = ?out.result.v2,
             v1 = ?out.result.v1,
             answer = out.answer.as_ref().map(Vec::len),
+            fingerprint = %obs.map_or_else(|| "-".to_string(), |o| o.fingerprint.to_string()),
+            user_agent = obs.map_or("-", |o| o.user_agent.as_str()),
+            probes = ?obs.map(|o| o.probes),
+            chain_check = ?obs.and_then(|o| o.chain_check),
+            shape = ?obs.and_then(|o| o.shape.as_ref()),
             "crawl session done"
         );
         let now = crate::time::now_secs();
@@ -843,17 +858,20 @@ impl PeerManager {
         let _ = stream.set_nodelay(true);
         let magic = self.chain_state.p2p_magic();
         if !v2 {
-            return (Opened::Open(Box::new(Connection::with_magic(stream, magic))), deadline);
+            return (Opened::Open(Box::new(Connection::with_magic(stream, magic)), None), deadline);
         }
         let stats = PeerStats::new(run.totals.clone());
         let exchange = tokio::time::timeout_at(
             deadline,
-            crate::net::v2transport::initiator_handshake(&mut stream, self.chain_state.network, 0, Some(&stats)),
+            crate::net::v2transport::initiator_handshake_observed(&mut stream, self.chain_state.network, 0, Some(&stats)),
         )
         .await;
         match exchange {
-            Ok(Ok((cipher, leftover))) => (
-                Opened::Open(Box::new(Connection::v2(crate::net::v2transport::V2Connection::new(stream, cipher, leftover)))),
+            Ok(Ok((cipher, leftover, greeting))) => (
+                Opened::Open(
+                    Box::new(Connection::v2(crate::net::v2transport::V2Connection::new(stream, cipher, leftover))),
+                    Some(greeting),
+                ),
                 deadline,
             ),
             // Core redials v1 only when nothing came back.
@@ -929,12 +947,12 @@ impl PeerManager {
         let mut result = SessionResult::default();
         let opened = if kind == SessionKind::V1Recheck {
             match self.crawl_open(target, false).await {
-                (Opened::Open(c), d) => Some((*c, false, d)),
+                (Opened::Open(c, g), d) => Some((*c, g, d)),
                 _ => None,
             }
         } else {
             match self.crawl_open(target, true).await {
-                (Opened::Open(c), d) => Some((*c, true, d)),
+                (Opened::Open(c, g), d) => Some((*c, g, d)),
                 (Opened::NoDial, _) => None,
                 (Opened::Failed, _) => {
                     result.v2 = Attempt::Failed;
@@ -943,15 +961,16 @@ impl PeerManager {
                 (Opened::V1Only, _) => {
                     result.v2 = Attempt::Failed;
                     match self.crawl_open(target, false).await {
-                        (Opened::Open(c), d) => Some((*c, false, d)),
+                        (Opened::Open(c, g), d) => Some((*c, g, d)),
                         _ => None,
                     }
                 }
             }
         };
-        let Some((mut conn, v2, deadline)) = opened else {
+        let Some((mut conn, greeting, deadline)) = opened else {
             return SessionOutput { result, answer: None };
         };
+        let v2 = greeting.is_some();
         let shook = self.crawl_handshake(&mut conn, target, deadline).await;
         let slot = if v2 { &mut result.v2 } else { &mut result.v1 };
         let mut hs = match shook {
@@ -994,18 +1013,21 @@ impl PeerManager {
 
         let mut getaddr = None;
         let mut answer = None;
+        let mut answer_kind = None;
         let mut probes = ProbeResults::default();
+        let mut chain_check = None;
         if kind == SessionKind::Discovery && !closed {
             let deadline = tokio::time::Instant::now() + t.discovery;
             let (got, was_closed) = self.crawl_getaddr(&mut writer, &mut read_rx, &abort, deadline).await;
             closed = was_closed;
             getaddr = Some(match &got {
-                Some((entries, delay_ms)) => {
+                Some((entries, _, delay_ms)) => {
                     GetaddrResult::Answered { entries: entries.len() as u32, delay_ms: *delay_ms }
                 }
                 None => GetaddrResult::NoAnswer,
             });
-            answer = got.map(|(entries, _)| entries);
+            answer_kind = got.as_ref().map(|(_, kind, _)| *kind);
+            answer = got.map(|(entries, _, _)| entries);
             if run.config.probes && !closed {
                 // Every vetted probe, in a random order: a declared crawler
                 // has no shape to vary, and the record wants them all.
@@ -1018,6 +1040,7 @@ impl PeerManager {
                 let (top, stop) = locator.unwrap_or((zero, zero));
                 let ctx = ProbeContext::new(&mut rand::thread_rng(), top, stop, hs.wtxid_relay);
                 let waits = (t.probe_reply, t.unknown_probe);
+                let mut headers = None;
                 send_probes(
                     0,
                     &mut writer,
@@ -1028,9 +1051,14 @@ impl PeerManager {
                     locator.is_some(),
                     waits,
                     Some(deadline),
+                    Some(&mut headers),
                     |p, o| probes.set(p, o),
                 )
                 .await;
+                // The chain check reads the `getheaders` probe's answer.
+                if let Some(headers) = headers {
+                    chain_check = self.crawl_chain_check(&top, &stop, &headers, hs.version.start_height);
+                }
             }
         }
         // Close as the peer would want: our FIN, then what it still sends
@@ -1044,7 +1072,29 @@ impl PeerManager {
         read_task.abort();
         drop(writer);
 
-        let fingerprint = crate::net::fingerprint::classify(false, &hs.behavior.handshake, hs.behavior.version.as_ref(), true);
+        // A session that sent no probe keeps the last one's answers in the
+        // book, and is judged with them.
+        let judged_probes = if probes.any() {
+            probes
+        } else {
+            run.book
+                .lock()
+                .get(&CrawlAddr::Peer(target.clone()))
+                .and_then(|e| e.observation.as_ref())
+                .map(|o| o.probes)
+                .unwrap_or_default()
+        };
+        let features = CrawlFeatures { v2: greeting, probes: judged_probes, getaddr: answer_kind };
+        let capture = &hs.behavior.handshake;
+        let fingerprint = crate::net::fingerprint::classify_crawl(capture, hs.behavior.version.as_ref(), &features);
+        // An unknown shape keeps its raw features, so a new implementation
+        // shows up as many records of one shape before it has a row.
+        let shape = (fingerprint == Fingerprint::Unknown).then(|| UnknownShape {
+            commands: capture.commands().collect(),
+            relay: hs.version.relay,
+            v2: greeting,
+            getaddr: answer_kind,
+        });
         let asn = match target {
             PeerAddr::Socket(sa) if crate::net::is_routable(sa.ip()) => {
                 self.asmap.get().map(|m| m.lookup(sa.ip())).filter(|a| *a != 0)
@@ -1062,12 +1112,36 @@ impl PeerManager {
             v2,
             height: hs.version.start_height,
             our_height: hs.our_height,
-            chain_check: None,
+            chain_check,
             clock_offset_secs: Some(hs.clock_offset_secs),
             handshake_rtt_ms: Some(hs.rtt_ms),
             getaddr,
+            shape,
         });
         SessionOutput { result, answer }
+    }
+
+    /// The chain check (`crawl::chain_check`) on the `getheaders` probe's
+    /// answer: `locator` and `stop` are the probe's. `None` when the
+    /// locator has left our block index.
+    fn crawl_chain_check(
+        &self,
+        locator: &bitcoin::BlockHash,
+        stop: &bitcoin::BlockHash,
+        headers: &[bitcoin::block::Header],
+        peer_height: i32,
+    ) -> Option<crate::net::crawlbook::ChainCheck> {
+        use crate::net::crawl::OurBlock;
+        let chain = &self.chain_state;
+        let locator_height = chain.get_block_index(locator)?.height;
+        // The index's answer, with no walk: a wrong row would mislabel one
+        // record, and a walk per header would cost a crawl too much.
+        let ours = |hash: &bitcoin::BlockHash| match chain.get_block_index(hash) {
+            None => OurBlock::Unknown,
+            Some(e) if chain.active_chain_hash_at_height_indexed(e.height) == Some(*hash) => OurBlock::Active(e.height),
+            Some(_) => OurBlock::Stale,
+        };
+        Some(crawl::chain_check(locator, locator_height, stop, headers, peer_height, ours))
     }
 
     /// Send one `getaddr` and wait for the answer: the first `addr` or
@@ -1082,7 +1156,7 @@ impl PeerManager {
         read_rx: &mut mpsc::Receiver<NetworkMessage>,
         abort: &tokio::sync::Notify,
         deadline: tokio::time::Instant,
-    ) -> (Option<(Vec<AddrV2Message>, u32)>, bool) {
+    ) -> (Option<GetaddrAnswer>, bool) {
         if writer.send(NetworkMessage::GetAddr).await.is_err() {
             return (None, true);
         }
@@ -1095,10 +1169,12 @@ impl PeerManager {
             };
             let delay = || u32::try_from(sent.elapsed().as_millis()).unwrap_or(u32::MAX);
             match msg {
-                NetworkMessage::AddrV2(entries) if entries.len() > 1 => return (Some((entries, delay())), false),
+                NetworkMessage::AddrV2(entries) if entries.len() > 1 => {
+                    return (Some((entries, AddrKind::AddrV2, delay())), false);
+                }
                 NetworkMessage::Addr(entries) if entries.len() > 1 => {
                     let v2 = entries.iter().filter_map(|(time, a)| addr_entry_v2(*time, a)).collect();
-                    return (Some((v2, delay())), false);
+                    return (Some((v2, AddrKind::Addr, delay())), false);
                 }
                 NetworkMessage::Ping(n) => {
                     if writer.send(NetworkMessage::Pong(n)).await.is_err() {

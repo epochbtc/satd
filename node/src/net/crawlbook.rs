@@ -55,7 +55,8 @@ use bitcoin::hashes::{sha256, sha256d, Hash};
 use bitcoin::p2p::address::{AddrV2, AddrV2Message};
 use bitcoin::p2p::ServiceFlags;
 
-use crate::net::fingerprint::Fingerprint;
+use crate::net::fingerprint::{AddrKind, Fingerprint};
+use crate::net::v2transport::V2Greeting;
 use crate::net::peer::PeerAddr;
 use crate::net::survey::{self, Probe, ProbeOutcome, ProbeResults, Reader};
 
@@ -117,7 +118,8 @@ pub const ABANDONED_AFTER_SECS: u64 = 10 * 60;
 const SEED_SOURCE: u64 = 0;
 
 const FILE_MAGIC: [u8; 8] = *b"satdcrwl";
-const FILE_VERSION: u32 = 1;
+/// 2: an unknown shape's raw features.
+const FILE_VERSION: u32 = 2;
 
 /// An address in the book. Dialable addresses are [`PeerAddr`]s; I2P and
 /// CJDNS are kept to be counted, never dialled.
@@ -244,7 +246,32 @@ pub struct Observation {
     pub handshake_rtt_ms: Option<u32>,
     /// `None` when the session did not send `getaddr`.
     pub getaddr: Option<GetaddrResult>,
+    /// For an unknown fingerprint only: what the classifier read that the
+    /// fields above do not hold.
+    pub shape: Option<UnknownShape>,
 }
+
+/// The raw features of a crawl session no crawl row matched, kept so that
+/// a new implementation shows up as a cluster of records of one shape
+/// before it has a row. The `version` fields and the probes' answers are
+/// in the [`Observation`] itself. Bounded: at most
+/// [`HANDSHAKE_CAPTURE_MAX`](crate::net::behavior::HANDSHAKE_CAPTURE_MAX)
+/// commands of at most [`SHAPE_COMMAND_LEN`] bytes each.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnknownShape {
+    /// The handshake transcript (peer text, `?` for an unprintable byte).
+    pub commands: Vec<String>,
+    /// The `relay` flag of the peer's `version`.
+    pub relay: bool,
+    /// What the peer sent inside BIP 324 before its first message; `None`
+    /// over v1.
+    pub v2: Option<V2Greeting>,
+    /// The message the `getaddr` answer came in, when one came.
+    pub getaddr: Option<AddrKind>,
+}
+
+/// The longest command an [`UnknownShape`] keeps: the wire's command field.
+pub const SHAPE_COMMAND_LEN: usize = 12;
 
 impl Observation {
     /// Our tip less the peer's height: positive when the peer lags.
@@ -1221,6 +1248,62 @@ fn encode_observation(buf: &mut Vec<u8>, o: &Observation) {
     buf.push(tag);
     buf.extend_from_slice(&entries.to_le_bytes());
     buf.extend_from_slice(&delay.to_le_bytes());
+    buf.push(u8::from(o.shape.is_some()));
+    if let Some(shape) = &o.shape {
+        encode_shape(buf, shape);
+    }
+}
+
+fn encode_shape(buf: &mut Vec<u8>, s: &UnknownShape) {
+    let commands = &s.commands[..s.commands.len().min(crate::net::behavior::HANDSHAKE_CAPTURE_MAX)];
+    buf.push(commands.len() as u8);
+    for c in commands {
+        let b = c.as_bytes();
+        let b = &b[..b.len().min(SHAPE_COMMAND_LEN)];
+        buf.push(b.len() as u8);
+        buf.extend_from_slice(b);
+    }
+    buf.push(u8::from(s.relay));
+    buf.push(u8::from(s.v2.is_some()));
+    let g = s.v2.unwrap_or_default();
+    buf.extend_from_slice(&g.garbage_len.to_le_bytes());
+    buf.extend_from_slice(&g.decoys.to_le_bytes());
+    buf.extend_from_slice(&g.version_len.to_le_bytes());
+    buf.push(match s.getaddr {
+        None => 0,
+        Some(AddrKind::Addr) => 1,
+        Some(AddrKind::AddrV2) => 2,
+    });
+}
+
+fn decode_shape(r: &mut Reader) -> Result<UnknownShape, String> {
+    let n = usize::from(r.u8()?);
+    if n > crate::net::behavior::HANDSHAKE_CAPTURE_MAX {
+        return Err(format!("shape of {n} commands"));
+    }
+    let mut commands = Vec::with_capacity(n);
+    for _ in 0..n {
+        let len = usize::from(r.u8()?);
+        if len > SHAPE_COMMAND_LEN {
+            return Err(format!("shape command of {len} bytes"));
+        }
+        let text: String =
+            r.take(len)?.iter().map(|b| if b.is_ascii_graphic() { char::from(*b) } else { '?' }).collect();
+        commands.push(text);
+    }
+    let relay = get_flag(r)?;
+    let has_v2 = get_flag(r)?;
+    let garbage_len = r.u16()?;
+    let decoys = r.u32()?;
+    let version_len = r.u32()?;
+    let v2 = has_v2.then_some(V2Greeting { garbage_len, decoys, version_len });
+    let getaddr = match r.u8()? {
+        0 => None,
+        1 => Some(AddrKind::Addr),
+        2 => Some(AddrKind::AddrV2),
+        k => return Err(format!("bad getaddr kind {k}")),
+    };
+    Ok(UnknownShape { commands, relay, v2, getaddr })
 }
 
 fn decode_observation(r: &mut Reader) -> Result<Observation, String> {
@@ -1260,6 +1343,7 @@ fn decode_observation(r: &mut Reader) -> Result<Observation, String> {
         2 => Some(GetaddrResult::Answered { entries, delay_ms }),
         t => return Err(format!("bad getaddr result {t}")),
     };
+    let shape = if get_flag(r)? { Some(decode_shape(r)?) } else { None };
     Ok(Observation {
         at,
         fingerprint,
@@ -1275,6 +1359,7 @@ fn decode_observation(r: &mut Reader) -> Result<Observation, String> {
         clock_offset_secs: has_offset.then_some(offset),
         handshake_rtt_ms: has_rtt.then_some(rtt),
         getaddr,
+        shape,
     })
 }
 

@@ -41,6 +41,7 @@ fn observation(fingerprint: Fingerprint, v2: bool) -> Observation {
         height: 900_000,
         our_height: 900_002,
         chain_check: None,
+        shape: None,
         clock_offset_secs: Some(-3),
         handshake_rtt_ms: Some(120),
         getaddr: Some(GetaddrResult::Answered { entries: 812, delay_ms: 21_000 }),

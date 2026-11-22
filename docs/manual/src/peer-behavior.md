@@ -33,6 +33,26 @@ implementation against a local node, committed with the sources
 | `unknown` | No row matches, or the transcript is not settled yet (less than 10 seconds connected and still open). A shape no capture shows, such as an older release or Core's block-relay-only and feeler connections, is unknown rather than a guess. |
 | `mismatch` | The user agent names one family and the transcript matches another. |
 
+The network crawl (`-crawl`) judges its own sessions against rows of their
+own, captured against the crawl's `version` (services 0, `relay` off),
+since peers answer it differently: none sends `getheaders`. A crawl row
+also pins what every capture showed of the BIP 324 greeting (no decoy
+packet, an empty version packet), of the probes (`notfound` for the
+unknown transaction from satd and rbitcoin, silence for the unknown
+message, no disconnect; Core answers the unknown transaction only when its
+operator grants the crawler relay, so its row leaves that open) and of the
+`getaddr` answer (`addrv2`), so a crawl session can be `known` with `high`
+confidence where the survey could only say `low`. Crawl rows exist for
+Bitcoin Core, satd and rbitcoin; a crawl session to any other
+implementation is `unknown`, and an unknown shape keeps its transcript,
+`relay` flag, BIP 324 greeting and `getaddr` answer in `crawlbook.dat`, so
+a new implementation shows up as many records of one shape. A crawl
+discovery session also runs a chain check on the `getheaders` probe's
+answer: the peer is on our chain (it has our tip), behind (it has nothing
+past our tip's parent, or only our older blocks), on a fork (another block
+after our tip's parent, or blocks off our chain), or on another chain under
+this network's magic (its answer starts from a block we do not know).
+
 **Flags**, each carried with the numbers that raised it:
 
 | Code | Name | Raised when |
