@@ -621,7 +621,9 @@ preserved; the satd extension is opt-in per request or per flag.
   crawler (`/satd:<version>(crawler)/`, services 0, relay off), BIP 324
   first and v1 after, one `getaddr` a day per address, kept in
   `crawlbook.dat`, outside every connection budget and never written to the
-  address book. Supersedes `-peersurvey` while on. Core has no crawler.
+  address book. Supersedes `-peersurvey` while on. `getcrawlinfo` reports
+  its state and counts (no address); `getcrawlnodes [verbose]` its book,
+  raw addresses included. Core has no crawler.
 
 - **`-maxoutboundfullrelay` and alt-slots (`-altslots`, `-altprefer`)** —
   the full-relay outbound count, fixed at 8 in Core, is configurable (above

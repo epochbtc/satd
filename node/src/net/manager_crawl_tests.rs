@@ -646,3 +646,183 @@ async fn an_extreme_version_timestamp_does_not_overflow_the_clock_offset() {
     let obs = out.result.observation.expect("an observation");
     assert_eq!(obs.clock_offset_secs, Some(i64::MIN));
 }
+
+// ---- getcrawlinfo, getcrawlnodes, the metrics ----
+
+/// With the crawl off, `getcrawlinfo` says so with every count zero,
+/// `getcrawlnodes` is empty and the metrics have no crawl.
+#[test]
+fn getcrawlinfo_with_the_crawl_off() {
+    let (pm, _dir) = mk_pm_with(None);
+    let info = pm.get_crawl_info();
+    assert_eq!(info["enabled"], false);
+    assert_eq!(info["state"], "off");
+    assert_eq!(info["held_by"], serde_json::json!([]));
+    assert_eq!(info["book"]["entries"], 0);
+    assert_eq!(info["reachable"]["total"], 0);
+    assert_eq!(info["families"]["core"]["count"], 0);
+    assert_eq!(pm.get_crawl_nodes(true), serde_json::json!([]));
+    assert!(pm.crawl_metrics().is_none());
+}
+
+/// `getcrawlinfo` names every reason the crawl starts no session (initial
+/// block download, `-connect`, networking off), says `running` with none,
+/// and `stopped` after a panic; `crawl_may_run` agrees with it each time.
+#[test]
+fn getcrawlinfo_names_why_the_crawl_is_held() {
+    let (pm, _dir) = mk_pm_with(None);
+    let run = enable(&pm, config());
+    let state = |pm: &PeerManager| {
+        let info = pm.get_crawl_info();
+        (info["state"].as_str().unwrap().to_string(), info["held_by"].clone())
+    };
+    assert_eq!(state(&pm), ("running".to_string(), serde_json::json!([])));
+    assert!(pm.crawl_may_run() && pm.crawl_metrics().unwrap().running);
+
+    run.out_of_ibd.store(false, Ordering::Relaxed);
+    assert_eq!(state(&pm), ("held".to_string(), serde_json::json!(["initial_block_download"])));
+    assert!(!pm.crawl_may_run());
+    run.out_of_ibd.store(true, Ordering::Relaxed);
+
+    pm.set_automatic_outbound(false);
+    assert_eq!(state(&pm), ("held".to_string(), serde_json::json!(["connect"])));
+    assert!(!pm.crawl_may_run());
+    pm.set_network_active(false);
+    assert_eq!(state(&pm), ("held".to_string(), serde_json::json!(["connect", "network_inactive"])));
+    let m = pm.crawl_metrics().unwrap();
+    assert!(!m.running && !m.stopped);
+    pm.set_automatic_outbound(true);
+    pm.set_network_active(true);
+    assert!(pm.crawl_may_run());
+
+    run.stopped.store(true, Ordering::Relaxed);
+    let info = pm.get_crawl_info();
+    assert_eq!((info["state"].clone(), info["stopped_by"].clone()), ("stopped".into(), "panic".into()));
+    assert!(!pm.crawl_may_run());
+    let m = pm.crawl_metrics().unwrap();
+    assert!(!m.running && m.stopped);
+}
+
+/// `getcrawlinfo`'s limits are the scheduler's (after the ceilings and any
+/// fd fitting), its networks what the crawl dials, and it says whether
+/// `-peersurvey` was asked for and is superseded.
+#[test]
+fn getcrawlinfo_reports_the_limits_in_force() {
+    let (pm, _dir) = mk_pm_with(None);
+    pm.enable_survey(SurveyConfig { interval: Duration::from_secs(60), probes: false, path: None });
+    let limits = Limits::new(1000, 3, 500);
+    enable(&pm, CrawlConfig { limits, networks: Some(vec![crate::net::crawlbook::Network::Ipv4]), ..config() });
+    let info = pm.get_crawl_info();
+    let l = &info["limits"];
+    assert_eq!((l["concurrency"].clone(), l["tor_concurrency"].clone(), l["rate"].clone()), (256.into(), 3.into(), 100.into()));
+    assert_eq!(l["liveness"], crate::net::crawlbook::DEFAULT_LIVENESS_SECS);
+    assert_eq!(l["networks"], serde_json::json!(["ipv4"]), "-crawlnet narrows");
+    assert_eq!(l["bind"], false);
+    assert_eq!(info["peersurvey_superseded"], true);
+    assert_eq!(info["book"]["max_entries"], crate::net::crawlbook::MAX_ENTRIES);
+}
+
+/// After a discovery session to a scripted Core peer, `getcrawlinfo`
+/// counts it reachable over IPv4 and v1 only, as core; the crawl's own
+/// traffic is counted and the node's is not; nothing in the answer or the
+/// metrics' counts names the peer. `getcrawlnodes` has its row, with the
+/// observation only under `verbose`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn getcrawlinfo_and_getcrawlnodes_after_a_session() {
+    let (pm, _dir) = mk_pm_with(None);
+    let run = enable(&pm, config());
+    let mut script = core_script();
+    script.answer = Some(answer(3));
+    let (target, _log) = scripted("127.0.0.1", script).await;
+    assert!(run.book.lock().seed(target.clone(), 0, crate::time::now_secs()));
+    pm.run_crawl_session(target.clone(), SessionKind::Discovery, None).await;
+
+    let info = pm.get_crawl_info();
+    assert_eq!(info["book"]["entries"], 4, "the peer and the three it named");
+    assert_eq!(info["book"]["learned"]["ipv4"], 4);
+    assert_eq!(info["reachable"], serde_json::json!({ "total": 1, "ipv4": 1, "ipv6": 0, "onion": 0 }));
+    assert_eq!(info["transport"]["v1_only"]["count"], 1);
+    assert_eq!(info["families"]["core"]["count"], 1);
+    assert_eq!(info["sessions"]["reached"], 1);
+    assert_eq!(info["sessions"]["unreached"], 0);
+    assert_eq!(info["sessions"]["in_flight"], serde_json::json!({ "clearnet": 0, "tor": 0 }));
+    assert!(info["totals"]["totalbytessent"].as_u64().unwrap() > 0);
+    assert!(info["totals"]["totalbytesrecv"].as_u64().unwrap() > 0);
+    assert_eq!(pm.net_totals().bytes_sent(), 0, "the crawl's traffic is not the node's");
+    let text = info.to_string();
+    assert!(!text.contains("127.0.0.1") && !text.contains("23.1.") && !text.contains("Satoshi"), "{text}");
+
+    let m = pm.crawl_metrics().unwrap();
+    assert_eq!((m.aggregate.reachable, m.reached), ([1, 0, 0], 1));
+
+    let rows = pm.get_crawl_nodes(false);
+    let rows = rows.as_array().unwrap();
+    assert_eq!(rows.len(), 4);
+    assert_eq!(rows[0]["addr"], target.to_string(), "the reached address first");
+    assert_eq!(rows[0]["family"], "core");
+    assert!(rows[0].get("observation").is_none());
+    let rows = pm.get_crawl_nodes(true);
+    let obs = &rows[0]["observation"];
+    assert_eq!(obs["subver"], "/Satoshi:32.1.0/");
+    assert_eq!(obs["getaddr"]["entries"], 3);
+}
+
+/// The metrics and the status page reuse an aggregate for
+/// [`crawl_conn::AGGREGATE_MAX_AGE`]; `getcrawlinfo` for
+/// [`crawl_conn::INFO_AGGREGATE_MAX_AGE`], and a new one refreshes theirs.
+#[test]
+fn the_metrics_reuse_a_recent_aggregate() {
+    let (pm, _dir) = mk_pm_with(None);
+    let run = enable(&pm, config());
+    assert_eq!(pm.crawl_metrics().unwrap().aggregate.entries, 0);
+    let now = crate::time::now_secs();
+    assert!(run.book.lock().seed(PeerAddr::Socket(SocketAddr::from(([23, 1, 1, 7], 8333))), 0, now));
+    assert_eq!(pm.crawl_metrics().unwrap().aggregate.entries, 0, "within the window: the aggregate taken before");
+    assert_eq!(pm.get_crawl_info()["book"]["entries"], 0, "getcrawlinfo reuses one under a second old");
+    // Age the kept aggregate past getcrawlinfo's window, not the metrics'.
+    if let Some((at, _)) = run.aggregate.lock().as_mut() {
+        *at -= crawl_conn::INFO_AGGREGATE_MAX_AGE;
+    }
+    assert_eq!(pm.get_crawl_info()["book"]["entries"], 1, "older: getcrawlinfo takes a new one");
+    assert_eq!(pm.crawl_metrics().unwrap().aggregate.entries, 1, "and the metrics read it");
+}
+
+/// With `-proxy` set, only a routable address goes through the proxy, so
+/// where the book admits local addresses (regtest) the crawl still dials
+/// clearnet, and `getcrawlinfo` says so: the networks it reports are the
+/// ones `crawl_may_dial` lets through.
+#[test]
+fn getcrawlinfo_networks_agree_with_what_the_crawl_dials_under_a_proxy() {
+    let (pm, _dir) = mk_pm_proxied("127.0.0.1:9");
+    enable(&pm, CrawlConfig { networks: Some(vec![crate::net::crawlbook::Network::Ipv4]), ..config() });
+    let local = PeerAddr::Socket(SocketAddr::from(([127, 0, 0, 1], 18444)));
+    assert!(pm.crawl_may_dial(&local), "a local address is dialled direct");
+    assert_eq!(pm.get_crawl_info()["limits"]["networks"], serde_json::json!(["ipv4"]));
+}
+
+/// With the crawl off, `getcrawlinfo` has every key it has with the crawl
+/// on, counts zero: a client reads one schema.
+#[test]
+fn getcrawlinfo_off_has_the_same_keys() {
+    fn keys(v: &serde_json::Value, prefix: &str, out: &mut Vec<String>) {
+        if let Some(o) = v.as_object() {
+            for (k, v) in o {
+                let path = format!("{prefix}{k}");
+                out.push(path.clone());
+                keys(v, &format!("{path}."), out);
+            }
+        }
+    }
+    let (off, _d1) = mk_pm_with(None);
+    let (on, _d2) = mk_pm_with(None);
+    enable(&on, config());
+    let (mut a, mut b) = (Vec::new(), Vec::new());
+    keys(&off.get_crawl_info(), "", &mut a);
+    keys(&on.get_crawl_info(), "", &mut b);
+    a.sort();
+    b.sort();
+    assert_eq!(a, b);
+    let info = off.get_crawl_info();
+    assert_eq!(info["sessions"]["reached"], 0);
+    assert_eq!(info["totals"]["totalbytessent"], 0);
+}

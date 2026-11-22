@@ -662,6 +662,24 @@ mod tests {
         assert!(rp.as_json().get().contains("rpc:write"));
     }
 
+    /// A read-only token sees the crawl's counts (`getcrawlinfo`) and not
+    /// its book (`getcrawlnodes`), whose rows are raw peer addresses; the
+    /// operator sees both.
+    #[tokio::test]
+    async fn read_token_gets_the_crawl_counts_and_not_its_addresses() {
+        let (svc, dispatched) = filter();
+        let rp = svc.call(req_with("getcrawlinfo", Some(read_only_token()))).await;
+        assert!(rp.is_success());
+        assert_eq!(dispatched.load(Ordering::SeqCst), 1);
+        let rp = svc.call(req_with("getcrawlnodes", Some(read_only_token()))).await;
+        assert!(rp.is_error());
+        assert_eq!(dispatched.load(Ordering::SeqCst), 1, "getcrawlnodes never reached the handler");
+        assert!(rp.as_json().get().contains("rpc:write"), "{}", rp.as_json().get());
+        let rp = svc.call(req_with("getcrawlnodes", Some(Principal::operator()))).await;
+        assert!(rp.is_success());
+        assert_eq!(dispatched.load(Ordering::SeqCst), 2);
+    }
+
     #[tokio::test]
     async fn read_token_is_forbidden_on_a_submit_method() {
         let (svc, dispatched) = filter();

@@ -137,6 +137,8 @@ const HELP_METHODS: &[(&str, &str)] = &[
     ("getaddednodeinfo", "Network"),
     ("getaddrmaninfo", "Network"),
     ("getconnectioncount", "Network"),
+    ("getcrawlinfo", "Network"),
+    ("getcrawlnodes", "Network"),
     ("getnettotals", "Network"),
     ("getnetworkinfo", "Network"),
     ("getnodeaddresses", "Network"),
@@ -3145,6 +3147,21 @@ pub async fn start(
         let verbose: Option<bool> = args.optional("verbose")?;
         args.check()?;
         Ok::<_, ErrorObjectOwned>(ctx.peer_manager.get_peer_survey(verbose.unwrap_or(false)))
+    })?;
+
+    // satd: the network crawl (`-crawl`): its state and aggregate, counts
+    // only.
+    module.register_method("getcrawlinfo", |_params, ctx, _extensions| {
+        Ok::<_, ErrorObjectOwned>(ctx.peer_manager.get_crawl_info())
+    })?;
+
+    // satd: the crawl's book, a row per address, raw addresses included;
+    // with `verbose` every field.
+    module.register_method("getcrawlnodes", |params, ctx, _extensions| {
+        let mut args = Args::new(&params);
+        let verbose: Option<bool> = args.optional("verbose")?;
+        args.check()?;
+        Ok::<_, ErrorObjectOwned>(ctx.peer_manager.get_crawl_nodes(verbose.unwrap_or(false)))
     })?;
 
     module.register_method("getconnectioncount", |_params, ctx, _extensions| {

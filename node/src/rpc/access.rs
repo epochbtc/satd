@@ -119,6 +119,9 @@ pub fn classify(method: &str) -> Option<RpcAccess> {
         | "getpeerinfo"
         // Counters and judgements by peer id; no address.
         | "getpeerbehavior"
+        // The crawl's state and aggregate: counts only, never an address
+        // (`getcrawlnodes` has those).
+        | "getcrawlinfo"
         | "getpolicyinfo"
         | "getquarantineentry"
         | "getquarantineinfo"
@@ -235,7 +238,11 @@ pub fn classify(method: &str) -> Option<RpcAccess> {
         // The network survey's records: with `verbose`, the address of every
         // peer the survey reached. An operator's diagnostic, kept off the
         // read-only listener and away from read-only tokens.
-        | "getpeersurvey" => Control,
+        | "getpeersurvey"
+        // The crawl's book: the raw address of every node it learned or
+        // reached. Kept off the read-only listener and away from read-only
+        // tokens, as the survey's rows are.
+        | "getcrawlnodes" => Control,
 
         // --- Control: index management ---
         "backfillindex" | "pauseindex" | "resumeindex" | "cancelindex" => Control,
@@ -326,6 +333,7 @@ mod tests {
             "logging",
             "getblockfrompeer",
             "getpeersurvey",
+            "getcrawlnodes",
             "prioritisetransaction",
             "getprioritisedtransactions",
             "savemempool",
@@ -376,6 +384,7 @@ mod tests {
             "getaddrmaninfo",
             "getrawaddrman",
             "getnapreport",
+            "getcrawlinfo",
         ] {
             assert_eq!(classify(m), Some(RpcAccess::Read), "{m}");
             assert!(readonly_listener_allows(m), "{m} must be allowed");

@@ -162,6 +162,9 @@ pub struct StatusSnapshot {
     /// The operator's `statusadvertise` values.
     pub connect: Vec<Advertised>,
     pub peers: Peers,
+    /// The network crawl (`-crawl`), when it is on. Counts only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub crawl: Option<CrawlStatus>,
     pub mempool: MempoolStatus,
     /// Absent while syncing, when there is no mempool to estimate from.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -240,6 +243,55 @@ pub struct Peers {
     /// Connected peers per behaviour flag, for the flags some peer carries,
     /// in code order. Counts only.
     pub flagged: Vec<FlagCount>,
+}
+
+/// The crawl's counts: no address, no user agent.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct CrawlStatus {
+    /// `running`, `held` (initial block download, `-connect`, networking
+    /// off) or `stopped` (after a panic in a crawl task).
+    pub state: &'static str,
+    /// Addresses in the crawl's book.
+    pub book_entries: usize,
+    /// Addresses with a handshake within the liveness window, per network.
+    pub reachable_ipv4: usize,
+    pub reachable_ipv6: usize,
+    pub reachable_onion: usize,
+    /// I2P and CJDNS addresses learned; the crawl never dials them.
+    pub learned_i2p: usize,
+    pub learned_cjdns: usize,
+    /// Reachable addresses per transport class.
+    pub v2_and_v1: usize,
+    pub v1_only: usize,
+    pub v2_only: usize,
+    pub v2_unconfirmed: usize,
+}
+
+impl CrawlStatus {
+    pub fn from_metrics(m: &crate::net::manager::CrawlMetrics) -> Self {
+        use crate::net::crawlreport::Transport;
+        let a = &m.aggregate;
+        let t = |c: Transport| a.transport[Transport::ALL.iter().position(|x| *x == c).expect("in ALL")];
+        CrawlStatus {
+            state: if m.stopped {
+                "stopped"
+            } else if m.running {
+                "running"
+            } else {
+                "held"
+            },
+            book_entries: a.entries,
+            reachable_ipv4: a.reachable[0],
+            reachable_ipv6: a.reachable[1],
+            reachable_onion: a.reachable[2],
+            learned_i2p: a.learned[3],
+            learned_cjdns: a.learned[4],
+            v2_and_v1: t(Transport::Both),
+            v1_only: t(Transport::V1Only),
+            v2_only: t(Transport::V2Only),
+            v2_unconfirmed: t(Transport::V2Unconfirmed),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -461,6 +513,7 @@ fn build_at(ctx: &MetricsContext, sources: &StatusSources, now: u64) -> StatusSn
             clients,
             flagged: flag_counts(&ctx.peer_manager.peer_flag_counts()),
         },
+        crawl: ctx.peer_manager.crawl_metrics().as_ref().map(CrawlStatus::from_metrics),
         mempool: MempoolStatus {
             transactions: info.size,
             bytes: info.bytes,

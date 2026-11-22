@@ -19,6 +19,7 @@
 - [JSON-RPC Extensions](json-rpc-extensions.md)
 - [Node Attestation (NAP)](nap.md)
 - [Peer Behaviour Flags](peer-behavior.md)
+- [Network Crawl](crawl.md)
 - [Terminal UI (`sat-tui`)](tui.md)
 
 # Protocol Surfaces

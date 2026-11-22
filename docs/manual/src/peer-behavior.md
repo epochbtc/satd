@@ -159,7 +159,9 @@ a restart. `getconfig` reports it as `p2p.peer_flag_policy`.
 ## Network survey
 
 **Off by default.** With `-peersurvey=1` the node surveys the network: which
-implementations are reachable, and how many of each.
+implementations are reachable, and how many of each. It samples, from the
+node's own address book; the [network crawl](crawl.md) (`-crawl`) counts,
+and supersedes the survey while it is on.
 
 > **The survey's file holds peer addresses.** `peersurvey.dat` in the data
 > directory keeps one record per address the survey reached, and

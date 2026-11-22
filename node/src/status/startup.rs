@@ -39,7 +39,7 @@ pub fn label(phase: &str) -> &'static str {
 /// The cards the running node's view fills. The startup view hides each
 /// one explicitly, so a tab that was showing the running node and polls
 /// through a restart does not keep its last chain figures on screen.
-pub(super) const NODE_CARDS: [&str; 5] = ["warnings", "chain", "wallets", "connect", "peers"];
+pub(super) const NODE_CARDS: [&str; 6] = ["warnings", "chain", "wallets", "connect", "peers", "crawl"];
 
 /// Every key the startup card marks. The running node's view carries each
 /// one blank and hidden ([`blank`]), so every marker on the page names a

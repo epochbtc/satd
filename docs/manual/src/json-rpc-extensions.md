@@ -327,6 +327,14 @@ mismatches, BIP 324 share and the busiest autonomous systems. With
 `verbose`, one row per address, so its output holds peer addresses. See
 [Network survey](peer-behavior.md#network-survey).
 
+`getcrawlinfo` reports the opt-in network crawl (`-crawl`): whether it runs
+or why it is held, the limits in force, the size of its book, its sessions
+and traffic, and its count of the reachable network by network, transport
+(including nodes that speak BIP 324 only) and implementation family. Counts
+only. `getcrawlnodes [verbose]` returns one row per address in the crawl's
+book, so its output holds raw peer addresses; it is operator control. See
+[Network Crawl](crawl.md).
+
 ## BIP 322 message verification
 
 `verifybip322 "address" "signature" "message"` verifies a

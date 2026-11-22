@@ -313,6 +313,7 @@ pub fn view(s: &StatusSnapshot, now: u64) -> View {
     for card in ["chain", "wallets", "peers"] {
         v.show.insert(card, true);
     }
+    v.show.insert("crawl", s.crawl.is_some());
     super::startup::blank(&mut v);
 
     v.state.insert("phase", tone);
@@ -379,7 +380,31 @@ pub fn view(s: &StatusSnapshot, now: u64) -> View {
             })
             .collect(),
     );
+    v.lists.insert("crawl", s.crawl.as_ref().map(crawl_items).unwrap_or_default());
     v
+}
+
+/// The crawl card's rows: counts only.
+fn crawl_items(c: &super::CrawlStatus) -> Vec<Item> {
+    let n = |label: &str, value: usize| Item { label: label.to_string(), value: thousands(value as u64), state: OK };
+    let state = match c.state {
+        "running" => OK,
+        "stopped" => BAD,
+        _ => WAIT,
+    };
+    vec![
+        Item { label: "State".to_string(), value: c.state.to_string(), state },
+        n("Addresses in the book", c.book_entries),
+        n("Reachable over IPv4", c.reachable_ipv4),
+        n("Reachable over IPv6", c.reachable_ipv6),
+        n("Reachable onions", c.reachable_onion),
+        n("I2P learned (never dialled)", c.learned_i2p),
+        n("CJDNS learned (never dialled)", c.learned_cjdns),
+        n("BIP 324 and v1", c.v2_and_v1),
+        n("v1 only", c.v1_only),
+        n("BIP 324 only", c.v2_only),
+        n("BIP 324, v1 not checked yet", c.v2_unconfirmed),
+    ]
 }
 
 /// Escape text for an HTML text node or a double-quoted attribute.
@@ -614,6 +639,11 @@ pub fn html(v: &View) -> String {
     p.raw("</div>");
     p.list("peers.clients");
     p.list("peers.flags");
+    p.raw("</section>");
+
+    p.section("section", "crawl", "card");
+    p.raw("<h2>Crawl</h2>");
+    p.list("crawl");
     p.raw("</section>");
 
     p.raw("<footer class=\"mute\"><span id=\"freshness\">Reload to update.</span></footer>");
