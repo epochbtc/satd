@@ -308,6 +308,7 @@ SATD_ONLY = {
     "getmempoolsummary": [["top_n", False]],
     "getquarantineentry": [["txid", False]],
     "getreorghistory": [["since_secs", False]],
+    "getpeerbehavior": [["peer_id", False]],
     "getsilentpaymentblockdata": [
         ["blockhash", False], ["verbosity", False], ["dust_limit", False],
     ],

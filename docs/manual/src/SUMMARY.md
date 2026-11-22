@@ -18,6 +18,7 @@
 - [Authentication & Authorization](authentication.md)
 - [JSON-RPC Extensions](json-rpc-extensions.md)
 - [Node Attestation (NAP)](nap.md)
+- [Peer Behaviour Flags](peer-behavior.md)
 - [Terminal UI (`sat-tui`)](tui.md)
 
 # Protocol Surfaces

@@ -141,6 +141,7 @@ const HELP_METHODS: &[(&str, &str)] = &[
     ("getnetworkinfo", "Network"),
     ("getnodeaddresses", "Network"),
     ("getorphaninfo", "Network"),
+    ("getpeerbehavior", "Network"),
     ("getpeerinfo", "Network"),
     ("listbanned", "Network"),
     ("ping", "Network"),
@@ -3123,6 +3124,17 @@ pub async fn start(
 
     module.register_method("getpeerinfo", |_params, ctx, _extensions| {
         Ok::<_, ErrorObjectOwned>(serde_json::json!(ctx.peer_manager.get_peer_info()))
+    })?;
+
+    // satd: each peer's behaviour record, fingerprint and flags, by id. No
+    // address; `getpeerinfo` is unchanged.
+    module.register_method("getpeerbehavior", |params, ctx, _extensions| {
+        let mut args = Args::new(&params);
+        let peer_id: Option<u64> = args.optional("peer_id")?;
+        args.check()?;
+        ctx.peer_manager.get_peer_behavior(peer_id).map(serde_json::Value::from).ok_or_else(|| {
+            ErrorObjectOwned::owned(-8, format!("peer_id {} not found", peer_id.unwrap_or_default()), None::<()>)
+        })
     })?;
 
     module.register_method("getconnectioncount", |_params, ctx, _extensions| {

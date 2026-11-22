@@ -11,6 +11,8 @@ pub mod compact;
 pub mod connection;
 pub mod dns;
 pub mod eviction;
+pub mod fingerprint;
+pub mod flags;
 pub mod flow;
 pub mod ibd;
 pub mod headers_queue;

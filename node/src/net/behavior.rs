@@ -457,6 +457,85 @@ impl fmt::Display for PeerBehavior {
     }
 }
 
+/// A capture under `contrib/peer-fingerprint/fixtures`, replayed through
+/// the handshake capture as the node would take it.
+#[cfg(test)]
+pub(crate) struct Replayed {
+    pub capture: HandshakeCapture,
+    pub version: Option<VersionFields>,
+    /// The peer dialed the recorder (the fixture's `connection`).
+    pub inbound: bool,
+}
+
+#[cfg(test)]
+fn fixture_dir() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../contrib/peer-fingerprint/fixtures")
+}
+
+/// The fixtures' names, without `.json`, sorted.
+#[cfg(test)]
+pub(crate) fn fixture_names() -> Vec<String> {
+    let dir = fixture_dir();
+    let mut names: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap_or_else(|e| panic!("reading {}: {e}", dir.display()))
+        .filter_map(|e| e.ok()?.file_name().into_string().ok())
+        .filter_map(|n| n.strip_suffix(".json").map(str::to_string))
+        .collect();
+    names.sort();
+    names
+}
+
+/// Replay one fixture. The recorder's own requests are in its `sent` list,
+/// so a `headers` or `notfound` received while one of its `getheaders` or
+/// `getdata` was unanswered is a reply, as is every `pong`.
+#[cfg(test)]
+pub(crate) fn replay_fixture(name: &str) -> Replayed {
+    let text = std::fs::read_to_string(fixture_dir().join(format!("{name}.json"))).unwrap();
+    let fixture: serde_json::Value = serde_json::from_str(&text).unwrap();
+    // (time, sent first on a tie, command)
+    let mut events: Vec<(u64, bool, String)> = Vec::new();
+    for (key, sent) in [("sent", true), ("received", false)] {
+        for m in fixture[key].as_array().unwrap() {
+            events.push((m["t_ms"].as_u64().unwrap(), !sent, m["command"].as_str().unwrap().to_string()));
+        }
+    }
+    events.sort_by_key(|(t, received, _)| (*t, *received));
+    let (mut getheaders_out, mut getdata_out) = (0u32, 0u32);
+    let mut capture = HandshakeCapture::default();
+    for (_, received, cmd) in &events {
+        if !received {
+            match cmd.as_str() {
+                "getheaders" => getheaders_out += 1,
+                "getdata" => getdata_out += 1,
+                _ => {}
+            }
+            continue;
+        }
+        let reply = match cmd.as_str() {
+            "pong" => true,
+            "headers" if getheaders_out > 0 => {
+                getheaders_out -= 1;
+                true
+            }
+            "notfound" if getdata_out > 0 => {
+                getdata_out -= 1;
+                true
+            }
+            _ => false,
+        };
+        capture.observe(cmd, reply);
+    }
+    let v = &fixture["version"];
+    let version = v.is_object().then(|| VersionFields {
+        protocol_version: v["protocol_version"].as_u64().unwrap() as u32,
+        services: v["services"].as_u64().unwrap(),
+        relay: v["relay"].as_bool().unwrap(),
+        start_height: v["start_height"].as_i64().unwrap() as i32,
+        user_agent: crate::net::limits::sanitize_string(v["user_agent"].as_str().unwrap()),
+    });
+    Replayed { capture, version, inbound: fixture["connection"] == "inbound" }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -663,54 +742,13 @@ mod tests {
             ("satd-0.7.0-outbound-v2", "version wtxidrelay sendaddrv2 verack getheaders"),
             ("satd-0.7.0-outbound", "version wtxidrelay sendaddrv2 verack getheaders"),
         ];
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../contrib/peer-fingerprint/fixtures");
-        let mut names: Vec<String> = std::fs::read_dir(&dir)
-            .unwrap_or_else(|e| panic!("reading {}: {e}", dir.display()))
-            .filter_map(|e| e.ok()?.file_name().into_string().ok())
-            .filter_map(|n| n.strip_suffix(".json").map(str::to_string))
-            .collect();
-        names.sort();
+        let names = fixture_names();
         let mut listed: Vec<String> = EXPECTED.iter().map(|(n, _)| n.to_string()).collect();
         listed.sort();
         assert_eq!(names, listed, "every fixture has a row here, and every row a fixture");
 
         for (name, want) in EXPECTED {
-            let text = std::fs::read_to_string(dir.join(format!("{name}.json"))).unwrap();
-            let fixture: serde_json::Value = serde_json::from_str(&text).unwrap();
-            // (time, sent first on a tie, command)
-            let mut events: Vec<(u64, bool, String)> = Vec::new();
-            for (key, sent) in [("sent", true), ("received", false)] {
-                for m in fixture[key].as_array().unwrap() {
-                    events.push((m["t_ms"].as_u64().unwrap(), !sent, m["command"].as_str().unwrap().to_string()));
-                }
-            }
-            events.sort_by_key(|(t, received, _)| (*t, *received));
-            let (mut getheaders_out, mut getdata_out) = (0u32, 0u32);
-            let mut c = HandshakeCapture::default();
-            for (_, received, cmd) in &events {
-                if !received {
-                    match cmd.as_str() {
-                        "getheaders" => getheaders_out += 1,
-                        "getdata" => getdata_out += 1,
-                        _ => {}
-                    }
-                    continue;
-                }
-                let reply = match cmd.as_str() {
-                    "pong" => true,
-                    "headers" if getheaders_out > 0 => {
-                        getheaders_out -= 1;
-                        true
-                    }
-                    "notfound" if getdata_out > 0 => {
-                        getdata_out -= 1;
-                        true
-                    }
-                    _ => false,
-                };
-                c.observe(cmd, reply);
-            }
-            let got: Vec<String> = c.commands().collect();
+            let got: Vec<String> = replay_fixture(name).capture.commands().collect();
             assert_eq!(got.join(" "), *want, "{name}");
         }
     }
