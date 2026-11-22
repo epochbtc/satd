@@ -53,13 +53,35 @@ waits --v1-retry-wait seconds for the peer's v1 retry. A peer that never
 retries gets a fixture with "v1_after_v2": false and no transcript, which is
 all a v1-only node learns from it.
 
+--crawl (with --dial) greets the node as an optional crawl mode would
+instead: a declared crawler that asks for addresses and nothing else.
+
+    - at once: version, wtxidrelay
+    - on the peer's version: sendaddrv2, verack
+    - nothing else unsolicited
+
+The version message carries protocol 70016, services 0, relay=0,
+start_height = the node's real tip (--start-height), a random nonce, a
+dummy addr_from, and the user agent /satd:<version>(crawler)/, with the
+version read from the workspace Cargo.toml (--crawl-version overrides).
+After the handshake and the --wait window it sends one getaddr and waits
+up to --getaddr-wait seconds (default 90) for the answer, then runs the
+probes. The answer is summarised, never kept: message kind, entry count,
+delay, networks, service bits, whether the node lists itself, and the
+spread of the entries' nTime. With --v2 it also records the node's BIP324
+transport (garbage length, decoy packets, its version packet, short or
+12-byte message IDs), and when the v2 attempt fails, how it failed
+(reset, end of stream or timeout, how many bytes came back first) before
+it redials over v1, as a crawler falls back.
+
 The fixture holds commands, sizes, timings and decoded fields. It never
 holds an address: the version message's address fields and nonce are
-dropped, and addr/addrv2 bodies are reduced to a count.
+dropped, and addr/addrv2 bodies are reduced to a count (in --crawl, to
+the summary above).
 
 No third-party dependencies.
 """
-import argparse, hashlib, io, json, os, random, socket, struct, sys, time
+import argparse, hashlib, io, ipaddress, json, os, random, socket, struct, sys, time
 
 MAGIC = {
     "mainnet": "f9beb4d9",
@@ -81,6 +103,9 @@ GREETING = "satd-0.7.0"
 USER_AGENT = "/satd-fingerprint-capture:1/"
 MAX_MSG_LEN = 4 * 1000 * 1000 + 1000  # Core's MAX_PROTOCOL_MESSAGE_LENGTH, plus header slack
 CAPTURE_FORMAT = 1
+CRAWL_SERVICES = 0
+CRAWL_GREETING = "crawl"
+NET_IDS = {1: "ipv4", 2: "ipv6", 3: "torv2", 4: "torv3", 5: "i2p", 6: "cjdns"}
 INV_TYPES = {1: "tx", 2: "block", 3: "filtered_block", 4: "cmpct_block", 5: "wtx",
              0x40000001: "witness_tx", 0x40000002: "witness_block"}
 
@@ -161,27 +186,44 @@ class V2Conn:
     in Bitcoin Core's functional test framework (--core-functional). Same
     interface as Conn: send(command, payload) and recv(deadline)."""
 
-    def __init__(self, sock, network, initiating, prefix=b""):
+    def __init__(self, sock, network, initiating, prefix=b"", record=False):
         from test_framework.v2_p2p import EncryptedP2PState, SHORTID, MSGTYPE_TO_SHORTID
         self.sock = sock
         self.buf = prefix
         self.shortid = SHORTID
         self.to_shortid = MSGTYPE_TO_SHORTID
         self.state = EncryptedP2PState(initiating=initiating, net=network)
+        # --crawl: what the peer does inside the transport, and, when the
+        # handshake fails, how (see v2_failure()).
+        self.record = record
+        self.raw_in = len(prefix)
+        self.raw_head = prefix[:24]
+        self.fail_kind = None
+        self.transport = None
+        self.decoys_after = 0
+        self.ids = {"short": 0, "long": 0}
+        self.last_id = None
 
     def _more(self, deadline):
         left = deadline - time.monotonic()
         if left <= 0:
+            self.fail_kind = "timeout"
             raise TimeoutError
         self.sock.settimeout(left)
         try:
             chunk = self.sock.recv(65536)
         except socket.timeout:
+            self.fail_kind = "timeout"
             raise TimeoutError
         except (ConnectionResetError, BrokenPipeError):
+            self.fail_kind = "reset"
             raise Closed
         if not chunk:
+            self.fail_kind = "eof"
             raise Closed
+        if len(self.raw_head) < 24:
+            self.raw_head += chunk[:24 - len(self.raw_head)]
+        self.raw_in += len(chunk)
         self.buf += chunk
 
     def _need(self, n, deadline):
@@ -206,6 +248,9 @@ class V2Conn:
         used, out = st.complete_handshake(io.BytesIO(self.buf[:need]))
         self.buf = self.buf[used:]
         self.sock.sendall(out)
+        if self.record:
+            self._authenticate_recording(deadline)
+            return
         while not st.tried_v2_handshake:
             try:
                 used, ok = st.authenticate_handshake(self.buf)
@@ -216,6 +261,65 @@ class V2Conn:
             self.buf = self.buf[used:]
             if not st.tried_v2_handshake:
                 self._more(deadline)
+
+    def _authenticate_recording(self, deadline):
+        """The peer's garbage, decoys and version packet, recorded as they
+        are authenticated: what authenticate_handshake() does, keeping
+        what it skips. BIP324 lets the version packet carry contents a
+        receiver ignores, so a non-empty one is recorded, not refused."""
+        from test_framework.v2_p2p import MAX_GARBAGE_LEN
+        st = self.state
+        term = st.peer["recv_garbage_terminator"]
+        while True:
+            at = self.buf.find(term)
+            if 0 <= at <= MAX_GARBAGE_LEN:
+                break
+            if len(self.buf) >= MAX_GARBAGE_LEN + len(term):
+                raise ValueError("no garbage terminator within 4095 bytes of garbage")
+            self._more(deadline)
+        aad = self.buf[:at]
+        info = {"garbage_len": at, "decoys_before_version": []}
+        self.buf = self.buf[at + len(term):]
+        while True:
+            used, contents = st.v2_receive_packet(self.buf, aad=aad)
+            if used == -1:
+                raise ValueError("v2 handshake failed to authenticate")
+            if used == 0:
+                self._more(deadline)
+                continue
+            self.buf = self.buf[used:]
+            aad = b""
+            if contents is None:
+                # 3-byte length, 1-byte header, 16-byte tag around the contents
+                info["decoys_before_version"].append(used - 20)
+                continue
+            info["version_packet_len"] = len(contents)
+            info["version_packet_hex"] = contents[:64].hex()
+            break
+        st.tried_v2_handshake = True
+        self.transport = info
+
+    def transport_summary(self):
+        if self.transport is None:
+            return None
+        return dict(self.transport, decoys_after_handshake=self.decoys_after, message_ids=dict(self.ids))
+
+    def v2_failure(self, error, started):
+        """How a v2 attempt failed, as a v1-only node fails it: by reset,
+        end of stream or timeout, and what it sent back first (a byte
+        count, and whether it looks like a v1 message; never the bytes)."""
+        head = self.raw_head
+        out = {"kind": self.fail_kind or type(error).__name__, "after_ms": int((time.monotonic() - started) * 1000),
+               "bytes_returned": self.raw_in, "error": f"{type(error).__name__} {error}".strip()}
+        if len(head) >= 4:
+            out["v1_magic_returned"] = head[:4] == self.state_magic()
+            if out["v1_magic_returned"] and len(head) >= 16:
+                out["v1_command_returned"] = head[4:16].rstrip(b"\x00").decode(errors="replace")
+        return out
+
+    def state_magic(self):
+        from test_framework.v2_p2p import MAGIC_BYTES
+        return MAGIC_BYTES[self.state.net]
 
     def send(self, command, payload=b""):
         sid = self.to_shortid.get(command.encode())
@@ -232,11 +336,16 @@ class V2Conn:
                 continue
             self.buf = self.buf[used:]
             if contents is None:
+                self.decoys_after += 1
                 continue  # decoy
             if not contents:
                 raise ValueError("empty v2 packet")
             if contents[0] == 0:
+                self.ids["long"] += 1
+                self.last_id = "long"
                 return contents[1:13].rstrip(b"\x00").decode(errors="replace"), contents[13:]
+            self.ids["short"] += 1
+            self.last_id = "short"
             name = self.shortid.get(contents[0])
             return (name.decode() if name else f"shortid-{contents[0]}"), contents[1:]
 
@@ -249,6 +358,114 @@ def version_payload():
     p += csize_write(len(ua)) + ua
     p += struct.pack("<i", 0) + b"\x01"
     return p
+
+
+def ip16(host):
+    """The 16-byte form of an IPv4 or IPv6 address, as addr and version carry it."""
+    try:
+        return b"\x00" * 10 + b"\xff\xff" + socket.inet_pton(socket.AF_INET, host)
+    except OSError:
+        return socket.inet_pton(socket.AF_INET6, host)
+
+
+def dial_target(args):
+    """--dial as (host, port), with IPv6 brackets removed: "[::1]:18444"."""
+    host, port = args.dial.rsplit(":", 1)
+    host = host.strip("[]")
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        sys.exit(f"--dial needs an IP address, not {host!r}: the version message carries it")
+    return host, port
+
+
+def crawl_version_payload(args):
+    """--crawl: services 0, relay 0, the node's real tip, a random nonce,
+    the dialed address in addr_recv (services 0) and a dummy addr_from,
+    as satd builds its version message."""
+    host, port = dial_target(args)
+    recv = struct.pack("<Q", 0) + ip16(host) + struct.pack(">H", int(port))
+    dummy = struct.pack("<Q", CRAWL_SERVICES) + bytes(16) + struct.pack(">H", 0)
+    p = struct.pack("<iQq", PROTOCOL_VERSION, CRAWL_SERVICES, int(time.time()))
+    p += recv + dummy + struct.pack("<Q", random.getrandbits(64))
+    ua = crawl_user_agent(args).encode()
+    p += csize_write(len(ua)) + ua
+    p += struct.pack("<i", args.start_height) + b"\x00"
+    return p
+
+
+def crawl_user_agent(args):
+    return f"/satd:{args.crawl_version}(crawler)/"
+
+
+def workspace_version():
+    """satd's version from the workspace Cargo.toml, as its user agent carries it."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "Cargo.toml")
+    try:
+        with open(path) as f:
+            section = None
+            for line in f:
+                line = line.strip()
+                if line.startswith("["):
+                    section = line
+                elif section == "[workspace.package]" and line.startswith("version"):
+                    return line.split("=", 1)[1].strip().strip('"')
+    except OSError:
+        pass
+    return None
+
+
+def addr_entries(command, p):
+    """(nTime, services, network, ip bytes, port) for each entry of an addr
+    or addrv2 body. Used only for summary numbers; nothing here is kept."""
+    count, off = csize_read(p, 0)
+    out = []
+    for _ in range(count):
+        if command == "addr":
+            if off + 30 > len(p):
+                break
+            t, services = struct.unpack_from("<IQ", p, off)
+            ip = p[off + 12:off + 28]
+            port = struct.unpack_from(">H", p, off + 28)[0]
+            net = "ipv4" if ip[:12] == b"\x00" * 10 + b"\xff\xff" else "ipv6"
+            off += 30
+        else:
+            t = struct.unpack_from("<I", p, off)[0]
+            services, off = csize_read(p, off + 4)
+            netid = p[off]
+            n, off = csize_read(p, off + 1)
+            ip = p[off:off + n]
+            off += n
+            port = struct.unpack_from(">H", p, off)[0]
+            off += 2
+            net = NET_IDS.get(netid, f"net-{netid}")
+            if net == "ipv4":
+                ip = b"\x00" * 10 + b"\xff\xff" + ip
+        out.append((t, services, net, ip, port))
+    return count, out
+
+
+def summarize_addr(command, p, target, delay_ms):
+    """A getaddr answer as summary numbers, never addresses: kind, count,
+    delay, networks, service bits, whether the node lists itself, and how
+    old its entries' nTime are."""
+    try:
+        count, entries = addr_entries(command, p)
+    except (struct.error, IndexError):
+        return {"kind": command, "count": None, "delay_ms": delay_ms, "undecodable": True}
+    now = int(time.time())
+    ages = sorted(now - e[0] for e in entries)
+    nets, services = {}, {}
+    for e in entries:
+        nets[e[2]] = nets.get(e[2], 0) + 1
+        k = f"{e[1]:x}"
+        services[k] = services.get(k, 0) + 1
+    out = {"kind": command, "count": count, "delay_ms": delay_ms, "networks": nets,
+           "services_hex": services, "lists_itself": any((e[3], e[4]) == target for e in entries)}
+    if ages:
+        out["ntime_age_s"] = {"min": ages[0], "median": ages[len(ages) // 2], "max": ages[-1],
+                              "spread": ages[-1] - ages[0], "future": sum(1 for a in ages if a < 0)}
+    return out
 
 
 def decode_version(p):
@@ -329,6 +546,10 @@ class Recorder:
         self.peer_verack_seen = False
         self.closed = None
         self.probes = []
+        self.target = None  # --crawl: the dialed (ip16, port), to tell whether the node lists itself
+        self.getaddr = None
+        self.getaddr_sent_ms = None
+        self.addr_after_getaddr = []
 
     def ms(self):
         return int((time.monotonic() - self.t0) * 1000)
@@ -346,8 +567,32 @@ class Recorder:
         fields = decode(command, payload)
         if fields is not None:
             entry["fields"] = fields
+        if self.args.crawl and getattr(self.conn, "last_id", None):
+            entry["v2_id"] = self.conn.last_id
         self.received.append(entry)
+        if self.args.crawl and command in ("addr", "addrv2") and self.getaddr_sent_ms is not None:
+            delay = entry["t_ms"] - self.getaddr_sent_ms
+            summary = summarize_addr(command, payload, self.target, delay)
+            self.addr_after_getaddr.append({"kind": command, "count": summary["count"], "delay_ms": delay,
+                                            "phase": self.phase})
+            # The answer, as bitnodes takes it: the first addr with more
+            # than one entry (a lone entry is usually a self-announcement).
+            if self.getaddr is None and (summary["count"] or 0) > 1:
+                self.getaddr = summary
+                entry["getaddr_answer"] = True
         dialer = self.args.dial is not None
+        if self.args.crawl:
+            if command == "version" and not self.peer_version_seen:
+                self.peer_version_seen = True
+                self.send("sendaddrv2")
+                self.send("verack")
+            elif command == "verack":
+                self.peer_verack_seen = True
+            elif command == "ping":
+                self.send("pong", payload[:8])
+            elif command == "getheaders":
+                self.send("headers", csize_write(0))
+            return entry
         if command == "version" and not self.peer_version_seen:
             self.peer_version_seen = True
             if not dialer:
@@ -388,7 +633,7 @@ class Recorder:
 
     def run(self):
         if self.args.dial:
-            self.send("version", version_payload())
+            self.send("version", crawl_version_payload(self.args) if self.args.crawl else version_payload())
             self.send("wtxidrelay")
         hs_deadline = time.monotonic() + 30
         while not (self.peer_version_seen and self.peer_verack_seen):
@@ -396,6 +641,14 @@ class Recorder:
                 raise RuntimeError("handshake did not complete in 30 s")
         self.phase = "passive"
         self.pump(time.monotonic() + self.args.wait)
+        if self.args.crawl:
+            # One getaddr once the handshake has settled; wait for the
+            # answer, which rides the address trickle (Core: about 30 s on
+            # average), and stop as soon as it is in.
+            self.phase = "getaddr"
+            self.getaddr_sent_ms = self.ms()
+            self.send("getaddr")
+            self.pump(time.monotonic() + self.args.getaddr_wait, lambda e: e.get("getaddr_answer", False))
         probes = self.probes  # kept on self, so a failure mid-probe keeps what ran
         if self.args.probes:
             self.phase = "probe"
@@ -445,6 +698,19 @@ def fixture_head(args, connection, v2_attempts):
                      "user_agent": USER_AGENT, "passive_wait_s": args.wait,
                      "probe_wait_s": args.probe_wait if args.probes else None},
         "v2_attempts_before_v1": v2_attempts,
+    } if not args.crawl else {
+        "capture_format": CAPTURE_FORMAT,
+        "shape": "crawl",
+        "label": args.label,
+        "implementation": args.implementation,
+        "implementation_version": args.implementation_version,
+        "network": args.network,
+        "connection": connection,
+        "peer_state": {"ibd": args.peer_ibd, "height": args.peer_height, "note": args.peer_note},
+        "recorder": {"greeting": CRAWL_GREETING, "protocol_version": PROTOCOL_VERSION, "services": CRAWL_SERVICES,
+                     "relay": False, "start_height": args.start_height, "user_agent": crawl_user_agent(args),
+                     "passive_wait_s": args.wait, "getaddr_wait_s": args.getaddr_wait,
+                     "probe_wait_s": args.probe_wait if args.probes else None},
     }
 
 
@@ -495,9 +761,49 @@ def capture(args, srv=None):
     magic = bytes.fromhex(MAGIC[args.network])
     v2_attempts = 0
     transport = "v1"
+    v2_failure = None
     if args.v2:
         sys.path.insert(0, args.core_functional)
-    if args.v2 and args.listen is not None:
+    if args.crawl:
+        # v2 first, then v1 if the v2 attempt fails, as a crawler dials.
+        host, port = dial_target(args)
+        conn = None
+        sock = None
+        if args.v2:
+            started = time.monotonic()
+            try:
+                sock = socket.create_connection((host, int(port)), timeout=10)
+            except OSError as e:
+                # Refused or reset before any v2 byte: recorded as a v2
+                # failure of kind "connect", then the v1 redial below.
+                sock = None
+                v2_failure = {"kind": "connect", "after_ms": int((time.monotonic() - started) * 1000),
+                              "bytes_returned": 0, "error": f"{type(e).__name__} {e}".strip()}
+        if args.v2 and sock is not None:
+            conn = V2Conn(sock, args.network, initiating=True, record=True)
+            try:
+                conn.handshake(time.monotonic() + 30)
+                transport = "v2"
+            except (Closed, TimeoutError, ValueError, OSError) as e:
+                v2_failure = conn.v2_failure(e, started)
+                sock.close()
+                conn = None
+        if conn is None:
+            try:
+                sock = socket.create_connection((host, int(port)), timeout=10)
+            except OSError as e:
+                # The v1 redial failed too: record how, as every other
+                # failure path here does, instead of writing no fixture.
+                d = fixture_head(args, "outbound", v2_attempts)
+                d.update({"transport": None, "v2_attempted": bool(args.v2), "v2_failure": v2_failure,
+                          "v2_transport": None, "getaddr": None, "addr_after_getaddr": None,
+                          "version": None, "commands": [], "received": [], "sent": [], "probes": [],
+                          "closed_by_peer": None,
+                          "error": f"v1 redial failed: {type(e).__name__} {e}".strip()})
+                return d
+            conn = Conn(sock, magic)
+        connection = "outbound"
+    elif args.v2 and args.listen is not None:
         srv.settimeout(args.accept_timeout)
         try:
             sock, conn, transport = accept_v2(args, srv)
@@ -511,7 +817,7 @@ def capture(args, srv=None):
             return d
         connection = "inbound"
     elif args.v2:
-        host, port = args.dial.rsplit(":", 1)
+        host, port = dial_target(args)
         sock = socket.create_connection((host, int(port)), timeout=10)
         conn = V2Conn(sock, args.network, initiating=True)
         try:
@@ -550,12 +856,15 @@ def capture(args, srv=None):
                 sock.close()
         connection = "inbound"
     else:
-        host, port = args.dial.rsplit(":", 1)
+        host, port = dial_target(args)
         sock = socket.create_connection((host, int(port)), timeout=10)
         conn = Conn(sock, magic)
         connection = "outbound"
 
     rec = Recorder(conn, args)
+    if args.crawl:
+        host, port = dial_target(args)
+        rec.target = (ip16(host), int(port))
     probes = []
     error = None
     try:
@@ -583,6 +892,23 @@ def capture(args, srv=None):
             break
         handshake_cmds.append(m["command"])
     d = fixture_head(args, connection, v2_attempts)
+    if args.crawl:
+        d.update({
+            "transport": transport,
+            "v2_attempted": bool(args.v2),
+            "v2_failure": v2_failure,
+            "v2_transport": conn.transport_summary() if isinstance(conn, V2Conn) else None,
+            "version": version,
+            "commands": handshake_cmds,
+            "getaddr": rec.getaddr,
+            "addr_after_getaddr": rec.addr_after_getaddr,
+            "received": rec.received,
+            "sent": rec.sent,
+            "probes": probes,
+            "closed_by_peer": rec.closed,
+            "error": error,
+        })
+        return d
     d.update({
         "transport": transport,
         "v1_after_v2": True if v2_attempts else None,
@@ -627,10 +953,22 @@ def main():
                     help="seconds to wait for each connection after the first (default 20)")
     ap.add_argument("--v1-retry-wait", type=float, default=30.0,
                     help="after a v2 attempt, how long to wait for the peer to retry over v1 (default 30)")
+    ap.add_argument("--crawl", action="store_true",
+                    help="with --dial: greet as a declared crawler, send one getaddr, record the answer (see above)")
+    ap.add_argument("--start-height", type=int, default=0,
+                    help="--crawl: start_height in our version, the node's real tip (default 0)")
+    ap.add_argument("--crawl-version", default=workspace_version(),
+                    help="--crawl: the version in /satd:<version>(crawler)/ (default: the workspace Cargo.toml's)")
+    ap.add_argument("--getaddr-wait", type=float, default=90.0,
+                    help="--crawl: seconds to wait for the getaddr answer (default 90)")
     ap.add_argument("--out", help="write the fixture here (default stdout)")
     args = ap.parse_args()
     if args.v2 and not args.core_functional:
         ap.error("--v2 needs --core-functional")
+    if args.crawl and not args.dial:
+        ap.error("--crawl needs --dial: a crawler only dials")
+    if args.crawl and not args.crawl_version:
+        ap.error("--crawl: no version in the workspace Cargo.toml; give --crawl-version")
     srv = None
     if args.listen is not None:
         # One listening socket for every session, so a peer's next

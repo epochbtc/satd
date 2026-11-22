@@ -22,9 +22,21 @@ A node that can mine is given one block first, so it is out of initial block
 download as most real peers are; the fixture records the state the node's
 own RPC reports. Crawlers have no chain: their state is recorded as unknown.
 
+--crawl captures each listening implementation as a crawler would see it:
+we dial it with capture.py --crawl (v2 first, then v1, with --transport
+v2), and the fixture is <name>-<version>-outbound-crawl[-v2].json. Before
+the capture the node's address book is seeded with --seed-addrs addresses
+(default 1000) where its RPC can add one (addpeeraddress), so its getaddr
+answer has something in it, and the node is started with no outbound
+connections of its own (-connect=0), so it never dials what it was given.
+The fixture records how many addresses the node accepted. The addresses
+are random routable IPv4 addresses on the regtest port: regtest nodes
+drop non-routable ones (Core's AddrMan keeps only IsRoutable()), and none
+of them is ever dialled or written anywhere.
+
 Usage: run-captures.py --workdir DIR --out DIR [--only NAME[,NAME...]]
 """
-import argparse, base64, json, os, shutil, signal, subprocess, sys, time, urllib.request
+import argparse, base64, ipaddress, json, os, random, shutil, signal, subprocess, sys, time, urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 CAPTURE = os.path.join(HERE, "capture.py")
@@ -99,6 +111,17 @@ class Impl:
         """(ibd 'yes'|'no'|'unknown', height)"""
         return "unknown", -1
 
+    # --crawl: the node starts with no outbound connections of its own
+    # (no_outbound), and seed(addrs) adds addresses to its address book;
+    # an implementation without an RPC for that returns None. Only an
+    # implementation whose argv() honours no_outbound may be seeded, so a
+    # seeded address can never be dialled.
+    no_outbound = False
+    honours_no_outbound = False
+
+    def seed(self, addrs):
+        return None
+
     def stop(self):
         if self.proc and self.proc.poll() is None:
             try:
@@ -116,6 +139,7 @@ class Impl:
 
 
 class CoreLike(Impl):
+    honours_no_outbound = True
     family = "core"
     bin_env = None
 
@@ -137,10 +161,18 @@ class CoreLike(Impl):
              "-dnsseed=0", "-fixedseeds=0", "-debug=net", "-printtoconsole=0"]
         if connect:
             a.append(f"-connect={connect}")
+        elif self.no_outbound:
+            a.append("-connect=0")
         return a
 
     def mine(self):
         self.cli("generatetodescriptor", "1", "raw(51)")
+
+    def seed(self, addrs):
+        ok = 0
+        for host, port in addrs:
+            ok += bool(json.loads(self.cli("addpeeraddress", host, str(port))).get("success"))
+        return {"method": "addpeeraddress", "offered": len(addrs), "accepted": ok}
 
     def state(self):
         info = json.loads(self.cli("getblockchaininfo"))
@@ -156,6 +188,7 @@ class Knots(CoreLike):
 
 
 class Satd(Impl):
+    honours_no_outbound = True
     family = name = "satd"
     env = ("SATD", "SATCLI")
 
@@ -168,13 +201,22 @@ class Satd(Impl):
 
     def argv(self, connect):
         a = [os.environ["SATD"], "--regtest", f"--datadir={self.dir}", f"--port={NODE_P2P}",
-             f"--rpcport={NODE_RPC}", "--listen=1"]
+             f"--rpcport={NODE_RPC}", "--listen=1",
+             "--esplora=0"]  # its HTTP listener is not under test, and its default port may be taken
         if connect:
             a.append(f"--connect={connect}")
+        elif self.no_outbound:
+            a.append("--connect=0")
         return a
 
     def mine(self):
         self.cli("generatetoaddress", "1", "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080")
+
+    def seed(self, addrs):
+        ok = 0
+        for host, port in addrs:
+            ok += bool(json.loads(self.cli("addpeeraddress", host, str(port))).get("success"))
+        return {"method": "addpeeraddress", "offered": len(addrs), "accepted": ok}
 
     def state(self):
         info = json.loads(self.cli("getblockchaininfo"))
@@ -263,6 +305,7 @@ class Bcoin(Impl):
 
 
 class Rbitcoin(Impl):
+    honours_no_outbound = True
     family = name = "rbitcoin"
     env = ("RBITCOIN",)
 
@@ -272,11 +315,21 @@ class Rbitcoin(Impl):
              "--no-seeds", "--no-discover"]
         if connect:
             a += ["--connect", connect]
+        elif self.no_outbound:
+            # --max-outbound must be at least 1: dial only a closed local
+            # port instead, so the node never dials its address book.
+            a += ["--connect", "127.0.0.1:1"]
         return a
 
     def rpc(self, method, params=None):
         token = open(os.path.join(self.dir, "rpc.token")).read().strip()  # rbitcoin writes a bearer token
         return rpc_http(f"http://127.0.0.1:{NODE_RPC}/", "", "", method, params, timeout=60, bearer=token)
+
+    def seed(self, addrs):
+        ok = 0
+        for host, port in addrs:
+            ok += bool(self.rpc("addpeeraddress", [host, port]).get("success"))
+        return {"method": "addpeeraddress", "offered": len(addrs), "accepted": ok}
 
     def mine(self):
         self.rpc("generatetoaddress", [1, REGTEST_P2PKH])
@@ -359,6 +412,7 @@ conn.close()
 
 
 class Libbitcoin(Impl):
+    honours_no_outbound = True
     """libbitcoin-server's bs, run in a container: bs 3.8 cannot choose the
     address it listens on, so it gets a network namespace of its own with
     only its P2P port published to the host's loopback. bs cannot mine and
@@ -424,6 +478,20 @@ class Libbitcoin(Impl):
 IMPLS = [Satd, Core, Knots, Btcd, Bcoin, Rbitcoin, Floresta, Libbitcoin, Seeder, Bitnodes]
 
 
+def seed_addresses(n, port=18444):
+    """n distinct random routable IPv4 addresses on the regtest default
+    port (as a real node would advertise them, not the test node's own
+    port). Never dialled: only a node started with no outbound connections
+    is seeded."""
+    rng = random.Random(0x5eed)
+    out = set()
+    while len(out) < n:
+        ip = ipaddress.IPv4Address(rng.getrandbits(32))
+        if ip.is_global and not ip.is_multicast:
+            out.add(str(ip))
+    return [(ip, port) for ip in sorted(out)]
+
+
 def capture(impl, direction, out, label, version, extra):
     bind = impl.recorder_bind() if hasattr(impl, "recorder_bind") else "127.0.0.1"
     args = [sys.executable, CAPTURE, "--label", label, "--implementation", impl.family,
@@ -439,16 +507,16 @@ def capture(impl, direction, out, label, version, extra):
     return subprocess.Popen(args)
 
 
-def set_state(path, impl, note):
+def set_state(path, impl, note, book=None):
     """Write the node's state into the fixture and any later sessions'."""
     base, ext = os.path.splitext(path)
-    ibd_height = set_state_one(path, impl, note)
+    ibd_height = set_state_one(path, impl, note, book)
     if os.path.exists(f"{base}-s2{ext}"):
-        set_state_one(f"{base}-s2{ext}", impl, note)
+        set_state_one(f"{base}-s2{ext}", impl, note, book)
     return ibd_height
 
 
-def set_state_one(path, impl, note):
+def set_state_one(path, impl, note, book=None):
     try:
         ibd, height = impl.state()
     except Exception as e:  # noqa: BLE001
@@ -458,6 +526,8 @@ def set_state_one(path, impl, note):
     with open(path) as f:
         d = json.load(f)
     d["peer_state"] = {"ibd": ibd, "height": height, "note": note}
+    if d.get("shape") == "crawl":
+        d["peer_state"]["address_book"] = book
     with open(path, "w") as f:
         f.write(json.dumps(d, indent=2) + "\n")
     return ibd, height
@@ -536,6 +606,45 @@ def run(impl, outdir, version, extra, suffix=""):
     return results
 
 
+def run_crawl(impl, outdir, version, extra, suffix, seed_n):
+    """--crawl: one outbound capture with capture.py --crawl, the node's
+    address book seeded first where it can be."""
+    if not impl.listens:
+        return []
+    shutil.rmtree(impl.dir, ignore_errors=True)
+    impl.no_outbound = True
+    note = "" if impl.can_mine else "cannot mine on regtest; never left IBD"
+    impl.start()
+    try:
+        wait_for(impl.ready, f"{impl.name} RPC")
+        if impl.can_mine:
+            impl.mine()
+        book = impl.seed(seed_addresses(seed_n)) if seed_n and impl.honours_no_outbound else None
+        if book is None:
+            why = ("not seeded" if not seed_n
+                   else "not seeded: it is not started without outbound connections"
+                   if not impl.honours_no_outbound else "no RPC adds to its address book")
+            book = {"method": None, "offered": 0, "accepted": 0, "note": why}
+        _, height = impl.state()
+        wait_for(lambda: __import__("socket").create_connection(("127.0.0.1", NODE_P2P), 2).close(),
+                 f"{impl.name} P2P port")
+        name = f"{impl.name}-{version}-outbound-crawl{suffix}"
+        path = os.path.join(outdir, f"{name}.json")
+        cap = capture(impl, "outbound", path, name, version,
+                      [*extra, "--crawl", "--start-height", str(max(height, 0))])
+        try:
+            rc = cap.wait(timeout=CAPTURE_TIMEOUT)
+            return [("outbound-crawl", rc, set_state(path, impl, note, book) if rc == 0 else None)]
+        except subprocess.TimeoutExpired:
+            return [("outbound-crawl", "timeout", None)]
+        finally:
+            if cap.poll() is None:
+                cap.kill()
+                cap.wait()
+    finally:
+        impl.stop()
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--workdir", required=True)
@@ -546,6 +655,9 @@ def main():
     ap.add_argument("--capture-arg", action="append", default=[], help="extra argument passed to capture.py")
     ap.add_argument("--transport", default="v1", help="v1, v2 or v1,v2 (v2 fixtures get a -v2 suffix)")
     ap.add_argument("--core-functional", help="Bitcoin Core's test/functional directory, needed for v2")
+    ap.add_argument("--crawl", action="store_true", help="crawl-shape captures of each listening implementation (see above)")
+    ap.add_argument("--seed-addrs", type=int, default=1000,
+                    help="--crawl: addresses to add to the node's address book first (default 1000; 0 for none)")
     args = ap.parse_args()
     versions = dict(v.split("=", 1) for v in args.version)
     only = set(args.only.split(",")) if args.only else None
@@ -568,7 +680,10 @@ def main():
                 extra += ["--v2", "--core-functional", args.core_functional]
                 suffix = "-v2"
             try:
-                results = run(impl, args.out, versions[impl.name], extra, suffix)
+                if args.crawl:
+                    results = run_crawl(impl, args.out, versions[impl.name], extra, suffix, args.seed_addrs)
+                else:
+                    results = run(impl, args.out, versions[impl.name], extra, suffix)
             except Exception as e:  # noqa: BLE001 -- one broken implementation must not end the sweep
                 print(f"{impl.name} {transport}: failed: {type(e).__name__}: {e}")
                 failed = True
