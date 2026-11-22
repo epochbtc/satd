@@ -1405,6 +1405,8 @@ pub struct PeerManager {
     inbound_netgroups: parking_lot::Mutex<crate::net::flags::NetgroupWindow>,
     /// The network survey (`-peersurvey`), when it is on.
     survey: std::sync::OnceLock<survey_conn::SurveyRun>,
+    /// The crawl (`-crawl`), when it is on.
+    crawl: std::sync::OnceLock<crawl_conn::CrawlRun>,
     /// `-maxoutboundfullrelay`.
     max_outbound_full_relay: AtomicUsize,
     /// `-peerflagpolicy=evict`: flagged inbound peers are evicted first
@@ -1968,6 +1970,7 @@ impl PeerManager {
             retired_behavior: Default::default(),
             inbound_netgroups: Default::default(),
             survey: Default::default(),
+            crawl: Default::default(),
             max_outbound_full_relay: AtomicUsize::new(MAX_OUTBOUND),
             flag_policy_evict: AtomicBool::new(false),
             alt_slots: Default::default(),
@@ -3841,7 +3844,7 @@ impl PeerManager {
             ConnType::AddrFetch | ConnType::Feeler => None,
             // Core returns false rather than opening one of these. A NAP pull
             // is satd's own, and opened only by the aggregator.
-            ConnType::Inbound | ConnType::Manual | ConnType::NapPull | ConnType::Survey => {
+            ConnType::Inbound | ConnType::Manual | ConnType::NapPull | ConnType::Survey | ConnType::Crawl => {
                 return Err(format!(
                     "cannot open a {} connection this way",
                     conn_type.as_str()
@@ -3888,7 +3891,7 @@ impl PeerManager {
             // (`semAddnode`) and do not consume an automatic slot. Nor does a
             // NAP pull, which the aggregator bounds itself, nor a survey
             // connection, which is outside every budget.
-            .filter(|h| !matches!(h.info.conn_type, ConnType::Manual | ConnType::NapPull | ConnType::Survey))
+            .filter(|h| !matches!(h.info.conn_type, ConnType::Manual | ConnType::NapPull) && !h.info.conn_type.is_measurement())
             .count()
             + pending.len()
             // The reconnect loop's dials in flight hold grants too.
@@ -4181,6 +4184,7 @@ impl PeerManager {
                             | ConnType::Feeler
                             | ConnType::BlockRelay
                             | ConnType::Survey
+                            | ConnType::Crawl
                     )
                     && h.info.state != PeerState::Disconnected
             })
@@ -4267,7 +4271,8 @@ impl PeerManager {
             .values()
             .filter(|h| {
                 h.info.direction == Direction::Outbound
-                    && !matches!(h.info.conn_type, ConnType::Manual | ConnType::NapPull | ConnType::Survey)
+                    && !matches!(h.info.conn_type, ConnType::Manual | ConnType::NapPull)
+                    && !h.info.conn_type.is_measurement()
                     && h.info.state != PeerState::Disconnected
             })
             .count();
@@ -5279,7 +5284,7 @@ impl PeerManager {
         let peers = self.peers.read();
         // A survey connection is not one of the node's peers: it is open
         // for seconds and outside every connection budget (`survey_conn`).
-        let mut entries: Vec<_> = peers.iter().filter(|(_, h)| h.info.conn_type != ConnType::Survey).collect();
+        let mut entries: Vec<_> = peers.iter().filter(|(_, h)| !h.info.conn_type.is_measurement()).collect();
         entries.sort_by_key(|(id, _)| **id);
         // `inflight` was a hardcoded `[]`, which reads as "this peer owes us
         // nothing" — the opposite of the answer when the question is which
@@ -5314,7 +5319,7 @@ impl PeerManager {
         let peers = self.peers.read();
         let mut summary = PeerSummary::default();
         for h in peers.values() {
-            if h.info.state != PeerState::Connected {
+            if h.info.state != PeerState::Connected || h.info.conn_type.is_measurement() {
                 continue;
             }
             match h.info.direction {
@@ -5348,7 +5353,7 @@ impl PeerManager {
         // state made them disagree for as long as a handshake was in
         // flight — which is exactly when a caller polling both notices. Survey
         // connections are left out of both.
-        self.peers.read().values().filter(|h| h.info.conn_type != ConnType::Survey).count()
+        self.peers.read().values().filter(|h| !h.info.conn_type.is_measurement()).count()
     }
 
     /// Number of connected peers using the BIP 324 v2 encrypted transport.
@@ -16134,11 +16139,11 @@ impl PeerManager {
         let peers = self.peers.read();
         let mut out: Vec<(PeerId, serde_json::Value)> = match id {
             Some(id) => vec![(id, crate::net::flags::peer_json(
-                &peers.get(&id).filter(|h| h.info.conn_type != ConnType::Survey)?.info,
+                &peers.get(&id).filter(|h| !h.info.conn_type.is_measurement())?.info,
             ))],
             None => peers
                 .iter()
-                .filter(|(_, h)| h.info.conn_type != ConnType::Survey)
+                .filter(|(_, h)| !h.info.conn_type.is_measurement())
                 .map(|(id, h)| (*id, crate::net::flags::peer_json(&h.info)))
                 .collect(),
         };
@@ -17472,11 +17477,13 @@ impl PeerManager {
 
         if direction == Direction::Inbound {
             // Core's `CheckIncomingNonce`: our own outbound version coming back.
+            // A crawl session's nonce counts too: the crawl may be handed
+            // this node's own address.
             let to_self = self.peers.read().values().any(|h| {
                 h.info.direction == Direction::Outbound
                     && h.info.state != PeerState::Connected
                     && h.info.local_nonce == Some(their_version.nonce)
-            });
+            }) || self.is_crawl_nonce(their_version.nonce);
             if to_self {
                 let addr = conn.peer_addr().map_or_else(|_| "?".to_string(), |a| a.to_string());
                 tracing::info!("connected to self at {addr}, disconnecting");
@@ -17796,6 +17803,9 @@ impl PeerManager {
     }
 
     fn build_version_message(&self, receiver: SocketAddr, conn_type: ConnType) -> VersionMessage {
+        if conn_type == ConnType::Crawl {
+            return self.crawl_version_message(receiver);
+        }
         let services = self.local_services();
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -17838,7 +17848,7 @@ fn nap_pull_via(conn_type: ConnType) -> Option<crate::nap::pull::Via> {
         ConnType::NapPull => Some(Via::Pull),
         ConnType::OutboundFullRelay | ConnType::Manual => Some(Via::Outbound),
         ConnType::Inbound => Some(Via::Inbound),
-        ConnType::BlockRelay | ConnType::AddrFetch | ConnType::Feeler | ConnType::Survey => None,
+        ConnType::BlockRelay | ConnType::AddrFetch | ConnType::Feeler | ConnType::Survey | ConnType::Crawl => None,
     }
 }
 
@@ -17914,6 +17924,9 @@ mod flags_tests;
 #[path = "manager_survey.rs"]
 mod survey_conn;
 
+#[path = "manager_crawl.rs"]
+mod crawl_conn;
+
 #[path = "manager_altslots.rs"]
 mod altslot_conn;
 pub use survey_conn::{SurveyConfig, SurveyMetrics};
@@ -17922,6 +17935,10 @@ pub use altslot_conn::AltSlotCounts;
 #[cfg(test)]
 #[path = "manager_survey_tests.rs"]
 mod survey_tests;
+
+#[cfg(test)]
+#[path = "manager_crawl_tests.rs"]
+mod crawl_tests;
 
 #[cfg(test)]
 #[path = "manager_altslots_tests.rs"]

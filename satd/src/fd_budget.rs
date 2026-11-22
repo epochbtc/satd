@@ -21,7 +21,11 @@
 //!          + max(1, bind + whitebind)           P2P listeners
 //!          + 1 with -listenonion                Tor control (the onion listener is a bind)
 //!          + 2 with -nap                        attestation pulls
-//!          + 1 with -peersurvey                 the survey connection
+//!          + 1 with -peersurvey                 the survey connection (not
+//!                                               with -crawl, which supersedes it)
+//!          + with -crawl, up to                 crawl sessions, fitted last:
+//!            crawlconcurrency                   lowered with a line in the log
+//!            + crawltorconcurrency              to what is left, never -maxconnections
 //!          + per RPC listener (plain, TLS,
 //!            read-only, read-only TLS):  1 + RPC_MAX_CONNECTIONS (100)
 //!          + Esplora:   listeners + esploramaxsockets
@@ -231,6 +235,11 @@ fn cap_need(config: &Config, option: &'static str, n: u64) -> Need {
     }
 }
 
+/// A crawl limit's need: all of it is headroom over a floor of none.
+fn crawl_need(option: &'static str, n: usize) -> Need {
+    Need::Default { option, default: n as u64, floor: 0 }
+}
+
 /// satd's needs apart from the automatic peers, itemized. See the module
 /// docs for the formula.
 pub fn needs(config: &Config) -> Vec<(&'static str, Need)> {
@@ -249,9 +258,18 @@ pub fn needs(config: &Config) -> Vec<(&'static str, Need)> {
     if config.nap {
         items.push(("nap pulls", fixed(node::nap::pull::MAX_PULL_CONNECTIONS as u64)));
     }
-    // One survey connection at a time, outside the peer budget.
-    if config.peersurvey {
+    // One survey connection at a time, outside the peer budget. The crawl
+    // supersedes it: with `-crawl` the survey opens none.
+    if config.peersurvey && !config.crawl {
         items.push(("survey connection", fixed(1)));
+    }
+    // The crawl's sessions are fitted into what is left once
+    // `-maxconnections` is met, as a cap left at its default is, whether or
+    // not the operator set them: the node's peers outrank its crawler. With
+    // no floor, a limit too tight for any session leaves the crawl none.
+    if config.crawl {
+        items.push(("crawl", crawl_need("crawlconcurrency", config.crawlconcurrency)));
+        items.push(("crawl tor", crawl_need("crawltorconcurrency", config.crawltorconcurrency)));
     }
     let rpc_listeners = config.rpcbind.len()
         + usize::from(config.rpc_tls_bind.is_some())
@@ -322,6 +340,18 @@ pub fn needs(config: &Config) -> Vec<(&'static str, Need)> {
 /// as needing a restart), and the rest keep the startup split.
 pub fn apply(config: &mut Config, fitted: &[FittedCap]) {
     for cap in fitted {
+        // The crawl's limits are fitted whether or not they were set.
+        match cap.option {
+            "crawlconcurrency" => {
+                config.crawlconcurrency = cap.fitted as usize;
+                continue;
+            }
+            "crawltorconcurrency" => {
+                config.crawltorconcurrency = cap.fitted as usize;
+                continue;
+            }
+            _ => {}
+        }
         if !config.caps_at_default.contains(&cap.option) {
             continue;
         }
@@ -584,5 +614,36 @@ mod tests {
         let mut set = config(&["--esploramaxsockets=100"]);
         apply(&mut set, &plan.fitted);
         assert_eq!((set.max_open_files, set.esplora_max_sockets), (288, 100));
+    }
+    /// `-crawl` adds its sessions as soft needs, fitted after
+    /// `-maxconnections`: a limit too tight for them lowers the crawl's
+    /// concurrency with a line in the log, never `-maxconnections`, even
+    /// when the operator set the concurrency. The survey's connection is
+    /// not counted, as the crawl supersedes it.
+    #[test]
+    fn the_crawl_is_fitted_after_maxconnections() {
+        let items = needs(&config(&["--crawl=1", "--crawlconcurrency=200", "--peersurvey=1"]));
+        assert_eq!(item(&items, "crawl"), Some(Need::Default { option: "crawlconcurrency", default: 200, floor: 0 }));
+        assert_eq!(item(&items, "crawl tor"), Some(Need::Default { option: "crawltorconcurrency", default: 8, floor: 0 }));
+        assert_eq!(item(&items, "survey connection"), None);
+        let base = required(&needs(&config(&[])));
+        assert_eq!(required(&items), base, "nothing of the crawl's is in the hard minimum");
+
+        // Room for 200 peers and the minimum, and little else.
+        let available = base + 200 + 20;
+        let plan = plan_for(&items, 200, available);
+        assert_eq!(plan.max_connections, 200);
+        assert!(plan.max_connections_note.is_none());
+        let crawl = plan.fitted.iter().find(|c| c.option == "crawlconcurrency").expect("lowered");
+        assert!(crawl.fitted < 200);
+        assert_eq!(crawl.note(), format!("Reducing -crawlconcurrency from 200 to {}, because of system limitations.", crawl.fitted));
+        let mut running = config(&["--crawl=1", "--crawlconcurrency=200"]);
+        apply(&mut running, &plan.fitted);
+        assert_eq!(running.crawlconcurrency, crawl.fitted as usize, "applied though set by hand");
+
+        // With room for everything the crawl keeps its limits.
+        let plan = plan_for(&items, 200, 65_536);
+        assert!(plan.fitted.iter().all(|c| !c.option.starts_with("crawl")));
+        assert_eq!(wanted(&items, 200), wanted(&needs(&config(&[])), 200) + 208);
     }
 }

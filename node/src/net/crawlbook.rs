@@ -444,6 +444,24 @@ pub struct BookParams {
     /// How often a reachable address is checked again, and how far back
     /// the snapshot looks (`-crawlliveness`).
     pub liveness_secs: u64,
+    /// Admit loopback and private addresses too, so a regtest crawl can
+    /// walk nodes on one host. Only [`Self::for_network`] on regtest sets
+    /// it; no option does.
+    pub allow_local: bool,
+}
+
+impl BookParams {
+    /// The defaults for `network`: local addresses are admitted on regtest
+    /// alone.
+    pub fn for_network(network: bitcoin::Network) -> Self {
+        BookParams { allow_local: network == bitcoin::Network::Regtest, ..BookParams::default() }
+    }
+
+    /// Whether an IP address may enter the book: public unicast, or under
+    /// [`Self::allow_local`] any address that names a host.
+    fn admits_ip(&self, ip: IpAddr) -> bool {
+        is_public_unicast(ip) || (self.allow_local && crate::net::is_valid(ip))
+    }
 }
 
 impl Default for BookParams {
@@ -453,6 +471,7 @@ impl Default for BookParams {
             max_age_secs: DEFAULT_MAX_AGE_SECS,
             ipv4_per_24: DEFAULT_IPV4_PER_24,
             liveness_secs: DEFAULT_LIVENESS_SECS,
+            allow_local: false,
         }
     }
 }
@@ -551,7 +570,7 @@ enum Unusable {
     Unsupported,
 }
 
-fn crawl_addr(m: &AddrV2Message) -> Result<CrawlAddr, Unusable> {
+fn crawl_addr(m: &AddrV2Message, params: &BookParams) -> Result<CrawlAddr, Unusable> {
     let ip = match &m.addr {
         AddrV2::Ipv4(v4) => IpAddr::V4(*v4),
         AddrV2::Ipv6(v6) => IpAddr::V6(*v6).to_canonical(),
@@ -563,7 +582,7 @@ fn crawl_addr(m: &AddrV2Message) -> Result<CrawlAddr, Unusable> {
         AddrV2::Cjdns(_) => return Err(Unusable::NotPublic),
         AddrV2::TorV2(_) | AddrV2::Unknown(..) => return Err(Unusable::Unsupported),
     };
-    if !is_public_unicast(ip) {
+    if !params.admits_ip(ip) {
         return Err(Unusable::NotPublic);
     }
     Ok(CrawlAddr::Peer(PeerAddr::Socket(std::net::SocketAddr::new(ip, m.port))))
@@ -632,7 +651,7 @@ impl CrawlBook {
                 report.in_future += 1;
                 continue;
             }
-            let addr = match crawl_addr(m) {
+            let addr = match crawl_addr(m, &self.params) {
                 Ok(a) => a,
                 Err(Unusable::NotPublic) => {
                     report.not_public += 1;
@@ -690,7 +709,7 @@ impl CrawlBook {
             onion @ PeerAddr::Onion { .. } => onion,
         };
         let usable = match &addr {
-            PeerAddr::Socket(sa) => is_public_unicast(sa.ip()),
+            PeerAddr::Socket(sa) => self.params.admits_ip(sa.ip()),
             PeerAddr::Onion { .. } => true,
         };
         if !usable || crate::net::is_bad_port(addr.port()) {
@@ -710,6 +729,18 @@ impl CrawlBook {
     /// each group by when it fell due, a discovery before a v1 recheck
     /// before a liveness check. An address with a session open is not due.
     pub fn next_due(&self, now: u64, limit: usize) -> Vec<(PeerAddr, SessionKind)> {
+        self.next_due_where(now, limit, |_| true)
+    }
+
+    /// [`Self::next_due`] over the addresses `dialable` accepts: the
+    /// engine passes over those on a network it does not reach, so they
+    /// do not fill the `limit` ahead of the ones it can dial.
+    pub fn next_due_where(
+        &self,
+        now: u64,
+        limit: usize,
+        dialable: impl Fn(&PeerAddr) -> bool,
+    ) -> Vec<(PeerAddr, SessionKind)> {
         let liveness = self.params.liveness_secs;
         let mut due: Vec<(bool, u64, SessionKind, &PeerAddr)> = self
             .entries
@@ -717,6 +748,9 @@ impl CrawlBook {
             .filter_map(|(addr, e)| {
                 let CrawlAddr::Peer(peer) = addr else { return None };
                 let (at, kind) = e.due(now, liveness)?;
+                if !dialable(peer) {
+                    return None;
+                }
                 Some((e.sources.len() < 2, at, kind, peer))
             })
             .collect();

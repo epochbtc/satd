@@ -149,6 +149,14 @@ pub enum ConnType {
     /// transactions or addresses. Not a Bitcoin Core type, so
     /// `addconnection` cannot open one.
     Survey,
+    /// A crawl session (`-crawl`): a declared crawler's `version`
+    /// (services 0, relay off), the handshake, a few seconds of listening
+    /// and, on a discovery session, one `getaddr` and the probes, then
+    /// closed. The crawl runs it on a connection of its own, never in the
+    /// node's peer table: it takes no slot of any budget, never reaches
+    /// `getpeerinfo`, and carries no blocks, transactions or addresses. Not
+    /// a Bitcoin Core type, so `addconnection` cannot open one.
+    Crawl,
 }
 
 impl ConnType {
@@ -164,6 +172,7 @@ impl ConnType {
             ConnType::Feeler => "feeler",
             ConnType::NapPull => "nap-pull",
             ConnType::Survey => "survey",
+            ConnType::Crawl => "crawl",
         }
     }
 
@@ -185,14 +194,23 @@ impl ConnType {
     /// feeler connections (`CNode::IsBlockOnlyConn() || IsFeelerConn()`).
     /// A survey connection sets it as a full-relay outbound does, so that its
     /// `version` is a full-relay one's.
+    /// A crawl connection clears it: the connection closes in seconds.
     pub fn wants_tx_relay(self) -> bool {
-        !matches!(self, ConnType::BlockRelay | ConnType::Feeler | ConnType::NapPull)
+        !matches!(self, ConnType::BlockRelay | ConnType::Feeler | ConnType::NapPull | ConnType::Crawl)
     }
 
     /// Whether we relay addresses over this connection. Core sets up a peer's
     /// address-relay state for everything except block-relay-only.
     pub fn relays_addrs(self) -> bool {
-        !matches!(self, ConnType::BlockRelay | ConnType::NapPull | ConnType::Survey)
+        !matches!(self, ConnType::BlockRelay | ConnType::NapPull | ConnType::Survey | ConnType::Crawl)
+    }
+
+    /// A connection that only measures the network: the survey's and the
+    /// crawl's. Neither is one of the node's peers: both are outside every
+    /// connection budget and left out of `getpeerinfo`,
+    /// `getconnectioncount` and `getpeerbehavior`.
+    pub fn is_measurement(self) -> bool {
+        matches!(self, ConnType::Survey | ConnType::Crawl)
     }
 }
 

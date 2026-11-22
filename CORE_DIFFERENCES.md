@@ -617,6 +617,12 @@ preserved; the satd extension is opt-in per request or per flag.
   `peersurvey.dat`. With `-peersurveyprobes` (on with the survey) it sends a
   few probes Core neither punishes nor disconnects for. Core has no survey.
 
+- **`-crawl`** — an opt-in network crawl: short sessions as a declared
+  crawler (`/satd:<version>(crawler)/`, services 0, relay off), BIP 324
+  first and v1 after, one `getaddr` a day per address, kept in
+  `crawlbook.dat`, outside every connection budget and never written to the
+  address book. Supersedes `-peersurvey` while on. Core has no crawler.
+
 - **`-maxoutboundfullrelay` and alt-slots (`-altslots`, `-altprefer`)** —
   the full-relay outbound count, fixed at 8 in Core, is configurable (above
   16 only with `-enable-dangerously-large-outbound-peer-limit`, never above

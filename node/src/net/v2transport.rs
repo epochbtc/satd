@@ -606,6 +606,11 @@ impl V2Writer {
     pub fn set_counters(&mut self, counters: Arc<PeerStats>) {
         self.counters = Some(counters);
     }
+
+    /// Close our side of the connection (a TCP FIN).
+    pub async fn shutdown(&mut self) -> io::Result<()> {
+        self.stream.shutdown().await
+    }
 }
 
 impl V2Reader {
