@@ -91,6 +91,13 @@ sat-cli getpeerbehavior 7
 It is a read: allowed on the read-only listener, and for a bearer token it
 needs `rpc:read`.
 
+## In sat-tui
+
+`sat-tui` shows the flags in a column of its peers tables, marks a
+mismatched agent with `≠`, opens a detail overlay with the evidence and
+counters on `Enter`, filters to flagged peers on `f`, and counts Peer
+clients by observed family. See [sat-tui](tui.md#peer-behaviour).
+
 ## Metrics, status page and log
 
 - `satd_peer_flagged{flag}`: connected peers carrying each flag, one series
