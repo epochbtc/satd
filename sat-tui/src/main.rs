@@ -1,4 +1,5 @@
 mod behavior;
+mod crawl;
 mod nap;
 mod rpc;
 mod state;
@@ -475,13 +476,15 @@ async fn poller(rpc: Arc<RpcClient>, state: Arc<Mutex<AppState>>) {
             // `getpeerbehavior` goes here too: the node judges its peers
             // every 5 s, and the peers tables show in both IBD and steady
             // state. So does `getpeersurvey`, whose aggregate the node keeps
-            // ready, for the Chain view, which either state can show.
-            let (index_res, srv_res, netinfo_res, behavior_res, survey_res) = tokio::join!(
+            // ready, for the Chain view, which either state can show, and
+            // `getcrawlinfo` for the same view.
+            let (index_res, srv_res, netinfo_res, behavior_res, survey_res, crawl_res) = tokio::join!(
                 rpc.get_index_info(),
                 rpc.get_server_status(),
                 rpc.get_network_info(),
                 rpc.get_peer_behavior(),
-                rpc.get_peer_survey()
+                rpc.get_peer_survey(),
+                rpc.get_crawl_info()
             );
             {
                 let mut st = state.lock();
@@ -490,6 +493,7 @@ async fn poller(rpc: Arc<RpcClient>, state: Arc<Mutex<AppState>>) {
                 apply_poll!(st, "getnetworkinfo", netinfo_res, update_server_version);
                 st.update_peer_behavior(behavior::classify(behavior_res));
                 st.update_peer_survey(survey::classify(survey_res));
+                st.update_crawl(crawl::classify(crawl_res));
             }
 
             // Heavy steady-state batch — only meaningful at chain tip.

@@ -286,6 +286,8 @@ where clearnet IP addresses of home nodes are.
 | `totals` | The crawl's own bytes, as `getnettotals` names them; not counted there. |
 
 It is a read: allowed on the read-only listener and to an `rpc:read` token.
+[sat-tui](tui.md#network-crawl--crawl-detail)'s Chain view draws it as
+the Network crawl row.
 
 ## `getcrawlnodes [verbose]`
 

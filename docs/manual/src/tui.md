@@ -534,6 +534,58 @@ and a bearer token without `rpc:write` are refused it. The TUI keeps
 polling, so the row appears once the survey runs or the credentials
 allow it.
 
+With the [network crawl](./crawl.md) on, the survey opens no connection
+and `getpeersurvey` says it is superseded. Where `-peersurvey` was asked
+for too, the row is then one line above the footer,
+`survey: superseded by the crawl, 1,204 addrs kept`, the records the
+survey kept; where it was not, no survey row is drawn.
+
+#### Network crawl | Crawl detail
+
+A row of its own, drawn only on a node running the
+[network crawl](./crawl.md) (`-crawl=1`), below the survey's place. The
+TUI polls `getcrawlinfo`, which carries counts only, about every 5
+seconds, and never asks for `getcrawlnodes` or `dumpcrawlsnapshot`,
+whose output holds peer addresses. A family or hold reason the node
+names is drawn only when it is a plain word (letters, digits, `_`, `-`),
+so no address reaches the screen.
+
+Network crawl:
+
+- The crawl's state: **running**; **held**, with each reason (initial
+  block download, `-connect`, networking off), when no session may
+  start; or **stopped**, after a panic in a crawl task.
+- `21,000 reachable`: the addresses with a completed handshake inside
+  the liveness window (`-crawlliveness`), the crawl's count of the
+  reachable network.
+- One bar per observed family, the 8 largest, then "other", each with
+  its share of the reachable addresses, and the **non-Core** share,
+  counted as in the survey row.
+
+Crawl detail:
+
+- **ipv4**, **ipv6**, **onion**: the reachable addresses on each network,
+  by share and count.
+- **v2 + v1**, **v1 only**, **v2 only**, **v2 unchecked**: the reachable
+  addresses by transport. A v2-only node did BIP 324 and then failed a v1
+  handshake within the liveness window; an unchecked one did BIP 324 and
+  has not had its v1 check yet. The four add up to the reachable count.
+- **mismatches**: the reachable addresses whose user agent names one
+  family while the handshake matches another.
+- **reached**, **unreached**: crawl sessions since the node started that
+  completed a handshake, and that did not.
+- **in flight**: sessions open now, clearnet and Tor, against the
+  concurrency limits in force.
+- **book**: the addresses in the crawl's book, against its cap.
+
+On a terminal too short for the row it collapses to one line above the
+footer, below the survey's line if there is one:
+`crawl: running, 21,000 reachable, non-Core 1.4 %, v2-only 40`. The row
+is not drawn, and nothing is shown as failing, when the crawl is off and
+when the node does not serve `getcrawlinfo` ("method not found"); a
+refusal is treated as the survey row treats one, though satd serves the
+method on the read-only listener and to an `rpc:read` token.
+
 ### NAP view (`5`)
 
 The [Node Attestation Protocol](nap.md) as this node runs it. The view is
@@ -656,7 +708,7 @@ even when RPC is slow.
 |---|---|
 | **1.5 s** | `getblockchaininfo`, `getpeerinfo`, `getmempoolinfo`, `getconnectioncount`, `getsysteminfo`, `getwarnings`. |
 | **3 s** | `getibdprogress`. During IBD only; the reply is heavy (full bitmap and per-peer breakdown). |
-| **~5 s** | `getsatdindexinfo`, `getserverstatus`, `getnetworkinfo`, `getpeerbehavior` and `getpeersurvey` (both also during IBD), plus the steady-state batch (`estimatefees`, `getmininginfo`, `getchaintxstats`, `uptime`, `getblockstats`, `getmempoolsummary`, `gettxoutsetinfo`, `getreorghistory`, `getmempoolhistory`, `getpolicyinfo`), and `getquarantineinfo` while `getpolicyinfo` reports a loaded ruleset; and `listnapattestations` and `getnapreport`, which also tell the TUI whether NAP is on. |
+| **~5 s** | `getsatdindexinfo`, `getserverstatus`, `getnetworkinfo`, `getpeerbehavior`, `getpeersurvey` and `getcrawlinfo` (all three also during IBD), plus the steady-state batch (`estimatefees`, `getmininginfo`, `getchaintxstats`, `uptime`, `getblockstats`, `getmempoolsummary`, `gettxoutsetinfo`, `getreorghistory`, `getmempoolhistory`, `getpolicyinfo`), and `getquarantineinfo` while `getpolicyinfo` reports a loaded ruleset; and `listnapattestations` and `getnapreport`, which also tell the TUI whether NAP is on. |
 | **per epoch** | `getblockhash` + `getblockheader` to anchor the current 2,016-block epoch's start time. Refreshed only when the epoch floor advances. |
 
 If a steady-state RPC has not returned within about 3 s, the title bar

@@ -12,6 +12,12 @@
 //!   read-only listener and a bearer token without `rpc:write` are refused
 //!   it. The TUI keeps polling, since a reloaded authfile can grant it.
 //!
+//! With the crawl on (`-crawl`) the survey opens no connection and the node
+//! says `superseded_by_crawl`. The TUI keeps that answer, marked
+//! [`Survey::superseded`], and the row says so in one line; it draws that
+//! line only where `getcrawlinfo` says `-peersurvey` was asked for, so a
+//! node that never ran the survey shows no survey row.
+//!
 //! Family names come from the node, which is not trusted to keep them
 //! printable: each goes through [`printable`] before it is drawn.
 
@@ -68,15 +74,18 @@ pub struct Survey {
     /// `None` until a survey connection has ended, and from a node that
     /// does not report it.
     pub last: Option<LastConnection>,
+    /// The crawl is on and the survey opens no connection: the counts are
+    /// the store the survey kept.
+    pub superseded: bool,
 }
 
 /// How one poll of `getpeersurvey` moves the TUI's copy.
 #[derive(Debug)]
 pub enum Poll {
-    /// The survey runs: replace the copy.
+    /// The survey runs, or the crawl supersedes it: replace the copy.
     On(Survey),
-    /// Hide the row: the survey is off, the node does not serve the method,
-    /// or it refuses it to this connection.
+    /// Hide the row: the survey is off (and not superseded), the node does
+    /// not serve the method, or it refuses it to this connection.
     Hidden,
     /// Any other failure: keep the copy, show the failure.
     Failed(String),
@@ -85,14 +94,17 @@ pub enum Poll {
 /// Classify one `getpeersurvey` result.
 pub fn classify(res: Result<Value, RpcError>) -> Poll {
     match res {
-        Ok(v) => match v.get("enabled").and_then(Value::as_bool) {
-            Some(false) => Poll::Hidden,
-            Some(true) => match parse(&v) {
-                Some(s) => Poll::On(s),
+        Ok(v) => {
+            let superseded = v.get("superseded_by_crawl").and_then(Value::as_bool) == Some(true);
+            match v.get("enabled").and_then(Value::as_bool) {
+                Some(false) if !superseded => Poll::Hidden,
+                Some(_) => match parse(&v) {
+                    Some(s) => Poll::On(Survey { superseded, ..s }),
+                    None => Poll::Failed("unexpected reply".into()),
+                },
                 None => Poll::Failed("unexpected reply".into()),
-            },
-            None => Poll::Failed("unexpected reply".into()),
-        },
+            }
+        }
         Err(RpcError::Rpc { code, .. })
             if code == JSONRPC_METHOD_NOT_FOUND || code == READONLY_REJECT_CODE || code == CAPABILITY_DENIED_CODE =>
         {
@@ -139,6 +151,7 @@ pub fn parse(v: &Value) -> Option<Survey> {
         completed: conns.map(|c| count(c, "completed")).unwrap_or(0),
         failed: conns.map(|c| count(c, "failed")).unwrap_or(0),
         last,
+        superseded: false,
     })
 }
 
@@ -177,6 +190,11 @@ impl Survey {
             self.non_core_pct(),
             self.pct(self.v2)
         )
+    }
+
+    /// The one line the row is while the crawl supersedes the survey.
+    pub fn superseded_line(&self) -> String {
+        format!("survey: superseded by the crawl, {} addrs kept", crate::ui::format_num(self.addresses))
     }
 
     /// The last connection as the panel states it, against `now` (Unix
@@ -263,7 +281,22 @@ pub(crate) mod tests {
         assert!(matches!(classify(Err(RpcError::Rpc { code: -1, message: "x".into() })), Poll::Failed(_)));
         assert!(matches!(classify(Ok(json!({"enabled": true}))), Poll::Failed(_)), "no counts");
         assert!(matches!(classify(Ok(json!([]))), Poll::Failed(_)));
-        assert!(matches!(classify(Ok(reply())), Poll::On(s) if s.addresses == 1204));
+        assert!(matches!(classify(Ok(reply())), Poll::On(s) if s.addresses == 1204 && !s.superseded));
+    }
+
+    /// With the crawl on the node says the survey is superseded, `enabled`
+    /// false: the answer is kept and marked, and the row is one line.
+    #[test]
+    fn superseded_by_the_crawl() {
+        let mut v = reply();
+        v["enabled"] = json!(false);
+        v["superseded_by_crawl"] = json!(true);
+        let Poll::On(s) = classify(Ok(v)) else { panic!("kept") };
+        assert!(s.superseded);
+        assert_eq!(s.superseded_line(), "survey: superseded by the crawl, 1,204 addrs kept");
+        let mut v = reply();
+        v["superseded_by_crawl"] = json!(false);
+        assert!(matches!(classify(Ok(v)), Poll::On(s) if !s.superseded));
     }
 
     #[test]

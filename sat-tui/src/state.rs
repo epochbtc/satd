@@ -730,6 +730,11 @@ pub struct AppState {
     /// where the node refuses it: the Chain view's survey row is hidden
     /// while `None`.
     pub peer_survey: Option<crate::survey::Survey>,
+    /// The network crawl's state and counts from `getcrawlinfo`. `None`
+    /// while the crawl is off, on a node that does not serve the method,
+    /// and where the node refuses it: the Chain view's crawl row is hidden
+    /// while `None`.
+    pub crawl: Option<crate::crawl::Crawl>,
 
     // Internal tracking
     prev_blocks: u32,
@@ -958,6 +963,7 @@ impl AppState {
             flagged_only: false,
             peer_detail: None,
             peer_survey: None,
+            crawl: None,
 
             prev_blocks: 0,
             prev_headers: 0,
@@ -1819,6 +1825,25 @@ impl AppState {
             }
             Poll::Failed(msg) => {
                 self.rpc_failures.insert("getpeersurvey", msg);
+            }
+        }
+    }
+
+    /// Apply one poll of `getcrawlinfo`, as [`Self::update_peer_survey`]
+    /// applies `getpeersurvey`'s.
+    pub fn update_crawl(&mut self, poll: crate::crawl::Poll) {
+        use crate::crawl::Poll;
+        match poll {
+            Poll::On(c) => {
+                self.rpc_failures.remove("getcrawlinfo");
+                self.crawl = Some(c);
+            }
+            Poll::Hidden => {
+                self.rpc_failures.remove("getcrawlinfo");
+                self.crawl = None;
+            }
+            Poll::Failed(msg) => {
+                self.rpc_failures.insert("getcrawlinfo", msg);
             }
         }
     }
@@ -2878,6 +2903,32 @@ mod tests {
             st.update_peer_survey(classify(Ok(reply())));
             st.update_peer_survey(classify(Err(crate::rpc::RpcError::Rpc { code, message: "no".into() })));
             assert!(st.peer_survey.is_none(), "{code}");
+            assert!(st.rpc_failures.is_empty(), "{code}: not an error");
+        }
+    }
+
+    /// The crawl row's data, as the survey row's: kept while the crawl is
+    /// on; the crawl off, a node without the method and a refusal clear it
+    /// with nothing failing; any other failure keeps the last answer.
+    #[test]
+    fn crawl_poll_shows_or_hides_the_row() {
+        use crate::crawl::{classify, tests::{off_reply, reply}};
+        let mut st = AppState::new();
+        st.update_crawl(classify(Ok(reply())));
+        assert_eq!(st.crawl.as_ref().map(|c| c.reachable), Some(21000));
+
+        st.update_crawl(crate::crawl::Poll::Failed("timed out".into()));
+        assert!(st.crawl.is_some(), "a failure keeps the last answer");
+        assert!(st.rpc_failures.contains_key("getcrawlinfo"));
+
+        st.update_crawl(classify(Ok(off_reply())));
+        assert!(st.crawl.is_none(), "crawl off");
+        assert!(!st.rpc_failures.contains_key("getcrawlinfo"));
+
+        for code in [crate::rpc::JSONRPC_METHOD_NOT_FOUND, crate::survey::READONLY_REJECT_CODE, crate::survey::CAPABILITY_DENIED_CODE] {
+            st.update_crawl(classify(Ok(reply())));
+            st.update_crawl(classify(Err(crate::rpc::RpcError::Rpc { code, message: "no".into() })));
+            assert!(st.crawl.is_none(), "{code}");
             assert!(st.rpc_failures.is_empty(), "{code}: not an error");
         }
     }
