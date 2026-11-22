@@ -55,6 +55,9 @@ pub(super) struct SurveyRun {
     /// (a failed dial or handshake), this run.
     completed: AtomicU64,
     failed: AtomicU64,
+    /// The last survey connection to end: when (Unix seconds) and whether
+    /// it completed. `None` until one ends.
+    last: parking_lot::Mutex<Option<(u64, bool)>>,
     /// Probe outcomes this run, by [`Probe::ALL`] then answered, silent,
     /// disconnected.
     probe_outcomes: [[AtomicU64; 3]; 4],
@@ -62,6 +65,16 @@ pub(super) struct SurveyRun {
     /// draw: for tests.
     #[cfg(test)]
     pub(super) forced_probes: parking_lot::Mutex<Option<Vec<Probe>>>,
+}
+
+impl SurveyRun {
+    /// Keep a survey connection that ended as the last one, and count it.
+    /// The last one is set first, so a reader that sees the count sees it.
+    fn note_connection(&self, completed: bool) {
+        *self.last.lock() = Some((crate::time::now_secs(), completed));
+        let counter = if completed { &self.completed } else { &self.failed };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 /// What the metrics read: counts only, no address.
@@ -161,6 +174,7 @@ impl PeerManager {
             dialing: AtomicBool::new(false),
             completed: AtomicU64::new(0),
             failed: AtomicU64::new(0),
+            last: parking_lot::Mutex::new(None),
             probe_outcomes: Default::default(),
             #[cfg(test)]
             forced_probes: Default::default(),
@@ -262,7 +276,7 @@ impl PeerManager {
             if !pm.dial_book_target(&dialled, Some(ConnType::Survey), AUTOMATIC_RECONNECT_MAX_BACKOFF).await
                 && let Some(run) = pm.survey.get()
             {
-                run.failed.fetch_add(1, Ordering::Relaxed);
+                run.note_connection(false);
             }
         });
         Some(target)
@@ -307,7 +321,7 @@ impl PeerManager {
             Err(e) => {
                 tracing::debug!("survey handshake failed: {e}, peer={id}");
                 if let Some(run) = self.survey.get() {
-                    run.failed.fetch_add(1, Ordering::Relaxed);
+                    run.note_connection(false);
                 }
                 return Ok(());
             }
@@ -373,7 +387,7 @@ impl PeerManager {
         let Some(run) = self.survey.get() else {
             return;
         };
-        run.completed.fetch_add(1, Ordering::Relaxed);
+        run.note_connection(true);
         let Some(addr) = book_addr else {
             return;
         };
@@ -552,6 +566,10 @@ impl PeerManager {
             "connections": {
                 "completed": run.completed.load(Ordering::Relaxed),
                 "failed": run.failed.load(Ordering::Relaxed),
+                "last": run.last.lock().map(|(time, completed)| serde_json::json!({
+                    "time": time,
+                    "result": if completed { "completed" } else { "failed" },
+                })),
             },
         });
         if verbose {

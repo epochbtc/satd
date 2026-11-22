@@ -725,6 +725,11 @@ pub struct AppState {
     pub flagged_only: bool,
     /// The peer whose detail overlay is open (`Enter`), by id.
     pub peer_detail: Option<u64>,
+    /// The network survey's aggregate from `getpeersurvey`. `None` while
+    /// the survey is off, on a node that does not serve the method, and
+    /// where the node refuses it: the Chain view's survey row is hidden
+    /// while `None`.
+    pub peer_survey: Option<crate::survey::Survey>,
 
     // Internal tracking
     prev_blocks: u32,
@@ -952,6 +957,7 @@ impl AppState {
             peer_behavior: None,
             flagged_only: false,
             peer_detail: None,
+            peer_survey: None,
 
             prev_blocks: 0,
             prev_headers: 0,
@@ -1795,6 +1801,26 @@ impl AppState {
             }
         }
         self.clamp_peer_selection();
+    }
+
+    /// Apply one poll of `getpeersurvey`. Off, not served or refused hides
+    /// the survey row without a failure; any other failure keeps the last
+    /// answer and is shown in the title bar like any other method's.
+    pub fn update_peer_survey(&mut self, poll: crate::survey::Poll) {
+        use crate::survey::Poll;
+        match poll {
+            Poll::On(s) => {
+                self.rpc_failures.remove("getpeersurvey");
+                self.peer_survey = Some(s);
+            }
+            Poll::Hidden => {
+                self.rpc_failures.remove("getpeersurvey");
+                self.peer_survey = None;
+            }
+            Poll::Failed(msg) => {
+                self.rpc_failures.insert("getpeersurvey", msg);
+            }
+        }
     }
 
     /// A peer's behaviour, while the node serves it.
@@ -2825,6 +2851,35 @@ mod tests {
         fresh.update_peer_behavior(mnf());
         fresh.open_peer_detail();
         assert_eq!(fresh.shown_peer_detail(), None);
+    }
+
+    /// The survey row's data: an answer from a node running the survey is
+    /// kept; the survey off, a node without the method and a refusal all
+    /// clear it with nothing recorded as failing; any other failure keeps
+    /// the last answer and shows.
+    #[test]
+    fn survey_poll_shows_or_hides_the_row() {
+        use crate::survey::{classify, tests::reply};
+        let mut st = AppState::new();
+        st.update_peer_survey(classify(Ok(reply())));
+        assert_eq!(st.peer_survey.as_ref().map(|s| s.addresses), Some(1204));
+
+        st.update_peer_survey(crate::survey::Poll::Failed("timed out".into()));
+        assert!(st.peer_survey.is_some(), "a failure keeps the last answer");
+        assert!(st.rpc_failures.contains_key("getpeersurvey"));
+
+        let mut off = reply();
+        off["enabled"] = json!(false);
+        st.update_peer_survey(classify(Ok(off)));
+        assert!(st.peer_survey.is_none(), "survey off");
+        assert!(!st.rpc_failures.contains_key("getpeersurvey"));
+
+        for code in [crate::rpc::JSONRPC_METHOD_NOT_FOUND, crate::survey::READONLY_REJECT_CODE, crate::survey::CAPABILITY_DENIED_CODE] {
+            st.update_peer_survey(classify(Ok(reply())));
+            st.update_peer_survey(classify(Err(crate::rpc::RpcError::Rpc { code, message: "no".into() })));
+            assert!(st.peer_survey.is_none(), "{code}");
+            assert!(st.rpc_failures.is_empty(), "{code}: not an error");
+        }
     }
 
     #[test]
