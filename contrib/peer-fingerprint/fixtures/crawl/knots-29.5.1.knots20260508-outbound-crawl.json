@@ -1,0 +1,273 @@
+{
+  "capture_format": 1,
+  "shape": "crawl",
+  "label": "knots-29.5.1.knots20260508-outbound-crawl",
+  "implementation": "core",
+  "implementation_version": "29.5.1.knots20260508",
+  "network": "regtest",
+  "connection": "outbound",
+  "peer_state": {
+    "ibd": "no",
+    "height": 1,
+    "note": "",
+    "address_book": {
+      "method": "addpeeraddress",
+      "offered": 1000,
+      "accepted": 989
+    }
+  },
+  "recorder": {
+    "greeting": "crawl",
+    "protocol_version": 70016,
+    "services": 0,
+    "relay": false,
+    "start_height": 1,
+    "user_agent": "/satd:0.8.0-pre(crawler)/",
+    "passive_wait_s": 10.0,
+    "getaddr_wait_s": 90.0,
+    "probe_wait_s": 5.0
+  },
+  "transport": "v1",
+  "v2_attempted": false,
+  "v2_failure": null,
+  "v2_transport": null,
+  "version": {
+    "protocol_version": 70016,
+    "services": 268438537,
+    "services_hex": "0000000010000c09",
+    "user_agent": "/Satoshi:29.5.1/Knots:20260508/",
+    "start_height": 1,
+    "relay": true,
+    "trailing_bytes": 0,
+    "timestamp_skew_s": 0
+  },
+  "commands": [
+    "version",
+    "wtxidrelay",
+    "sendaddrv2",
+    "verack",
+    "sendcmpct",
+    "ping",
+    "feefilter"
+  ],
+  "getaddr": {
+    "kind": "addrv2",
+    "count": 227,
+    "delay_ms": 0,
+    "networks": {
+      "ipv4": 227
+    },
+    "services_hex": {
+      "10000009": 227
+    },
+    "lists_itself": false,
+    "ntime_age_s": {
+      "min": 10,
+      "median": 11,
+      "max": 12,
+      "spread": 2,
+      "future": 0
+    }
+  },
+  "addr_after_getaddr": [
+    {
+      "kind": "addrv2",
+      "count": 227,
+      "delay_ms": 0,
+      "phase": "getaddr"
+    }
+  ],
+  "received": [
+    {
+      "t_ms": 0,
+      "phase": "handshake",
+      "command": "version",
+      "len": 117,
+      "fields": {
+        "protocol_version": 70016,
+        "services": 268438537,
+        "services_hex": "0000000010000c09",
+        "user_agent": "/Satoshi:29.5.1/Knots:20260508/",
+        "start_height": 1,
+        "relay": true,
+        "trailing_bytes": 0,
+        "timestamp_skew_s": 0
+      }
+    },
+    {
+      "t_ms": 0,
+      "phase": "handshake",
+      "command": "wtxidrelay",
+      "len": 0
+    },
+    {
+      "t_ms": 0,
+      "phase": "handshake",
+      "command": "sendaddrv2",
+      "len": 0
+    },
+    {
+      "t_ms": 0,
+      "phase": "handshake",
+      "command": "verack",
+      "len": 0
+    },
+    {
+      "t_ms": 0,
+      "phase": "passive",
+      "command": "sendcmpct",
+      "len": 9,
+      "fields": {
+        "announce": false,
+        "cmpct_version": 2
+      }
+    },
+    {
+      "t_ms": 0,
+      "phase": "passive",
+      "command": "ping",
+      "len": 8,
+      "fields": {
+        "has_nonce": true
+      }
+    },
+    {
+      "t_ms": 0,
+      "phase": "passive",
+      "command": "feefilter",
+      "len": 8,
+      "fields": {
+        "feerate": 1000
+      }
+    },
+    {
+      "t_ms": 10010,
+      "phase": "getaddr",
+      "command": "addrv2",
+      "len": 3860,
+      "fields": {
+        "count": 227
+      },
+      "getaddr_answer": true
+    },
+    {
+      "t_ms": 10011,
+      "phase": "probe",
+      "command": "pong",
+      "len": 8,
+      "fields": {
+        "has_nonce": true
+      }
+    },
+    {
+      "t_ms": 10011,
+      "phase": "probe",
+      "command": "headers",
+      "len": 82,
+      "fields": {
+        "count": 1
+      }
+    }
+  ],
+  "sent": [
+    {
+      "t_ms": 0,
+      "phase": "handshake",
+      "command": "version"
+    },
+    {
+      "t_ms": 0,
+      "phase": "handshake",
+      "command": "wtxidrelay"
+    },
+    {
+      "t_ms": 0,
+      "phase": "handshake",
+      "command": "sendaddrv2"
+    },
+    {
+      "t_ms": 0,
+      "phase": "handshake",
+      "command": "verack"
+    },
+    {
+      "t_ms": 0,
+      "phase": "passive",
+      "command": "pong"
+    },
+    {
+      "t_ms": 10010,
+      "phase": "getaddr",
+      "command": "getaddr"
+    },
+    {
+      "t_ms": 10011,
+      "phase": "probe",
+      "command": "ping"
+    },
+    {
+      "t_ms": 10011,
+      "phase": "probe",
+      "command": "getheaders"
+    },
+    {
+      "t_ms": 10011,
+      "phase": "probe",
+      "command": "getdata"
+    },
+    {
+      "t_ms": 15016,
+      "phase": "probe",
+      "command": "fpprobe"
+    }
+  ],
+  "probes": [
+    {
+      "probe": "ping",
+      "command": "ping",
+      "expect": "pong",
+      "disconnected": false,
+      "replies": [
+        "pong"
+      ],
+      "answered": true,
+      "latency_ms": 0,
+      "reply_fields": {
+        "has_nonce": true
+      }
+    },
+    {
+      "probe": "getheaders",
+      "command": "getheaders",
+      "expect": "headers",
+      "disconnected": false,
+      "replies": [
+        "headers"
+      ],
+      "answered": true,
+      "latency_ms": 0,
+      "reply_fields": {
+        "count": 1
+      }
+    },
+    {
+      "probe": "getdata_unknown_tx",
+      "command": "getdata",
+      "expect": "notfound",
+      "disconnected": false,
+      "replies": [],
+      "answered": false
+    },
+    {
+      "probe": "unknown_message",
+      "command": "fpprobe",
+      "expect": null,
+      "disconnected": false,
+      "replies": [],
+      "answered": false
+    }
+  ],
+  "closed_by_peer": null,
+  "error": null,
+  "session": 1
+}

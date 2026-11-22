@@ -405,6 +405,8 @@ pub enum Transports {
     Both,
     /// BIP 324 only: it closed our v1 connection before its `version`.
     V2Only,
+    /// v1 only: it failed our BIP 324 attempt, and the v1 redial completed.
+    V1Only,
 }
 
 impl Transports {
@@ -412,6 +414,7 @@ impl Transports {
         match self {
             Transports::Both => true,
             Transports::V2Only => v2,
+            Transports::V1Only => !v2,
         }
     }
 }
@@ -460,8 +463,10 @@ pub struct CrawlRow {
     pub v2_version_contents: bool,
     /// The probes' answers, in [`Probe::ALL`]'s order.
     pub probes: [Answer; 4],
-    /// The message the `getaddr` answer comes in.
-    pub getaddr: AddrKind,
+    /// The message the `getaddr` answer comes in; `None` when no capture
+    /// got an answer (btcd and bcoin: nothing seeds their address books
+    /// over RPC, so they had nothing to give), and so it is not pinned.
+    pub getaddr: Option<AddrKind>,
 }
 
 impl CrawlRow {
@@ -484,20 +489,22 @@ impl CrawlRow {
                 .iter()
                 .zip(self.probes)
                 .all(|(p, answer)| f.probes.get(*p).is_none_or(|o| answer.admits(o)))
-            && f.getaddr.is_none_or(|k| k == self.getaddr)
+            && f.getaddr.is_none_or(|k| self.getaddr.is_none_or(|g| g == k))
     }
 }
 
 /// The shapes measured against the crawl's `version`. Captures with no
 /// row: those in which the implementation sent no `version` (rbitcoin
-/// closing our v1 connection). Knots, btcd, bcoin and libbitcoin have no
-/// crawl-shape capture yet, so no row: a crawl session to one is unknown.
+/// closing our v1 connection, bcoin refusing the v1 redial after banning
+/// us for the v2 attempt). Knots shares Core's row, as it shares Core's
+/// networking code.
 #[rustfmt::skip]
 pub const CRAWL_TABLE: &[CrawlRow] = &[
     CrawlRow {
         captures: &[
             "core-32.1-outbound-crawl", "core-32.1-outbound-crawl-v2",
             "core-24.0.1-outbound-crawl", "core-24.0.1-outbound-crawl-v2",
+            "knots-29.5.1.knots20260508-outbound-crawl", "knots-29.5.1.knots20260508-outbound-crawl-v2",
         ],
         family: Family::Core,
         commands: &["version", "wtxidrelay", "sendaddrv2", "verack", "sendcmpct", "ping"],
@@ -509,7 +516,7 @@ pub const CRAWL_TABLE: &[CrawlRow] = &[
         // relay (`-whitelist` with the relay permission): live Core nodes
         // of 30.x to 32.1 answered it. So it is not pinned.
         probes: [Answer::Either, Answer::Either, Answer::Either, Answer::Silent],
-        getaddr: AddrKind::AddrV2,
+        getaddr: Some(AddrKind::AddrV2),
     },
     CrawlRow {
         captures: &["satd-0.8.0-pre-outbound-crawl", "satd-0.8.0-pre-outbound-crawl-v2"],
@@ -519,7 +526,7 @@ pub const CRAWL_TABLE: &[CrawlRow] = &[
         transports: Transports::Both,
         v2_decoys: false, v2_version_contents: false,
         probes: [Answer::Either, Answer::Either, Answer::Answered, Answer::Silent],
-        getaddr: AddrKind::AddrV2,
+        getaddr: Some(AddrKind::AddrV2),
     },
     CrawlRow {
         // The v1 capture shows rbitcoin closing the connection before its
@@ -531,7 +538,47 @@ pub const CRAWL_TABLE: &[CrawlRow] = &[
         transports: Transports::V2Only,
         v2_decoys: false, v2_version_contents: false,
         probes: [Answer::Either, Answer::Either, Answer::Answered, Answer::Silent],
-        getaddr: AddrKind::AddrV2,
+        getaddr: Some(AddrKind::AddrV2),
+    },
+    CrawlRow {
+        // btcd resets our BIP 324 attempt with nothing sent, and the v1
+        // redial completes: hence v1 only. It sends no `sendcmpct` and no
+        // `ping` of its own.
+        captures: &["btcd-0.27.0-outbound-crawl", "btcd-0.27.0-outbound-crawl-v2"],
+        family: Family::Btcd,
+        commands: &["version", "sendaddrv2", "verack"],
+        relay: true, services_zero: false, protocol_version: None,
+        transports: Transports::V1Only,
+        v2_decoys: false, v2_version_contents: false,
+        probes: [Answer::Either, Answer::Either, Answer::Answered, Answer::Silent],
+        getaddr: None,
+    },
+    CrawlRow {
+        // bcoin reads our BIP 324 attempt as v1 messages with a bad magic
+        // and bans us, so only the v1 capture has its shape. It speaks
+        // 70015, so no `wtxidrelay` or `sendaddrv2`, and announces its own
+        // address straight after `verack`.
+        captures: &["bcoin-2.2.0-outbound-crawl"],
+        family: Family::Bcoin,
+        commands: &["version", "verack", "addr"],
+        relay: true, services_zero: false, protocol_version: Some(70015),
+        transports: Transports::V1Only,
+        v2_decoys: false, v2_version_contents: false,
+        probes: [Answer::Either, Answer::Either, Answer::Answered, Answer::Silent],
+        getaddr: None,
+    },    CrawlRow {
+        // libbitcoin answers our BIP 324 attempt with its v1 `version`
+        // and closes; the v1 redial completes. It speaks 70013, sets relay
+        // off, and closes the session 60 s in with no `getaddr` answer,
+        // before any probe: so no probe answer is pinned.
+        captures: &["libbitcoin-3.8.0-outbound-crawl", "libbitcoin-3.8.0-outbound-crawl-v2"],
+        family: Family::Libbitcoin,
+        commands: &["version", "verack", "ping"],
+        relay: false, services_zero: false, protocol_version: Some(70013),
+        transports: Transports::V1Only,
+        v2_decoys: false, v2_version_contents: false,
+        probes: [Answer::Either, Answer::Either, Answer::Either, Answer::Either],
+        getaddr: None,
     },
 ];
 
@@ -728,7 +775,7 @@ mod tests {
     #[test]
     fn every_crawl_capture_classifies_as_its_own_family_and_no_other() {
         let names = crawl_fixture_names();
-        assert!(names.len() >= 8, "the crawl captures: {names:?}");
+        assert!(names.len() >= 16, "the crawl captures: {names:?}");
         for row in CRAWL_TABLE {
             for capture in row.captures {
                 assert!(names.iter().any(|n| n == capture), "crawl row names {capture}, which is not a crawl capture");
@@ -865,11 +912,39 @@ mod tests {
         assert_eq!(classify_crawl(&r.capture, Some(&v), &f), Fingerprint::Known(Family::Core, Confidence::High));
     }
 
+    /// The v1-only rows admit no BIP 324 session: btcd, bcoin and
+    /// libbitcoin never completed one, so the same shape inside BIP 324 is
+    /// some other implementation. bcoin's and libbitcoin's rows pin their
+    /// protocol versions, and libbitcoin's its relay flag.
+    #[test]
+    fn the_v1_only_crawl_rows_pin_their_transport_and_version() {
+        for (name, family) in [
+            ("btcd-0.27.0-outbound-crawl", Family::Btcd),
+            ("bcoin-2.2.0-outbound-crawl", Family::Bcoin),
+            ("libbitcoin-3.8.0-outbound-crawl", Family::Libbitcoin),
+        ] {
+            let (r, f) = replay_crawl_fixture(name);
+            assert_eq!(classify_crawl(&r.capture, r.version.as_ref(), &f), Fingerprint::Known(family, Confidence::High), "{name}");
+            let inside_v2 = CrawlFeatures { v2: Some(V2Greeting { garbage_len: 0, decoys: 0, version_len: 0 }), ..f };
+            assert_eq!(classify_crawl(&r.capture, r.version.as_ref(), &inside_v2), Fingerprint::Unknown, "{name} over v2");
+        }
+        for (name, protocol_version) in [("bcoin-2.2.0-outbound-crawl", 70016), ("libbitcoin-3.8.0-outbound-crawl", 70015)] {
+            let (r, f) = replay_crawl_fixture(name);
+            let mut v = r.version.clone().unwrap();
+            v.protocol_version = protocol_version;
+            assert_eq!(classify_crawl(&r.capture, Some(&v), &f), Fingerprint::Unknown, "{name} at {protocol_version}");
+        }
+        let (r, f) = replay_crawl_fixture("libbitcoin-3.8.0-outbound-crawl");
+        let mut v = r.version.clone().unwrap();
+        v.relay = true;
+        assert_eq!(classify_crawl(&r.capture, Some(&v), &f), Fingerprint::Unknown, "libbitcoin with relay on");
+    }
+
     /// Where two families' crawl rows share the commands, a session whose
     /// probe answers rule one out is `high`: the survey, which sends no
     /// probe before it judges, can only be `low` there. Only the `version`
     /// fields telling them apart is `low`. (A table built for the test: no
-    /// two captured families share crawl commands.)
+    /// two captured families share crawl commands; Knots is Core.)
     #[test]
     fn a_probe_answer_that_tells_families_apart_is_high_confidence() {
         let base = &CRAWL_TABLE[1];

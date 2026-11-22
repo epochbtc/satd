@@ -79,9 +79,10 @@ mode would: a declared crawler that only asks for addresses. Its `version`
 carries protocol 70016, services 0, relay 0, `start_height` the node's real
 tip, a random nonce, the dialed address in `addr_recv`, a dummy
 `addr_from`, and the user agent `/satd:<version>(crawler)/` (the version
-from the workspace `Cargo.toml`). It sends `version` and `wtxidrelay` at
-once, `sendaddrv2` and `verack` on the node's `version`, and nothing else
-unsolicited; it answers `ping` and `getheaders` as before. After the
+from the workspace `Cargo.toml`). It sends `version` at once and, on the
+node's `version`, `wtxidrelay` and `sendaddrv2` when the common version is
+70016 or more (as the crawl does: libbitcoin 3.8.0 and bcoin 2.2.0 speak
+older versions), then `verack`, and nothing else unsolicited; it answers `ping` and `getheaders` as before. After the
 handshake and the 10 s passive window it sends one `getaddr`, waits up to
 90 s for the answer (the first `addr`/`addrv2` with more than one entry),
 then runs the same four probes.
@@ -157,14 +158,21 @@ node accepted. What the table shows:
   it), and `unset WITH_BITCOIN_CONSENSUS` for its `unset -f` bug. `bs`
   cannot choose its listen address, so it runs in a container with only
   its P2P port published to 127.0.0.1.
-- **Crawl captures: four families.** Knots, btcd, bcoin and
-  libbitcoin-server have no crawl-shape capture yet: their builds were not
-  available where these were captured. Core 24.0.1, which predates BIP324,
-  stands in for how a v1-only node refuses our v2 attempt; btcd, bcoin and
-  libbitcoin may refuse differently. The Core, satd and rbitcoin versions
-  are the ones available there (Core 32.1 and 24.0.1, satd at this tree's
-  version, an rbitcoin 0.8.99 development build), not those of the
-  fixtures above.
+- **Crawl captures: versions.** The Core, satd and rbitcoin versions are
+  the ones that were available (Core 32.1 and 24.0.1, satd at this tree's
+  version, an rbitcoin 0.8.99 development build); Knots 29.5.1, btcd
+  0.27.0, bcoin 2.2.0 and libbitcoin-server 3.8.0 are their current
+  releases. The Core, satd, rbitcoin, Knots and btcd crawl captures were
+  taken while the recorder still sent `wtxidrelay` with its `version`;
+  all of them speak 70016 or more, where the crawl sends it too.
+- **Crawl captures: how v1-only clients refuse v2.** Core 24.0.1 closes
+  with nothing sent and btcd resets: a crawler redials those over v1.
+  bcoin and libbitcoin send their v1 `version` first, then close on our
+  BIP 324 bytes, and bcoin bans the address for them (its log: `Invalid
+  magic value`, `Ban threshold exceeded`), so its v1 redial is refused.
+- **Crawl captures: btcd, bcoin and libbitcoin address books.** None of
+  them can be given addresses over RPC, so their `getaddr` answers are
+  empty or absent.
 - **Crawl captures: regtest address books.** Each answer comes from about
   1,000 addresses added over RPC seconds before, all IPv4 on one port, so
   the answer's networks, service bits and `nTime` spread say little about a
@@ -202,3 +210,17 @@ SATD=… SATCLI=… CORE_BIN=…/bin RBITCOIN=… \
   --transport v1,v2 --core-functional /path/to/bitcoin/test/functional \
   --version satd=0.8.0-pre --version core=32.1 --version rbitcoin=0.8.99
 ```
+
+and for the other families:
+
+```sh
+KNOTS_BIN=…/bin BTCD=… BCOIN=… LIBBITCOIN_BS=… \
+./run-captures.py --crawl --workdir /path/to/scratch --out fixtures/crawl \
+  --only knots,btcd,bcoin,libbitcoin \
+  --transport v1,v2 --core-functional /path/to/bitcoin/test/functional \
+  --version knots=29.5.1.knots20260508 --version btcd=0.27.0 \
+  --version bcoin=2.2.0 --version libbitcoin=3.8.0
+```
+
+bcoin needs its native `bdb` module built (`npm rebuild bdb` after an
+install with `--ignore-scripts`).
