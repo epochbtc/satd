@@ -288,6 +288,12 @@ impl RpcClient {
         self.call("getpeersurvey", &[]).await
     }
 
+    /// satd's `getcrawlinfo`: the crawl's state and counts, never an
+    /// address. A node without it answers "method not found".
+    pub async fn get_crawl_info(&self) -> Result<serde_json::Value, RpcError> {
+        self.call("getcrawlinfo", &[]).await
+    }
+
     pub async fn get_network_info(&self) -> Result<serde_json::Value, RpcError> {
         self.call("getnetworkinfo", &[]).await
     }
