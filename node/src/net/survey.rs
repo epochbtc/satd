@@ -196,7 +196,7 @@ pub enum ProbeOutcome {
 }
 
 impl ProbeOutcome {
-    fn code(self) -> (u8, u32) {
+    pub(crate) fn code(self) -> (u8, u32) {
         match self {
             ProbeOutcome::Answered(v) => (1, v),
             ProbeOutcome::Silent => (2, 0),
@@ -204,7 +204,7 @@ impl ProbeOutcome {
         }
     }
 
-    fn from_code(code: u8, value: u32) -> Result<Option<Self>, String> {
+    pub(crate) fn from_code(code: u8, value: u32) -> Result<Option<Self>, String> {
         Ok(match code {
             0 => None,
             1 => Some(ProbeOutcome::Answered(value)),
@@ -476,24 +476,31 @@ impl SurveyStore {
     /// the execute bits: it holds peer addresses, so it is never more open
     /// than the data directory.
     pub fn save(&self, path: &Path, network_magic: [u8; 4]) -> Result<(), String> {
-        let buf = self.encode(network_magic);
-        let tmp = path.with_extension("dat.tmp");
-        {
-            let mut f = std::fs::File::create(&tmp).map_err(|e| format!("creating {}: {e}", tmp.display()))?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt as _;
-                let dir = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
-                let dir_mode =
-                    std::fs::metadata(dir).map_err(|e| format!("reading {}: {e}", dir.display()))?.permissions().mode();
-                f.set_permissions(std::fs::Permissions::from_mode(dir_mode & 0o666))
-                    .map_err(|e| format!("setting the permissions of {}: {e}", tmp.display()))?;
-            }
-            f.write_all(&buf).map_err(|e| format!("writing {}: {e}", tmp.display()))?;
-            f.sync_all().map_err(|e| format!("fsync {}: {e}", tmp.display()))?;
-        }
-        std::fs::rename(&tmp, path).map_err(|e| format!("renaming {} -> {}: {e}", tmp.display(), path.display()))
+        write_private_file(path, &self.encode(network_magic))
     }
+}
+
+/// Write `buf` to `path` through a temporary file renamed over it. The file
+/// takes the permissions of the directory it is in, less the execute bits:
+/// the files written this way hold peer addresses, so they are never more
+/// open than the data directory.
+pub(crate) fn write_private_file(path: &Path, buf: &[u8]) -> Result<(), String> {
+    let tmp = path.with_extension("dat.tmp");
+    {
+        let mut f = std::fs::File::create(&tmp).map_err(|e| format!("creating {}: {e}", tmp.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let dir = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+            let dir_mode =
+                std::fs::metadata(dir).map_err(|e| format!("reading {}: {e}", dir.display()))?.permissions().mode();
+            f.set_permissions(std::fs::Permissions::from_mode(dir_mode & 0o666))
+                .map_err(|e| format!("setting the permissions of {}: {e}", tmp.display()))?;
+        }
+        f.write_all(buf).map_err(|e| format!("writing {}: {e}", tmp.display()))?;
+        f.sync_all().map_err(|e| format!("fsync {}: {e}", tmp.display()))?;
+    }
+    std::fs::rename(&tmp, path).map_err(|e| format!("renaming {} -> {}: {e}", tmp.display(), path.display()))
 }
 
 /// The network an address is on, as `getnodeaddresses` names it.
@@ -519,7 +526,7 @@ fn family_from_byte(b: u8) -> Result<Family, String> {
     Family::ALL.get(usize::from(b)).copied().ok_or_else(|| format!("bad family {b}"))
 }
 
-fn encode_fingerprint(buf: &mut Vec<u8>, fp: Fingerprint) {
+pub(crate) fn encode_fingerprint(buf: &mut Vec<u8>, fp: Fingerprint) {
     let (tag, a, b) = match fp {
         Fingerprint::Unknown => (0, None, None),
         Fingerprint::Known(f, Confidence::High) => (1, Some(f), None),
@@ -529,7 +536,7 @@ fn encode_fingerprint(buf: &mut Vec<u8>, fp: Fingerprint) {
     buf.extend_from_slice(&[tag, family_byte(a), family_byte(b)]);
 }
 
-fn decode_fingerprint(r: &mut Reader) -> Result<Fingerprint, String> {
+pub(crate) fn decode_fingerprint(r: &mut Reader) -> Result<Fingerprint, String> {
     let tag = r.u8()?;
     let a = r.u8()?;
     let b = r.u8()?;
@@ -542,7 +549,7 @@ fn decode_fingerprint(r: &mut Reader) -> Result<Fingerprint, String> {
     })
 }
 
-fn encode_addr(buf: &mut Vec<u8>, addr: &PeerAddr) {
+pub(crate) fn encode_addr(buf: &mut Vec<u8>, addr: &PeerAddr) {
     match addr {
         PeerAddr::Socket(sa) => {
             buf.push(0);
@@ -563,7 +570,7 @@ fn encode_addr(buf: &mut Vec<u8>, addr: &PeerAddr) {
     }
 }
 
-fn decode_addr(r: &mut Reader) -> Result<PeerAddr, String> {
+pub(crate) fn decode_addr(r: &mut Reader) -> Result<PeerAddr, String> {
     match r.u8()? {
         0 => {
             let octets: [u8; 16] = r.take(16)?.try_into().expect("16 bytes");
@@ -582,10 +589,10 @@ fn decode_addr(r: &mut Reader) -> Result<PeerAddr, String> {
     }
 }
 
-struct Reader<'a>(&'a [u8]);
+pub(crate) struct Reader<'a>(pub(crate) &'a [u8]);
 
 impl<'a> Reader<'a> {
-    fn take(&mut self, n: usize) -> Result<&'a [u8], String> {
+    pub(crate) fn take(&mut self, n: usize) -> Result<&'a [u8], String> {
         if self.0.len() < n {
             return Err("file truncated".to_string());
         }
@@ -594,19 +601,19 @@ impl<'a> Reader<'a> {
         Ok(head)
     }
 
-    fn u8(&mut self) -> Result<u8, String> {
+    pub(crate) fn u8(&mut self) -> Result<u8, String> {
         Ok(self.take(1)?[0])
     }
 
-    fn u16(&mut self) -> Result<u16, String> {
+    pub(crate) fn u16(&mut self) -> Result<u16, String> {
         Ok(u16::from_le_bytes(self.take(2)?.try_into().expect("2 bytes")))
     }
 
-    fn u32(&mut self) -> Result<u32, String> {
+    pub(crate) fn u32(&mut self) -> Result<u32, String> {
         Ok(u32::from_le_bytes(self.take(4)?.try_into().expect("4 bytes")))
     }
 
-    fn u64(&mut self) -> Result<u64, String> {
+    pub(crate) fn u64(&mut self) -> Result<u64, String> {
         Ok(u64::from_le_bytes(self.take(8)?.try_into().expect("8 bytes")))
     }
 }
