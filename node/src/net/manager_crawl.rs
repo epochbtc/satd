@@ -510,7 +510,12 @@ impl PeerManager {
                 true
             }
             Err(e) => {
-                tracing::warn!(dir = %store.dir().display(), "Could not write a crawl snapshot: {e}");
+                store.failed(now);
+                tracing::warn!(
+                    dir = %store.dir().display(),
+                    "Could not write a crawl snapshot (next try in {} min): {e}",
+                    crawlsnapshot::SNAPSHOT_RETRY_SECS / 60
+                );
                 false
             }
         }

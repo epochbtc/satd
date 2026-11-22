@@ -306,9 +306,9 @@ fn asns_under_the_minimum_are_folded_into_other() {
     assert_eq!(asns(&raw), ["-", "-", "AS64496", "AS64496", "AS64496", "AS64497"]);
 }
 
-/// Keyed, an onion is listed by its address, raw (without the port, as
-/// every node's port is only `default` or `other`); I2P and CJDNS
-/// addresses appear only as counts.
+/// Keyed, an onion is listed by its address, raw (on the network's port
+/// without the port: its class says `default`); I2P and CJDNS addresses
+/// appear only as counts.
 #[test]
 fn onions_raw_i2p_and_cjdns_as_counts() {
     for mode in [keyed(1), Mode::Raw] {
@@ -461,4 +461,35 @@ fn snapshot_files_are_private() {
     assert_eq!(gunzip(&std::fs::read(&w.path).unwrap()).unwrap(), lines);
     let leftovers = std::fs::read_dir(data.join(SNAPSHOT_DIR)).unwrap().count();
     assert_eq!(leftovers, 1, "no temporary file left");
+}
+
+/// Keyed, one onion's services on two ports are two nodes: the one on the
+/// network's port by host alone, the other with its port.
+#[test]
+fn one_onion_on_two_ports_is_two_nodes_keyed() {
+    let mut book = book();
+    let other = PeerAddr::Onion { host: ONION.to_string(), port: 9050 };
+    assert!(book.seed(other.clone(), ServiceFlags::NETWORK.to_u64(), NOW - 4 * HOUR));
+    let result = SessionResult { v2: Attempt::Failed, v1: Attempt::Ok, observation: Some(observation(None)) };
+    book.record_result(&other, None, SessionKind::Discovery, result, NOW);
+    let out = export_json(&book, &ctx(), &keyed(1));
+    let nodes = out["nodes"].as_object().unwrap();
+    assert!(nodes.contains_key(ONION), "{out}");
+    assert!(nodes.contains_key(&format!("{ONION}:9050")), "{out}");
+    assert_eq!(out["total_nodes"], nodes.len());
+}
+
+/// A failed write is not retried on every tick: the store waits
+/// SNAPSHOT_RETRY_SECS, then a write that works clears it.
+#[test]
+fn a_failed_snapshot_write_waits_before_the_next_try() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = SnapshotStore::open(dir.path().join(SNAPSHOT_DIR));
+    assert!(store.due(NOW));
+    store.failed(NOW);
+    assert!(!store.due(NOW + 1));
+    assert!(!store.due(NOW + SNAPSHOT_RETRY_SECS - 1));
+    assert!(store.due(NOW + SNAPSHOT_RETRY_SECS));
+    store.write(NOW + SNAPSHOT_RETRY_SECS, b"{}\n").unwrap();
+    assert!(store.due(NOW + SNAPSHOT_RETRY_SECS + HOUR), "the next hour");
 }

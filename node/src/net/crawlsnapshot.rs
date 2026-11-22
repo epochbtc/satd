@@ -162,14 +162,16 @@ pub fn load_key(source: &KeySource) -> Result<ExportKey, String> {
         KeySource::Supplied(path) => read_key(path),
         KeySource::Default(path) => match read_key(path) {
             Ok(key) => Ok(key),
-            Err(_) if !path.exists() => {
+            Err(_) => {
+                // Absent, or created by a concurrent first export since the
+                // read: create it unless it is there (the link never
+                // replaces one), then read what is there. Another
+                // export's key wins; a file of the wrong length still errs.
                 let mut key = [0u8; EXPORT_KEY_BYTES];
                 rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut key);
                 create_key_file(path, &key)?;
-                // Another export may have created it first: its key wins.
                 read_key(path)
             }
-            Err(e) => Err(e),
         },
     }
 }
@@ -290,9 +292,14 @@ pub fn export_json(book: &CrawlBook, ctx: &ExportContext<'_>, mode: &Mode) -> se
     for (peer, e) in &reachable {
         let (key, asn) = match (mode, peer) {
             (Mode::Raw, _) => (peer.to_string(), asn_of(e).map(asn_text)),
-            // The onion raw; its port, as every node's, only as
-            // `default` or `other`.
-            (Mode::Keyed { .. }, PeerAddr::Onion { host, .. }) => (host.clone(), asn_of(e).map(asn_text)),
+            // The onion raw. On the network's port it is listed by host
+            // alone (its port class says `default`); on another port the
+            // port is kept, so two services of one onion are two nodes.
+            // An onion's port is as public as its address.
+            (Mode::Keyed { .. }, PeerAddr::Onion { host, port }) => {
+                let key = if *port == ctx.default_port { host.clone() } else { format!("{host}:{port}") };
+                (key, asn_of(e).map(asn_text))
+            }
             (Mode::Keyed { key, min_k }, PeerAddr::Socket(sa)) => {
                 let asn = asn_of(e).map(|a| {
                     if per_asn.get(&a).copied().unwrap_or(0) < *min_k { "other".to_string() } else { asn_text(a) }
@@ -468,14 +475,21 @@ pub struct Written {
 pub struct SnapshotStore {
     dir: PathBuf,
     last: Option<u64>,
+    /// When the last write failed: none is tried again for
+    /// [`SNAPSHOT_RETRY_SECS`].
+    failed: Option<u64>,
 }
+
+/// After a failed write, how long before the next try: each try builds the
+/// whole reachable set under the book's lock.
+pub const SNAPSHOT_RETRY_SECS: u64 = 10 * 60;
 
 impl SnapshotStore {
     /// The store at `dir`; its newest snapshot, if any, is the last write,
     /// so a restart within the hour writes none.
     pub fn open(dir: PathBuf) -> Self {
         let last = list_snapshots(&dir).ok().and_then(|t| t.last().copied());
-        SnapshotStore { dir, last }
+        SnapshotStore { dir, last, failed: None }
     }
 
     pub fn dir(&self) -> &Path {
@@ -486,6 +500,13 @@ impl SnapshotStore {
     /// hour.
     pub fn due(&self, now: u64) -> bool {
         self.last.is_none_or(|l| l / HOUR != now / HOUR)
+            && self.failed.is_none_or(|f| now.saturating_sub(f) >= SNAPSHOT_RETRY_SECS)
+    }
+
+    /// Note a failed write at `now`: [`Self::due`] waits
+    /// [`SNAPSHOT_RETRY_SECS`] before the next try.
+    pub fn failed(&mut self, now: u64) {
+        self.failed = Some(now);
     }
 
     /// Write `lines` as the snapshot at `now`, then prune.
@@ -495,8 +516,15 @@ impl SnapshotStore {
         let gz = gzip(lines, now as u32);
         survey::write_private_file(&path, &gz)?;
         self.last = Some(now);
+        self.failed = None;
         let mut pruned = 0;
-        for t in prune_plan(&list_snapshots(&self.dir)?, now) {
+        // The snapshot is written: a failure to prune is a warning, not
+        // a failed write.
+        let existing = list_snapshots(&self.dir).unwrap_or_else(|e| {
+            tracing::warn!(dir = %self.dir.display(), "Could not list the crawl snapshots to prune: {e}");
+            Vec::new()
+        });
+        for t in prune_plan(&existing, now) {
             let p = self.dir.join(snapshot_file_name(t));
             match std::fs::remove_file(&p) {
                 Ok(()) => pruned += 1,

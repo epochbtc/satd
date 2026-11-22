@@ -404,8 +404,10 @@ so its history can be followed; without the key, an ID cannot be tested
 against a guessed address, as a plain hash could across the whole IPv4
 space. And in a keyed export:
 
-- onion addresses are listed as they are (the host), since their operators
-  publish them to be dialled and they say nothing about location;
+- onion addresses are listed as they are (the host, with `:port` added
+  only when it is not the network's port, so one onion's two services are
+  two nodes), since their operators publish them to be dialled and they say
+  nothing about location;
 - I2P and CJDNS addresses appear only as counts;
 - the port is only `default` or `other`;
 - an ASN with fewer than `-crawlexportmink` (10) nodes in the export is
