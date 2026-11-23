@@ -14,7 +14,7 @@ use std::fmt;
 use std::time::{Duration, Instant};
 
 use crate::net::behavior::PeerBehavior;
-use crate::net::fingerprint::{Family, Fingerprint};
+use crate::net::fingerprint::{Confidence, Family, Fingerprint};
 
 /// How often the manager re-evaluates every connected peer.
 pub const EVALUATE_INTERVAL_SECS: u64 = 5;
@@ -504,6 +504,9 @@ pub fn peer_json(info: &crate::net::peer::PeerInfo) -> serde_json::Value {
     let b = &info.behavior;
     let p = &info.flags;
     let fingerprint = match p.fingerprint {
+        // Connected peers are judged by `classify`, which never claims;
+        // should one be, it is reported apart from a known family.
+        Fingerprint::Known(family, Confidence::Claimed) => json!({"result": "claimed", "claimed": family.name()}),
         Fingerprint::Known(family, confidence) => {
             json!({"result": "known", "family": family.name(), "confidence": confidence.name()})
         }

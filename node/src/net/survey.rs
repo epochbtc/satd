@@ -532,6 +532,9 @@ pub(crate) fn encode_fingerprint(buf: &mut Vec<u8>, fp: Fingerprint) {
         Fingerprint::Known(f, Confidence::High) => (1, Some(f), None),
         Fingerprint::Known(f, Confidence::Low) => (2, Some(f), None),
         Fingerprint::Mismatch { claimed, observed } => (3, Some(observed), Some(claimed)),
+        // Only a crawl session is judged so: `crawlbook.dat` holds it, the
+        // survey's store never does.
+        Fingerprint::Known(f, Confidence::Claimed) => (4, Some(f), None),
     };
     buf.extend_from_slice(&[tag, family_byte(a), family_byte(b)]);
 }
@@ -545,6 +548,7 @@ pub(crate) fn decode_fingerprint(r: &mut Reader) -> Result<Fingerprint, String> 
         1 => Fingerprint::Known(family_from_byte(a)?, Confidence::High),
         2 => Fingerprint::Known(family_from_byte(a)?, Confidence::Low),
         3 => Fingerprint::Mismatch { observed: family_from_byte(a)?, claimed: family_from_byte(b)? },
+        4 => Fingerprint::Known(family_from_byte(a)?, Confidence::Claimed),
         t => return Err(format!("bad fingerprint tag {t}")),
     })
 }

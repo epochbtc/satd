@@ -118,8 +118,10 @@ pub const ABANDONED_AFTER_SECS: u64 = 10 * 60;
 const SEED_SOURCE: u64 = 0;
 
 const FILE_MAGIC: [u8; 8] = *b"satdcrwl";
-/// 2: an unknown shape's raw features.
-const FILE_VERSION: u32 = 2;
+/// 2: an unknown shape's raw features. 3: a fingerprint may be claimed
+/// (no row matched; the user agent names the family). A version 2 file
+/// holds no claimed fingerprint and reads as it is.
+const FILE_VERSION: u32 = 3;
 
 /// An address in the book. Dialable addresses are [`PeerAddr`]s; I2P and
 /// CJDNS are kept to be counted, never dialled.
@@ -247,8 +249,9 @@ pub struct Observation {
     pub handshake_rtt_ms: Option<u32>,
     /// `None` when the session did not send `getaddr`.
     pub getaddr: Option<GetaddrResult>,
-    /// For an unknown fingerprint only: what the classifier read that the
-    /// fields above do not hold.
+    /// For a session no crawl row matched only (an unknown or a claimed
+    /// fingerprint): what the classifier read that the fields above do not
+    /// hold.
     pub shape: Option<UnknownShape>,
 }
 
@@ -1041,7 +1044,7 @@ impl CrawlBook {
             return Err("not a crawl book file".to_string());
         }
         let version = r.u32()?;
-        if version != FILE_VERSION {
+        if version != FILE_VERSION && version != 2 {
             return Err(format!("unknown crawl book version {version}"));
         }
         if r.take(4)? != network_magic {

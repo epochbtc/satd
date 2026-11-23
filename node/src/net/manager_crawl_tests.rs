@@ -1119,8 +1119,8 @@ async fn no_chain_check_without_probes_or_on_a_liveness_session() {
 
 /// A crawl session is judged against the crawl rows: a peer that greets
 /// the crawler as Core does is Core with high confidence; the same
-/// transcript closing the connection on a probe is no capture's shape, and
-/// its raw features are kept.
+/// transcript closing the connection on a probe is no capture's shape: its
+/// user agent's family is only claimed, and its raw features are kept.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_crawl_session_is_judged_on_its_crawl_features() {
     use crate::net::fingerprint::{AddrKind, Confidence, Family, Fingerprint};
@@ -1138,10 +1138,13 @@ async fn a_crawl_session_is_judged_on_its_crawl_features() {
     let obs = pm.crawl_session(&target, SessionKind::Discovery).await.result.observation.unwrap();
     assert_eq!(obs.fingerprint, Fingerprint::Known(Family::Core, Confidence::High));
 
+    // No row matches: the user agent's claim, never observed, and the
+    // raw features are kept as for an unknown shape.
     let (target, _log) = scripted("127.0.0.1", Script { hang_up_on_getdata: true, ..core }).await;
     let obs = pm.crawl_session(&target, SessionKind::Discovery).await.result.observation.unwrap();
-    assert_eq!(obs.fingerprint, Fingerprint::Unknown);
-    let shape = obs.shape.expect("an unknown shape keeps its raw features");
+    assert_eq!(obs.fingerprint, Fingerprint::Known(Family::Core, Confidence::Claimed));
+    assert_eq!(obs.fingerprint.observed(), None);
+    let shape = obs.shape.expect("a shape no row matched keeps its raw features");
     assert_eq!(shape.commands, ["version", "wtxidrelay", "sendaddrv2", "verack", "sendcmpct", "ping"]);
     assert!(shape.relay);
     assert_eq!(shape.v2, None, "a v1 session");
@@ -1153,17 +1156,19 @@ async fn a_crawl_session_is_judged_on_its_crawl_features() {
 /// undo what a discovery session found.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_session_without_probes_is_judged_with_the_last_answers() {
-    use crate::net::fingerprint::Fingerprint;
+    use crate::net::fingerprint::{Confidence, Family, Fingerprint};
     let (pm, _dir) = mk_pm_with(None);
     let run = enable(&pm, config());
-    // Core's transcript, closing the connection on a probe: no row.
+    // Core's transcript, closing the connection on a probe: no row, so
+    // only the user agent's claim.
     // (An answer to `getaddr`, so the probes go out before the session's bound.)
     let script = Script { answer: Some(answer(3)), hang_up_on_getdata: true, ..core_script() };
     let (target, _log) = scripted("127.0.0.1", script).await;
     assert!(run.book.lock().seed(target.clone(), 0, crate::time::now_secs()));
     pm.run_crawl_session(target.clone(), SessionKind::Discovery, None).await;
     let fp = |pm: &PeerManager| pm.crawl_book().unwrap().get(&CrawlAddr::Peer(target.clone())).unwrap().observation.clone().unwrap().fingerprint;
-    assert_eq!(fp(&pm), Fingerprint::Unknown);
+    let claimed = Fingerprint::Known(Family::Core, Confidence::Claimed);
+    assert_eq!(fp(&pm), claimed);
     pm.run_crawl_session(target.clone(), SessionKind::Liveness, None).await;
-    assert_eq!(fp(&pm), Fingerprint::Unknown, "the liveness session is judged with the disconnect");
+    assert_eq!(fp(&pm), claimed, "the liveness session is judged with the disconnect");
 }

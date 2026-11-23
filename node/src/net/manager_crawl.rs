@@ -72,7 +72,7 @@ use crate::net::crawlbook::{
 };
 use crate::net::crawlreport;
 use crate::net::crawlsnapshot::{self, SnapshotStore};
-use crate::net::fingerprint::{AddrKind, CrawlFeatures, Fingerprint};
+use crate::net::fingerprint::{AddrKind, CrawlFeatures};
 use crate::net::v2transport::V2Greeting;
 use crate::net::survey::{self, ProbeContext, ProbeResults};
 use bitcoin::p2p::address::{AddrV2, AddrV2Message};
@@ -1102,9 +1102,10 @@ impl PeerManager {
         let features = CrawlFeatures { v2: greeting, probes: judged_probes, getaddr: answer_kind };
         let capture = &hs.behavior.handshake;
         let fingerprint = crate::net::fingerprint::classify_crawl(capture, hs.behavior.version.as_ref(), &features);
-        // An unknown shape keeps its raw features, so a new implementation
+        // A shape no row matched (unknown, or only claimed by its user
+        // agent) keeps its raw features, so a new implementation or release
         // shows up as many records of one shape before it has a row.
-        let shape = (fingerprint == Fingerprint::Unknown).then(|| UnknownShape {
+        let shape = fingerprint.observed().is_none().then(|| UnknownShape {
             commands: capture.commands().collect(),
             relay: hs.version.relay,
             v2: greeting,

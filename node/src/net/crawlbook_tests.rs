@@ -610,6 +610,10 @@ fn a_bad_file_is_refused() {
     // Version 1 had no shapes: set aside, not misread.
     wrong_version[8..12].copy_from_slice(&1u32.to_le_bytes());
     assert!(err(&reseal(wrong_version)).contains("version 1"));
+    // Version 2 had no claimed fingerprint, and reads as it is.
+    let mut v2_file = body.clone();
+    v2_file[8..12].copy_from_slice(&2u32.to_le_bytes());
+    assert_eq!(CrawlBook::decode(&reseal(v2_file), MAGIC, NOW, p).unwrap().len(), full_book().len());
     assert!(err(&reseal(body[..body.len() - 3].to_vec())).contains("truncated"));
     let mut trailing = body.clone();
     trailing.push(0);
@@ -654,6 +658,27 @@ fn an_unknown_shape_is_bounded() {
     encode_shape(&mut buf, &big);
     let back = decode_shape(&mut Reader(&buf)).unwrap();
     assert_eq!(back.commands, vec!["x".repeat(SHAPE_COMMAND_LEN); crate::net::behavior::HANDSHAKE_CAPTURE_MAX]);
+}
+
+/// A claimed fingerprint (no row matched; the user agent names the
+/// family) round-trips, with the shape it keeps, and stays apart from an
+/// observed one.
+#[test]
+fn a_claimed_fingerprint_round_trips() {
+    let mut book = full_book();
+    let mut claimed = observation(NOW + 6);
+    claimed.fingerprint = Fingerprint::Known(Family::Btcd, Confidence::Claimed);
+    claimed.user_agent = "/btcwire:0.5.0/btcd:0.29.0/".to_string();
+    claimed.shape = Some(shape());
+    book.record_result(&v4(2), None, SessionKind::Discovery, SessionResult { v2: Attempt::Failed, v1: Attempt::Ok, observation: Some(claimed.clone()) }, NOW + 6);
+    let kept = book.get(&CrawlAddr::Peer(v4(2))).unwrap().observation.clone().unwrap();
+    assert_eq!(kept.fingerprint, claimed.fingerprint);
+    let back = CrawlBook::decode(&book.encode(MAGIC), MAGIC, NOW + 6, BookParams::default()).unwrap();
+    let o = back.get(&CrawlAddr::Peer(v4(2))).unwrap().observation.as_ref().unwrap();
+    assert_eq!(o, &kept);
+    assert_eq!(o.shape, claimed.shape);
+    assert_eq!(o.fingerprint.observed(), None);
+    assert_eq!(o.fingerprint.claimed_only(), Some(Family::Btcd));
 }
 
 #[test]

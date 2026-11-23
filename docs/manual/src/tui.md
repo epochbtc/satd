@@ -560,7 +560,9 @@ Network crawl:
   reachable network.
 - One bar per observed family, the 8 largest, then "other", each with
   its share of the reachable addresses, and the **non-Core** share,
-  counted as in the survey row.
+  counted as in the survey row. A node whose handshake matched no family
+  is in the `unknown` bar even when its user agent names one (`claimed`
+  in `getcrawlinfo`): a claim is never drawn as an observed family.
 
 Crawl detail:
 

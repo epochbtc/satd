@@ -1,0 +1,121 @@
+{
+  "capture_format": 1,
+  "shape": "crawl",
+  "label": "libbitcoin-3.6.0-outbound-crawl-v2",
+  "implementation": "libbitcoin",
+  "implementation_version": "3.6.0",
+  "network": "regtest",
+  "connection": "outbound",
+  "peer_state": {
+    "ibd": "unknown",
+    "height": -1,
+    "note": "cannot mine on regtest; never left IBD",
+    "address_book": {
+      "method": null,
+      "offered": 0,
+      "accepted": 0,
+      "note": "no RPC adds to its address book"
+    }
+  },
+  "recorder": {
+    "greeting": "crawl",
+    "protocol_version": 70016,
+    "services": 0,
+    "relay": false,
+    "start_height": 0,
+    "user_agent": "/satd:0.8.0-pre(crawler)/",
+    "passive_wait_s": 10.0,
+    "getaddr_wait_s": 90.0,
+    "probe_wait_s": 5.0
+  },
+  "transport": "v1",
+  "v2_attempted": true,
+  "v2_failure": {
+    "kind": "eof",
+    "after_ms": 41,
+    "bytes_returned": 128,
+    "error": "Closed",
+    "v1_magic_returned": true,
+    "v1_command_returned": "version"
+  },
+  "v2_transport": null,
+  "version": {
+    "protocol_version": 70013,
+    "services": 9,
+    "services_hex": "0000000000000009",
+    "user_agent": "/libbitcoin:3.6.0/",
+    "start_height": 0,
+    "relay": false,
+    "trailing_bytes": 0,
+    "timestamp_skew_s": 0
+  },
+  "commands": [
+    "version",
+    "verack",
+    "ping"
+  ],
+  "getaddr": null,
+  "addr_after_getaddr": [],
+  "received": [
+    {
+      "t_ms": 1,
+      "phase": "handshake",
+      "command": "version",
+      "len": 104,
+      "fields": {
+        "protocol_version": 70013,
+        "services": 9,
+        "services_hex": "0000000000000009",
+        "user_agent": "/libbitcoin:3.6.0/",
+        "start_height": 0,
+        "relay": false,
+        "trailing_bytes": 0,
+        "timestamp_skew_s": 0
+      }
+    },
+    {
+      "t_ms": 1,
+      "phase": "handshake",
+      "command": "verack",
+      "len": 0
+    },
+    {
+      "t_ms": 1,
+      "phase": "passive",
+      "command": "ping",
+      "len": 8,
+      "fields": {
+        "has_nonce": true
+      }
+    }
+  ],
+  "sent": [
+    {
+      "t_ms": 0,
+      "phase": "handshake",
+      "command": "version"
+    },
+    {
+      "t_ms": 1,
+      "phase": "handshake",
+      "command": "verack"
+    },
+    {
+      "t_ms": 1,
+      "phase": "passive",
+      "command": "pong"
+    },
+    {
+      "t_ms": 10011,
+      "phase": "getaddr",
+      "command": "getaddr"
+    }
+  ],
+  "probes": [],
+  "closed_by_peer": {
+    "t_ms": 60001,
+    "phase": "getaddr"
+  },
+  "error": null,
+  "session": 1
+}

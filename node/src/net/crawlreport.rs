@@ -95,10 +95,17 @@ pub struct Aggregate {
     /// node's own `version` services do not count here, though they decide
     /// the dial ([`CrawlEntry::dials_v2_first`](crate::net::crawlbook::CrawlEntry::dials_v2_first)).
     pub v2_advertised: usize,
-    /// Reachable addresses per observed family, [`Family::ALL`]'s order.
+    /// Reachable addresses per observed family (a row matched, at `high`
+    /// or `low`), [`Family::ALL`]'s order.
     pub families: [usize; Family::ALL.len()],
-    /// Reachable addresses whose handshake matched no family.
+    /// Reachable addresses whose handshake matched no family: the claimed
+    /// ones included.
     pub unknown: usize,
+    /// Of the [`unknown`](Self::unknown) ones, those whose user agent names
+    /// a family (a [`Confidence::Claimed`](crate::net::fingerprint::Confidence::Claimed)
+    /// fingerprint), per family, [`Family::ALL`]'s order. Never counted in
+    /// [`families`](Self::families): a user agent is not an observation.
+    pub claimed: [usize; Family::ALL.len()],
     /// Reachable addresses whose user agent names one family and handshake
     /// another.
     pub mismatches: usize,
@@ -134,9 +141,13 @@ pub fn aggregate(book: &CrawlBook, now: u64) -> Aggregate {
             agg.v2_advertised += 1;
         }
         let fp = e.observation.as_ref().map(|o| o.fingerprint).unwrap_or_default();
+        let index = |f: Family| Family::ALL.iter().position(|x| *x == f).expect("every family is in ALL");
         match fp.observed() {
-            Some(f) => agg.families[Family::ALL.iter().position(|x| *x == f).expect("every family is in ALL")] += 1,
+            Some(f) => agg.families[index(f)] += 1,
             None => agg.unknown += 1,
+        }
+        if let Some(f) = fp.claimed_only() {
+            agg.claimed[index(f)] += 1;
         }
         if matches!(fp, Fingerprint::Mismatch { .. }) {
             agg.mismatches += 1;
@@ -146,8 +157,10 @@ pub fn aggregate(book: &CrawlBook, now: u64) -> Aggregate {
 }
 
 /// The aggregate as `getcrawlinfo` reports it: `book`, `reachable`,
-/// `transport`, `families` and `mismatches`. Shares are of the reachable
-/// addresses.
+/// `transport`, `families`, `claimed` and `mismatches`. Shares are of the
+/// reachable addresses. `families` counts observed families and `unknown`;
+/// `claimed` splits the unknown ones by the family their user agent names,
+/// so it never adds to a family's observed count.
 pub fn aggregate_json(agg: &Aggregate, max_entries: usize) -> serde_json::Value {
     let total = agg.reachable_total();
     let share = |n: usize| if total == 0 { 0.0 } else { n as f64 / total as f64 };
@@ -176,6 +189,10 @@ pub fn aggregate_json(agg: &Aggregate, max_entries: usize) -> serde_json::Value 
         families.insert(f.name().to_string(), serde_json::json!({ "count": c, "share": share(c) }));
     }
     families.insert("unknown".to_string(), serde_json::json!({ "count": agg.unknown, "share": share(agg.unknown) }));
+    let mut claimed = serde_json::Map::new();
+    for (f, c) in Family::ALL.iter().zip(agg.claimed) {
+        claimed.insert(f.name().to_string(), serde_json::json!({ "count": c, "share": share(c) }));
+    }
     serde_json::json!({
         "book": {
             "entries": agg.entries,
@@ -186,6 +203,7 @@ pub fn aggregate_json(agg: &Aggregate, max_entries: usize) -> serde_json::Value 
         "reachable": reachable,
         "transport": transport,
         "families": families,
+        "claimed": claimed,
         "mismatches": agg.mismatches,
     })
 }
@@ -244,21 +262,23 @@ fn observation_json(o: &Observation) -> serde_json::Value {
 }
 
 /// One `getcrawlnodes` row. Without `verbose`: the address, its network,
-/// whether it is reachable now, its last handshake, transport class and
-/// family. With `verbose`: every field of the entry and of its last
-/// observation.
+/// whether it is reachable now, its last handshake, transport class,
+/// observed family and fingerprint (`core/claimed` when only the user
+/// agent names the family; `family` is then null). With `verbose`: every
+/// field of the entry and of its last observation.
 pub fn row_json(addr: &CrawlAddr, e: &CrawlEntry, now: u64, liveness_secs: u64, verbose: bool) -> serde_json::Value {
     let reachable =
         addr.dialable() && e.last_success.is_some_and(|s| s >= now.saturating_sub(liveness_secs));
     let transport = e.last_success.map(|_| Transport::of(e).name());
-    let family = e.observation.as_ref().and_then(|o| o.fingerprint.observed()).map(Family::name);
+    let fingerprint = e.observation.as_ref().map(|o| o.fingerprint);
     let mut row = serde_json::json!({
         "addr": addr_text(addr),
         "network": addr.network().name(),
         "reachable": reachable,
         "last_success": e.last_success,
         "transport": transport,
-        "family": family,
+        "family": fingerprint.and_then(|f| f.observed()).map(Family::name),
+        "fingerprint": fingerprint.map(|f| f.to_string()),
     });
     if verbose {
         let extra = serde_json::json!({

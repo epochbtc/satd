@@ -1,0 +1,61 @@
+{
+  "capture_format": 1,
+  "shape": "crawl",
+  "label": "bcoin-2.1.2-outbound-crawl-v2",
+  "implementation": "bcoin",
+  "implementation_version": "2.1.2",
+  "network": "regtest",
+  "connection": "outbound",
+  "peer_state": {
+    "ibd": "unknown",
+    "height": 1,
+    "note": "RPC reports no IBD state; its tip was mined seconds before the capture",
+    "address_book": {
+      "method": null,
+      "offered": 0,
+      "accepted": 0,
+      "note": "not seeded: it is not started without outbound connections"
+    }
+  },
+  "recorder": {
+    "greeting": "crawl",
+    "protocol_version": 70016,
+    "services": 0,
+    "relay": false,
+    "start_height": 1,
+    "user_agent": "/satd:0.8.0-pre(crawler)/",
+    "passive_wait_s": 10.0,
+    "getaddr_wait_s": 90.0,
+    "probe_wait_s": 5.0
+  },
+  "transport": "v1",
+  "v2_attempted": true,
+  "v2_failure": {
+    "kind": "eof",
+    "after_ms": 43,
+    "bytes_returned": 603,
+    "error": "Closed",
+    "v1_magic_returned": true,
+    "v1_command_returned": "version"
+  },
+  "v2_transport": null,
+  "version": null,
+  "commands": [],
+  "getaddr": null,
+  "addr_after_getaddr": [],
+  "received": [],
+  "sent": [
+    {
+      "t_ms": 0,
+      "phase": "handshake",
+      "command": "version"
+    }
+  ],
+  "probes": [],
+  "closed_by_peer": {
+    "t_ms": 0,
+    "phase": "handshake"
+  },
+  "error": null,
+  "session": 1
+}

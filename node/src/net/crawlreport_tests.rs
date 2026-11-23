@@ -214,7 +214,7 @@ fn rows_without_and_with_verbose() {
     assert_eq!(rows.len(), 9);
     let keys = |r: &serde_json::Value| r.as_object().unwrap().keys().cloned().collect::<BTreeSet<_>>();
     let short: BTreeSet<String> =
-        ["addr", "network", "reachable", "last_success", "transport", "family"].map(String::from).into();
+        ["addr", "network", "reachable", "last_success", "transport", "family", "fingerprint"].map(String::from).into();
     for r in rows {
         assert_eq!(keys(r), short, "{r}");
     }
@@ -261,4 +261,49 @@ fn rows_without_and_with_verbose() {
     let a = row(rows, "23.1.1.7:8333");
     assert_eq!((a["v2_advertised"].clone(), a["sources"].clone()), (true.into(), 1.into()), "seeded only");
     assert_eq!(row(rows, "23.1.5.7:8333")["observation"], serde_json::Value::Null);
+}
+
+/// A claimed family (no row matched; the user agent names it) is never
+/// counted as observed: `families` counts it as `unknown`, and `claimed`
+/// alone carries the family. The rows say so too: no `family`, and the
+/// fingerprint `core/claimed`.
+#[test]
+fn a_claimed_family_is_never_counted_as_observed() {
+    let mut book = CrawlBook::new(crate::net::crawlbook::BookParams::for_network(bitcoin::Network::Bitcoin));
+    for addr in [v4(1), v4(2), v4(3)] {
+        assert!(book.seed(addr, 1, NOW - HOUR));
+    }
+    let d = SessionKind::Discovery;
+    let claimed = Fingerprint::Known(Family::Core, Confidence::Claimed);
+    book.record_result(&v4(1), None, d, result(Attempt::Failed, Attempt::Ok, Some(claimed)), NOW);
+    let low = Fingerprint::Known(Family::Btcd, Confidence::Low);
+    book.record_result(&v4(2), None, d, result(Attempt::Failed, Attempt::Ok, Some(low)), NOW);
+    book.record_result(&v4(3), None, d, result(Attempt::Failed, Attempt::Ok, Some(Fingerprint::Unknown)), NOW);
+    let agg = aggregate(&book, NOW);
+    assert_eq!(agg.reachable_total(), 3);
+    assert_eq!(family(&agg, Family::Core), 0, "claimed is not observed");
+    assert_eq!(family(&agg, Family::Btcd), 1, "low is observed");
+    assert_eq!(agg.unknown, 2, "the claimed one and the unknown one");
+    let claimed_of = |f: Family| agg.claimed[Family::ALL.iter().position(|x| *x == f).unwrap()];
+    assert_eq!(claimed_of(Family::Core), 1);
+    assert_eq!(agg.claimed.iter().sum::<usize>(), 1);
+    assert_eq!(agg.mismatches, 0);
+    assert_eq!(agg.families.iter().sum::<usize>() + agg.unknown, agg.reachable_total());
+
+    let json = aggregate_json(&agg, 250_000);
+    assert_eq!(json["families"]["core"]["count"], 0);
+    assert_eq!(json["families"]["unknown"]["count"], 2);
+    assert_eq!(json["claimed"]["core"], serde_json::json!({ "count": 1, "share": 1.0 / 3.0 }));
+    for f in Family::ALL.iter().filter(|f| **f != Family::Core) {
+        assert_eq!(json["claimed"][f.name()]["count"], 0, "{}", f.name());
+    }
+    assert!(json["claimed"].get("unknown").is_none());
+
+    let rows = nodes_json(&book, NOW, true);
+    let row = rows.as_array().unwrap().iter().find(|r| r["addr"] == "23.1.1.7:8333").unwrap();
+    assert_eq!(row["family"], serde_json::Value::Null);
+    assert_eq!(row["fingerprint"], "core/claimed");
+    assert_eq!(row["observation"]["family"], serde_json::Value::Null);
+    assert_eq!(row["observation"]["claimed"], "core");
+    assert_eq!(row["observation"]["mismatch"], false);
 }
