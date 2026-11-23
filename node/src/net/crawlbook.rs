@@ -383,7 +383,9 @@ impl CrawlEntry {
         self.sources.len()
     }
 
-    /// Whether the address was advertised with `NODE_P2P_V2`.
+    /// Whether the address was last advertised with `NODE_P2P_V2`, in a
+    /// `getaddr` answer or the address-book sample. The node's own `version`
+    /// services are not read: [`Self::dials_v2_first`] reads them.
     pub fn v2_advertised(&self) -> bool {
         ServiceFlags::from(self.advertised_services).has(ServiceFlags::P2P_V2)
     }

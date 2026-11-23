@@ -90,7 +90,10 @@ pub struct Aggregate {
     /// Reachable addresses per [`Transport`] class, [`Transport::ALL`]'s
     /// order.
     pub transport: [usize; Transport::ALL.len()],
-    /// Reachable addresses advertised with `NODE_P2P_V2`.
+    /// Reachable addresses whose address was last advertised (in a
+    /// `getaddr` answer or the address-book sample) with `NODE_P2P_V2`. The
+    /// node's own `version` services do not count here, though they decide
+    /// the dial ([`CrawlEntry::dials_v2_first`](crate::net::crawlbook::CrawlEntry::dials_v2_first)).
     pub v2_advertised: usize,
     /// Reachable addresses per observed family, [`Family::ALL`]'s order.
     pub families: [usize; Family::ALL.len()],

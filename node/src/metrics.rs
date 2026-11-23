@@ -1070,7 +1070,7 @@ fn render_crawl(out: &mut String, m: Option<&crate::net::manager::CrawlMetrics>)
     metric(
         out,
         "satd_crawl_v2_advertised",
-        "Reachable addresses advertised with NODE_P2P_V2.",
+        "Reachable addresses whose address was advertised with NODE_P2P_V2.",
         "gauge",
         &[],
         a.v2_advertised as u64,
