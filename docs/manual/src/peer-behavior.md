@@ -19,18 +19,27 @@ session. Two things come out of it.
 
 **A fingerprint.** The commands a peer sends from its `version` through the
 end of its connection setup, with its `version` fields (protocol version,
-services, `relay`), are compared against a table of the shapes each
-implementation was measured to send: Bitcoin Core (Knots and other Core
-forks are in the Core family, since they share its networking code), btcd,
-bcoin, libbitcoin, Floresta, rbitcoin, satd, and the bitcoin-seeder and
-bitnodes crawlers. Every row of the table comes from a capture of that
-implementation against a local node, committed with the sources
-(`contrib/peer-fingerprint/`). The result is one of:
+services, `relay`), are compared against a table of rows, one or more per
+implementation: Bitcoin Core (Knots and other Core forks are in the Core
+family, since they share its networking code), btcd, bcoin, libbitcoin,
+Floresta, rbitcoin, satd, and the bitcoin-seeder and bitnodes crawlers. A
+row names the traits that set its family apart (which feature messages it
+sends between `version` and `verack`, which announcements follow `verack`
+before its first other message, what that message is, and for some
+families the protocol version, `relay` and whether any service bit is
+set), not the whole transcript of one release, and covers the directions
+it was captured in (which side dialled). Each row was checked against
+captures of that implementation against a local node, inbound and
+outbound, of several releases where more than one could be run, committed
+with the sources (`contrib/peer-fingerprint/`); a test replays every
+capture and checks that it classifies as its own family and no other. The
+result is one of:
 
 | Result | Means |
 |---|---|
-| `known` | The transcript matches one family, and the user agent names that family or none. `confidence` is `high` when the commands alone tell, `low` when another family sends the same commands and the `version` fields told them apart. |
-| `unknown` | No row matches, or the transcript is not settled yet (less than 10 seconds connected and still open). A shape no capture shows, such as an older release or Core's block-relay-only and feeler connections, is unknown rather than a guess. |
+| `known` | The transcript matches one family's row, and the user agent names that family or none. `confidence` is `high` when the traits alone tell, `low` when another family's row has the same traits and the `version` fields told them apart. |
+| `claimed` | No row matches, and the user agent names a family: `claimed` is that family. Nothing the peer did confirmed it, so it is never counted as an observed family and is never a `mismatch`. A release that behaves unlike every captured one, or a connection that closed before showing its traits (Core's feeler, rbitcoin's catch-up connection), ends here. |
+| `unknown` | No row matches and the user agent names no family, or the transcript is not settled yet (less than 10 seconds connected and still open). |
 | `mismatch` | The user agent names one family and the transcript matches another. |
 
 The network crawl (`-crawl`) judges its own sessions against rows of their
@@ -43,8 +52,9 @@ message, no disconnect; Core answers the unknown transaction only when its
 operator grants the crawler relay, so its row leaves that open) and of the
 `getaddr` answer (`addrv2`), so a crawl session can be `known` with `high`
 confidence where the survey could only say `low`. Crawl rows exist for
-Bitcoin Core, satd and rbitcoin; a crawl session to any other
-implementation is `unknown`, and an unknown shape keeps its transcript,
+Bitcoin Core, satd, rbitcoin, btcd, bcoin and libbitcoin (see
+[Network Crawl](crawl.md)); a crawl session no row matches is `claimed` or
+`unknown` as above, and keeps its transcript,
 `relay` flag, BIP 324 greeting and `getaddr` answer in `crawlbook.dat`, so
 a new implementation shows up as many records of one shape. A crawl
 discovery session also runs a chain check on the `getheaders` probe's
@@ -90,7 +100,7 @@ sat-cli getpeerbehavior 7
     "subver": "/bitcoin-seeder:0.01/",
     "evaluated": true,
     "fingerprint": {
-      "result": "known", "family": "bitcoin-seeder", "confidence": "high",
+      "result": "known", "family": "bitcoin-seeder", "confidence": "low",
       "settled": true, "handshake": ["version", "verack", "getaddr"]
     },
     "flag_codes": "C",
@@ -131,7 +141,10 @@ clients by observed family. See [sat-tui](tui.md#peer-behaviour).
   per code, zeros included.
 - `satd_peer_fingerprint{family}`: connected peers per observed family
   (a mismatch counts under the family its transcript matched), plus
-  `family="unknown"`.
+  `family="unknown"`, which counts the claimed ones too.
+- `satd_peer_fingerprint_claimed{family}`: the connected peers no row
+  matched whose user agent names that family. They are never counted under
+  the family in `satd_peer_fingerprint`.
 - The [status page](observability.md#status-page) lists the number of
   connected peers carrying each flag, and only the flags some peer carries.
 - With `-debug=net`, one line when a peer first gains a flag in a
@@ -255,6 +268,11 @@ node's own peers.
     "...": "...",
     "unknown": {"count": 41, "share": 0.0505}
   },
+  "claimed": {
+    "core": {"count": 37, "share": 0.0456},
+    "btcd": {"count": 2, "share": 0.0025},
+    "...": "..."
+  },
   "mismatches": 3,
   "v2": {"count": 402, "share": 0.495},
   "top_as": [{"asn": 64496, "count": 57}],
@@ -270,7 +288,8 @@ node's own peers.
 | Field | What |
 |---|---|
 | `addresses` | Records in the store: addresses the survey reached in the last 30 days. |
-| `families` | Records per observed family (a mismatch counts under the family its handshake matched), with each one's share of `addresses`. |
+| `families` | Records per observed family (a mismatch counts under the family its handshake matched), with each one's share of `addresses`. `unknown` counts every record no row matched, the claimed ones included. |
+| `claimed` | The `unknown` records whose user agent names a family, per family, with each one's share of `addresses`: what the peers say they run, kept apart from what the survey saw. |
 | `mismatches` | Records whose user agent names one family and handshake matches another. |
 | `v2` | Records reached over BIP 324. |
 | `top_as` | The ten autonomous systems with the most records. Empty without `-asmap`. |
@@ -285,7 +304,12 @@ example `core/high`), `family`, `claimed` (the family the user agent names),
 `mismatch`, `subver` (sanitized peer text), `version`, `services`, `v2`,
 `asn`, `first_seen`, `last_seen` (Unix seconds) and `probes`, each probe
 sent with its `result` (`answered`, `silent` or `disconnected`) and, when
-answered, its `value`.
+answered, its `value`. A claimed record has `fingerprint` `core/claimed`
+(for example) and a null `family`. A record no row matched, claimed or
+unknown, also carries `handshake`, the commands it was judged on, and
+`relay`, its `version`'s relay flag, so that the shapes no row knows can
+be told apart and given rows; with `-debug=net` the same is logged when its
+survey connection ends.
 
 The RPC is operator control: it is refused on the read-only listener, and
 for a bearer token it needs `rpc:write`.
@@ -294,7 +318,11 @@ for a bearer token it needs `rpc:write`.
 
 `peersurvey.dat` keeps one record per address: the fingerprint, user agent,
 protocol version, services, whether it spoke v2, its autonomous system, when
-it was first and last seen, and the last probe outcomes. A record not seen
+it was first and last seen, the last probe outcomes and, for a record no row
+matched, its handshake transcript (at most 16 commands) and `relay` flag. A
+file written before the transcript was kept is read as it is: its records
+keep the fingerprints they were judged with, and have no transcript until
+the address is surveyed again. A record not seen
 for 30 days is dropped, and past 250,000 records (about 25 MB) the least
 recently seen go first. It is written every 10 minutes and at shutdown, and
 read at startup; a file that does not read is renamed with a `.bad-<unix time>` suffix, with a warning, and
@@ -305,7 +333,10 @@ the survey starts empty.
 - `satd_peer_survey_enabled`: 1 while the survey runs.
 - `satd_peer_survey_records`, `satd_peer_survey_family{family}`,
   `satd_peer_survey_mismatches` and `satd_peer_survey_v2`: the store's
-  counts.
+  counts. `family="unknown"` counts the claimed records too.
+- `satd_peer_survey_claimed{family}`: the records no row matched whose user
+  agent names that family; never counted under the family in
+  `satd_peer_survey_family`.
 - `satd_peer_survey_connections_total{result}`: `completed` and `failed`
   survey connections.
 - `satd_peer_survey_probes_total{probe,outcome}`: probe outcomes.
@@ -364,8 +395,8 @@ With `-altslots` above 0 and no `-altprefer`, the one rule is
 A `ua:` term never rests on the user agent alone. Each candidate is
 **verified** (its handshake matched the family its agent names; a Knots
 agent with a Core-family handshake is verified), **unverified** (its
-handshake matched nothing the table knows, or its agent names no known
-family) or **contradicted** (its handshake matched another family; the peer
+handshake matched no row, so its fingerprint is `unknown` or only
+`claimed`, or its agent names no known family) or **contradicted** (its handshake matched another family; the peer
 carries the `F` flag). `-altuatrust`:
 
 - `strict`: `ua:` terms match verified candidates only.

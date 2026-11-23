@@ -470,8 +470,12 @@ pub struct FlagCounts {
     /// Peers whose transcript matched each family, in [`Family::ALL`]
     /// order, mismatches counted under the family observed.
     pub families: [usize; Family::ALL.len()],
-    /// Peers with no match (or none yet).
+    /// Peers with no match (or none yet), the claimed ones included.
     pub unknown: usize,
+    /// The unknown peers whose user agent names a family (a
+    /// [`Confidence::Claimed`] fingerprint), per family: never counted in
+    /// `families`.
+    pub claimed: [usize; Family::ALL.len()],
 }
 
 impl FlagCounts {
@@ -485,6 +489,10 @@ impl FlagCounts {
                 self.families[i] += 1;
             }
             None => self.unknown += 1,
+        }
+        if let Some(family) = p.fingerprint.claimed_only() {
+            let i = Family::ALL.iter().position(|f| *f == family).unwrap_or(0);
+            self.claimed[i] += 1;
         }
     }
 }
@@ -504,8 +512,8 @@ pub fn peer_json(info: &crate::net::peer::PeerInfo) -> serde_json::Value {
     let b = &info.behavior;
     let p = &info.flags;
     let fingerprint = match p.fingerprint {
-        // Connected peers are judged by `classify`, which never claims;
-        // should one be, it is reported apart from a known family.
+        // No row matched and the user agent names the family: reported
+        // apart from a known family, with no `family` of its own.
         Fingerprint::Known(family, Confidence::Claimed) => json!({"result": "claimed", "claimed": family.name()}),
         Fingerprint::Known(family, confidence) => {
             json!({"result": "known", "family": family.name(), "confidence": confidence.name()})

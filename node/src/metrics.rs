@@ -948,6 +948,15 @@ fn render_peer_flags(out: &mut String, counts: &crate::net::flags::FlagCounts) {
         metric_sample(out, "satd_peer_fingerprint", &[("family", family.name())], n as u64);
     }
     metric_sample(out, "satd_peer_fingerprint", &[("family", "unknown")], counts.unknown as u64);
+    metric_header(
+        out,
+        "satd_peer_fingerprint_claimed",
+        "Connected peers no row matched whose user agent names this family: counted as unknown under satd_peer_fingerprint, never as the family.",
+        "gauge",
+    );
+    for (family, n) in Family::ALL.iter().zip(counts.claimed) {
+        metric_sample(out, "satd_peer_fingerprint_claimed", &[("family", family.name())], n as u64);
+    }
 }
 
 /// The network survey (`-peersurvey`): `satd_peer_survey_enabled`, and with
@@ -986,6 +995,15 @@ fn render_peer_survey(out: &mut String, m: Option<&crate::net::manager::SurveyMe
         metric_sample(out, "satd_peer_survey_family", &[("family", family.name())], n as u64);
     }
     metric_sample(out, "satd_peer_survey_family", &[("family", "unknown")], m.unknown as u64);
+    metric_header(
+        out,
+        "satd_peer_survey_claimed",
+        "Survey records no row matched whose user agent names this family: counted as unknown under satd_peer_survey_family, never as the family.",
+        "gauge",
+    );
+    for (family, n) in Family::ALL.iter().zip(m.claimed) {
+        metric_sample(out, "satd_peer_survey_claimed", &[("family", family.name())], n as u64);
+    }
     metric(
         out,
         "satd_peer_survey_mismatches",
@@ -2197,6 +2215,50 @@ mod tests {
             assert!(out.lines().any(|l| l == line), "{line} in:\n{out}");
         }
         assert!(!out.contains("satd_crawl_claimed{family=\"unknown\"}"));
+    }
+
+    /// The survey's and the connected peers' metrics keep a claimed
+    /// family apart from the observed ones as the crawl's do: the record
+    /// or peer is `unknown` under the family series, and only the claimed
+    /// series names its family.
+    #[test]
+    fn the_survey_and_peer_metrics_keep_claimed_apart_from_observed() {
+        use crate::net::fingerprint::{Confidence, Family, Fingerprint};
+        let index = |f: Family| Family::ALL.iter().position(|x| *x == f).unwrap();
+        let mut m = crate::net::manager::SurveyMetrics::default();
+        m.families[index(Family::Btcd)] = 2;
+        m.unknown = 3;
+        m.claimed[index(Family::Core)] = 1;
+        let mut out = String::new();
+        render_peer_survey(&mut out, Some(&m));
+        for line in [
+            "satd_peer_survey_family{family=\"core\"} 0",
+            "satd_peer_survey_family{family=\"unknown\"} 3",
+            "satd_peer_survey_claimed{family=\"core\"} 1",
+            "satd_peer_survey_claimed{family=\"btcd\"} 0",
+        ] {
+            assert!(out.lines().any(|l| l == line), "{line} in:\n{out}");
+        }
+        assert!(!out.contains("satd_peer_survey_claimed{family=\"unknown\"}"));
+
+        let mut counts = crate::net::flags::FlagCounts::default();
+        for fp in [
+            Fingerprint::Known(Family::Core, Confidence::Claimed),
+            Fingerprint::Known(Family::Core, Confidence::High),
+            Fingerprint::Unknown,
+        ] {
+            counts.add(&crate::net::flags::PeerFlags { fingerprint: fp, ..Default::default() });
+        }
+        let mut out = String::new();
+        render_peer_flags(&mut out, &counts);
+        for line in [
+            "satd_peer_fingerprint{family=\"core\"} 1",
+            "satd_peer_fingerprint{family=\"unknown\"} 2",
+            "satd_peer_fingerprint_claimed{family=\"core\"} 1",
+            "satd_peer_fingerprint_claimed{family=\"satd\"} 0",
+        ] {
+            assert!(out.lines().any(|l| l == line), "{line} in:\n{out}");
+        }
     }
 
     #[test]

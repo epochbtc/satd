@@ -374,6 +374,7 @@ fn netgroup_rule_holds_with_eight_alt_slots() {
                     first_seen: now,
                     last_seen: now,
                     probes: Default::default(),
+                    shape: None,
                 },
                 now,
             );
@@ -413,6 +414,7 @@ fn verified_store_candidates_first_and_known_misses_skipped() {
         first_seen: now,
         last_seen: now,
         probes: Default::default(),
+        shape: None,
     };
     {
         let mut st = pm.alt_slots.state.lock();
@@ -626,6 +628,7 @@ fn a_trial_result_keeps_the_survey_probes() {
         first_seen: now,
         last_seen: now,
         probes,
+        shape: None,
     };
     assert!(pm.insert_survey_record(PeerAddr::Socket(addr), record, now));
     add_peer(&pm, settled(1, addr, Some(AltRole::Trial), known(Family::Btcd), BTCD));

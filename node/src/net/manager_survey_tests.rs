@@ -477,6 +477,36 @@ async fn a_survey_records_the_peer_and_marks_its_address_good() {
     assert!(crate::time::now_secs().abs_diff(when) < 60, "{json}");
 }
 
+/// A peer whose shape no row matches, under a user agent naming a family,
+/// is recorded at `claimed`: under `unknown` in `families`, under its
+/// family in `claimed`, never as observed, with its raw shape kept in the
+/// record and shown by `getpeersurvey true`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_survey_of_a_shape_no_row_matches_is_claimed_and_keeps_its_shape() {
+    let mut script = core_script();
+    script.user_agent = "/Satoshi:25.1.0/";
+    // An `inv` straight after `verack`: no captured release sends that.
+    script.after_verack = vec![NetworkMessage::Inv(Vec::new())];
+    let (_got, pm, target, _dir) = survey_one(script, None).await;
+    let r = pm.survey_store().unwrap().get(&PeerAddr::Socket(target)).cloned().expect("a record");
+    assert_eq!(r.fingerprint, Fingerprint::Known(Family::Core, Confidence::Claimed));
+    let shape = r.shape.expect("the raw shape is kept");
+    assert_eq!(shape.commands, ["version", "wtxidrelay", "sendaddrv2", "verack", "inv"]);
+    assert!(shape.relay);
+    let json = pm.get_peer_survey(false);
+    assert_eq!(json["families"]["core"]["count"], 0, "a claim is never an observed family");
+    assert_eq!(json["families"]["unknown"]["count"], 1);
+    assert_eq!(json["claimed"]["core"]["count"], 1);
+    let metrics = pm.survey_metrics().unwrap();
+    assert_eq!((metrics.families[0], metrics.unknown, metrics.claimed[0]), (0, 1, 1));
+    let verbose = pm.get_peer_survey(true);
+    let row = &verbose["peers"][0];
+    assert_eq!(row["fingerprint"], "core/claimed");
+    assert_eq!(row["family"], serde_json::Value::Null);
+    assert_eq!(row["claimed"], "core");
+    assert_eq!(row["handshake"], serde_json::json!(["version", "wtxidrelay", "sendaddrv2", "verack", "inv"]));
+}
+
 /// Each probe sends its message and records the answer: the `pong`'s
 /// round trip, the `notfound` naming our transaction, and silence after
 /// the unknown message. At genesis the `getheaders` probe is not sent: no

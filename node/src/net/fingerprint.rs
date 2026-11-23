@@ -1,21 +1,22 @@
 //! Which implementation a peer runs, judged from what it sent during and
 //! just after its handshake.
 //!
-//! [`classify`] compares a peer's handshake transcript
+//! [`classify`] judges a node connection (a survey connection, or any
+//! connected peer): it compares the peer's handshake transcript
 //! ([`crate::net::behavior::HandshakeCapture`]) and `version` fields against
-//! [`TABLE`], a list of the shapes each implementation was measured to send.
-//! Every row comes from a capture committed under
-//! `contrib/peer-fingerprint/fixtures` and is named after it; the fixture
-//! replay test checks that each capture classifies as its own family and no
-//! other. No row is written from documentation. A shape no capture shows
-//! (an older release, a block-relay-only or feeler connection from Core) is
-//! [`Fingerprint::Unknown`], never a guess.
+//! [`TABLE`], whose rows name the traits ([`Trait`]) that set each family
+//! apart. Every row is checked against captures committed under
+//! `contrib/peer-fingerprint/fixtures`, inbound and outbound, of several
+//! releases of its client, and names them; the fixture replay test checks
+//! that each capture classifies as its own family and no other. No row is
+//! written from documentation.
 //!
 //! Crawl sessions are judged by [`classify_crawl`] against
-//! [`CRAWL_TABLE`], whose rows match a family's traits rather than one
-//! release's transcript; with no row matching, it reports the family the
-//! user agent names at [`Confidence::Claimed`], which is never an observed
-//! family ([`Fingerprint::observed`]). [`classify`] never claims.
+//! [`CRAWL_TABLE`], whose rows hold the same traits plus what a crawl
+//! session sees besides. Under either table, a session no row matches
+//! reports the family its user agent names at [`Confidence::Claimed`],
+//! which is never an observed family ([`Fingerprint::observed`]); a user
+//! agent that names no family is [`Fingerprint::Unknown`], never a guess.
 //!
 //! Knots and the other Core forks share Core's networking code and are the
 //! [`Family::Core`] family.
@@ -114,8 +115,8 @@ pub enum Confidence {
     /// told them apart.
     Low,
     /// No row matched: the family is the one the user agent names, and
-    /// nothing the peer did confirmed it. Only crawl sessions are judged so
-    /// ([`classify_crawl`]). A claimed family is never an observed one
+    /// nothing the peer did confirmed it ([`classify`], [`classify_crawl`]).
+    /// A claimed family is never an observed one
     /// ([`Fingerprint::observed`]), and never a mismatch.
     Claimed,
 }
@@ -137,8 +138,8 @@ pub enum Fingerprint {
     /// it or no family at all; or, at [`Confidence::Claimed`], no row
     /// matches and the user agent names this family.
     Known(Family, Confidence),
-    /// No row matches (and, for a crawl session, the user agent names no
-    /// family), or the transcript is not settled yet.
+    /// No row matches and the user agent names no family, or the
+    /// transcript is not settled yet.
     #[default]
     Unknown,
     /// The user agent names one family and the transcript matches another.
@@ -203,139 +204,252 @@ impl RowDirection {
     }
 }
 
-/// One measured shape.
+/// One family's shape on a node connection (a survey connection, or any
+/// connected peer), in one direction: the traits that set it apart from
+/// every other family's, checked against inbound and outbound captures of
+/// several releases of it, rather than the whole transcript of one. What no
+/// trait names (the order of the negotiation messages, an announcement
+/// another release adds, the first message after the announcements where
+/// no trait pins it) is left open, so other releases match.
 ///
-/// A row pins the commands (replies to our own requests left out, as the
-/// transcript leaves them out), the direction, `relay`, and whether any
-/// service bit is set, all as captured. A shape with no feature negotiation
-/// in it (no `wtxidrelay` or `sendaddrv2`) is what every client below
-/// protocol 70016 sends, so those rows pin the protocol version too.
+/// The traits are [`Trait`]s, as the crawl rows' are: the transcript is
+/// the same record ([`HandshakeCapture`]) cut the same way. A node
+/// connection sends no crawl probes before it is judged, so a row states
+/// no probe answer, BIP 324 greeting or `getaddr` answer. The direction is
+/// not a trait of the peer but the row's scope: a family's shape depends on
+/// which side dialled (Core asks a node that dialled it for nothing, and
+/// asks the node it dialled for addresses), and a row covers only the
+/// directions its captures were taken in.
 #[derive(Debug)]
 pub struct Row {
-    /// The captures it comes from, as fixture names without `.json`.
+    /// The captures it was checked against, as fixture names without
+    /// `.json`.
     pub captures: &'static [&'static str],
     pub family: Family,
     pub direction: RowDirection,
-    pub commands: &'static [&'static str],
-    pub relay: bool,
-    pub services_zero: bool,
-    pub protocol_version: Option<u32>,
+    /// Every one must hold.
+    pub traits: &'static [Trait],
 }
 
 impl Row {
-    fn matches_version(&self, v: &VersionFields) -> bool {
-        v.relay == self.relay
-            && (v.services == 0) == self.services_zero
-            && self.protocol_version.is_none_or(|p| p == v.protocol_version)
+    fn matches_version(&self, p: &Phases, v: &VersionFields) -> bool {
+        self.traits.iter().filter(|t| t.of_version()).all(|t| t.holds(p, v))
+    }
+
+    /// The direction, and every trait but the `version` fields'.
+    fn admits_session(&self, inbound: bool, p: &Phases, v: &VersionFields) -> bool {
+        self.direction.admits(inbound) && self.traits.iter().filter(|t| !t.of_version()).all(|t| t.holds(p, v))
     }
 }
 
-/// The measured shapes. Captures with no row: those in which the
-/// implementation sent no `version` (a v2 dial to a v1-only node, rbitcoin
-/// refusing v1), and rbitcoin's first, catch-up connection, which ends at
-/// `verack` as any client's feeler connection does.
+/// The families' shapes on node connections, in no particular order: every
+/// capture under `contrib/peer-fingerprint/fixtures` with a `version`
+/// matches its own family's row and no other (the fixture replay test).
+/// Captures with no row: those in which the implementation sent no
+/// `version` (a v2 dial to a v1-only node, rbitcoin refusing v1), and
+/// rbitcoin's first, catch-up connection, which ends at `verack` as any
+/// client's feeler connection does; a session no row matches is judged by
+/// the family its user agent names, at [`Confidence::Claimed`].
 #[rustfmt::skip]
 pub const TABLE: &[Row] = &[
     Row {
+        // Core and Knots since 0.21 dialing us: both negotiation messages,
+        // then `getaddr` before any announcement. btcd, Floresta and bitnodes
+        // send no `wtxidrelay`.
         captures: &[
-            "core-31.2-inbound", "core-31.2-inbound-s2", "core-31.2-inbound-v2", "core-31.2-inbound-v2-s2",
-            "knots-29.4.3.knots20260508-inbound", "knots-29.4.3.knots20260508-inbound-s2",
-            "knots-29.4.3.knots20260508-inbound-v2", "knots-29.4.3.knots20260508-inbound-v2-s2",
+            "core-0.21.2-inbound-s2", "core-0.21.2-inbound-v2-s2", "core-0.21.2-inbound-v2", "core-0.21.2-inbound",
+            "core-22.1-inbound-s2", "core-22.1-inbound-v2-s2", "core-22.1-inbound-v2", "core-22.1-inbound",
+            "core-23.2-inbound-s2", "core-23.2-inbound-v2-s2", "core-23.2-inbound-v2", "core-23.2-inbound",
+            "core-24.2-inbound-s2", "core-24.2-inbound-v2-s2", "core-24.2-inbound-v2", "core-24.2-inbound",
+            "core-25.2-inbound-s2", "core-25.2-inbound-v2-s2", "core-25.2-inbound-v2", "core-25.2-inbound",
+            "core-28.1-inbound-s2", "core-28.1-inbound-v2-s2", "core-28.1-inbound-v2", "core-28.1-inbound",
+            "core-31.2-inbound-s2", "core-31.2-inbound-v2-s2", "core-31.2-inbound-v2", "core-31.2-inbound",
+            "core-32.1-inbound-s2", "core-32.1-inbound-v2-s2", "core-32.1-inbound-v2", "core-32.1-inbound",
+            "knots-28.1.knots20250305-inbound-s2", "knots-28.1.knots20250305-inbound-v2-s2",
+            "knots-28.1.knots20250305-inbound-v2", "knots-28.1.knots20250305-inbound",
+            "knots-29.4.3.knots20260508-inbound-s2", "knots-29.4.3.knots20260508-inbound-v2-s2",
+            "knots-29.4.3.knots20260508-inbound-v2", "knots-29.4.3.knots20260508-inbound",
         ],
         family: Family::Core,
         direction: RowDirection::Inbound,
-        commands: &["version", "wtxidrelay", "sendaddrv2", "verack", "getaddr"],
-        relay: true, services_zero: false, protocol_version: None,
+        traits: &[Trait::Negotiates("wtxidrelay"), Trait::Negotiates("sendaddrv2"), Trait::Then("getaddr")],
     },
     Row {
+        // Core before 0.21 (protocol 70015) dialing us: nothing to negotiate,
+        // then `getaddr`, as the seeder sends it: its protocol version tells
+        // them apart, so it is `low`.
         captures: &[
-            "core-31.2-outbound", "core-31.2-outbound-v2",
-            "knots-29.4.3.knots20260508-outbound", "knots-29.4.3.knots20260508-outbound-v2",
+            "core-0.20.2-inbound-s2", "core-0.20.2-inbound-v2-s2", "core-0.20.2-inbound-v2", "core-0.20.2-inbound",
+        ],
+        family: Family::Core,
+        direction: RowDirection::Inbound,
+        traits: &[
+            Trait::NeverNegotiates("wtxidrelay"), Trait::NeverNegotiates("sendaddrv2"),
+            Trait::Then("getaddr"), Trait::Protocol(70015),
+        ],
+    },
+    Row {
+        // Core and Knots since 24 dialed by us, by a node or by the survey: both
+        // negotiation messages, then `sendcmpct` alone before its next message
+        // (`ping` in every capture). No `sendheaders` sets it apart from
+        // rbitcoin and older Core, no `feefilter` from satd.
+        captures: &[
+            "core-24.2-outbound-survey", "core-24.2-outbound",
+            "core-25.2-outbound-survey", "core-25.2-outbound",
+            "core-28.1-outbound-survey-v2", "core-28.1-outbound-survey", "core-28.1-outbound-v2",
+            "core-28.1-outbound",
+            "core-31.2-outbound-v2", "core-31.2-outbound",
+            "core-32.1-outbound-survey-v2", "core-32.1-outbound-survey", "core-32.1-outbound-v2",
+            "core-32.1-outbound",
+            "knots-28.1.knots20250305-outbound-survey-v2", "knots-28.1.knots20250305-outbound-survey",
+            "knots-28.1.knots20250305-outbound-v2", "knots-28.1.knots20250305-outbound",
+            "knots-29.4.3.knots20260508-outbound-v2", "knots-29.4.3.knots20260508-outbound",
         ],
         family: Family::Core,
         direction: RowDirection::Outbound,
-        commands: &["version", "wtxidrelay", "sendaddrv2", "verack", "sendcmpct", "ping"],
-        relay: true, services_zero: false, protocol_version: None,
+        traits: &[
+            Trait::Negotiates("wtxidrelay"), Trait::Negotiates("sendaddrv2"),
+            Trait::Announces("sendcmpct"), Trait::NeverAnnounces("sendheaders"), Trait::NeverAnnounces("feefilter"),
+        ],
     },
     Row {
-        captures: &["satd-0.7.0-inbound", "satd-0.7.0-inbound-s2", "satd-0.7.0-inbound-v2", "satd-0.7.0-inbound-v2-s2"],
-        family: Family::Satd,
-        direction: RowDirection::Inbound,
-        commands: &["version", "wtxidrelay", "sendaddrv2", "verack", "sendheaders", "getheaders"],
-        relay: true, services_zero: false, protocol_version: None,
-    },
-    Row {
-        captures: &["satd-0.7.0-outbound", "satd-0.7.0-outbound-v2"],
-        family: Family::Satd,
+        // Core before 24 dialed by us: `sendheaders` straight after `verack`,
+        // then `sendcmpct` twice (compact block versions 2 and 1), where
+        // rbitcoin sends it once. 0.20 negotiates nothing (70015), 0.21 to 23
+        // both messages: the negotiation is left open.
+        captures: &[
+            "core-0.20.2-outbound-survey", "core-0.20.2-outbound",
+            "core-0.21.2-outbound-survey", "core-0.21.2-outbound",
+            "core-22.1-outbound-survey", "core-22.1-outbound",
+            "core-23.2-outbound-survey", "core-23.2-outbound",
+        ],
+        family: Family::Core,
         direction: RowDirection::Outbound,
-        commands: &["version", "wtxidrelay", "sendaddrv2", "verack", "getheaders"],
-        relay: true, services_zero: false, protocol_version: None,
+        traits: &[
+            Trait::Announces("sendheaders"), Trait::AnnouncesTimes("sendcmpct", 2), Trait::NeverAnnounces("feefilter"),
+        ],
     },
     Row {
-        captures: &["rbitcoin-0.8.0-inbound-v2-s2", "rbitcoin-0.8.0-outbound-v2"],
+        // satd 0.7 and the 0.8 tree, either direction: `getheaders` before any
+        // `sendcmpct` (dialing us, after its `sendheaders`). No other family
+        // asks for headers first.
+        captures: &[
+            "satd-0.7.0-inbound-s2", "satd-0.7.0-inbound-v2-s2", "satd-0.7.0-inbound-v2", "satd-0.7.0-inbound",
+            "satd-0.7.0-outbound-v2", "satd-0.7.0-outbound",
+            "satd-0.7.2-inbound-s2", "satd-0.7.2-inbound-v2-s2", "satd-0.7.2-inbound-v2", "satd-0.7.2-inbound",
+            "satd-0.7.2-outbound-survey-v2", "satd-0.7.2-outbound-survey", "satd-0.7.2-outbound-v2",
+            "satd-0.7.2-outbound",
+            "satd-0.8.0-pre-inbound-s2", "satd-0.8.0-pre-inbound-v2-s2", "satd-0.8.0-pre-inbound-v2",
+            "satd-0.8.0-pre-inbound", "satd-0.8.0-pre-outbound-survey-v2", "satd-0.8.0-pre-outbound-survey",
+            "satd-0.8.0-pre-outbound-v2", "satd-0.8.0-pre-outbound",
+        ],
+        family: Family::Satd,
+        direction: RowDirection::Either,
+        traits: &[
+            Trait::Negotiates("wtxidrelay"), Trait::Negotiates("sendaddrv2"),
+            Trait::NeverAnnounces("sendcmpct"), Trait::Then("getheaders"),
+        ],
+    },
+    Row {
+        // rbitcoin, BIP 324 only, either direction: `sendheaders` and one
+        // `sendcmpct` straight after `verack`. Core before 24 sends
+        // `sendcmpct` twice; satd sends none before `getheaders`.
+        captures: &[
+            "rbitcoin-0.8.0-inbound-v2-s2", "rbitcoin-0.8.0-outbound-v2",
+            "rbitcoin-0.8.99-inbound-v2-s2", "rbitcoin-0.8.99-inbound-v2", "rbitcoin-0.8.99-outbound-survey-v2",
+            "rbitcoin-0.8.99-outbound-v2",
+            "rbitcoin-0.9.99-inbound-v2-s2", "rbitcoin-0.9.99-inbound-v2", "rbitcoin-0.9.99-outbound-survey-v2",
+            "rbitcoin-0.9.99-outbound-v2",
+        ],
         family: Family::Rbitcoin,
         direction: RowDirection::Either,
-        commands: &["version", "wtxidrelay", "sendaddrv2", "verack", "sendheaders", "sendcmpct", "ping"],
-        relay: true, services_zero: false, protocol_version: None,
+        traits: &[
+            Trait::Negotiates("wtxidrelay"), Trait::Negotiates("sendaddrv2"),
+            Trait::Announces("sendheaders"), Trait::AnnouncesTimes("sendcmpct", 1),
+        ],
     },
     Row {
-        captures: &["btcd-0.27.0-inbound", "btcd-0.27.0-inbound-v2"],
+        // btcd, either direction: `sendaddrv2` with no `wtxidrelay` (it relays
+        // by txid), relay on. Dialing us it shares its traits with Floresta and
+        // bitnodes, which its `version` tells apart (`low`). 0.24.2 asks for
+        // blocks after `verack`; later releases send nothing more to us.
+        captures: &[
+            "btcd-0.24.2-inbound-v2", "btcd-0.24.2-inbound", "btcd-0.24.2-outbound-survey", "btcd-0.24.2-outbound",
+            "btcd-0.25.0-inbound-v2", "btcd-0.25.0-inbound", "btcd-0.25.0-outbound-survey", "btcd-0.25.0-outbound",
+            "btcd-0.27.0-inbound-v2", "btcd-0.27.0-inbound", "btcd-0.27.0-outbound",
+        ],
         family: Family::Btcd,
-        direction: RowDirection::Inbound,
-        commands: &["version", "sendaddrv2", "verack", "getaddr"],
-        relay: true, services_zero: false, protocol_version: None,
+        direction: RowDirection::Either,
+        traits: &[
+            Trait::Negotiates("sendaddrv2"), Trait::NeverNegotiates("wtxidrelay"),
+            Trait::Relay(true), Trait::ServicesZero(false),
+        ],
     },
     Row {
-        captures: &["btcd-0.27.0-outbound"],
-        family: Family::Btcd,
-        direction: RowDirection::Outbound,
-        commands: &["version", "sendaddrv2", "verack"],
-        relay: true, services_zero: false, protocol_version: None,
-    },
-    Row {
-        captures: &["bcoin-2.2.0-inbound", "bcoin-2.2.0-inbound-v2", "bcoin-2.2.0-outbound"],
+        // bcoin, either direction: protocol 70015, so nothing negotiated, and
+        // its own `addr` straight after `verack`.
+        captures: &[
+            "bcoin-2.0.0-inbound-v2", "bcoin-2.0.0-inbound", "bcoin-2.0.0-outbound-survey", "bcoin-2.0.0-outbound",
+            "bcoin-2.1.2-inbound-v2", "bcoin-2.1.2-inbound", "bcoin-2.1.2-outbound-survey", "bcoin-2.1.2-outbound",
+            "bcoin-2.2.0-inbound-v2", "bcoin-2.2.0-inbound", "bcoin-2.2.0-outbound",
+        ],
         family: Family::Bcoin,
         direction: RowDirection::Either,
-        commands: &["version", "verack", "addr"],
-        relay: true, services_zero: false, protocol_version: Some(70015),
+        traits: &[Trait::Then("addr"), Trait::Protocol(70015)],
     },
     Row {
+        // libbitcoin-server, either direction: protocol 70013, relay off; it
+        // closes on the `wtxidrelay` we send, before anything after `verack`.
         captures: &[
-            "libbitcoin-3.8.0-inbound", "libbitcoin-3.8.0-inbound-s2", "libbitcoin-3.8.0-inbound-v2",
-            "libbitcoin-3.8.0-inbound-v2-s2", "libbitcoin-3.8.0-outbound",
+            "libbitcoin-3.8.0-inbound-s2", "libbitcoin-3.8.0-inbound-v2-s2", "libbitcoin-3.8.0-inbound-v2",
+            "libbitcoin-3.8.0-inbound", "libbitcoin-3.8.0-outbound",
         ],
         family: Family::Libbitcoin,
         direction: RowDirection::Either,
-        commands: &["version", "verack"],
-        relay: false, services_zero: false, protocol_version: Some(70013),
+        traits: &[
+            Trait::NeverNegotiates("wtxidrelay"), Trait::NeverNegotiates("sendaddrv2"),
+            Trait::Protocol(70013), Trait::Relay(false),
+        ],
     },
     Row {
-        captures: &["floresta-0.9.1-inbound", "floresta-0.9.1-inbound-s2"],
+        // Floresta, which only dials: `sendaddrv2` with no `wtxidrelay`, relay
+        // off, services set.
+        captures: &[
+            "floresta-0.9.1-inbound-s2", "floresta-0.9.1-inbound-v2", "floresta-0.9.1-inbound",
+        ],
         family: Family::Floresta,
         direction: RowDirection::Inbound,
-        commands: &["version", "sendaddrv2", "verack", "getaddr"],
-        relay: false, services_zero: false, protocol_version: None,
+        traits: &[
+            Trait::Negotiates("sendaddrv2"), Trait::NeverNegotiates("wtxidrelay"),
+            Trait::Relay(false), Trait::ServicesZero(false),
+        ],
     },
     Row {
-        captures: &["floresta-0.9.1-inbound-v2"],
-        family: Family::Floresta,
-        direction: RowDirection::Inbound,
-        commands: &["version", "sendaddrv2", "verack", "feefilter", "getaddr"],
-        relay: false, services_zero: false, protocol_version: None,
-    },
-    Row {
-        captures: &["bitcoin-seeder-92d2b46-inbound", "bitcoin-seeder-92d2b46-inbound-v2"],
+        // The bitcoin-seeder crawler: protocol 60000, so nothing negotiated,
+        // no services, `getaddr`. Core before 0.21 shares its other traits
+        // (`low` for both).
+        captures: &[
+            "bitcoin-seeder-92d2b46-inbound-v2", "bitcoin-seeder-92d2b46-inbound",
+        ],
         family: Family::BitcoinSeeder,
         direction: RowDirection::Inbound,
-        commands: &["version", "verack", "getaddr"],
-        relay: false, services_zero: true, protocol_version: Some(60000),
+        traits: &[
+            Trait::NeverNegotiates("wtxidrelay"), Trait::NeverNegotiates("sendaddrv2"),
+            Trait::Then("getaddr"), Trait::Protocol(60000), Trait::ServicesZero(true),
+        ],
     },
     Row {
-        captures: &["bitnodes-036dc5c-inbound", "bitnodes-036dc5c-inbound-v2"],
+        // The bitnodes crawler: `sendaddrv2` with no `wtxidrelay`, relay off,
+        // no services.
+        captures: &[
+            "bitnodes-036dc5c-inbound-v2", "bitnodes-036dc5c-inbound",
+        ],
         family: Family::Bitnodes,
         direction: RowDirection::Inbound,
-        commands: &["version", "sendaddrv2", "verack", "getaddr"],
-        relay: false, services_zero: true, protocol_version: None,
+        traits: &[
+            Trait::Negotiates("sendaddrv2"), Trait::NeverNegotiates("wtxidrelay"),
+            Trait::Relay(false), Trait::ServicesZero(true),
+        ],
     },
 ];
 
@@ -347,17 +461,39 @@ pub const SETTLE_SECS: u64 = 10;
 
 /// The row a transcript matches, if any.
 pub fn matching_row(inbound: bool, capture: &HandshakeCapture, version: &VersionFields) -> Option<&'static Row> {
-    TABLE.iter().find(|row| {
-        row.direction.admits(inbound)
-            && capture.commands().eq(row.commands.iter().copied())
-            && row.matches_version(version)
-    })
+    matching_row_in(TABLE, inbound, capture, version)
+}
+
+fn matching_row_in<'t>(
+    table: &'t [Row],
+    inbound: bool,
+    capture: &HandshakeCapture,
+    version: &VersionFields,
+) -> Option<&'t Row> {
+    let phases = Phases::of(capture)?;
+    table.iter().find(|row| row.admits_session(inbound, &phases, version) && row.matches_version(&phases, version))
 }
 
 /// Judge a peer. `settled` is whether its transcript is final though still
 /// open: it has been connected [`SETTLE_SECS`], or the connection ended. An
 /// open, unsettled transcript is [`Fingerprint::Unknown`] for now.
+///
+/// A row's match is `high` when no other family's row admits the session's
+/// direction and traits, `low` when only the `version` fields told them
+/// apart. With no row matching, a user agent that names a family gives
+/// that family at [`Confidence::Claimed`], never counted as observed and
+/// never a mismatch; one that names none is [`Fingerprint::Unknown`].
 pub fn classify(
+    inbound: bool,
+    capture: &HandshakeCapture,
+    version: Option<&VersionFields>,
+    settled: bool,
+) -> Fingerprint {
+    classify_in(TABLE, inbound, capture, version, settled)
+}
+
+fn classify_in(
+    table: &[Row],
     inbound: bool,
     capture: &HandshakeCapture,
     version: Option<&VersionFields>,
@@ -369,17 +505,19 @@ pub fn classify(
     if capture.is_open() && !settled {
         return Fingerprint::Unknown;
     }
-    let Some(row) = matching_row(inbound, capture, version) else {
-        return Fingerprint::Unknown;
+    let claimed = Family::claimed_by(&version.user_agent);
+    let Some(row) = matching_row_in(table, inbound, capture, version) else {
+        return claimed.map_or(Fingerprint::Unknown, |f| Fingerprint::Known(f, Confidence::Claimed));
     };
     let observed = row.family;
-    match Family::claimed_by(&version.user_agent) {
+    match claimed {
         Some(claimed) if claimed != observed => Fingerprint::Mismatch { claimed, observed },
         _ => {
-            let shared = TABLE.iter().any(|other| {
-                other.family != observed && other.direction.admits(inbound) && other.commands == row.commands
-            });
-            Fingerprint::Known(observed, if shared { Confidence::Low } else { Confidence::High })
+            let phases = Phases::of(capture).expect("a row matched");
+            let only_version_tells = table
+                .iter()
+                .any(|other| other.family != observed && other.admits_session(inbound, &phases, version));
+            Fingerprint::Known(observed, if only_version_tells { Confidence::Low } else { Confidence::High })
         }
     }
 }
@@ -473,7 +611,7 @@ impl Answer {
     }
 }
 
-/// A crawl session's transcript cut at its `verack`: what the peer sent
+/// A session's transcript cut at its `verack`: what the peer sent
 /// between its `version` and its `verack` (the feature negotiation), the
 /// announcements it sent after `verack`, and the first other message after
 /// them.
@@ -505,7 +643,8 @@ impl Phases {
     }
 }
 
-/// One trait a crawl row requires of a session.
+/// One trait a row requires of a session: a crawl row ([`CrawlRow`]) or a
+/// node connection's ([`Row`]).
 ///
 /// A crawl session records what the node sends unprompted: the handshake
 /// and the passive wait after it. Answers to the crawl's own `getaddr` and
@@ -516,6 +655,11 @@ impl Phases {
 /// that requires `Then` or `NeverAnnounces` cannot match it, though a row
 /// that pins neither still can. With no row matching, the session is
 /// `Claimed` if its user agent names a family, `Unknown` if not.
+///
+/// A node connection (the survey's, or a connected peer's) has no passive
+/// window: its transcript closes at the first message after the
+/// announcements, whenever that comes, and that message may be an answer
+/// to our own `getaddr`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Trait {
     /// Sends this message between its `version` and its `verack`.
@@ -528,19 +672,27 @@ pub enum Trait {
     /// `verack`. Holds only once that message came: until then the
     /// announcements may not be complete.
     NeverAnnounces(&'static str),
-    /// Its first message after `verack` and its announcements, within
-    /// the passive wait.
+    /// Sends this announcement exactly this many times before its first
+    /// other message after `verack` (Core before 24 sends `sendcmpct`
+    /// twice, for compact block versions 2 and 1). Holds only once that
+    /// message came, as [`Trait::NeverAnnounces`] does.
+    AnnouncesTimes(&'static str, usize),
+    /// Its first message after `verack` and its announcements: within the
+    /// passive wait for a crawl session, whenever it comes for a node
+    /// connection.
     Then(&'static str),
     /// The protocol version of its `version`.
     Protocol(u32),
     /// The `relay` flag of its `version`.
     Relay(bool),
+    /// Whether its `version` states no service at all (a crawler's).
+    ServicesZero(bool),
 }
 
 impl Trait {
     /// A trait of the `version` fields, which alone make a match `low`.
     fn of_version(self) -> bool {
-        matches!(self, Trait::Protocol(_) | Trait::Relay(_))
+        matches!(self, Trait::Protocol(_) | Trait::Relay(_) | Trait::ServicesZero(_))
     }
 
     fn holds(self, p: &Phases, v: &VersionFields) -> bool {
@@ -550,9 +702,11 @@ impl Trait {
             Trait::NeverNegotiates(cmd) => !has(&p.negotiation, cmd),
             Trait::Announces(cmd) => has(&p.announcements, cmd),
             Trait::NeverAnnounces(cmd) => p.then.is_some() && !has(&p.announcements, cmd),
+            Trait::AnnouncesTimes(cmd, n) => p.then.is_some() && p.announcements.iter().filter(|c| *c == cmd).count() == n,
             Trait::Then(cmd) => p.then.as_deref() == Some(cmd),
             Trait::Protocol(n) => v.protocol_version == n,
             Trait::Relay(r) => v.relay == r,
+            Trait::ServicesZero(z) => (v.services == 0) == z,
         }
     }
 }
@@ -818,14 +972,17 @@ mod tests {
     use super::*;
     use crate::net::behavior::replay_fixture;
 
-    /// Fixture replay: every capture a row names classifies as that row's
-    /// family, every capture under `contrib/peer-fingerprint/fixtures` that
-    /// no row names classifies as unknown, and every name a row lists is a
-    /// capture. Each capture is also tried against every other row: it
-    /// matches its own and no other.
+    /// Node-connection fixture replay: every capture with a `version` that
+    /// a row names is named by exactly one row and classifies as that
+    /// row's family, `high` or `low`, and no other family's row admits it.
+    /// A capture with no `version` (the node refused us) is named by none
+    /// and is unknown; one with a `version` no row names (rbitcoin's
+    /// catch-up connection) is claimed by its user agent. Every name a row
+    /// lists is a capture.
     #[test]
     fn every_capture_classifies_as_its_own_family_and_no_other() {
         let names = crate::net::behavior::fixture_names();
+        assert!(names.len() >= 150, "the captures: {}", names.len());
         for row in TABLE {
             for capture in row.captures {
                 assert!(names.iter().any(|n| n == capture), "row names {capture}, which is not a capture");
@@ -835,30 +992,73 @@ mod tests {
             let r = replay_fixture(name);
             let got = classify(r.inbound, &r.capture, r.version.as_ref(), true);
             let own: Vec<&Row> = TABLE.iter().filter(|row| row.captures.contains(&name.as_str())).collect();
-            assert!(own.len() <= 1, "{name} is named by {} rows", own.len());
-            match own.first() {
-                Some(row) => {
-                    assert_eq!(got.observed(), Some(row.family), "{name}");
-                    assert!(matches!(got, Fingerprint::Known(..)), "{name}: its own agent, so no mismatch: {got:?}");
-                    let v = r.version.as_ref().unwrap();
-                    let hits: Vec<&Row> = TABLE
-                        .iter()
-                        .filter(|other| {
-                            other.direction.admits(r.inbound)
-                                && r.capture.commands().eq(other.commands.iter().copied())
-                                && other.matches_version(v)
-                        })
-                        .collect();
-                    assert_eq!(hits.len(), 1, "{name} matches {} rows", hits.len());
-                }
-                None => assert_eq!(got, Fingerprint::Unknown, "{name} has no row"),
-            }
+            let Some(v) = r.version.as_ref() else {
+                assert!(own.is_empty(), "{name} has no version, so no row");
+                assert_eq!(got, Fingerprint::Unknown, "{name}");
+                continue;
+            };
+            let Some(row) = own.first() else {
+                assert_eq!(
+                    got,
+                    Family::claimed_by(&v.user_agent).map_or(Fingerprint::Unknown, |f| Fingerprint::Known(f, Confidence::Claimed)),
+                    "{name} has no row"
+                );
+                continue;
+            };
+            assert_eq!(own.len(), 1, "{name} is named by {} rows", own.len());
+            assert!(
+                matches!(got, Fingerprint::Known(f, Confidence::High | Confidence::Low) if f == row.family),
+                "{name}: {got}"
+            );
+            let phases = Phases::of(&r.capture).unwrap();
+            let hits: Vec<Family> = TABLE
+                .iter()
+                .filter(|other| other.admits_session(r.inbound, &phases, v) && other.matches_version(&phases, v))
+                .map(|other| other.family)
+                .collect();
+            assert!(hits.iter().all(|f| *f == row.family), "{name} matches these rows: {hits:?}");
         }
     }
 
-    /// The families the captures could not tell apart by commands alone
-    /// (btcd, Floresta and bitnodes dialing us) are told apart by their
-    /// `version` fields, and say so with a low confidence.
+    /// A node-connection capture's release: its name less the direction,
+    /// shape, transport and session suffixes.
+    fn release_of(capture: &str) -> &str {
+        let base = capture.strip_suffix("-s2").unwrap_or(capture);
+        let base = base.strip_suffix("-v2").unwrap_or(base);
+        let base = base.strip_suffix("-survey").unwrap_or(base);
+        base.strip_suffix("-inbound").or_else(|| base.strip_suffix("-outbound")).unwrap()
+    }
+
+    /// Each family's rows were checked against captures of more than one
+    /// release of its client, except the families only one release of
+    /// which could be run (named here, with why).
+    #[test]
+    fn every_family_was_checked_against_more_than_one_release() {
+        let single: &[(Family, &str)] = &[
+            (Family::Floresta, "one release captured; it dials only"),
+            (Family::Libbitcoin, "one release captured on node connections"),
+            (Family::BitcoinSeeder, "a crawler, one commit captured"),
+            (Family::Bitnodes, "a crawler, one commit captured"),
+        ];
+        let families: std::collections::BTreeSet<Family> = TABLE.iter().map(|r| r.family).collect();
+        for family in families {
+            let releases: std::collections::BTreeSet<&str> = TABLE
+                .iter()
+                .filter(|r| r.family == family)
+                .flat_map(|r| r.captures.iter())
+                .map(|c| release_of(c))
+                .collect();
+            if single.iter().any(|(f, _)| *f == family) {
+                assert!(!releases.is_empty(), "{family}");
+                continue;
+            }
+            assert!(releases.len() >= 2, "{family}: {releases:?}");
+        }
+    }
+
+    /// The families the captures could not tell apart by their traits
+    /// alone (btcd, Floresta and bitnodes dialing us) are told apart by
+    /// their `version` fields, and say so with a low confidence.
     #[test]
     fn a_shape_shared_by_families_is_known_with_low_confidence() {
         for (name, family) in [
@@ -897,14 +1097,19 @@ mod tests {
         );
     }
 
-    /// The direction is part of the shape: Core dialing us and Core dialed
-    /// by us send different transcripts, and neither matches the other row.
+    /// A row covers only the directions its captures were taken in: Core
+    /// dialed by us and Core dialing us send different transcripts, and
+    /// neither matches the other's row. With no row, the user agent's
+    /// family is claimed.
     #[test]
-    fn a_shape_from_the_other_direction_is_unknown() {
+    fn a_shape_from_the_other_direction_is_only_claimed() {
         let r = replay_fixture("core-31.2-outbound");
-        assert_eq!(classify(true, &r.capture, r.version.as_ref(), true), Fingerprint::Unknown);
-        let r = replay_fixture("btcd-0.27.0-inbound");
-        assert_eq!(classify(false, &r.capture, r.version.as_ref(), true), Fingerprint::Unknown);
+        assert_eq!(classify(true, &r.capture, r.version.as_ref(), true), Fingerprint::Known(Family::Core, Confidence::Claimed));
+        let r = replay_fixture("core-31.2-inbound");
+        assert_eq!(classify(false, &r.capture, r.version.as_ref(), true), Fingerprint::Known(Family::Core, Confidence::Claimed));
+        // Floresta only dials: a node we dialed with its shape is not it.
+        let r = replay_fixture("floresta-0.9.1-inbound");
+        assert_eq!(classify(false, &r.capture, r.version.as_ref(), true), Fingerprint::Known(Family::Floresta, Confidence::Claimed));
     }
 
     /// An open transcript is judged only once settled.
@@ -923,16 +1128,181 @@ mod tests {
         assert_eq!(classify(true, &r.capture, r.version.as_ref(), false).observed(), Some(Family::Core));
     }
 
-    /// A pre-70016 shape pins its protocol version, so an old Core dialing
-    /// us with `version verack getaddr` is not taken for the seeder.
+    /// A shape with no feature negotiation pins its protocol version: the
+    /// seeder and Core before 0.21 dialing us both send `version verack
+    /// getaddr`, and only the protocol version tells them apart (`low`). At
+    /// a version neither row pins, the user agent's family is only claimed.
     #[test]
     fn a_shape_without_negotiation_pins_its_protocol_version() {
         let r = replay_fixture("bitcoin-seeder-92d2b46-inbound");
         let mut v = r.version.clone().unwrap();
-        assert_eq!(classify(true, &r.capture, Some(&v), true).observed(), Some(Family::BitcoinSeeder));
+        assert_eq!(classify(true, &r.capture, Some(&v), true), Fingerprint::Known(Family::BitcoinSeeder, Confidence::Low));
+        let core = replay_fixture("core-0.20.2-inbound");
+        assert_eq!(
+            classify(true, &core.capture, core.version.as_ref(), true),
+            Fingerprint::Known(Family::Core, Confidence::Low)
+        );
+        // The seeder's agent at Core 0.20's version is Core's shape.
         v.protocol_version = 70015;
-        assert_eq!(classify(true, &r.capture, Some(&v), true), Fingerprint::Unknown);
+        v.services = 1;
+        assert_eq!(
+            classify(true, &r.capture, Some(&v), true),
+            Fingerprint::Mismatch { claimed: Family::BitcoinSeeder, observed: Family::Core }
+        );
+        v.protocol_version = 70014;
+        assert_eq!(classify(true, &r.capture, Some(&v), true), Fingerprint::Known(Family::BitcoinSeeder, Confidence::Claimed));
+        v.user_agent = "/Satoshi:0.19.1/".into();
+        assert_eq!(classify(true, &r.capture, Some(&v), true), Fingerprint::Known(Family::Core, Confidence::Claimed));
     }
+
+    /// A node-connection shape no capture shows, but with its family's
+    /// traits, still matches by them: what no trait names (the order of the
+    /// negotiation messages, Core's `sendtxrcncl` under
+    /// `-txreconciliation`, a later first message, a newer protocol version,
+    /// another release's user agent) is left open.
+    #[test]
+    fn a_perturbed_node_transcript_still_matches_by_its_traits() {
+        type Edit = fn(&mut Vec<String>, &mut VersionFields);
+        let cases: &[(&str, &str, Edit)] = &[
+            ("core-32.1-outbound-survey", "erlay, the other order, 70018", |c, v| {
+                c.swap(1, 2);
+                c.insert(3, "sendtxrcncl".into());
+                v.protocol_version = 70018;
+                v.user_agent = "/Satoshi:33.0.0/".into();
+            }),
+            ("core-25.2-outbound", "a getheaders first, relay off (-blocksonly)", |c, v| {
+                let ping = c.iter().position(|x| x == "ping").unwrap();
+                c[ping] = "getheaders".into();
+                v.relay = false;
+                v.user_agent = "/Satoshi:26.0.0/".into();
+            }),
+            ("core-22.1-outbound", "a later first message", |c, v| {
+                let ping = c.iter().position(|x| x == "ping").unwrap();
+                c[ping] = "inv".into();
+                v.user_agent = "/Satoshi:0.19.1/".into();
+            }),
+            ("core-28.1-inbound", "the other order, 70017", |c, v| {
+                c.swap(1, 2);
+                v.protocol_version = 70017;
+                v.user_agent = "/Satoshi:30.0.0/Knots:20251010/".into();
+            }),
+            ("satd-0.8.0-pre-inbound", "feefilter before getheaders, 70017", |c, v| {
+                c.insert(5, "feefilter".into());
+                v.protocol_version = 70017;
+                v.user_agent = "/satd:0.9.0/".into();
+            }),
+            ("rbitcoin-0.9.99-outbound-v2", "sendcmpct before sendheaders, a feefilter", |c, v| {
+                c.splice(4..6, ["sendcmpct".to_string(), "feefilter".into(), "sendheaders".into()]);
+                v.user_agent = "/rbitcoin:0.10.0/".into();
+            }),
+            ("btcd-0.25.0-outbound", "a getblocks after verack, 70017", |c, v| {
+                c.push("getblocks".into());
+                v.protocol_version = 70017;
+                v.user_agent = "/btcwire:0.5.0/btcd:0.28.0/".into();
+            }),
+            ("bcoin-2.1.2-inbound", "other services", |_, v| {
+                v.services = 1;
+                v.user_agent = "/bcoin:2.3.0/".into();
+            }),
+            ("libbitcoin-3.8.0-outbound", "other services and height", |_, v| {
+                v.services = 1;
+                v.start_height = 900_000;
+                v.user_agent = "/libbitcoin:4.0.0/".into();
+            }),
+            ("floresta-0.9.1-inbound-v2", "a getheaders for its first message", |c, v| {
+                *c.last_mut().unwrap() = "getheaders".into();
+                v.user_agent = "/Floresta:0.10.0/".into();
+            }),
+        ];
+        for (name, what, edit) in cases {
+            let r = replay_fixture(name);
+            let mut commands: Vec<String> = r.capture.commands().collect();
+            let mut v = r.version.clone().unwrap();
+            edit(&mut commands, &mut v);
+            let own = TABLE.iter().find(|row| row.captures.contains(name)).expect("a named capture").family;
+            let got = classify(r.inbound, &transcript(&commands), Some(&v), true);
+            assert!(
+                matches!(got, Fingerprint::Known(fam, Confidence::High | Confidence::Low) if fam == own),
+                "{name} with {what}: {got}"
+            );
+        }
+    }
+
+    /// The traits that tell the families apart where their transcripts are
+    /// closest: rbitcoin's single `sendcmpct` against older Core's two,
+    /// satd's `getheaders` before any `sendcmpct`, and newer Core's lack of
+    /// `feefilter`. Each shape moved across that line is the other family,
+    /// or only claimed.
+    #[test]
+    fn the_closest_families_are_told_apart_by_their_traits() {
+        let v = |name: &str| replay_fixture(name).version.unwrap();
+        // Core 23 with one `sendcmpct` is rbitcoin's shape: under Core's
+        // user agent, a mismatch.
+        let rb = transcript(&["version", "wtxidrelay", "sendaddrv2", "verack", "sendheaders", "sendcmpct", "ping"]);
+        assert_eq!(
+            classify(false, &rb, Some(&v("core-23.2-outbound")), true),
+            Fingerprint::Mismatch { claimed: Family::Core, observed: Family::Rbitcoin }
+        );
+        // rbitcoin with two is older Core's.
+        let two = transcript(&["version", "wtxidrelay", "sendaddrv2", "verack", "sendheaders", "sendcmpct", "sendcmpct", "ping"]);
+        assert_eq!(
+            classify(false, &two, Some(&v("rbitcoin-0.9.99-outbound-v2")), true),
+            Fingerprint::Mismatch { claimed: Family::Rbitcoin, observed: Family::Core }
+        );
+        // Three is no one's.
+        let three =
+            transcript(&["version", "wtxidrelay", "sendaddrv2", "verack", "sendheaders", "sendcmpct", "sendcmpct", "sendcmpct", "ping"]);
+        assert_eq!(classify(false, &three, Some(&v("core-23.2-outbound")), true), Fingerprint::Known(Family::Core, Confidence::Claimed));
+        // satd sending `sendcmpct` before its `getheaders` has Core's
+        // traits, which leave Core's first message open: under satd's user
+        // agent, a mismatch.
+        let s = transcript(&["version", "wtxidrelay", "sendaddrv2", "verack", "sendcmpct", "getheaders"]);
+        assert_eq!(
+            classify(false, &s, Some(&v("satd-0.7.2-outbound")), true),
+            Fingerprint::Mismatch { claimed: Family::Satd, observed: Family::Core }
+        );
+        // Core since 24 announcing `feefilter` before its next message is
+        // no capture's either.
+        let f = transcript(&["version", "wtxidrelay", "sendaddrv2", "verack", "sendcmpct", "feefilter", "ping"]);
+        assert_eq!(classify(false, &f, Some(&v("core-25.2-outbound")), true), Fingerprint::Known(Family::Core, Confidence::Claimed));
+        // `AnnouncesTimes` waits for the announcements to end.
+        let open = Phases::of(&transcript(&["version", "verack", "sendheaders", "sendcmpct", "sendcmpct"])).unwrap();
+        assert!(!Trait::AnnouncesTimes("sendcmpct", 2).holds(&open, &v("core-23.2-outbound")));
+    }
+
+    /// With no row matching, the family is the one the user agent names,
+    /// at `claimed`: never observed, never a mismatch, whichever family it
+    /// names, uncaptured releases included. A user agent that names none is
+    /// unknown, and so is a session with no `version`.
+    #[test]
+    fn a_node_shape_no_row_matches_is_claimed_by_its_user_agent() {
+        // A peer that sends nothing after `verack` and closes: Core's
+        // feeler, rbitcoin's catch-up connection.
+        let early = transcript(&["version", "wtxidrelay", "sendaddrv2", "verack"]);
+        let v = replay_fixture("core-31.2-outbound").version.unwrap();
+        for (ua, want) in [
+            ("/Satoshi:25.1.0/", Fingerprint::Known(Family::Core, Confidence::Claimed)),
+            ("/Satoshi:99.0.0/", Fingerprint::Known(Family::Core, Confidence::Claimed)),
+            ("/btcwire:0.5.0/btcd:0.99.0/", Fingerprint::Known(Family::Btcd, Confidence::Claimed)),
+            ("/satd:0.9.0/", Fingerprint::Known(Family::Satd, Confidence::Claimed)),
+            ("/bitcoin-lisp:0.1.0/", Fingerprint::Unknown),
+            ("", Fingerprint::Unknown),
+        ] {
+            let v = VersionFields { user_agent: ua.into(), ..v.clone() };
+            for inbound in [false, true] {
+                let got = classify(inbound, &early, Some(&v), true);
+                assert_eq!(got, want, "{ua}");
+                assert_eq!(got.observed(), None, "{ua}: a claim is never observed");
+                assert!(!matches!(got, Fingerprint::Mismatch { .. }));
+            }
+        }
+        assert_eq!(classify(false, &early, None, true), Fingerprint::Unknown);
+        // Not settled yet: no claim either.
+        let open = transcript(&["version", "wtxidrelay", "sendaddrv2", "verack", "sendcmpct"]);
+        assert_eq!(classify(false, &open, Some(&v), false), Fingerprint::Unknown);
+    }
+
+
 
     // ---- Crawl rows ----
 
@@ -1123,23 +1493,28 @@ mod tests {
         assert!(Phases::of(&transcript(&["version", "wtxidrelay"])).is_none(), "no verack, no phases");
     }
 
-    /// The crawl rows are the crawl's: the survey's table does not know
-    /// satd greeted as a crawler (no `getheaders` to services 0). The
+    /// The crawl rows are the crawl's: the node table does not know satd
+    /// greeted as a crawler (no `getheaders` to services 0), so it can only
+    /// take the user agent's word for it. The
     /// crawl's traits are not tied to the crawl's greeting, though: satd
     /// 0.7.0 dialled as a node shows the traits of its crawl row too.
     #[test]
     fn crawl_shapes_and_node_shapes_are_judged_by_their_own_tables() {
         let (r, _) = replay_crawl_fixture("satd-0.8.0-pre-outbound-crawl");
-        assert_eq!(classify(false, &r.capture, r.version.as_ref(), true), Fingerprint::Unknown);
+        assert_eq!(classify(false, &r.capture, r.version.as_ref(), true), Fingerprint::Known(Family::Satd, Confidence::Claimed));
         assert_eq!(crawl("satd-0.8.0-pre-outbound-crawl"), Fingerprint::Known(Family::Satd, Confidence::High));
         let r = replay_fixture("satd-0.7.0-outbound");
         assert_eq!(
             classify_crawl(&r.capture, r.version.as_ref(), &CrawlFeatures::default()),
             Fingerprint::Known(Family::Satd, Confidence::High)
         );
-        // The passive survey never claims: no row, unknown.
+        // The node classifier claims as the crawl's does: no row, the user
+        // agent's family at `claimed`.
         let v = VersionFields { user_agent: "/satd:0.7.0/".into(), ..r.version.clone().unwrap() };
-        assert_eq!(classify(false, &transcript(&["version", "verack", "inv"]), Some(&v), true), Fingerprint::Unknown);
+        assert_eq!(
+            classify(false, &transcript(&["version", "verack", "inv"]), Some(&v), true),
+            Fingerprint::Known(Family::Satd, Confidence::Claimed)
+        );
     }
 
     /// The `getdata` probe pins the satd, rbitcoin, btcd and bcoin rows,

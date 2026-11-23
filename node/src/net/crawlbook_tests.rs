@@ -633,6 +633,7 @@ fn a_bad_file_is_refused() {
             first_seen: NOW,
             last_seen: NOW,
             probes: ProbeResults::default(),
+            shape: None,
         },
         NOW,
     );

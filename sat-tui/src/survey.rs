@@ -44,6 +44,9 @@ pub const TOP_FAMILIES: usize = 8;
 /// Autonomous systems listed.
 pub const TOP_AS: usize = 5;
 
+/// Claimed families listed.
+pub const TOP_CLAIMED: usize = 3;
+
 /// The survey's last connection to end.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LastConnection {
@@ -60,6 +63,10 @@ pub struct Survey {
     /// `(family, count)` for every family with a record, `unknown`
     /// included, largest first.
     pub families: Vec<(String, u64)>,
+    /// `(family, count)` of the `unknown` records whose user agent names a
+    /// family (no row matched), largest first; never in `families` but
+    /// their own. Empty from a node that does not report it.
+    pub claimed: Vec<(String, u64)>,
     pub mismatches: u64,
     pub v2: u64,
     /// `(asn, count)`, largest first, as the node lists them.
@@ -122,12 +129,17 @@ fn count(v: &Value, key: &str) -> u64 {
 /// `addresses` count.
 pub fn parse(v: &Value) -> Option<Survey> {
     let addresses = v.get("addresses")?.as_u64()?;
-    let mut families: Vec<(String, u64)> = v
-        .get("families")
-        .and_then(Value::as_object)
-        .map(|o| o.iter().map(|(name, f)| (printable(name), count(f, "count"))).filter(|(_, n)| *n > 0).collect())
-        .unwrap_or_default();
-    families.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    let counts = |key: &str| {
+        let mut out: Vec<(String, u64)> = v
+            .get(key)
+            .and_then(Value::as_object)
+            .map(|o| o.iter().map(|(name, f)| (printable(name), count(f, "count"))).filter(|(_, n)| *n > 0).collect())
+            .unwrap_or_default();
+        out.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        out
+    };
+    let families = counts("families");
+    let claimed = counts("claimed");
     let top_as = v
         .get("top_as")
         .and_then(Value::as_array)
@@ -143,6 +155,7 @@ pub fn parse(v: &Value) -> Option<Survey> {
     Some(Survey {
         addresses,
         families,
+        claimed,
         mismatches: count(v, "mismatches"),
         v2: v.get("v2").map(|x| count(x, "count")).unwrap_or(0),
         top_as,
@@ -232,6 +245,11 @@ pub(crate) mod tests {
                 "bitnodes": {"count": 0, "share": 0.0},
                 "unknown": {"count": 58, "share": 0.048}
             },
+            "claimed": {
+                "core": {"count": 41, "share": 0.034},
+                "btcd": {"count": 2, "share": 0.002},
+                "bcoin": {"count": 0, "share": 0.0}
+            },
             "mismatches": 5,
             "v2": {"count": 494, "share": 0.41},
             "top_as": [{"asn": 64496, "count": 84}, {"asn": 64497, "count": 61}],
@@ -251,6 +269,7 @@ pub(crate) mod tests {
         assert_eq!(s.families.len(), 9, "bitnodes has no record");
         assert_eq!(s.families[0], ("core".to_string(), 1080));
         assert_eq!(s.families[1], ("unknown".to_string(), 58));
+        assert_eq!(s.claimed, [("core".to_string(), 41), ("btcd".to_string(), 2)], "apart from families, zeros left out");
         assert_eq!(s.v2, 494);
         assert_eq!(s.top_as, [(64496, 84), (64497, 61)]);
         assert_eq!((s.completed, s.failed, s.probed, s.probes), (1300, 2100, 600, true));

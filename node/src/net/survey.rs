@@ -64,7 +64,15 @@ pub const SAVE_INTERVAL: Duration = Duration::from_secs(10 * 60);
 /// How many autonomous systems the aggregate lists.
 pub const TOP_AS: usize = 10;
 
-const FILE_MAGIC: [u8; 8] = *b"satdsrv1";
+/// The file as written: each record ends with its [`SurveyShape`], when it
+/// has one.
+const FILE_MAGIC: [u8; 8] = *b"satdsrv2";
+/// The first format, read as it is: no record holds a shape.
+const FILE_MAGIC_V1: [u8; 8] = *b"satdsrv1";
+
+/// The most commands a [`SurveyShape`] keeps, and the longest each one is.
+pub const SHAPE_COMMANDS_MAX: usize = crate::net::behavior::HANDSHAKE_CAPTURE_MAX;
+pub const SHAPE_COMMAND_LEN: usize = 12;
 
 /// A message sent on a survey connection after the passive wait, to tell
 /// apart implementations whose handshakes look alike. Each was checked
@@ -259,6 +267,29 @@ pub struct SurveyRecord {
     pub first_seen: u64,
     pub last_seen: u64,
     pub probes: ProbeResults,
+    /// For a record no row matched only (an unknown or a claimed
+    /// fingerprint): what the classifier read that the fields above do not
+    /// hold, so that the next round of unknown shapes can be told apart.
+    pub shape: Option<SurveyShape>,
+}
+
+/// The raw features of a survey session no row matched. The `version`'s
+/// protocol, services and user agent are in the [`SurveyRecord`] itself.
+/// Bounded: at most [`SHAPE_COMMANDS_MAX`] commands of at most
+/// [`SHAPE_COMMAND_LEN`] bytes each.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SurveyShape {
+    /// The handshake transcript (peer text, `?` for an unprintable byte).
+    pub commands: Vec<String>,
+    /// The `relay` flag of the peer's `version`.
+    pub relay: bool,
+}
+
+impl SurveyShape {
+    /// The shape of a session's transcript and `version`.
+    pub fn of(capture: &crate::net::behavior::HandshakeCapture, relay: bool) -> SurveyShape {
+        SurveyShape { commands: capture.commands().take(SHAPE_COMMANDS_MAX).collect(), relay }
+    }
 }
 
 /// `getpeersurvey`'s aggregate.
@@ -268,8 +299,13 @@ pub struct Aggregate {
     pub addresses: usize,
     /// Records per observed family; [`Family::ALL`]'s order.
     pub families: [usize; Family::ALL.len()],
-    /// Records whose handshake matched no family.
+    /// Records whose handshake matched no family, the claimed ones
+    /// included.
     pub unknown: usize,
+    /// The unknown records whose user agent names a family (a
+    /// [`Confidence::Claimed`] fingerprint), per family; [`Family::ALL`]'s
+    /// order. Never counted in `families`.
+    pub claimed: [usize; Family::ALL.len()],
     /// Records whose user agent names one family and handshake another.
     pub mismatches: usize,
     /// Records reached over BIP 324.
@@ -358,6 +394,9 @@ impl SurveyStore {
                 Some(f) => agg.families[family_index(f)] += 1,
                 None => agg.unknown += 1,
             }
+            if let Some(f) = r.fingerprint.claimed_only() {
+                agg.claimed[family_index(f)] += 1;
+            }
             if matches!(r.fingerprint, Fingerprint::Mismatch { .. }) {
                 agg.mismatches += 1;
             }
@@ -381,8 +420,15 @@ impl SurveyStore {
     /// The file's bytes: a magic, the network magic, the records, then the
     /// hash256 of everything before it.
     pub fn encode(&self, network_magic: [u8; 4]) -> Vec<u8> {
+        self.encode_as(network_magic, true)
+    }
+
+    /// The bytes in the current format, or, with `with_shapes` false, in
+    /// the first (`satdsrv1`), which holds no shape: for the test that an
+    /// older file still reads.
+    fn encode_as(&self, network_magic: [u8; 4], with_shapes: bool) -> Vec<u8> {
         let mut buf = Vec::with_capacity(16 + self.records.len() * 100);
-        buf.extend_from_slice(&FILE_MAGIC);
+        buf.extend_from_slice(if with_shapes { &FILE_MAGIC } else { &FILE_MAGIC_V1 });
         buf.extend_from_slice(&network_magic);
         buf.extend_from_slice(&(self.records.len() as u32).to_le_bytes());
         let mut rows: Vec<(&PeerAddr, &SurveyRecord)> = self.records.iter().collect();
@@ -405,6 +451,9 @@ impl SurveyStore {
                 buf.push(code);
                 buf.extend_from_slice(&value.to_le_bytes());
             }
+            if with_shapes {
+                encode_shape(&mut buf, r.shape.as_ref());
+            }
         }
         let checksum = sha256d::Hash::hash(&buf);
         buf.extend_from_slice(checksum.as_byte_array());
@@ -422,9 +471,11 @@ impl SurveyStore {
             return Err("checksum mismatch".to_string());
         }
         let mut r = Reader(body);
-        if r.take(8)? != FILE_MAGIC {
-            return Err("not a survey file".to_string());
-        }
+        let with_shapes = match r.take(8)? {
+            m if m == FILE_MAGIC => true,
+            m if m == FILE_MAGIC_V1 => false,
+            _ => return Err("not a survey file".to_string()),
+        };
         if r.take(4)? != network_magic {
             return Err("written for another network".to_string());
         }
@@ -449,9 +500,21 @@ impl SurveyStore {
                     probes.set(p, o);
                 }
             }
+            let shape = if with_shapes { decode_shape(&mut r)? } else { None };
             store.records.insert(
                 addr,
-                SurveyRecord { fingerprint, user_agent, protocol_version, services, v2, asn, first_seen, last_seen, probes },
+                SurveyRecord {
+                    fingerprint,
+                    user_agent,
+                    protocol_version,
+                    services,
+                    v2,
+                    asn,
+                    first_seen,
+                    last_seen,
+                    probes,
+                    shape,
+                },
             );
         }
         if !r.0.is_empty() {
@@ -532,8 +595,9 @@ pub(crate) fn encode_fingerprint(buf: &mut Vec<u8>, fp: Fingerprint) {
         Fingerprint::Known(f, Confidence::High) => (1, Some(f), None),
         Fingerprint::Known(f, Confidence::Low) => (2, Some(f), None),
         Fingerprint::Mismatch { claimed, observed } => (3, Some(observed), Some(claimed)),
-        // Only a crawl session is judged so: `crawlbook.dat` holds it, the
-        // survey's store never does.
+        // A shape no row matches, under a user agent that names a family:
+        // `crawlbook.dat`, the survey's records and the alt-slot records
+        // all hold it.
         Fingerprint::Known(f, Confidence::Claimed) => (4, Some(f), None),
     };
     buf.extend_from_slice(&[tag, family_byte(a), family_byte(b)]);
@@ -551,6 +615,51 @@ pub(crate) fn decode_fingerprint(r: &mut Reader) -> Result<Fingerprint, String> 
         4 => Fingerprint::Known(family_from_byte(a)?, Confidence::Claimed),
         t => return Err(format!("bad fingerprint tag {t}")),
     })
+}
+
+/// A shape: a presence byte, then the relay flag, the command count and
+/// each command as a length and its bytes.
+fn encode_shape(buf: &mut Vec<u8>, shape: Option<&SurveyShape>) {
+    let Some(s) = shape else {
+        buf.push(0);
+        return;
+    };
+    buf.push(1);
+    buf.push(u8::from(s.relay));
+    let commands = &s.commands[..s.commands.len().min(SHAPE_COMMANDS_MAX)];
+    buf.push(commands.len() as u8);
+    for c in commands {
+        let c = &c.as_bytes()[..c.len().min(SHAPE_COMMAND_LEN)];
+        buf.push(c.len() as u8);
+        buf.extend_from_slice(c);
+    }
+}
+
+fn decode_shape(r: &mut Reader) -> Result<Option<SurveyShape>, String> {
+    match r.u8()? {
+        0 => return Ok(None),
+        1 => {}
+        t => return Err(format!("bad shape tag {t}")),
+    }
+    let relay = r.u8()? != 0;
+    let n = usize::from(r.u8()?);
+    if n > SHAPE_COMMANDS_MAX {
+        return Err(format!("shape of {n} commands"));
+    }
+    let mut commands = Vec::with_capacity(n);
+    for _ in 0..n {
+        let len = usize::from(r.u8()?);
+        if len > SHAPE_COMMAND_LEN {
+            return Err(format!("shape command of {len} bytes"));
+        }
+        let text: String = r
+            .take(len)?
+            .iter()
+            .map(|b| if b.is_ascii_graphic() { char::from(*b) } else { '?' })
+            .collect();
+        commands.push(text);
+    }
+    Ok(Some(SurveyShape { commands, relay }))
 }
 
 pub(crate) fn encode_addr(buf: &mut Vec<u8>, addr: &PeerAddr) {
@@ -642,9 +751,14 @@ pub fn aggregate_json(agg: &Aggregate, settings: &serde_json::Value) -> serde_js
         families.insert(f.name().to_string(), serde_json::json!({ "count": n, "share": share(n) }));
     }
     families.insert("unknown".to_string(), serde_json::json!({ "count": agg.unknown, "share": share(agg.unknown) }));
+    let mut claimed = serde_json::Map::new();
+    for (f, n) in Family::ALL.iter().zip(agg.claimed) {
+        claimed.insert(f.name().to_string(), serde_json::json!({ "count": n, "share": share(n) }));
+    }
     let mut out = serde_json::json!({
         "addresses": agg.addresses,
         "families": families,
+        "claimed": claimed,
         "mismatches": agg.mismatches,
         "v2": { "count": agg.v2, "share": share(agg.v2) },
         "top_as": agg.top_as.iter().map(|(asn, n)| serde_json::json!({ "asn": asn, "count": n })).collect::<Vec<_>>(),
@@ -667,7 +781,7 @@ fn row_json(addr: &PeerAddr, r: &SurveyRecord) -> serde_json::Value {
         PeerAddr::Socket(sa) => sa.to_string(),
         PeerAddr::Onion { host, port } => format!("{host}:{port}"),
     };
-    serde_json::json!({
+    let mut row = serde_json::json!({
         "addr": addr_text,
         "network": network_name(addr),
         "fingerprint": r.fingerprint.to_string(),
@@ -682,7 +796,12 @@ fn row_json(addr: &PeerAddr, r: &SurveyRecord) -> serde_json::Value {
         "first_seen": r.first_seen,
         "last_seen": r.last_seen,
         "probes": probes_json(&r.probes),
-    })
+    });
+    if let Some(shape) = &r.shape {
+        row["handshake"] = serde_json::json!(shape.commands);
+        row["relay"] = serde_json::json!(shape.relay);
+    }
+    row
 }
 
 /// The probe outcomes as a row reports them: by probe name, its result and,
@@ -721,6 +840,7 @@ mod tests {
             first_seen: last_seen,
             last_seen,
             probes: ProbeResults::default(),
+            shape: None,
         }
     }
 
@@ -744,7 +864,12 @@ mod tests {
             record(Fingerprint::Known(Family::Satd, Confidence::Low), NOW - 5),
             NOW,
         );
-        store.insert(PeerAddr::Onion { host: ONION.to_string(), port: 8333 }, record(Fingerprint::Unknown, NOW - 9), NOW);
+        let mut unmatched = record(Fingerprint::Unknown, NOW - 9);
+        unmatched.shape = Some(SurveyShape { commands: vec!["version".into(), "verack".into(), "inv".into()], relay: false });
+        store.insert(PeerAddr::Onion { host: ONION.to_string(), port: 8333 }, unmatched, NOW);
+        let mut claimed = record(Fingerprint::Known(Family::Core, Confidence::Claimed), NOW - 7);
+        claimed.shape = Some(SurveyShape { commands: vec!["version".into(); SHAPE_COMMANDS_MAX], relay: true });
+        store.insert(v4(3), claimed, NOW);
         let mut again = record(Fingerprint::Known(Family::Core, Confidence::High), NOW);
         again.first_seen = NOW;
         store.insert(v4(2), record(Fingerprint::Known(Family::Core, Confidence::High), NOW - 100), NOW);
@@ -755,10 +880,57 @@ mod tests {
         let path = dir.path().join(SURVEY_FILE);
         store.save(&path, MAGIC).unwrap();
         let back = SurveyStore::load(&path, MAGIC, NOW).unwrap();
-        assert_eq!(back.len(), 4);
+        assert_eq!(back.len(), 5);
         for (addr, r) in store.rows() {
             assert_eq!(back.get(addr), Some(r), "{addr:?}");
         }
+    }
+
+    /// A file in the first format (`satdsrv1`, no shapes), as earlier
+    /// builds wrote it, still reads: every record as it was, with no shape.
+    /// It is the current format less one byte per record.
+    #[test]
+    fn a_file_from_before_the_shapes_still_reads() {
+        let mut store = SurveyStore::default();
+        store.insert(v4(1), record(Fingerprint::Known(Family::Core, Confidence::High), NOW), NOW);
+        store.insert(v4(2), record(Fingerprint::Mismatch { claimed: Family::Core, observed: Family::Btcd }, NOW), NOW);
+        store.insert(v4(3), record(Fingerprint::Unknown, NOW - 3), NOW);
+        let old = store.encode_as(MAGIC, false);
+        assert_eq!(&old[..8], b"satdsrv1");
+        assert_eq!(old.len() + store.len(), store.encode(MAGIC).len());
+        let back = SurveyStore::decode(&old, MAGIC, NOW, MAX_RECORDS).unwrap();
+        assert_eq!(back.len(), 3);
+        for (addr, r) in store.rows() {
+            assert_eq!(back.get(addr), Some(r), "{addr:?}");
+            assert_eq!(back.get(addr).unwrap().shape, None);
+        }
+        // Written again, it is in the current format.
+        assert_eq!(&back.encode(MAGIC)[..8], b"satdsrv2");
+    }
+
+    /// A shape out of its bounds is refused, as a damaged file.
+    #[test]
+    fn a_shape_past_its_bounds_is_refused() {
+        let mut store = SurveyStore::default();
+        let mut r = record(Fingerprint::Unknown, NOW);
+        r.shape = Some(SurveyShape { commands: vec!["version".into()], relay: true });
+        store.insert(v4(1), r, NOW);
+        let bytes = store.encode(MAGIC);
+        // The shape is the record's tail: tag, relay, count, then `version`.
+        let body = &bytes[..bytes.len() - 32];
+        let count_at = body.len() - 1 - "version".len() - 1;
+        let reseal = |mut body: Vec<u8>| {
+            let sum = sha256d::Hash::hash(&body);
+            body.extend_from_slice(sum.as_byte_array());
+            body
+        };
+        let mut many = body.to_vec();
+        many[count_at] = (SHAPE_COMMANDS_MAX + 1) as u8;
+        assert!(SurveyStore::decode(&reseal(many), MAGIC, NOW, MAX_RECORDS).unwrap_err().contains("commands"));
+        let mut tag = body.to_vec();
+        tag[count_at - 2] = 7;
+        assert!(SurveyStore::decode(&reseal(tag), MAGIC, NOW, MAX_RECORDS).unwrap_err().contains("shape tag"));
+        assert!(SurveyStore::decode(&bytes, MAGIC, NOW, MAX_RECORDS).is_ok());
     }
 
     /// A damaged file, one for another network, and one that is not a
@@ -849,19 +1021,32 @@ mod tests {
         add(Fingerprint::Known(Family::Core, Confidence::High), true, Some(1));
         add(Fingerprint::Mismatch { claimed: Family::Core, observed: Family::Btcd }, false, Some(2));
         add(Fingerprint::Unknown, false, None);
+        add(Fingerprint::Known(Family::Core, Confidence::Claimed), false, None);
+        add(Fingerprint::Known(Family::Btcd, Confidence::Claimed), false, None);
         let agg = store.aggregate();
-        assert_eq!(agg.addresses, 4);
-        assert_eq!(agg.families[0], 2, "core");
+        assert_eq!(agg.addresses, 6);
+        assert_eq!(agg.families[0], 2, "core, observed only: a claim is never counted as the family");
         assert_eq!(agg.families[1], 1, "btcd, observed");
-        assert_eq!((agg.unknown, agg.mismatches, agg.v2), (1, 1, 2));
+        assert_eq!((agg.unknown, agg.mismatches, agg.v2), (3, 1, 2), "the claimed ones are unknown");
+        assert_eq!(agg.claimed[0], 1, "core, claimed");
+        assert_eq!(agg.claimed[1], 1, "btcd, claimed");
+        assert_eq!(agg.claimed.iter().sum::<usize>(), 2);
         assert_eq!(agg.top_as, vec![(1, 2), (2, 1)]);
 
         let json = survey_json(&store, true, &serde_json::json!({ "enabled": true }));
         assert_eq!(json["families"]["core"]["count"], 2);
-        assert_eq!(json["families"]["core"]["share"], 0.5);
-        assert_eq!(json["families"]["unknown"]["count"], 1);
+        assert_eq!(json["families"]["core"]["share"], 2.0 / 6.0);
+        assert_eq!(json["families"]["unknown"]["count"], 3);
+        assert_eq!(json["claimed"]["core"]["count"], 1);
+        assert_eq!(json["claimed"]["btcd"]["count"], 1);
+        assert_eq!(json["claimed"]["satd"]["count"], 0);
+        assert!(json["claimed"].get("unknown").is_none());
         assert_eq!(json["enabled"], true);
-        assert_eq!(json["peers"].as_array().unwrap().len(), 4);
+        let peers = json["peers"].as_array().unwrap();
+        assert_eq!(peers.len(), 6);
+        let claimed_row = peers.iter().find(|p| p["fingerprint"] == "core/claimed").unwrap();
+        assert_eq!(claimed_row["family"], serde_json::Value::Null, "a claim is no observed family");
+        assert_eq!(claimed_row["claimed"], "core");
         assert!(survey_json(&store, false, &serde_json::Value::Null).get("peers").is_none());
     }
 

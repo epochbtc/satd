@@ -515,6 +515,15 @@ pub fn survey_right_lines(s: &crate::survey::Survey, now: u64) -> Vec<Line<'stat
         row("v2:", format!("{:.1} % ({})", s.pct(s.v2), format_num(s.v2))),
         row("mismatches:", format!("{:.1} % ({})", s.pct(s.mismatches), format_num(s.mismatches))),
     ];
+    // The unknown records whose user agent names a family: their own
+    // lines, never a family bar.
+    let claimed: u64 = s.claimed.iter().map(|(_, n)| n).sum();
+    if claimed > 0 {
+        lines.push(row("claimed:", format!("{:.1} % ({})", s.pct(claimed), format_num(claimed))));
+        for (family, n) in s.claimed.iter().take(crate::survey::TOP_CLAIMED) {
+            lines.push(row(&format!("  {family}"), format!("{:.1} % ({})", s.pct(*n), format_num(*n))));
+        }
+    }
     if s.top_as.is_empty() {
         let why = if s.addresses == 0 { "none" } else { "none (needs -asmap)" };
         lines.push(row("top AS:", why.into()));
@@ -746,13 +755,22 @@ mod tests {
         let right: Vec<String> = survey_right_lines(s, 1_790_000_042).iter().map(line_text).collect();
         assert_eq!(right[0], "  v2:          41.0 % (494)");
         assert_eq!(right[1], "  mismatches:  0.4 % (5)");
-        assert_eq!(right[3], "    AS64496    7.0 %");
+        assert_eq!(right[2], "  claimed:     3.6 % (43)");
+        assert_eq!(right[3], "    core       3.4 % (41)");
+        assert_eq!(right[4], "    btcd       0.2 % (2)");
+        assert_eq!(right[6], "    AS64496    7.0 %");
         assert!(right.contains(&"  last survey: 42s ago, completed".to_string()), "{right:?}");
         assert!(right.contains(&"  connections: 1,300 ok, 2,100 failed".to_string()), "{right:?}");
         assert_eq!(right.last().map(String::as_str), Some("  probed:      600 addrs"));
         for l in &right {
             assert!(l.chars().count() <= 38, "fits an 80-column terminal's panel: {l:?}");
         }
+
+        // Nothing claimed (or an older node): no claimed lines.
+        let mut unclaimed = s.clone();
+        unclaimed.claimed.clear();
+        let right: Vec<String> = survey_right_lines(&unclaimed, 1_790_000_042).iter().map(line_text).collect();
+        assert!(!right.iter().any(|l| l.contains("claimed")), "{right:?}");
 
         // Probes off: no probe line. No `-asmap`: no AS list.
         let mut quiet = s.clone();

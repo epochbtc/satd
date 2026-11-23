@@ -82,8 +82,8 @@ fn no_capture_raises_a_flag_by_its_handshake_alone() {
     let _clock = MockClock::install();
     let (pm, _dir) = pm_with_coins(&[]);
     for (i, name) in crate::net::behavior::fixture_names().iter().enumerate() {
-        let id = 200 + i as PeerId;
-        let _rx = scripted(&pm, id, name, &format!("11.{i}.0.1:8333"), 30);
+        let id = 1 + i as PeerId; // add_peer_cap keeps each id to one IPv4 octet
+        let _rx = scripted(&pm, id, name, &format!("11.{}.{}.1:8333", i / 250, i % 250), 30);
         assert_eq!(codes(&flags_of(&pm, id)), "", "{name}");
     }
 }
