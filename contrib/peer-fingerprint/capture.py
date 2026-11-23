@@ -56,8 +56,9 @@ all a v1-only node learns from it.
 --crawl (with --dial) greets the node as an optional crawl mode would
 instead: a declared crawler that asks for addresses and nothing else.
 
-    - at once: version, wtxidrelay
-    - on the peer's version: sendaddrv2, verack
+    - at once: version
+    - on the peer's version: wtxidrelay and sendaddrv2 when the common
+      version is 70016 or more, then verack
     - nothing else unsolicited
 
 The version message carries protocol 70016, services 0, relay=0,
@@ -584,7 +585,13 @@ class Recorder:
         if self.args.crawl:
             if command == "version" and not self.peer_version_seen:
                 self.peer_version_seen = True
-                self.send("sendaddrv2")
+                # As the crawl does: the feature negotiation only at a
+                # common version of 70016 (BIP 339's WTXID_RELAY_VERSION),
+                # which an older node takes for unknown messages.
+                theirs = struct.unpack("<i", payload[:4])[0] if len(payload) >= 4 else 0
+                if min(PROTOCOL_VERSION, theirs) >= 70016:
+                    self.send("wtxidrelay")
+                    self.send("sendaddrv2")
                 self.send("verack")
             elif command == "verack":
                 self.peer_verack_seen = True
@@ -634,7 +641,8 @@ class Recorder:
     def run(self):
         if self.args.dial:
             self.send("version", crawl_version_payload(self.args) if self.args.crawl else version_payload())
-            self.send("wtxidrelay")
+            if not self.args.crawl:
+                self.send("wtxidrelay")
         hs_deadline = time.monotonic() + 30
         while not (self.peer_version_seen and self.peer_verack_seen):
             if self.pump(hs_deadline, lambda e: self.peer_version_seen and self.peer_verack_seen) is None:
