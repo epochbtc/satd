@@ -655,6 +655,11 @@ impl Phases {
 /// that requires `Then` or `NeverAnnounces` cannot match it, though a row
 /// that pins neither still can. With no row matching, the session is
 /// `Claimed` if its user agent names a family, `Unknown` if not.
+///
+/// A node connection (the survey's, or a connected peer's) has no passive
+/// window: its transcript closes at the first message after the
+/// announcements, whenever that comes, and that message may be an answer
+/// to our own `getaddr`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Trait {
     /// Sends this message between its `version` and its `verack`.
@@ -672,8 +677,9 @@ pub enum Trait {
     /// twice, for compact block versions 2 and 1). Holds only once that
     /// message came, as [`Trait::NeverAnnounces`] does.
     AnnouncesTimes(&'static str, usize),
-    /// Its first message after `verack` and its announcements, within
-    /// the passive wait.
+    /// Its first message after `verack` and its announcements: within the
+    /// passive wait for a crawl session, whenever it comes for a node
+    /// connection.
     Then(&'static str),
     /// The protocol version of its `version`.
     Protocol(u32),

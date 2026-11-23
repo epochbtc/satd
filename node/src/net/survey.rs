@@ -595,8 +595,9 @@ pub(crate) fn encode_fingerprint(buf: &mut Vec<u8>, fp: Fingerprint) {
         Fingerprint::Known(f, Confidence::High) => (1, Some(f), None),
         Fingerprint::Known(f, Confidence::Low) => (2, Some(f), None),
         Fingerprint::Mismatch { claimed, observed } => (3, Some(observed), Some(claimed)),
-        // Only a crawl session is judged so: `crawlbook.dat` holds it, the
-        // survey's store never does.
+        // A shape no row matches, under a user agent that names a family:
+        // `crawlbook.dat`, the survey's records and the alt-slot records
+        // all hold it.
         Fingerprint::Known(f, Confidence::Claimed) => (4, Some(f), None),
     };
     buf.extend_from_slice(&[tag, family_byte(a), family_byte(b)]);
