@@ -512,8 +512,10 @@ impl Phases {
 /// probes are not recorded, so an answer can never stand in for an
 /// unprompted message (a node answering `getaddr` with `addr` must not pass
 /// for bcoin's `Then("addr")`). A node whose first message after its
-/// announcements comes only after the passive wait has no `then`: the
-/// traits that need it do not hold, and the session falls to `Claimed`.
+/// announcements comes only after the passive wait has no `then`: a row
+/// that requires `Then` or `NeverAnnounces` cannot match it, though a row
+/// that pins neither still can. With no row matching, the session is
+/// `Claimed` if its user agent names a family, `Unknown` if not.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Trait {
     /// Sends this message between its `version` and its `verack`.
