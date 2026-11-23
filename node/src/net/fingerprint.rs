@@ -506,6 +506,14 @@ impl Phases {
 }
 
 /// One trait a crawl row requires of a session.
+///
+/// A crawl session records what the node sends unprompted: the handshake
+/// and the passive wait after it. Answers to the crawl's own `getaddr` and
+/// probes are not recorded, so an answer can never stand in for an
+/// unprompted message (a node answering `getaddr` with `addr` must not pass
+/// for bcoin's `Then("addr")`). A node whose first message after its
+/// announcements comes only after the passive wait has no `then`: the
+/// traits that need it do not hold, and the session falls to `Claimed`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Trait {
     /// Sends this message between its `version` and its `verack`.
@@ -518,7 +526,8 @@ pub enum Trait {
     /// `verack`. Holds only once that message came: until then the
     /// announcements may not be complete.
     NeverAnnounces(&'static str),
-    /// Its first message after `verack` and its announcements.
+    /// Its first message after `verack` and its announcements, within
+    /// the passive wait.
     Then(&'static str),
     /// The protocol version of its `version`.
     Protocol(u32),
