@@ -1,0 +1,323 @@
+{
+  "capture_format": 1,
+  "shape": "crawl",
+  "label": "rbitcoin-0.8.0-outbound-crawl-v2",
+  "implementation": "rbitcoin",
+  "implementation_version": "0.8.0",
+  "network": "regtest",
+  "connection": "outbound",
+  "peer_state": {
+    "ibd": "no",
+    "height": 1,
+    "note": "",
+    "address_book": {
+      "method": "addpeeraddress",
+      "offered": 1000,
+      "accepted": 1000
+    }
+  },
+  "recorder": {
+    "greeting": "crawl",
+    "protocol_version": 70016,
+    "services": 0,
+    "relay": false,
+    "start_height": 1,
+    "user_agent": "/satd:0.8.0-pre(crawler)/",
+    "passive_wait_s": 10.0,
+    "getaddr_wait_s": 90.0,
+    "probe_wait_s": 5.0
+  },
+  "transport": "v2",
+  "v2_attempted": true,
+  "v2_failure": null,
+  "v2_transport": {
+    "garbage_len": 0,
+    "decoys_before_version": [],
+    "version_packet_len": 0,
+    "version_packet_hex": "",
+    "decoys_after_handshake": 0,
+    "message_ids": {
+      "short": 7,
+      "long": 5
+    }
+  },
+  "version": {
+    "protocol_version": 70016,
+    "services": 2057,
+    "services_hex": "0000000000000809",
+    "user_agent": "/rbitcoin:0.8.0/",
+    "start_height": 1,
+    "relay": true,
+    "trailing_bytes": 0,
+    "timestamp_skew_s": 0
+  },
+  "commands": [
+    "version",
+    "wtxidrelay",
+    "sendaddrv2",
+    "verack",
+    "sendheaders",
+    "sendcmpct",
+    "ping",
+    "feefilter"
+  ],
+  "getaddr": {
+    "kind": "addrv2",
+    "count": 230,
+    "delay_ms": 5,
+    "networks": {
+      "ipv4": 230
+    },
+    "services_hex": {
+      "809": 230
+    },
+    "lists_itself": false,
+    "ntime_age_s": {
+      "min": 0,
+      "median": 0,
+      "max": 0,
+      "spread": 0,
+      "future": 0
+    }
+  },
+  "addr_after_getaddr": [
+    {
+      "kind": "addrv2",
+      "count": 230,
+      "delay_ms": 5,
+      "phase": "getaddr"
+    }
+  ],
+  "received": [
+    {
+      "t_ms": 40,
+      "phase": "handshake",
+      "command": "version",
+      "len": 102,
+      "fields": {
+        "protocol_version": 70016,
+        "services": 2057,
+        "services_hex": "0000000000000809",
+        "user_agent": "/rbitcoin:0.8.0/",
+        "start_height": 1,
+        "relay": true,
+        "trailing_bytes": 0,
+        "timestamp_skew_s": 0
+      },
+      "v2_id": "long"
+    },
+    {
+      "t_ms": 41,
+      "phase": "handshake",
+      "command": "wtxidrelay",
+      "len": 0,
+      "v2_id": "long"
+    },
+    {
+      "t_ms": 41,
+      "phase": "handshake",
+      "command": "sendaddrv2",
+      "len": 0,
+      "v2_id": "long"
+    },
+    {
+      "t_ms": 41,
+      "phase": "handshake",
+      "command": "verack",
+      "len": 0,
+      "v2_id": "long"
+    },
+    {
+      "t_ms": 81,
+      "phase": "passive",
+      "command": "sendheaders",
+      "len": 0,
+      "v2_id": "long"
+    },
+    {
+      "t_ms": 81,
+      "phase": "passive",
+      "command": "sendcmpct",
+      "len": 9,
+      "fields": {
+        "announce": false,
+        "cmpct_version": 2
+      },
+      "v2_id": "short"
+    },
+    {
+      "t_ms": 81,
+      "phase": "passive",
+      "command": "ping",
+      "len": 8,
+      "fields": {
+        "has_nonce": true
+      },
+      "v2_id": "short"
+    },
+    {
+      "t_ms": 82,
+      "phase": "passive",
+      "command": "feefilter",
+      "len": 8,
+      "fields": {
+        "feerate": 100
+      },
+      "v2_id": "short"
+    },
+    {
+      "t_ms": 10051,
+      "phase": "getaddr",
+      "command": "addrv2",
+      "len": 3451,
+      "fields": {
+        "count": 230
+      },
+      "v2_id": "short",
+      "getaddr_answer": true
+    },
+    {
+      "t_ms": 10052,
+      "phase": "probe",
+      "command": "pong",
+      "len": 8,
+      "fields": {
+        "has_nonce": true
+      },
+      "v2_id": "short"
+    },
+    {
+      "t_ms": 10053,
+      "phase": "probe",
+      "command": "headers",
+      "len": 82,
+      "fields": {
+        "count": 1
+      },
+      "v2_id": "short"
+    },
+    {
+      "t_ms": 10053,
+      "phase": "probe",
+      "command": "notfound",
+      "len": 37,
+      "fields": {
+        "count": 1,
+        "types": {
+          "witness_tx": 1
+        }
+      },
+      "v2_id": "short"
+    }
+  ],
+  "sent": [
+    {
+      "t_ms": 0,
+      "phase": "handshake",
+      "command": "version"
+    },
+    {
+      "t_ms": 40,
+      "phase": "handshake",
+      "command": "wtxidrelay"
+    },
+    {
+      "t_ms": 40,
+      "phase": "handshake",
+      "command": "sendaddrv2"
+    },
+    {
+      "t_ms": 40,
+      "phase": "handshake",
+      "command": "verack"
+    },
+    {
+      "t_ms": 81,
+      "phase": "passive",
+      "command": "pong"
+    },
+    {
+      "t_ms": 10047,
+      "phase": "getaddr",
+      "command": "getaddr"
+    },
+    {
+      "t_ms": 10052,
+      "phase": "probe",
+      "command": "ping"
+    },
+    {
+      "t_ms": 10052,
+      "phase": "probe",
+      "command": "getheaders"
+    },
+    {
+      "t_ms": 10053,
+      "phase": "probe",
+      "command": "getdata"
+    },
+    {
+      "t_ms": 10053,
+      "phase": "probe",
+      "command": "fpprobe"
+    }
+  ],
+  "probes": [
+    {
+      "probe": "ping",
+      "command": "ping",
+      "expect": "pong",
+      "disconnected": false,
+      "replies": [
+        "pong"
+      ],
+      "answered": true,
+      "latency_ms": 0,
+      "reply_fields": {
+        "has_nonce": true
+      }
+    },
+    {
+      "probe": "getheaders",
+      "command": "getheaders",
+      "expect": "headers",
+      "disconnected": false,
+      "replies": [
+        "headers"
+      ],
+      "answered": true,
+      "latency_ms": 1,
+      "reply_fields": {
+        "count": 1
+      }
+    },
+    {
+      "probe": "getdata_unknown_tx",
+      "command": "getdata",
+      "expect": "notfound",
+      "disconnected": false,
+      "replies": [
+        "notfound"
+      ],
+      "answered": true,
+      "latency_ms": 0,
+      "reply_fields": {
+        "count": 1,
+        "types": {
+          "witness_tx": 1
+        }
+      }
+    },
+    {
+      "probe": "unknown_message",
+      "command": "fpprobe",
+      "expect": null,
+      "disconnected": false,
+      "replies": [],
+      "answered": false
+    }
+  ],
+  "closed_by_peer": null,
+  "error": null,
+  "session": 1
+}

@@ -94,6 +94,45 @@ address only one node ever named is dialled after the others, so one node
 flooding its answers cannot set the crawl's agenda. The book holds at most
 250,000 addresses; past that the least recently named or reached go first.
 
+### How it tells implementations apart
+
+Each session with a completed handshake is judged against the crawl's own
+rows, one or two per implementation family, measured by greeting each
+client as the crawl does. A row names the traits that set its family
+apart, not the whole transcript of one release, and each was checked
+against captures of two or more releases:
+
+| Family | Traits | Releases captured |
+|---|---|---|
+| Bitcoin Core (Knots included) | `wtxidrelay` and `sendaddrv2` before `verack`; then `sendcmpct`, with no `feefilter` or `sendheaders` before its next message | Core 24.0.1, 28.1, 31.1, 32.1; Knots 28.1, 29.5.1 |
+| satd | the same negotiation; then `sendcmpct` and `feefilter` before its next message (0.8), or `getheaders` straight after `verack` (0.6, 0.7) | 0.6.3, 0.7.2, the 0.8 development tree |
+| rbitcoin | the same negotiation, then `sendheaders`; BIP 324 only | 0.8.0, a 0.8.99 development build, 0.9.2 |
+| btcd | `sendaddrv2` with no `wtxidrelay`; v1 only | 0.24.2, 0.25.0, 0.27.0 |
+| bcoin | protocol 70015, its own `addr` straight after `verack`; v1 only | 2.0.0, 2.1.2, 2.2.0 |
+| libbitcoin | protocol 70013, `relay` off, nothing negotiated, its own `ping` straight after `verack`; v1 only | 3.6.0, 3.8.0 |
+
+A row also holds what none of its captures contradicted: no BIP 324 decoy
+packet or version-packet contents, the probe answers (`notfound` for the
+unknown transaction from all but Core, which answers it only when its
+operator grants the crawler relay; silence for the unknown message; never a
+disconnect) and an `addrv2` answer to `getaddr`.
+
+The result is `high` when the session matches one family's row, `low` when
+only the `version` fields told two families' rows apart, and a
+**mismatch** when the user agent names another family than the one
+matched. When no row matches, the family the user agent names is reported
+with confidence **`claimed`**: a node that closed before showing its
+traits, or a release whose shape no capture has. A claimed family is
+never counted as observed: `getcrawlinfo`, the metrics and the export
+count it as `unknown`, and give the claim apart. It is never a mismatch.
+A user agent that names no family is `unknown`. Every session no row
+matched keeps its transcript, `relay` flag, BIP 324 greeting and
+`getaddr` message in the book, so a new implementation or release shows
+up as many records of one shape before it has a row.
+
+Only the crawl claims. A connected peer's or the network survey's
+fingerprint is never `claimed`: no match is `unknown` there.
+
 ## Options
 
 All are read at startup only (`-crawl` and every `-crawl*` option is
@@ -274,6 +313,7 @@ where clearnet IP addresses of home nodes are.
                 "v2_advertised": {"count": 9400, "share": 0.4476}},
   "families": {"core": {"count": 20100, "share": 0.9571}, "...": "...",
                "unknown": {"count": 500, "share": 0.0238}},
+  "claimed": {"core": {"count": 310, "share": 0.0148}, "...": "..."},
   "mismatches": 12,
   "sessions": {"reached": 50213, "unreached": 140022,
                "in_flight": {"clearnet": 31, "tor": 8}},
@@ -292,7 +332,8 @@ where clearnet IP addresses of home nodes are.
 | `book` | Entries in the book and its cap; entries per network, and those ever reached. I2P and CJDNS are learned only. |
 | `reachable` | Addresses whose last completed handshake is within the liveness window, per dialled network. This is the crawl's count of the reachable network. |
 | `transport` | The reachable addresses in five classes that add up to `reachable.total`: `v2_and_v1`, `v1_only` (v1 worked and the last BIP 324 attempt failed), `v1_v2_untried` (v1 worked and BIP 324 was never tried, the node not advertising it), `v2_only` (a v1 attempt failed within the liveness window of a BIP 324 success), `v2_unconfirmed` (BIP 324 worked, v1 not checked yet). `v2_advertised` counts those whose address was last advertised with `NODE_P2P_V2` (in a `getaddr` answer or the address book), whatever their own `version` said. Shares are of `reachable.total`. |
-| `families` | The reachable addresses per implementation family their handshake matched (a mismatch counts under the family observed), and `unknown`. |
+| `families` | The reachable addresses per implementation family their handshake matched, `high` or `low` (a mismatch counts under the family observed), and `unknown`: no row matched, the claimed ones included. A family's count never includes a claim. |
+| `claimed` | Of the `unknown` addresses, those whose user agent names a family (confidence `claimed`), per family. Never added to `families`. |
 | `mismatches` | Reachable addresses whose user agent names one family and handshake another. |
 | `sessions` | Sessions since start that completed a handshake (`reached`) or did not (`unreached`), and those open now. |
 | `totals` | The crawl's own bytes, as `getnettotals` names them; not counted there. |
@@ -316,7 +357,8 @@ Without `verbose`, each row is:
 | `reachable` | A handshake within the liveness window. |
 | `last_success` | The last completed handshake, Unix seconds; null if never. |
 | `transport` | Its transport class, as in `getcrawlinfo`; null if never reached. |
-| `family` | The implementation family its last handshake matched; null if none. |
+| `family` | The implementation family its last handshake matched; null if none, a claimed family included. |
+| `fingerprint` | The last handshake's result: `core/high`, `btcd/low`, `core/claimed`, `unknown` or `mismatch(claimed=core,observed=btcd)`; null if never reached. |
 
 `getcrawlnodes true` adds every field of the entry: `dialable`,
 `first_learned`, `last_named`, `sources` (distinct nodes that named it, at
@@ -407,7 +449,7 @@ Each node is Bitnodes' thirteen fields, then a `satd` object:
 | 6–10 | city, country, latitude, longitude, timezone | null: no geolocation |
 | 11 | ASN | `AS<n>` from `-asmap`; null without one |
 | 12 | organization | null |
-| 13 | `satd` | `network` (`ipv4`, `ipv6`, `onion`), `port` (`default` or `other`), `transport` (as in `getcrawlinfo`), `v2_advertised`, `family`, `confidence` (`high` or `low`; null unless the family is known), `mismatch`, `chain_check`, `last_seen` (its last completed handshake) |
+| 13 | `satd` | `network` (`ipv4`, `ipv6`, `onion`), `port` (`default` or `other`), `transport` (as in `getcrawlinfo`), `v2_advertised`, `family` (null when claimed), `confidence` (`high`, `low` or `claimed`; null when unknown or a mismatch), `claimed` (the family the user agent names, if any), `mismatch`, `chain_check`, `last_seen` (its last completed handshake) |
 
 **Keyed, the default.** A clearnet node is listed by its node ID:
 HMAC-SHA256 under the export key of its address as `ip:port` (an IPv6
@@ -454,9 +496,10 @@ is missing or not 32 bytes, it returns an error.
   while sessions may start; `satd_crawl_stopped`, 1 after a panic.
 - `satd_crawl_book_entries{network}`: the book per network.
 - `satd_crawl_reachable{network}`, `satd_crawl_transport{class}`,
-  `satd_crawl_v2_advertised`, `satd_crawl_family{family}` and
-  `satd_crawl_mismatches`: the reachable addresses, as `getcrawlinfo`
-  counts them.
+  `satd_crawl_v2_advertised`, `satd_crawl_family{family}`,
+  `satd_crawl_claimed{family}` and `satd_crawl_mismatches`: the reachable
+  addresses, as `getcrawlinfo` counts them. A claimed address is under
+  `satd_crawl_family{family="unknown"}`, never under its family.
 - `satd_crawl_sessions_total{result}` (`reached`, `unreached`) and
   `satd_crawl_sessions_in_flight{network}` (`clearnet`, `tor`).
 - `satd_crawl_bytes_sent_total` and `satd_crawl_bytes_recv_total`: the

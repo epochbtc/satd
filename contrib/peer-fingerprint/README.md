@@ -115,13 +115,27 @@ accepted.
 | satd | 0.8.0-pre | yes | yes | `sendcmpct feefilter ping` | `addrv2`, 230 of 1000, 2 ms / 8 ms | garbage 2731 B, no decoys, empty version packet | n/a |
 | rbitcoin | 0.8.99 | no | yes | `sendheaders sendcmpct ping` | — / `addrv2`, 230 of 1000, 11 ms | garbage 3570 B, no decoys, empty version packet | n/a |
 
+Further releases, captured to check that each crawl row matches its
+family's traits and not one release's transcript (same method; the
+columns as above, the `getaddr` answer and the v2 refusal left out):
+
+| Implementation | Versions | v1 | v2 | Opening messages after `verack` |
+|---|---|---|---|---|
+| Bitcoin Core | 28.1, 31.1 | yes | yes | `sendcmpct ping feefilter` |
+| Bitcoin Knots | 28.1.knots20250305 | yes | yes | `sendcmpct ping feefilter`; answers the `getdata` probe with `notfound` |
+| satd | 0.6.3, 0.7.2 | yes | yes | `getheaders sendcmpct feefilter ping` |
+| rbitcoin | 0.8.0, 0.9.2 | no | yes | `sendheaders sendcmpct ping` (0.8.0 then `feefilter`) |
+| btcd | 0.24.2, 0.25.0 | yes | no (reset) | none (0.24.2: `getblocks`, then it closes 30 s in, before the probes) |
+| bcoin | 2.0.0, 2.1.2 | yes | no (bans) | `addr sendcmpct getaddr` |
+| libbitcoin-server | 3.6.0 | yes | no (closes) | `ping`; closes 60 s in |
+
 "227 of 990" is the entry count of the answer out of the addresses the
 node accepted. What the table shows:
 
 - **No `getheaders`.** Against the normal outbound shape Core (31.2 in
   the fixtures above, and 32.1 when re-checked) and satd 0.7.0 send
-  `getheaders` after `verack`; against services 0 no implementation asks
-  for headers. rbitcoin still sends
+  `getheaders` after `verack`; against services 0 only satd 0.6.3 and
+  0.7.2 ask for headers. rbitcoin still sends
   `sendheaders`.
 - **`notfound` depends on `relay`.** Core (32.1 and 24.0.1) leaves the
   `getdata` probe for an unknown txid unanswered on a connection that set
@@ -165,6 +179,12 @@ node accepted. What the table shows:
   releases. The Core, satd, rbitcoin, Knots and btcd crawl captures were
   taken while the recorder still sent `wtxidrelay` with its `version`;
   all of them speak 70016 or more, where the crawl sends it too.
+- **Crawl captures: libbitcoin 3.6.0.** There is no 3.7 release. 3.6.0
+  was built as 3.8.0 was, in an Ubuntu 18.04 container, with its
+  `install.sh` pointed at the `v3.6.0` tags (the `libbitcoin`
+  organisation's for system, database, network, node and server, the
+  maintainer's account for blockchain, protocol and consensus) instead of
+  the `version3` branches, and run in the same container setup as 3.8.0.
 - **Crawl captures: how v1-only clients refuse v2.** Core 24.0.1 closes
   with nothing sent and btcd resets: a crawler redials those over v1.
   bcoin and libbitcoin send their v1 `version` first, then close on our

@@ -233,17 +233,37 @@ fn the_export_is_bitnodes_shaped() {
                 assert_eq!(a[i], serde_json::Value::Null, "{k}: {what}");
             }
             let satd = a[13].as_object().unwrap();
-            for f in ["network", "port", "transport", "v2_advertised", "family", "confidence", "mismatch", "chain_check", "last_seen"] {
+            for f in ["network", "port", "transport", "v2_advertised", "family", "confidence", "claimed", "mismatch", "chain_check", "last_seen"] {
                 assert!(satd.contains_key(f), "{k}: satd.{f}");
             }
             assert_eq!(satd["transport"], "v1_only");
             assert_eq!(satd["family"], "core");
             assert_eq!(satd["confidence"], "high");
+            assert_eq!(satd["claimed"], "core", "the family its user agent names");
             assert_eq!(satd["last_seen"], NOW);
         }
         assert_eq!(out["satd"]["chain"], "main");
         assert_eq!(out["satd"]["liveness"], crate::net::crawlbook::DEFAULT_LIVENESS_SECS);
     }
+}
+
+/// A node only its user agent names the family of is exported with no
+/// family: `confidence` says `claimed`, `claimed` names the family.
+#[test]
+fn a_claimed_family_is_exported_as_no_family() {
+    let mut book = CrawlBook::new(BookParams::for_network(bitcoin::Network::Bitcoin));
+    assert!(book.seed(v4(1, 8333), ServiceFlags::NETWORK.to_u64(), NOW - HOUR));
+    let mut o = observation(None);
+    o.fingerprint = Fingerprint::Known(Family::Core, Confidence::Claimed);
+    let result = SessionResult { v2: Attempt::Failed, v1: Attempt::Ok, observation: Some(o) };
+    book.record_result(&v4(1, 8333), None, SessionKind::Discovery, result, NOW);
+    let out = export_json(&book, &ctx(), &Mode::Raw);
+    let node = out["nodes"]["23.1.1.7:8333"].as_array().unwrap();
+    let satd = &node[13];
+    assert_eq!(satd["family"], serde_json::Value::Null);
+    assert_eq!(satd["confidence"], "claimed");
+    assert_eq!(satd["claimed"], "core");
+    assert_eq!(satd["mismatch"], false);
 }
 
 /// Keyed, no clearnet address and no port is anywhere in the export: not

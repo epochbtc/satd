@@ -1,0 +1,133 @@
+{
+  "capture_format": 1,
+  "shape": "crawl",
+  "label": "btcd-0.24.2-outbound-crawl-v2",
+  "implementation": "btcd",
+  "implementation_version": "0.24.2",
+  "network": "regtest",
+  "connection": "outbound",
+  "peer_state": {
+    "ibd": "unknown",
+    "height": 1,
+    "note": "RPC reports no IBD state; its tip was mined seconds before the capture",
+    "address_book": {
+      "method": null,
+      "offered": 0,
+      "accepted": 0,
+      "note": "not seeded: it is not started without outbound connections"
+    }
+  },
+  "recorder": {
+    "greeting": "crawl",
+    "protocol_version": 70016,
+    "services": 0,
+    "relay": false,
+    "start_height": 1,
+    "user_agent": "/satd:0.8.0-pre(crawler)/",
+    "passive_wait_s": 10.0,
+    "getaddr_wait_s": 90.0,
+    "probe_wait_s": 5.0
+  },
+  "transport": "v1",
+  "v2_attempted": true,
+  "v2_failure": {
+    "kind": "reset",
+    "after_ms": 33,
+    "bytes_returned": 0,
+    "error": "Closed"
+  },
+  "v2_transport": null,
+  "version": {
+    "protocol_version": 70016,
+    "services": 1101,
+    "services_hex": "000000000000044d",
+    "user_agent": "/btcwire:0.5.0/btcd:0.24.2/",
+    "start_height": 1,
+    "relay": true,
+    "trailing_bytes": 0,
+    "timestamp_skew_s": 0
+  },
+  "commands": [
+    "version",
+    "sendaddrv2",
+    "verack",
+    "getblocks"
+  ],
+  "getaddr": null,
+  "addr_after_getaddr": [],
+  "received": [
+    {
+      "t_ms": 0,
+      "phase": "handshake",
+      "command": "version",
+      "len": 113,
+      "fields": {
+        "protocol_version": 70016,
+        "services": 1101,
+        "services_hex": "000000000000044d",
+        "user_agent": "/btcwire:0.5.0/btcd:0.24.2/",
+        "start_height": 1,
+        "relay": true,
+        "trailing_bytes": 0,
+        "timestamp_skew_s": 0
+      }
+    },
+    {
+      "t_ms": 0,
+      "phase": "handshake",
+      "command": "sendaddrv2",
+      "len": 0
+    },
+    {
+      "t_ms": 0,
+      "phase": "handshake",
+      "command": "verack",
+      "len": 0
+    },
+    {
+      "t_ms": 40,
+      "phase": "passive",
+      "command": "getblocks",
+      "len": 101,
+      "fields": {
+        "version": 70016,
+        "locator_len": 2,
+        "stop_zero": true
+      }
+    }
+  ],
+  "sent": [
+    {
+      "t_ms": 0,
+      "phase": "handshake",
+      "command": "version"
+    },
+    {
+      "t_ms": 0,
+      "phase": "handshake",
+      "command": "wtxidrelay"
+    },
+    {
+      "t_ms": 0,
+      "phase": "handshake",
+      "command": "sendaddrv2"
+    },
+    {
+      "t_ms": 0,
+      "phase": "handshake",
+      "command": "verack"
+    },
+    {
+      "t_ms": 10010,
+      "phase": "getaddr",
+      "command": "getaddr"
+    }
+  ],
+  "probes": [],
+  "closed_by_peer": {
+    "t_ms": 30040,
+    "phase": "getaddr"
+  },
+  "error": null,
+  "session": 1
+}

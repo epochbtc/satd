@@ -25,7 +25,7 @@
 use std::fmt;
 use std::time::Duration;
 
-use crate::net::fingerprint::{Family, Fingerprint};
+use crate::net::fingerprint::{Confidence, Family, Fingerprint};
 use crate::net::flags::{Flag, FlagSet};
 
 /// `-maxoutboundfullrelay`'s default: Core's
@@ -330,7 +330,8 @@ pub struct Candidate<'a> {
 impl Candidate<'_> {
     pub fn trust(&self) -> Trust {
         match (self.fingerprint, Family::claimed_by(self.user_agent)) {
-            (Fingerprint::Unknown, _) => Trust::Unverified,
+            // A claimed family is the user agent's word alone.
+            (Fingerprint::Unknown | Fingerprint::Known(_, Confidence::Claimed), _) => Trust::Unverified,
             (Fingerprint::Mismatch { .. }, _) => Trust::Contradicted,
             (Fingerprint::Known(observed, _), Some(claimed)) if claimed == observed => Trust::Verified,
             (Fingerprint::Known(..), Some(_)) => Trust::Contradicted,
@@ -435,7 +436,6 @@ pub fn glob_match(glob: &str, text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::net::fingerprint::Confidence;
 
     fn cand(fp: Fingerprint, ua: &str) -> Candidate<'_> {
         Candidate { fingerprint: fp, user_agent: ua, services: 0, flags: FlagSet::default() }
@@ -500,7 +500,8 @@ mod tests {
     }
 
     /// Knots with a Core-family fingerprint is verified, Knots with an
-    /// unknown one unverified, Knots with a btcd one contradicted.
+    /// unknown or only claimed one unverified, Knots with a btcd one
+    /// contradicted.
     #[test]
     fn trust_levels() {
         let knots = "/Satoshi:28.1.0/Knots:20250305/";
@@ -510,6 +511,11 @@ mod tests {
         assert_eq!(cand(contradicted, knots).trust(), Trust::Contradicted);
         // An agent naming no family the table knows.
         assert_eq!(cand(known(Family::Core), "/Custom:1.0/").trust(), Trust::Unverified);
+        // A claimed family is the agent's word alone: unverified, and no
+        // family term matches it.
+        let claimed = cand(Fingerprint::Known(Family::Core, Confidence::Claimed), knots);
+        assert_eq!(claimed.trust(), Trust::Unverified);
+        assert_eq!(claimed.fingerprint.observed(), None);
     }
 
     #[test]

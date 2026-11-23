@@ -232,6 +232,8 @@ fn port_class(peer: &PeerAddr, default_port: u16) -> &'static str {
 fn satd_fields(peer: &PeerAddr, e: &CrawlEntry, default_port: u16) -> serde_json::Value {
     let o = e.observation.as_ref();
     let fp = o.map(|o| o.fingerprint).unwrap_or_default();
+    // `claimed` confidence comes with a null `family`: the user agent named
+    // the family and no row matched, so nothing was observed.
     let confidence = match fp {
         Fingerprint::Known(_, c) => Some(c.name()),
         _ => None,
@@ -243,6 +245,7 @@ fn satd_fields(peer: &PeerAddr, e: &CrawlEntry, default_port: u16) -> serde_json
         "v2_advertised": e.v2_advertised(),
         "family": fp.observed().map(Family::name),
         "confidence": confidence,
+        "claimed": o.and_then(|o| Family::claimed_by(&o.user_agent)).map(Family::name),
         "mismatch": matches!(fp, Fingerprint::Mismatch { .. }),
         "chain_check": o.and_then(|o| o.chain_check).map(crawlreport::chain_check_name),
         "last_seen": e.last_success,

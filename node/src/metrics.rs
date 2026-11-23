@@ -1018,7 +1018,8 @@ fn render_peer_survey(out: &mut String, m: Option<&crate::net::manager::SurveyMe
 
 /// The network crawl (`-crawl`): `satd_crawl_enabled`, and with the crawl on
 /// whether it runs, its book per network, the reachable addresses per
-/// network, transport class and observed family, its sessions this run and
+/// network, transport class, observed family and claimed family (apart
+/// from the observed), its sessions this run and
 /// its own traffic (apart from `satd_net_bytes_*`). Counts only, no address.
 fn render_crawl(out: &mut String, m: Option<&crate::net::manager::CrawlMetrics>) {
     use crate::net::crawlbook::Network;
@@ -1085,6 +1086,15 @@ fn render_crawl(out: &mut String, m: Option<&crate::net::manager::CrawlMetrics>)
         metric_sample(out, "satd_crawl_family", &[("family", family.name())], n as u64);
     }
     metric_sample(out, "satd_crawl_family", &[("family", "unknown")], a.unknown as u64);
+    metric_header(
+        out,
+        "satd_crawl_claimed",
+        "Reachable addresses whose handshake matched no family but whose user agent names this one; counted under satd_crawl_family{family=\"unknown\"}, never under the family.",
+        "gauge",
+    );
+    for (family, n) in Family::ALL.iter().zip(a.claimed) {
+        metric_sample(out, "satd_crawl_claimed", &[("family", family.name())], n as u64);
+    }
     metric(
         out,
         "satd_crawl_mismatches",
@@ -2163,6 +2173,31 @@ fn plain_response(status: u16, body: &str) -> hyper::Response<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A claimed family is never counted as observed: under
+    /// `satd_crawl_family` it is `unknown`, and only `satd_crawl_claimed`
+    /// carries the family.
+    #[test]
+    fn the_crawl_metrics_keep_claimed_apart_from_observed() {
+        use crate::net::fingerprint::Family;
+        let index = |f: Family| Family::ALL.iter().position(|x| *x == f).unwrap();
+        let mut m = crate::net::manager::CrawlMetrics::default();
+        m.aggregate.families[index(Family::Btcd)] = 2;
+        m.aggregate.unknown = 3;
+        m.aggregate.claimed[index(Family::Core)] = 1;
+        let mut out = String::new();
+        render_crawl(&mut out, Some(&m));
+        for line in [
+            "satd_crawl_family{family=\"core\"} 0",
+            "satd_crawl_family{family=\"btcd\"} 2",
+            "satd_crawl_family{family=\"unknown\"} 3",
+            "satd_crawl_claimed{family=\"core\"} 1",
+            "satd_crawl_claimed{family=\"btcd\"} 0",
+        ] {
+            assert!(out.lines().any(|l| l == line), "{line} in:\n{out}");
+        }
+        assert!(!out.contains("satd_crawl_claimed{family=\"unknown\"}"));
+    }
 
     #[test]
     fn label_escaping_handles_specials() {
