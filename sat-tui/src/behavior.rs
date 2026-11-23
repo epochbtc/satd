@@ -27,6 +27,9 @@ pub enum Fingerprint {
     /// No row matches, or the transcript is not settled yet.
     #[default]
     Unknown,
+    /// No row matches, and the user agent names `family`: nothing the peer
+    /// did confirmed it, so it is never counted as an observed family.
+    Claimed { family: String },
     /// The user agent names `claimed`; the transcript matches `observed`.
     Mismatch { claimed: String, observed: String },
 }
@@ -37,7 +40,7 @@ impl Fingerprint {
         match self {
             Fingerprint::Known { family, .. } => family,
             Fingerprint::Mismatch { observed, .. } => observed,
-            Fingerprint::Unknown => "unknown",
+            Fingerprint::Unknown | Fingerprint::Claimed { .. } => "unknown",
         }
     }
 
@@ -170,6 +173,7 @@ fn parse_peer(v: &Value) -> Option<PeerBehavior> {
             let f = fp?;
             Fingerprint::Mismatch { claimed: text(f, "claimed"), observed: text(f, "observed") }
         }
+        Some("claimed") => Fingerprint::Claimed { family: text(fp?, "claimed") },
         _ => Fingerprint::Unknown,
     };
     let flags = v
@@ -285,6 +289,9 @@ pub fn family_distribution(map: &BehaviorMap, top_n: usize) -> Vec<(String, usiz
     for p in map.values() {
         let label = match &p.fingerprint {
             Fingerprint::Mismatch { claimed, observed } => format!("{observed} [{claimed}]"),
+            // Unknown to the classifier: under `unknown`, the agent's
+            // family in brackets as a mismatch's is.
+            Fingerprint::Claimed { family } => format!("unknown [{family}]"),
             other => other.observed().to_string(),
         };
         *counts.entry(label).or_default() += 1;
@@ -322,6 +329,7 @@ pub fn fingerprint_line(p: &PeerBehavior) -> String {
         Fingerprint::Mismatch { claimed, observed } => {
             format!("{observed}, but the user agent names {claimed}")
         }
+        Fingerprint::Claimed { family } => format!("unknown; the user agent names {family} (claimed)"),
         Fingerprint::Unknown if !p.settled => "unknown (not settled yet)".into(),
         Fingerprint::Unknown => "unknown".into(),
     }
@@ -467,6 +475,26 @@ pub(crate) mod tests {
         assert_eq!(p.handshake, ["ver?sion"]);
         assert_eq!(evidence_line(&p.flags[0]), "k?=v?");
         assert_eq!(p.counters, [("c".to_string(), "?".to_string())]);
+    }
+
+    /// A claimed fingerprint is unknown to the classifier: never counted
+    /// as its family, and labelled apart.
+    #[test]
+    fn a_claimed_fingerprint_is_not_an_observed_family() {
+        let v = json!([
+            {"id": 1, "subver": "/Satoshi:25.1.0/", "flag_codes": "", "flags": [], "counters": {},
+             "fingerprint": {"result": "claimed", "claimed": "core", "settled": true, "handshake": ["version"]}},
+            {"id": 2, "subver": "/Satoshi:31.2.0/", "flag_codes": "", "flags": [], "counters": {},
+             "fingerprint": {"result": "known", "family": "core", "confidence": "high", "settled": true, "handshake": []}}
+        ]);
+        let map = parse(&v).unwrap();
+        assert_eq!(map[&1].fingerprint, Fingerprint::Claimed { family: "core".into() });
+        assert_eq!(map[&1].fingerprint.observed(), "unknown");
+        assert_eq!(fingerprint_line(&map[&1]), "unknown; the user agent names core (claimed)");
+        assert_eq!(
+            family_distribution(&map, 8),
+            [("core".to_string(), 1), ("unknown [core]".to_string(), 1)]
+        );
     }
 
     #[test]

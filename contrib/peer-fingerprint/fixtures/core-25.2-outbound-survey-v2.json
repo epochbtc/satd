@@ -1,0 +1,33 @@
+{
+  "capture_format": 1,
+  "label": "core-25.2-outbound-survey-v2",
+  "implementation": "core",
+  "implementation_version": "25.2",
+  "network": "regtest",
+  "connection": "outbound",
+  "peer_state": {
+    "ibd": "no",
+    "height": 1,
+    "note": ""
+  },
+  "recorder": {
+    "greeting": "survey",
+    "protocol_version": 70016,
+    "services": 3081,
+    "start_height": 1,
+    "user_agent": "/satd-fingerprint-capture:1/",
+    "passive_wait_s": 10.0,
+    "probe_wait_s": 5.0
+  },
+  "v2_attempts_before_v1": 0,
+  "transport": "v2",
+  "v2_handshake": "failed: Closed",
+  "version": null,
+  "commands": [],
+  "received": [],
+  "sent": [],
+  "probes": [],
+  "closed_by_peer": null,
+  "error": null,
+  "session": 1
+}

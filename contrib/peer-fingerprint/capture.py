@@ -53,6 +53,19 @@ waits --v1-retry-wait seconds for the peer's v1 retry. A peer that never
 retries gets a fixture with "v1_after_v2": false and no transcript, which is
 all a v1-only node learns from it.
 
+--survey (with --dial) greets the node as satd's peer survey
+(-peersurvey) does, as measured from the 0.8 tree:
+
+    - at once: version (start_height --start-height)
+    - on the peer's version: wtxidrelay and sendaddrv2 when the common
+      version is 70016 or more, then verack
+    - on the peer's verack: sendheaders (common version 70012 or more),
+      sendcmpct(0, 2), feefilter(100 sat/kvB)
+    - nothing else unsolicited: no getheaders, no getaddr, no ping
+
+It records and probes as the plain --dial capture does. The fixture's
+recorder greeting is "survey".
+
 --crawl (with --dial) greets the node as an optional crawl mode would
 instead: a declared crawler that asks for addresses and nothing else.
 
@@ -106,6 +119,7 @@ MAX_MSG_LEN = 4 * 1000 * 1000 + 1000  # Core's MAX_PROTOCOL_MESSAGE_LENGTH, plus
 CAPTURE_FORMAT = 1
 CRAWL_SERVICES = 0
 CRAWL_GREETING = "crawl"
+SURVEY_GREETING = "survey"
 NET_IDS = {1: "ipv4", 2: "ipv6", 3: "torv2", 4: "torv3", 5: "i2p", 6: "cjdns"}
 INV_TYPES = {1: "tx", 2: "block", 3: "filtered_block", 4: "cmpct_block", 5: "wtx",
              0x40000001: "witness_tx", 0x40000002: "witness_block"}
@@ -361,6 +375,18 @@ def version_payload():
     return p
 
 
+def survey_version_payload(args):
+    """--survey: satd's own version, as a survey connection sends it: the
+    node's real tip as start_height."""
+    addr = struct.pack("<Q", 0) + bytes(16) + struct.pack(">H", 0)
+    p = struct.pack("<iQq", PROTOCOL_VERSION, OUR_SERVICES, int(time.time()))
+    p += addr + addr + struct.pack("<Q", random.getrandbits(64))
+    ua = USER_AGENT.encode()
+    p += csize_write(len(ua)) + ua
+    p += struct.pack("<i", args.start_height) + b"\x01"
+    return p
+
+
 def ip16(host):
     """The 16-byte form of an IPv4 or IPv6 address, as addr and version carry it."""
     try:
@@ -551,6 +577,7 @@ class Recorder:
         self.getaddr = None
         self.getaddr_sent_ms = None
         self.addr_after_getaddr = []
+        self.common_version = 0  # --survey: min(ours, the peer's)
 
     def ms(self):
         return int((time.monotonic() - self.t0) * 1000)
@@ -600,6 +627,26 @@ class Recorder:
             elif command == "getheaders":
                 self.send("headers", csize_write(0))
             return entry
+        if self.args.survey:
+            if command == "version" and not self.peer_version_seen:
+                self.peer_version_seen = True
+                theirs = struct.unpack("<i", payload[:4])[0] if len(payload) >= 4 else 0
+                self.common_version = min(PROTOCOL_VERSION, theirs)
+                if self.common_version >= 70016:
+                    self.send("wtxidrelay")
+                    self.send("sendaddrv2")
+                self.send("verack")
+            elif command == "verack" and not self.peer_verack_seen:
+                self.peer_verack_seen = True
+                if self.common_version >= 70012:
+                    self.send("sendheaders")
+                self.send("sendcmpct", b"\x00" + struct.pack("<Q", 2))
+                self.send("feefilter", struct.pack("<q", FEEFILTER))
+            elif command == "ping":
+                self.send("pong", payload[:8])
+            elif command == "getheaders":
+                self.send("headers", csize_write(0))
+            return entry
         if command == "version" and not self.peer_version_seen:
             self.peer_version_seen = True
             if not dialer:
@@ -640,8 +687,13 @@ class Recorder:
 
     def run(self):
         if self.args.dial:
-            self.send("version", crawl_version_payload(self.args) if self.args.crawl else version_payload())
-            if not self.args.crawl:
+            if self.args.crawl:
+                self.send("version", crawl_version_payload(self.args))
+            elif self.args.survey:
+                self.send("version", survey_version_payload(self.args))
+            else:
+                self.send("version", version_payload())
+            if not (self.args.crawl or self.args.survey):
                 self.send("wtxidrelay")
         hs_deadline = time.monotonic() + 30
         while not (self.peer_version_seen and self.peer_verack_seen):
@@ -702,7 +754,9 @@ def fixture_head(args, connection, v2_attempts):
         "network": args.network,
         "connection": connection,
         "peer_state": {"ibd": args.peer_ibd, "height": args.peer_height, "note": args.peer_note},
-        "recorder": {"greeting": GREETING, "protocol_version": PROTOCOL_VERSION, "services": OUR_SERVICES,
+        "recorder": {"greeting": SURVEY_GREETING if args.survey else GREETING,
+                     "protocol_version": PROTOCOL_VERSION, "services": OUR_SERVICES,
+                     **({"start_height": args.start_height} if args.survey else {}),
                      "user_agent": USER_AGENT, "passive_wait_s": args.wait,
                      "probe_wait_s": args.probe_wait if args.probes else None},
         "v2_attempts_before_v1": v2_attempts,
@@ -963,8 +1017,10 @@ def main():
                     help="after a v2 attempt, how long to wait for the peer to retry over v1 (default 30)")
     ap.add_argument("--crawl", action="store_true",
                     help="with --dial: greet as a declared crawler, send one getaddr, record the answer (see above)")
+    ap.add_argument("--survey", action="store_true",
+                    help="with --dial: greet as satd's peer survey does (see above)")
     ap.add_argument("--start-height", type=int, default=0,
-                    help="--crawl: start_height in our version, the node's real tip (default 0)")
+                    help="--crawl, --survey: start_height in our version, the node's real tip (default 0)")
     ap.add_argument("--crawl-version", default=workspace_version(),
                     help="--crawl: the version in /satd:<version>(crawler)/ (default: the workspace Cargo.toml's)")
     ap.add_argument("--getaddr-wait", type=float, default=90.0,
@@ -975,6 +1031,10 @@ def main():
         ap.error("--v2 needs --core-functional")
     if args.crawl and not args.dial:
         ap.error("--crawl needs --dial: a crawler only dials")
+    if args.survey and not args.dial:
+        ap.error("--survey needs --dial: a survey connection only dials")
+    if args.survey and args.crawl:
+        ap.error("--survey and --crawl are different greetings")
     if args.crawl and not args.crawl_version:
         ap.error("--crawl: no version in the workspace Cargo.toml; give --crawl-version")
     srv = None

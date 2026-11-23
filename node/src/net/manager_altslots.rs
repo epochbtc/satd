@@ -622,6 +622,12 @@ impl PeerManager {
                 first_seen: now,
                 last_seen: now,
                 probes: Default::default(),
+                shape: info
+                    .flags
+                    .fingerprint
+                    .observed()
+                    .is_none()
+                    .then(|| crate::net::survey::SurveyShape::of(&info.behavior.handshake, version.relay)),
             },
         ))
     }

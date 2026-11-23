@@ -34,6 +34,11 @@ are random routable IPv4 addresses on the regtest port: regtest nodes
 drop non-routable ones (Core's AddrMan keeps only IsRoutable()), and none
 of them is ever dialled or written anywhere.
 
+--survey captures each listening implementation as satd's peer survey
+sees it: we dial it with capture.py --survey, and the fixture is
+<name>-<version>-outbound-survey[-v2].json, beside the other node-shape
+fixtures. The node's address book is left as it is.
+
 Usage: run-captures.py --workdir DIR --out DIR [--only NAME[,NAME...]]
 """
 import argparse, base64, ipaddress, json, os, random, shutil, signal, subprocess, sys, time, urllib.request
@@ -155,10 +160,21 @@ class CoreLike(Impl):
             raise RuntimeError(out.stderr.strip())
         return out.stdout.strip()
 
+    def has_option(self, name):
+        """Whether this bitcoind knows the option (Core before 22 has no
+        -fixedseeds, and refuses to start on an unknown one)."""
+        if not hasattr(self, "_help"):
+            out = subprocess.run([os.path.join(os.environ[self.bin_env], "bitcoind"), "-help-debug", "-help"],
+                                 capture_output=True, text=True, timeout=30)
+            self._help = out.stdout
+        return f"  {name}" in self._help
+
     def argv(self, connect):
         a = [os.path.join(os.environ[self.bin_env], "bitcoind"), "-regtest", f"-datadir={self.dir}",
              f"-port={NODE_P2P}", f"-rpcport={NODE_RPC}", "-bind=127.0.0.1", "-listen=1",
-             "-dnsseed=0", "-fixedseeds=0", "-debug=net", "-printtoconsole=0"]
+             "-dnsseed=0", "-debug=net", "-printtoconsole=0"]
+        if self.has_option("-fixedseeds"):
+            a.append("-fixedseeds=0")
         if connect:
             a.append(f"-connect={connect}")
         elif self.no_outbound:
@@ -645,6 +661,37 @@ def run_crawl(impl, outdir, version, extra, suffix, seed_n):
         impl.stop()
 
 
+def run_survey(impl, outdir, version, extra, suffix):
+    """--survey: one outbound capture with capture.py --survey."""
+    if not impl.listens:
+        return []
+    shutil.rmtree(impl.dir, ignore_errors=True)
+    note = "" if impl.can_mine else "cannot mine on regtest; never left IBD"
+    impl.start()
+    try:
+        wait_for(impl.ready, f"{impl.name} RPC")
+        if impl.can_mine:
+            impl.mine()
+        _, height = impl.state()
+        wait_for(lambda: __import__("socket").create_connection(("127.0.0.1", NODE_P2P), 2).close(),
+                 f"{impl.name} P2P port")
+        name = f"{impl.name}-{version}-outbound-survey{suffix}"
+        path = os.path.join(outdir, f"{name}.json")
+        cap = capture(impl, "outbound", path, name, version,
+                      [*extra, "--survey", "--start-height", str(max(height, 0))])
+        try:
+            rc = cap.wait(timeout=CAPTURE_TIMEOUT)
+            return [("outbound-survey", rc, set_state(path, impl, note) if rc == 0 else None)]
+        except subprocess.TimeoutExpired:
+            return [("outbound-survey", "timeout", None)]
+        finally:
+            if cap.poll() is None:
+                cap.kill()
+                cap.wait()
+    finally:
+        impl.stop()
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--workdir", required=True)
@@ -656,6 +703,7 @@ def main():
     ap.add_argument("--transport", default="v1", help="v1, v2 or v1,v2 (v2 fixtures get a -v2 suffix)")
     ap.add_argument("--core-functional", help="Bitcoin Core's test/functional directory, needed for v2")
     ap.add_argument("--crawl", action="store_true", help="crawl-shape captures of each listening implementation (see above)")
+    ap.add_argument("--survey", action="store_true", help="survey-shape captures of each listening implementation (see above)")
     ap.add_argument("--seed-addrs", type=int, default=1000,
                     help="--crawl: addresses to add to the node's address book first (default 1000; 0 for none)")
     args = ap.parse_args()
@@ -680,7 +728,9 @@ def main():
                 extra += ["--v2", "--core-functional", args.core_functional]
                 suffix = "-v2"
             try:
-                if args.crawl:
+                if args.survey:
+                    results = run_survey(impl, args.out, versions[impl.name], extra, suffix)
+                elif args.crawl:
                     results = run_crawl(impl, args.out, versions[impl.name], extra, suffix, args.seed_addrs)
                 else:
                     results = run(impl, args.out, versions[impl.name], extra, suffix)

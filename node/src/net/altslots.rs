@@ -516,6 +516,15 @@ mod tests {
         let claimed = cand(Fingerprint::Known(Family::Core, Confidence::Claimed), knots);
         assert_eq!(claimed.trust(), Trust::Unverified);
         assert_eq!(claimed.fingerprint.observed(), None);
+        // As the survey and connected peers now claim too: no family rule
+        // takes a claim, and a strict `ua:` rule does not either.
+        let btcd = cand(Fingerprint::Known(Family::Btcd, Confidence::Claimed), "/btcwire:0.5.0/btcd:0.25.0/");
+        for (rule, c) in [("family:core", claimed), ("family:non-core", btcd), ("family:btcd", btcd)] {
+            assert!(!Rule::parse(rule).unwrap().matches(&c, UaTrust::Consistent), "{rule}");
+        }
+        let ua = Rule::parse("ua:/Satoshi:*Knots*").unwrap();
+        assert!(!ua.matches(&claimed, UaTrust::Strict));
+        assert!(ua.matches(&claimed, UaTrust::Consistent));
     }
 
     #[test]

@@ -172,7 +172,8 @@ view's) show what the node judged about each peer:
 - `Enter` opens the **Peer detail** overlay for the highlighted row:
   connection type, transport (`v1` / `v2`), how long it has been
   connected, the claimed agent, the observed family (with its
-  confidence, or the family the agent claimed on a mismatch), the
+  confidence, the family the agent claimed on a mismatch, or `unknown;
+  the user agent names core (claimed)` when no row matched), the
   handshake commands, each flag with its evidence (`key=value`), and the
   raw counters. `Esc` (or `q`) closes it.
 - `f` toggles a filter showing only flagged peers; the table title then
@@ -487,7 +488,10 @@ family their handshake matched instead (`core`, `btcd`, `bitcoin-seeder`,
 …; `unknown` while a peer's handshake is unsettled or matches no
 family): top 4 plus "other", then `fingerprint mismatches: N`. A peer
 whose agent names another family is counted under the observed one,
-with the claimed family in brackets: `btcd [core]`.
+with the claimed family in brackets: `btcd [core]`. A peer whose
+handshake matched no row while its agent names a family (`claimed`) is
+counted as `unknown [core]`: a claim is never drawn as an observed
+family.
 
 Trivia: subsidy era name, halving date, next halving block height.
 Light reading.
@@ -506,7 +510,7 @@ Network survey:
   node still keeps (it drops a record not seen for 30 days).
 - One bar per observed family, the 8 largest, then "other", each with
   its share of the addresses. `unknown` is a handshake that matched no
-  family.
+  family, the claimed ones (below) included.
 - **non-Core**: the share whose handshake matched a family other than
   Core's. Core's forks, Knots among them, share its networking code and
   count as Core; `unknown` is not counted either way.
@@ -516,6 +520,11 @@ Survey detail:
 - **v2**: the share reached over BIP 324, with the count.
 - **mismatches**: the share whose user agent names one family while the
   handshake matches another.
+- **claimed**: the share, with the count, of the `unknown` addresses
+  whose user agent names a family (`claimed` in `getpeersurvey`), then
+  the 3 largest such families, each with its share and count. Drawn only
+  when there is one; these are what the peers say they run, so they never
+  get a family bar.
 - **top AS**: the 5 autonomous systems with the most addresses, by
   number and share. Without `-asmap` the node knows none.
 - **last survey**: when the last survey connection ended, and whether

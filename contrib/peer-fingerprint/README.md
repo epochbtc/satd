@@ -25,6 +25,15 @@ a client behaves.
   is from our side: `inbound` means the peer dialed us. When listening, the
   recorder also takes the node's next connection, if it opens one within
   20 s, as `…-s2.json`.
+- `capture.py --survey` (with `--dial`) greets the node as satd's peer
+  survey (`-peersurvey`) does, as measured from the 0.8 tree: `version`;
+  on the peer's `version`, `wtxidrelay` and `sendaddrv2` at a common
+  version of 70016 or more, then `verack`; on its `verack`,
+  `sendheaders`, `sendcmpct` and `feefilter`, and nothing else
+  unsolicited (no `getheaders`, `getaddr` or `ping`). `run-captures.py
+  --survey` writes `<name>-<version>-outbound-survey[-v2].json` beside the
+  other node-shape fixtures, and the classifier's rows are checked against
+  them as against the rest.
 - `fixtures/crawl/` holds the crawl-shape captures (below):
   `<name>-<version>-outbound-crawl[-v2].json`. They sit in a directory of
   their own so the classifier's fixture tests, which read every
@@ -49,8 +58,29 @@ dropped, and addr/addrv2 bodies are reduced to a count.
 | bitcoin-seeder | `92d2b46` | it dials only | no | `getaddr`, with `start_height` 350000 |
 | bitnodes | `036dc5c` | it dials only | no | `getaddr`, with `relay` 0 and services 0 |
 
+Further releases, captured (same method, both directions, v1 and v2, and
+with `--survey`) to check that each node row matches its family's traits
+and not one release's transcript. The columns: what each sends right after
+`verack` when we dial it, then when it dials us.
+
+| Implementation | Versions | We dial it | It dials us |
+|---|---|---|---|
+| Bitcoin Core | 0.20.2 | `sendheaders sendcmpct sendcmpct ping` (70015: no `wtxidrelay` or `sendaddrv2`) | `getaddr` (70015) |
+| Bitcoin Core | 0.21.2, 22.1, 23.2 | `sendheaders sendcmpct sendcmpct ping` | `getaddr` |
+| Bitcoin Core | 24.2, 25.2, 28.1, 32.1 | `sendcmpct ping` | `getaddr` |
+| Bitcoin Knots | 28.1.knots20250305 | `sendcmpct ping` | `getaddr` |
+| satd | 0.7.2, 0.8 tree | `getheaders` | `sendheaders getheaders` |
+| rbitcoin | 0.8.99, 0.9.99 (development builds) | `sendheaders sendcmpct ping`, v2 only | the same, on its second connection, v2 only |
+| btcd | 0.24.2, 0.25.0 | none (0.24.2 to the survey greeting: `getblocks`) | `getaddr` |
+| bcoin | 2.0.0, 2.1.2 | `addr` | `addr` |
+
+Every one sends the same to the survey greeting as to the plain one, except
+as noted. Core before 0.21 runs without `-fixedseeds`, which it does not
+know; `run-captures.py` leaves the flag out for a `bitcoind` whose help
+does not list it.
+
 Replies to the recorder's own `getheaders` and `ping` are left out of the
-last column. Where those replies fall among a peer's own messages depends
+last columns of both tables. Where those replies fall among a peer's own messages depends
 on timing (two captures of satd differ only in that), so a classifier
 should compare a peer's own messages and treat replies separately. The messages are the same over v1 and v2 for every
 implementation that speaks both.

@@ -25,7 +25,7 @@
 use super::*;
 use crate::net::survey::{
     self, PASSIVE_WAIT, PROBE_REPLY_WAIT, Probe, ProbeContext, ProbeOutcome, ProbeResults, SurveyRecord,
-    SurveyStore, UNKNOWN_PROBE_WAIT,
+    SurveyShape, SurveyStore, UNKNOWN_PROBE_WAIT,
 };
 use rand::seq::SliceRandom as _;
 
@@ -86,7 +86,11 @@ pub struct SurveyMetrics {
     /// Records by observed family, [`crate::net::fingerprint::Family::ALL`]'s
     /// order.
     pub families: [usize; crate::net::fingerprint::Family::ALL.len()],
+    /// Records no row matched, the claimed ones included.
     pub unknown: usize,
+    /// The unknown records whose user agent names a family, per family:
+    /// never counted in `families`.
+    pub claimed: [usize; crate::net::fingerprint::Family::ALL.len()],
     pub mismatches: usize,
     pub v2: usize,
     /// By [`Probe::ALL`] then answered, silent, disconnected.
@@ -512,13 +516,24 @@ impl PeerManager {
         let info = &mut handle.info;
         let fingerprint = crate::net::fingerprint::classify(false, &info.behavior.handshake, info.behavior.version.as_ref(), true);
         let reason = if closed { "survey-peer-closed" } else { "survey-done" };
+        // A shape no row matched keeps its raw features, in the record and
+        // here, so the next round of unknown shapes can be told apart.
+        let relay = info.behavior.version.as_ref().is_some_and(|v| v.relay);
+        let shape = fingerprint.observed().is_none().then(|| SurveyShape::of(&info.behavior.handshake, relay));
         tracing::debug!(
-            "survey connection done ({reason}), fingerprint={fingerprint} v2={v2} probes={}, disconnecting peer={id}",
+            "survey connection done ({reason}), fingerprint={fingerprint} v2={v2} probes={}{}, disconnecting peer={id}",
             Probe::ALL
                 .iter()
                 .filter_map(|p| probes.get(*p).map(|o| format!("{}:{}", p.name(), o.name())))
                 .collect::<Vec<_>>()
-                .join(",")
+                .join(","),
+            shape.as_ref().map_or_else(String::new, |s| format!(
+                " handshake={} relay={} version={} services={:016x}",
+                s.commands.join(","),
+                s.relay,
+                version.version,
+                version.services.to_u64()
+            ))
         );
         self.retire_behavior(id, info, reason);
         let Some(run) = self.survey.get() else {
@@ -545,6 +560,7 @@ impl PeerManager {
             first_seen: now,
             last_seen: now,
             probes,
+            shape,
         };
         let aggregate = {
             let mut store = run.store.lock();
@@ -691,6 +707,7 @@ impl PeerManager {
             failed: run.failed.load(Ordering::Relaxed),
             families: agg.families,
             unknown: agg.unknown,
+            claimed: agg.claimed,
             mismatches: agg.mismatches,
             v2: agg.v2,
             probe_outcomes,

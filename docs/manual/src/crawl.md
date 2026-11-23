@@ -130,8 +130,10 @@ matched keeps its transcript, `relay` flag, BIP 324 greeting and
 `getaddr` message in the book, so a new implementation or release shows
 up as many records of one shape before it has a row.
 
-Only the crawl claims. A connected peer's or the network survey's
-fingerprint is never `claimed`: no match is `unknown` there.
+Connected peers and the network survey are judged the same way against
+rows of their own, captured against an ordinary node's `version`: a
+session no row matches is `claimed` there too (see
+[Peer Behaviour Flags](peer-behavior.md#what-is-judged)).
 
 ## Options
 
