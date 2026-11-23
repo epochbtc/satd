@@ -1061,7 +1061,7 @@ fn render_crawl(out: &mut String, m: Option<&crate::net::manager::CrawlMetrics>)
     metric_header(
         out,
         "satd_crawl_transport",
-        "Reachable addresses by transport: v2_and_v1, v1_only, v2_only, v2_unconfirmed.",
+        "Reachable addresses by transport: v2_and_v1, v1_only, v1_v2_untried, v2_only, v2_unconfirmed.",
         "gauge",
     );
     for (t, c) in Transport::ALL.iter().zip(a.transport) {

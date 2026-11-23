@@ -67,7 +67,7 @@ fn core() -> Fingerprint {
 /// | IPv4 `b` | v1 only | btcd |
 /// | IPv4 `c` | v2 only | satd, claiming core (a mismatch) |
 /// | IPv6 `d` | v2, v1 not checked | unknown |
-/// | onion `e` | v1 only | core |
+/// | onion `e` | v1, v2 never tried (not advertised) | core |
 /// | IPv4 `f` | reached 3 h ago: not reachable | |
 /// | IPv4 `g` | never reached | |
 fn book() -> CrawlBook {
@@ -85,7 +85,7 @@ fn book() -> CrawlBook {
     book.record_result(&v4(3), None, d, result(Attempt::Ok, Attempt::NotTried, Some(mismatch)), NOW);
     book.record_result(&v4(3), None, SessionKind::V1Recheck, result(Attempt::NotTried, Attempt::Failed, None), NOW);
     book.record_result(&v6(), None, d, result(Attempt::Ok, Attempt::NotTried, Some(Fingerprint::Unknown)), NOW);
-    book.record_result(&onion(), None, d, result(Attempt::Failed, Attempt::Ok, Some(core())), NOW);
+    book.record_result(&onion(), None, d, result(Attempt::NotTried, Attempt::Ok, Some(core())), NOW);
     book.record_result(&v4(4), None, d, result(Attempt::Ok, Attempt::NotTried, Some(core())), NOW - 3 * HOUR);
     book.record_result(&v4(5), None, d, result(Attempt::Failed, Attempt::Failed, None), NOW);
     let learned = [
@@ -117,7 +117,7 @@ fn the_aggregate_counts_the_book_exactly() {
     assert_eq!(agg.ever_reached, [4, 1, 1, 0, 0]);
     assert_eq!(agg.reachable, [3, 1, 1], "f's handshake is past the liveness window");
     assert_eq!(agg.reachable_total(), 5);
-    assert_eq!(agg.transport, [1, 2, 1, 1], "v2 and v1, v1 only, v2 only, v2 unconfirmed");
+    assert_eq!(agg.transport, [1, 1, 1, 1, 1], "v2 and v1, v1 only, v1 v2 untried, v2 only, v2 unconfirmed");
     assert_eq!(agg.transport.iter().sum::<usize>(), agg.reachable_total(), "every reachable address in one class");
     assert_eq!(agg.v2_advertised, 1);
     assert_eq!(family(&agg, Family::Core), 2);
@@ -130,8 +130,25 @@ fn the_aggregate_counts_the_book_exactly() {
     // A day on, nothing is reachable and the learned counts stand.
     let later = aggregate(&book, NOW + 24 * HOUR);
     assert_eq!(later.reachable, [0, 0, 0]);
-    assert_eq!(later.transport, [0; 4]);
+    assert_eq!(later.transport, [0; 5]);
     assert_eq!(later.learned, agg.learned);
+}
+
+/// A v1 handshake is "v1 only" only when a BIP 324 attempt failed; with no
+/// v2 attempt at all (the node advertised none) it is a class of its own.
+#[test]
+fn v1_only_means_v2_was_tried_and_failed() {
+    let mut book = CrawlBook::new(crate::net::crawlbook::BookParams::for_network(bitcoin::Network::Bitcoin));
+    for a in [v4(1), v4(2)] {
+        assert!(book.seed(a, 1, NOW - HOUR));
+    }
+    let d = SessionKind::Discovery;
+    book.record_result(&v4(1), None, d, result(Attempt::Failed, Attempt::Ok, Some(core())), NOW);
+    book.record_result(&v4(2), None, d, result(Attempt::NotTried, Attempt::Ok, Some(core())), NOW);
+    let class = |a: PeerAddr| Transport::of(book.get(&crate::net::crawlbook::CrawlAddr::Peer(a)).unwrap());
+    assert_eq!(class(v4(1)), Transport::V1Only);
+    assert_eq!(class(v4(2)), Transport::V1V2Untried);
+    assert_eq!(Transport::V1V2Untried.name(), "v1_v2_untried");
 }
 
 /// The JSON carries the aggregate, shares of the reachable addresses, and
@@ -148,7 +165,8 @@ fn the_aggregate_json_is_counts_only() {
     assert_eq!(json["reachable"], serde_json::json!({ "total": 5, "ipv4": 3, "ipv6": 1, "onion": 1 }));
     assert!(json["reachable"].get("i2p").is_none(), "I2P and CJDNS are never reachable: never dialled");
     assert_eq!(json["transport"]["v2_only"], serde_json::json!({ "count": 1, "share": 0.2 }));
-    assert_eq!(json["transport"]["v1_only"]["count"], 2);
+    assert_eq!(json["transport"]["v1_only"]["count"], 1);
+    assert_eq!(json["transport"]["v1_v2_untried"]["count"], 1);
     assert_eq!(json["transport"]["v2_and_v1"]["count"], 1);
     assert_eq!(json["transport"]["v2_unconfirmed"]["count"], 1);
     assert_eq!(json["transport"]["v2_advertised"]["count"], 1);

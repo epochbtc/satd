@@ -566,10 +566,13 @@ Crawl detail:
 
 - **ipv4**, **ipv6**, **onion**: the reachable addresses on each network,
   by share and count.
-- **v2 + v1**, **v1 only**, **v2 only**, **v2 unchecked**: the reachable
-  addresses by transport. A v2-only node did BIP 324 and then failed a v1
-  handshake within the liveness window; an unchecked one did BIP 324 and
-  has not had its v1 check yet. The four add up to the reachable count.
+- **v2 + v1**, **v1 only**, **v1 no v2 ad**, **v2 only**, **v2 unchecked**:
+  the reachable addresses by transport. A v1-only node did v1 after a
+  failed BIP 324 attempt; a "v1 no v2 ad" node did v1 and was never tried
+  over BIP 324, as it did not advertise it. A v2-only node did BIP 324 and
+  then failed a v1 handshake within the liveness window; an unchecked one
+  did BIP 324 and has not had its v1 check yet. The five add up to the
+  reachable count.
 - **mismatches**: the reachable addresses whose user agent names one
   family while the handshake matches another.
 - **reached**, **unreached**: crawl sessions since the node started that

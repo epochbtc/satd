@@ -60,7 +60,18 @@ unsolicited. The node's own `-uacomment`, listen address, onion and
 `-externalip` never appear. A crawl session answers `ping` with `pong`,
 gives a `getaddr` sent to it nothing, and ignores everything else.
 
-BIP 324 is tried first. A node that refuses it as a v1-only node does
+BIP 324 is tried first only to a node known to advertise it
+(`NODE_P2P_V2`), as Bitcoin Core does for its own outbound connections:
+after a handshake, by the services in the node's own last `version`;
+before one, by the services its address was last advertised with in a
+`getaddr` answer or the address book. A seed (`-crawlseed`, a fixed seed, a
+DNS seed) carries no services, so it is dialled over v1 until a handshake
+or an answer naming it says otherwise. Every other address is dialled over
+v1, with no BIP 324 bytes sent: some v1-only implementations close on
+them, and one bans the dialling address. A node that speaks BIP 324 without
+advertising it is therefore counted as v1 (`v1_v2_untried`).
+
+A node dialled over BIP 324 that refuses it as a v1-only node does
 (closing, or never answering, with nothing sent back) is redialled over v1,
 as Bitcoin Core does. A node that did BIP 324 and then fails the v1 recheck
 within the liveness window is counted **v2-only**, a class v1-only crawlers
@@ -256,7 +267,8 @@ where clearnet IP addresses of home nodes are.
            "ever_reached": {"ipv4": 14000, "ipv6": 3100, "onion": 6400, "i2p": 0, "cjdns": 0}},
   "reachable": {"total": 21000, "ipv4": 12500, "ipv6": 2600, "onion": 5900},
   "transport": {"v2_and_v1": {"count": 9000, "share": 0.4286},
-                "v1_only": {"count": 11500, "share": 0.5476},
+                "v1_only": {"count": 1500, "share": 0.0714},
+                "v1_v2_untried": {"count": 10000, "share": 0.4762},
                 "v2_only": {"count": 40, "share": 0.0019},
                 "v2_unconfirmed": {"count": 460, "share": 0.0219},
                 "v2_advertised": {"count": 9400, "share": 0.4476}},
@@ -279,7 +291,7 @@ where clearnet IP addresses of home nodes are.
 | `limits` | The limits in force: after the ceilings and the file-descriptor fitting. `networks` are those the crawl dials; `bind` whether `-crawlbind` is set (not the address). |
 | `book` | Entries in the book and its cap; entries per network, and those ever reached. I2P and CJDNS are learned only. |
 | `reachable` | Addresses whose last completed handshake is within the liveness window, per dialled network. This is the crawl's count of the reachable network. |
-| `transport` | The reachable addresses in four classes that add up to `reachable.total`: `v2_and_v1`, `v1_only`, `v2_only` (a v1 attempt failed within the liveness window of a BIP 324 success), `v2_unconfirmed` (BIP 324 worked, v1 not checked yet). `v2_advertised` counts those advertised with `NODE_P2P_V2`. Shares are of `reachable.total`. |
+| `transport` | The reachable addresses in five classes that add up to `reachable.total`: `v2_and_v1`, `v1_only` (v1 worked and the last BIP 324 attempt failed), `v1_v2_untried` (v1 worked and BIP 324 was never tried, the node not advertising it), `v2_only` (a v1 attempt failed within the liveness window of a BIP 324 success), `v2_unconfirmed` (BIP 324 worked, v1 not checked yet). `v2_advertised` counts those advertised with `NODE_P2P_V2`. Shares are of `reachable.total`. |
 | `families` | The reachable addresses per implementation family their handshake matched (a mismatch counts under the family observed), and `unknown`. |
 | `mismatches` | Reachable addresses whose user agent names one family and handshake another. |
 | `sessions` | Sessions since start that completed a handshake (`reached`) or did not (`unreached`), and those open now. |

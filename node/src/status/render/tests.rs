@@ -67,6 +67,7 @@ fn snapshot() -> StatusSnapshot {
             learned_cjdns: 0,
             v2_and_v1: 5,
             v1_only: 3,
+            v1_v2_untried: 2,
             v2_only: 1,
             v2_unconfirmed: 1,
         }),
@@ -224,6 +225,8 @@ fn status_shows_crawl_counts_only() {
     assert_eq!(get("Reachable over IPv4").value, "7");
     assert_eq!(get("I2P learned (never dialled)").value, "4");
     assert_eq!(get("BIP 324 only").value, "1");
+    assert_eq!(get("v1 only (BIP 324 failed)").value, "3");
+    assert_eq!(get("v1, BIP 324 not advertised").value, "2");
     // Every value is a count, bar the state.
     for i in rows.iter().filter(|i| i.label != "State") {
         assert!(i.value.chars().all(|c| c.is_ascii_digit() || c == ','), "{i:?}");

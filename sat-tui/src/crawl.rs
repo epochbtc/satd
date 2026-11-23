@@ -50,14 +50,17 @@ pub enum CrawlState {
 }
 
 /// The reachable addresses by transport, as `getcrawlinfo` classes them.
-/// The four classes add up to the reachable total.
+/// The five classes add up to the reachable total.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Transport {
     pub v2_and_v1: u64,
+    /// v1, and the last BIP 324 attempt failed.
     pub v1_only: u64,
+    /// v1, and BIP 324 never tried: the node did not advertise it.
+    pub v1_v2_untried: u64,
     pub v2_only: u64,
     pub v2_unconfirmed: u64,
-    /// Advertised with `NODE_P2P_V2`: not a fifth class.
+    /// Advertised with `NODE_P2P_V2`: not a sixth class.
     pub v2_advertised: u64,
 }
 
@@ -170,6 +173,7 @@ pub fn parse(v: &Value) -> Option<Crawl> {
     let transport = Transport {
         v2_and_v1: class("v2_and_v1"),
         v1_only: class("v1_only"),
+        v1_v2_untried: class("v1_v2_untried"),
         v2_only: class("v2_only"),
         v2_unconfirmed: class("v2_unconfirmed"),
         v2_advertised: class("v2_advertised"),
@@ -285,7 +289,8 @@ pub(crate) mod tests {
                      "ever_reached": {"ipv4": 14000, "ipv6": 3100, "onion": 6400, "i2p": 0, "cjdns": 0}},
             "reachable": {"total": 21000, "ipv4": 12500, "ipv6": 2600, "onion": 5900},
             "transport": {"v2_and_v1": {"count": 9000, "share": 0.4286},
-                          "v1_only": {"count": 11500, "share": 0.5476},
+                          "v1_only": {"count": 1500, "share": 0.0714},
+                          "v1_v2_untried": {"count": 10000, "share": 0.4762},
                           "v2_only": {"count": 40, "share": 0.0019},
                           "v2_unconfirmed": {"count": 460, "share": 0.0219},
                           "v2_advertised": {"count": 9400, "share": 0.4476}},
@@ -323,7 +328,14 @@ pub(crate) mod tests {
         assert_eq!(c.by_network, [("ipv4", 12500), ("ipv6", 2600), ("onion", 5900)]);
         assert_eq!(
             c.transport,
-            Transport { v2_and_v1: 9000, v1_only: 11500, v2_only: 40, v2_unconfirmed: 460, v2_advertised: 9400 }
+            Transport {
+                v2_and_v1: 9000,
+                v1_only: 1500,
+                v1_v2_untried: 10000,
+                v2_only: 40,
+                v2_unconfirmed: 460,
+                v2_advertised: 9400
+            }
         );
         assert_eq!(c.families.len(), 9, "bitnodes has no reachable address");
         assert_eq!(c.families[0], ("core".to_string(), 20100));

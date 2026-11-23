@@ -401,7 +401,8 @@ fn crawl_items(c: &super::CrawlStatus) -> Vec<Item> {
         n("I2P learned (never dialled)", c.learned_i2p),
         n("CJDNS learned (never dialled)", c.learned_cjdns),
         n("BIP 324 and v1", c.v2_and_v1),
-        n("v1 only", c.v1_only),
+        n("v1 only (BIP 324 failed)", c.v1_only),
+        n("v1, BIP 324 not advertised", c.v1_v2_untried),
         n("BIP 324 only", c.v2_only),
         n("BIP 324, v1 not checked yet", c.v2_unconfirmed),
     ]

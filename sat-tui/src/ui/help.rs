@@ -323,7 +323,7 @@ fn chain_help() -> Vec<Line<'static>> {
         blank(),
         heading("Network Crawl Row (satd with -crawl=1)"),
         label("Network Crawl", "State (running, held and why, stopped); addresses reachable now; share by observed family (top 8, then 'other'); non-Core share."),
-        label("Crawl Detail", "Reachable by network; v2 + v1, v1 only, v2 only, v2 unchecked; mismatches; sessions reached and unreached; sessions open against the limits; book size."),
+        label("Crawl Detail", "Reachable by network; v2 + v1, v1 only (v2 failed), v1 no v2 ad (v2 not advertised, never tried), v2 only, v2 unchecked; mismatches; sessions reached and unreached; sessions open against the limits; book size."),
         label("Survey row", "With the crawl on, one 'survey: superseded by the crawl' line, if -peersurvey was asked for too."),
         label("Short terminal", "The row collapses to one 'crawl:' line above the footer."),
         blank(),
