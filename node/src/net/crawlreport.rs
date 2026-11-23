@@ -29,8 +29,12 @@ pub const DIALLED: [Network; 3] = [Network::Ipv4, Network::Ipv6, Network::Onion]
 pub enum Transport {
     /// BIP 324 and v1 both completed a handshake.
     Both,
-    /// v1 completed and BIP 324 did not: a v1-only node.
+    /// v1 completed and the last BIP 324 attempt failed: a v1-only node.
     V1Only,
+    /// v1 completed and BIP 324 was never tried: the node advertised no
+    /// `NODE_P2P_V2`, so the crawl dialled it over v1 alone. Whether it
+    /// speaks v2 is not known.
+    V1V2Untried,
     /// BIP 324 completed and a v1 attempt within the liveness window failed.
     V2Only,
     /// BIP 324 completed and no v1 attempt has told yet whether v1 works.
@@ -38,12 +42,14 @@ pub enum Transport {
 }
 
 impl Transport {
-    pub const ALL: [Transport; 4] = [Transport::Both, Transport::V1Only, Transport::V2Only, Transport::V2Unconfirmed];
+    pub const ALL: [Transport; 5] =
+        [Transport::Both, Transport::V1Only, Transport::V1V2Untried, Transport::V2Only, Transport::V2Unconfirmed];
 
     pub fn name(self) -> &'static str {
         match self {
             Transport::Both => "v2_and_v1",
             Transport::V1Only => "v1_only",
+            Transport::V1V2Untried => "v1_v2_untried",
             Transport::V2Only => "v2_only",
             Transport::V2Unconfirmed => "v2_unconfirmed",
         }
@@ -57,8 +63,10 @@ impl Transport {
             Transport::Both
         } else if e.v2_ok == Some(true) {
             Transport::V2Unconfirmed
-        } else {
+        } else if e.v2_ok == Some(false) {
             Transport::V1Only
+        } else {
+            Transport::V1V2Untried
         }
     }
 
@@ -82,7 +90,10 @@ pub struct Aggregate {
     /// Reachable addresses per [`Transport`] class, [`Transport::ALL`]'s
     /// order.
     pub transport: [usize; Transport::ALL.len()],
-    /// Reachable addresses advertised with `NODE_P2P_V2`.
+    /// Reachable addresses whose address was last advertised (in a
+    /// `getaddr` answer or the address-book sample) with `NODE_P2P_V2`. The
+    /// node's own `version` services do not count here, though they decide
+    /// the dial ([`CrawlEntry::dials_v2_first`](crate::net::crawlbook::CrawlEntry::dials_v2_first)).
     pub v2_advertised: usize,
     /// Reachable addresses per observed family, [`Family::ALL`]'s order.
     pub families: [usize; Family::ALL.len()],

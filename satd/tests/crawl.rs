@@ -25,16 +25,17 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 /// A scripted v1-only peer: Core's shape when dialled, or btcd's, and its
-/// answer to `getaddr`.
+/// answer to `getaddr`: each port, and whether it is advertised with
+/// `NODE_P2P_V2`.
 #[derive(Clone)]
 struct Shape {
     user_agent: &'static str,
     negotiation: Vec<NetworkMessage>,
     after_verack: Vec<NetworkMessage>,
-    answer: Vec<u16>,
+    answer: Vec<(u16, bool)>,
 }
 
-fn core(answer: Vec<u16>) -> Shape {
+fn core(answer: Vec<(u16, bool)>) -> Shape {
     Shape {
         user_agent: "/Satoshi:32.1.0/",
         negotiation: vec![NetworkMessage::WtxidRelay, NetworkMessage::SendAddrV2],
@@ -43,7 +44,7 @@ fn core(answer: Vec<u16>) -> Shape {
     }
 }
 
-fn btcd(answer: Vec<u16>) -> Shape {
+fn btcd(answer: Vec<(u16, bool)>) -> Shape {
     Shape {
         user_agent: "/btcwire:0.5.0/btcd:0.27.0/",
         negotiation: vec![NetworkMessage::SendAddrV2],
@@ -71,11 +72,12 @@ fn recv(stream: &mut TcpStream) -> io::Result<NetworkMessage> {
     Ok(raw.into_payload())
 }
 
-fn loopback_entry(port: u16) -> AddrV2Message {
+fn loopback_entry(port: u16, v2: bool) -> AddrV2Message {
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as u32;
+    let services = ServiceFlags::NETWORK | ServiceFlags::WITNESS;
     AddrV2Message {
         time: now - 60,
-        services: ServiceFlags::NETWORK | ServiceFlags::WITNESS,
+        services: if v2 { services | ServiceFlags::P2P_V2 } else { services },
         addr: AddrV2::Ipv4(Ipv4Addr::LOCALHOST),
         port,
     }
@@ -113,7 +115,7 @@ fn serve(mut stream: TcpStream, shape: &Shape) -> io::Result<()> {
                 }
             }
             NetworkMessage::GetAddr => {
-                let entries = shape.answer.iter().map(|p| loopback_entry(*p)).collect();
+                let entries = shape.answer.iter().map(|(p, v2)| loopback_entry(*p, *v2)).collect();
                 send(&mut stream, NetworkMessage::AddrV2(entries))?;
             }
             NetworkMessage::Ping(n) => send(&mut stream, NetworkMessage::Pong(n))?,
@@ -184,9 +186,11 @@ fn read_book(node: &TestNode) -> CrawlBook {
 /// A cluster crawled to completion: the crawler starts from one scripted
 /// Core peer, which names two real satd nodes, a scripted btcd peer and an
 /// address nobody listens on; the btcd peer names the dead address again.
-/// The book must hold exactly those five, four reached: the scripted peers
-/// over v1 after a refused v2 attempt, the satd nodes over v2 and then v1
-/// on the v1 recheck, none v2-only. No crawl connection is ever a peer of
+/// The answers advertise the satd nodes with `NODE_P2P_V2` and the others
+/// without. The book must hold exactly those five, four reached: the
+/// scripted peers (the seed, which carries no services, and btcd) over v1
+/// alone with no v2 attempt, the satd nodes over v2 and then v1 on the v1
+/// recheck, none v2-only. No crawl connection is ever a peer of
 /// the crawler, and the survey reports itself superseded. Across a restart
 /// the book and its timers are kept: nothing is due, so nothing changes.
 ///
@@ -200,9 +204,9 @@ fn a_regtest_cluster_is_crawled_to_completion() {
     let (xp, yp) = (x.p2p_port.unwrap(), y.p2p_port.unwrap());
     let dead = closed_port();
     let (l2, s2) = bind();
-    let s2_accepts = scripted(l2, btcd(vec![yp, dead]));
+    let s2_accepts = scripted(l2, btcd(vec![(yp, true), (dead, false)]));
     let (l1, s1) = bind();
-    let s1_accepts = scripted(l1, core(vec![xp, s2, dead]));
+    let s1_accepts = scripted(l1, core(vec![(xp, true), (s2, false), (dead, false)]));
     let metrics_port = find_available_port();
     let args = [
         "--maxconnections=0".to_string(),
@@ -230,7 +234,7 @@ fn a_regtest_cluster_is_crawled_to_completion() {
         assert_eq!(c.rpc_ok("getpeerinfo", vec![]), json!([]));
         std::thread::sleep(Duration::from_millis(500));
     }
-    assert!(s1_accepts.load(Ordering::SeqCst) >= 2 && s2_accepts.load(Ordering::SeqCst) >= 2, "v2, then v1");
+    assert_eq!((s1_accepts.load(Ordering::SeqCst), s2_accepts.load(Ordering::SeqCst)), (1, 1), "v1 alone, no v2 attempt");
     let survey = c.rpc_ok("getpeersurvey", vec![]);
     assert_eq!(survey["superseded_by_crawl"], true, "{survey}");
     check_reports(&c, metrics_port, &[s1, s2, dead, xp, yp]);
@@ -258,7 +262,7 @@ fn a_regtest_cluster_is_crawled_to_completion() {
     let entry = |port| book.get(&CrawlAddr::Peer(peer(port))).unwrap_or_else(|| panic!("{port} in the book"));
     for (port, entries) in [(s1, 3), (s2, 2)] {
         let e = entry(port);
-        assert_eq!((e.v2_ok, e.v1_ok, e.v2_only), (Some(false), Some(true), false), "scripted {port}");
+        assert_eq!((e.v2_ok, e.v1_ok, e.v2_only), (None, Some(true), false), "scripted {port}");
         let obs = e.observation.as_ref().unwrap();
         assert!(matches!(obs.getaddr, Some(GetaddrResult::Answered { entries: n, .. }) if n == entries), "{obs:?}");
         assert!(obs.probes.any());
@@ -295,7 +299,7 @@ fn a_regtest_cluster_is_crawled_to_completion() {
 
 /// What the RPCs, the metrics and the status page say of the crawled
 /// cluster: five addresses on IPv4, four reachable (the scripted peers over
-/// v1 only, the satd nodes over both), and no address anywhere but in
+/// v1 with v2 never tried, the satd nodes over both), and no address anywhere but in
 /// `getcrawlnodes`.
 fn check_reports(c: &TestNode, metrics_port: u16, ports: &[u16]) {
     let info = c.rpc_ok("getcrawlinfo", vec![]);
@@ -308,7 +312,8 @@ fn check_reports(c: &TestNode, metrics_port: u16, ports: &[u16]) {
     assert_eq!(info["book"]["learned"]["ipv4"], 5);
     assert_eq!(info["book"]["ever_reached"]["ipv4"], 4);
     assert_eq!(info["reachable"], json!({ "total": 4, "ipv4": 4, "ipv6": 0, "onion": 0 }), "{info}");
-    assert_eq!(info["transport"]["v1_only"]["count"], 2, "{info}");
+    assert_eq!(info["transport"]["v1_v2_untried"]["count"], 2, "{info}");
+    assert_eq!(info["transport"]["v1_only"]["count"], 0, "{info}");
     assert_eq!(info["transport"]["v2_and_v1"]["count"], 2, "{info}");
     assert_eq!(info["transport"]["v2_only"]["count"], 0);
     let families = info["families"].as_object().unwrap();
@@ -370,7 +375,8 @@ fn check_reports(c: &TestNode, metrics_port: u16, ports: &[u16]) {
         "satd_crawl_running 1",
         "satd_crawl_book_entries{network=\"ipv4\"} 5",
         "satd_crawl_reachable{network=\"ipv4\"} 4",
-        "satd_crawl_transport{class=\"v1_only\"} 2",
+        "satd_crawl_transport{class=\"v1_v2_untried\"} 2",
+        "satd_crawl_transport{class=\"v1_only\"} 0",
     ] {
         assert!(body.lines().any(|l| l == line), "missing `{line}`");
     }
@@ -380,7 +386,8 @@ fn check_reports(c: &TestNode, metrics_port: u16, ports: &[u16]) {
     assert_eq!(crawl["state"], "running", "{status}");
     assert_eq!(crawl["book_entries"], 5);
     assert_eq!(crawl["reachable_ipv4"], 4);
-    assert_eq!(crawl["v1_only"], 2);
+    assert_eq!(crawl["v1_v2_untried"], 2);
+    assert_eq!(crawl["v1_only"], 0);
     let page = reqwest::blocking::get(format!("{base}/status")).unwrap().text().unwrap();
     for text in [status.to_string(), page] {
         assert!(!text.contains("127.0.0.1"), "no address on the status page");
@@ -399,7 +406,7 @@ fn check_reports(c: &TestNode, metrics_port: u16, ports: &[u16]) {
 fn peers_dat_is_unchanged_by_a_crawl() {
     let dead = closed_port();
     let (l, port) = bind();
-    let accepts = scripted(l, core(vec![dead, closed_port()]));
+    let accepts = scripted(l, core(vec![(dead, false), (closed_port(), false)]));
     let mut node = TestNode::start(&["--maxconnections=0"]);
     node.rpc_ok("generatetoaddress", vec![json!(1), json!(ADDR)]);
     let r = node.rpc_ok("addpeeraddress", vec![json!("127.0.0.1"), json!(port)]);
@@ -425,7 +432,7 @@ fn peers_dat_is_unchanged_by_a_crawl() {
 #[test]
 fn nothing_is_dialled_in_initial_block_download() {
     let (l, port) = bind();
-    let accepts = scripted(l, core(vec![closed_port(), closed_port()]));
+    let accepts = scripted(l, core(vec![(closed_port(), false), (closed_port(), false)]));
     let seed = format!("--crawlseed=127.0.0.1:{port}");
     let mut node = TestNode::start(&["--maxconnections=0", "--crawl=1", &seed, "--loglevel=info"]);
     std::thread::sleep(test_timeout(12));

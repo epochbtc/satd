@@ -28,11 +28,23 @@
 //!
 //! # Transport
 //!
-//! BIP 324 first. A v2 attempt that fails as a v1-only node fails it (it
-//! closes the connection, or never answers, with nothing received) is
-//! redialled over v1, as Core does (`V2Transport::ShouldReconnectV1`); one
-//! that received bytes and failed is not. A v1 recheck dials v1 alone. The
-//! node's `-v2transport` and `-v2only` do not apply: the crawl measures both
+//! BIP 324 first only to a node known to advertise `NODE_P2P_V2`, as Core
+//! dials its own outbound peers: the services of the node's own last
+//! `version` once a handshake has completed, before that the services its
+//! address was last advertised with
+//! ([`CrawlEntry::dials_v2_first`](crate::net::crawlbook::CrawlEntry::dials_v2_first)).
+//! A seed (`-crawlseed`, a fixed seed, a DNS seed) carries no services, so
+//! it is dialled over v1 until a handshake or an answer naming it says
+//! otherwise. Any other target is dialled over v1 with no v2 bytes sent:
+//! some v1-only implementations close on them, and one bans the dialler's
+//! address. A node that speaks v2 without advertising it is therefore
+//! counted v1 (`v1_v2_untried`), not v1-only.
+//!
+//! A v2 attempt that fails as a v1-only node fails it (it closes the
+//! connection, or never answers, with nothing received) is redialled over
+//! v1, as Core does (`V2Transport::ShouldReconnectV1`); one that received
+//! bytes and failed is not. A v1 recheck dials v1 alone. The node's
+//! `-v2transport` and `-v2only` do not apply: the crawl measures both
 //! transports.
 //!
 //! # Networks
@@ -938,14 +950,17 @@ impl PeerManager {
         })
     }
 
-    /// A whole session to `target`: the transport (v2, then v1 if v2
-    /// failed as a v1-only node fails it; v1 alone for a recheck), the
-    /// handshake, the passive wait, and for a discovery session `getaddr`
-    /// and, under `-crawlprobes`, the probes.
+    /// A whole session to `target`: the transport (v2 to a node known to
+    /// advertise it, then v1 if v2 failed as a v1-only node fails it; v1
+    /// alone to any other node and for a recheck), the handshake, the
+    /// passive wait, and for a discovery session `getaddr` and, under
+    /// `-crawlprobes`, the probes.
     pub(super) async fn crawl_session(&self, target: &PeerAddr, kind: SessionKind) -> SessionOutput {
         let run = self.crawl.get().expect("the crawl is on");
         let mut result = SessionResult::default();
-        let opened = if kind == SessionKind::V1Recheck {
+        let v2_first = kind != SessionKind::V1Recheck
+            && run.book.lock().get(&CrawlAddr::Peer(target.clone())).is_some_and(|e| e.dials_v2_first());
+        let opened = if !v2_first {
             match self.crawl_open(target, false).await {
                 (Opened::Open(c, g), d) => Some((*c, g, d)),
                 _ => None,

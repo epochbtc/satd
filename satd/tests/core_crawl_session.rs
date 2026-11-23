@@ -1,5 +1,8 @@
 //! The crawl's whole session against a live Bitcoin Core: a regtest satd
-//! with `-crawl` and Core as its only seed runs its discovery session
+//! with `-crawl` learns Core's address, advertised with `NODE_P2P_V2`, from
+//! the `getaddr` answer of a scripted v1 peer (its only seed; a seed
+//! carries no services, so it alone would be dialled over v1), and runs
+//! its discovery session to Core
 //! (BIP 324, the crawler's `version`, `wtxidrelay`, `sendaddrv2`, `verack`,
 //! one `getaddr`, the four probes, the `getheaders` one being the chain
 //! check) and then its v1 recheck (the handshake over v1). Core, which does
@@ -33,7 +36,14 @@ use node::net::crawlbook::{BookParams, ChainCheck, CrawlAddr, CrawlBook, Getaddr
 use node::net::fingerprint::{Confidence, Family, Fingerprint};
 use node::net::survey::{Probe, ProbeOutcome};
 use p2p_diff::CoreOracle;
+use bitcoin::consensus::{deserialize, serialize};
+use bitcoin::p2p::address::{AddrV2, AddrV2Message};
+use bitcoin::p2p::message::{NetworkMessage, RawNetworkMessage};
+use bitcoin::p2p::message_network::VersionMessage;
+use bitcoin::p2p::{Address, Magic, ServiceFlags};
 use serde_json::json;
+use std::io::{self, Read, Write};
+use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::time::{Duration, Instant};
 
 const ADDR: &str = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
@@ -50,6 +60,80 @@ fn names_peer(line: &str, id: &str) -> bool {
     line.split(|c: char| !c.is_ascii_alphanumeric() && c != '=').any(|w| w == format!("peer={id}"))
 }
 
+fn send(stream: &mut TcpStream, msg: NetworkMessage) -> io::Result<()> {
+    stream.write_all(&serialize(&RawNetworkMessage::new(Magic::REGTEST, msg)))
+}
+
+fn recv(stream: &mut TcpStream) -> io::Result<NetworkMessage> {
+    let mut header = [0u8; 24];
+    stream.read_exact(&mut header)?;
+    if header[..4] != Magic::REGTEST.to_bytes() {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "not v1"));
+    }
+    let len = u32::from_le_bytes(header[16..20].try_into().unwrap()) as usize;
+    let mut buf = header.to_vec();
+    buf.resize(24 + len, 0);
+    stream.read_exact(&mut buf[24..])?;
+    let raw: RawNetworkMessage = deserialize(&buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+    Ok(raw.into_payload())
+}
+
+/// A scripted v1 peer whose `getaddr` answer names Core with
+/// `NODE_P2P_V2`, next to a bad-port address the crawl skips (a one-entry
+/// answer reads as the peer's own announcement). Returns its port.
+fn referrer(core_port: u16) -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as u32;
+    let services = ServiceFlags::NETWORK | ServiceFlags::WITNESS;
+    let answer = vec![
+        AddrV2Message {
+            time: now - 60,
+            services: services | ServiceFlags::P2P_V2,
+            addr: AddrV2::Ipv4(Ipv4Addr::LOCALHOST),
+            port: core_port,
+        },
+        AddrV2Message { time: now - 60, services, addr: AddrV2::Ipv4(Ipv4Addr::new(1, 2, 3, 4)), port: 22 },
+    ];
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let answer = answer.clone();
+            std::thread::spawn(move || -> io::Result<()> {
+                let mut stream = stream;
+                stream.set_read_timeout(Some(Duration::from_secs(120)))?;
+                loop {
+                    match recv(&mut stream)? {
+                        NetworkMessage::Version(_) => {
+                            let zero: SocketAddr = "0.0.0.0:0".parse().unwrap();
+                            let v = VersionMessage {
+                                version: 70016,
+                                services,
+                                timestamp: now as i64,
+                                receiver: Address::new(&zero, ServiceFlags::NONE),
+                                sender: Address::new(&zero, services),
+                                nonce: 0x5eed,
+                                user_agent: "/Satoshi:32.1.0/".into(),
+                                start_height: 0,
+                                relay: true,
+                            };
+                            send(&mut stream, NetworkMessage::Version(v))?;
+                            send(&mut stream, NetworkMessage::WtxidRelay)?;
+                            send(&mut stream, NetworkMessage::SendAddrV2)?;
+                            send(&mut stream, NetworkMessage::Verack)?;
+                        }
+                        NetworkMessage::GetAddr => send(&mut stream, NetworkMessage::AddrV2(answer.clone()))?,
+                        NetworkMessage::Ping(n) => send(&mut stream, NetworkMessage::Pong(n))?,
+                        NetworkMessage::GetHeaders(_) => send(&mut stream, NetworkMessage::Headers(vec![]))?,
+                        NetworkMessage::GetData(inv) => send(&mut stream, NetworkMessage::NotFound(inv))?,
+                        _ => {}
+                    }
+                }
+            });
+        }
+    });
+    port
+}
+
 #[test]
 fn the_crawl_session_is_handled_by_core_without_punishment() {
     let mut oracle = CoreOracle::start_without_whitelist().expect("start Bitcoin Core");
@@ -60,7 +144,7 @@ fn the_crawl_session_is_handled_by_core_without_punishment() {
     let core_port = oracle.p2p_port();
     let mut log = oracle.new_log_lines();
 
-    let seed = format!("--crawlseed=127.0.0.1:{core_port}");
+    let seed = format!("--crawlseed=127.0.0.1:{}", referrer(core_port));
     let mut node = TestNode::start(&["--maxconnections=0", "--crawl=1", &seed, "--loglevel=debug"]);
     // satd on Core's chain, one block past it, and Core given that block:
     // the chain check then finds our tip. The crawl's first probe comes
@@ -143,5 +227,5 @@ fn the_crawl_session_is_handled_by_core_without_punishment() {
     assert_eq!(obs.chain_check, Some(ChainCheck::OnChain), "{obs:?}");
     assert_eq!(obs.fingerprint, Fingerprint::Known(Family::Core, Confidence::High), "{obs:?}");
     assert_eq!(obs.shape, None);
-    assert_eq!(book.len(), 1, "no bad-port address entered the book");
+    assert_eq!(book.len(), 2, "Core and the referrer: no bad-port address entered the book");
 }

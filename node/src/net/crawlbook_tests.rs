@@ -532,6 +532,36 @@ fn full_book() -> CrawlBook {
     book
 }
 
+/// A session dials BIP 324 first only to a node known to advertise
+/// `NODE_P2P_V2`: before a handshake by what its address was advertised
+/// with, after one by its own `version`. A seed carries no services and
+/// does not wipe what an answer advertised.
+#[test]
+fn v2_first_follows_the_advertised_then_the_version_services() {
+    let v2 = (ServiceFlags::NETWORK | ServiceFlags::P2P_V2).to_u64();
+    let mut book = CrawlBook::new(BookParams::for_network(bitcoin::Network::Bitcoin));
+    let a = v4(1);
+    let key = CrawlAddr::Peer(a.clone());
+    assert!(book.seed(a.clone(), 0, NOW));
+    assert!(!book.get(&key).unwrap().dials_v2_first(), "a seed advertises nothing");
+    let mut named = v4_answer(1, 1);
+    named[0].services = ServiceFlags::from(v2);
+    book.admit(&source(1), &named, NOW);
+    assert!(book.get(&key).unwrap().dials_v2_first(), "an answer advertised v2");
+    assert!(book.seed(a.clone(), 0, NOW + 1));
+    assert!(book.get(&key).unwrap().dials_v2_first(), "a seed again leaves the advertisement");
+    assert!(book.get(&key).unwrap().v2_advertised());
+    // The node's own version, without NODE_P2P_V2, now decides.
+    let mut obs = observation(NOW + 2);
+    obs.services = ServiceFlags::NETWORK.to_u64();
+    book.record_result(&a, None, SessionKind::Discovery, SessionResult { v2: Attempt::Ok, v1: Attempt::NotTried, observation: Some(obs) }, NOW + 2);
+    assert!(!book.get(&key).unwrap().dials_v2_first(), "its version said no v2");
+    let mut obs = observation(NOW + 3);
+    obs.services = v2;
+    book.record_result(&a, None, SessionKind::Liveness, SessionResult { v2: Attempt::NotTried, v1: Attempt::Ok, observation: Some(obs) }, NOW + 3);
+    assert!(book.get(&key).unwrap().dials_v2_first(), "its version said v2");
+}
+
 #[test]
 fn the_book_round_trips_through_the_file() {
     let book = full_book();

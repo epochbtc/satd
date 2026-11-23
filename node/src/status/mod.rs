@@ -263,6 +263,7 @@ pub struct CrawlStatus {
     /// Reachable addresses per transport class.
     pub v2_and_v1: usize,
     pub v1_only: usize,
+    pub v1_v2_untried: usize,
     pub v2_only: usize,
     pub v2_unconfirmed: usize,
 }
@@ -288,6 +289,7 @@ impl CrawlStatus {
             learned_cjdns: a.learned[4],
             v2_and_v1: t(Transport::Both),
             v1_only: t(Transport::V1Only),
+            v1_v2_untried: t(Transport::V1V2Untried),
             v2_only: t(Transport::V2Only),
             v2_unconfirmed: t(Transport::V2Unconfirmed),
         }

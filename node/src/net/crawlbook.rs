@@ -175,11 +175,12 @@ impl Network {
 /// What one crawl session to an address is for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum SessionKind {
-    /// v2 then v1, the handshake, `getaddr`, the probes.
+    /// The transport ([`CrawlEntry::dials_v2_first`]), the handshake,
+    /// `getaddr`, the probes.
     Discovery,
     /// v1 only, the handshake: tells a v2-only node from one that does both.
     V1Recheck,
-    /// v2 then v1, the handshake only.
+    /// The transport, the handshake only.
     Liveness,
 }
 
@@ -382,9 +383,21 @@ impl CrawlEntry {
         self.sources.len()
     }
 
-    /// Whether the address was advertised with `NODE_P2P_V2`.
+    /// Whether the address was last advertised with `NODE_P2P_V2`, in a
+    /// `getaddr` answer or the address-book sample. The node's own `version`
+    /// services are not read: [`Self::dials_v2_first`] reads them.
     pub fn v2_advertised(&self) -> bool {
         ServiceFlags::from(self.advertised_services).has(ServiceFlags::P2P_V2)
+    }
+
+    /// Whether a session dials BIP 324 first, as Core's outbound does: when
+    /// the node's own last `version` carried `NODE_P2P_V2`, or, before any
+    /// handshake, when its address was advertised with it. Otherwise it
+    /// dials v1 and sends no v2 bytes: a v1-only node that answers v2 bytes
+    /// by closing, or by banning the dialler, is still reached.
+    pub fn dials_v2_first(&self) -> bool {
+        let services = self.observation.as_ref().map_or(self.advertised_services, |o| o.services);
+        ServiceFlags::from(services).has(ServiceFlags::P2P_V2)
     }
 
     /// The last completed handshake, as the history counts it.
@@ -744,7 +757,9 @@ impl CrawlBook {
         }
         let addr = CrawlAddr::Peer(addr);
         if self.entries.contains_key(&addr) {
-            self.update(&addr, |e| e.seeded(SEED_SOURCE, services));
+            // A seed with no services says nothing of them (a DNS seed, a
+            // fixed seed, `-crawlseed`): what an answer advertised stands.
+            self.update(&addr, |e| e.seeded(SEED_SOURCE, if services == 0 { e.advertised_services } else { services }));
             true
         } else {
             self.insert(addr, CrawlEntry::new(now, SEED_SOURCE, services, 0), now)

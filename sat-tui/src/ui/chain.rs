@@ -453,7 +453,8 @@ pub fn crawl_left_lines(c: &crate::crawl::Crawl, width: u16) -> Vec<Line<'static
 }
 
 /// The Crawl detail panel: the reachable addresses by network and by
-/// transport (v2 and v1, v1 only, v2 only, v2 not yet checked over v1),
+/// transport (v2 and v1, v1 only, v1 with v2 never tried as it was not
+/// advertised, v2 only, v2 not yet checked over v1),
 /// mismatches, sessions since start, sessions open against the limits,
 /// and the book against its cap.
 pub fn crawl_right_lines(c: &crate::crawl::Crawl) -> Vec<Line<'static>> {
@@ -468,6 +469,7 @@ pub fn crawl_right_lines(c: &crate::crawl::Crawl) -> Vec<Line<'static>> {
     let t = &c.transport;
     lines.push(row("v2 + v1:", share(t.v2_and_v1)));
     lines.push(row("v1 only:", share(t.v1_only)));
+    lines.push(row("v1 no v2 ad:", share(t.v1_v2_untried)));
     lines.push(row("v2 only:", share(t.v2_only)));
     lines.push(row("v2 unchecked:", share(t.v2_unconfirmed)));
     lines.push(row("mismatches:", share(c.mismatches)));
@@ -831,7 +833,8 @@ mod tests {
                 "  ipv6:         12.4 % (2,600)",
                 "  onion:        28.1 % (5,900)",
                 "  v2 + v1:      42.9 % (9,000)",
-                "  v1 only:      54.8 % (11,500)",
+                "  v1 only:      7.1 % (1,500)",
+                "  v1 no v2 ad:  47.6 % (10,000)",
                 "  v2 only:      0.2 % (40)",
                 "  v2 unchecked: 2.2 % (460)",
                 "  mismatches:   0.1 % (12)",

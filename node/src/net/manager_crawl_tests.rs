@@ -64,6 +64,8 @@ struct Script {
     notfound: bool,
     /// Close the connection on a `getdata`.
     hang_up_on_getdata: bool,
+    /// The services of its `version`.
+    services: ServiceFlags,
 }
 
 fn core_script() -> Script {
@@ -84,6 +86,7 @@ fn core_script() -> Script {
         headers: Vec::new(),
         notfound: true,
         hang_up_on_getdata: false,
+        services: ServiceFlags::NETWORK | ServiceFlags::WITNESS,
     }
 }
 
@@ -171,7 +174,7 @@ async fn serve(mut stream: TcpStream, script: Script, log: Log, i: usize) {
         log.lock()[i].push(msg.clone());
         match msg {
             NetworkMessage::Version(_) => {
-                let services = ServiceFlags::NETWORK | ServiceFlags::WITNESS;
+                let services = script.services;
                 let zero: SocketAddr = "0.0.0.0:0".parse().unwrap();
                 let _ = conn
                     .send(NetworkMessage::Version(VersionMessage {
@@ -234,6 +237,34 @@ async fn until(secs: u64, f: impl Fn() -> bool) -> bool {
     f()
 }
 
+/// Put `target` in the book as an address advertised with `NODE_P2P_V2`.
+fn seed_v2(pm: &PeerManager, target: &PeerAddr) {
+    let services = ServiceFlags::NETWORK | ServiceFlags::WITNESS | ServiceFlags::P2P_V2;
+    let run = pm.crawl.get().unwrap();
+    assert!(run.book.lock().seed(target.clone(), services.to_u64(), crate::time::now_secs()));
+}
+
+/// A listener that records the first four bytes of every connection and
+/// hangs up: a v1 dial opens with the network magic, a v2 one with the
+/// first bytes of its ElligatorSwift key.
+async fn first_bytes() -> (PeerAddr, Arc<parking_lot::Mutex<Vec<[u8; 4]>>>) {
+    use tokio::io::AsyncReadExt as _;
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let firsts: Arc<parking_lot::Mutex<Vec<[u8; 4]>>> = Default::default();
+    let seen = firsts.clone();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else { return };
+            let mut first = [0u8; 4];
+            if stream.read_exact(&mut first).await.is_ok() {
+                seen.lock().push(first);
+            }
+        }
+    });
+    (PeerAddr::Socket(addr), firsts)
+}
+
 // ---- Our version ----
 
 /// A crawl session's `version` declares a crawler: protocol 70016,
@@ -279,6 +310,7 @@ async fn a_liveness_session_sends_the_handshake_and_nothing_else() {
     script.after_verack.push(NetworkMessage::GetAddr);
     script.ping_every = Some(Duration::from_millis(150));
     let (target, log) = scripted("127.0.0.1", script).await;
+    seed_v2(&pm, &target);
     let out = pm.crawl_session(&target, SessionKind::Liveness).await;
     assert_eq!((out.result.v2, out.result.v1), (Attempt::Failed, Attempt::Ok), "v1-only: v2, then the v1 redial");
     let conns = log.lock().clone();
@@ -313,7 +345,8 @@ async fn a_discovery_session_asks_once_probes_and_records() {
     let (target, log) = scripted("127.0.0.1", script).await;
     assert!(run.book.lock().seed(target.clone(), 0, crate::time::now_secs()));
     pm.run_crawl_session(target.clone(), SessionKind::Discovery, None).await;
-    let got = log.lock()[1].clone();
+    assert_eq!(log.lock().len(), 1, "a seed advertises nothing: v1 alone");
+    let got = log.lock()[0].clone();
     assert_eq!(got.iter().filter(|m| matches!(m, NetworkMessage::GetAddr)).count(), 1);
     assert!(!got.iter().any(|m| matches!(m, NetworkMessage::Addr(_) | NetworkMessage::AddrV2(_))), "no address to the peer");
     for probe in ["ping", "getdata"] {
@@ -324,7 +357,7 @@ async fn a_discovery_session_asks_once_probes_and_records() {
     let book = pm.crawl_book().unwrap();
     let e = book.get(&CrawlAddr::Peer(target)).unwrap();
     assert_eq!(e.v1_ok, Some(true));
-    assert_eq!(e.v2_ok, Some(false));
+    assert_eq!(e.v2_ok, None, "v2 never tried");
     assert!(e.last_discovery.is_some());
     let obs = e.observation.as_ref().unwrap();
     assert_eq!(obs.getaddr.map(|g| matches!(g, GetaddrResult::Answered { entries: 3, .. })), Some(true), "{obs:?}");
@@ -344,14 +377,88 @@ async fn a_v2_attempt_that_received_bytes_is_not_redialled() {
     let (pm, _dir) = mk_pm_with(None);
     enable(&pm, config());
     let (target, log) = scripted("127.0.0.1", Script { garbage: true, ..core_script() }).await;
+    seed_v2(&pm, &target);
     let out = pm.crawl_session(&target, SessionKind::Liveness).await;
     assert_eq!((out.result.v2, out.result.v1), (Attempt::Failed, Attempt::NotTried));
     assert_eq!(log.lock().len(), 1, "no v1 redial");
-    // A v1 recheck dials v1 alone.
+    // A v1 recheck dials v1 alone, to a node advertising v2 too.
     let (target, log) = scripted("127.0.0.1", core_script()).await;
+    seed_v2(&pm, &target);
     let out = pm.crawl_session(&target, SessionKind::V1Recheck).await;
     assert_eq!((out.result.v2, out.result.v1), (Attempt::NotTried, Attempt::Ok));
     assert_eq!(log.lock().len(), 1);
+}
+
+/// A target not known to advertise `NODE_P2P_V2` (a seed, or an address
+/// advertised without it) is dialled over v1 with no v2 bytes: the
+/// connection opens with the network magic, and there is one connection.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_target_not_advertising_v2_is_dialled_v1_with_no_v2_bytes() {
+    let (pm, _dir) = mk_pm_with(None);
+    let run = enable(&pm, config());
+    let now = crate::time::now_secs();
+    let (seed, firsts) = first_bytes().await;
+    assert!(run.book.lock().seed(seed.clone(), 0, now));
+    let (named, named_firsts) = first_bytes().await;
+    let without = (ServiceFlags::NETWORK | ServiceFlags::WITNESS).to_u64();
+    assert!(run.book.lock().seed(named.clone(), without, now));
+    for (target, firsts) in [(&seed, &firsts), (&named, &named_firsts)] {
+        let out = pm.crawl_session(target, SessionKind::Discovery).await;
+        assert_eq!((out.result.v2, out.result.v1), (Attempt::NotTried, Attempt::Failed));
+        assert_eq!(*firsts.lock(), vec![Magic::REGTEST.to_bytes()], "one v1 dial, no v2 bytes");
+    }
+    // A target not in the book at all is dialled the same way.
+    let (stray, firsts) = first_bytes().await;
+    let out = pm.crawl_session(&stray, SessionKind::Liveness).await;
+    assert_eq!(out.result.v2, Attempt::NotTried);
+    assert_eq!(*firsts.lock(), vec![Magic::REGTEST.to_bytes()]);
+}
+
+/// A target advertised with `NODE_P2P_V2` is dialled over BIP 324 first,
+/// and redialled over v1 when the v2 attempt got nothing back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_target_advertising_v2_is_dialled_v2_first() {
+    let (pm, _dir) = mk_pm_with(None);
+    enable(&pm, config());
+    let (target, firsts) = first_bytes().await;
+    seed_v2(&pm, &target);
+    let out = pm.crawl_session(&target, SessionKind::Discovery).await;
+    assert_eq!((out.result.v2, out.result.v1), (Attempt::Failed, Attempt::Failed));
+    let firsts = firsts.lock().clone();
+    assert_eq!(firsts.len(), 2, "the v2 attempt and the v1 redial: {firsts:?}");
+    assert_ne!(firsts[0], Magic::REGTEST.to_bytes(), "v2 first");
+    assert_eq!(firsts[1], Magic::REGTEST.to_bytes(), "then v1");
+}
+
+/// Once a handshake has completed, the node's own `version` services
+/// decide, not what its address was advertised with: a node advertised
+/// without v2 whose `version` carries it is dialled v2 first next time, and
+/// one advertised with v2 whose `version` does not is dialled v1 alone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn after_a_handshake_the_nodes_version_services_decide() {
+    let (pm, _dir) = mk_pm_with(None);
+    let run = enable(&pm, config());
+    let with_v2 = ServiceFlags::NETWORK | ServiceFlags::WITNESS | ServiceFlags::P2P_V2;
+    let (says_v2, log) = scripted("127.0.0.1", Script { services: with_v2, ..core_script() }).await;
+    assert!(run.book.lock().seed(says_v2.clone(), 0, crate::time::now_secs()));
+    pm.run_crawl_session(says_v2.clone(), SessionKind::Liveness, None).await;
+    assert_eq!(log.lock().len(), 1, "advertised nothing: v1 alone");
+    pm.run_crawl_session(says_v2.clone(), SessionKind::Liveness, None).await;
+    let conns = log.lock().clone();
+    assert_eq!(conns.len(), 3, "its version said v2: the v2 attempt, then the v1 redial");
+    assert!(conns[1].is_empty(), "the v2 attempt got no v1 message through");
+    let book = pm.crawl_book().unwrap();
+    let e = book.get(&CrawlAddr::Peer(says_v2)).unwrap();
+    assert_eq!((e.v2_ok, e.v1_ok), (Some(false), Some(true)));
+    drop(book);
+
+    let (says_v1, log) = scripted("127.0.0.1", core_script()).await;
+    seed_v2(&pm, &says_v1);
+    pm.run_crawl_session(says_v1.clone(), SessionKind::Liveness, None).await;
+    assert_eq!(log.lock().len(), 2, "advertised v2: the v2 attempt and the v1 redial");
+    pm.run_crawl_session(says_v1.clone(), SessionKind::Liveness, None).await;
+    assert_eq!(log.lock().len(), 3, "its version said no v2: v1 alone");
+    assert!(!log.lock()[2].is_empty());
 }
 
 /// A discovery session whose `getaddr` is never answered ends at its bound,
@@ -384,7 +491,7 @@ async fn crawl_connections_are_no_peers() {
     let (target, log) = scripted("127.0.0.1", core_script()).await;
     let pm2 = Arc::clone(&pm);
     let session = tokio::spawn(async move { pm2.crawl_session(&target, SessionKind::Liveness).await });
-    assert!(until(10, || log.lock().get(1).is_some_and(|c| c.iter().any(|m| m.cmd() == "verack"))).await);
+    assert!(until(10, || log.lock().first().is_some_and(|c| c.iter().any(|m| m.cmd() == "verack"))).await);
     assert!(pm.peers.read().is_empty());
     assert!(pm.get_peer_info().is_empty());
     assert_eq!(pm.connection_count(), 0);
@@ -752,7 +859,8 @@ async fn getcrawlinfo_and_getcrawlnodes_after_a_session() {
     assert_eq!(info["book"]["entries"], 4, "the peer and the three it named");
     assert_eq!(info["book"]["learned"]["ipv4"], 4);
     assert_eq!(info["reachable"], serde_json::json!({ "total": 1, "ipv4": 1, "ipv6": 0, "onion": 0 }));
-    assert_eq!(info["transport"]["v1_only"]["count"], 1);
+    assert_eq!(info["transport"]["v1_v2_untried"]["count"], 1, "a seed advertises no v2");
+    assert_eq!(info["transport"]["v1_only"]["count"], 0);
     assert_eq!(info["families"]["core"]["count"], 1);
     assert_eq!(info["sessions"]["reached"], 1);
     assert_eq!(info["sessions"]["unreached"], 0);
@@ -955,7 +1063,7 @@ async fn chain_check_against(
     let (target, log) = scripted("127.0.0.1", Script { headers, answer: Some(answer(3)), ..core_script() }).await;
     let out = pm.crawl_session(&target, SessionKind::Discovery).await;
     let obs = out.result.observation.expect("an observation");
-    let sent = log.lock()[1].iter().filter(|m| m.cmd() == "getheaders").cloned().collect();
+    let sent = log.lock().last().unwrap().iter().filter(|m| m.cmd() == "getheaders").cloned().collect();
     (obs.chain_check, sent)
 }
 
