@@ -67,7 +67,9 @@ pub const TOP_AS: usize = 10;
 /// The file as written: each record ends with its [`SurveyShape`], when it
 /// has one.
 const FILE_MAGIC: [u8; 8] = *b"satdsrv2";
-/// The first format, read as it is: no record holds a shape.
+/// The first format. Its records were judged before the trait rows and
+/// hold no shape, so none of them is kept: such a file reads as an empty
+/// store, and the survey fills again from the current classifier.
 const FILE_MAGIC_V1: [u8; 8] = *b"satdsrv1";
 
 /// The most commands a [`SurveyShape`] keeps, and the longest each one is.
@@ -322,6 +324,9 @@ pub struct Aggregate {
 pub struct SurveyStore {
     records: HashMap<PeerAddr, SurveyRecord>,
     max_records: usize,
+    /// Records the file held in the first format, dropped as it was read.
+    /// Never written.
+    dropped_old_format: usize,
 }
 
 impl Default for SurveyStore {
@@ -333,7 +338,14 @@ impl Default for SurveyStore {
 impl SurveyStore {
     /// An empty store that keeps at most `max_records`.
     pub fn with_limit(max_records: usize) -> Self {
-        SurveyStore { records: HashMap::new(), max_records }
+        SurveyStore { records: HashMap::new(), max_records, dropped_old_format: 0 }
+    }
+
+    /// How many records the file read held in the first format
+    /// (`satdsrv1`), all of them dropped: they were judged before the trait
+    /// rows.
+    pub fn dropped_old_format(&self) -> usize {
+        self.dropped_old_format
     }
 
     pub fn len(&self) -> usize {
@@ -425,7 +437,7 @@ impl SurveyStore {
 
     /// The bytes in the current format, or, with `with_shapes` false, in
     /// the first (`satdsrv1`), which holds no shape: for the test that an
-    /// older file still reads.
+    /// older file is dropped.
     fn encode_as(&self, network_magic: [u8; 4], with_shapes: bool) -> Vec<u8> {
         let mut buf = Vec::with_capacity(16 + self.records.len() * 100);
         buf.extend_from_slice(if with_shapes { &FILE_MAGIC } else { &FILE_MAGIC_V1 });
@@ -519,6 +531,13 @@ impl SurveyStore {
         }
         if !r.0.is_empty() {
             return Err("trailing bytes".to_string());
+        }
+        // Read whole first, so a damaged old file is still refused and set
+        // aside like any other; then dropped, every record of it.
+        if !with_shapes {
+            store.dropped_old_format = store.records.len();
+            store.records.clear();
+            return Ok(store);
         }
         store.expire(now);
         store.evict_to_limit();
@@ -887,10 +906,12 @@ mod tests {
     }
 
     /// A file in the first format (`satdsrv1`, no shapes), as earlier
-    /// builds wrote it, still reads: every record as it was, with no shape.
-    /// It is the current format less one byte per record.
+    /// builds wrote it, reads as an empty store: its records were judged
+    /// before the trait rows, so none is kept to stand in the tallies, and
+    /// the count dropped is reported. It is the current format less one
+    /// byte per record, and still checked whole: a damaged one is refused.
     #[test]
-    fn a_file_from_before_the_shapes_still_reads() {
+    fn a_file_from_before_the_shapes_is_dropped() {
         let mut store = SurveyStore::default();
         store.insert(v4(1), record(Fingerprint::Known(Family::Core, Confidence::High), NOW), NOW);
         store.insert(v4(2), record(Fingerprint::Mismatch { claimed: Family::Core, observed: Family::Btcd }, NOW), NOW);
@@ -899,13 +920,22 @@ mod tests {
         assert_eq!(&old[..8], b"satdsrv1");
         assert_eq!(old.len() + store.len(), store.encode(MAGIC).len());
         let back = SurveyStore::decode(&old, MAGIC, NOW, MAX_RECORDS).unwrap();
-        assert_eq!(back.len(), 3);
-        for (addr, r) in store.rows() {
-            assert_eq!(back.get(addr), Some(r), "{addr:?}");
-            assert_eq!(back.get(addr).unwrap().shape, None);
-        }
-        // Written again, it is in the current format.
-        assert_eq!(&back.encode(MAGIC)[..8], b"satdsrv2");
+        assert!(back.is_empty());
+        assert_eq!(back.dropped_old_format(), 3);
+        assert_eq!(back.aggregate().addresses, 0);
+        // Written again, it is in the current format, empty.
+        let again = back.encode(MAGIC);
+        assert_eq!(&again[..8], b"satdsrv2");
+        assert_eq!(SurveyStore::decode(&again, MAGIC, NOW, MAX_RECORDS).unwrap().len(), 0);
+        // A current-format file of the same records keeps them all.
+        let current = SurveyStore::decode(&store.encode(MAGIC), MAGIC, NOW, MAX_RECORDS).unwrap();
+        assert_eq!(current.len(), 3);
+        assert_eq!(current.dropped_old_format(), 0);
+        // An old file cut short is refused, not read as empty.
+        let mut cut = old[..old.len() - 32 - 1].to_vec();
+        let sum = sha256d::Hash::hash(&cut);
+        cut.extend_from_slice(sum.as_byte_array());
+        assert!(SurveyStore::decode(&cut, MAGIC, NOW, MAX_RECORDS).is_err());
     }
 
     /// A shape out of its bounds is refused, as a damaged file.
