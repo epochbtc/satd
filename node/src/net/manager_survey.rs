@@ -274,7 +274,14 @@ impl PeerManager {
         let store = match &config.path {
             Some(path) => match SurveyStore::load(path, self.chain_state.p2p_magic().to_bytes(), now) {
                 Ok(store) => {
-                    tracing::info!(records = store.len(), "Loaded the network survey");
+                    if store.dropped_old_format() > 0 {
+                        tracing::info!(
+                            dropped = store.dropped_old_format(),
+                            "The network survey file is in the old format; its records are dropped and the survey starts empty"
+                        );
+                    } else {
+                        tracing::info!(records = store.len(), "Loaded the network survey");
+                    }
                     store
                 }
                 Err(e) => {

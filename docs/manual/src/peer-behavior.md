@@ -320,9 +320,11 @@ for a bearer token it needs `rpc:write`.
 protocol version, services, whether it spoke v2, its autonomous system, when
 it was first and last seen, the last probe outcomes and, for a record no row
 matched, its handshake transcript (at most 16 commands) and `relay` flag. A
-file written before the transcript was kept is read as it is: its records
-keep the fingerprints they were judged with, and have no transcript until
-the address is surveyed again. A record not seen
+file written before the transcript was kept (the `satdsrv1` format) is
+dropped at startup, with its record count logged, and the survey starts
+empty: its records were judged before the current rows, and a uniform draw
+from the address book revisits an address too rarely to replace them. A
+damaged old file is set aside like any other. A record not seen
 for 30 days is dropped, and past 250,000 records (about 25 MB) the least
 recently seen go first. It is written every 10 minutes and at shutdown, and
 read at startup; a file that does not read is renamed with a `.bad-<unix time>` suffix, with a warning, and
