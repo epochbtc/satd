@@ -57,6 +57,8 @@ pub fn build_router(state: EsploraState) -> Result<Router, RouterBuildError> {
         .route("/tx/{txid}/status", get(tx::tx_status))
         .route("/tx/{txid}/outspend/{vout}", get(outspend::tx_outspend))
         .route("/tx/{txid}/outspends", get(outspend::tx_outspends))
+        // The same answer for up to 50 txids, as rbitcoin's Esplora serves it.
+        .route("/txs/outspends", get(outspend::txs_outspends))
         // Address-string family (Esplora plan PR 5).
         .route("/address/{addr}", get(address::address_info))
         .route("/address/{addr}/txs", get(address::address_txs_combined))

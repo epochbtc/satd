@@ -82,13 +82,14 @@ address-index docs) and `--txindex=1` (auto-enabled by the reconciliation in
 
 | Method | URL | Returns |
 |---|---|---|
-| GET | `/tx/:txid` | JSON: full tx (`vin`/`vout`/`status`/`fee`). 404 if unknown. |
+| GET | `/tx/:txid` | JSON: full tx (`vin`/`vout`/`status`/`fee`/`sigops`). 404 if unknown. |
 | GET | `/tx/:txid/status` | JSON: `{confirmed, block_height?, block_hash?, block_time?}`. |
 | GET | `/tx/:txid/hex` | `text/plain`: hex-encoded serialized tx. |
 | GET | `/tx/:txid/raw` | `application/octet-stream`: raw tx bytes. |
 | POST | `/tx` | Body: hex-encoded tx. Returns the txid as plain text on accept. Bad hex or a mempool reject returns 400. With bearer auth, the token must hold `rpc:submit` (or `rpc:write`) as well as `esplora:read`; a read-only token gets 403. |
 | GET | `/tx/:txid/outspend/:vout` | JSON: `{spent, txid?, vin?, status?}`. |
 | GET | `/tx/:txid/outspends` | JSON: array of outspends, one per output, vout-ordered. |
+| GET | `/txs/outspends?txids=<txid>,<txid>,...` | JSON: one array per txid, in request order, each the array `/tx/:txid/outspends` returns. At most 50 txids: more is 400 `Too many txids requested`; no `txids`, or an empty one, is 400 `No txids specified`. A txid that is malformed or unknown gets `[]` in its place; one given twice is answered twice. An extension, not in upstream Esplora, matching rbitcoin's Esplora. |
 | GET | `/tx/:txid/merkle-proof` | JSON: `{block_height, merkle: [hex...], pos}`. |
 | GET | `/tx/:txid/merkleblock-proof` | `text/plain`: hex-encoded P2P MerkleBlock for the given tx. |
 
@@ -193,6 +194,15 @@ the standard endpoints (`/address/:addr` or `/blocks/tip/{hash,height}`).
 - **`fee` field on tx JSON.** `null` when at least one prevout cannot be
   resolved (for example, txindex disabled or the previous tx pruned). `Some(0)`
   for coinbase. Otherwise `sum_inputs - sum_outputs`.
+- **`sigops` field on tx JSON.** The transaction's BIP 141 sigop cost, as
+  Bitcoin Core's `GetTransactionSigOpCost` counts it and block validation
+  limits it: 4 for each legacy sigop (an `OP_CHECKSIG` in a scriptSig or an
+  output script; a bare multisig opcode counts 20), 4 for each sigop of a
+  P2SH redeem script, 1 for a P2WPKH input, 1 for each sigop of a P2WSH
+  witness script, nothing for a taproot spend. A coinbase has its legacy
+  sigops. An input whose previous output cannot be resolved adds nothing, so
+  when `fee` is `null` the cost may be short. An extension, not in upstream
+  Esplora, matching rbitcoin's Esplora.
 - **Mempool UTXOs in `/utxo`.** Outputs created by mempool transactions appear
   with `status.confirmed: false` and no block fields. Outputs spent in the
   mempool are excluded.
@@ -210,7 +220,8 @@ On a node running with `pruneopreturn`
   reads as the bare `OP_RETURN` it keeps: `scriptpubkey` `"6a"`,
   `scriptpubkey_asm` `"OP_RETURN"`, `scriptpubkey_type` `"op_return"`, plus
   `"scriptpubkey_stripped_size"`, the original length. The `txid`, sizes,
-  values and fee are the original's.
+  values and fee are the original's. It has no `sigops`: the stripped
+  scripts are not there to count.
 - **Raw bytes are refused** with 404: `/block/:hash/raw` with
   `block data not available (OP_RETURN data stripped)`, and `/tx/:txid/hex` and
   `/tx/:txid/raw` with `transaction data not available (OP_RETURN data
@@ -276,6 +287,7 @@ curl "http://127.0.0.1:3000/address/bc1q.../utxo?asof=00000000000000000002a7c4..
 | `.../utxo` | Outputs funded up to it and not spent up to it, all confirmed. |
 | `/tx/:txid/status` | `confirmed: true` if it confirmed up to it, `confirmed: false` if later; 404 if only in the mempool. |
 | `/tx/:txid/outspend/:vout` <br> `/tx/:txid/outspends` | Spent only by a spend confirmed up to it; a later or mempool spend leaves the output unspent. 404 for a transaction only in the mempool. |
+| `/txs/outspends?txids=` | Each txid as `/tx/:txid/outspends` answers as of it; `[]` for a transaction only in the mempool. |
 
 The mempool is never part of the answer. The
 [chain-tip headers](#chain-tip-headers) name the asof block and its height.

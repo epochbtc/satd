@@ -3,6 +3,7 @@
 //! Endpoints:
 //! - `GET /tx/:txid/outspend/:vout`        → single outspend
 //! - `GET /tx/:txid/outspends`             → array of outspends, one per output
+//! - `GET /txs/outspends?txids=a,b,...`    → one such array per txid
 //! - `GET /tx/:txid/merkle-proof`          → JSON merkle path
 //! - `GET /tx/:txid/merkleblock-proof`     → hex-encoded MerkleBlock
 //!
@@ -15,15 +16,16 @@ use std::collections::HashMap;
 
 use axum::Json;
 use axum::Extension;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use bitcoin::consensus::encode::serialize;
 use bitcoin::hashes::Hash as _;
 use bitcoin::merkle_tree::MerkleBlock;
 use bitcoin::{OutPoint, TxMerkleNode, Txid};
 use node::storage::Store;
 use node::storage::opreturn_strip::StoredBlock;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
+use crate::blocking::off_worker;
 use crate::chain_tip::Pin;
 use crate::error::{EsploraError, EsploraResult};
 use crate::handlers::tx::TxStatusJson;
@@ -83,18 +85,81 @@ pub async fn tx_outspends(
     Path(txid_s): Path<String>,
 ) -> EsploraResult<Json<Vec<OutspendJson>>> {
     let txid = parse_txid(&txid_s)?;
+    Ok(Json(outspends_of(&state, &pin, &txid)?))
+}
 
+/// The most txids one `/txs/outspends` request names, as in rbitcoin's
+/// Esplora.
+pub(crate) const MAX_OUTSPENDS_TXIDS: usize = 50;
+
+#[derive(Debug, Deserialize)]
+pub struct TxidsQuery {
+    txids: Option<String>,
+}
+
+/// `GET /txs/outspends?txids=a,b,...`: for each txid, in request order, the
+/// array `/tx/:txid/outspends` answers, read at the same pin. Not in
+/// upstream Esplora; the route, the limit and the refusals are those of
+/// rbitcoin's Esplora.
+///
+/// A txid that is malformed, or names no transaction as of the pin, gets an
+/// empty array in its place rather than failing the batch. A txid given
+/// twice is answered twice.
+pub async fn txs_outspends(
+    State(state): State<EsploraState>,
+    Extension(pin): Extension<Pin>,
+    Query(query): Query<TxidsQuery>,
+) -> EsploraResult<Json<Vec<Vec<OutspendJson>>>> {
+    let raw = query
+        .txids
+        .filter(|txids| !txids.is_empty())
+        .ok_or_else(|| EsploraError::BadRequest("No txids specified".to_string()))?;
+    let txids = parse_txid_list(&raw)?;
+    // Each txid costs a block read for its output count.
+    let batch = off_worker(&state, move |state| {
+        txids
+            .iter()
+            .map(|txid| match txid {
+                Some(txid) => match outspends_of(state, &pin, txid) {
+                    Err(EsploraError::NotFound) => Ok(Vec::new()),
+                    answer => answer,
+                },
+                None => Ok(Vec::new()),
+            })
+            .collect::<EsploraResult<Vec<_>>>()
+    })
+    .await?;
+    Ok(Json(batch))
+}
+
+/// The comma-separated `txids` value: one entry per item, `None` for one
+/// that is not a txid. More than [`MAX_OUTSPENDS_TXIDS`] items is 400.
+fn parse_txid_list(raw: &str) -> EsploraResult<Vec<Option<Txid>>> {
+    let items: Vec<&str> = raw.split(',').collect();
+    if items.len() > MAX_OUTSPENDS_TXIDS {
+        return Err(EsploraError::BadRequest("Too many txids requested".to_string()));
+    }
+    Ok(items.into_iter().map(|item| item.parse::<Txid>().ok()).collect())
+}
+
+/// One outspend per output of `txid`, in output order. 404 for a transaction
+/// unknown as of `pin`.
+fn outspends_of(
+    state: &EsploraState,
+    pin: &Pin,
+    txid: &Txid,
+) -> EsploraResult<Vec<OutspendJson>> {
     // Determine the tx's output count. For confirmed txs we look up the
     // tx body via txindex; for mempool txs we read it from the entry.
     // Either path returns the output count without serializing the body.
-    let output_count = output_count_of(&state, &pin, &txid)?;
+    let output_count = output_count_of(state, pin, txid)?;
 
     // The mempool spender of each output, from the mempool's own spends
     // index under one lock: O(outputs), with nothing copied. Building a
     // whole-mempool map here copied every mempool transaction per request,
     // on a route anyone who can reach Esplora may call.
     let mempool_index = if pin.mempool {
-        state.mempool.acting_spenders_of_outputs(&txid, output_count as u32)
+        state.mempool.acting_spenders_of_outputs(txid, output_count as u32)
     } else {
         HashMap::new()
     };
@@ -104,16 +169,16 @@ pub async fn tx_outspends(
     // of a transaction's spends sit together; asking per output would
     // re-derive that ordinal from the txid N times and do N point reads.
     let confirmed: HashMap<u32, node_index::SpendingRef> =
-        state.spend_index.spends_of_tx(&txid)?.into_iter().collect();
+        state.spend_index.spends_of_tx(txid)?.into_iter().collect();
 
     let mut out = Vec::with_capacity(output_count);
     for vout in 0..output_count as u32 {
         out.push(match confirmed.get(&vout) {
-            Some(sref) => confirmed_outspend(&state, &pin, sref),
-            None => build_outspend(&state, &pin, &OutPoint { txid, vout }, mempool_index.get(&vout))?,
+            Some(sref) => confirmed_outspend(state, pin, sref),
+            None => build_outspend(state, pin, &OutPoint { txid: *txid, vout }, mempool_index.get(&vout))?,
         });
     }
-    Ok(Json(out))
+    Ok(out)
 }
 
 pub async fn tx_merkle_proof(
@@ -371,6 +436,10 @@ fn compute_merkle_branch(txids: &[Txid], pos: usize) -> Vec<TxMerkleNode> {
     }
     branch
 }
+
+#[cfg(test)]
+#[path = "outspend_batch_tests.rs"]
+mod batch_tests;
 
 #[cfg(test)]
 mod tests {
