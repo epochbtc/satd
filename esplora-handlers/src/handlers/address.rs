@@ -8,6 +8,8 @@
 //!   or the history after `after_txid`
 //! - `GET /address/:addr/txs/chain[/:last_seen_txid]` → 25 confirmed per page (newest first)
 //! - `GET /address/:addr/txs/mempool`                → up to 50 mempool txs (no paging)
+//! - `GET /address/:addr/txs/summary[/:last_seen_txid]` → the `/txs/chain` page as compact
+//!   rows with the script's net value (an extension, in the shape rbitcoin's Esplora serves)
 //! - `GET /address/:addr/utxo`                       → live UTXOs with status
 //!
 //! Wire shapes match upstream Esplora exactly. The `address` field in
@@ -33,6 +35,7 @@ use axum::extract::{Path, Query, State};
 use axum::{Extension, Json};
 use bitcoin::address::NetworkUnchecked;
 use bitcoin::{Address, Network, OutPoint, Txid};
+use node::storage::Store as _;
 use node_index::{HistoryEntry, Scripthash, scripthash_of};
 use serde::{Deserialize, Serialize};
 
@@ -79,6 +82,23 @@ pub struct TxsQuery {
     /// mempool.space's paging cursor: continue the history after this
     /// transaction (see `build_combined_txs`).
     pub after_txid: Option<String>,
+}
+
+/// One row of `/txs/summary`: a confirmed transaction and what it did to the
+/// script's balance. The shape is that of rbitcoin's Esplora.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TxSummaryJson {
+    pub txid: String,
+    /// Net sats for the script in this transaction: what its outputs pay the
+    /// script, less what its inputs spend from it.
+    pub value: i64,
+    pub height: u32,
+    /// The confirming block's header time; 0 if the header cannot be read.
+    pub time: u32,
+    /// The transaction's index in its block, the coinbase 0. Left out when
+    /// the store cannot place it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tx_position: Option<u32>,
 }
 
 #[derive(Debug, Serialize)]
@@ -128,6 +148,27 @@ pub async fn address_txs_chain_paged(
     let sh = parse_address(&addr, state.network)?;
     let last_seen = parse_txid(&last_seen)?;
     Ok(Json(off_worker(&state, move |st| build_chain_txs(st, &pin, &sh, Some(last_seen))).await?))
+}
+
+pub async fn address_txs_summary(
+    State(state): State<EsploraState>,
+    Extension(pin): Extension<Pin>,
+    Path(addr): Path<String>,
+    Query(query): Query<TxsQuery>,
+) -> EsploraResult<Json<Vec<TxSummaryJson>>> {
+    let sh = parse_address(&addr, state.network)?;
+    let after = parse_after_txid(&query)?;
+    Ok(Json(off_worker(&state, move |st| build_summary_txs(st, &pin, &sh, after)).await?))
+}
+
+pub async fn address_txs_summary_paged(
+    State(state): State<EsploraState>,
+    Extension(pin): Extension<Pin>,
+    Path((addr, last_seen)): Path<(String, String)>,
+) -> EsploraResult<Json<Vec<TxSummaryJson>>> {
+    let sh = parse_address(&addr, state.network)?;
+    let last_seen = parse_txid(&last_seen)?;
+    Ok(Json(off_worker(&state, move |st| build_summary_txs(st, &pin, &sh, Some(last_seen))).await?))
 }
 
 pub async fn address_txs_mempool(
@@ -186,6 +227,27 @@ pub async fn scripthash_txs_chain_paged(
     let sh = parse_scripthash(&hash)?;
     let last_seen = parse_txid(&last_seen)?;
     Ok(Json(off_worker(&state, move |st| build_chain_txs(st, &pin, &sh, Some(last_seen))).await?))
+}
+
+pub async fn scripthash_txs_summary(
+    State(state): State<EsploraState>,
+    Extension(pin): Extension<Pin>,
+    Path(hash): Path<String>,
+    Query(query): Query<TxsQuery>,
+) -> EsploraResult<Json<Vec<TxSummaryJson>>> {
+    let sh = parse_scripthash(&hash)?;
+    let after = parse_after_txid(&query)?;
+    Ok(Json(off_worker(&state, move |st| build_summary_txs(st, &pin, &sh, after)).await?))
+}
+
+pub async fn scripthash_txs_summary_paged(
+    State(state): State<EsploraState>,
+    Extension(pin): Extension<Pin>,
+    Path((hash, last_seen)): Path<(String, String)>,
+) -> EsploraResult<Json<Vec<TxSummaryJson>>> {
+    let sh = parse_scripthash(&hash)?;
+    let last_seen = parse_txid(&last_seen)?;
+    Ok(Json(off_worker(&state, move |st| build_summary_txs(st, &pin, &sh, Some(last_seen))).await?))
 }
 
 pub async fn scripthash_txs_mempool(
@@ -413,6 +475,10 @@ mod historycap_tests;
 #[cfg(test)]
 #[path = "address_pin_tests.rs"]
 mod pin_tests;
+
+#[cfg(test)]
+#[path = "address_txssummary_tests.rs"]
+mod txssummary_tests;
 
 #[cfg(test)]
 mod tests {
@@ -837,6 +903,111 @@ fn build_chain_txs(
         Some(page) => render_confirmed_txs(state, &page),
         None => Ok(Vec::new()),
     }
+}
+
+/// `/address/:addr/txs/summary[/:last_seen_txid]`: the page
+/// `/txs/chain[/:last_seen_txid]` lists (the same transactions in the same
+/// order, confirmed only, 25 a page, as of the pin), each as a compact row
+/// with the script's net value in it. An extension in the shape rbitcoin's
+/// Esplora serves.
+///
+/// A cursor that is not in the script's confirmed history as of the pin is
+/// 422 `after_txid not found`, as there, where `/txs/chain` answers an empty
+/// page: an empty page here means the history ended.
+///
+/// The values come from the script's history rows, with no transaction or
+/// block read. A spending row names the output it spends and not its amount,
+/// which is in that output's funding row, anywhere below it in the history:
+/// so the whole history is read, and a script over the history cap is refused
+/// as the stats are.
+fn build_summary_txs(
+    state: &EsploraState,
+    pin: &Pin,
+    sh: &Scripthash,
+    after: Option<Txid>,
+) -> EsploraResult<Vec<TxSummaryJson>> {
+    state
+        .address_index
+        .check_history_cap(sh, state.config.max_history_entries)?;
+    // A cursor confirmed above the pin was not in the history as of it.
+    if let Some(cursor) = &after
+        && confirmed_place(state, cursor).is_some_and(|(height, _)| !pin.covers(height))
+    {
+        return Err(after_txid_not_found());
+    }
+    let page = pinned_page(state, pin, sh, after)?.ok_or_else(after_txid_not_found)?;
+    if page.is_empty() {
+        return Ok(Vec::new());
+    }
+    // Read after the page, so it holds every transaction on it.
+    let history = state.address_index.confirmed_history(sh)?;
+    let values = net_values(&page, &history);
+    let mut out = Vec::with_capacity(page.len());
+    for (height, txid) in &page {
+        // A page transaction with no row left the chain between the two
+        // reads: a disconnect, which reruns the request.
+        let value = *values.get(txid).ok_or(EsploraError::ServiceUnavailable)?;
+        let time = pin
+            .hash_at_height(&state.chain, *height)
+            .and_then(|h| state.chain.get_block_index(&h))
+            .map_or(0, |entry| entry.header.time);
+        out.push(TxSummaryJson {
+            txid: txid.to_string(),
+            value,
+            height: *height,
+            time,
+            tx_position: confirmed_place(state, txid)
+                .and_then(|(at, position)| (at == *height).then_some(position)),
+        });
+    }
+    Ok(out)
+}
+
+/// What each transaction of `page` did to the script's balance, from the
+/// script's history rows: the amounts of its funding rows, less the amounts
+/// of the outputs its spending rows spend. A transaction with no row in
+/// `history` has no entry.
+///
+/// Like the stats (`compute_chain_stats_from_history`), independent of the
+/// rows' order, and a spent output with no funding row counts as nothing.
+fn net_values(page: &[(u32, Txid)], history: &[HistoryEntry]) -> HashMap<Txid, i64> {
+    let on_page: std::collections::HashSet<Txid> = page.iter().map(|(_, t)| *t).collect();
+    let sats = |amount: u64| i64::try_from(amount).unwrap_or(i64::MAX);
+    let mut values: HashMap<Txid, i64> = HashMap::with_capacity(page.len());
+    // The outputs the page's transactions spend, and which one spends each.
+    let mut spent_by: HashMap<OutPoint, Txid> = HashMap::new();
+    for entry in history {
+        if !on_page.contains(&entry.txid()) {
+            continue;
+        }
+        let value = values.entry(entry.txid()).or_insert(0);
+        match entry {
+            HistoryEntry::Funding { amount_sat, .. } => {
+                *value = value.saturating_add(sats(*amount_sat));
+            }
+            HistoryEntry::Spending { txid, prev_outpoint, .. } => {
+                spent_by.insert(*prev_outpoint, *txid);
+            }
+        }
+    }
+    for entry in history {
+        if let HistoryEntry::Funding { txid, vout, amount_sat, .. } = entry
+            && let Some(spender) = spent_by.get(&OutPoint { txid: *txid, vout: *vout })
+            && let Some(value) = values.get_mut(spender)
+        {
+            *value = value.saturating_sub(sats(*amount_sat));
+        }
+    }
+    values
+}
+
+/// Where `txid` confirmed: its block's height and its index in the block,
+/// from the chain-order ordinals the address index keeps. No block is read.
+fn confirmed_place(state: &EsploraState, txid: &Txid) -> Option<(u32, u32)> {
+    let store = state.chain.store_ref();
+    let seq = store.get_tx_seq(txid)?;
+    let (first, height) = store.block_of_seq(seq)?;
+    Some((height, u32::try_from(seq.checked_sub(first)?).ok()?))
 }
 
 /// Render confirmed `(height, txid)` transactions in full Esplora shape.

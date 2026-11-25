@@ -47,6 +47,10 @@ mod esplora_asof;
 // transactions themselves.
 #[path = "e2e/esplora_block_summary.rs"]
 mod esplora_block_summary;
+// Esplora `/address/:addr/txs/summary` rows against values computed from
+// the transactions themselves.
+#[path = "e2e/esplora_address_summary.rs"]
+mod esplora_address_summary;
 #[path = "e2e/electrum_asof.rs"]
 mod electrum_asof;
 // Electrum protocol 1.6: package broadcast (CPFP) and the canonical mempool

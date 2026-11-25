@@ -106,11 +106,13 @@ format differs from Electrum's.
 | GET | `/address/:address/txs/chain` <br> `/scripthash/:hash/txs/chain` | JSON: 25 confirmed txs, newest first. |
 | GET | `/address/:address/txs/chain/:last_seen_txid` <br> `/scripthash/:hash/txs/chain/:last_seen_txid` | JSON: next 25 confirmed txs strictly older than `last_seen_txid`. Unknown cursor returns an empty array, not 404. |
 | GET | `/address/:address/txs/mempool` <br> `/scripthash/:hash/txs/mempool` | JSON: up to 50 mempool txs, in the order this node admitted them. No paging. |
+| GET | `/address/:address/txs/summary` <br> `/scripthash/:hash/txs/summary` | JSON: the `/txs/chain` page as compact rows `{txid, value, height, time, tx_position}`: 25 confirmed txs, newest first. `value` is the script's net sats in the tx (received less spent, signed), `height` and `time` the confirming block's, `tx_position` the tx's index in it. `?after_txid=<txid>` pages like the path cursor. An extension, not in upstream Esplora, matching rbitcoin's Esplora. |
+| GET | `/address/:address/txs/summary/:last_seen_txid` <br> `/scripthash/:hash/txs/summary/:last_seen_txid` | JSON: the next 25 rows strictly older than `last_seen_txid`; an empty array after the oldest. A cursor not in the script's confirmed history is 422 `after_txid not found`. Same extension. |
 | GET | `/address/:address/utxo` <br> `/scripthash/:hash/utxo` | JSON: live UTXOs (confirmed + mempool funding) with `{txid, vout, value, status}`. |
 
 Wrong-network addresses return 400, as do malformed addresses and bad
-scripthash hex (non-hex characters or wrong length). The stats, `utxo` and
-`sse` routes also return 400 `Too many history entries` for a script with
+scripthash hex (non-hex characters or wrong length). The stats, `utxo`,
+`txs/summary` and `sse` routes also return 400 `Too many history entries` for a script with
 more than 200,000 confirmed transactions; see
 [High-history scripts](#compatibility-statement).
 
@@ -270,6 +272,7 @@ curl "http://127.0.0.1:3000/address/bc1q.../utxo?asof=00000000000000000002a7c4..
 | `/address/:address` <br> `/scripthash/:hash` | `chain_stats` over blocks up to and including it; `mempool_stats` all zero. |
 | `.../txs` | The confirmed transactions only, newest first; `?after_txid=` pages them. |
 | `.../txs/chain[/:last_seen_txid]` | The confirmed transactions up to it. |
+| `.../txs/summary[/:last_seen_txid]` | The rows of the confirmed transactions up to it. |
 | `.../utxo` | Outputs funded up to it and not spent up to it, all confirmed. |
 | `/tx/:txid/status` | `confirmed: true` if it confirmed up to it, `confirmed: false` if later; 404 if only in the mempool. |
 | `/tx/:txid/outspend/:vout` <br> `/tx/:txid/outspends` | Spent only by a spend confirmed up to it; a later or mempool spend leaves the output unspent. 404 for a transaction only in the mempool. |
@@ -373,7 +376,9 @@ blockstream.info and mempool.space within these constraints:
   confirmed part of `/address/:addr/txs` (with or without `?after_txid=`) read
   the history from the cursor down and stop once the page is complete, so a
   page costs about the same however long the history is. `/address/:addr`
-  (the stats) and `/address/:addr/utxo` read the script's whole history, so
+  (the stats), `/address/:addr/utxo` and `/address/:addr/txs/summary[/:cursor]`
+  (whose values are summed from the history rows, a spent output's amount
+  being in the row that funded it) read the script's whole history, so
   they are capped: a script whose confirmed history holds more than 200,000
   transactions gets 400 `Too many history entries (more than 200000
   transactions)`, as mempool.space's electrs answers above its history
