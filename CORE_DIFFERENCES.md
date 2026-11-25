@@ -1012,7 +1012,9 @@ silently returning an empty or wrong answer.
   figure, and starts evicting (and raising `mempoolminfee`) later.
   `getmempoolinfo.usage` is satd's estimate of the memory its entries occupy,
   added up from what each entry holds rather than measured from the
-  allocator, so it is a lower bound. After a reorg both trim a cluster
+  allocator, so it is a lower bound. Core v31's `getmempoolinfo.optimal`
+  (whether every cluster's linearization is known to be optimal) is not
+  reported: satd does not track that. After a reorg both trim a cluster
   that its returned transactions grow past `-limitclustercount` or
   `-limitclustersize`, the same way. Core ranks what it keeps by the
   linearizations its clusters already had; satd linearizes each cluster

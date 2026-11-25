@@ -338,6 +338,11 @@ fn the_cluster_rpcs_answer_as_core_does() {
 fn a_reorg_trims_the_cluster_its_returned_parent_grows_past_the_limit() {
     let wallet = DeterministicWallet::from_secret([0x5d; 32]);
     let mut node = funded_node(&["-limitclustercount=3"], &wallet);
+    // The configured limits are what `getmempoolinfo` reports (Core v31),
+    // the size in virtual bytes.
+    let info = node.rpc_ok("getmempoolinfo", vec![]);
+    assert_eq!(info["limitclustercount"], json!(3), "{info}");
+    assert_eq!(info["limitclustersize"], json!(101_000), "{info}");
     let secp = bitcoin::secp256k1::Secp256k1::new();
     let (parent_hex, parent, kp, spk) = spend_coinbase_to_taproot(&node, &wallet, 10_000);
     node.rpc_ok("sendrawtransaction", vec![json!(parent_hex)]);

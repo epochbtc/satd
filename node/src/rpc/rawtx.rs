@@ -48,6 +48,9 @@ pub fn get_mempool_info(mempool: &Mempool) -> Value {
         "fullrbf": info.full_rbf,
         "maxdatacarriersize": info.max_data_carrier_size,
         "permitbaremultisig": info.permit_bare_multisig,
+        // Core v31: the cluster limits, the size in virtual bytes.
+        "limitclustercount": info.limit_cluster_count,
+        "limitclustersize": info.limit_cluster_size,
     });
     annotate_units(&mut response, unit);
     response
