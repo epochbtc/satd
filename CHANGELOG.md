@@ -110,6 +110,7 @@ It includes every fix shipped in 0.7.1:
 - IBD: header sync no longer downloads the header chain many times over (5.6 GB of `headers` for a 78 MB chain) (#1229).
 - IBD: testnet4 and testnet3 get Core's default `-assumevalid`, and the stall watchdog counts verified script inputs, so a fresh testnet4 sync gets past block 51,540 (#1216).
 - Esplora: `/`, `/mempool`, `/mempool/txids`, `/mempool/recent` and `/tx/:txid/outspends` no longer copy the whole mempool on every request; any client that could reach Esplora could make the node do so at will. Also in 0.7.2.
+- Esplora: `GET /block/:hash/txs/summary` lists a block as one `[txid, fee, weight, value]` row per transaction, coinbase first, in the shape rbitcoin's Esplora serves, so the rbitcoin-space explorer lists a block without `getblock` verbosity 2.
 - P2P: a peer that sends a `getblocktxn` naming no transaction is disconnected, as in Bitcoin Core; one 33-byte request could make the node upload a whole block. Also in 0.7.2.
 - P2P: a block that extends the tip is announced to peers only after its BIP 34 coinbase height and transaction finality are checked, as in Core. Also in 0.7.2.
 - Tor: the onion address and private key `ADD_ONION` returns, and the saved key, are checked as Core checks them before they are used, and a control-port line over 100,000 bytes is refused. Also in 0.7.2.

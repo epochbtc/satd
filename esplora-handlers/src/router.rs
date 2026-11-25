@@ -96,6 +96,8 @@ pub fn build_router(state: EsploraState) -> Result<Router, RouterBuildError> {
         .route("/block/{hash}/raw", get(block::block_raw))
         .route("/block/{hash}/status", get(block::block_status))
         .route("/block/{hash}/txs", get(block::block_txs))
+        // A static segment, so it wins over `/txs/{start_index}`.
+        .route("/block/{hash}/txs/summary", get(block::block_txs_summary))
         .route("/block/{hash}/txs/{start_index}", get(block::block_txs_page))
         .route("/block/{hash}/txid/{index}", get(block::block_txid_at_index))
         .route("/block/{hash}/txids", get(block::block_txids))
