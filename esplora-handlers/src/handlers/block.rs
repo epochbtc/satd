@@ -10,6 +10,8 @@
 //!   of 25; 404 `start index out of range` at or past the end)
 //! - `GET /block/:hash/txid/:i`      → `<txid hex>` for tx at index `i`
 //! - `GET /block/:hash/txids`        → array of every txid in the block
+//! - `GET /block/:hash/txs/summary`  → `[txid, fee, weight, value]` for
+//!   every tx in the block (an extension, as rbitcoin's Esplora serves it)
 //!
 //! Every handler reads through `get_stored_block`, so an OP_RETURN-stripped
 //! block is served from its strip record: txids from the record, sizes and
@@ -25,8 +27,10 @@ use axum::Json;
 use axum::body::Body;
 use axum::extract::{Path, State};
 use axum::http::{HeaderValue, Response, StatusCode};
-use bitcoin::BlockHash;
 use bitcoin::consensus::{Encodable, encode::serialize};
+use bitcoin::{Block, BlockHash, Txid};
+use node::mining::fee_profile::BlockFeeProfile;
+use node::storage::undo::UndoData;
 
 use crate::chain_tip::Pin;
 use crate::encode::{BlockHeaderJson, block_header_json};
@@ -164,6 +168,89 @@ pub async fn block_txids(
     Ok(Json(block.txids().iter().map(|t| t.to_string()).collect()))
 }
 
+/// The body of a 404 for a block whose fees cannot be computed because its
+/// undo data is gone.
+pub(crate) const BLOCK_UNDO_UNAVAILABLE: &str = "block undo data not available";
+
+/// One row of `/block/:hash/txs/summary`, serialized as the JSON array
+/// `[txid, fee, weight, value]`: fee and total output value in satoshis,
+/// BIP 141 weight in weight units (not sigop-adjusted).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct BlockTxSummaryRow(pub String, pub u64, pub u64, pub u64);
+
+/// `/block/:hash/txs/summary` → one `[txid, fee, weight, value]` row per
+/// transaction in block order, the coinbase first with fee 0. Not part of
+/// upstream Esplora: the route and its shape are those of rbitcoin's
+/// Esplora, for a client that lists a whole block without fetching every
+/// transaction in full.
+///
+/// 404 for a hash that is unknown, not on the best chain as of the pinned
+/// tip, or whose block data is pruned, as rbitcoin answers. Fees come from
+/// the block's undo data, as in `getblock` verbosity 2 and `getblockstats`;
+/// a block that spends coins and has no undo row is 404
+/// [`BLOCK_UNDO_UNAVAILABLE`], and an undo row that cannot be read or does
+/// not match the block is a 500, never a row with a made-up fee.
+pub async fn block_txs_summary(
+    State(state): State<EsploraState>,
+    axum::Extension(pin): axum::Extension<Pin>,
+    Path(hash): Path<String>,
+) -> EsploraResult<Json<Vec<BlockTxSummaryRow>>> {
+    let hash = parse_hash(&hash)?;
+    let entry = state
+        .chain
+        .get_block_index(&hash)
+        .ok_or(EsploraError::NotFound)?;
+    if pin.hash_at_height(&state.chain, entry.height) != Some(hash) {
+        return Err(EsploraError::NotFound);
+    }
+    let stored = state
+        .chain
+        .get_stored_block(&hash)
+        .ok_or(EsploraError::NotFound)?;
+    let undo = state
+        .chain
+        .read_undo(&hash)
+        .map_err(|e| EsploraError::Internal(format!("undo data for block {hash}: {e}")))?;
+    block_summary_rows(&stored.block, &stored.txids(), undo.as_ref()).map(Json)
+}
+
+/// The rows of `/block/:hash/txs/summary` for `block`, whose transactions
+/// have `txids` (from the strip record for an OP_RETURN-stripped block,
+/// whose filled form keeps the original weights and output values).
+fn block_summary_rows(
+    block: &Block,
+    txids: &[Txid],
+    undo: Option<&UndoData>,
+) -> EsploraResult<Vec<BlockTxSummaryRow>> {
+    let spending = block.txdata.iter().filter(|tx| !tx.is_coinbase()).count();
+    let profile = match undo {
+        Some(undo) => BlockFeeProfile::from_undo(block, undo)
+            .map_err(|e| EsploraError::Internal(e.to_string()))?,
+        // A block of coinbases only (genesis, an empty block) spends nothing.
+        None if spending == 0 => BlockFeeProfile::default(),
+        None => return Err(EsploraError::NotFoundReason(BLOCK_UNDO_UNAVAILABLE.to_string())),
+    };
+    // The profile leaves out a transaction whose outputs exceed its inputs.
+    // No connected block holds one, so a short profile means the undo row is
+    // not this block's.
+    if profile.txs.len() != spending || txids.len() != block.txdata.len() {
+        return Err(EsploraError::Internal(
+            "undo data is inconsistent with the block".to_string(),
+        ));
+    }
+    let mut fees = profile.txs.iter().map(|priced| priced.fee);
+    Ok(block
+        .txdata
+        .iter()
+        .zip(txids)
+        .map(|(tx, txid)| {
+            let fee = if tx.is_coinbase() { 0 } else { fees.next().unwrap_or(0) };
+            let value: u64 = tx.output.iter().map(|o| o.value.to_sat()).sum();
+            BlockTxSummaryRow(txid.to_string(), fee, tx.weight().to_wu(), value)
+        })
+        .collect())
+}
+
 /// `/block/:hash/txid/:index` → `<txid hex>` at the given index.
 pub async fn block_txid_at_index(
     State(state): State<EsploraState>,
@@ -245,6 +332,10 @@ fn block_page_bounds(
 #[cfg(test)]
 #[path = "block_esplorapaging_tests.rs"]
 mod esplorapaging_tests;
+
+#[cfg(test)]
+#[path = "block_txssummary_tests.rs"]
+mod txssummary_tests;
 
 /// Reusable helper exposed for the `/blocks` page summary in
 /// `chain::collect_blocks_descending`. Returns

@@ -43,6 +43,10 @@ mod electrum_status;
 mod esplora_paging;
 #[path = "e2e/esplora_asof.rs"]
 mod esplora_asof;
+// Esplora `/block/:hash/txs/summary` against figures computed from the
+// transactions themselves.
+#[path = "e2e/esplora_block_summary.rs"]
+mod esplora_block_summary;
 #[path = "e2e/electrum_asof.rs"]
 mod electrum_asof;
 // Electrum protocol 1.6: package broadcast (CPFP) and the canonical mempool

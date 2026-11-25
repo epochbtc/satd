@@ -76,6 +76,7 @@ address-index docs) and `--txindex=1` (auto-enabled by the reconciliation in
 | GET | `/block/:hash/txs/:start_index` | JSON: 25 txs starting at `start_index`, which must be a multiple of 25 (400 otherwise). At or past the end of the block: 404 `start index out of range`. |
 | GET | `/block/:hash/txid/:index` | `text/plain`: txid at the given block-tx index. |
 | GET | `/block/:hash/txids` | JSON: array of every txid in the block. |
+| GET | `/block/:hash/txs/summary` | JSON: one `[txid, fee, weight, value]` array per transaction in block order, the coinbase first with fee 0. Fee and total output value in sats, BIP 141 weight. An extension, not in upstream Esplora, matching rbitcoin's Esplora. 404 for a block that is unknown, not on the best chain, or pruned. |
 
 ### Transaction
 
