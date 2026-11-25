@@ -93,6 +93,25 @@ fn getmempoolinfo_bytes_is_vsize_and_total_fee_is_base_fees() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Core v31's `MempoolInfoToJSON` reports `m_opts.limits.cluster_count` and
+/// `cluster_size_vbytes`: the size in virtual bytes, though
+/// `-limitclustersize` is given in kvB.
+#[test]
+fn getmempoolinfo_reports_the_cluster_limits_in_cores_units() {
+    let mp = Mempool::new(1_000_000, 0);
+    let info = get_mempool_info(&mp);
+    assert_eq!(info["limitclustercount"].as_u64(), Some(64), "{info}");
+    assert_eq!(info["limitclustersize"].as_u64(), Some(101_000), "{info}");
+
+    let mut cfg = mp.policy();
+    cfg.max_cluster_count = 7;
+    cfg.max_cluster_vsize = 55_000;
+    mp.reload_policy(cfg);
+    let info = get_mempool_info(&mp);
+    assert_eq!(info["limitclustercount"].as_u64(), Some(7), "{info}");
+    assert_eq!(info["limitclustersize"].as_u64(), Some(55_000), "{info}");
+}
+
 #[test]
 fn gettxout_hides_an_output_spent_in_the_mempool() {
     let (cs, mp, dir) = env(&[(prev(1), coin(COIN_VALUE))]);

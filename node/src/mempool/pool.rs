@@ -668,6 +668,12 @@ pub struct MempoolInfo {
     pub max_data_carrier_size: usize,
     /// Whether bare multisig outputs are relayed (`-permitbaremultisig`).
     pub permit_bare_multisig: bool,
+    /// `-limitclustercount`: the most transactions one cluster may hold
+    /// (`getmempoolinfo.limitclustercount`).
+    pub limit_cluster_count: usize,
+    /// `-limitclustersize` in virtual bytes, as Core reports it
+    /// (`getmempoolinfo.limitclustersize`); the option itself is in kvB.
+    pub limit_cluster_size: u64,
 }
 
 /// Outcome of a ruleset re-placement pass ([`Mempool::reapply_policy`], §8).
@@ -9357,6 +9363,8 @@ impl Mempool {
             full_rbf,
             max_data_carrier_size,
             permit_bare_multisig,
+            limit_cluster_count,
+            limit_cluster_size,
         ) = {
             let cfg = self.config.read();
             let dcs = if cfg.data_carrier {
@@ -9371,6 +9379,8 @@ impl Mempool {
                 cfg.full_rbf,
                 dcs,
                 cfg.permit_bare_multisig,
+                cfg.max_cluster_count,
+                cfg.max_cluster_vsize,
             )
         };
         let inner = self.inner.read();
@@ -9425,6 +9435,8 @@ impl Mempool {
             unbroadcast,
             max_data_carrier_size,
             permit_bare_multisig,
+            limit_cluster_count,
+            limit_cluster_size,
         }
     }
 
