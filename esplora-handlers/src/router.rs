@@ -65,6 +65,15 @@ pub fn build_router(state: EsploraState) -> Result<Router, RouterBuildError> {
             "/address/{addr}/txs/chain/{last_seen_txid}",
             get(address::address_txs_chain_paged),
         )
+        // Compact history rows, as rbitcoin's Esplora serves them.
+        .route(
+            "/address/{addr}/txs/summary",
+            get(address::address_txs_summary),
+        )
+        .route(
+            "/address/{addr}/txs/summary/{last_seen_txid}",
+            get(address::address_txs_summary_paged),
+        )
         .route("/address/{addr}/utxo", get(address::address_utxo))
         // Scripthash family — parallel set; same handlers branched on
         // a different parser.
@@ -80,6 +89,14 @@ pub fn build_router(state: EsploraState) -> Result<Router, RouterBuildError> {
         .route(
             "/scripthash/{hash}/txs/chain/{last_seen_txid}",
             get(address::scripthash_txs_chain_paged),
+        )
+        .route(
+            "/scripthash/{hash}/txs/summary",
+            get(address::scripthash_txs_summary),
+        )
+        .route(
+            "/scripthash/{hash}/txs/summary/{last_seen_txid}",
+            get(address::scripthash_txs_summary_paged),
         )
         .route("/scripthash/{hash}/utxo", get(address::scripthash_utxo))
         .layer(pinned(crate::chain_tip::AsOf::Accepted));
