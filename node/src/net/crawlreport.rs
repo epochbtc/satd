@@ -121,6 +121,12 @@ pub struct Aggregate {
     /// Reachable addresses whose user agent names one family and handshake
     /// another.
     pub mismatches: usize,
+    /// Addresses in the book, reachable or not, whose last observation is
+    /// closed early and that have a retry scheduled.
+    pub retries_pending: usize,
+    /// Addresses in the book whose last observation is closed early and
+    /// that have no retry left.
+    pub retries_exhausted: usize,
 }
 
 impl Aggregate {
@@ -142,6 +148,12 @@ pub fn aggregate(book: &CrawlBook, now: u64) -> Aggregate {
         agg.learned[i] += 1;
         if e.last_success.is_some() {
             agg.ever_reached[i] += 1;
+        }
+        if e.closed_early_retry.pending() {
+            agg.retries_pending += 1;
+        }
+        if e.closed_early_retry.exhausted() && e.observation.as_ref().is_some_and(|o| o.verdict == Verdict::ClosedEarly) {
+            agg.retries_exhausted += 1;
         }
     }
     for (peer, e) in book.snapshot(now) {
@@ -174,8 +186,10 @@ pub fn aggregate(book: &CrawlBook, now: u64) -> Aggregate {
 }
 
 /// The aggregate as `getcrawlinfo` reports it: `book`, `reachable`,
-/// `transport`, `families`, `claimed`, `fake`, `closed_early` and
-/// `mismatches`. Shares are of the reachable addresses. Each reachable
+/// `transport`, `families`, `claimed`, `fake`, `closed_early`,
+/// `mismatches` and `retries` (closed-early addresses in the whole book
+/// with a retry scheduled, and with none left). Shares are of the
+/// reachable addresses. Each reachable
 /// address is counted once among `families` (observed families, and
 /// `unknown`: no row matched and the user agent names no family),
 /// `claimed` (no row matched; the user agent names the family), `fake`
@@ -230,6 +244,7 @@ pub fn aggregate_json(agg: &Aggregate, max_entries: usize) -> serde_json::Value 
         "fake": per_family(&agg.fake),
         "closed_early": { "count": agg.closed_early, "share": share(agg.closed_early) },
         "mismatches": agg.mismatches,
+        "retries": { "pending": agg.retries_pending, "exhausted": agg.retries_exhausted },
     })
 }
 
@@ -291,7 +306,8 @@ fn observation_json(o: &Observation) -> serde_json::Value {
 /// observed family and fingerprint (`core/claimed` when only the user
 /// agent names the family, `fake/core` for a fake session, `closed-early`
 /// when the peer closed before its transcript settled; `family` is then
-/// null). With `verbose`: every field of the entry and of its last
+/// null), and for a closed-early address its `retry` schedule (`count`,
+/// `next_due`). With `verbose`: every field of the entry and of its last
 /// observation.
 pub fn row_json(addr: &CrawlAddr, e: &CrawlEntry, now: u64, liveness_secs: u64, verbose: bool) -> serde_json::Value {
     let reachable =
@@ -307,6 +323,9 @@ pub fn row_json(addr: &CrawlAddr, e: &CrawlEntry, now: u64, liveness_secs: u64, 
         "family": o.and_then(Observation::observed_family).map(Family::name),
         "fingerprint": o.map(Observation::fingerprint_text),
     });
+    if o.is_some_and(|o| o.verdict == Verdict::ClosedEarly) {
+        row["retry"] = e.closed_early_retry.json();
+    }
     if verbose {
         let extra = serde_json::json!({
             "dialable": addr.dialable(),

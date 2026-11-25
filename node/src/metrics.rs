@@ -1025,6 +1025,14 @@ fn render_peer_survey(out: &mut String, m: Option<&crate::net::manager::SurveyMe
     );
     metric(
         out,
+        "satd_peer_survey_closed_early_retries",
+        "Closed-early survey records whose address has a retry scheduled.",
+        "gauge",
+        &[],
+        m.retries_pending as u64,
+    );
+    metric(
+        out,
         "satd_peer_survey_mismatches",
         "Survey records whose user agent names one family and handshake matches another.",
         "gauge",
@@ -1150,6 +1158,14 @@ fn render_crawl(out: &mut String, m: Option<&crate::net::manager::CrawlMetrics>)
         "gauge",
         &[],
         a.closed_early as u64,
+    );
+    metric(
+        out,
+        "satd_crawl_closed_early_retries",
+        "Crawl book addresses whose last session closed early and that have a retry scheduled.",
+        "gauge",
+        &[],
+        a.retries_pending as u64,
     );
     metric(
         out,
@@ -2243,6 +2259,7 @@ mod tests {
         m.aggregate.claimed[index(Family::Core)] = 1;
         m.aggregate.fake[index(Family::Core)] = 4;
         m.aggregate.closed_early = 5;
+        m.aggregate.retries_pending = 6;
         let mut out = String::new();
         render_crawl(&mut out, Some(&m));
         for line in [
@@ -2254,6 +2271,8 @@ mod tests {
             "satd_crawl_fake{family=\"core\"} 4",
             "satd_crawl_fake{family=\"btcd\"} 0",
             "satd_crawl_closed_early 5",
+            "satd_crawl_closed_early_retries 6",
+            "# TYPE satd_crawl_closed_early_retries gauge",
             "# TYPE satd_crawl_fake gauge",
             "# TYPE satd_crawl_closed_early gauge",
         ] {
@@ -2277,6 +2296,7 @@ mod tests {
         m.claimed[index(Family::Core)] = 1;
         m.fake[index(Family::Core)] = 4;
         m.closed_early = 5;
+        m.retries_pending = 6;
         let mut out = String::new();
         render_peer_survey(&mut out, Some(&m));
         for line in [
@@ -2287,6 +2307,8 @@ mod tests {
             "satd_peer_survey_fake{family=\"core\"} 4",
             "satd_peer_survey_fake{family=\"btcd\"} 0",
             "satd_peer_survey_closed_early 5",
+            "satd_peer_survey_closed_early_retries 6",
+            "# TYPE satd_peer_survey_closed_early_retries gauge",
             "# TYPE satd_peer_survey_fake gauge",
             "# TYPE satd_peer_survey_closed_early gauge",
         ] {

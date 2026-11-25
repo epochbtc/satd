@@ -611,9 +611,9 @@ fn a_bad_file_is_refused() {
     // Version 1 had no shapes: set aside, not misread.
     wrong_version[8..12].copy_from_slice(&1u32.to_le_bytes());
     assert!(err(&reseal(wrong_version)).contains("version 1"));
-    let mut v5 = body.clone();
-    v5[8..12].copy_from_slice(&5u32.to_le_bytes());
-    assert!(err(&reseal(v5)).contains("version 5"));
+    let mut v6 = body.clone();
+    v6[8..12].copy_from_slice(&6u32.to_le_bytes());
+    assert!(err(&reseal(v6)).contains("version 6"));
     assert!(err(&reseal(body[..body.len() - 3].to_vec())).contains("truncated"));
     let mut trailing = body.clone();
     trailing.push(0);
@@ -635,6 +635,7 @@ fn a_bad_file_is_refused() {
             probes: ProbeResults::default(),
             shape: None,
             verdict: Default::default(),
+            retry: Default::default(),
         },
         NOW,
     );
@@ -662,10 +663,10 @@ fn an_unknown_shape_is_bounded() {
     assert_eq!(back.commands, vec!["x".repeat(SHAPE_COMMAND_LEN); crate::net::behavior::HANDSHAKE_CAPTURE_MAX]);
 }
 
-/// A fake and a closed-early observation round-trip with their verdicts,
-/// and a later session replaces a closed-early verdict as any newer
-/// observation replaces the last: the entry's reachability, transport and
-/// timers are those of any session that completed a handshake.
+/// A fake and a closed-early observation round-trip with their verdicts
+/// and the retry schedule, and a later session that settles replaces a
+/// closed-early verdict: the entry's reachability, transport and timers
+/// are those of any session that completed a handshake.
 #[test]
 fn verdicts_round_trip_and_a_later_session_replaces_them() {
     let mut book = full_book();
@@ -678,26 +679,173 @@ fn verdicts_round_trip_and_a_later_session_replaces_them() {
     fake.user_agent = "/Satoshi:25.0.0/".to_string();
     fake.verdict = Verdict::Fake(Family::Core);
     let v1 = |o: Observation| SessionResult { v2: Attempt::NotTried, v1: Attempt::Ok, observation: Some(o) };
-    book.record_result(&v4(2), None, SessionKind::Liveness, v1(early.clone()), NOW + 6);
-    book.record_result(&v4(1), None, SessionKind::Discovery, v1(fake.clone()), NOW + 6);
+    // v4(1) has failed and has no observation; v4(0) a settled one.
+    book.record_result(&v4(1), None, SessionKind::Liveness, v1(early.clone()), NOW + 6);
+    book.record_result(&v4(0), None, SessionKind::Discovery, v1(fake.clone()), NOW + 6);
     let back = CrawlBook::decode(&book.encode(MAGIC), MAGIC, NOW + 6, BookParams::default()).unwrap();
     assert_eq!(back.dropped_old_observations(), 0);
     for (addr, e) in book.rows() {
         assert_eq!(back.get(addr), Some(e), "{addr:?}");
     }
-    let e = back.get(&CrawlAddr::Peer(v4(2))).unwrap();
+    let e = back.get(&CrawlAddr::Peer(v4(1))).unwrap();
     assert_eq!(e.observation.as_ref().unwrap().verdict, Verdict::ClosedEarly);
     assert_eq!(e.last_success, Some(NOW + 6), "closed early is reached");
-    assert_eq!(back.get(&CrawlAddr::Peer(v4(1))).unwrap().observation.as_ref().unwrap().verdict, Verdict::Fake(Family::Core));
-    // The liveness check that closed early kept the discovery's getaddr
-    // answer, as any session that sent none does.
-    assert_eq!(e.observation.as_ref().unwrap().getaddr, Some(GetaddrResult::NoAnswer));
+    assert_eq!((e.failures, e.retry_at), (0, None), "and no longer failing");
+    assert_eq!(e.closed_early_retry.count, 1, "the retry survives the file");
+    let fake_entry = back.get(&CrawlAddr::Peer(v4(0))).unwrap();
+    assert_eq!(fake_entry.observation.as_ref().unwrap().verdict, Verdict::Fake(Family::Core));
+    assert_eq!(fake_entry.closed_early_retry, ClosedEarlyRetry::default());
 
-    // A later session that settles replaces the verdict.
+    // A later session that settles replaces the verdict and clears the
+    // schedule.
     let settled = observation(NOW + 7);
-    book.record_result(&v4(2), None, SessionKind::Liveness, v1(settled.clone()), NOW + 7);
-    let o = book.get(&CrawlAddr::Peer(v4(2))).unwrap().observation.clone().unwrap();
+    book.record_result(&v4(1), None, SessionKind::Liveness, v1(settled.clone()), NOW + 7);
+    let e = book.get(&CrawlAddr::Peer(v4(1))).unwrap();
+    let o = e.observation.clone().unwrap();
     assert_eq!((o.verdict, o.fingerprint), (Verdict::Classified, settled.fingerprint));
+    assert_eq!(e.closed_early_retry, ClosedEarlyRetry::default());
+}
+
+/// A closed-early session never replaces a settled observation, classified
+/// at any confidence or fake: the entry keeps it whole, its reachability,
+/// transport and timers move on, and no retry is scheduled. A fake
+/// session replaces a classified observation.
+#[test]
+fn a_closed_early_session_keeps_a_settled_observation() {
+    let fingerprints = [
+        (Fingerprint::Known(Family::Core, Confidence::High), Verdict::Classified),
+        (Fingerprint::Known(Family::Btcd, Confidence::Low), Verdict::Classified),
+        (Fingerprint::Known(Family::Core, Confidence::Claimed), Verdict::Classified),
+        (Fingerprint::Mismatch { claimed: Family::Core, observed: Family::Btcd }, Verdict::Classified),
+        (Fingerprint::Unknown, Verdict::Classified),
+        (Fingerprint::Known(Family::Core, Confidence::Claimed), Verdict::Fake(Family::Core)),
+    ];
+    for (fp, verdict) in fingerprints {
+        let a = v4(1);
+        let key = CrawlAddr::Peer(a.clone());
+        let mut book = CrawlBook::default();
+        assert!(book.seed(a.clone(), 0, NOW));
+        let mut first = observation(NOW);
+        first.fingerprint = fp;
+        first.verdict = verdict;
+        first.shape = Some(shape());
+        first.getaddr = Some(GetaddrResult::Answered { entries: 5, delay_ms: 10 });
+        let reached = SessionResult { v2: Attempt::Ok, v1: Attempt::NotTried, observation: Some(first.clone()) };
+        book.record_result(&a, None, SessionKind::Discovery, reached, NOW);
+        let mut early = observation(NOW + HOUR);
+        early.fingerprint = Fingerprint::Unknown;
+        early.verdict = Verdict::ClosedEarly;
+        early.v2 = false;
+        early.services = 0x409;
+        let closed = SessionResult { v2: Attempt::NotTried, v1: Attempt::Ok, observation: Some(early) };
+        book.record_result(&a, None, SessionKind::Liveness, closed, NOW + HOUR);
+        let e = book.get(&key).unwrap();
+        assert_eq!(e.observation.as_ref(), Some(&first), "{fp:?}/{verdict:?}: the settled observation is kept whole");
+        assert_eq!(e.closed_early_retry, ClosedEarlyRetry::default(), "{fp:?}: no retry");
+        assert_eq!(
+            (e.last_success, e.reachable_count, e.v1_ok, e.v2_ok),
+            (Some(NOW + HOUR), 2, Some(true), Some(true)),
+            "{fp:?}: reachability and transport move on"
+        );
+    }
+    // A fake session replaces a classified observation.
+    let a = v4(2);
+    let mut book = reached_book(&a, NOW);
+    let mut fake = observation(NOW + 1);
+    fake.verdict = Verdict::Fake(Family::Core);
+    fake.fingerprint = Fingerprint::Known(Family::Core, Confidence::Claimed);
+    let result = SessionResult { v1: Attempt::Ok, observation: Some(fake), ..Default::default() };
+    book.record_result(&a, None, SessionKind::Liveness, result, NOW + 1);
+    assert_eq!(book.get(&CrawlAddr::Peer(a)).unwrap().observation.as_ref().unwrap().verdict, Verdict::Fake(Family::Core));
+}
+
+fn closed_early(at: u64) -> SessionResult {
+    let mut o = observation(at);
+    o.fingerprint = Fingerprint::Unknown;
+    o.verdict = Verdict::ClosedEarly;
+    SessionResult { v2: Attempt::NotTried, v1: Attempt::Ok, observation: Some(o) }
+}
+
+fn no_row_has_a_retry(book: &CrawlBook, now: u64) -> bool {
+    crate::net::crawlreport::nodes_json(book, now, true).as_array().unwrap().iter().all(|r| r.get("retry").is_none())
+}
+
+/// An address whose sessions close early and that has no settled
+/// observation is due a session at each retry's time, ahead of its next
+/// liveness check (a liveness session, or a discovery once one is due):
+/// ten retries, then none, and the address waits for its next ordinary
+/// session. A settled session clears the schedule; a due retry that
+/// completes no handshake is spent.
+#[test]
+fn a_closed_early_address_is_retried_ahead_of_its_liveness_check() {
+    let a = v4(1);
+    let key = CrawlAddr::Peer(a.clone());
+    // A liveness window past every retry's wait, so only the retries and
+    // the daily discovery fall due.
+    let mut book = CrawlBook::new(BookParams { liveness_secs: 30 * DAY, ..BookParams::default() });
+    assert!(book.seed(a.clone(), 0, NOW));
+    book.record_result(&a, None, SessionKind::Discovery, closed_early(NOW), NOW);
+    let mut now = NOW;
+    for n in 1..=10u8 {
+        let e = book.get(&key).unwrap();
+        let r = e.closed_early_retry;
+        assert_eq!(r.count, n);
+        let due = r.next_due.unwrap();
+        let wait = ClosedEarlyRetry::delay_secs(n);
+        assert!((now + wait * 4 / 5..=now + wait * 6 / 5).contains(&due), "retry {n}");
+        let discovery = e.last_discovery.unwrap() + DISCOVERY_INTERVAL_SECS;
+        if due - 1 < discovery {
+            assert_eq!(due_kind(&book, &a, due - 1), None, "retry {n}: not before its time");
+        }
+        let kind = due_kind(&book, &a, due).expect("the retry is due");
+        let want = if due >= discovery { SessionKind::Discovery } else { SessionKind::Liveness };
+        assert_eq!(kind, want, "retry {n}");
+        let agg = crate::net::crawlreport::aggregate(&book, due);
+        assert_eq!((agg.retries_pending, agg.retries_exhausted), (1, 0));
+        now = due;
+        let token = book.mark_dialling(&a, now);
+        assert!(token.is_some());
+        assert_eq!(due_kind(&book, &a, now), None, "not due while in flight");
+        book.record_result(&a, token, kind, closed_early(now), now);
+    }
+    let e = book.get(&key).unwrap();
+    let r = e.closed_early_retry;
+    assert_eq!((r.count, r.next_due), (crate::net::survey::CLOSED_EARLY_RETRIES, None), "exhausted");
+    let agg = crate::net::crawlreport::aggregate(&book, now);
+    assert_eq!((agg.retries_pending, agg.retries_exhausted), (0, 1));
+    let json = crate::net::crawlreport::aggregate_json(&agg, 10);
+    assert_eq!(json["retries"], serde_json::json!({ "pending": 0, "exhausted": 1 }));
+    let rows = crate::net::crawlreport::nodes_json(&book, now, false);
+    assert_eq!(rows[0]["retry"], serde_json::json!({ "count": 10, "next_due": null }));
+    // Exhausted: due only at its next ordinary session, and a closed-early
+    // session then schedules no retry.
+    let next = e.last_discovery.unwrap() + DISCOVERY_INTERVAL_SECS;
+    assert_eq!(due_kind(&book, &a, next - 1), None);
+    assert_eq!(due_kind(&book, &a, next), Some(SessionKind::Discovery));
+    book.record_result(&a, None, SessionKind::Discovery, closed_early(next), next);
+    assert_eq!(book.get(&key).unwrap().closed_early_retry.next_due, None, "not restarted");
+    // A settled session clears it.
+    book.record_result(&a, None, SessionKind::Liveness, v2_ok(next + 1), next + 1);
+    assert_eq!(book.get(&key).unwrap().closed_early_retry, ClosedEarlyRetry::default());
+    assert!(no_row_has_a_retry(&book, next + 1));
+
+    // A due retry that reaches nothing is spent: the next is scheduled,
+    // and the failure backs the address off as any failure does.
+    let b = v4(2);
+    let key = CrawlAddr::Peer(b.clone());
+    let mut book = CrawlBook::default();
+    assert!(book.seed(b.clone(), 0, NOW));
+    book.record_result(&b, None, SessionKind::Discovery, closed_early(NOW), NOW);
+    let due = book.get(&key).unwrap().closed_early_retry.next_due.unwrap();
+    book.record_result(&b, None, SessionKind::Liveness, down(), due);
+    let e = book.get(&key).unwrap();
+    assert_eq!(e.closed_early_retry.count, 2);
+    assert!(e.closed_early_retry.next_due.unwrap() > due);
+    assert_eq!(e.retry_at, Some(due + BACKOFF_SECS[0]));
+    // A failure before a retry is due spends nothing.
+    let before = e.closed_early_retry;
+    book.record_result(&b, None, SessionKind::Liveness, down(), due + 1);
+    assert_eq!(book.get(&key).unwrap().closed_early_retry, before);
 }
 
 /// A file in format 2 or 3, as earlier builds wrote it, stored no verdict:
@@ -715,7 +863,11 @@ fn an_older_file_keeps_its_entries_and_drops_their_observations() {
     for version in [3u32, 2] {
         let old = book.encode_as(MAGIC, version);
         assert_eq!(u32::from_le_bytes(old[8..12].try_into().unwrap()), version);
-        assert_eq!(old.len() + 2 * with_obs, current.len(), "the current format less two verdict bytes per observation");
+        assert_eq!(
+            old.len() + 2 * with_obs + 10 * book.len(),
+            current.len(),
+            "the current format less two verdict bytes per observation and ten retry bytes per entry"
+        );
         let back = CrawlBook::decode(&old, MAGIC, NOW + 6, BookParams::default()).unwrap();
         assert_eq!(back.len(), book.len(), "every entry kept");
         assert_eq!(back.dropped_old_observations(), with_obs);
@@ -742,6 +894,64 @@ fn an_older_file_keeps_its_entries_and_drops_their_observations() {
     }
 }
 
+/// A version 4 file, as the previous build wrote it, keeps every entry
+/// and every observation with its verdict, each with no retry scheduled:
+/// the current format less the ten retry bytes per entry, still read
+/// whole.
+#[test]
+fn a_version_4_file_keeps_its_observations_with_no_retry() {
+    let mut book = full_book();
+    book.record_result(&v4(1), None, SessionKind::Liveness, closed_early(NOW + 6), NOW + 6);
+    assert!(book.get(&CrawlAddr::Peer(v4(1))).unwrap().closed_early_retry.pending(), "fixture");
+    let old = book.encode_as(MAGIC, 4);
+    assert_eq!(u32::from_le_bytes(old[8..12].try_into().unwrap()), 4);
+    assert_eq!(old.len() + 10 * book.len(), book.encode(MAGIC).len());
+    let back = CrawlBook::decode(&old, MAGIC, NOW + 6, BookParams::default()).unwrap();
+    assert_eq!((back.len(), back.dropped_old_observations()), (book.len(), 0));
+    for (addr, e) in book.rows() {
+        let kept = CrawlEntry { closed_early_retry: ClosedEarlyRetry::default(), ..e.clone() };
+        assert_eq!(back.get(addr), Some(&kept), "{addr:?}");
+    }
+    assert_eq!(back.get(&CrawlAddr::Peer(v4(1))).unwrap().observation.as_ref().unwrap().verdict, Verdict::ClosedEarly);
+    let mut flipped = old.clone();
+    flipped[40] ^= 1;
+    assert!(CrawlBook::decode(&flipped, MAGIC, NOW, BookParams::default()).unwrap_err().contains("checksum"));
+    let body = &old[..old.len() - 32];
+    assert!(CrawlBook::decode(&reseal(body[..body.len() - 1].to_vec()), MAGIC, NOW, BookParams::default()).is_err());
+}
+
+/// A retry schedule out of its range is refused, as a damaged file, and
+/// so is one on an entry whose observation is not closed early.
+#[test]
+fn a_bad_retry_schedule_is_refused() {
+    let a = v4(1);
+    let mut book = CrawlBook::default();
+    assert!(book.seed(a.clone(), 0, NOW));
+    book.record_result(&a, None, SessionKind::Discovery, closed_early(NOW), NOW);
+    let bytes = book.encode(MAGIC);
+    let body = &bytes[..bytes.len() - 32];
+    let n = body.len();
+    // The only entry ends: verdict (2), count, presence, time (8).
+    assert_eq!(body[n - 12], 2, "fixture: closed early");
+    let with = |f: &dyn Fn(&mut Vec<u8>)| {
+        let mut b = body.to_vec();
+        f(&mut b);
+        reseal(b)
+    };
+    assert!(CrawlBook::decode(&with(&|_| {}), MAGIC, NOW, BookParams::default()).is_ok());
+    type Damage<'a> = &'a dyn Fn(&mut Vec<u8>);
+    let cases: [(&str, Damage); 4] = [
+        ("count 11", &|b| b[n - 10] = 11),
+        ("presence 2", &|b| b[n - 9] = 2),
+        ("due with no count", &|b| b[n - 10] = 0),
+        ("on a classified observation", &|b| b[n - 12] = 0),
+    ];
+    for (what, f) in cases {
+        let err = CrawlBook::decode(&with(f), MAGIC, NOW, BookParams::default()).unwrap_err();
+        assert!(err.contains("retry"), "{what}: {err}");
+    }
+}
+
 /// A verdict out of its range is refused, as a damaged file.
 #[test]
 fn a_bad_verdict_is_refused() {
@@ -750,11 +960,12 @@ fn a_bad_verdict_is_refused() {
     assert!(book.seed(a.clone(), 0, NOW));
     book.record_result(&a, None, SessionKind::Discovery, v2_ok(NOW), NOW);
     let bytes = book.encode(MAGIC);
-    // The verdict ends the only observation, and the file's body.
+    // The verdict ends the only observation, and the file's body but for
+    // the entry's ten retry bytes.
     let body = &bytes[..bytes.len() - 32];
     let with = |tag: u8, family: u8| {
         let mut b = body.to_vec();
-        let n = b.len();
+        let n = b.len() - 10;
         b[n - 2] = tag;
         b[n - 1] = family;
         reseal(b)

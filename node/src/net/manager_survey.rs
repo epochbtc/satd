@@ -23,6 +23,14 @@
 //! that claims Core and sends nothing but `version` and `verack` through
 //! the whole wait is fake ([`survey::is_fake_core`]).
 //!
+//! An address recorded closed early is dialled again on a schedule
+//! ([`survey::ClosedEarlyRetry`]: 15 min, 30 min, 1 h, 2 h, then every 4 h,
+//! each spread at random, at most ten times), since a node with full
+//! inbound slots that evicted one connection often has room for a later
+//! one. A due retry takes the next survey turn ahead of the uniform draw,
+//! passed over as a drawn address would be. A settled record is never
+//! replaced by a closed-early session, and is never retried.
+//!
 //! The address book learns what a feeler would teach it (Core's `Good` on a
 //! completed handshake, an attempt on a failed dial, the services the peer
 //! states), and nothing else.
@@ -101,6 +109,8 @@ pub struct SurveyMetrics {
     pub fake: [usize; crate::net::fingerprint::Family::ALL.len()],
     /// The closed-early records ([`Verdict::ClosedEarly`]).
     pub closed_early: usize,
+    /// The closed-early records with a retry scheduled.
+    pub retries_pending: usize,
     pub mismatches: usize,
     pub v2: usize,
     /// By [`Probe::ALL`] then answered, silent, disconnected.
@@ -445,21 +455,49 @@ impl PeerManager {
         {
             return None;
         }
-        let target = self.draw_survey_target()?;
+        let retry = self.next_survey_retry();
+        let is_retry = retry.is_some();
+        let target = retry.or_else(|| self.draw_survey_target())?;
         run.dialing.store(true, Ordering::Relaxed);
         let guard = DialingGuard(Arc::clone(self));
         let pm = Arc::clone(self);
         let dialled = target.clone();
         tokio::spawn(async move {
             let _guard = guard;
-            tracing::debug!(target = %dialled, "Making survey connection");
+            tracing::debug!(target = %dialled, retry = is_retry, "Making survey connection");
             if !pm.dial_book_target(&dialled, Some(ConnType::Survey), AUTOMATIC_RECONNECT_MAX_BACKOFF).await
                 && let Some(run) = pm.survey.get()
             {
                 run.note_connection(false);
+                pm.survey_retry_failed(&dialled);
             }
         });
         Some(target)
+    }
+
+    /// The closed-early address whose retry is due, the longest due first,
+    /// that a draw would not pass over ([`Self::survey_may_target`]);
+    /// `None` when none is.
+    pub(super) fn next_survey_retry(&self) -> Option<PeerAddr> {
+        let due = self.read_survey_store(|store| store.due_retries(crate::time::now_secs()))?;
+        let now = Instant::now();
+        due.into_iter().find(|target| self.survey_may_target(target, now))
+    }
+
+    /// A survey connection to `addr` did not connect: if it was a due
+    /// retry, that retry is spent and the next is scheduled.
+    fn survey_retry_failed(&self, addr: &PeerAddr) {
+        let Some(run) = self.survey.get() else {
+            return;
+        };
+        let aggregate = {
+            let mut store = run.store.lock();
+            if !store.retry_failed(addr, crate::time::now_secs()) {
+                return;
+            }
+            store.aggregate()
+        };
+        *run.aggregate.lock() = aggregate;
     }
 
     /// The address a survey connection is dialled at: drawn uniformly from
@@ -476,14 +514,18 @@ impl PeerManager {
         addrs.sort_unstable();
         addrs.shuffle(&mut rand::thread_rng());
         let now = Instant::now();
-        addrs.into_iter().find(|target| {
-            !self.is_manual_target(target)
-                && self.may_dial(target)
-                && !self.is_peer_addr_banned(target)
-                && !self.is_dial_in_flight(target)
-                && self.redial_due(target, now)
-                && !crate::net::is_bad_port(target.port())
-        })
+        addrs.into_iter().find(|target| self.survey_may_target(target, now))
+    }
+
+    /// Whether a survey connection may be dialled at `target`: what the
+    /// draw passes over (see [`Self::draw_survey_target`]) it is not.
+    fn survey_may_target(&self, target: &PeerAddr, now: Instant) -> bool {
+        !self.is_manual_target(target)
+            && self.may_dial(target)
+            && !self.is_peer_addr_banned(target)
+            && !self.is_dial_in_flight(target)
+            && self.redial_due(target, now)
+            && !crate::net::is_bad_port(target.port())
     }
 
     /// A survey connection from its transport on: the handshake, then
@@ -502,6 +544,10 @@ impl PeerManager {
                 tracing::debug!("survey handshake failed: {e}, peer={id}");
                 if let Some(run) = self.survey.get() {
                     run.note_connection(false);
+                }
+                let addr = self.peers.read().get(&id).and_then(|h| Self::dialled_book_addr(&h.info));
+                if let Some(addr) = addr {
+                    self.survey_retry_failed(&addr);
                 }
                 return Ok(());
             }
@@ -611,6 +657,7 @@ impl PeerManager {
             probes,
             shape,
             verdict,
+            retry: Default::default(),
         };
         let aggregate = {
             let mut store = run.store.lock();
@@ -760,6 +807,7 @@ impl PeerManager {
             claimed: agg.claimed,
             fake: agg.fake,
             closed_early: agg.closed_early,
+            retries_pending: agg.retries_pending,
             mismatches: agg.mismatches,
             v2: agg.v2,
             probe_outcomes,

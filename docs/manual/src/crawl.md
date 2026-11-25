@@ -141,8 +141,8 @@ counted apart from every family, claim and `unknown`:
   slots: on a new inbound connection Core evicts one, the youngest member
   of its largest network group, and a crawl connection seconds old is
   often that one. On a synced mainnet node, the survey's records showed
-  105 such Core nodes. The same address, dialled again, may settle: the
-  next session's verdict replaces it, as any newer observation does.
+  105 such Core nodes. The same address, dialled again, may settle, so it
+  is retried (below).
 - **Fake.** The user agent names Core, the common protocol version is
   70016 or more, the transcript is exactly `version`, `verack` (no
   negotiation message between them, nothing after), and the passive wait
@@ -153,9 +153,29 @@ counted apart from every family, claim and `unknown`:
   counted under `fake`, by the family it claims. Only Core has the rule,
   as the survey's, since the evidence is Core's alone.
 
-Neither changes how the crawl dials the node, how often, or its transport
-class: the session is recorded as any session that completed a handshake
-is.
+Neither changes how the crawl dials the node or its transport class: the
+session is recorded as any session that completed a handshake is.
+
+A closed-early address with no settled observation is retried: after its
+closed-early session a liveness session is due 15 minutes later, and after
+each further closed-early session (or a retry that completed no
+handshake) the next is due after 30 minutes, 1 hour, 2 hours, then 4 hours
+for every later one, each wait moved at random by up to a fifth either way.
+A retry only brings the address's next session forward, ahead of its
+liveness check (a discovery still comes first once one is due); it goes
+through the same limits, network rules and BIP 324 rule as every session.
+A failing address's unreachable backoff still comes first. After ten
+retries none is scheduled: the address waits for its next ordinary
+session, and a closed-early session then does not start the retries over.
+The first session that settles (a fingerprint, or fake) clears the
+schedule.
+
+A closed-early session never replaces a settled observation. An address
+whose last observation has a fingerprint (at any confidence, claimed
+included) or is fake keeps that observation whole; the session still
+counts as reached and updates the reachability, transport results and
+timers, and no retry is scheduled. A fake session still replaces a
+classified observation, and a settled session replaces any.
 
 Connected peers and the network survey are judged the same way against
 rows of their own, captured against an ordinary node's `version`: a
@@ -262,13 +282,17 @@ failures, backoff, the next session of each kind), its transport results
 what its last completed handshake showed: implementation family, sanitized
 user agent, protocol version, services, autonomous system (with `-asmap`),
 probe outcomes, height and its gap to the node's tip, clock offset,
-handshake round trip, the size and delay of its `getaddr` answer, and
-whether the session was fake or closed early.
+handshake round trip, the size and delay of its `getaddr` answer,
+whether the session was fake or closed early and, for a closed-early
+address, its retry count and next due time.
 
 It is written every 10 minutes and at shutdown, and read at startup. A file
 that does not read is renamed with a `.bad-<unix time>` suffix, with a
-warning, and the crawl starts empty. A file written before the fake and
-closed-early verdicts (book version 2 or 3) is read whole, a damaged one
+warning, and the crawl starts empty. The book is format version 5; a
+version 4 book is read whole and keeps everything, each entry with no
+retry scheduled (a closed-early address gets one after its next
+closed-early session). A file written before the fake and closed-early
+verdicts (book version 2 or 3) is read whole, a damaged one
 still set aside, and keeps every entry with its reachability, transport
 results, sources and timers; each entry's last observation is dropped and
 the count logged, since neither version stored whether the peer closed
@@ -354,6 +378,7 @@ where clearnet IP addresses of home nodes are.
   "fake": {"core": {"count": 140, "share": 0.0067}, "...": "..."},
   "closed_early": {"count": 100, "share": 0.0048},
   "mismatches": 12,
+  "retries": {"pending": 60, "exhausted": 14},
   "sessions": {"reached": 50213, "unreached": 140022,
                "in_flight": {"clearnet": 31, "tor": 8}},
   "totals": {"totalbytessent": 81234567, "totalbytesrecv": 912345678}
@@ -376,6 +401,7 @@ where clearnet IP addresses of home nodes are.
 | `fake` | The reachable addresses whose last session was fake (a Core user agent; `version` and `verack` only, silent through the wait), per claimed family. Never in `families` or `claimed`. |
 | `closed_early` | The reachable addresses whose peer closed the last session before its handshake settled: no fingerprint, in no family. Each reachable address is counted once among `families`, `claimed`, `fake` and `closed_early`. |
 | `mismatches` | Reachable addresses whose user agent names one family and handshake another. |
+| `retries` | Addresses in the book, reachable or not, whose last observation is closed early: with a retry scheduled (`pending`), and with none left after ten (`exhausted`). |
 | `sessions` | Sessions since start that completed a handshake (`reached`) or did not (`unreached`), and those open now. |
 | `totals` | The crawl's own bytes, as `getnettotals` names them; not counted there. |
 
@@ -400,6 +426,7 @@ Without `verbose`, each row is:
 | `transport` | Its transport class, as in `getcrawlinfo`; null if never reached. |
 | `family` | The implementation family its last handshake matched; null if none, a claimed, fake or closed-early one included. |
 | `fingerprint` | The last handshake's result: `core/high`, `btcd/low`, `core/claimed`, `unknown`, `mismatch(claimed=core,observed=btcd)`, `fake/core` or `closed-early`; null if never reached or not observed since an older book was read. |
+| `retry` | A closed-early row only: `count`, the retries scheduled so far, and `next_due`, when the next is due (Unix seconds; null once all ten are spent). |
 
 `getcrawlnodes true` adds every field of the entry: `dialable`,
 `first_learned`, `last_named`, `sources` (distinct nodes that named it, at
@@ -545,6 +572,8 @@ is missing or not 32 bytes, it returns an error.
   one of the family, claimed, fake and closed-early series only:
   `satd_crawl_family{family="unknown"}` is what none of the others
   names.
+- `satd_crawl_closed_early_retries`: the closed-early addresses in the
+  book with a retry scheduled.
 - `satd_crawl_sessions_total{result}` (`reached`, `unreached`) and
   `satd_crawl_sessions_in_flight{network}` (`clearnet`, `tor`).
 - `satd_crawl_bytes_sent_total` and `satd_crawl_bytes_recv_total`: the

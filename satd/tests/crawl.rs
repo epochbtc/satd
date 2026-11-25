@@ -4,7 +4,8 @@
 //! address book's file unchanged by a crawl; no session before the node
 //! leaves initial block download; and what `getcrawlinfo`, `getcrawlnodes`,
 //! the metrics and the status page report of it; and a fake node and a
-//! closed-early one counted apart. A regtest book admits loopback addresses
+//! closed-early one counted apart, and a closed-early one retried until it
+//! settles. A regtest book admits loopback addresses
 //! (mainnet, testnet4 and signet never do), and every address here is one,
 //! so nothing is dialled off the host.
 
@@ -37,6 +38,10 @@ struct Shape {
     /// Close the connection on the dialler's `verack`, once
     /// `after_verack` is sent.
     close_after_verack: bool,
+    /// On the first this many connections, close on the dialler's `verack`
+    /// with nothing after it, as a node with full inbound slots evicts a
+    /// new connection.
+    evict_first: usize,
 }
 
 fn core(answer: Vec<(u16, bool)>) -> Shape {
@@ -46,6 +51,7 @@ fn core(answer: Vec<(u16, bool)>) -> Shape {
         after_verack: vec![NetworkMessage::Ping(7)],
         answer,
         close_after_verack: false,
+        evict_first: 0,
     }
 }
 
@@ -68,6 +74,7 @@ fn btcd(answer: Vec<(u16, bool)>) -> Shape {
         after_verack: vec![],
         answer,
         close_after_verack: false,
+        evict_first: 0,
     }
 }
 
@@ -101,7 +108,7 @@ fn loopback_entry(port: u16, v2: bool) -> AddrV2Message {
     }
 }
 
-fn serve(mut stream: TcpStream, shape: &Shape) -> io::Result<()> {
+fn serve(mut stream: TcpStream, shape: &Shape, connection: usize) -> io::Result<()> {
     stream.set_read_timeout(Some(Duration::from_secs(120)))?;
     loop {
         match recv(&mut stream)? {
@@ -128,6 +135,9 @@ fn serve(mut stream: TcpStream, shape: &Shape) -> io::Result<()> {
                 send(&mut stream, NetworkMessage::Verack)?;
             }
             NetworkMessage::Verack => {
+                if connection < shape.evict_first {
+                    return Ok(());
+                }
                 for m in &shape.after_verack {
                     send(&mut stream, m.clone())?;
                 }
@@ -153,10 +163,10 @@ fn scripted(listener: TcpListener, shape: Shape) -> Arc<AtomicUsize> {
     let counter = accepts.clone();
     std::thread::spawn(move || {
         for stream in listener.incoming().flatten() {
-            counter.fetch_add(1, Ordering::SeqCst);
+            let connection = counter.fetch_add(1, Ordering::SeqCst);
             let shape = shape.clone();
             std::thread::spawn(move || {
-                let _ = serve(stream, &shape);
+                let _ = serve(stream, &shape, connection);
             });
         }
     });
@@ -567,5 +577,70 @@ fn the_crawl_counts_fake_and_closed_early_apart() {
     assert_eq!(verdict(&book, fake), node::net::survey::Verdict::Fake(node::net::fingerprint::Family::Core));
     c.restart_preserving_datadir(&args);
     check_info(&c.rpc_ok("getcrawlinfo", vec![]));
+    c.stop();
+}
+
+/// The `getcrawlnodes` row of the address on `port`.
+fn crawl_row(node: &TestNode, port: u16) -> Option<serde_json::Value> {
+    let rows = node.rpc_ok("getcrawlnodes", vec![]);
+    rows.as_array()?.iter().find(|r| r["addr"] == format!("127.0.0.1:{port}")).cloned()
+}
+
+/// A node that closes the first two crawl sessions straight after the
+/// handshake (a Core node with its inbound slots full), and has room on
+/// the third. The node's clock is mocked and frozen, so nothing falls due
+/// on its own: each session after the first is the closed-early retry,
+/// dialled once the clock is stepped to its due time (15 min, then 30 min,
+/// each spread by a fifth), well inside the two-hour liveness window. The
+/// third session settles: the address is Core and the schedule is cleared.
+#[test]
+fn a_closed_early_address_is_retried_until_it_settles() {
+    let (l, port) = bind();
+    let accepts = scripted(l, Shape { evict_first: 2, ..core(vec![]) });
+    let metrics_port = find_available_port();
+    let args = [
+        "--maxconnections=0".to_string(),
+        "--crawl=1".to_string(),
+        format!("--crawlseed=127.0.0.1:{port}"),
+        "--loglevel=debug".to_string(),
+        format!("--metricsport={metrics_port}"),
+    ];
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let mut c = TestNode::start(&args);
+    // Frozen before the crawl leaves initial block download, so every
+    // session is timed by it.
+    let mut now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    c.rpc_ok("setmocktime", vec![json!(now)]);
+    c.rpc_ok("generatetoaddress", vec![json!(1), json!(ADDR)]);
+
+    for (n, wait) in [(1u64, 900u64), (2, 1_800)] {
+        wait_for("a closed-early session", 300, || sessions_done(&c, port) >= n as usize);
+        wait_for("its row", 10, || crawl_row(&c, port).is_some_and(|r| r["retry"]["count"] == n));
+        let row = crawl_row(&c, port).unwrap();
+        assert_eq!(row["fingerprint"], "closed-early", "{row}");
+        let due = row["retry"]["next_due"].as_u64().unwrap();
+        assert!((now + wait * 4 / 5..=now + wait * 6 / 5).contains(&due), "retry {n} due in {} s: {row}", due as i64 - now as i64);
+        wait_for("the aggregate", 15, || c.rpc_ok("getcrawlinfo", vec![])["retries"]["pending"] == 1);
+        let body = reqwest::blocking::get(format!("http://127.0.0.1:{metrics_port}/metrics")).unwrap().text().unwrap();
+        assert!(body.lines().any(|l| l == "satd_crawl_closed_early_retries 1"), "{body}");
+        // Not before its time.
+        std::thread::sleep(Duration::from_secs(3));
+        assert_eq!(accepts.load(Ordering::SeqCst), n as usize, "nothing is due before the retry");
+        c.rpc_ok("setmocktime", vec![json!(due)]);
+        now = due;
+    }
+    wait_for("the third session", 300, || sessions_done(&c, port) >= 3);
+    wait_for("its row", 10, || crawl_row(&c, port).is_some_and(|r| r["fingerprint"] != "closed-early"));
+    let row = crawl_row(&c, port).unwrap();
+    // A liveness session sends no getaddr: Core is observed or only claimed.
+    assert!(row["fingerprint"].as_str().unwrap().starts_with("core/"), "{row}");
+    assert!(row.get("retry").is_none(), "settled: no retry: {row}");
+    assert_eq!(accepts.load(Ordering::SeqCst), 3);
+    wait_for("the aggregate", 15, || c.rpc_ok("getcrawlinfo", vec![])["retries"]["pending"] == 0);
+    let info = c.rpc_ok("getcrawlinfo", vec![]);
+    assert_eq!(info["retries"], json!({ "pending": 0, "exhausted": 0 }), "{info}");
+    assert_eq!(info["closed_early"]["count"], 0, "{info}");
+    let core = info["families"]["core"]["count"].as_u64().unwrap() + info["claimed"]["core"]["count"].as_u64().unwrap();
+    assert_eq!(core, 1, "{info}");
     c.stop();
 }

@@ -6,6 +6,8 @@
 //! survey off the node dials nothing. A peer claiming Core that sends only
 //! `version` and `verack` and stays silent is counted fake, and one that
 //! closes straight after the handshake closed early, neither as a family.
+//! A closed-early address is given retries until a session settles, and a
+//! settled one keeps its fingerprint when a later session closes early.
 
 mod common;
 
@@ -19,7 +21,7 @@ use serde_json::json;
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 /// What a scripted peer sends when dialled.
@@ -37,6 +39,8 @@ struct Shape {
     /// Hang up once the dialler's `verack` arrives, as a node with full
     /// inbound slots evicting its newest connection does.
     close_after_verack: bool,
+    /// Hang up so while this is set, whatever `close_after_verack` says.
+    evicting: Option<Arc<AtomicBool>>,
 }
 
 /// `core-31.2-outbound`: Core when dialled.
@@ -49,6 +53,7 @@ fn core() -> Shape {
         after_verack: vec![NetworkMessage::SendCmpct(SendCmpct { send_compact: false, version: 2 }), NetworkMessage::Ping(7)],
         answers: true,
         close_after_verack: false,
+        evicting: None,
     }
 }
 
@@ -62,6 +67,7 @@ fn btcd() -> Shape {
         after_verack: vec![],
         answers: true,
         close_after_verack: false,
+        evicting: None,
     }
 }
 
@@ -75,6 +81,7 @@ fn libbitcoin() -> Shape {
         after_verack: vec![],
         answers: true,
         close_after_verack: false,
+        evicting: None,
     }
 }
 
@@ -90,6 +97,7 @@ fn fake_core() -> Shape {
         after_verack: vec![],
         answers: false,
         close_after_verack: false,
+        evicting: None,
     }
 }
 
@@ -146,7 +154,7 @@ fn serve(mut stream: TcpStream, shape: &Shape) -> io::Result<()> {
                 send(&mut stream, NetworkMessage::Verack)?;
             }
             NetworkMessage::Verack => {
-                if shape.close_after_verack {
+                if shape.close_after_verack || shape.evicting.as_ref().is_some_and(|e| e.load(Ordering::SeqCst)) {
                     // A clean close: our end first, then read to the
                     // dialler's, so no reset discards what it has not read.
                     stream.shutdown(std::net::Shutdown::Write)?;
@@ -365,4 +373,169 @@ fn with_the_survey_off_the_node_dials_nothing() {
     assert!(!node.datadir.join("regtest").join("peersurvey.dat").exists());
     node.stop();
     assert!(!node.datadir.join("regtest").join("peersurvey.dat").exists(), "nothing written");
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()
+}
+
+/// The verbose row of the peer on `port`, once there is one.
+fn survey_row(node: &TestNode, port: u16) -> Option<serde_json::Value> {
+    let verbose = node.rpc_ok("getpeersurvey", vec![json!(true)]);
+    verbose["peers"].as_array()?.iter().find(|r| r["addr"] == format!("127.0.0.1:{port}")).cloned()
+}
+
+/// A peer that closes straight after the handshake (a Core node with its
+/// inbound slots full) is recorded closed early and given a retry after
+/// each such session: due 15 min, 30 min, 1 h, 2 h, then 4 h after it, each
+/// spread by a fifth, ten in all, then none. The node's clock is mocked
+/// and frozen, so every session happens at one instant and each due time
+/// is checked against it; with one address in the book every survey turn
+/// reaches it. Once the peer has room, its session settles: the record is
+/// Core and the schedule is cleared.
+#[test]
+fn a_closed_early_address_is_retried_until_it_settles() {
+    let metrics_port = find_available_port();
+    let mut node = TestNode::start(&[
+        "--maxconnections=0",
+        "--peersurvey=1",
+        "--peersurveyinterval=1",
+        &format!("--metricsport={metrics_port}"),
+    ]);
+    leave_ibd(&node);
+    let t0 = now_secs();
+    node.rpc_ok("setmocktime", vec![json!(t0)]);
+    let evicting = Arc::new(AtomicBool::new(true));
+    let (port, accepts) = scripted(Shape { evicting: Some(evicting.clone()), ..core() });
+    add_address(&node, port);
+
+    let delays = [900u64, 1_800, 3_600, 7_200, 14_400];
+    let row = poll_until_json(
+        || survey_row(&node, port).unwrap_or(json!(null)),
+        |r| r["fingerprint"] == "closed-early",
+        test_timeout(120).as_secs(),
+    );
+    let count = row["retry"]["count"].as_u64().unwrap();
+    assert!(count >= 1, "{row}");
+    if let Some(due) = row["retry"]["next_due"].as_u64() {
+        let wait = delays[(count as usize).min(delays.len()) - 1];
+        assert!((t0 + wait * 4 / 5..=t0 + wait * 6 / 5).contains(&due), "retry {count} due {}: {row}", due - t0);
+    }
+
+    // Every survey turn reaches the one address, so the ten retries are
+    // scheduled, and then none.
+    let survey = poll_until_json(
+        || node.rpc_ok("getpeersurvey", vec![]),
+        |v| v["retries"]["exhausted"] == 1,
+        test_timeout(120).as_secs(),
+    );
+    assert_eq!(survey["retries"], json!({ "pending": 0, "exhausted": 1 }), "{survey}");
+    assert_eq!(survey["closed_early"]["count"], 1);
+    let row = survey_row(&node, port).unwrap();
+    assert_eq!(row["retry"], json!({ "count": 10, "next_due": null }), "{row}");
+    assert!(accepts.load(Ordering::SeqCst) >= 11, "the first session and ten more");
+
+    // The peer has room now: the next session settles, and clears it.
+    evicting.store(false, Ordering::SeqCst);
+    let row = poll_until_json(
+        || survey_row(&node, port).unwrap_or(json!(null)),
+        |r| r["fingerprint"] != "closed-early",
+        test_timeout(120).as_secs(),
+    );
+    assert_eq!(row["family"], "core", "{row}");
+    assert!(row.get("retry").is_none(), "settled: no retry: {row}");
+    let survey = node.rpc_ok("getpeersurvey", vec![]);
+    assert_eq!(survey["retries"], json!({ "pending": 0, "exhausted": 0 }), "{survey}");
+    assert_eq!((survey["closed_early"]["count"].clone(), survey["families"]["core"]["count"].clone()), (json!(0), json!(1)));
+    let body = reqwest::blocking::get(format!("http://127.0.0.1:{metrics_port}/metrics")).unwrap().text().unwrap();
+    assert!(body.lines().any(|l| l == "satd_peer_survey_closed_early_retries 0"), "{body}");
+    node.stop();
+}
+
+/// A closed-early address with a retry pending keeps it across a restart,
+/// and the metric counts it.
+#[test]
+fn a_pending_retry_survives_a_restart() {
+    let metrics_port = find_available_port();
+    let mut node = TestNode::start(&[
+        "--maxconnections=0",
+        "--peersurvey=1",
+        "--peersurveyinterval=1",
+        &format!("--metricsport={metrics_port}"),
+    ]);
+    leave_ibd(&node);
+    let port = scripted(evicting_core()).0;
+    add_address(&node, port);
+    let row = poll_until_json(
+        || survey_row(&node, port).unwrap_or(json!(null)),
+        |r| r["fingerprint"] == "closed-early",
+        test_timeout(120).as_secs(),
+    );
+    assert!(row["retry"]["count"].as_u64().unwrap() >= 1, "{row}");
+    let body = reqwest::blocking::get(format!("http://127.0.0.1:{metrics_port}/metrics")).unwrap().text().unwrap();
+    assert!(body.lines().any(|l| l.starts_with("satd_peer_survey_closed_early_retries ")), "{body}");
+    node.stop();
+    // Read back with the survey connecting no more, so the schedule stands.
+    node.restart_preserving_datadir(&["--maxconnections=0", "--peersurvey=1", "--peersurveyinterval=3600"]);
+    let back = survey_row(&node, port).unwrap();
+    assert_eq!(back["fingerprint"], "closed-early");
+    assert!(back["retry"]["count"].as_u64().unwrap() >= 1, "{back}");
+    let survey = node.rpc_ok("getpeersurvey", vec![]);
+    assert_eq!(
+        survey["retries"]["pending"].as_u64().unwrap() + survey["retries"]["exhausted"].as_u64().unwrap(),
+        1,
+        "{survey}"
+    );
+    node.stop();
+}
+
+/// A settled address whose later survey sessions close early keeps its
+/// fingerprint and transcript; only its last sighting moves on, and it gets
+/// no retry.
+#[test]
+fn a_settled_address_keeps_its_fingerprint_when_it_later_closes_early() {
+    let mut node = TestNode::start(&["--maxconnections=0", "--peersurvey=1", "--peersurveyinterval=1"]);
+    leave_ibd(&node);
+    let t0 = now_secs();
+    node.rpc_ok("setmocktime", vec![json!(t0)]);
+    let evicting = Arc::new(AtomicBool::new(false));
+    let (port, accepts) = scripted(Shape { evicting: Some(evicting.clone()), ..core() });
+    add_address(&node, port);
+    poll_until_json(
+        || survey_row(&node, port).unwrap_or(json!(null)),
+        |r| r["family"] == "core",
+        test_timeout(120).as_secs(),
+    );
+    let wait_accepts = |n: usize| {
+        let deadline = std::time::Instant::now() + test_timeout(60);
+        while accepts.load(Ordering::SeqCst) < n {
+            assert!(std::time::Instant::now() < deadline, "no more sessions");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        // The session before it is recorded just after its connection
+        // leaves the peer table, which lets the next one be dialled.
+        std::thread::sleep(Duration::from_millis(500));
+    };
+
+    // From now on the peer closes straight after the handshake. A
+    // connection accepted after the change is one; one survey connection
+    // at a time, so by then the last settled session has been recorded.
+    evicting.store(true, Ordering::SeqCst);
+    wait_accepts(accepts.load(Ordering::SeqCst) + 1);
+    let settled = survey_row(&node, port).unwrap();
+    assert_eq!(settled["family"], "core", "{settled}");
+    node.rpc_ok("setmocktime", vec![json!(t0 + 100)]);
+    // Two more connections: the one before them, closed early at the new
+    // time, has been recorded.
+    wait_accepts(accepts.load(Ordering::SeqCst) + 2);
+    let mut row = survey_row(&node, port).unwrap();
+    assert_eq!(row["last_seen"], t0 + 100, "the last sighting moves on: {row}");
+    row["last_seen"] = settled["last_seen"].clone();
+    assert_eq!(row, settled, "all else is the settled record's");
+    assert!(row.get("retry").is_none(), "no retry: {row}");
+    let survey = node.rpc_ok("getpeersurvey", vec![]);
+    assert_eq!(survey["closed_early"]["count"], 0, "{survey}");
+    assert_eq!(survey["families"]["core"]["count"], 1, "{survey}");
+    assert_eq!(survey["retries"], json!({ "pending": 0, "exhausted": 0 }));
+    node.stop();
 }

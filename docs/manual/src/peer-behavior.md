@@ -270,6 +270,28 @@ answered, and are counted apart from every family:
 A connection the node closes itself (`disconnectnode`, a ban,
 `setnetworkactive false`, shutdown) is neither, and records nothing.
 
+A closed-early address is dialled again later, since a node that had no
+room for one connection often has room for the next. After a
+closed-early session the address gets a retry, due 15 minutes later; after
+each further closed-early session (or a retry whose dial or handshake
+failed) the next is due after 30 minutes, 1 hour, 2 hours, then 4 hours
+for every later one. Each wait is moved at random by up to a fifth either
+way, so the retries are not predictable. A due retry takes the next survey
+connection ahead of the uniform draw, and is passed over as a drawn
+address would be (a peer the operator named, a banned address, one
+connected or being dialled, a network the node does not reach, a bad
+port); the survey still opens one connection at a time, and each retry
+counts in `connections` like any other. After ten retries none is
+scheduled: the address stays closed early until the draw reaches it again,
+and a closed-early session then does not start the retries over. The
+first session that settles (a fingerprint, or fake) clears the schedule.
+
+A closed-early session never replaces a settled record. An address
+already recorded with a fingerprint (at any confidence, claimed included)
+or as fake keeps that record, transcript and probes included, and only its
+`last_seen` moves on; it gets no retry. A fake session still replaces a
+classified record, and a settled session replaces any record.
+
 ### Probes
 
 With `-peersurveyprobes=1` (the default with the survey), each survey
@@ -317,6 +339,7 @@ node's own peers.
   "v2": {"count": 402, "share": 0.495},
   "top_as": [{"asn": 64496, "count": 57}],
   "probed": 405,
+  "retries": {"pending": 5, "exhausted": 2},
   "enabled": true,
   "probes": true,
   "interval": 60,
@@ -340,6 +363,7 @@ Each record is counted once among `families`, `claimed`, `fake` and
 `closed_early`, so their counts add up to `addresses`. Every `share` is of
 `addresses`, all records whatever their kind.
 | `probed` | Records with at least one probe outcome. |
+| `retries` | Closed-early records with a retry scheduled (`pending`), and with none left after ten (`exhausted`). |
 | `enabled`, `probes`, `interval` | The survey's settings. With the survey off, `enabled` is false and every count is zero. |
 | `connections` | Survey connections since start: `completed`, and `failed` at the dial or the handshake; `last`, the most recent to end, with its `time` (Unix seconds) and `result` (`completed` or `failed`), null until one ends. |
 | `alt_slots` | The [alt-slots](#alt-slots): `configured`, `matched`, `fallback` and `empty`. Reported with the survey off too. |
@@ -353,7 +377,9 @@ sent with its `result` (`answered`, `silent` or `disconnected`) and, when
 answered, its `value`. A claimed record has `fingerprint` `core/claimed`
 (for example) and a null `family`; a fake one `fake/core`, and a
 closed-early one `closed-early`, each with a null `family` and the user
-agent's family in `claimed`. A record no row matched, claimed, fake,
+agent's family in `claimed`. A closed-early row also carries `retry`: its
+`count` of retries scheduled so far and `next_due`, when the next is due
+(Unix seconds; null once all ten are spent). A record no row matched, claimed, fake,
 closed early or unknown, also carries `handshake`, the commands it was judged on, and
 `relay`, its `version`'s relay flag, so that the shapes no row knows can
 be told apart and given rows; with `-debug=net` the same is logged when its
@@ -364,12 +390,15 @@ for a bearer token it needs `rpc:write`.
 
 ### The store
 
-`peersurvey.dat` (format `satdsrv3`) keeps one record per address: the
+`peersurvey.dat` (format `satdsrv4`) keeps one record per address: the
 fingerprint, user agent, protocol version, services, whether it spoke v2,
 its autonomous system, when it was first and last seen, the last probe
-outcomes, whether it was fake or closed early and, for a record no row
-matched, its handshake transcript (at most 16 commands) and `relay` flag. A
-file in an older format is dropped at startup, with its record count
+outcomes, whether it was fake or closed early, for a closed-early record
+its retry count and next due time, and, for a record no row matched, its
+handshake transcript (at most 16 commands) and `relay` flag. A `satdsrv3`
+file is read whole, each record kept with no retry scheduled: its
+closed-early addresses get one after their next closed-early session. A
+file in an older format still is dropped at startup, with its record count
 logged, and the survey starts empty: `satdsrv1` records were judged before
 the current rows, `satdsrv2` records never stored whether the peer closed
 the connection early, and a uniform draw from the address book revisits an
@@ -392,6 +421,8 @@ the survey starts empty.
 - `satd_peer_survey_fake{family}`: the fake records, by the family the user
   agent claims.
 - `satd_peer_survey_closed_early`: the closed-early records.
+- `satd_peer_survey_closed_early_retries`: the closed-early records with a
+  retry scheduled.
 - `satd_peer_survey_connections_total{result}`: `completed` and `failed`
   survey connections.
 - `satd_peer_survey_probes_total{probe,outcome}`: probe outcomes.
