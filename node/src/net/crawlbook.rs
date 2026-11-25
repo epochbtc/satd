@@ -55,10 +55,10 @@ use bitcoin::hashes::{sha256, sha256d, Hash};
 use bitcoin::p2p::address::{AddrV2, AddrV2Message};
 use bitcoin::p2p::ServiceFlags;
 
-use crate::net::fingerprint::{AddrKind, Fingerprint};
+use crate::net::fingerprint::{AddrKind, Family, Fingerprint};
 use crate::net::v2transport::V2Greeting;
 use crate::net::peer::PeerAddr;
-use crate::net::survey::{self, Probe, ProbeOutcome, ProbeResults, Reader};
+use crate::net::survey::{self, Probe, ProbeOutcome, ProbeResults, Reader, Verdict};
 
 /// The file's name in the network data directory.
 pub const CRAWL_FILE: &str = "crawlbook.dat";
@@ -119,9 +119,13 @@ const SEED_SOURCE: u64 = 0;
 
 const FILE_MAGIC: [u8; 8] = *b"satdcrwl";
 /// 2: an unknown shape's raw features. 3: a fingerprint may be claimed
-/// (no row matched; the user agent names the family). A version 2 file
-/// holds no claimed fingerprint and reads as it is.
-const FILE_VERSION: u32 = 3;
+/// (no row matched; the user agent names the family). 4: each observation
+/// ends with its [`Verdict`] (fake, closed early). A version 2 or 3 file
+/// never stored whether the peer closed during the passive wait, so none
+/// of its observations can be told closed early or fake from the rest:
+/// each entry is kept, its observation dropped
+/// ([`CrawlBook::dropped_old_observations`]).
+const FILE_VERSION: u32 = 4;
 
 /// An address in the book. Dialable addresses are [`PeerAddr`]s; I2P and
 /// CJDNS are kept to be counted, never dialled.
@@ -253,6 +257,12 @@ pub struct Observation {
     /// fingerprint): what the classifier read that the fields above do not
     /// hold.
     pub shape: Option<UnknownShape>,
+    /// What the session showed besides its fingerprint
+    /// ([`survey::session_verdict`]): the peer closed during the passive
+    /// wait before its transcript settled ([`Verdict::ClosedEarly`]; the
+    /// fingerprint is then [`Fingerprint::Unknown`]), or it claimed Core on
+    /// a session no release of Core produces ([`Verdict::Fake`]).
+    pub verdict: Verdict,
 }
 
 /// The raw features of a crawl session no crawl row matched, kept so that
@@ -281,6 +291,27 @@ impl Observation {
     /// Our tip less the peer's height: positive when the peer lags.
     pub fn height_gap(&self) -> i64 {
         i64::from(self.our_height) - i64::from(self.height)
+    }
+
+    /// The family a row observed; `None` for a fake or closed-early
+    /// session, whatever its fingerprint, as for a claimed or unknown one.
+    pub fn observed_family(&self) -> Option<Family> {
+        match self.verdict {
+            Verdict::Classified => self.fingerprint.observed(),
+            Verdict::Fake(_) | Verdict::ClosedEarly => None,
+        }
+    }
+
+    /// The fingerprint as the rows give it: `fake/core`, `closed-early`,
+    /// or the fingerprint (`core/high`, `core/claimed`, `unknown`, ...).
+    pub fn fingerprint_text(&self) -> String {
+        self.verdict.fingerprint_text(self.fingerprint)
+    }
+
+    /// Whether the user agent names one family and a row observed
+    /// another: never for a fake or closed-early session.
+    pub fn mismatch(&self) -> bool {
+        self.verdict == Verdict::Classified && matches!(self.fingerprint, Fingerprint::Mismatch { .. })
     }
 }
 
@@ -642,6 +673,9 @@ pub struct CrawlBook {
     /// Entries (one per port) per IP.
     ips: HashMap<IpAddr, u32>,
     params: BookParams,
+    /// Observations the file held in an older format (version 2 or 3),
+    /// dropped as it was read. Never written.
+    dropped_old_observations: usize,
 }
 
 impl Default for CrawlBook {
@@ -652,7 +686,24 @@ impl Default for CrawlBook {
 
 impl CrawlBook {
     pub fn new(params: BookParams) -> Self {
-        CrawlBook { entries: HashMap::new(), lru: BTreeSet::new(), prefixes: HashMap::new(), ips: HashMap::new(), params }
+        CrawlBook {
+            entries: HashMap::new(),
+            lru: BTreeSet::new(),
+            prefixes: HashMap::new(),
+            ips: HashMap::new(),
+            params,
+            dropped_old_observations: 0,
+        }
+    }
+
+    /// How many observations the file read held in an older format (version
+    /// 2 or 3), all of them dropped with their entries kept: neither format
+    /// stored whether the peer closed during the passive wait, so a
+    /// closed-early or fake session cannot be told from the rest. Each such
+    /// entry keeps its reachability, transport and timers, and has its
+    /// observation again from its next session.
+    pub fn dropped_old_observations(&self) -> usize {
+        self.dropped_old_observations
     }
 
     pub fn params(&self) -> &BookParams {
@@ -1013,16 +1064,23 @@ impl CrawlBook {
     /// the entries, then the hash256 of everything before it. Sessions open
     /// at the time are not recorded.
     pub fn encode(&self, network_magic: [u8; 4]) -> Vec<u8> {
+        self.encode_as(network_magic, FILE_VERSION)
+    }
+
+    /// The bytes in format `version`: [`FILE_VERSION`], or 3, which holds
+    /// no verdict, for the tests that such a file's observations are
+    /// dropped.
+    fn encode_as(&self, network_magic: [u8; 4], version: u32) -> Vec<u8> {
         let mut buf = Vec::with_capacity(20 + self.entries.len() * 120);
         buf.extend_from_slice(&FILE_MAGIC);
-        buf.extend_from_slice(&FILE_VERSION.to_le_bytes());
+        buf.extend_from_slice(&version.to_le_bytes());
         buf.extend_from_slice(&network_magic);
         buf.extend_from_slice(&(self.entries.len() as u32).to_le_bytes());
         let mut rows: Vec<(&CrawlAddr, &CrawlEntry)> = self.entries.iter().collect();
         rows.sort_unstable_by(|a, b| a.0.cmp(b.0));
         for (addr, e) in rows {
             encode_crawl_addr(&mut buf, addr);
-            encode_entry(&mut buf, e);
+            encode_entry(&mut buf, e, version);
         }
         let checksum = sha256d::Hash::hash(&buf);
         buf.extend_from_slice(checksum.as_byte_array());
@@ -1044,7 +1102,7 @@ impl CrawlBook {
             return Err("not a crawl book file".to_string());
         }
         let version = r.u32()?;
-        if version != FILE_VERSION && version != 2 {
+        if !(2..=FILE_VERSION).contains(&version) {
             return Err(format!("unknown crawl book version {version}"));
         }
         if r.take(4)? != network_magic {
@@ -1052,9 +1110,14 @@ impl CrawlBook {
         }
         let count = r.u32()? as usize;
         let mut entries = HashMap::with_capacity(count.min(MAX_ENTRIES));
+        let mut dropped_old_observations = 0;
         for _ in 0..count {
             let addr = decode_crawl_addr(&mut r)?;
-            let entry = decode_entry(&mut r)?;
+            let mut entry = decode_entry(&mut r, version)?;
+            // Read whole first, so a damaged old file is still refused.
+            if version < 4 && entry.observation.take().is_some() {
+                dropped_old_observations += 1;
+            }
             if entries.insert(addr, entry).is_some() {
                 return Err("duplicate address".to_string());
             }
@@ -1063,6 +1126,7 @@ impl CrawlBook {
             return Err("trailing bytes".to_string());
         }
         let mut book = CrawlBook::new(params);
+        book.dropped_old_observations = dropped_old_observations;
         // Most recent last, so the bound drops the least recently used.
         let mut rows: Vec<(CrawlAddr, CrawlEntry)> = entries.into_iter().collect();
         rows.sort_unstable_by(|a, b| (a.1.lru_key(), &a.0).cmp(&(b.1.lru_key(), &b.0)));
@@ -1163,7 +1227,7 @@ fn get_flag(r: &mut Reader) -> Result<bool, String> {
     }
 }
 
-fn encode_entry(buf: &mut Vec<u8>, e: &CrawlEntry) {
+fn encode_entry(buf: &mut Vec<u8>, e: &CrawlEntry, version: u32) {
     buf.extend_from_slice(&e.first_learned.to_le_bytes());
     buf.extend_from_slice(&e.last_named.to_le_bytes());
     buf.push(e.sources.len() as u8);
@@ -1191,12 +1255,13 @@ fn encode_entry(buf: &mut Vec<u8>, e: &CrawlEntry) {
         None => buf.push(0),
         Some(o) => {
             buf.push(1);
-            encode_observation(buf, o);
+            encode_observation(buf, o, version);
         }
     }
 }
 
-fn decode_entry(r: &mut Reader) -> Result<CrawlEntry, String> {
+/// An entry as file `version` wrote it.
+fn decode_entry(r: &mut Reader, version: u32) -> Result<CrawlEntry, String> {
     let first_learned = r.u64()?;
     let last_named = r.u64()?;
     let n = usize::from(r.u8()?);
@@ -1230,11 +1295,11 @@ fn decode_entry(r: &mut Reader) -> Result<CrawlEntry, String> {
         v2_only: get_flag(r)?,
         reachable_count: r.u32()?,
         first_reachable: get_opt_u64(r)?,
-        observation: if get_flag(r)? { Some(decode_observation(r)?) } else { None },
+        observation: if get_flag(r)? { Some(decode_observation(r, version)?) } else { None },
     })
 }
 
-fn encode_observation(buf: &mut Vec<u8>, o: &Observation) {
+fn encode_observation(buf: &mut Vec<u8>, o: &Observation, version: u32) {
     buf.extend_from_slice(&o.at.to_le_bytes());
     survey::encode_fingerprint(buf, o.fingerprint);
     let ua = o.user_agent.as_bytes();
@@ -1269,6 +1334,9 @@ fn encode_observation(buf: &mut Vec<u8>, o: &Observation) {
     buf.push(u8::from(o.shape.is_some()));
     if let Some(shape) = &o.shape {
         encode_shape(buf, shape);
+    }
+    if version >= 4 {
+        survey::encode_verdict(buf, o.verdict);
     }
 }
 
@@ -1324,7 +1392,9 @@ fn decode_shape(r: &mut Reader) -> Result<UnknownShape, String> {
     Ok(UnknownShape { commands, relay, v2, getaddr })
 }
 
-fn decode_observation(r: &mut Reader) -> Result<Observation, String> {
+/// An observation as file `version` wrote it: from version 4 on, with its
+/// verdict.
+fn decode_observation(r: &mut Reader, version: u32) -> Result<Observation, String> {
     let at = r.u64()?;
     let fingerprint = survey::decode_fingerprint(r)?;
     let ua_len = usize::from(r.u16()?);
@@ -1362,6 +1432,7 @@ fn decode_observation(r: &mut Reader) -> Result<Observation, String> {
         t => return Err(format!("bad getaddr result {t}")),
     };
     let shape = if get_flag(r)? { Some(decode_shape(r)?) } else { None };
+    let verdict = if version >= 4 { survey::decode_verdict(r)? } else { Verdict::Classified };
     Ok(Observation {
         at,
         fingerprint,
@@ -1378,6 +1449,7 @@ fn decode_observation(r: &mut Reader) -> Result<Observation, String> {
         handshake_rtt_ms: has_rtt.then_some(rtt),
         getaddr,
         shape,
+        verdict,
     })
 }
 

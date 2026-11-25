@@ -73,6 +73,45 @@ impl FamilyBar {
     }
 }
 
+/// The bars of `families` (observed, and `unknown`) and `claimed`: each
+/// family's observed and claimed counts together, the [`TOP_FAMILIES`]
+/// largest, the rest folded into `other`. The survey row's and the crawl
+/// row's.
+pub fn family_bars(families: &[(String, u64)], claimed: &[(String, u64)]) -> Vec<FamilyBar> {
+    let mut bars: Vec<FamilyBar> =
+        families.iter().map(|(name, n)| FamilyBar { name: name.clone(), observed: *n, claimed: 0 }).collect();
+    for (name, n) in claimed {
+        match bars.iter_mut().find(|b| b.name == *name) {
+            Some(b) => b.claimed += n,
+            None => bars.push(FamilyBar { name: name.clone(), observed: 0, claimed: *n }),
+        }
+    }
+    bars.sort_by(|a, b| b.total().cmp(&a.total()).then_with(|| a.name.cmp(&b.name)));
+    if bars.len() <= TOP_FAMILIES {
+        return bars;
+    }
+    let rest = bars.split_off(TOP_FAMILIES);
+    bars.push(FamilyBar {
+        name: "other".into(),
+        observed: rest.iter().map(|b| b.observed).sum(),
+        claimed: rest.iter().map(|b| b.claimed).sum(),
+    });
+    bars
+}
+
+/// For a node from before the fake and closed-early counts, which counted
+/// its claimed records (or addresses) under `unknown` too: take them out
+/// of `families`' unknown count, dropping a count left at zero, largest
+/// first again.
+pub fn claimed_out_of_unknown(families: &mut Vec<(String, u64)>, claimed: &[(String, u64)]) {
+    let claimed_total: u64 = claimed.iter().map(|(_, n)| n).sum();
+    if let Some(i) = families.iter().position(|(f, _)| f == "unknown") {
+        families[i].1 = families[i].1.saturating_sub(claimed_total);
+    }
+    families.retain(|(_, n)| *n > 0);
+    families.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+}
+
 /// The survey's last connection to end.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LastConnection {
@@ -175,12 +214,7 @@ pub fn parse(v: &Value) -> Option<Survey> {
     let closed_early = v.get("closed_early").map(|c| count(c, "count"));
     if closed_early.is_none() {
         // An older node counted its claimed records under `unknown` too.
-        let claimed_total: u64 = claimed.iter().map(|(_, n)| n).sum();
-        if let Some(i) = families.iter().position(|(f, _)| f == "unknown") {
-            families[i].1 = families[i].1.saturating_sub(claimed_total);
-        }
-        families.retain(|(_, n)| *n > 0);
-        families.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        claimed_out_of_unknown(&mut families, &claimed);
     }
     let top_as = v
         .get("top_as")
@@ -223,25 +257,7 @@ impl Survey {
     /// holds only the records no family is named for; fake and closed-early
     /// records are in no bar.
     pub fn family_bars(&self) -> Vec<FamilyBar> {
-        let mut bars: Vec<FamilyBar> =
-            self.families.iter().map(|(name, n)| FamilyBar { name: name.clone(), observed: *n, claimed: 0 }).collect();
-        for (name, n) in &self.claimed {
-            match bars.iter_mut().find(|b| b.name == *name) {
-                Some(b) => b.claimed += n,
-                None => bars.push(FamilyBar { name: name.clone(), observed: 0, claimed: *n }),
-            }
-        }
-        bars.sort_by(|a, b| b.total().cmp(&a.total()).then_with(|| a.name.cmp(&b.name)));
-        if bars.len() <= TOP_FAMILIES {
-            return bars;
-        }
-        let rest = bars.split_off(TOP_FAMILIES);
-        bars.push(FamilyBar {
-            name: "other".into(),
-            observed: rest.iter().map(|b| b.observed).sum(),
-            claimed: rest.iter().map(|b| b.claimed).sum(),
-        });
-        bars
+        family_bars(&self.families, &self.claimed)
     }
 
     /// The fake records of every family.

@@ -6,7 +6,7 @@ use super::survey_tests::{book_add, mk_pm_live, mk_pm_proxied, mk_pm_with, ONION
 use super::*;
 use crate::net::crawl::{CrawlConfig, Limits, Timings};
 use crate::net::crawlbook::{Attempt, CrawlAddr, GetaddrResult, SessionKind, SessionResult};
-use crate::net::survey::{Probe, ProbeOutcome};
+use crate::net::survey::{Probe, ProbeOutcome, Verdict};
 use bitcoin::p2p::Magic;
 use bitcoin::p2p::address::{AddrV2, AddrV2Message, Address};
 
@@ -66,6 +66,10 @@ struct Script {
     hang_up_on_getdata: bool,
     /// The services of its `version`.
     services: ServiceFlags,
+    /// Close the connection once `after_verack` is sent: with nothing
+    /// after `verack`, as a Core node with full inbound slots evicts the
+    /// connection.
+    close_after_verack: bool,
 }
 
 fn core_script() -> Script {
@@ -87,7 +91,19 @@ fn core_script() -> Script {
         notfound: true,
         hang_up_on_getdata: false,
         services: ServiceFlags::NETWORK | ServiceFlags::WITNESS,
+        close_after_verack: false,
     }
+}
+
+/// Core with its inbound slots full: the handshake, then the close.
+fn evicting_core() -> Script {
+    Script { after_verack: vec![], close_after_verack: true, ..core_script() }
+}
+
+/// An impostor claiming Core 25.0: `version` and `verack`, nothing between
+/// them, nothing after, the connection held open.
+fn fake_core() -> Script {
+    Script { user_agent: "/Satoshi:25.0.0/", negotiation: vec![], after_verack: vec![], ..core_script() }
 }
 
 fn silent() -> Script {
@@ -197,6 +213,9 @@ async fn serve(mut stream: TcpStream, script: Script, log: Log, i: usize) {
             NetworkMessage::Verack => {
                 for m in &script.after_verack {
                     let _ = conn.send(m.clone()).await;
+                }
+                if script.close_after_verack {
+                    return;
                 }
             }
             NetworkMessage::Ping(n) => {
@@ -1143,6 +1162,7 @@ async fn a_crawl_session_is_judged_on_its_crawl_features() {
     let (target, _log) = scripted("127.0.0.1", Script { hang_up_on_getdata: true, ..core }).await;
     let obs = pm.crawl_session(&target, SessionKind::Discovery).await.result.observation.unwrap();
     assert_eq!(obs.fingerprint, Fingerprint::Known(Family::Core, Confidence::Claimed));
+    assert_eq!(obs.verdict, Verdict::Classified, "it closed after its transcript settled: not closed early");
     assert_eq!(obs.fingerprint.observed(), None);
     let shape = obs.shape.expect("a shape no row matched keeps its raw features");
     assert_eq!(shape.commands, ["version", "wtxidrelay", "sendaddrv2", "verack", "sendcmpct", "ping"]);
@@ -1171,4 +1191,84 @@ async fn a_session_without_probes_is_judged_with_the_last_answers() {
     assert_eq!(fp(&pm), claimed);
     pm.run_crawl_session(target.clone(), SessionKind::Liveness, None).await;
     assert_eq!(fp(&pm), claimed, "the liveness session is judged with the disconnect");
+}
+
+/// A peer that closes the connection during the passive wait, before its
+/// transcript settles (a Core node with full inbound slots evicting the
+/// crawl's connection), is closed early: reached, over the transport it
+/// was reached on, with what its `version` said, and no fingerprint, so
+/// the transcript it cut short matches no row. A discovery session to it
+/// sends no `getaddr`, as to any peer that closed. One that closes once
+/// its transcript has settled is judged as it is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_peer_that_closes_before_its_transcript_settles_is_closed_early() {
+    use crate::net::fingerprint::Fingerprint;
+    let (pm, _dir) = mk_pm_with(None);
+    let run = enable(&pm, config());
+    let (target, log) = scripted("127.0.0.1", evicting_core()).await;
+    assert!(run.book.lock().seed(target.clone(), 0, crate::time::now_secs()));
+    pm.run_crawl_session(target.clone(), SessionKind::Discovery, None).await;
+    assert!(!log.lock()[0].iter().any(|m| matches!(m, NetworkMessage::GetAddr)), "closed: no getaddr");
+    let book = pm.crawl_book().unwrap();
+    let e = book.get(&CrawlAddr::Peer(target.clone())).unwrap();
+    assert_eq!((e.v1_ok, e.v2_ok, e.failures), (Some(true), None, 0), "reached over v1, v2 never tried");
+    assert!(e.last_success.is_some() && e.retry_at.is_none());
+    let obs = e.observation.as_ref().unwrap();
+    assert_eq!(obs.verdict, Verdict::ClosedEarly);
+    assert_eq!(obs.fingerprint, Fingerprint::Unknown, "no fingerprint");
+    assert_eq!(obs.user_agent, "/Satoshi:32.1.0/");
+    assert_eq!(obs.protocol_version, 70016);
+    assert_eq!(obs.services, (ServiceFlags::NETWORK | ServiceFlags::WITNESS).to_u64());
+    assert_eq!(obs.getaddr, None);
+    assert_eq!(obs.shape.as_ref().map(|s| s.commands.clone()).unwrap(), ["version", "wtxidrelay", "sendaddrv2", "verack"]);
+    assert_eq!(run.reached.load(Ordering::Relaxed), 1, "a reached session");
+    let agg = crate::net::crawlreport::aggregate(&book, crate::time::now_secs());
+    assert_eq!((agg.reachable_total(), agg.closed_early, agg.unknown), (1, 1, 0));
+    assert_eq!(agg.claimed.iter().sum::<usize>(), 0, "counted under no claim");
+    *run.aggregate.lock() = None;
+    let info = pm.get_crawl_info();
+    assert_eq!(info["closed_early"], serde_json::json!({ "count": 1, "share": 1.0 }), "{info}");
+    assert_eq!(info["families"]["unknown"]["count"], 0);
+
+    // The same peer settling on a later session replaces the verdict.
+    let (settled, _log) = scripted("127.0.0.1", core_script()).await;
+    let obs = pm.crawl_session(&settled, SessionKind::Liveness).await.result.observation.unwrap();
+    assert_eq!(obs.verdict, Verdict::Classified);
+    // Closing once its transcript has settled is no early close.
+    let late = Script { close_after_verack: true, ..core_script() };
+    let (target, _log) = scripted("127.0.0.1", late).await;
+    let obs = pm.crawl_session(&target, SessionKind::Liveness).await.result.observation.unwrap();
+    assert_eq!(obs.verdict, Verdict::Classified, "{obs:?}");
+}
+
+/// A peer that claims Core, sends only `version` and `verack` and stays
+/// connected and silent through the passive wait is fake, its family
+/// claimed; one that sends Core's negotiation is not, nor one claiming
+/// btcd with the same bare transcript.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_silent_core_claimant_is_fake() {
+    use crate::net::fingerprint::Family;
+    let (pm, _dir) = mk_pm_with(None);
+    let run = enable(&pm, config());
+    let (target, _log) = scripted("127.0.0.1", fake_core()).await;
+    assert!(run.book.lock().seed(target.clone(), 0, crate::time::now_secs()));
+    pm.run_crawl_session(target.clone(), SessionKind::Liveness, None).await;
+    let book = pm.crawl_book().unwrap();
+    let e = book.get(&CrawlAddr::Peer(target.clone())).unwrap();
+    assert_eq!(e.v1_ok, Some(true), "reached");
+    let obs = e.observation.as_ref().unwrap();
+    assert_eq!(obs.verdict, Verdict::Fake(Family::Core), "{obs:?}");
+    assert_eq!(obs.fingerprint_text(), "fake/core");
+    assert_eq!(obs.observed_family(), None);
+    let agg = crate::net::crawlreport::aggregate(&book, crate::time::now_secs());
+    assert_eq!(agg.fake[0], 1, "core, fake");
+    assert_eq!((agg.unknown, agg.claimed.iter().sum::<usize>(), agg.families.iter().sum::<usize>()), (0, 0, 0));
+
+    let (negotiated, _log) = scripted("127.0.0.1", Script { after_verack: vec![], ..core_script() }).await;
+    let obs = pm.crawl_session(&negotiated, SessionKind::Liveness).await.result.observation.unwrap();
+    assert_eq!(obs.verdict, Verdict::Classified, "Core's negotiation: no fake");
+    let btcd = Script { user_agent: "/btcwire:0.5.0/btcd:0.27.0/", ..fake_core() };
+    let (btcd, _log) = scripted("127.0.0.1", btcd).await;
+    let obs = pm.crawl_session(&btcd, SessionKind::Liveness).await.result.observation.unwrap();
+    assert_eq!(obs.verdict, Verdict::Classified, "only Core has the rule");
 }

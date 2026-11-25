@@ -8,6 +8,16 @@
 //! letters, digits, `_` and `-`, so no address can reach the screen even
 //! from a node that put one in its reply.
 //!
+//! Each family's bar is its observed reachable addresses plus its claimed
+//! ones (no row matched; the user agent names the family), the claimed
+//! part drawn apart, as the survey row draws it. The node also counts fake
+//! addresses (a user agent naming a family on a session no release of it
+//! produces) and closed-early ones (the peer closed before its handshake
+//! settled); neither is in any bar. A node from before those counts
+//! reports no `closed_early`, and counted its claimed addresses inside
+//! `families.unknown`: for it the unknown bar is that count less the
+//! claimed ones, and the fake and closed-early lines are not drawn.
+//!
 //! The row is drawn only while the crawl is on. It is hidden, and nothing
 //! is shown as failing, when the node:
 //! - answers "method not found" (an older satd, or another implementation);
@@ -19,7 +29,7 @@
 use serde_json::Value;
 
 use crate::rpc::{RpcError, JSONRPC_METHOD_NOT_FOUND};
-use crate::survey::{CAPABILITY_DENIED_CODE, READONLY_REJECT_CODE, TOP_FAMILIES};
+use crate::survey::{CAPABILITY_DENIED_CODE, FamilyBar, READONLY_REJECT_CODE};
 
 /// The networks the crawl dials, in the order the panel lists them (satd
 /// `node/src/net/crawlreport.rs`, `DIALLED`).
@@ -76,9 +86,18 @@ pub struct Crawl {
     /// `(network, count)` for each of [`NETWORKS`].
     pub by_network: Vec<(&'static str, u64)>,
     pub transport: Transport,
-    /// `(family, count)` for every family with a reachable address,
-    /// `unknown` included, largest first.
+    /// `(family, count)` for every observed family with a reachable
+    /// address, and `unknown` (no row matched and the user agent names no
+    /// family), largest first.
     pub families: Vec<(String, u64)>,
+    /// `(family, count)` of the reachable addresses no row matched whose
+    /// user agent names a family, largest first; never in `families`.
+    pub claimed: Vec<(String, u64)>,
+    /// `(family, count)` of the fake addresses, largest first; in no bar.
+    pub fake: Vec<(String, u64)>,
+    /// The closed-early addresses; `None` from a node that does not report
+    /// them (nor `fake`).
+    pub closed_early: Option<u64>,
     pub mismatches: u64,
     /// Sessions since start that completed a handshake, and that did not.
     pub reached: u64,
@@ -102,6 +121,9 @@ impl Default for Crawl {
             by_network: NETWORKS.iter().map(|n| (*n, 0)).collect(),
             transport: Transport::default(),
             families: Vec::new(),
+            claimed: Vec::new(),
+            fake: Vec::new(),
+            closed_early: None,
             mismatches: 0,
             reached: 0,
             unreached: 0,
@@ -118,8 +140,9 @@ impl Default for Crawl {
 /// How one poll of `getcrawlinfo` moves the TUI's copy.
 #[derive(Debug)]
 pub enum Poll {
-    /// The crawl is on: replace the copy.
-    On(Crawl),
+    /// The crawl is on: replace the copy. Boxed: a copy is far larger
+    /// than the other variants.
+    On(Box<Crawl>),
     /// Hide the row: the crawl is off, the node does not serve the method,
     /// or it refuses it to this connection.
     Hidden,
@@ -133,7 +156,7 @@ pub fn classify(res: Result<Value, RpcError>) -> Poll {
         Ok(v) => match v.get("enabled").and_then(Value::as_bool) {
             Some(false) => Poll::Hidden,
             Some(true) => match parse(&v) {
-                Some(c) => Poll::On(c),
+                Some(c) => Poll::On(Box::new(c)),
                 None => Poll::Failed("unexpected reply".into()),
             },
             None => Poll::Failed("unexpected reply".into()),
@@ -178,12 +201,22 @@ pub fn parse(v: &Value) -> Option<Crawl> {
         v2_unconfirmed: class("v2_unconfirmed"),
         v2_advertised: class("v2_advertised"),
     };
-    let mut families: Vec<(String, u64)> = v
-        .get("families")
-        .and_then(Value::as_object)
-        .map(|o| o.iter().map(|(name, f)| (word(name), count(Some(f), "count"))).filter(|(_, n)| *n > 0).collect())
-        .unwrap_or_default();
-    families.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    let counts = |key: &str| {
+        let mut out: Vec<(String, u64)> = v
+            .get(key)
+            .and_then(Value::as_object)
+            .map(|o| o.iter().map(|(name, f)| (word(name), count(Some(f), "count"))).filter(|(_, n)| *n > 0).collect())
+            .unwrap_or_default();
+        out.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        out
+    };
+    let mut families = counts("families");
+    let claimed = counts("claimed");
+    let closed_early = v.get("closed_early").map(|c| count(Some(c), "count"));
+    if closed_early.is_none() {
+        // An older node counted its claimed addresses under `unknown` too.
+        crate::survey::claimed_out_of_unknown(&mut families, &claimed);
+    }
     let sessions = v.get("sessions");
     let in_flight = sessions.and_then(|s| s.get("in_flight"));
     let limits = v.get("limits");
@@ -195,6 +228,9 @@ pub fn parse(v: &Value) -> Option<Crawl> {
         by_network,
         transport,
         families,
+        claimed,
+        fake: counts("fake"),
+        closed_early,
         mismatches: count(Some(v), "mismatches"),
         reached: count(sessions, "reached"),
         unreached: count(sessions, "unreached"),
@@ -223,21 +259,30 @@ impl Crawl {
         if self.reachable == 0 { 0.0 } else { n as f64 * 100.0 / self.reachable as f64 }
     }
 
-    /// The bars: the [`TOP_FAMILIES`] largest families, the rest folded
-    /// into `other`.
-    pub fn family_bars(&self) -> Vec<(String, u64)> {
-        if self.families.len() <= TOP_FAMILIES {
-            return self.families.clone();
-        }
-        let other = self.families[TOP_FAMILIES..].iter().map(|(_, n)| n).sum();
-        let mut out = self.families[..TOP_FAMILIES].to_vec();
-        out.push(("other".into(), other));
-        out
+    /// The bars: each family's observed and claimed addresses together,
+    /// the [`TOP_FAMILIES`](crate::survey::TOP_FAMILIES) largest, the rest
+    /// folded into `other`, as the survey row's. `unknown` holds only the
+    /// addresses no family is named for; fake and closed-early addresses
+    /// are in no bar.
+    pub fn family_bars(&self) -> Vec<FamilyBar> {
+        crate::survey::family_bars(&self.families, &self.claimed)
+    }
+
+    /// The claimed addresses of every family.
+    pub fn claimed_total(&self) -> u64 {
+        self.claimed.iter().map(|(_, n)| n).sum()
+    }
+
+    /// The fake addresses of every family.
+    pub fn fake_total(&self) -> u64 {
+        self.fake.iter().map(|(_, n)| n).sum()
     }
 
     /// Reachable addresses whose handshake matched a family other than
     /// Core's, as a percentage, counted as the survey row counts them:
-    /// Core's forks count as Core, `unknown` is left out.
+    /// Core's forks count as Core, `unknown` is left out, and so are the
+    /// claimed, fake and closed-early addresses, which a row never
+    /// observed.
     pub fn non_core_pct(&self) -> f64 {
         let non_core = self.families.iter().filter(|(f, _)| f != "core" && f != "unknown").map(|(_, n)| n).sum();
         self.pct(non_core)
@@ -272,7 +317,9 @@ pub(crate) mod tests {
     use super::*;
     use serde_json::json;
 
-    /// An answer in the shape satd's `getcrawlinfo` gives with the crawl on.
+    /// An answer in the shape satd's `getcrawlinfo` gives with the crawl
+    /// on: of the 21,000 reachable addresses, 20,300 observed, 100 unknown,
+    /// 360 claimed, 140 fake and 100 closed early.
     pub(crate) fn reply() -> Value {
         json!({
             "enabled": true,
@@ -294,7 +341,7 @@ pub(crate) mod tests {
                           "v2_only": {"count": 40, "share": 0.0019},
                           "v2_unconfirmed": {"count": 460, "share": 0.0219},
                           "v2_advertised": {"count": 9400, "share": 0.4476}},
-            "families": {"core": {"count": 20100, "share": 0.9571},
+            "families": {"core": {"count": 20000, "share": 0.9524},
                          "btcd": {"count": 150, "share": 0.0071},
                          "satd": {"count": 60, "share": 0.0029},
                          "rbitcoin": {"count": 40, "share": 0.0019},
@@ -303,7 +350,13 @@ pub(crate) mod tests {
                          "floresta": {"count": 10, "share": 0.0005},
                          "bitcoin-seeder": {"count": 5, "share": 0.0002},
                          "bitnodes": {"count": 0, "share": 0.0},
-                         "unknown": {"count": 600, "share": 0.0286}},
+                         "unknown": {"count": 100, "share": 0.0048}},
+            "claimed": {"core": {"count": 350, "share": 0.0167},
+                        "btcd": {"count": 10, "share": 0.0005},
+                        "bcoin": {"count": 0, "share": 0.0}},
+            "fake": {"core": {"count": 140, "share": 0.0067},
+                     "btcd": {"count": 0, "share": 0.0}},
+            "closed_early": {"count": 100, "share": 0.0048},
             "mismatches": 12,
             "sessions": {"reached": 50213, "unreached": 140022,
                          "in_flight": {"clearnet": 31, "tor": 8}},
@@ -338,8 +391,14 @@ pub(crate) mod tests {
             }
         );
         assert_eq!(c.families.len(), 9, "bitnodes has no reachable address");
-        assert_eq!(c.families[0], ("core".to_string(), 20100));
-        assert_eq!(c.families[1], ("unknown".to_string(), 600));
+        assert_eq!(c.families[0], ("core".to_string(), 20000));
+        assert_eq!(c.families[1], ("btcd".to_string(), 150));
+        assert!(c.families.contains(&("unknown".to_string(), 100)), "unknown as the node counts it");
+        assert_eq!(c.claimed, [("core".to_string(), 350), ("btcd".to_string(), 10)], "apart from families, zeros left out");
+        assert_eq!(c.claimed_total(), 360);
+        assert_eq!(c.fake, [("core".to_string(), 140)]);
+        assert_eq!(c.fake_total(), 140);
+        assert_eq!(c.closed_early, Some(100));
         assert_eq!((c.mismatches, c.reached, c.unreached), (12, 50213, 140022));
         assert_eq!((c.in_flight_clearnet, c.in_flight_tor, c.concurrency, c.tor_concurrency), (31, 8, 32, 8));
         assert_eq!((c.book, c.book_max), (61234, 250000));
@@ -379,13 +438,41 @@ pub(crate) mod tests {
         assert!(matches!(classify(Ok(reply())), Poll::On(c) if c.reachable == 21000));
     }
 
+    /// A node from before the fake and closed-early counts (no
+    /// `closed_early`) counted its claimed addresses under `unknown`: the
+    /// unknown bar is that count less the claimed ones, and there are no
+    /// fake or closed-early counts to draw.
+    #[test]
+    fn an_older_node_without_the_new_counts() {
+        let mut v = reply();
+        v.as_object_mut().unwrap().remove("fake");
+        v.as_object_mut().unwrap().remove("closed_early");
+        v["families"]["unknown"]["count"] = json!(700);
+        let c = parse(&v).unwrap();
+        assert_eq!(c.closed_early, None);
+        assert!(c.fake.is_empty());
+        assert!(c.families.contains(&("unknown".to_string(), 340)), "700 less the 360 claimed: {:?}", c.families);
+        // Every unknown one claimed: no unknown bar.
+        v["families"]["unknown"]["count"] = json!(360);
+        assert!(!parse(&v).unwrap().families.iter().any(|(f, _)| f == "unknown"));
+    }
+
+    /// Each bar is the family's observed and claimed addresses together,
+    /// the eight largest, then `other`; fake and closed-early addresses
+    /// are in none.
     #[test]
     fn top_eight_families_then_other() {
         let c = parse(&reply()).unwrap();
         let bars = c.family_bars();
-        assert_eq!(bars.len(), TOP_FAMILIES + 1);
-        assert_eq!(bars[TOP_FAMILIES], ("other".to_string(), 5), "bitcoin-seeder's 5 folded");
-        assert_eq!(bars.iter().map(|(_, n)| n).sum::<u64>(), 21000);
+        assert_eq!(bars.len(), crate::survey::TOP_FAMILIES + 1);
+        assert_eq!(bars[0], FamilyBar { name: "core".into(), observed: 20000, claimed: 350 });
+        assert_eq!(bars[1], FamilyBar { name: "btcd".into(), observed: 150, claimed: 10 });
+        assert_eq!(
+            bars[crate::survey::TOP_FAMILIES],
+            FamilyBar { name: "other".into(), observed: 5, claimed: 0 },
+            "bitcoin-seeder's 5 folded"
+        );
+        assert_eq!(bars.iter().map(FamilyBar::total).sum::<u64>(), 21000 - 140 - 100, "all but the fake and closed-early");
     }
 
     #[test]

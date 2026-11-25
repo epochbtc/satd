@@ -580,11 +580,14 @@ Network crawl:
 - `21,000 reachable`: the addresses with a completed handshake inside
   the liveness window (`-crawlliveness`), the crawl's count of the
   reachable network.
-- One bar per observed family, the 8 largest, then "other", each with
-  its share of the reachable addresses, and the **non-Core** share,
-  counted as in the survey row. A node whose handshake matched no family
-  is in the `unknown` bar even when its user agent names one (`claimed`
-  in `getcrawlinfo`): a claim is never drawn as an observed family.
+- One bar per family, the 8 largest, then "other", each with its share
+  of the reachable addresses, and the **non-Core** share, counted as in
+  the survey row. As in the survey row, a bar is the family's observed
+  addresses in full blocks, then in the dark shade those no handshake
+  row matched whose user agent names the family (`claimed` in
+  `getcrawlinfo`); the share is of both. The `unknown` bar holds only the
+  addresses no family is named for, and fake and closed-early addresses
+  are in no bar. The non-Core share counts observed families only.
 
 Crawl detail:
 
@@ -599,6 +602,20 @@ Crawl detail:
   reachable count.
 - **mismatches**: the reachable addresses whose user agent names one
   family while the handshake matches another.
+- **claimed**: the share, with the count, of the reachable addresses no
+  handshake row matched whose user agent names a family, then the 3
+  largest such families: the dark part of those families' bars. Drawn
+  only when there is one.
+- **fake**: the share and count of the
+  [fake](./crawl.md#how-it-tells-implementations-apart) addresses, then the 3 largest
+  families they claim.
+- **closed early**: the share and count of the reachable addresses whose
+  peer closed the crawl's last session before its handshake was complete,
+  usually a node with full inbound slots evicting its newest connection.
+  The fake and closed-early lines are drawn for a node that reports them,
+  zero or not; an older node reports neither, and for it the TUI takes
+  the claimed addresses out of the `unknown` bar, which such a node
+  counted them in.
 - **reached**, **unreached**: crawl sessions since the node started that
   completed a handshake, and that did not.
 - **in flight**: sessions open now, clearnet and Tor, against the

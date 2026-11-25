@@ -933,6 +933,12 @@ fn matching_crawl_row_in<'t>(
 /// family at [`Confidence::Claimed`]; one that names none is
 /// [`Fingerprint::Unknown`]. A claimed result is never a mismatch: nothing
 /// was observed to contradict the claim.
+///
+/// The session's [`Verdict`](crate::net::survey::Verdict) is judged apart
+/// ([`crate::net::survey::session_verdict`], as for a survey session): a
+/// session whose peer closed before its transcript settled is not judged
+/// here at all and has no fingerprint, and a fake one keeps what this
+/// returns but is counted under no family.
 pub fn classify_crawl(
     capture: &HandshakeCapture,
     version: Option<&VersionFields>,

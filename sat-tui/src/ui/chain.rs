@@ -442,8 +442,9 @@ fn non_core_line(pct: f64) -> Line<'static> {
 }
 
 /// The Network crawl panel, `width` cells inside its border: the state
-/// (with every hold reason), the reachable count, a bar per family (the
-/// eight largest, then `other`) and the non-Core share.
+/// (with every hold reason), the reachable count, a bar per family
+/// (observed and claimed, as the survey's; the eight largest, then
+/// `other`) and the non-Core share.
 pub fn crawl_left_lines(c: &crate::crawl::Crawl, width: u16) -> Vec<Line<'static>> {
     use crate::crawl::CrawlState;
     let color = match c.state {
@@ -460,17 +461,17 @@ pub fn crawl_left_lines(c: &crate::crawl::Crawl, width: u16) -> Vec<Line<'static
         lines.push(Line::from(Span::styled("  no address reachable yet", Style::default().fg(Color::DarkGray))));
         return lines;
     }
-    let bars = c.family_bars().into_iter().map(|(name, observed)| crate::survey::FamilyBar { name, observed, claimed: 0 });
-    lines.extend(family_bar_lines(bars.collect(), |n| c.pct(n), width));
+    lines.extend(family_bar_lines(c.family_bars(), |n| c.pct(n), width));
     lines.push(non_core_line(c.non_core_pct()));
     lines
 }
 
 /// The Crawl detail panel: the reachable addresses by network and by
 /// transport (v2 and v1, v1 only, v1 with v2 never tried as it was not
-/// advertised, v2 only, v2 not yet checked over v1),
-/// mismatches, sessions since start, sessions open against the limits,
-/// and the book against its cap.
+/// advertised, v2 only, v2 not yet checked over v1), mismatches, the
+/// claimed, fake and closed-early shares, sessions since start, sessions
+/// open against the limits, and the book against its cap. The fake and
+/// closed-early lines are drawn for a node that reports them, zero or not.
 pub fn crawl_right_lines(c: &crate::crawl::Crawl) -> Vec<Line<'static>> {
     let row = |label: &str, value: String| {
         Line::from(vec![
@@ -487,6 +488,22 @@ pub fn crawl_right_lines(c: &crate::crawl::Crawl) -> Vec<Line<'static>> {
     lines.push(row("v2 only:", share(t.v2_only)));
     lines.push(row("v2 unchecked:", share(t.v2_unconfirmed)));
     lines.push(row("mismatches:", share(c.mismatches)));
+    // The addresses no row matched whose user agent names a family: the
+    // dark part of that family's bar, listed here too.
+    let claimed = c.claimed_total();
+    if claimed > 0 {
+        lines.push(row("claimed:", share(claimed)));
+        for (family, n) in c.claimed.iter().take(crate::survey::TOP_CLAIMED) {
+            lines.push(row(&format!("  {family}"), share(*n)));
+        }
+    }
+    if let Some(closed_early) = c.closed_early {
+        lines.push(row("fake:", share(c.fake_total())));
+        for (family, n) in c.fake.iter().take(crate::survey::TOP_FAKE) {
+            lines.push(row(&format!("  {family}"), share(*n)));
+        }
+        lines.push(row("closed early:", share(closed_early)));
+    }
     lines.push(row("reached:", format!("{} sessions", format_num(c.reached))));
     lines.push(row("unreached:", format!("{} sessions", format_num(c.unreached))));
     lines.push(row(
@@ -878,7 +895,12 @@ mod tests {
         let left: Vec<String> = crawl_left_lines(c, 38).iter().map(line_text).collect();
         assert_eq!(left[0], "  running");
         assert_eq!(left[1], "  21,000 reachable");
-        assert!(left[2].starts_with("  core           ") && left[2].ends_with(" 95.7%"), "{left:?}");
+        // Core's 20,000 observed and 350 claimed: 96.9 %, the claimed part
+        // in the dark shade.
+        assert!(left[2].starts_with("  core           ") && left[2].ends_with(" 96.9%"), "{left:?}");
+        assert!(left[2].contains('\u{2593}'), "the claimed part: {left:?}");
+        assert!(left[3].starts_with("  btcd ") && left[3].contains('\u{2593}'), "{left:?}");
+        assert!(left.iter().any(|l| l.starts_with("  unknown ") && l.ends_with("  0.5%")), "only the truly unknown: {left:?}");
         assert!(left[10].starts_with("  other "), "{left:?}");
         assert_eq!(left.last().map(String::as_str), Some("  non-Core 1.4 %"));
         assert_eq!(left.len(), 12);
@@ -896,6 +918,12 @@ mod tests {
                 "  v2 only:      0.2 % (40)",
                 "  v2 unchecked: 2.2 % (460)",
                 "  mismatches:   0.1 % (12)",
+                "  claimed:      1.7 % (360)",
+                "    core        1.7 % (350)",
+                "    btcd        0.0 % (10)",
+                "  fake:         0.7 % (140)",
+                "    core        0.7 % (140)",
+                "  closed early: 0.5 % (100)",
                 "  reached:      50,213 sessions",
                 "  unreached:    140,022 sessions",
                 "  in flight:    31/32, tor 8/8",
@@ -905,6 +933,18 @@ mod tests {
         for l in left.iter().chain(&right) {
             assert!(l.chars().count() <= 38, "fits the panel: {l:?}");
         }
+
+        // A node that reports no fake or closed-early counts: no such
+        // lines. One that reports them at zero: both, at zero. No claimed
+        // address: no claimed line.
+        let older = crate::crawl::Crawl { closed_early: None, fake: Vec::new(), ..c.clone() };
+        let right: Vec<String> = crawl_right_lines(&older).iter().map(line_text).collect();
+        assert!(!right.iter().any(|l| l.contains("fake") || l.contains("closed early")), "{right:?}");
+        let none = crate::crawl::Crawl { closed_early: Some(0), fake: Vec::new(), claimed: Vec::new(), ..c.clone() };
+        let right: Vec<String> = crawl_right_lines(&none).iter().map(line_text).collect();
+        assert!(right.contains(&"  fake:         0.0 % (0)".to_string()), "{right:?}");
+        assert!(right.contains(&"  closed early: 0.0 % (0)".to_string()), "{right:?}");
+        assert!(!right.iter().any(|l| l.contains("claimed")), "{right:?}");
 
         // Held, with every reason; a long state is cut to the panel.
         let mut held = c.clone();
@@ -985,11 +1025,12 @@ mod tests {
     #[test]
     fn chain_view_draws_the_crawl_row() {
         let st = crawl_state(true);
-        let tall = render(&st, 100, 45);
+        let tall = render(&st, 100, 51);
         assert!(tall[25].contains("Network Crawl") && tall[25].contains("Crawl Detail"), "{tall:#?}");
         assert!(tall.iter().any(|l| l.contains("21,000 reachable")));
         assert!(tall.iter().any(|l| l.contains("v2 only:      0.2 % (40)")));
-        assert!(tall[43].contains("survey: superseded by the crawl, 1,204 addrs kept"), "{tall:#?}");
+        assert!(tall[49].contains("survey: superseded by the crawl, 1,204 addrs kept"), "{tall:#?}");
+        assert!(tall.iter().any(|l| l.contains("closed early: 0.5 % (100)")), "{tall:#?}");
         assert!(!tall.iter().any(|l| l.contains("Network Survey")));
         assert!(tall.iter().any(|l| l.contains("Trivia")) && tall.iter().any(|l| l.contains("Peer Clients")));
 
@@ -998,7 +1039,7 @@ mod tests {
         assert!(short[28].contains("crawl: running, 21,000 reachable, non-Core 1.4 %, v2-only 40"), "{short:#?}");
         assert!(!short.iter().any(|l| l.contains("Network Crawl")));
 
-        let alone = render(&crawl_state(false), 100, 45);
+        let alone = render(&crawl_state(false), 100, 51);
         assert!(alone.iter().any(|l| l.contains("Network Crawl")));
         assert!(!alone.iter().any(|l| l.contains("survey")), "{alone:#?}");
     }
@@ -1024,6 +1065,10 @@ mod tests {
             serde_json::json!({"count": 7000, "share": 0.3});
         v["families"]["abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqrstu.b32.i2p"] =
             serde_json::json!({"count": 6000, "share": 0.3});
+        for key in ["claimed", "fake"] {
+            v[key]["203.0.113.7:8333"] = serde_json::json!({"count": 900, "share": 0.04});
+            v[key]["[2001:db8::1]:8333"] = serde_json::json!({"count": 800, "share": 0.04});
+        }
         v["stopped_by"] = serde_json::json!("203.0.113.7:8333");
         v["peers"] = serde_json::json!([{"addr": "203.0.113.7:8333"}, {"addr": "[2001:db8::1]:8333"}]);
         v["limits"]["networks"] = serde_json::json!(["203.0.113.7"]);

@@ -54,7 +54,9 @@ operator grants the crawler relay, so its row leaves that open) and of the
 confidence where the survey could only say `low`. Crawl rows exist for
 Bitcoin Core, satd, rbitcoin, btcd, bcoin and libbitcoin (see
 [Network Crawl](crawl.md)); a crawl session no row matches is `claimed` or
-`unknown` as above, and keeps its transcript,
+`unknown` as above, a crawl session can be
+[closed early or fake](#closed-early-and-fake) as a survey connection can,
+and one no row matched keeps its transcript,
 `relay` flag, BIP 324 greeting and `getaddr` answer in `crawlbook.dat`, so
 a new implementation shows up as many records of one shape. A crawl
 discovery session also runs a chain check on the `getheaders` probe's

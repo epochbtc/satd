@@ -283,8 +283,8 @@ pub struct SurveyRecord {
     pub verdict: Verdict,
 }
 
-/// How a survey session's passive wait ended, as far as [`session_verdict`]
-/// reads it. A wait the node itself cut short (`disconnectnode`, a ban,
+/// How a survey or crawl session's passive wait ended, as far as
+/// [`session_verdict`] reads it. A wait the node itself cut short (`disconnectnode`, a ban,
 /// `setnetworkactive false`, shutdown) is none of these.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PassiveEnd {
@@ -317,12 +317,25 @@ pub enum Verdict {
     ClosedEarly,
 }
 
+impl Verdict {
+    /// A row's `fingerprint` as `getpeersurvey`'s verbose rows and the
+    /// crawl's rows give it: `fake/<family>`, `closed-early`, or the
+    /// fingerprint itself (`core/high`, `core/claimed`, `unknown`, ...).
+    pub fn fingerprint_text(self, fingerprint: Fingerprint) -> String {
+        match self {
+            Verdict::Classified => fingerprint.to_string(),
+            Verdict::Fake(f) => format!("fake/{f}"),
+            Verdict::ClosedEarly => "closed-early".to_string(),
+        }
+    }
+}
+
 /// The lowest common protocol version at which Core sends `wtxidrelay`
 /// (BIP 339) and `sendaddrv2` (BIP 155) before its `verack`.
 pub const FAKE_CORE_MIN_COMMON_VERSION: u32 = 70016;
 
-/// Whether a survey session is an impostor claiming to be Core. All must
-/// hold:
+/// Whether a survey or crawl session is an impostor claiming to be Core.
+/// All must hold:
 ///
 /// - the user agent names Core ([`Family::claimed_by`]);
 /// - the common protocol version (the lower of the peer's and ours) is at
@@ -353,8 +366,9 @@ pub fn is_fake_core(
         && passive == PassiveEnd::Timeout
 }
 
-/// A survey session's [`Verdict`] from how its passive wait ended and what
-/// its transcript holds. The peer closing while its transcript is still
+/// A survey or crawl session's [`Verdict`] from how its passive wait
+/// ended and what its transcript holds; `our_version` is the protocol
+/// version the session's own `version` stated. The peer closing while its transcript is still
 /// open is [`Verdict::ClosedEarly`]; [`is_fake_core`] is
 /// [`Verdict::Fake`]; anything else keeps its fingerprint. `passive` is
 /// `None` where the node cut the wait short.
@@ -760,8 +774,9 @@ pub(crate) fn decode_fingerprint(r: &mut Reader) -> Result<Fingerprint, String> 
 }
 
 /// A verdict: a tag (0 classified, 1 fake, 2 closed early), then the fake
-/// one's claimed family, `0xff` for the others.
-fn encode_verdict(buf: &mut Vec<u8>, verdict: Verdict) {
+/// one's claimed family, `0xff` for the others. `peersurvey.dat` and
+/// `crawlbook.dat` both hold it.
+pub(crate) fn encode_verdict(buf: &mut Vec<u8>, verdict: Verdict) {
     let (tag, family) = match verdict {
         Verdict::Classified => (0, None),
         Verdict::Fake(f) => (1, Some(f)),
@@ -770,7 +785,7 @@ fn encode_verdict(buf: &mut Vec<u8>, verdict: Verdict) {
     buf.extend_from_slice(&[tag, family_byte(family)]);
 }
 
-fn decode_verdict(r: &mut Reader) -> Result<Verdict, String> {
+pub(crate) fn decode_verdict(r: &mut Reader) -> Result<Verdict, String> {
     let tag = r.u8()?;
     let family = r.u8()?;
     match (tag, family) {
@@ -953,11 +968,7 @@ fn row_json(addr: &PeerAddr, r: &SurveyRecord) -> serde_json::Value {
     let mut row = serde_json::json!({
         "addr": addr_text,
         "network": network_name(addr),
-        "fingerprint": match r.verdict {
-            Verdict::Classified => r.fingerprint.to_string(),
-            Verdict::Fake(f) => format!("fake/{f}"),
-            Verdict::ClosedEarly => "closed-early".to_string(),
-        },
+        "fingerprint": r.verdict.fingerprint_text(r.fingerprint),
         "family": r.fingerprint.observed().map(Family::name),
         "claimed": claimed.or_else(|| Family::claimed_by(&r.user_agent).map(Family::name)),
         "mismatch": mismatch,
