@@ -323,7 +323,8 @@ the numbers behind each, and the raw counters they are judged from.
 
 `getpeersurvey [verbose]` reports the opt-in network survey (`-peersurvey`):
 the share of each implementation family among the addresses it reached,
-mismatches, BIP 324 share and the busiest autonomous systems. With
+the families claimed by user agent alone, the fake and closed-early
+records, mismatches, BIP 324 share and the busiest autonomous systems. With
 `verbose`, one row per address, so its output holds peer addresses. See
 [Network survey](peer-behavior.md#network-survey).
 

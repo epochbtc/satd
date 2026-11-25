@@ -508,23 +508,36 @@ Network survey:
 
 - `1,204 addrs, last 30 d`: the addresses the survey reached that the
   node still keeps (it drops a record not seen for 30 days).
-- One bar per observed family, the 8 largest, then "other", each with
-  its share of the addresses. `unknown` is a handshake that matched no
-  family, the claimed ones (below) included.
+- One bar per family, the 8 largest, then "other", each with its share
+  of the addresses. A bar is the family's observed addresses (full
+  blocks) followed by its claimed ones (dark shade): those no handshake
+  row matched whose user agent names the family. `unknown` is a handshake
+  that matched no family under a user agent that names none. Fake and
+  closed-early addresses (below) are in no bar.
 - **non-Core**: the share whose handshake matched a family other than
   Core's. Core's forks, Knots among them, share its networking code and
-  count as Core; `unknown` is not counted either way.
+  count as Core; `unknown` and claimed families are not counted.
 
 Survey detail:
 
 - **v2**: the share reached over BIP 324, with the count.
 - **mismatches**: the share whose user agent names one family while the
   handshake matches another.
-- **claimed**: the share, with the count, of the `unknown` addresses
-  whose user agent names a family (`claimed` in `getpeersurvey`), then
-  the 3 largest such families, each with its share and count. Drawn only
-  when there is one; these are what the peers say they run, so they never
-  get a family bar.
+- **claimed**: the share, with the count, of the addresses no handshake
+  row matched whose user agent names a family (`claimed` in
+  `getpeersurvey`), then the 3 largest such families, each with its share
+  and count: the dark part of those families' bars. Drawn only when there
+  is one.
+- **fake**: the share and count of the
+  [fake](./peer-behavior.md#closed-early-and-fake) addresses, then the 3
+  largest families they claim.
+- **closed early**: the share and count of the addresses whose peer
+  closed the survey connection before its handshake was complete,
+  usually a node with full inbound slots evicting its newest connection.
+  The fake and closed-early lines are drawn for a node that reports them,
+  zero or not; an older node reports neither, and for it the TUI takes
+  the claimed addresses out of the `unknown` bar, which such a node
+  counted them in.
 - **top AS**: the 5 autonomous systems with the most addresses, by
   number and share. Without `-asmap` the node knows none.
 - **last survey**: when the last survey connection ended, and whether

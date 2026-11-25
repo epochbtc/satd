@@ -375,6 +375,7 @@ fn netgroup_rule_holds_with_eight_alt_slots() {
                     last_seen: now,
                     probes: Default::default(),
                     shape: None,
+                    verdict: Default::default(),
                 },
                 now,
             );
@@ -415,6 +416,7 @@ fn verified_store_candidates_first_and_known_misses_skipped() {
         last_seen: now,
         probes: Default::default(),
         shape: None,
+        verdict: Default::default(),
     };
     {
         let mut st = pm.alt_slots.state.lock();
@@ -429,6 +431,47 @@ fn verified_store_candidates_first_and_known_misses_skipped() {
     }
     pm.alt_slots.state.lock().results.insert(PeerAddr::Socket(verified), rec(known(Family::Core), CORE), now);
     pm.alt_slots.state.lock().results.insert(PeerAddr::Socket(unverified), rec(known(Family::Core), CORE), now);
+    assert_eq!(pm.pick_alt_trial(Instant::now(), &[], &config), None, "every book entry is a known miss");
+}
+
+/// A fake or closed-early survey record is no family for the alt-slot
+/// rules, as an unknown one is not: under `family:core` neither is a store
+/// candidate, and each is a known miss that is not drawn from the book.
+#[test]
+fn fake_and_closed_early_records_match_no_family_rule() {
+    use crate::net::survey::Verdict;
+    let (pm, _dir) = mk_pm();
+    alt(&pm, 1, &["family:core"], UaTrust::Consistent);
+    let fake = own_group(1);
+    let early = own_group(2);
+    let core = own_group(3);
+    let now = crate::time::now_secs();
+    let rec = |fp, ua: &str, verdict| crate::net::survey::SurveyRecord {
+        fingerprint: fp,
+        user_agent: ua.into(),
+        protocol_version: 70016,
+        services: 1 | 8 | 1024,
+        v2: false,
+        asn: None,
+        first_seen: now,
+        last_seen: now,
+        probes: Default::default(),
+        shape: None,
+        verdict,
+    };
+    {
+        let mut st = pm.alt_slots.state.lock();
+        let claimed = Fingerprint::Known(Family::Core, Confidence::Claimed);
+        st.results.insert(PeerAddr::Socket(fake), rec(claimed, "/Satoshi:25.0.0/", Verdict::Fake(Family::Core)), now);
+        st.results.insert(PeerAddr::Socket(early), rec(Fingerprint::Unknown, CORE, Verdict::ClosedEarly), now);
+        st.results.insert(PeerAddr::Socket(core), rec(known(Family::Core), CORE, Verdict::Classified), now);
+    }
+    learn(&pm, &[fake, early, core]);
+    let config = pm.alt_slot_config();
+    for _ in 0..20 {
+        assert_eq!(pm.pick_alt_trial(Instant::now(), &[], &config), Some(PeerAddr::Socket(core)));
+    }
+    pm.alt_slots.state.lock().results.insert(PeerAddr::Socket(core), rec(Fingerprint::Unknown, CORE, Verdict::ClosedEarly), now);
     assert_eq!(pm.pick_alt_trial(Instant::now(), &[], &config), None, "every book entry is a known miss");
 }
 
@@ -629,6 +672,7 @@ fn a_trial_result_keeps_the_survey_probes() {
         last_seen: now,
         probes,
         shape: None,
+        verdict: Default::default(),
     };
     assert!(pm.insert_survey_record(PeerAddr::Socket(addr), record, now));
     add_peer(&pm, settled(1, addr, Some(AltRole::Trial), known(Family::Btcd), BTCD));

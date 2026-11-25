@@ -628,6 +628,9 @@ impl PeerManager {
                     .observed()
                     .is_none()
                     .then(|| crate::net::survey::SurveyShape::of(&info.behavior.handshake, version.relay)),
+                // A trial is a connected peer, judged as one: never fake or
+                // closed early.
+                verdict: Default::default(),
             },
         ))
     }

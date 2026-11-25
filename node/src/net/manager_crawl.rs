@@ -63,7 +63,7 @@
 //! node keeps running.
 
 use super::*;
-use super::survey_conn::{listen_passive, next_message, send_probes, Listened, Next};
+use super::survey_conn::{listen_passive, next_message, send_probes, Next};
 use crate::net::behavior::PeerBehavior;
 use crate::net::crawl::{self, CrawlConfig, Scheduler};
 use crate::net::crawlbook::{
@@ -1018,13 +1018,11 @@ impl PeerManager {
         let t = run.config.timings;
         let passive_deadline = tokio::time::Instant::now() + t.passive;
         let capture = &mut hs.behavior.handshake;
-        let mut closed = matches!(
-            listen_passive(0, &mut writer, &mut read_rx, &abort, passive_deadline, |msg| {
-                capture.observe(crate::net::behavior::wire_command(msg), matches!(msg, NetworkMessage::Pong(_)))
-            })
-            .await,
-            Listened::Closed
-        );
+        let mut closed = listen_passive(0, &mut writer, &mut read_rx, &abort, passive_deadline, |msg| {
+            capture.observe(crate::net::behavior::wire_command(msg), matches!(msg, NetworkMessage::Pong(_)))
+        })
+        .await
+        .closed();
 
         let mut getaddr = None;
         let mut answer = None;

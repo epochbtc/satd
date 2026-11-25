@@ -634,6 +634,7 @@ fn a_bad_file_is_refused() {
             last_seen: NOW,
             probes: ProbeResults::default(),
             shape: None,
+            verdict: Default::default(),
         },
         NOW,
     );

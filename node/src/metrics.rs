@@ -960,8 +960,10 @@ fn render_peer_flags(out: &mut String, counts: &crate::net::flags::FlagCounts) {
 }
 
 /// The network survey (`-peersurvey`): `satd_peer_survey_enabled`, and with
-/// the survey on, its records by observed family, mismatches and v2, the
-/// survey connections and the probe outcomes this run. Counts only, no
+/// the survey on, its records by observed family, claimed family and fake
+/// claimed family, the closed-early ones, mismatches and v2, the survey
+/// connections and the probe outcomes this run. Each record is in one of
+/// the family, claimed, fake and closed-early series only. Counts only, no
 /// address.
 fn render_peer_survey(out: &mut String, m: Option<&crate::net::manager::SurveyMetrics>) {
     use crate::net::fingerprint::Family;
@@ -988,7 +990,7 @@ fn render_peer_survey(out: &mut String, m: Option<&crate::net::manager::SurveyMe
     metric_header(
         out,
         "satd_peer_survey_family",
-        "Survey records by the implementation family the handshake matched; unknown when none matched.",
+        "Survey records by the implementation family the handshake matched; unknown when none matched and the user agent names none.",
         "gauge",
     );
     for (family, n) in Family::ALL.iter().zip(m.families) {
@@ -998,12 +1000,29 @@ fn render_peer_survey(out: &mut String, m: Option<&crate::net::manager::SurveyMe
     metric_header(
         out,
         "satd_peer_survey_claimed",
-        "Survey records no row matched whose user agent names this family: counted as unknown under satd_peer_survey_family, never as the family.",
+        "Survey records no row matched whose user agent names this family: never counted under satd_peer_survey_family.",
         "gauge",
     );
     for (family, n) in Family::ALL.iter().zip(m.claimed) {
         metric_sample(out, "satd_peer_survey_claimed", &[("family", family.name())], n as u64);
     }
+    metric_header(
+        out,
+        "satd_peer_survey_fake",
+        "Survey records whose user agent names this family on a session no release of it produces (a Core user agent, version and verack only, silent through the wait): never counted under satd_peer_survey_family or satd_peer_survey_claimed.",
+        "gauge",
+    );
+    for (family, n) in Family::ALL.iter().zip(m.fake) {
+        metric_sample(out, "satd_peer_survey_fake", &[("family", family.name())], n as u64);
+    }
+    metric(
+        out,
+        "satd_peer_survey_closed_early",
+        "Survey records whose peer closed the connection before its handshake transcript settled: no fingerprint, counted under no family.",
+        "gauge",
+        &[],
+        m.closed_early as u64,
+    );
     metric(
         out,
         "satd_peer_survey_mismatches",
@@ -2229,6 +2248,8 @@ mod tests {
         m.families[index(Family::Btcd)] = 2;
         m.unknown = 3;
         m.claimed[index(Family::Core)] = 1;
+        m.fake[index(Family::Core)] = 4;
+        m.closed_early = 5;
         let mut out = String::new();
         render_peer_survey(&mut out, Some(&m));
         for line in [
@@ -2236,10 +2257,16 @@ mod tests {
             "satd_peer_survey_family{family=\"unknown\"} 3",
             "satd_peer_survey_claimed{family=\"core\"} 1",
             "satd_peer_survey_claimed{family=\"btcd\"} 0",
+            "satd_peer_survey_fake{family=\"core\"} 4",
+            "satd_peer_survey_fake{family=\"btcd\"} 0",
+            "satd_peer_survey_closed_early 5",
+            "# TYPE satd_peer_survey_fake gauge",
+            "# TYPE satd_peer_survey_closed_early gauge",
         ] {
             assert!(out.lines().any(|l| l == line), "{line} in:\n{out}");
         }
         assert!(!out.contains("satd_peer_survey_claimed{family=\"unknown\"}"));
+        assert!(!out.contains("satd_peer_survey_fake{family=\"unknown\"}"));
 
         let mut counts = crate::net::flags::FlagCounts::default();
         for fp in [

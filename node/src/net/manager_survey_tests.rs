@@ -3,7 +3,7 @@
 
 use super::*;
 use crate::net::fingerprint::{Confidence, Family, Fingerprint};
-use crate::net::survey::{Probe, ProbeOutcome};
+use crate::net::survey::{Probe, ProbeOutcome, Verdict};
 use bitcoin::p2p::Magic;
 use bitcoin::p2p::address::Address;
 
@@ -478,8 +478,8 @@ async fn a_survey_records_the_peer_and_marks_its_address_good() {
 }
 
 /// A peer whose shape no row matches, under a user agent naming a family,
-/// is recorded at `claimed`: under `unknown` in `families`, under its
-/// family in `claimed`, never as observed, with its raw shape kept in the
+/// is recorded at `claimed`: under its family in `claimed`, never in
+/// `families` (as observed or unknown), with its raw shape kept in the
 /// record and shown by `getpeersurvey true`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_survey_of_a_shape_no_row_matches_is_claimed_and_keeps_its_shape() {
@@ -493,12 +493,13 @@ async fn a_survey_of_a_shape_no_row_matches_is_claimed_and_keeps_its_shape() {
     let shape = r.shape.expect("the raw shape is kept");
     assert_eq!(shape.commands, ["version", "wtxidrelay", "sendaddrv2", "verack", "inv"]);
     assert!(shape.relay);
+    assert_eq!(r.verdict, Verdict::Classified, "it said more than `verack`: no fake");
     let json = pm.get_peer_survey(false);
     assert_eq!(json["families"]["core"]["count"], 0, "a claim is never an observed family");
-    assert_eq!(json["families"]["unknown"]["count"], 1);
+    assert_eq!(json["families"]["unknown"]["count"], 0, "nor unknown");
     assert_eq!(json["claimed"]["core"]["count"], 1);
     let metrics = pm.survey_metrics().unwrap();
-    assert_eq!((metrics.families[0], metrics.unknown, metrics.claimed[0]), (0, 1, 1));
+    assert_eq!((metrics.families[0], metrics.unknown, metrics.claimed[0]), (0, 0, 1));
     let verbose = pm.get_peer_survey(true);
     let row = &verbose["peers"][0];
     assert_eq!(row["fingerprint"], "core/claimed");
@@ -544,6 +545,64 @@ async fn a_peer_that_closes_over_a_probe_gets_no_more() {
     assert_eq!(r.probes.get(Probe::GetData), Some(ProbeOutcome::Silent));
     assert_eq!(r.probes.get(Probe::Unknown), Some(ProbeOutcome::Disconnected));
     assert_eq!(r.probes.get(Probe::Ping), None);
+    // Its transcript had settled before it closed: judged as it is.
+    assert_eq!(r.verdict, Verdict::Classified);
+    assert_eq!(r.fingerprint, Fingerprint::Known(Family::Core, Confidence::High));
+}
+
+/// A peer that closes the connection during the passive wait, its
+/// transcript still open (a node with full inbound slots evicting the
+/// survey connection, its newest), gets no fingerprint: the record keeps
+/// the `version`'s fields, is closed early, and is counted on that tally
+/// alone. It still counts as a completed survey connection.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_peer_that_closes_during_the_passive_wait_is_closed_early() {
+    let script = Script { after_verack: vec![], hold: Duration::from_secs(1), ..core_script() };
+    let (_got, pm, target, _dir) = survey_one(script, Some(Probe::ALL.to_vec())).await;
+    let r = pm.survey_store().unwrap().get(&PeerAddr::Socket(target)).cloned().expect("a record");
+    assert_eq!(r.verdict, Verdict::ClosedEarly);
+    assert_eq!(r.fingerprint, Fingerprint::Unknown, "no fingerprint");
+    assert_eq!(r.user_agent, "/Satoshi:32.1.0/");
+    assert_eq!(r.protocol_version, 70016);
+    assert!(!r.probes.any(), "no probe after the close");
+    let json = pm.get_peer_survey(false);
+    assert_eq!(json["closed_early"]["count"], 1);
+    assert_eq!(json["closed_early"]["share"], 1.0);
+    for family in ["core", "unknown"] {
+        assert_eq!(json["families"][family]["count"], 0, "{family}: {json}");
+    }
+    assert_eq!(json["claimed"]["core"]["count"], 0);
+    assert_eq!(json["fake"]["core"]["count"], 0);
+    assert_eq!(json["connections"]["completed"], 1);
+    let m = pm.survey_metrics().unwrap();
+    assert_eq!((m.closed_early, m.unknown, m.claimed[0], m.fake[0]), (1, 0, 0, 0));
+    assert_eq!(pm.get_peer_survey(true)["peers"][0]["fingerprint"], "closed-early");
+}
+
+/// A peer claiming Core at protocol 70016 that sends `version` and
+/// `verack` and then nothing, the connection open through the whole
+/// passive wait, is fake: counted on its own tally under Core, never as
+/// Core, a claim or unknown.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_silent_peer_claiming_core_is_fake() {
+    let script = Script { user_agent: "/Satoshi:25.0.0/", negotiation: vec![], after_verack: vec![], ..core_script() };
+    let (_got, pm, target, _dir) = survey_one(script, None).await;
+    let r = pm.survey_store().unwrap().get(&PeerAddr::Socket(target)).cloned().expect("a record");
+    assert_eq!(r.verdict, Verdict::Fake(Family::Core));
+    assert_eq!(r.fingerprint, Fingerprint::Known(Family::Core, Confidence::Claimed));
+    assert_eq!(r.shape.as_ref().map(|s| s.commands.clone()), Some(vec!["version".to_string(), "verack".to_string()]));
+    let json = pm.get_peer_survey(false);
+    assert_eq!(json["fake"]["core"]["count"], 1);
+    for family in ["core", "unknown"] {
+        assert_eq!(json["families"][family]["count"], 0, "{family}: {json}");
+    }
+    assert_eq!(json["claimed"]["core"]["count"], 0);
+    assert_eq!(json["closed_early"]["count"], 0);
+    let m = pm.survey_metrics().unwrap();
+    assert_eq!((m.fake[0], m.claimed[0], m.unknown, m.closed_early), (1, 0, 0, 0));
+    let row = &pm.get_peer_survey(true)["peers"][0];
+    assert_eq!(row["fingerprint"], "fake/core");
+    assert_eq!(row["claimed"], "core");
 }
 
 /// A survey dial that fails counts as failed and marks an attempt on the
