@@ -590,6 +590,10 @@ impl Electrum {
 /// the flag, and output `vout` described as its bare `OP_RETURN`.
 fn as_stripped_esplora(mut tx: serde_json::Value, vout: usize, script_len: usize) -> serde_json::Value {
     tx["opreturn_stripped"] = serde_json::json!(true);
+    // The sigop cost is not served once the script it would be counted over
+    // is gone; before the strip it was there.
+    assert!(tx["sigops"].is_u64(), "premise: the intact transaction has sigops: {tx}");
+    tx.as_object_mut().unwrap().remove("sigops");
     let out = &mut tx["vout"][vout];
     out["scriptpubkey"] = serde_json::json!("6a");
     out["scriptpubkey_asm"] = serde_json::json!("OP_RETURN");
