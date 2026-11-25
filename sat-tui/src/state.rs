@@ -1836,7 +1836,7 @@ impl AppState {
         match poll {
             Poll::On(c) => {
                 self.rpc_failures.remove("getcrawlinfo");
-                self.crawl = Some(c);
+                self.crawl = Some(*c);
             }
             Poll::Hidden => {
                 self.rpc_failures.remove("getcrawlinfo");

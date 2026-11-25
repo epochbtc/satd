@@ -26,6 +26,20 @@
 //! more. A session ends with our FIN and a short wait for the peer's, so
 //! unread bytes do not turn the close into a reset.
 //!
+//! # Verdicts
+//!
+//! A session whose peer closes the connection during the passive wait,
+//! before its handshake transcript settles, is closed early
+//! ([`Verdict::ClosedEarly`](crate::net::survey::Verdict::ClosedEarly)): the
+//! node is reached (it sent its `version` and `verack`) and its observation
+//! keeps what the `version` said, but it has no fingerprint. A Core node
+//! with full inbound slots evicts the youngest connection of its largest
+//! network group, which a crawl session seconds old often is. One that
+//! claims Core and sends nothing but `version` and `verack` through the
+//! whole wait, the connection open, is fake ([`survey::is_fake_core`]).
+//! Neither changes the reachability, transport or timers a session that
+//! ended records.
+//!
 //! # Transport
 //!
 //! BIP 324 first only to a node known to advertise `NODE_P2P_V2`, as Core
@@ -74,7 +88,7 @@ use crate::net::crawlreport;
 use crate::net::crawlsnapshot::{self, SnapshotStore};
 use crate::net::fingerprint::{AddrKind, CrawlFeatures};
 use crate::net::v2transport::V2Greeting;
-use crate::net::survey::{self, ProbeContext, ProbeResults};
+use crate::net::survey::{self, ProbeContext, ProbeResults, Verdict};
 use bitcoin::p2p::address::{AddrV2, AddrV2Message};
 use rand::seq::SliceRandom as _;
 
@@ -256,6 +270,12 @@ impl PeerManager {
             Some(path) => match CrawlBook::load(path, magic, now, params) {
                 Ok(book) => {
                     tracing::info!(entries = book.len(), "Loaded the crawl book");
+                    if book.dropped_old_observations() > 0 {
+                        tracing::info!(
+                            dropped = book.dropped_old_observations(),
+                            "The crawl book is in an older format (version 2 or 3); its entries are kept and their last observations dropped, each to be observed again at its next session"
+                        );
+                    }
                     book
                 }
                 Err(e) => {
@@ -744,6 +764,7 @@ impl PeerManager {
             probes = ?obs.map(|o| o.probes),
             chain_check = ?obs.and_then(|o| o.chain_check),
             shape = ?obs.and_then(|o| o.shape.as_ref()),
+            verdict = ?obs.map(|o| o.verdict),
             "crawl session done"
         );
         let now = crate::time::now_secs();
@@ -1018,11 +1039,21 @@ impl PeerManager {
         let t = run.config.timings;
         let passive_deadline = tokio::time::Instant::now() + t.passive;
         let capture = &mut hs.behavior.handshake;
-        let mut closed = listen_passive(0, &mut writer, &mut read_rx, &abort, passive_deadline, |msg| {
+        let listened = listen_passive(0, &mut writer, &mut read_rx, &abort, passive_deadline, |msg| {
             capture.observe(crate::net::behavior::wire_command(msg), matches!(msg, NetworkMessage::Pong(_)))
         })
-        .await
-        .closed();
+        .await;
+        let mut closed = listened.closed();
+        // Judged on the handshake and the passive wait alone: nothing after
+        // it enters the transcript.
+        let user_agent = crate::net::limits::sanitize_string(&hs.version.user_agent);
+        let verdict = survey::session_verdict(
+            listened.passive_end(),
+            &hs.behavior.handshake,
+            &user_agent,
+            hs.version.version,
+            crawl::CRAWL_PROTOCOL_VERSION,
+        );
 
         let mut getaddr = None;
         let mut answer = None;
@@ -1099,7 +1130,13 @@ impl PeerManager {
         };
         let features = CrawlFeatures { v2: greeting, probes: judged_probes, getaddr: answer_kind };
         let capture = &hs.behavior.handshake;
-        let fingerprint = crate::net::fingerprint::classify_crawl(capture, hs.behavior.version.as_ref(), &features);
+        // A peer that closed before its transcript settled showed nothing
+        // of its implementation: no fingerprint.
+        let fingerprint = if verdict == Verdict::ClosedEarly {
+            crate::net::fingerprint::Fingerprint::Unknown
+        } else {
+            crate::net::fingerprint::classify_crawl(capture, hs.behavior.version.as_ref(), &features)
+        };
         // A shape no row matched (unknown, or only claimed by its user
         // agent) keeps its raw features, so a new implementation or release
         // shows up as many records of one shape before it has a row.
@@ -1118,7 +1155,7 @@ impl PeerManager {
         result.observation = Some(Observation {
             at: crate::time::now_secs(),
             fingerprint,
-            user_agent: crate::net::limits::sanitize_string(&hs.version.user_agent),
+            user_agent,
             protocol_version: hs.version.version,
             services: hs.version.services.to_u64(),
             asn,
@@ -1131,6 +1168,7 @@ impl PeerManager {
             handshake_rtt_ms: Some(hs.rtt_ms),
             getaddr,
             shape,
+            verdict,
         });
         SessionOutput { result, answer }
     }

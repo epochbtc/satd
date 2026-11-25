@@ -58,6 +58,7 @@ fn observation(at: u64) -> Observation {
         handshake_rtt_ms: Some(120),
         getaddr: None,
         shape: None,
+        verdict: Default::default(),
     }
 }
 
@@ -610,10 +611,9 @@ fn a_bad_file_is_refused() {
     // Version 1 had no shapes: set aside, not misread.
     wrong_version[8..12].copy_from_slice(&1u32.to_le_bytes());
     assert!(err(&reseal(wrong_version)).contains("version 1"));
-    // Version 2 had no claimed fingerprint, and reads as it is.
-    let mut v2_file = body.clone();
-    v2_file[8..12].copy_from_slice(&2u32.to_le_bytes());
-    assert_eq!(CrawlBook::decode(&reseal(v2_file), MAGIC, NOW, p).unwrap().len(), full_book().len());
+    let mut v5 = body.clone();
+    v5[8..12].copy_from_slice(&5u32.to_le_bytes());
+    assert!(err(&reseal(v5)).contains("version 5"));
     assert!(err(&reseal(body[..body.len() - 3].to_vec())).contains("truncated"));
     let mut trailing = body.clone();
     trailing.push(0);
@@ -660,6 +660,112 @@ fn an_unknown_shape_is_bounded() {
     encode_shape(&mut buf, &big);
     let back = decode_shape(&mut Reader(&buf)).unwrap();
     assert_eq!(back.commands, vec!["x".repeat(SHAPE_COMMAND_LEN); crate::net::behavior::HANDSHAKE_CAPTURE_MAX]);
+}
+
+/// A fake and a closed-early observation round-trip with their verdicts,
+/// and a later session replaces a closed-early verdict as any newer
+/// observation replaces the last: the entry's reachability, transport and
+/// timers are those of any session that completed a handshake.
+#[test]
+fn verdicts_round_trip_and_a_later_session_replaces_them() {
+    let mut book = full_book();
+    let mut early = observation(NOW + 6);
+    early.fingerprint = Fingerprint::Unknown;
+    early.verdict = Verdict::ClosedEarly;
+    early.shape = Some(shape());
+    let mut fake = observation(NOW + 6);
+    fake.fingerprint = Fingerprint::Known(Family::Core, Confidence::Claimed);
+    fake.user_agent = "/Satoshi:25.0.0/".to_string();
+    fake.verdict = Verdict::Fake(Family::Core);
+    let v1 = |o: Observation| SessionResult { v2: Attempt::NotTried, v1: Attempt::Ok, observation: Some(o) };
+    book.record_result(&v4(2), None, SessionKind::Liveness, v1(early.clone()), NOW + 6);
+    book.record_result(&v4(1), None, SessionKind::Discovery, v1(fake.clone()), NOW + 6);
+    let back = CrawlBook::decode(&book.encode(MAGIC), MAGIC, NOW + 6, BookParams::default()).unwrap();
+    assert_eq!(back.dropped_old_observations(), 0);
+    for (addr, e) in book.rows() {
+        assert_eq!(back.get(addr), Some(e), "{addr:?}");
+    }
+    let e = back.get(&CrawlAddr::Peer(v4(2))).unwrap();
+    assert_eq!(e.observation.as_ref().unwrap().verdict, Verdict::ClosedEarly);
+    assert_eq!(e.last_success, Some(NOW + 6), "closed early is reached");
+    assert_eq!(back.get(&CrawlAddr::Peer(v4(1))).unwrap().observation.as_ref().unwrap().verdict, Verdict::Fake(Family::Core));
+    // The liveness check that closed early kept the discovery's getaddr
+    // answer, as any session that sent none does.
+    assert_eq!(e.observation.as_ref().unwrap().getaddr, Some(GetaddrResult::NoAnswer));
+
+    // A later session that settles replaces the verdict.
+    let settled = observation(NOW + 7);
+    book.record_result(&v4(2), None, SessionKind::Liveness, v1(settled.clone()), NOW + 7);
+    let o = book.get(&CrawlAddr::Peer(v4(2))).unwrap().observation.clone().unwrap();
+    assert_eq!((o.verdict, o.fingerprint), (Verdict::Classified, settled.fingerprint));
+}
+
+/// A file in format 2 or 3, as earlier builds wrote it, stored no verdict:
+/// a closed-early or fake observation cannot be told from the rest. Every
+/// entry is kept, with its reachability, transport, sources and timers,
+/// and every observation is dropped and counted. Each such file is still
+/// read whole: a damaged one is refused, not read with its observations
+/// dropped.
+#[test]
+fn an_older_file_keeps_its_entries_and_drops_their_observations() {
+    let book = full_book();
+    let with_obs = book.rows().filter(|(_, e)| e.observation.is_some()).count();
+    assert_eq!(with_obs, 2, "fixture");
+    let current = book.encode(MAGIC);
+    for version in [3u32, 2] {
+        let old = book.encode_as(MAGIC, version);
+        assert_eq!(u32::from_le_bytes(old[8..12].try_into().unwrap()), version);
+        assert_eq!(old.len() + 2 * with_obs, current.len(), "the current format less two verdict bytes per observation");
+        let back = CrawlBook::decode(&old, MAGIC, NOW + 6, BookParams::default()).unwrap();
+        assert_eq!(back.len(), book.len(), "every entry kept");
+        assert_eq!(back.dropped_old_observations(), with_obs);
+        for (addr, e) in book.rows() {
+            let b = back.get(addr).unwrap();
+            assert!(b.observation.is_none(), "{addr:?}");
+            let kept = CrawlEntry { observation: None, ..e.clone() };
+            assert_eq!(b, &kept, "all but the observation: {addr:?}");
+        }
+        for t in [NOW + 6, NOW + 3 * HOUR, NOW + 2 * DAY] {
+            assert_eq!(back.next_due(t, usize::MAX), book.next_due(t, usize::MAX), "the timers stand");
+        }
+        assert_eq!(back.snapshot(NOW + 6).count(), book.snapshot(NOW + 6).count(), "the reachable set stands");
+        // Written again, it is in the current format, with no observation.
+        let again = back.encode(MAGIC);
+        assert_eq!(u32::from_le_bytes(again[8..12].try_into().unwrap()), FILE_VERSION);
+        assert_eq!(CrawlBook::decode(&again, MAGIC, NOW + 6, BookParams::default()).unwrap().dropped_old_observations(), 0);
+        // Cut short, or damaged in its body: refused.
+        let body = &old[..old.len() - 32];
+        assert!(CrawlBook::decode(&reseal(body[..body.len() - 1].to_vec()), MAGIC, NOW, BookParams::default()).is_err());
+        let mut flipped = old.clone();
+        flipped[40] ^= 1;
+        assert!(CrawlBook::decode(&flipped, MAGIC, NOW, BookParams::default()).unwrap_err().contains("checksum"));
+    }
+}
+
+/// A verdict out of its range is refused, as a damaged file.
+#[test]
+fn a_bad_verdict_is_refused() {
+    let mut book = CrawlBook::default();
+    let a = v4(1);
+    assert!(book.seed(a.clone(), 0, NOW));
+    book.record_result(&a, None, SessionKind::Discovery, v2_ok(NOW), NOW);
+    let bytes = book.encode(MAGIC);
+    // The verdict ends the only observation, and the file's body.
+    let body = &bytes[..bytes.len() - 32];
+    let with = |tag: u8, family: u8| {
+        let mut b = body.to_vec();
+        let n = b.len();
+        b[n - 2] = tag;
+        b[n - 1] = family;
+        reseal(b)
+    };
+    assert_eq!(CrawlBook::decode(&with(0, 0xff), MAGIC, NOW, BookParams::default()).unwrap().len(), 1);
+    let fake = CrawlBook::decode(&with(1, 0), MAGIC, NOW, BookParams::default()).unwrap();
+    assert_eq!(fake.get(&CrawlAddr::Peer(a.clone())).unwrap().observation.as_ref().unwrap().verdict, Verdict::Fake(Family::Core));
+    for (tag, family) in [(3, 0xff), (1, 0xff), (0, 0), (2, 1)] {
+        let err = CrawlBook::decode(&with(tag, family), MAGIC, NOW, BookParams::default()).unwrap_err();
+        assert!(err.contains("verdict") || err.contains("family"), "{tag}/{family}: {err}");
+    }
 }
 
 /// A claimed fingerprint (no row matched; the user agent names the

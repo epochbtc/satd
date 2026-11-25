@@ -17,8 +17,8 @@
 use crate::net::crawlbook::{
     ChainCheck, CrawlAddr, CrawlBook, CrawlEntry, GetaddrResult, Network, Observation,
 };
-use crate::net::fingerprint::{Family, Fingerprint};
-use crate::net::survey;
+use crate::net::fingerprint::{Confidence, Family, Fingerprint};
+use crate::net::survey::{self, Verdict};
 
 /// The networks the crawl dials, in [`Network::ALL`]'s order.
 pub const DIALLED: [Network; 3] = [Network::Ipv4, Network::Ipv6, Network::Onion];
@@ -98,14 +98,26 @@ pub struct Aggregate {
     /// Reachable addresses per observed family (a row matched, at `high`
     /// or `low`), [`Family::ALL`]'s order.
     pub families: [usize; Family::ALL.len()],
-    /// Reachable addresses whose handshake matched no family: the claimed
-    /// ones included.
+    /// Reachable addresses whose handshake matched no family and whose user
+    /// agent names none: neither claimed, fake nor closed early. An address
+    /// with no observation yet (its entry was read from an older book) is
+    /// one: nothing names a family for it.
     pub unknown: usize,
-    /// Of the [`unknown`](Self::unknown) ones, those whose user agent names
-    /// a family (a [`Confidence::Claimed`](crate::net::fingerprint::Confidence::Claimed)
-    /// fingerprint), per family, [`Family::ALL`]'s order. Never counted in
-    /// [`families`](Self::families): a user agent is not an observation.
+    /// Reachable addresses whose handshake matched no family but whose
+    /// user agent names one (a [`Confidence::Claimed`] fingerprint), per
+    /// family, [`Family::ALL`]'s order. Never counted in
+    /// [`families`](Self::families) or [`unknown`](Self::unknown): a user
+    /// agent is not an observation.
     pub claimed: [usize; Family::ALL.len()],
+    /// Reachable addresses whose last session was fake
+    /// ([`Verdict::Fake`]), per claimed family, [`Family::ALL`]'s order.
+    /// Never counted in `families`, `claimed` or `unknown`.
+    pub fake: [usize; Family::ALL.len()],
+    /// Reachable addresses whose last session was closed early
+    /// ([`Verdict::ClosedEarly`]): counted under no family, claim or
+    /// unknown, and as reachable, by network and by transport like any
+    /// other.
+    pub closed_early: usize,
     /// Reachable addresses whose user agent names one family and handshake
     /// another.
     pub mismatches: usize,
@@ -140,27 +152,35 @@ pub fn aggregate(book: &CrawlBook, now: u64) -> Aggregate {
         if e.v2_advertised() {
             agg.v2_advertised += 1;
         }
-        let fp = e.observation.as_ref().map(|o| o.fingerprint).unwrap_or_default();
         let index = |f: Family| Family::ALL.iter().position(|x| *x == f).expect("every family is in ALL");
-        match fp.observed() {
-            Some(f) => agg.families[index(f)] += 1,
-            None => agg.unknown += 1,
-        }
-        if let Some(f) = fp.claimed_only() {
-            agg.claimed[index(f)] += 1;
-        }
-        if matches!(fp, Fingerprint::Mismatch { .. }) {
-            agg.mismatches += 1;
+        // Each reachable address in exactly one of the family, claimed,
+        // fake, closed-early and unknown tallies.
+        let (verdict, fp) = e.observation.as_ref().map_or((Verdict::Classified, Fingerprint::Unknown), |o| (o.verdict, o.fingerprint));
+        match verdict {
+            Verdict::ClosedEarly => agg.closed_early += 1,
+            Verdict::Fake(f) => agg.fake[index(f)] += 1,
+            Verdict::Classified => match fp {
+                Fingerprint::Known(f, Confidence::Claimed) => agg.claimed[index(f)] += 1,
+                Fingerprint::Known(f, _) => agg.families[index(f)] += 1,
+                Fingerprint::Mismatch { observed, .. } => {
+                    agg.families[index(observed)] += 1;
+                    agg.mismatches += 1;
+                }
+                Fingerprint::Unknown => agg.unknown += 1,
+            },
         }
     }
     agg
 }
 
 /// The aggregate as `getcrawlinfo` reports it: `book`, `reachable`,
-/// `transport`, `families`, `claimed` and `mismatches`. Shares are of the
-/// reachable addresses. `families` counts observed families and `unknown`;
-/// `claimed` splits the unknown ones by the family their user agent names,
-/// so it never adds to a family's observed count.
+/// `transport`, `families`, `claimed`, `fake`, `closed_early` and
+/// `mismatches`. Shares are of the reachable addresses. Each reachable
+/// address is counted once among `families` (observed families, and
+/// `unknown`: no row matched and the user agent names no family),
+/// `claimed` (no row matched; the user agent names the family), `fake`
+/// (per claimed family) and `closed_early`, so a claim never adds to a
+/// family's observed count.
 pub fn aggregate_json(agg: &Aggregate, max_entries: usize) -> serde_json::Value {
     let total = agg.reachable_total();
     let share = |n: usize| if total == 0 { 0.0 } else { n as f64 / total as f64 };
@@ -189,10 +209,13 @@ pub fn aggregate_json(agg: &Aggregate, max_entries: usize) -> serde_json::Value 
         families.insert(f.name().to_string(), serde_json::json!({ "count": c, "share": share(c) }));
     }
     families.insert("unknown".to_string(), serde_json::json!({ "count": agg.unknown, "share": share(agg.unknown) }));
-    let mut claimed = serde_json::Map::new();
-    for (f, c) in Family::ALL.iter().zip(agg.claimed) {
-        claimed.insert(f.name().to_string(), serde_json::json!({ "count": c, "share": share(c) }));
-    }
+    let per_family = |counts: &[usize; Family::ALL.len()]| {
+        let mut out = serde_json::Map::new();
+        for (f, c) in Family::ALL.iter().zip(counts) {
+            out.insert(f.name().to_string(), serde_json::json!({ "count": c, "share": share(*c) }));
+        }
+        serde_json::Value::Object(out)
+    };
     serde_json::json!({
         "book": {
             "entries": agg.entries,
@@ -203,7 +226,9 @@ pub fn aggregate_json(agg: &Aggregate, max_entries: usize) -> serde_json::Value 
         "reachable": reachable,
         "transport": transport,
         "families": families,
-        "claimed": claimed,
+        "claimed": per_family(&agg.claimed),
+        "fake": per_family(&agg.fake),
+        "closed_early": { "count": agg.closed_early, "share": share(agg.closed_early) },
         "mismatches": agg.mismatches,
     })
 }
@@ -230,9 +255,9 @@ pub(crate) fn chain_check_name(c: ChainCheck) -> &'static str {
 }
 
 fn observation_json(o: &Observation) -> serde_json::Value {
-    let (claimed, mismatch) = match o.fingerprint {
-        Fingerprint::Mismatch { claimed, .. } => (Some(claimed.name()), true),
-        _ => (None, false),
+    let claimed = match o.fingerprint {
+        Fingerprint::Mismatch { claimed, .. } => Some(claimed.name()),
+        _ => None,
     };
     let getaddr = o.getaddr.map(|g| match g {
         GetaddrResult::Answered { entries, delay_ms } => {
@@ -242,10 +267,10 @@ fn observation_json(o: &Observation) -> serde_json::Value {
     });
     serde_json::json!({
         "time": o.at,
-        "fingerprint": o.fingerprint.to_string(),
-        "family": o.fingerprint.observed().map(Family::name),
+        "fingerprint": o.fingerprint_text(),
+        "family": o.observed_family().map(Family::name),
         "claimed": claimed.or_else(|| Family::claimed_by(&o.user_agent).map(Family::name)),
-        "mismatch": mismatch,
+        "mismatch": o.mismatch(),
         "subver": o.user_agent,
         "version": o.protocol_version,
         "services": format!("{:016x}", o.services),
@@ -264,21 +289,23 @@ fn observation_json(o: &Observation) -> serde_json::Value {
 /// One `getcrawlnodes` row. Without `verbose`: the address, its network,
 /// whether it is reachable now, its last handshake, transport class,
 /// observed family and fingerprint (`core/claimed` when only the user
-/// agent names the family; `family` is then null). With `verbose`: every
-/// field of the entry and of its last observation.
+/// agent names the family, `fake/core` for a fake session, `closed-early`
+/// when the peer closed before its transcript settled; `family` is then
+/// null). With `verbose`: every field of the entry and of its last
+/// observation.
 pub fn row_json(addr: &CrawlAddr, e: &CrawlEntry, now: u64, liveness_secs: u64, verbose: bool) -> serde_json::Value {
     let reachable =
         addr.dialable() && e.last_success.is_some_and(|s| s >= now.saturating_sub(liveness_secs));
     let transport = e.last_success.map(|_| Transport::of(e).name());
-    let fingerprint = e.observation.as_ref().map(|o| o.fingerprint);
+    let o = e.observation.as_ref();
     let mut row = serde_json::json!({
         "addr": addr_text(addr),
         "network": addr.network().name(),
         "reachable": reachable,
         "last_success": e.last_success,
         "transport": transport,
-        "family": fingerprint.and_then(|f| f.observed()).map(Family::name),
-        "fingerprint": fingerprint.map(|f| f.to_string()),
+        "family": o.and_then(Observation::observed_family).map(Family::name),
+        "fingerprint": o.map(Observation::fingerprint_text),
     });
     if verbose {
         let extra = serde_json::json!({

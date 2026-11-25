@@ -165,6 +165,17 @@ impl Listened {
     pub(super) fn closed(self) -> bool {
         matches!(self, Listened::PeerClosed | Listened::Aborted)
     }
+
+    /// The end [`survey::session_verdict`] judges; `None` where the node
+    /// cut the wait short.
+    pub(super) fn passive_end(self) -> Option<PassiveEnd> {
+        match self {
+            Listened::Timeout => Some(PassiveEnd::Timeout),
+            Listened::Settled => Some(PassiveEnd::Settled),
+            Listened::PeerClosed => Some(PassiveEnd::PeerClosed),
+            Listened::Aborted => None,
+        }
+    }
 }
 
 /// The passive wait of a survey or crawl session: take the peer's messages
@@ -530,12 +541,7 @@ impl PeerManager {
         });
 
         let listened = self.survey_listen(id, &mut writer, &mut read_rx, &abort).await;
-        let passive = match listened {
-            Listened::Timeout => Some(PassiveEnd::Timeout),
-            Listened::Settled => Some(PassiveEnd::Settled),
-            Listened::PeerClosed => Some(PassiveEnd::PeerClosed),
-            Listened::Aborted => None,
-        };
+        let passive = listened.passive_end();
         let mut probes = ProbeResults::default();
         let closed = listened.closed()
             || (self.survey.get().is_some_and(|run| run.config.probes)

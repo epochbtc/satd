@@ -121,14 +121,41 @@ The result is `high` when the session matches one family's row, `low` when
 only the `version` fields told two families' rows apart, and a
 **mismatch** when the user agent names another family than the one
 matched. When no row matches, the family the user agent names is reported
-with confidence **`claimed`**: a node that closed before showing its
-traits, or a release whose shape no capture has. A claimed family is
-never counted as observed: `getcrawlinfo`, the metrics and the export
-count it as `unknown`, and give the claim apart. It is never a mismatch.
-A user agent that names no family is `unknown`. Every session no row
-matched keeps its transcript, `relay` flag, BIP 324 greeting and
+with confidence **`claimed`**: a release whose shape no capture has, or a
+node that closed on a probe. A claimed family is never counted as
+observed: `getcrawlinfo`, the metrics and the export count it under
+`claimed`, apart from both its family and `unknown`. It is never a
+mismatch. A user agent that names no family is `unknown`. Every session
+no row matched keeps its transcript, `relay` flag, BIP 324 greeting and
 `getaddr` message in the book, so a new implementation or release shows
 up as many records of one shape before it has a row.
+
+Two kinds of session say nothing about the implementation, and are
+counted apart from every family, claim and `unknown`:
+
+- **Closed early.** The peer closed the connection during the passive
+  wait, before its handshake transcript settled. The node is reached (it
+  sent its `version` and `verack`) and counted as reachable, by network
+  and by transport, with what its `version` said, but it has no
+  fingerprint. These are mostly ordinary Core nodes with full inbound
+  slots: on a new inbound connection Core evicts one, the youngest member
+  of its largest network group, and a crawl connection seconds old is
+  often that one. On a synced mainnet node, the survey's records showed
+  105 such Core nodes. The same address, dialled again, may settle: the
+  next session's verdict replaces it, as any newer observation does.
+- **Fake.** The user agent names Core, the common protocol version is
+  70016 or more, the transcript is exactly `version`, `verack` (no
+  negotiation message between them, nothing after), and the passive wait
+  ran out with the connection still open. Every Core release since 0.21
+  sends `wtxidrelay` and `sendaddrv2` before `verack` at that version and
+  a message within the wait, so no Core node produces this session; on a
+  synced mainnet node 74 nodes claiming `/Satoshi:25.x/` did. It is
+  counted under `fake`, by the family it claims. Only Core has the rule,
+  as the survey's, since the evidence is Core's alone.
+
+Neither changes how the crawl dials the node, how often, or its transport
+class: the session is recorded as any session that completed a handshake
+is.
 
 Connected peers and the network survey are judged the same way against
 rows of their own, captured against an ordinary node's `version`: a
@@ -235,11 +262,19 @@ failures, backoff, the next session of each kind), its transport results
 what its last completed handshake showed: implementation family, sanitized
 user agent, protocol version, services, autonomous system (with `-asmap`),
 probe outcomes, height and its gap to the node's tip, clock offset,
-handshake round trip, and the size and delay of its `getaddr` answer.
+handshake round trip, the size and delay of its `getaddr` answer, and
+whether the session was fake or closed early.
 
 It is written every 10 minutes and at shutdown, and read at startup. A file
 that does not read is renamed with a `.bad-<unix time>` suffix, with a
-warning, and the crawl starts empty. On mainnet the file is around 25 MB and
+warning, and the crawl starts empty. A file written before the fake and
+closed-early verdicts (book version 2 or 3) is read whole, a damaged one
+still set aside, and keeps every entry with its reachability, transport
+results, sources and timers; each entry's last observation is dropped and
+the count logged, since neither version stored whether the peer closed
+during the passive wait. Until its next session such an address counts as
+reachable with no observation (under `unknown`); every reachable address
+has one again within the liveness window. On mainnet the file is around 25 MB and
 the book about 50 MB in memory at its 250,000-entry cap.
 
 **It holds raw IP addresses.** It is written with the data directory's
@@ -313,9 +348,11 @@ where clearnet IP addresses of home nodes are.
                 "v2_only": {"count": 40, "share": 0.0019},
                 "v2_unconfirmed": {"count": 460, "share": 0.0219},
                 "v2_advertised": {"count": 9400, "share": 0.4476}},
-  "families": {"core": {"count": 20100, "share": 0.9571}, "...": "...",
-               "unknown": {"count": 500, "share": 0.0238}},
-  "claimed": {"core": {"count": 310, "share": 0.0148}, "...": "..."},
+  "families": {"core": {"count": 20000, "share": 0.9524}, "...": "...",
+               "unknown": {"count": 100, "share": 0.0048}},
+  "claimed": {"core": {"count": 350, "share": 0.0167}, "...": "..."},
+  "fake": {"core": {"count": 140, "share": 0.0067}, "...": "..."},
+  "closed_early": {"count": 100, "share": 0.0048},
   "mismatches": 12,
   "sessions": {"reached": 50213, "unreached": 140022,
                "in_flight": {"clearnet": 31, "tor": 8}},
@@ -334,8 +371,10 @@ where clearnet IP addresses of home nodes are.
 | `book` | Entries in the book and its cap; entries per network, and those ever reached. I2P and CJDNS are learned only. |
 | `reachable` | Addresses whose last completed handshake is within the liveness window, per dialled network. This is the crawl's count of the reachable network. |
 | `transport` | The reachable addresses in five classes that add up to `reachable.total`: `v2_and_v1`, `v1_only` (v1 worked and the last BIP 324 attempt failed), `v1_v2_untried` (v1 worked and BIP 324 was never tried, the node not advertising it), `v2_only` (a v1 attempt failed within the liveness window of a BIP 324 success), `v2_unconfirmed` (BIP 324 worked, v1 not checked yet). `v2_advertised` counts those whose address was last advertised with `NODE_P2P_V2` (in a `getaddr` answer or the address book), whatever their own `version` said. Shares are of `reachable.total`. |
-| `families` | The reachable addresses per implementation family their handshake matched, `high` or `low` (a mismatch counts under the family observed), and `unknown`: no row matched, the claimed ones included. A family's count never includes a claim. |
-| `claimed` | Of the `unknown` addresses, those whose user agent names a family (confidence `claimed`), per family. Never added to `families`. |
+| `families` | The reachable addresses per implementation family their handshake matched, `high` or `low` (a mismatch counts under the family observed), and `unknown`: no row matched and the user agent names no family. A family's count never includes a claim, a fake or a closed-early address. |
+| `claimed` | The reachable addresses no row matched whose user agent names a family (confidence `claimed`), per family. Never in `families`. |
+| `fake` | The reachable addresses whose last session was fake (a Core user agent; `version` and `verack` only, silent through the wait), per claimed family. Never in `families` or `claimed`. |
+| `closed_early` | The reachable addresses whose peer closed the last session before its handshake settled: no fingerprint, in no family. Each reachable address is counted once among `families`, `claimed`, `fake` and `closed_early`. |
 | `mismatches` | Reachable addresses whose user agent names one family and handshake another. |
 | `sessions` | Sessions since start that completed a handshake (`reached`) or did not (`unreached`), and those open now. |
 | `totals` | The crawl's own bytes, as `getnettotals` names them; not counted there. |
@@ -359,8 +398,8 @@ Without `verbose`, each row is:
 | `reachable` | A handshake within the liveness window. |
 | `last_success` | The last completed handshake, Unix seconds; null if never. |
 | `transport` | Its transport class, as in `getcrawlinfo`; null if never reached. |
-| `family` | The implementation family its last handshake matched; null if none, a claimed family included. |
-| `fingerprint` | The last handshake's result: `core/high`, `btcd/low`, `core/claimed`, `unknown` or `mismatch(claimed=core,observed=btcd)`; null if never reached. |
+| `family` | The implementation family its last handshake matched; null if none, a claimed, fake or closed-early one included. |
+| `fingerprint` | The last handshake's result: `core/high`, `btcd/low`, `core/claimed`, `unknown`, `mismatch(claimed=core,observed=btcd)`, `fake/core` or `closed-early`; null if never reached or not observed since an older book was read. |
 
 `getcrawlnodes true` adds every field of the entry: `dialable`,
 `first_learned`, `last_named`, `sources` (distinct nodes that named it, at
@@ -420,8 +459,9 @@ snapshot, so tools that read those read this:
     "adccb55f12feb805aab99ac4145f6109": [70016, "/Satoshi:32.1.0/", null, 3081, 900000,
       null, null, null, null, null, null, "AS64496", null,
       {"network": "ipv4", "port": "default", "transport": "v2_and_v1",
-       "v2_advertised": true, "family": "core", "confidence": "high",
-       "mismatch": false, "chain_check": null, "last_seen": 1790005980}],
+       "v2_advertised": true, "family": "core", "fingerprint": "core/high",
+       "confidence": "high", "claimed": "core", "mismatch": false,
+       "chain_check": null, "last_seen": 1790005980}],
     "pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.onion": ["..."]
   },
   "satd": {"export": "keyed", "chain": "main", "liveness": 7200,
@@ -451,7 +491,7 @@ Each node is Bitnodes' thirteen fields, then a `satd` object:
 | 6–10 | city, country, latitude, longitude, timezone | null: no geolocation |
 | 11 | ASN | `AS<n>` from `-asmap`; null without one |
 | 12 | organization | null |
-| 13 | `satd` | `network` (`ipv4`, `ipv6`, `onion`), `port` (`default` or `other`), `transport` (as in `getcrawlinfo`), `v2_advertised`, `family` (null when claimed), `confidence` (`high`, `low` or `claimed`; null when unknown or a mismatch), `claimed` (the family the user agent names, if any), `mismatch`, `chain_check`, `last_seen` (its last completed handshake) |
+| 13 | `satd` | `network` (`ipv4`, `ipv6`, `onion`), `port` (`default` or `other`), `transport` (as in `getcrawlinfo`), `v2_advertised`, `family` (null when claimed, fake or closed early), `fingerprint` (as `getcrawlnodes` gives it: `core/high`, `core/claimed`, `fake/core`, `closed-early`, ...), `confidence` (`high`, `low` or `claimed`; null when unknown, a mismatch, fake or closed early), `claimed` (the family the user agent names, if any), `mismatch`, `chain_check`, `last_seen` (its last completed handshake) |
 
 **Keyed, the default.** A clearnet node is listed by its node ID:
 HMAC-SHA256 under the export key of its address as `ip:port` (an IPv6
@@ -499,9 +539,12 @@ is missing or not 32 bytes, it returns an error.
 - `satd_crawl_book_entries{network}`: the book per network.
 - `satd_crawl_reachable{network}`, `satd_crawl_transport{class}`,
   `satd_crawl_v2_advertised`, `satd_crawl_family{family}`,
-  `satd_crawl_claimed{family}` and `satd_crawl_mismatches`: the reachable
-  addresses, as `getcrawlinfo` counts them. A claimed address is under
-  `satd_crawl_family{family="unknown"}`, never under its family.
+  `satd_crawl_claimed{family}`, `satd_crawl_fake{family}`,
+  `satd_crawl_closed_early` and `satd_crawl_mismatches`: the reachable
+  addresses, as `getcrawlinfo` counts them. Each reachable address is in
+  one of the family, claimed, fake and closed-early series only:
+  `satd_crawl_family{family="unknown"}` is what none of the others
+  names.
 - `satd_crawl_sessions_total{result}` (`reached`, `unreached`) and
   `satd_crawl_sessions_in_flight{network}` (`clearnet`, `tor`).
 - `satd_crawl_bytes_sent_total` and `satd_crawl_bytes_recv_total`: the

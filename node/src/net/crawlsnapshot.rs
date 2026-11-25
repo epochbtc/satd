@@ -57,11 +57,11 @@ use hmac::{Hmac, Mac};
 use sha2::Sha256;
 
 use crate::net::crawl::network_of;
-use crate::net::crawlbook::{CrawlBook, CrawlEntry, Network};
+use crate::net::crawlbook::{CrawlBook, CrawlEntry, Network, Observation};
 use crate::net::crawlreport::{self, Transport};
 use crate::net::fingerprint::{Family, Fingerprint};
 use crate::net::peer::PeerAddr;
-use crate::net::survey;
+use crate::net::survey::{self, Verdict};
 
 /// The snapshot directory, in the network's data directory.
 pub const SNAPSHOT_DIR: &str = "crawl";
@@ -229,13 +229,17 @@ fn port_class(peer: &PeerAddr, default_port: u16) -> &'static str {
 }
 
 /// Our fields of a node, the `satd` object after Bitnodes' thirteen.
+/// `fingerprint` reads as `getcrawlnodes` gives it: `fake/core` for a fake
+/// session and `closed-early` for one the peer closed before its
+/// transcript settled, both with a null `family` and `confidence`.
 fn satd_fields(peer: &PeerAddr, e: &CrawlEntry, default_port: u16) -> serde_json::Value {
     let o = e.observation.as_ref();
     let fp = o.map(|o| o.fingerprint).unwrap_or_default();
+    let classified = o.is_none_or(|o| o.verdict == Verdict::Classified);
     // `claimed` confidence comes with a null `family`: the user agent named
     // the family and no row matched, so nothing was observed.
     let confidence = match fp {
-        Fingerprint::Known(_, c) => Some(c.name()),
+        Fingerprint::Known(_, c) if classified => Some(c.name()),
         _ => None,
     };
     serde_json::json!({
@@ -243,10 +247,11 @@ fn satd_fields(peer: &PeerAddr, e: &CrawlEntry, default_port: u16) -> serde_json
         "port": port_class(peer, default_port),
         "transport": Transport::of(e).name(),
         "v2_advertised": e.v2_advertised(),
-        "family": fp.observed().map(Family::name),
+        "family": o.and_then(Observation::observed_family).map(Family::name),
+        "fingerprint": o.map(Observation::fingerprint_text),
         "confidence": confidence,
         "claimed": o.and_then(|o| Family::claimed_by(&o.user_agent)).map(Family::name),
-        "mismatch": matches!(fp, Fingerprint::Mismatch { .. }),
+        "mismatch": o.is_some_and(Observation::mismatch),
         "chain_check": o.and_then(|o| o.chain_check).map(crawlreport::chain_check_name),
         "last_seen": e.last_success,
     })

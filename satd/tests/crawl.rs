@@ -3,7 +3,8 @@
 //! the book checked exactly; the book and its timers across a restart; the
 //! address book's file unchanged by a crawl; no session before the node
 //! leaves initial block download; and what `getcrawlinfo`, `getcrawlnodes`,
-//! the metrics and the status page report of it. A regtest book admits loopback addresses
+//! the metrics and the status page report of it; and a fake node and a
+//! closed-early one counted apart. A regtest book admits loopback addresses
 //! (mainnet, testnet4 and signet never do), and every address here is one,
 //! so nothing is dialled off the host.
 
@@ -33,6 +34,9 @@ struct Shape {
     negotiation: Vec<NetworkMessage>,
     after_verack: Vec<NetworkMessage>,
     answer: Vec<(u16, bool)>,
+    /// Close the connection on the dialler's `verack`, once
+    /// `after_verack` is sent.
+    close_after_verack: bool,
 }
 
 fn core(answer: Vec<(u16, bool)>) -> Shape {
@@ -41,7 +45,20 @@ fn core(answer: Vec<(u16, bool)>) -> Shape {
         negotiation: vec![NetworkMessage::WtxidRelay, NetworkMessage::SendAddrV2],
         after_verack: vec![NetworkMessage::Ping(7)],
         answer,
+        close_after_verack: false,
     }
+}
+
+/// Core with its inbound slots full: it completes the handshake, then
+/// evicts the new connection before sending anything more.
+fn evicting_core() -> Shape {
+    Shape { after_verack: vec![], close_after_verack: true, ..core(vec![]) }
+}
+
+/// An impostor claiming Core 25.0: `version` and `verack`, nothing
+/// between them and nothing after, the connection held open.
+fn fake_core() -> Shape {
+    Shape { user_agent: "/Satoshi:25.0.0/", negotiation: vec![], after_verack: vec![], ..core(vec![]) }
 }
 
 fn btcd(answer: Vec<(u16, bool)>) -> Shape {
@@ -50,6 +67,7 @@ fn btcd(answer: Vec<(u16, bool)>) -> Shape {
         negotiation: vec![NetworkMessage::SendAddrV2],
         after_verack: vec![],
         answer,
+        close_after_verack: false,
     }
 }
 
@@ -112,6 +130,9 @@ fn serve(mut stream: TcpStream, shape: &Shape) -> io::Result<()> {
             NetworkMessage::Verack => {
                 for m in &shape.after_verack {
                     send(&mut stream, m.clone())?;
+                }
+                if shape.close_after_verack {
+                    return Ok(());
                 }
             }
             NetworkMessage::GetAddr => {
@@ -316,10 +337,12 @@ fn check_reports(c: &TestNode, metrics_port: u16, ports: &[u16]) {
     assert_eq!(info["transport"]["v1_only"]["count"], 0, "{info}");
     assert_eq!(info["transport"]["v2_and_v1"]["count"], 2, "{info}");
     assert_eq!(info["transport"]["v2_only"]["count"], 0);
-    let families = info["families"].as_object().unwrap();
-    // Every reachable address in one family or unknown; which family the
-    // classifier gives a crawl session's transcript is its own test's.
-    assert_eq!(families.values().map(|f| f["count"].as_u64().unwrap()).sum::<u64>(), 4, "{info}");
+    // Every reachable address in exactly one of the family (or unknown),
+    // claimed, fake and closed-early tallies; which family the classifier
+    // gives a crawl session's transcript is its own test's.
+    let sum = |key: &str| info[key].as_object().unwrap().values().map(|f| f["count"].as_u64().unwrap()).sum::<u64>();
+    let counted = sum("families") + sum("claimed") + sum("fake") + info["closed_early"]["count"].as_u64().unwrap();
+    assert_eq!(counted, 4, "{info}");
     assert!(info["sessions"]["reached"].as_u64().unwrap() >= 6);
     assert!(info["totals"]["totalbytesrecv"].as_u64().unwrap() > 0);
     let text = info.to_string();
@@ -449,4 +472,100 @@ fn nothing_is_dialled_in_initial_block_download() {
     assert_eq!((info["state"].clone(), info["held_by"].clone()), (json!("running"), json!([])));
     assert_eq!(info["started"], true);
     node.stop();
+}
+
+/// A node that claims Core and sends only `version` and `verack`, holding
+/// the connection open and silent through the passive wait, is fake; one
+/// that closes the connection straight after the handshake is closed
+/// early. Both are reachable and counted by network and transport, and
+/// each is counted on its own tally, in no family, claim or unknown:
+/// `getcrawlinfo`, `getcrawlnodes`, the keyed export and the metrics say
+/// so, and the book keeps the verdicts across a restart.
+#[test]
+fn the_crawl_counts_fake_and_closed_early_apart() {
+    let (lf, fake) = bind();
+    scripted(lf, fake_core());
+    let (le, early) = bind();
+    scripted(le, evicting_core());
+    let metrics_port = find_available_port();
+    let args = [
+        "--maxconnections=0".to_string(),
+        "--crawl=1".to_string(),
+        format!("--crawlseed=127.0.0.1:{fake}"),
+        format!("--crawlseed=127.0.0.1:{early}"),
+        "--loglevel=debug".to_string(),
+        format!("--metricsport={metrics_port}"),
+    ];
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let mut c = TestNode::start(&args);
+    c.rpc_ok("generatetoaddress", vec![json!(1), json!(ADDR)]);
+    // The fake's discovery session waits out its getaddr and probes.
+    wait_for("both sessions", 300, || sessions_done(&c, fake) >= 1 && sessions_done(&c, early) >= 1);
+
+    wait_for("the aggregate", 10, || c.rpc_ok("getcrawlinfo", vec![])["reachable"]["total"] == 2);
+    let info = c.rpc_ok("getcrawlinfo", vec![]);
+    let check_info = |info: &serde_json::Value| {
+        assert_eq!(info["reachable"], json!({ "total": 2, "ipv4": 2, "ipv6": 0, "onion": 0 }), "both reachable: {info}");
+        assert_eq!(info["transport"]["v1_v2_untried"]["count"], 2, "{info}");
+        assert_eq!(info["fake"]["core"], json!({ "count": 1, "share": 0.5 }), "{info}");
+        assert_eq!(info["closed_early"], json!({ "count": 1, "share": 0.5 }), "{info}");
+        assert_eq!(info["families"]["core"]["count"], 0, "{info}");
+        assert_eq!(info["families"]["unknown"]["count"], 0, "{info}");
+        assert_eq!(info["claimed"]["core"]["count"], 0, "{info}");
+        assert_eq!(info["mismatches"], 0);
+    };
+    check_info(&info);
+    assert!(!info.to_string().contains("Satoshi"), "counts only");
+
+    let verbose = c.rpc_call_with_named_params("getcrawlnodes", json!({ "verbose": true })).unwrap();
+    let rows = verbose["result"].as_array().unwrap_or_else(|| panic!("{verbose}"));
+    let row = |port: u16| rows.iter().find(|r| r["addr"] == format!("127.0.0.1:{port}")).expect("a row");
+    let f = row(fake);
+    assert_eq!(f["fingerprint"], "fake/core", "{f}");
+    assert_eq!(f["family"], serde_json::Value::Null);
+    assert_eq!(f["reachable"], true);
+    assert_eq!(f["observation"]["claimed"], "core");
+    assert_eq!(f["observation"]["subver"], "/Satoshi:25.0.0/");
+    let e = row(early);
+    assert_eq!(e["fingerprint"], "closed-early", "{e}");
+    assert_eq!(e["family"], serde_json::Value::Null);
+    assert_eq!((e["reachable"].clone(), e["transport"].clone()), (json!(true), json!("v1_v2_untried")));
+    assert_eq!(e["observation"]["claimed"], "core");
+    assert_eq!(e["observation"]["subver"], "/Satoshi:32.1.0/");
+    assert_eq!(e["observation"]["version"], 70016);
+    assert_eq!(e["observation"]["getaddr"], serde_json::Value::Null, "closed: no getaddr");
+
+    let keyed = c.rpc_ok("dumpcrawlsnapshot", vec![]);
+    let text = keyed.to_string();
+    assert!(!text.contains("127.0.0.1") && !text.contains(&format!(":{fake}")) && !text.contains(&format!(":{early}")));
+    let mut fingerprints: Vec<String> = keyed["nodes"]
+        .as_object()
+        .unwrap()
+        .values()
+        .map(|n| n[13]["fingerprint"].as_str().unwrap().to_string())
+        .collect();
+    fingerprints.sort();
+    assert_eq!(fingerprints, ["closed-early", "fake/core"], "{keyed}");
+
+    let body = reqwest::blocking::get(format!("http://127.0.0.1:{metrics_port}/metrics")).unwrap().text().unwrap();
+    for line in [
+        "satd_crawl_reachable{network=\"ipv4\"} 2",
+        "satd_crawl_fake{family=\"core\"} 1",
+        "satd_crawl_closed_early 1",
+        "satd_crawl_family{family=\"core\"} 0",
+        "satd_crawl_family{family=\"unknown\"} 0",
+        "satd_crawl_claimed{family=\"core\"} 0",
+    ] {
+        assert!(body.lines().any(|l| l == line), "missing `{line}`");
+    }
+    c.stop();
+
+    // The verdicts survive a restart: nothing is due, so the book stands.
+    let book = read_book(&c);
+    let verdict = |b: &CrawlBook, port: u16| b.get(&CrawlAddr::Peer(peer(port))).unwrap().observation.as_ref().unwrap().verdict;
+    assert_eq!(verdict(&book, early), node::net::survey::Verdict::ClosedEarly);
+    assert_eq!(verdict(&book, fake), node::net::survey::Verdict::Fake(node::net::fingerprint::Family::Core));
+    c.restart_preserving_datadir(&args);
+    check_info(&c.rpc_ok("getcrawlinfo", vec![]));
+    c.stop();
 }

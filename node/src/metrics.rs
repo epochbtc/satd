@@ -1055,9 +1055,11 @@ fn render_peer_survey(out: &mut String, m: Option<&crate::net::manager::SurveyMe
 
 /// The network crawl (`-crawl`): `satd_crawl_enabled`, and with the crawl on
 /// whether it runs, its book per network, the reachable addresses per
-/// network, transport class, observed family and claimed family (apart
-/// from the observed), its sessions this run and
-/// its own traffic (apart from `satd_net_bytes_*`). Counts only, no address.
+/// network, transport class, observed family, claimed family and fake
+/// claimed family, the closed-early ones, its sessions this run and its own
+/// traffic (apart from `satd_net_bytes_*`). Each reachable address is in
+/// one of the family, claimed, fake and closed-early series only. Counts
+/// only, no address.
 fn render_crawl(out: &mut String, m: Option<&crate::net::manager::CrawlMetrics>) {
     use crate::net::crawlbook::Network;
     use crate::net::crawlreport::{Transport, DIALLED};
@@ -1116,7 +1118,7 @@ fn render_crawl(out: &mut String, m: Option<&crate::net::manager::CrawlMetrics>)
     metric_header(
         out,
         "satd_crawl_family",
-        "Reachable addresses by the implementation family the handshake matched; unknown when none matched.",
+        "Reachable addresses by the implementation family the handshake matched; unknown when none matched and the user agent names none.",
         "gauge",
     );
     for (family, n) in Family::ALL.iter().zip(a.families) {
@@ -1126,12 +1128,29 @@ fn render_crawl(out: &mut String, m: Option<&crate::net::manager::CrawlMetrics>)
     metric_header(
         out,
         "satd_crawl_claimed",
-        "Reachable addresses whose handshake matched no family but whose user agent names this one; counted under satd_crawl_family{family=\"unknown\"}, never under the family.",
+        "Reachable addresses whose handshake matched no family but whose user agent names this one: never counted under satd_crawl_family.",
         "gauge",
     );
     for (family, n) in Family::ALL.iter().zip(a.claimed) {
         metric_sample(out, "satd_crawl_claimed", &[("family", family.name())], n as u64);
     }
+    metric_header(
+        out,
+        "satd_crawl_fake",
+        "Reachable addresses whose last crawl session named this family in its user agent on a session no release of it produces (a Core user agent, version and verack only, silent through the passive wait): never counted under satd_crawl_family or satd_crawl_claimed.",
+        "gauge",
+    );
+    for (family, n) in Family::ALL.iter().zip(a.fake) {
+        metric_sample(out, "satd_crawl_fake", &[("family", family.name())], n as u64);
+    }
+    metric(
+        out,
+        "satd_crawl_closed_early",
+        "Reachable addresses whose peer closed the last crawl session before its handshake transcript settled: no fingerprint, counted under no family.",
+        "gauge",
+        &[],
+        a.closed_early as u64,
+    );
     metric(
         out,
         "satd_crawl_mismatches",
@@ -2211,9 +2230,9 @@ fn plain_response(status: u16, body: &str) -> hyper::Response<String> {
 mod tests {
     use super::*;
 
-    /// A claimed family is never counted as observed: under
-    /// `satd_crawl_family` it is `unknown`, and only `satd_crawl_claimed`
-    /// carries the family.
+    /// A claimed family is never counted as observed, and a fake or
+    /// closed-early address neither: each has a series of its own, and
+    /// `satd_crawl_family{family="unknown"}` is what none of them names.
     #[test]
     fn the_crawl_metrics_keep_claimed_apart_from_observed() {
         use crate::net::fingerprint::Family;
@@ -2222,6 +2241,8 @@ mod tests {
         m.aggregate.families[index(Family::Btcd)] = 2;
         m.aggregate.unknown = 3;
         m.aggregate.claimed[index(Family::Core)] = 1;
+        m.aggregate.fake[index(Family::Core)] = 4;
+        m.aggregate.closed_early = 5;
         let mut out = String::new();
         render_crawl(&mut out, Some(&m));
         for line in [
@@ -2230,10 +2251,16 @@ mod tests {
             "satd_crawl_family{family=\"unknown\"} 3",
             "satd_crawl_claimed{family=\"core\"} 1",
             "satd_crawl_claimed{family=\"btcd\"} 0",
+            "satd_crawl_fake{family=\"core\"} 4",
+            "satd_crawl_fake{family=\"btcd\"} 0",
+            "satd_crawl_closed_early 5",
+            "# TYPE satd_crawl_fake gauge",
+            "# TYPE satd_crawl_closed_early gauge",
         ] {
             assert!(out.lines().any(|l| l == line), "{line} in:\n{out}");
         }
         assert!(!out.contains("satd_crawl_claimed{family=\"unknown\"}"));
+        assert!(!out.contains("satd_crawl_fake{family=\"unknown\"}"));
     }
 
     /// The survey's and the connected peers' metrics keep a claimed

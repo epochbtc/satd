@@ -4,7 +4,7 @@ use super::*;
 use crate::net::crawlbook::{Attempt, SessionKind, SessionResult};
 use crate::net::fingerprint::Confidence;
 use crate::net::peer::PeerAddr;
-use crate::net::survey::{Probe, ProbeOutcome, ProbeResults};
+use crate::net::survey::{Probe, ProbeOutcome, ProbeResults, Verdict};
 use bitcoin::p2p::address::{AddrV2, AddrV2Message};
 use bitcoin::p2p::ServiceFlags;
 use std::collections::BTreeSet;
@@ -42,6 +42,7 @@ fn observation(fingerprint: Fingerprint, v2: bool) -> Observation {
         our_height: 900_002,
         chain_check: None,
         shape: None,
+        verdict: Default::default(),
         clock_offset_secs: Some(-3),
         handshake_rtt_ms: Some(120),
         getaddr: Some(GetaddrResult::Answered { entries: 812, delay_ms: 21_000 }),
@@ -197,8 +198,11 @@ fn an_empty_book_reports_zeros() {
     }
     for f in Family::ALL {
         assert_eq!(json["families"][f.name()]["count"], 0);
+        assert_eq!(json["claimed"][f.name()], serde_json::json!({ "count": 0, "share": 0.0 }));
+        assert_eq!(json["fake"][f.name()], serde_json::json!({ "count": 0, "share": 0.0 }));
     }
     assert_eq!(json["families"]["unknown"]["share"], 0.0);
+    assert_eq!(json["closed_early"], serde_json::json!({ "count": 0, "share": 0.0 }));
     assert_eq!(nodes_json(&CrawlBook::default(), NOW, true), serde_json::json!([]));
 }
 
@@ -263,14 +267,36 @@ fn rows_without_and_with_verbose() {
     assert_eq!(row(rows, "23.1.5.7:8333")["observation"], serde_json::Value::Null);
 }
 
+/// The reachable addresses in exactly one of the family, claimed, fake,
+/// closed-early and unknown tallies.
+fn counted_once(agg: &Aggregate) -> usize {
+    agg.families.iter().sum::<usize>()
+        + agg.unknown
+        + agg.claimed.iter().sum::<usize>()
+        + agg.fake.iter().sum::<usize>()
+        + agg.closed_early
+}
+
+/// An observation with `verdict`, over v1.
+fn judged(fingerprint: Fingerprint, verdict: Verdict, user_agent: &str) -> SessionResult {
+    let mut o = observation(fingerprint, false);
+    o.verdict = verdict;
+    o.user_agent = user_agent.to_string();
+    SessionResult { v2: Attempt::Failed, v1: Attempt::Ok, observation: Some(o) }
+}
+
 /// A claimed family (no row matched; the user agent names it) is never
-/// counted as observed: `families` counts it as `unknown`, and `claimed`
-/// alone carries the family. The rows say so too: no `family`, and the
-/// fingerprint `core/claimed`.
+/// counted as observed or as unknown: `claimed` alone carries the family.
+/// A fake session and a closed-early one are counted apart again, fake by
+/// its claimed family: `unknown` is only what names no family, and each
+/// reachable address is counted once. A closed-early address is still
+/// reachable, by network and transport like any other. The rows say so
+/// too: no `family`, and the fingerprint `core/claimed`, `fake/core` or
+/// `closed-early`, the claim kept.
 #[test]
 fn a_claimed_family_is_never_counted_as_observed() {
     let mut book = CrawlBook::new(crate::net::crawlbook::BookParams::for_network(bitcoin::Network::Bitcoin));
-    for addr in [v4(1), v4(2), v4(3)] {
+    for addr in [v4(1), v4(2), v4(3), v4(4), v4(5), v4(6)] {
         assert!(book.seed(addr, 1, NOW - HOUR));
     }
     let d = SessionKind::Discovery;
@@ -279,28 +305,66 @@ fn a_claimed_family_is_never_counted_as_observed() {
     let low = Fingerprint::Known(Family::Btcd, Confidence::Low);
     book.record_result(&v4(2), None, d, result(Attempt::Failed, Attempt::Ok, Some(low)), NOW);
     book.record_result(&v4(3), None, d, result(Attempt::Failed, Attempt::Ok, Some(Fingerprint::Unknown)), NOW);
+    book.record_result(&v4(4), None, d, judged(claimed, Verdict::Fake(Family::Core), "/Satoshi:25.0.0/"), NOW);
+    // A fake whose transcript a row matched is still fake, and no
+    // mismatch.
+    let mismatch = Fingerprint::Mismatch { claimed: Family::Core, observed: Family::Btcd };
+    book.record_result(&v4(5), None, d, judged(mismatch, Verdict::Fake(Family::Core), "/Satoshi:25.1.0/"), NOW);
+    book.record_result(&v4(6), None, d, judged(Fingerprint::Unknown, Verdict::ClosedEarly, "/Satoshi:28.1.0/"), NOW);
     let agg = aggregate(&book, NOW);
-    assert_eq!(agg.reachable_total(), 3);
-    assert_eq!(family(&agg, Family::Core), 0, "claimed is not observed");
-    assert_eq!(family(&agg, Family::Btcd), 1, "low is observed");
-    assert_eq!(agg.unknown, 2, "the claimed one and the unknown one");
-    let claimed_of = |f: Family| agg.claimed[Family::ALL.iter().position(|x| *x == f).unwrap()];
-    assert_eq!(claimed_of(Family::Core), 1);
-    assert_eq!(agg.claimed.iter().sum::<usize>(), 1);
-    assert_eq!(agg.mismatches, 0);
-    assert_eq!(agg.families.iter().sum::<usize>() + agg.unknown, agg.reachable_total());
+    assert_eq!(agg.reachable_total(), 6, "a closed-early address is reachable");
+    assert_eq!(agg.transport[Transport::ALL.iter().position(|t| *t == Transport::V1Only).unwrap()], 6);
+    assert_eq!(family(&agg, Family::Core), 0, "claimed is not observed, nor fake");
+    assert_eq!(family(&agg, Family::Btcd), 1, "low is observed; a fake's row is not");
+    assert_eq!(agg.unknown, 1, "only the one that names no family");
+    let of = |counts: &[usize], f: Family| counts[Family::ALL.iter().position(|x| *x == f).unwrap()];
+    assert_eq!(of(&agg.claimed, Family::Core), 1);
+    assert_eq!(agg.claimed.iter().sum::<usize>(), 1, "the fakes are not claimed");
+    assert_eq!(of(&agg.fake, Family::Core), 2);
+    assert_eq!(agg.fake.iter().sum::<usize>(), 2);
+    assert_eq!(agg.closed_early, 1);
+    assert_eq!(agg.mismatches, 0, "a fake is no mismatch");
+    assert_eq!(counted_once(&agg), agg.reachable_total(), "each reachable address in exactly one tally");
 
     let json = aggregate_json(&agg, 250_000);
     assert_eq!(json["families"]["core"]["count"], 0);
-    assert_eq!(json["families"]["unknown"]["count"], 2);
-    assert_eq!(json["claimed"]["core"], serde_json::json!({ "count": 1, "share": 1.0 / 3.0 }));
+    assert_eq!(json["families"]["unknown"]["count"], 1);
+    assert_eq!(json["claimed"]["core"], serde_json::json!({ "count": 1, "share": 1.0 / 6.0 }));
     for f in Family::ALL.iter().filter(|f| **f != Family::Core) {
         assert_eq!(json["claimed"][f.name()]["count"], 0, "{}", f.name());
+        assert_eq!(json["fake"][f.name()]["count"], 0, "{}", f.name());
     }
     assert!(json["claimed"].get("unknown").is_none());
+    assert_eq!(json["fake"]["core"], serde_json::json!({ "count": 2, "share": 2.0 / 6.0 }), "shares are of the reachable");
+    assert!(json["fake"].get("unknown").is_none());
+    assert_eq!(json["closed_early"], serde_json::json!({ "count": 1, "share": 1.0 / 6.0 }));
+    assert!(!json.to_string().contains("Satoshi"), "counts only");
 
     let rows = nodes_json(&book, NOW, true);
-    let row = rows.as_array().unwrap().iter().find(|r| r["addr"] == "23.1.1.7:8333").unwrap();
+    let rows = rows.as_array().unwrap();
+    let at = |i: u8| rows.iter().find(|r| r["addr"] == format!("23.1.{i}.7:8333")).unwrap();
+    for i in [4, 5] {
+        let fake = at(i);
+        assert_eq!(fake["fingerprint"], "fake/core", "{fake}");
+        assert_eq!(fake["family"], serde_json::Value::Null);
+        assert_eq!(fake["observation"]["fingerprint"], "fake/core");
+        assert_eq!(fake["observation"]["family"], serde_json::Value::Null);
+        assert_eq!(fake["observation"]["claimed"], "core");
+        assert_eq!(fake["observation"]["mismatch"], false);
+    }
+    let early = at(6);
+    assert_eq!(early["fingerprint"], "closed-early", "{early}");
+    assert_eq!((early["reachable"].clone(), early["transport"].clone()), (true.into(), "v1_only".into()));
+    assert_eq!(early["observation"]["fingerprint"], "closed-early");
+    assert_eq!(early["observation"]["claimed"], "core", "the user agent's claim is kept");
+    assert_eq!(early["observation"]["subver"], "/Satoshi:28.1.0/");
+    assert_eq!(early["observation"]["version"], 70016);
+    let short = nodes_json(&book, NOW, false);
+    let short = short.as_array().unwrap();
+    assert!(short.iter().any(|r| r["fingerprint"] == "closed-early"));
+    assert_eq!(short.iter().filter(|r| r["fingerprint"] == "fake/core").count(), 2);
+
+    let row = at(1);
     assert_eq!(row["family"], serde_json::Value::Null);
     assert_eq!(row["fingerprint"], "core/claimed");
     assert_eq!(row["observation"]["family"], serde_json::Value::Null);

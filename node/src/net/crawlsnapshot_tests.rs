@@ -8,6 +8,7 @@ use crate::net::fingerprint::Confidence;
 use crate::net::survey::ProbeResults;
 use bitcoin::p2p::ServiceFlags;
 use bitcoin::p2p::address::{AddrV2, AddrV2Message};
+use std::collections::BTreeSet;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 
 /// A day-aligned time, so UTC days and hours fall on round offsets.
@@ -49,6 +50,7 @@ fn observation(asn: Option<u32>) -> Observation {
         our_height: 900_002,
         chain_check: None,
         shape: None,
+        verdict: Default::default(),
         clock_offset_secs: Some(-3),
         handshake_rtt_ms: Some(120),
         getaddr: Some(GetaddrResult::Answered { entries: 812, delay_ms: 21_000 }),
@@ -233,11 +235,12 @@ fn the_export_is_bitnodes_shaped() {
                 assert_eq!(a[i], serde_json::Value::Null, "{k}: {what}");
             }
             let satd = a[13].as_object().unwrap();
-            for f in ["network", "port", "transport", "v2_advertised", "family", "confidence", "claimed", "mismatch", "chain_check", "last_seen"] {
+            for f in ["network", "port", "transport", "v2_advertised", "family", "fingerprint", "confidence", "claimed", "mismatch", "chain_check", "last_seen"] {
                 assert!(satd.contains_key(f), "{k}: satd.{f}");
             }
             assert_eq!(satd["transport"], "v1_only");
             assert_eq!(satd["family"], "core");
+            assert_eq!(satd["fingerprint"], "core/high");
             assert_eq!(satd["confidence"], "high");
             assert_eq!(satd["claimed"], "core", "the family its user agent names");
             assert_eq!(satd["last_seen"], NOW);
@@ -261,9 +264,76 @@ fn a_claimed_family_is_exported_as_no_family() {
     let node = out["nodes"]["23.1.1.7:8333"].as_array().unwrap();
     let satd = &node[13];
     assert_eq!(satd["family"], serde_json::Value::Null);
+    assert_eq!(satd["fingerprint"], "core/claimed");
     assert_eq!(satd["confidence"], "claimed");
     assert_eq!(satd["claimed"], "core");
     assert_eq!(satd["mismatch"], false);
+}
+
+/// A fake node and a closed-early one are exported as no family and no
+/// confidence, their `fingerprint` reading `fake/core` and `closed-early`
+/// and `claimed` kept; the closed-early one is in the reachable set with
+/// its `version`'s fields. Keyed, neither carries its address.
+#[test]
+fn fake_and_closed_early_nodes_are_exported_apart() {
+    let mut book = CrawlBook::new(BookParams::for_network(bitcoin::Network::Bitcoin));
+    let (fake_at, early_at) = (v4(1, 8333), v4(2, 8333));
+    for a in [&fake_at, &early_at] {
+        assert!(book.seed(a.clone(), ServiceFlags::NETWORK.to_u64(), NOW - HOUR));
+    }
+    let mut fake = observation(None);
+    // A fake whose transcript a row matched is still no family.
+    fake.fingerprint = Fingerprint::Mismatch { claimed: Family::Core, observed: Family::Btcd };
+    fake.user_agent = "/Satoshi:25.0.0/".to_string();
+    fake.verdict = Verdict::Fake(Family::Core);
+    let mut early = observation(None);
+    early.fingerprint = Fingerprint::Unknown;
+    early.verdict = Verdict::ClosedEarly;
+    for (a, o) in [(&fake_at, fake), (&early_at, early)] {
+        let result = SessionResult { v2: Attempt::Failed, v1: Attempt::Ok, observation: Some(o) };
+        book.record_result(a, None, SessionKind::Discovery, result, NOW);
+    }
+    let raw = export_json(&book, &ctx(), &Mode::Raw);
+    assert_eq!(raw["total_nodes"], 2, "both reachable");
+    let satd = |key: &str| raw["nodes"][key][13].clone();
+    let f = satd("23.1.1.7:8333");
+    assert_eq!(f["fingerprint"], "fake/core", "{f}");
+    assert_eq!((f["family"].clone(), f["confidence"].clone()), (serde_json::Value::Null, serde_json::Value::Null));
+    assert_eq!(f["claimed"], "core");
+    assert_eq!(f["mismatch"], false);
+    let e = satd("23.1.2.7:8333");
+    assert_eq!(e["fingerprint"], "closed-early", "{e}");
+    assert_eq!((e["family"].clone(), e["confidence"].clone()), (serde_json::Value::Null, serde_json::Value::Null));
+    assert_eq!(e["claimed"], "core");
+    assert_eq!(e["transport"], "v1_only");
+    assert_eq!(raw["nodes"]["23.1.2.7:8333"][1], "/Satoshi:32.1.0/", "the version's user agent is kept");
+
+    // A fake whose fingerprint is the usual claim: still no confidence.
+    let claimed_at = v4(3, 8333);
+    assert!(book.seed(claimed_at.clone(), ServiceFlags::NETWORK.to_u64(), NOW - HOUR));
+    let mut claimed_fake = observation(None);
+    claimed_fake.fingerprint = Fingerprint::Known(Family::Core, Confidence::Claimed);
+    claimed_fake.verdict = Verdict::Fake(Family::Core);
+    let result = SessionResult { v2: Attempt::Failed, v1: Attempt::Ok, observation: Some(claimed_fake) };
+    book.record_result(&claimed_at, None, SessionKind::Discovery, result, NOW);
+    let raw = export_json(&book, &ctx(), &Mode::Raw);
+    let c = &raw["nodes"]["23.1.3.7:8333"][13];
+    assert_eq!((c["fingerprint"].clone(), c["confidence"].clone()), ("fake/core".into(), serde_json::Value::Null), "{c}");
+
+    let keyed = export_json(&book, &ctx(), &keyed(1));
+    let text = keyed.to_string();
+    assert!(!text.contains("23.1.1.7") && !text.contains("23.1.2.7") && !text.contains("23.1.3.7"), "{text}");
+    let fingerprints: BTreeSet<String> = keyed["nodes"]
+        .as_object()
+        .unwrap()
+        .values()
+        .map(|n| n[13]["fingerprint"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(fingerprints, ["closed-early", "fake/core"].map(String::from).into(), "two fakes, one closed early");
+    assert_eq!(keyed["total_nodes"], 3);
+    // The hourly lines are the raw export's nodes.
+    let lines = String::from_utf8(snapshot_lines(&book, &ctx())).unwrap();
+    assert!(lines.contains("\"fingerprint\":\"fake/core\"") && lines.contains("\"fingerprint\":\"closed-early\""), "{lines}");
 }
 
 /// Keyed, no clearnet address and no port is anywhere in the export: not
