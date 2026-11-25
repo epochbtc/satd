@@ -376,6 +376,7 @@ fn netgroup_rule_holds_with_eight_alt_slots() {
                     probes: Default::default(),
                     shape: None,
                     verdict: Default::default(),
+                    retry: Default::default(),
                 },
                 now,
             );
@@ -417,6 +418,7 @@ fn verified_store_candidates_first_and_known_misses_skipped() {
         probes: Default::default(),
         shape: None,
         verdict: Default::default(),
+        retry: Default::default(),
     };
     {
         let mut st = pm.alt_slots.state.lock();
@@ -458,6 +460,7 @@ fn fake_and_closed_early_records_match_no_family_rule() {
         probes: Default::default(),
         shape: None,
         verdict,
+        retry: Default::default(),
     };
     {
         let mut st = pm.alt_slots.state.lock();
@@ -471,7 +474,10 @@ fn fake_and_closed_early_records_match_no_family_rule() {
     for _ in 0..20 {
         assert_eq!(pm.pick_alt_trial(Instant::now(), &[], &config), Some(PeerAddr::Socket(core)));
     }
-    pm.alt_slots.state.lock().results.insert(PeerAddr::Socket(core), rec(Fingerprint::Unknown, CORE, Verdict::ClosedEarly), now);
+    // A closed-early result never replaces a settled one (the store keeps
+    // the earlier fingerprint); a fake one does.
+    let claimed = Fingerprint::Known(Family::Core, Confidence::Claimed);
+    pm.alt_slots.state.lock().results.insert(PeerAddr::Socket(core), rec(claimed, CORE, Verdict::Fake(Family::Core)), now);
     assert_eq!(pm.pick_alt_trial(Instant::now(), &[], &config), None, "every book entry is a known miss");
 }
 
@@ -673,6 +679,7 @@ fn a_trial_result_keeps_the_survey_probes() {
         probes,
         shape: None,
         verdict: Default::default(),
+        retry: Default::default(),
     };
     assert!(pm.insert_survey_record(PeerAddr::Socket(addr), record, now));
     add_peer(&pm, settled(1, addr, Some(AltRole::Trial), known(Family::Btcd), BTCD));

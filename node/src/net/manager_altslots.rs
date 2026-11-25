@@ -631,6 +631,7 @@ impl PeerManager {
                 // A trial is a connected peer, judged as one: never fake or
                 // closed early.
                 verdict: Default::default(),
+                retry: Default::default(),
             },
         ))
     }

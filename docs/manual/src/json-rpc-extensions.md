@@ -324,8 +324,10 @@ the numbers behind each, and the raw counters they are judged from.
 `getpeersurvey [verbose]` reports the opt-in network survey (`-peersurvey`):
 the share of each implementation family among the addresses it reached,
 the families claimed by user agent alone, the fake and closed-early
-records, mismatches, BIP 324 share and the busiest autonomous systems. With
-`verbose`, one row per address, so its output holds peer addresses. See
+records, how many closed-early addresses have a retry pending or none
+left, mismatches, BIP 324 share and the busiest autonomous systems. With
+`verbose`, one row per address (a closed-early one with its retry count
+and next due time), so its output holds peer addresses. See
 [Network survey](peer-behavior.md#network-survey).
 
 `getcrawlinfo` reports the opt-in network crawl (`-crawl`): whether it runs
@@ -333,8 +335,10 @@ or why it is held, the limits in force, the size of its book, its sessions
 and traffic, and its count of the reachable network by network, transport
 (including nodes that speak BIP 324 only) and implementation family, with
 the families claimed by user agent alone and the fake and closed-early
-nodes counted apart. Counts only. `getcrawlnodes [verbose]` returns one row per address in the crawl's
-book, so its output holds raw peer addresses; it is operator control.
+nodes counted apart, and how many closed-early addresses have a retry
+pending or none left. Counts only. `getcrawlnodes [verbose]` returns one row per address in the crawl's
+book (a closed-early one with its retry count and next due time), so its
+output holds raw peer addresses; it is operator control.
 `dumpcrawlsnapshot [raw]` returns the crawl's reachable set shaped as a
 Bitnodes snapshot: keyed by default (clearnet nodes by an HMAC node ID, no
 address or port), raw addresses only with `raw=true`; operator control. See

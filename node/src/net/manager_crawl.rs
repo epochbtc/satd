@@ -40,6 +40,13 @@
 //! Neither changes the reachability, transport or timers a session that
 //! ended records.
 //!
+//! A closed-early session never replaces a settled observation: the entry
+//! keeps its fingerprint. An address with no settled observation is dialled
+//! again on a schedule ([`survey::ClosedEarlyRetry`]: 15 min, 30 min, 1 h,
+//! 2 h, then every 4 h, each spread at random, at most ten times): its next
+//! session (a liveness session, or a discovery once one is due) comes
+//! forward, under the same limits and dial rules as every session.
+//!
 //! # Transport
 //!
 //! BIP 324 first only to a node known to advertise `NODE_P2P_V2`, as Core

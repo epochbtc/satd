@@ -43,6 +43,7 @@
 //! | [`SessionKind::Liveness`] | Every [`BookParams::liveness_secs`] after the last completed handshake. |
 //! | [`SessionKind::V1Recheck`] | For an address whose last v2 attempt succeeded: on first contact, then every [`V1_RECHECK_INTERVAL_SECS`]. A v1 failure next to a v2 success marks it v2-only. |
 //! | Unreachable retry | After [`BACKOFF_SECS`] (1 h, 4 h, 24 h, then daily). An address failing for [`DROP_AFTER_SECS`] that no source named in that time is dropped. |
+//! | Closed-early retry | For an address whose sessions closed early and that has no settled observation: a liveness session after 15 min, 30 min, 1 h, 2 h, then every 4 h, each spread at random, at most ten times ([`ClosedEarlyRetry`]), ahead of its next liveness check. |
 //!
 //! The file holds peer addresses. It is written with the data directory's
 //! permissions (execute bits dropped), as `peersurvey.dat` is.
@@ -58,7 +59,7 @@ use bitcoin::p2p::ServiceFlags;
 use crate::net::fingerprint::{AddrKind, Family, Fingerprint};
 use crate::net::v2transport::V2Greeting;
 use crate::net::peer::PeerAddr;
-use crate::net::survey::{self, Probe, ProbeOutcome, ProbeResults, Reader, Verdict};
+use crate::net::survey::{self, ClosedEarlyRetry, Probe, ProbeOutcome, ProbeResults, Reader, Verdict};
 
 /// The file's name in the network data directory.
 pub const CRAWL_FILE: &str = "crawlbook.dat";
@@ -124,8 +125,10 @@ const FILE_MAGIC: [u8; 8] = *b"satdcrwl";
 /// never stored whether the peer closed during the passive wait, so none
 /// of its observations can be told closed early or fake from the rest:
 /// each entry is kept, its observation dropped
-/// ([`CrawlBook::dropped_old_observations`]).
-const FILE_VERSION: u32 = 4;
+/// ([`CrawlBook::dropped_old_observations`]). 5: each entry ends with its
+/// [`ClosedEarlyRetry`]; a version 4 file reads whole, each entry with no
+/// retry scheduled.
+const FILE_VERSION: u32 = 5;
 
 /// An address in the book. Dialable addresses are [`PeerAddr`]s; I2P and
 /// CJDNS are kept to be counted, never dialled.
@@ -380,6 +383,9 @@ pub struct CrawlEntry {
     pub first_reachable: Option<u64>,
 
     pub observation: Option<Observation>,
+    /// For an address whose last observation is closed early only: when it
+    /// is dialled again. Empty for every other entry.
+    pub closed_early_retry: ClosedEarlyRetry,
 }
 
 impl CrawlEntry {
@@ -408,6 +414,7 @@ impl CrawlEntry {
             reachable_count: 0,
             first_reachable: None,
             observation: None,
+            closed_early_retry: ClosedEarlyRetry::default(),
         }
     }
 
@@ -494,6 +501,11 @@ impl CrawlEntry {
         }
         if discovery <= now {
             return Some((discovery, SessionKind::Discovery));
+        }
+        // A closed-early address's retry: a liveness session, ahead of the
+        // next liveness check.
+        if let Some(at) = self.closed_early_retry.next_due.filter(|at| *at <= now) {
+            return Some((at, SessionKind::Liveness));
         }
         if self.v2_ok == Some(true) {
             let v1 = self.last_v1_check.map_or(success, |c| c + V1_RECHECK_INTERVAL_SECS);
@@ -874,6 +886,15 @@ impl CrawlBook {
     /// completes no handshake backs the address off, and drops it once it
     /// has failed for [`DROP_AFTER_SECS`] with no source naming it.
     ///
+    /// A closed-early session never replaces a settled observation
+    /// (classified or fake): the entry keeps it, and only its reachability,
+    /// transport and timers move on. An entry with no settled observation
+    /// takes the closed-early one and its next retry
+    /// ([`ClosedEarlyRetry::schedule`]); a due retry that completes no
+    /// handshake is spent and the next scheduled. A settled observation
+    /// replaces any (a fake one a classified one too) and clears the
+    /// schedule.
+    ///
     /// `session` is the token [`Self::mark_dialling`] returned (`None` for
     /// a result with no session marked). A result whose token is not the
     /// session open now is stale, from a session abandoned and since
@@ -940,18 +961,33 @@ impl CrawlBook {
                     e.last_discovery = Some(now);
                 }
                 if let Some(mut obs) = result.observation {
-                    // A session that did not send `getaddr`, probe or check
-                    // the chain keeps what the last one that did found.
-                    if let Some(old) = e.observation.take() {
-                        obs.getaddr = obs.getaddr.or(old.getaddr);
-                        obs.chain_check = obs.chain_check.or(old.chain_check);
-                        if !obs.probes.any() {
-                            obs.probes = old.probes;
+                    let settled = e.observation.as_ref().is_some_and(|o| o.verdict != Verdict::ClosedEarly);
+                    if obs.verdict == Verdict::ClosedEarly && settled {
+                        // The settled observation stands, and needs no retry.
+                        e.closed_early_retry = ClosedEarlyRetry::default();
+                    } else {
+                        // A session that did not send `getaddr`, probe or
+                        // check the chain keeps what the last one that did
+                        // found.
+                        if let Some(old) = e.observation.take() {
+                            obs.getaddr = obs.getaddr.or(old.getaddr);
+                            obs.chain_check = obs.chain_check.or(old.chain_check);
+                            if !obs.probes.any() {
+                                obs.probes = old.probes;
+                            }
                         }
+                        if obs.verdict == Verdict::ClosedEarly {
+                            e.closed_early_retry.schedule(now, &mut rand::thread_rng());
+                        } else {
+                            e.closed_early_retry = ClosedEarlyRetry::default();
+                        }
+                        e.observation = Some(obs);
                     }
-                    e.observation = Some(obs);
                 }
             } else {
+                if e.closed_early_retry.due(now) {
+                    e.closed_early_retry.schedule(now, &mut rand::thread_rng());
+                }
                 e.failures = e.failures.saturating_add(1);
                 e.failing_since.get_or_insert(now);
                 let wait = BACKOFF_SECS[(e.failures as usize).min(BACKOFF_SECS.len()) - 1];
@@ -1067,9 +1103,9 @@ impl CrawlBook {
         self.encode_as(network_magic, FILE_VERSION)
     }
 
-    /// The bytes in format `version`: [`FILE_VERSION`], or 3, which holds
-    /// no verdict, for the tests that such a file's observations are
-    /// dropped.
+    /// The bytes in format `version`: [`FILE_VERSION`]; 4, which holds no
+    /// retry schedule; or 3 or 2, which hold no verdict either. The older
+    /// ones are for the tests of how such a file reads.
     fn encode_as(&self, network_magic: [u8; 4], version: u32) -> Vec<u8> {
         let mut buf = Vec::with_capacity(20 + self.entries.len() * 120);
         buf.extend_from_slice(&FILE_MAGIC);
@@ -1114,6 +1150,11 @@ impl CrawlBook {
         for _ in 0..count {
             let addr = decode_crawl_addr(&mut r)?;
             let mut entry = decode_entry(&mut r, version)?;
+            if entry.closed_early_retry != ClosedEarlyRetry::default()
+                && entry.observation.as_ref().is_none_or(|o| o.verdict != Verdict::ClosedEarly)
+            {
+                return Err("a retry on an entry not closed early".to_string());
+            }
             // Read whole first, so a damaged old file is still refused.
             if version < 4 && entry.observation.take().is_some() {
                 dropped_old_observations += 1;
@@ -1258,6 +1299,9 @@ fn encode_entry(buf: &mut Vec<u8>, e: &CrawlEntry, version: u32) {
             encode_observation(buf, o, version);
         }
     }
+    if version >= 5 {
+        survey::encode_retry(buf, e.closed_early_retry);
+    }
 }
 
 /// An entry as file `version` wrote it.
@@ -1272,7 +1316,7 @@ fn decode_entry(r: &mut Reader, version: u32) -> Result<CrawlEntry, String> {
     for _ in 0..n {
         sources.push(r.u64()?);
     }
-    Ok(CrawlEntry {
+    let mut entry = CrawlEntry {
         first_learned,
         last_named,
         sources,
@@ -1296,7 +1340,12 @@ fn decode_entry(r: &mut Reader, version: u32) -> Result<CrawlEntry, String> {
         reachable_count: r.u32()?,
         first_reachable: get_opt_u64(r)?,
         observation: if get_flag(r)? { Some(decode_observation(r, version)?) } else { None },
-    })
+        closed_early_retry: ClosedEarlyRetry::default(),
+    };
+    if version >= 5 {
+        entry.closed_early_retry = survey::decode_retry(r)?;
+    }
+    Ok(entry)
 }
 
 fn encode_observation(buf: &mut Vec<u8>, o: &Observation, version: u32) {

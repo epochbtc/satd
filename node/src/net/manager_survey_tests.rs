@@ -672,3 +672,149 @@ fn the_getheaders_probe_asks_for_one_header_past_genesis() {
     let tip = pm.chain_state.accept_block(&block).expect("connect fixture block").hash();
     assert_eq!(pm.survey_locator(), Some((genesis, tip)));
 }
+
+// ---- Closed-early retries ----
+
+/// A closed-early record as a survey connection writes it.
+fn closed_early_record(now: u64) -> crate::net::survey::SurveyRecord {
+    crate::net::survey::SurveyRecord {
+        fingerprint: Fingerprint::Unknown,
+        user_agent: "/Satoshi:32.1.0/".to_string(),
+        protocol_version: 70016,
+        services: 0x409,
+        v2: false,
+        asn: None,
+        first_seen: now,
+        last_seen: now,
+        probes: Default::default(),
+        shape: None,
+        verdict: Verdict::ClosedEarly,
+        retry: Default::default(),
+    }
+}
+
+/// Record `addr` closed early two hours ago, so its first retry is due now.
+fn closed_early_due(pm: &PeerManager, addr: &PeerAddr) {
+    let then = crate::time::now_secs() - 2 * 60 * 60;
+    assert!(pm.insert_survey_record(addr.clone(), closed_early_record(then), then));
+    let r = pm.survey_store().unwrap().get(addr).unwrap().retry;
+    assert!(r.count >= 1, "fixture");
+    assert!(r.due(crate::time::now_secs()), "fixture: due");
+}
+
+/// A due retry takes the survey's turn ahead of the uniform draw, every
+/// time, whatever the book holds; one not yet due does not.
+#[test]
+fn a_due_retry_takes_the_turn_ahead_of_the_draw() {
+    let (pm, _dir) = mk_pm();
+    enable(&pm, false);
+    for i in 0..50 {
+        book_add(&pm, SocketAddr::from(([1 + i as u8, 2, 3, 4], 8333)));
+    }
+    let retry = PeerAddr::Socket(SocketAddr::from(([9, 9, 9, 9], 8333)));
+    let now = crate::time::now_secs();
+    assert!(pm.insert_survey_record(retry.clone(), closed_early_record(now), now));
+    assert_eq!(pm.next_survey_retry(), None, "scheduled, not yet due");
+    assert_ne!(pm.draw_survey_target(), None);
+    closed_early_due(&pm, &retry);
+    for _ in 0..200 {
+        assert_eq!(pm.next_survey_retry(), Some(retry.clone()));
+    }
+    let json = pm.get_peer_survey(true);
+    assert_eq!(json["retries"], serde_json::json!({ "pending": 1, "exhausted": 0 }), "{json}");
+    assert_eq!(json["peers"][0]["retry"]["count"], 2, "a second closed-early record: the second retry");
+    assert_eq!(pm.survey_metrics().unwrap().retries_pending, 1);
+}
+
+/// A due retry is passed over as a drawn address would be: one the
+/// operator named, a banned one, one connected or being dialled, a bad
+/// port, one on a network the node does not reach. The draw then takes
+/// the turn.
+#[test]
+fn a_due_retry_is_passed_over_as_the_draw_passes_over() {
+    let (pm, _dir) = mk_pm();
+    enable(&pm, false);
+    let named = SocketAddr::from(([1, 1, 1, 1], 8333));
+    let banned = SocketAddr::from(([2, 2, 2, 2], 8333));
+    let connected = SocketAddr::from(([3, 3, 3, 3], 8333));
+    let bad_port = SocketAddr::from(([4, 4, 4, 4], 22));
+    let dialling = SocketAddr::from(([5, 5, 5, 5], 8333));
+    let onion = PeerAddr::Onion { host: ONION.to_string(), port: 8333 };
+    pm.manual_addrs.write().insert(named);
+    let _ = pm.ban_list.write().add(
+        &crate::net::ban::BanTarget::Net(ipnet::IpNet::from(banned.ip())),
+        crate::time::now_secs(),
+        crate::time::now_secs() + 3_600,
+    );
+    add_handle(&pm, outbound(1, connected, ConnType::OutboundFullRelay, PeerState::Connected));
+    pm.pending_connections.write().insert(dialling);
+    for a in [named, banned, connected, bad_port, dialling] {
+        closed_early_due(&pm, &PeerAddr::Socket(a));
+    }
+    closed_early_due(&pm, &onion);
+    assert_eq!(pm.next_survey_retry(), None, "every due retry passed over");
+    let fine = SocketAddr::from(([6, 6, 6, 6], 8333));
+    book_add(&pm, fine);
+    assert_eq!(pm.draw_survey_target(), Some(PeerAddr::Socket(fine)), "the draw takes the turn");
+    closed_early_due(&pm, &PeerAddr::Socket(fine));
+    assert_eq!(pm.next_survey_retry(), Some(PeerAddr::Socket(fine)));
+}
+
+/// A survey turn dials a due retry rather than a drawn address; a retry
+/// whose dial fails is spent and the next scheduled, counted as a failed
+/// survey connection.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_retry_is_spent_and_the_next_scheduled() {
+    let (pm, _dir) = mk_pm();
+    enable(&pm, false);
+    for i in 0..20 {
+        book_add(&pm, SocketAddr::from(([1 + i as u8, 2, 3, 4], 8333)));
+    }
+    // Bound and closed: nothing listens.
+    let target = PeerAddr::Socket(std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap());
+    closed_early_due(&pm, &target);
+    assert_eq!(pm.survey_tick(), Some(target.clone()), "the retry takes the turn");
+    wait_for(|| pm.survey_metrics().unwrap().failed == 1, "the dial fails").await;
+    wait_for(|| !pm.survey_open(), "the dial ends").await;
+    let r = pm.survey_store().unwrap().get(&target).unwrap().retry;
+    assert_eq!(r.count, 2, "spent");
+    let now = crate::time::now_secs();
+    let due = r.next_due.unwrap();
+    assert!((now + 1_440 - 5..=now + 2_160).contains(&due), "30 min, spread: {}", due as i64 - now as i64);
+    assert_eq!(pm.next_survey_retry(), None);
+    assert_eq!(pm.get_peer_survey(false)["retries"]["pending"], 1);
+}
+
+/// A settled address whose later survey closes early keeps its
+/// fingerprint and transcript, only `last_seen` moving on, and gets no
+/// retry: the session still counts as a completed survey connection.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_settled_record_survives_a_later_closed_early_session() {
+    let (pm, _dir) = mk_pm();
+    enable(&pm, false);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let target = listener.local_addr().unwrap();
+    let addr = PeerAddr::Socket(target);
+    book_add(&pm, target);
+    let then = crate::time::now_secs() - 600;
+    let settled = crate::net::survey::SurveyRecord {
+        fingerprint: Fingerprint::Known(Family::Core, Confidence::High),
+        verdict: Verdict::Classified,
+        shape: Some(crate::net::survey::SurveyShape { commands: vec!["version".into(), "verack".into()], relay: true }),
+        ..closed_early_record(then)
+    };
+    assert!(pm.insert_survey_record(addr.clone(), settled.clone(), then));
+    let evicting = Script { after_verack: vec![], hold: Duration::from_secs(1), ..core_script() };
+    let server = tokio::spawn(serve(listener, vec![evicting]));
+    assert_eq!(pm.survey_tick(), Some(addr.clone()));
+    wait_for(|| pm.survey_metrics().unwrap().completed == 1, "the survey connection ends").await;
+    let _ = tokio::time::timeout(Duration::from_secs(10), server).await;
+    let r = pm.survey_store().unwrap().get(&addr).cloned().unwrap();
+    assert!(r.last_seen > then, "last seen moves on");
+    assert_eq!(crate::net::survey::SurveyRecord { last_seen: then, ..r.clone() }, settled, "all else kept");
+    assert_eq!(r.retry, Default::default(), "no retry");
+    let json = pm.get_peer_survey(false);
+    assert_eq!(json["closed_early"]["count"], 0);
+    assert_eq!(json["families"]["core"]["count"], 1);
+    assert_eq!(json["retries"], serde_json::json!({ "pending": 0, "exhausted": 0 }));
+}

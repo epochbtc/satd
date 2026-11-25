@@ -70,6 +70,10 @@ struct Script {
     /// after `verack`, as a Core node with full inbound slots evicts the
     /// connection.
     close_after_verack: bool,
+    /// The connections (counted from 0) on which it closes on the dialler's
+    /// `verack`, sending nothing after it, as a node with full inbound
+    /// slots evicts a new connection.
+    evict_on: Vec<usize>,
 }
 
 fn core_script() -> Script {
@@ -92,6 +96,7 @@ fn core_script() -> Script {
         hang_up_on_getdata: false,
         services: ServiceFlags::NETWORK | ServiceFlags::WITNESS,
         close_after_verack: false,
+        evict_on: Vec::new(),
     }
 }
 
@@ -211,6 +216,9 @@ async fn serve(mut stream: TcpStream, script: Script, log: Log, i: usize) {
                 let _ = conn.send(NetworkMessage::Verack).await;
             }
             NetworkMessage::Verack => {
+                if script.evict_on.contains(&i) {
+                    return;
+                }
                 for m in &script.after_verack {
                     let _ = conn.send(m.clone()).await;
                 }
@@ -1271,4 +1279,91 @@ async fn a_silent_core_claimant_is_fake() {
     let (btcd, _log) = scripted("127.0.0.1", btcd).await;
     let obs = pm.crawl_session(&btcd, SessionKind::Liveness).await.result.observation.unwrap();
     assert_eq!(obs.verdict, Verdict::Classified, "only Core has the rule");
+}
+
+// ---- Closed-early retries ----
+
+/// A closed-early address is dialled again by the tick once its retry is
+/// due, and not before: with a liveness window past the test, only the
+/// retry makes it due. The retry's settled session clears the schedule.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_tick_dials_a_due_retry_and_a_settled_session_clears_it() {
+    let (pm, _dir, _shutdown) = mk_pm_live(None);
+    let run = enable(&pm, CrawlConfig { liveness_secs: 30 * 24 * 60 * 60, ..config() });
+    let (target, log) = scripted("127.0.0.1", Script { evict_on: vec![0], ..core_script() }).await;
+    let key = CrawlAddr::Peer(target.clone());
+    // The first session, closed early, two hours ago: its retry is due.
+    let then = crate::time::now_secs() - 2 * 60 * 60;
+    assert!(run.book.lock().seed(target.clone(), 0, then));
+    let out = pm.crawl_session(&target, SessionKind::Discovery).await;
+    assert_eq!(out.result.observation.as_ref().unwrap().verdict, Verdict::ClosedEarly, "fixture");
+    assert!(run.book.lock().record_result(&target, None, SessionKind::Discovery, out.result, then));
+    let r = pm.crawl_book().unwrap().get(&key).unwrap().closed_early_retry;
+    assert_eq!(r.count, 1);
+    assert!(r.due(crate::time::now_secs()));
+    *run.aggregate.lock() = None;
+    let info = pm.get_crawl_info();
+    assert_eq!(info["retries"], serde_json::json!({ "pending": 1, "exhausted": 0 }), "{info}");
+    assert_eq!(pm.crawl_metrics().unwrap().aggregate.retries_pending, 1);
+    let rows = pm.get_crawl_nodes(false);
+    assert_eq!(rows[0]["retry"], serde_json::json!({ "count": 1, "next_due": r.next_due }), "{rows}");
+
+    let mut sessions = tokio::task::JoinSet::new();
+    pm.crawl_tick(&mut sessions);
+    while sessions.join_next().await.is_some() {}
+    assert_eq!(log.lock().len(), 2, "the retry was dialled");
+    let e = pm.crawl_book().unwrap().get(&key).cloned().unwrap();
+    let obs = e.observation.as_ref().unwrap();
+    assert_eq!(obs.verdict, Verdict::Classified, "{obs:?}");
+    assert_eq!(e.closed_early_retry, Default::default(), "settled: cleared");
+    assert!(pm.get_crawl_nodes(false)[0].get("retry").is_none());
+
+    // Nothing is due now: another tick dials nothing.
+    pm.crawl_tick(&mut sessions);
+    while sessions.join_next().await.is_some() {}
+    assert_eq!(log.lock().len(), 2);
+}
+
+/// A closed-early retry that is not due yet does not make the address due.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_retry_not_yet_due_dials_nothing() {
+    let (pm, _dir, _shutdown) = mk_pm_live(None);
+    let run = enable(&pm, CrawlConfig { liveness_secs: 30 * 24 * 60 * 60, ..config() });
+    let (target, log) = scripted("127.0.0.1", evicting_core()).await;
+    assert!(run.book.lock().seed(target.clone(), 0, crate::time::now_secs()));
+    pm.run_crawl_session(target.clone(), SessionKind::Discovery, None).await;
+    let r = pm.crawl_book().unwrap().get(&CrawlAddr::Peer(target.clone())).unwrap().closed_early_retry;
+    assert_eq!(r.count, 1);
+    assert!(!r.due(crate::time::now_secs()));
+    let mut sessions = tokio::task::JoinSet::new();
+    pm.crawl_tick(&mut sessions);
+    while sessions.join_next().await.is_some() {}
+    assert_eq!(log.lock().len(), 1, "not dialled again");
+}
+
+/// A settled address whose later session closes early keeps its
+/// fingerprint: the observation is the settled one, the reachability and
+/// timers are the later session's, and no retry is scheduled.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_settled_address_keeps_its_fingerprint_when_a_later_session_closes_early() {
+    let (pm, _dir) = mk_pm_with(None);
+    let run = enable(&pm, config());
+    let (target, log) = scripted("127.0.0.1", Script { evict_on: vec![1], ..core_script() }).await;
+    let key = CrawlAddr::Peer(target.clone());
+    assert!(run.book.lock().seed(target.clone(), 0, crate::time::now_secs()));
+    pm.run_crawl_session(target.clone(), SessionKind::Liveness, None).await;
+    let first = pm.crawl_book().unwrap().get(&key).cloned().unwrap();
+    let settled = first.observation.clone().unwrap();
+    assert_eq!(settled.verdict, Verdict::Classified, "fixture: {settled:?}");
+    pm.run_crawl_session(target.clone(), SessionKind::Liveness, None).await;
+    assert_eq!(log.lock().len(), 2);
+    let e = pm.crawl_book().unwrap().get(&key).cloned().unwrap();
+    assert_eq!(e.observation.as_ref(), Some(&settled), "the settled observation stands");
+    assert_eq!(e.reachable_count, 2, "the session counts as reached");
+    assert!(e.last_success >= first.last_success);
+    assert_eq!(e.closed_early_retry, Default::default(), "no retry");
+    *run.aggregate.lock() = None;
+    let info = pm.get_crawl_info();
+    assert_eq!(info["closed_early"]["count"], 0, "{info}");
+    assert_eq!(info["retries"], serde_json::json!({ "pending": 0, "exhausted": 0 }));
 }

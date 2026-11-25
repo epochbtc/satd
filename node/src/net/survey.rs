@@ -65,8 +65,11 @@ pub const SAVE_INTERVAL: Duration = Duration::from_secs(10 * 60);
 pub const TOP_AS: usize = 10;
 
 /// The file as written: each record ends with its [`SurveyShape`], when it
-/// has one, then its [`Verdict`].
-const FILE_MAGIC: [u8; 8] = *b"satdsrv3";
+/// has one, its [`Verdict`], then its [`ClosedEarlyRetry`].
+const FILE_MAGIC: [u8; 8] = *b"satdsrv4";
+/// The third format: verdicts, no retry schedule. Its records are current
+/// and kept, each with no retry scheduled.
+const FILE_MAGIC_V3: [u8; 8] = *b"satdsrv3";
 /// The second format: shapes, no verdict. It never stored whether the peer
 /// closed the connection during the passive wait, so a closed-early record
 /// cannot be told from the rest, and none of its records is kept: such a
@@ -281,6 +284,9 @@ pub struct SurveyRecord {
     /// What the session showed besides its fingerprint: whether the peer
     /// closed early, or claimed a family it did not behave as.
     pub verdict: Verdict,
+    /// For a closed-early record only: when the address is dialled again.
+    /// Empty for every other record.
+    pub retry: ClosedEarlyRetry,
 }
 
 /// How a survey or crawl session's passive wait ended, as far as
@@ -327,6 +333,81 @@ impl Verdict {
             Verdict::Fake(f) => format!("fake/{f}"),
             Verdict::ClosedEarly => "closed-early".to_string(),
         }
+    }
+}
+
+/// How many times an address whose session closed early is dialled again
+/// before the schedule stops ([`ClosedEarlyRetry`]).
+pub const CLOSED_EARLY_RETRIES: u8 = 10;
+
+/// The wait before the first, second, third and fourth retry of an address
+/// whose session closed early; every later retry waits as long as the last.
+pub const CLOSED_EARLY_RETRY_SECS: [u64; 5] = [15 * 60, 30 * 60, 60 * 60, 2 * 60 * 60, 4 * 60 * 60];
+
+/// Each retry's wait is spread at random by up to this share of it, either
+/// way, so a retry is not dialled at a time a peer could predict.
+pub const CLOSED_EARLY_RETRY_SPREAD_PERCENT: u64 = 20;
+
+/// The retry schedule of an address whose sessions closed early
+/// ([`Verdict::ClosedEarly`]) and that has no settled session yet. A node
+/// with full inbound slots evicts its newest inbound connection within a
+/// second of `verack`; dialled again later, it often has room. After each
+/// closed-early session (and each retry that did not connect) the next
+/// retry is due after [`CLOSED_EARLY_RETRY_SECS`], spread by
+/// [`CLOSED_EARLY_RETRY_SPREAD_PERCENT`], until [`CLOSED_EARLY_RETRIES`]
+/// have been scheduled; then none is, and the address waits for an
+/// ordinary visit. A settled session (classified or fake) clears it. The
+/// survey's records and the crawl's entries both hold one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ClosedEarlyRetry {
+    /// Retries scheduled since the address's first closed-early session, at
+    /// most [`CLOSED_EARLY_RETRIES`].
+    pub count: u8,
+    /// When the next retry is due, Unix seconds; `None` with none scheduled.
+    pub next_due: Option<u64>,
+}
+
+impl ClosedEarlyRetry {
+    /// The wait before retry `n` (the first is 1), before its spread.
+    pub fn delay_secs(n: u8) -> u64 {
+        let i = usize::from(n.max(1)).min(CLOSED_EARLY_RETRY_SECS.len()) - 1;
+        CLOSED_EARLY_RETRY_SECS[i]
+    }
+
+    /// Schedule the next retry after a closed-early session, or after a
+    /// retry that did not connect, at `now`: due after the next wait,
+    /// spread at random. Once [`CLOSED_EARLY_RETRIES`] have been scheduled
+    /// none is, and the schedule is exhausted. Returns whether one was.
+    pub fn schedule(&mut self, now: u64, rng: &mut impl Rng) -> bool {
+        if self.count >= CLOSED_EARLY_RETRIES {
+            self.next_due = None;
+            return false;
+        }
+        self.count += 1;
+        let base = Self::delay_secs(self.count);
+        let spread = base * CLOSED_EARLY_RETRY_SPREAD_PERCENT / 100;
+        self.next_due = Some(now + rng.gen_range(base - spread..=base + spread));
+        true
+    }
+
+    /// Whether a retry is due at `now`.
+    pub fn due(&self, now: u64) -> bool {
+        self.next_due.is_some_and(|d| now >= d)
+    }
+
+    /// Whether a retry is scheduled.
+    pub fn pending(&self) -> bool {
+        self.next_due.is_some()
+    }
+
+    /// Whether every retry has been scheduled and none is left.
+    pub fn exhausted(&self) -> bool {
+        self.count >= CLOSED_EARLY_RETRIES && self.next_due.is_none()
+    }
+
+    /// The schedule as the rows give it: `{ "count", "next_due" }`.
+    pub fn json(&self) -> serde_json::Value {
+        serde_json::json!({ "count": self.count, "next_due": self.next_due })
     }
 }
 
@@ -440,6 +521,10 @@ pub struct Aggregate {
     pub top_as: Vec<(u32, usize)>,
     /// Records that carry at least one probe outcome.
     pub probed: usize,
+    /// Closed-early records with a retry scheduled.
+    pub retries_pending: usize,
+    /// Closed-early records with no retry left ([`ClosedEarlyRetry::exhausted`]).
+    pub retries_exhausted: usize,
 }
 
 /// The survey's records, one per address.
@@ -447,8 +532,8 @@ pub struct Aggregate {
 pub struct SurveyStore {
     records: HashMap<PeerAddr, SurveyRecord>,
     max_records: usize,
-    /// Records the file held in an older format (`satdsrv1`, `satdsrv2`),
-    /// dropped as it was read. Never written.
+    /// Records the file held in a format whose records are not kept
+    /// (`satdsrv1`, `satdsrv2`), dropped as it was read. Never written.
     dropped_old_format: usize,
 }
 
@@ -487,13 +572,66 @@ impl SurveyStore {
     /// Record a survey of `addr`. An address seen before keeps its
     /// `first_seen`. Expired records go, then the least recently seen until
     /// the store is within its limit.
-    pub fn insert(&mut self, addr: PeerAddr, mut record: SurveyRecord, now: u64) {
-        if let Some(old) = self.records.get(&addr) {
+    ///
+    /// A closed-early session never replaces a settled record (classified
+    /// or fake): that record keeps its fingerprint, verdict and transcript,
+    /// and only its `last_seen` moves on. Only an address with no settled
+    /// record is recorded closed early, and it is given its next retry
+    /// ([`ClosedEarlyRetry::schedule`]). A settled session replaces any
+    /// record (a fake one a classified one too) and clears the schedule.
+    pub fn insert(&mut self, addr: PeerAddr, record: SurveyRecord, now: u64) {
+        self.insert_with(addr, record, now, &mut rand::thread_rng());
+    }
+
+    /// [`Self::insert`], its retry spread drawn from `rng`.
+    pub fn insert_with(&mut self, addr: PeerAddr, mut record: SurveyRecord, now: u64, rng: &mut impl Rng) {
+        let old = self.records.get(&addr);
+        if let Some(old) = old {
             record.first_seen = old.first_seen.min(record.first_seen);
         }
+        let record = match (old, record.verdict) {
+            (Some(old), Verdict::ClosedEarly) if old.verdict != Verdict::ClosedEarly => SurveyRecord {
+                first_seen: record.first_seen,
+                last_seen: old.last_seen.max(record.last_seen),
+                retry: ClosedEarlyRetry::default(),
+                ..old.clone()
+            },
+            (old, Verdict::ClosedEarly) => {
+                let mut retry = old.map(|o| o.retry).unwrap_or_default();
+                retry.schedule(now, rng);
+                SurveyRecord { retry, ..record }
+            }
+            _ => SurveyRecord { retry: ClosedEarlyRetry::default(), ..record },
+        };
         self.records.insert(addr, record);
         self.expire(now);
         self.evict_to_limit();
+    }
+
+    /// A retry of `addr` that was due at `now` did not connect (the dial
+    /// or the handshake failed): it counts as a retry, and the next is
+    /// scheduled. Returns whether the record changed.
+    pub fn retry_failed(&mut self, addr: &PeerAddr, now: u64) -> bool {
+        match self.records.get_mut(addr) {
+            Some(r) if r.verdict == Verdict::ClosedEarly && r.retry.due(now) => {
+                r.retry.schedule(now, &mut rand::thread_rng());
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// The addresses whose closed-early retry is due at `now`, the longest
+    /// due first, then by address.
+    pub fn due_retries(&self, now: u64) -> Vec<PeerAddr> {
+        let mut due: Vec<(u64, &PeerAddr)> = self
+            .records
+            .iter()
+            .filter(|(_, r)| r.retry.due(now))
+            .filter_map(|(a, r)| r.retry.next_due.map(|d| (d, a)))
+            .collect();
+        due.sort_unstable();
+        due.into_iter().map(|(_, a)| a.clone()).collect()
     }
 
     /// Drop the records not seen for [`EXPIRY_SECS`].
@@ -548,6 +686,12 @@ impl SurveyStore {
             if let Some(asn) = r.asn {
                 *by_as.entry(asn).or_default() += 1;
             }
+            if r.retry.pending() {
+                agg.retries_pending += 1;
+            }
+            if r.verdict == Verdict::ClosedEarly && r.retry.exhausted() {
+                agg.retries_exhausted += 1;
+            }
         }
         let mut top: Vec<(u32, usize)> = by_as.into_iter().collect();
         top.sort_unstable_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
@@ -559,17 +703,19 @@ impl SurveyStore {
     /// The file's bytes: a magic, the network magic, the records, then the
     /// hash256 of everything before it.
     pub fn encode(&self, network_magic: [u8; 4]) -> Vec<u8> {
-        self.encode_as(network_magic, 3)
+        self.encode_as(network_magic, 4)
     }
 
-    /// The bytes in format `format`: 3, the current one; 2 (`satdsrv2`),
-    /// which holds no verdict; or 1 (`satdsrv1`), which holds no shape
-    /// either. The older two are for the tests that such a file is dropped.
+    /// The bytes in format `format`: 4, the current one; 3 (`satdsrv3`),
+    /// which holds no retry schedule; 2 (`satdsrv2`), which holds no
+    /// verdict either; or 1 (`satdsrv1`), which holds no shape either. The
+    /// older ones are for the tests of how such a file reads.
     fn encode_as(&self, network_magic: [u8; 4], format: u8) -> Vec<u8> {
         let mut buf = Vec::with_capacity(16 + self.records.len() * 100);
         buf.extend_from_slice(match format {
             1 => &FILE_MAGIC_V1,
             2 => &FILE_MAGIC_V2,
+            3 => &FILE_MAGIC_V3,
             _ => &FILE_MAGIC,
         });
         buf.extend_from_slice(&network_magic);
@@ -600,6 +746,9 @@ impl SurveyStore {
             if format >= 3 {
                 encode_verdict(&mut buf, r.verdict);
             }
+            if format >= 4 {
+                encode_retry(&mut buf, r.retry);
+            }
         }
         let checksum = sha256d::Hash::hash(&buf);
         buf.extend_from_slice(checksum.as_byte_array());
@@ -618,7 +767,8 @@ impl SurveyStore {
         }
         let mut r = Reader(body);
         let format = match r.take(8)? {
-            m if m == FILE_MAGIC => 3,
+            m if m == FILE_MAGIC => 4,
+            m if m == FILE_MAGIC_V3 => 3,
             m if m == FILE_MAGIC_V2 => 2,
             m if m == FILE_MAGIC_V1 => 1,
             _ => return Err("not a survey file".to_string()),
@@ -649,6 +799,12 @@ impl SurveyStore {
             }
             let shape = if format >= 2 { decode_shape(&mut r)? } else { None };
             let verdict = if format >= 3 { decode_verdict(&mut r)? } else { Verdict::Classified };
+            // A `satdsrv3` record has no schedule: its address is retried
+            // after its next closed-early session.
+            let retry = if format >= 4 { decode_retry(&mut r)? } else { ClosedEarlyRetry::default() };
+            if verdict != Verdict::ClosedEarly && retry != ClosedEarlyRetry::default() {
+                return Err("a retry on a settled record".to_string());
+            }
             store.records.insert(
                 addr,
                 SurveyRecord {
@@ -663,6 +819,7 @@ impl SurveyStore {
                     probes,
                     shape,
                     verdict,
+                    retry,
                 },
             );
         }
@@ -794,6 +951,29 @@ pub(crate) fn decode_verdict(r: &mut Reader) -> Result<Verdict, String> {
         (2, 0xff) => Ok(Verdict::ClosedEarly),
         (t, f) => Err(format!("bad verdict {t}/{f}")),
     }
+}
+
+/// A retry schedule: its count, then a presence byte and the next due time
+/// (zero with none). `peersurvey.dat` and `crawlbook.dat` both hold it.
+pub(crate) fn encode_retry(buf: &mut Vec<u8>, retry: ClosedEarlyRetry) {
+    buf.push(retry.count);
+    buf.push(u8::from(retry.next_due.is_some()));
+    buf.extend_from_slice(&retry.next_due.unwrap_or(0).to_le_bytes());
+}
+
+pub(crate) fn decode_retry(r: &mut Reader) -> Result<ClosedEarlyRetry, String> {
+    let count = r.u8()?;
+    let present = r.u8()?;
+    let at = r.u64()?;
+    let next_due = match present {
+        0 if at == 0 => None,
+        1 if count > 0 => Some(at),
+        _ => return Err(format!("bad retry schedule {count}/{present}")),
+    };
+    if count > CLOSED_EARLY_RETRIES {
+        return Err(format!("retry count {count}"));
+    }
+    Ok(ClosedEarlyRetry { count, next_due })
 }
 
 /// A shape: a presence byte, then the relay flag, the command count and
@@ -947,6 +1127,7 @@ pub fn aggregate_json(agg: &Aggregate, settings: &serde_json::Value) -> serde_js
         "v2": { "count": agg.v2, "share": share(agg.v2) },
         "top_as": agg.top_as.iter().map(|(asn, n)| serde_json::json!({ "asn": asn, "count": n })).collect::<Vec<_>>(),
         "probed": agg.probed,
+        "retries": { "pending": agg.retries_pending, "exhausted": agg.retries_exhausted },
     });
     if let (Some(o), Some(s)) = (out.as_object_mut(), settings.as_object()) {
         for (k, v) in s {
@@ -984,6 +1165,9 @@ fn row_json(addr: &PeerAddr, r: &SurveyRecord) -> serde_json::Value {
     if let Some(shape) = &r.shape {
         row["handshake"] = serde_json::json!(shape.commands);
         row["relay"] = serde_json::json!(shape.relay);
+    }
+    if r.verdict == Verdict::ClosedEarly {
+        row["retry"] = r.retry.json();
     }
     row
 }
@@ -1026,6 +1210,7 @@ mod tests {
             probes: ProbeResults::default(),
             shape: None,
             verdict: Verdict::Classified,
+            retry: ClosedEarlyRetry::default(),
         }
     }
 
@@ -1071,12 +1256,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(SURVEY_FILE);
         store.save(&path, MAGIC).unwrap();
-        assert_eq!(&std::fs::read(&path).unwrap()[..8], b"satdsrv3");
+        assert_eq!(&std::fs::read(&path).unwrap()[..8], b"satdsrv4");
         let back = SurveyStore::load(&path, MAGIC, NOW).unwrap();
         assert_eq!(back.len(), 7);
         assert_eq!(back.dropped_old_format(), 0);
         assert_eq!(back.get(&v4(4)).unwrap().verdict, Verdict::Fake(Family::Core));
         assert_eq!(back.get(&v4(5)).unwrap().verdict, Verdict::ClosedEarly);
+        assert_eq!(back.get(&v4(5)).unwrap().retry.count, 1, "the retry schedule survives the file");
+        assert!(back.get(&v4(5)).unwrap().retry.pending());
         for (addr, r) in store.rows() {
             assert_eq!(back.get(addr), Some(r), "{addr:?}");
         }
@@ -1086,9 +1273,9 @@ mod tests {
     /// empty store and the count dropped is reported: `satdsrv1` (no
     /// shapes; judged before the trait rows) and `satdsrv2` (no verdict;
     /// whether the peer closed early was never stored). `satdsrv2` is the
-    /// current format less the two verdict bytes per record, `satdsrv1` less
-    /// the shape's byte too, and each is still checked whole: a damaged one
-    /// is refused, not read as empty.
+    /// current format less the ten retry bytes and two verdict bytes per
+    /// record, `satdsrv1` less the shape's byte too, and each is still
+    /// checked whole: a damaged one is refused, not read as empty.
     #[test]
     fn a_file_in_an_older_format_is_dropped() {
         let mut store = SurveyStore::default();
@@ -1096,7 +1283,7 @@ mod tests {
         store.insert(v4(2), record(Fingerprint::Mismatch { claimed: Family::Core, observed: Family::Btcd }, NOW), NOW);
         store.insert(v4(3), record(Fingerprint::Unknown, NOW - 3), NOW);
         let current_len = store.encode(MAGIC).len();
-        for (format, magic, less) in [(1u8, b"satdsrv1", 3), (2, b"satdsrv2", 2)] {
+        for (format, magic, less) in [(1u8, b"satdsrv1", 13), (2, b"satdsrv2", 12)] {
             let old = store.encode_as(MAGIC, format);
             assert_eq!(&old[..8], magic);
             assert_eq!(old.len() + less * store.len(), current_len, "format {format}");
@@ -1106,7 +1293,7 @@ mod tests {
             assert_eq!(back.aggregate().addresses, 0);
             // Written again, it is in the current format, empty.
             let again = back.encode(MAGIC);
-            assert_eq!(&again[..8], b"satdsrv3");
+            assert_eq!(&again[..8], b"satdsrv4");
             assert_eq!(SurveyStore::decode(&again, MAGIC, NOW, MAX_RECORDS).unwrap().len(), 0);
             // An old file cut short is refused, not read as empty.
             let mut cut = old[..old.len() - 32 - 1].to_vec();
@@ -1132,9 +1319,10 @@ mod tests {
         store.insert(v4(1), record(Fingerprint::Unknown, NOW), NOW);
         let bytes = store.encode(MAGIC);
         let body = &bytes[..bytes.len() - 32];
+        // The verdict ends the record but for its ten retry bytes.
         let reseal = |tag: u8, family: u8| {
             let mut body = body.to_vec();
-            let n = body.len();
+            let n = body.len() - 10;
             body[n - 2] = tag;
             body[n - 1] = family;
             let sum = sha256d::Hash::hash(&body);
@@ -1150,6 +1338,250 @@ mod tests {
         }
     }
 
+    /// The schedule: 15 min, 30 min, 1 h, 2 h, then 4 h for every later
+    /// retry, each spread by at most a fifth either way; ten retries, then
+    /// none, and the schedule is exhausted.
+    #[test]
+    fn the_retry_schedule_waits_longer_each_time_and_stops_at_ten() {
+        let expect = [900, 1_800, 3_600, 7_200, 14_400, 14_400, 14_400, 14_400, 14_400, 14_400];
+        for (i, want) in expect.iter().enumerate() {
+            assert_eq!(ClosedEarlyRetry::delay_secs(i as u8 + 1), *want, "retry {}", i + 1);
+        }
+        assert_eq!(ClosedEarlyRetry::delay_secs(200), 14_400, "capped at 4 h");
+        let mut rng = rand::rngs::StdRng::seed_from_u64(3);
+        let mut r = ClosedEarlyRetry::default();
+        assert!(!r.pending() && !r.exhausted() && !r.due(NOW));
+        for (i, want) in expect.iter().enumerate() {
+            let now = NOW + i as u64 * 100_000;
+            assert!(r.schedule(now, &mut rng), "retry {} is scheduled", i + 1);
+            assert_eq!(r.count, i as u8 + 1);
+            let due = r.next_due.unwrap();
+            assert!((now + want * 4 / 5..=now + want * 6 / 5).contains(&due), "retry {}: {}", i + 1, due - now);
+            assert!(r.pending() && !r.exhausted());
+            assert!(!r.due(due - 1) && r.due(due));
+        }
+        assert!(!r.schedule(NOW + 2_000_000, &mut rng), "no eleventh");
+        assert_eq!((r.count, r.next_due), (CLOSED_EARLY_RETRIES, None));
+        assert!(r.exhausted() && !r.pending());
+        assert!(!r.schedule(NOW + 3_000_000, &mut rng), "and none after");
+        assert_eq!(CLOSED_EARLY_RETRIES, 10);
+    }
+
+    /// The spread covers its whole range, a fifth either way, and no more.
+    #[test]
+    fn the_retry_spread_is_a_fifth_either_way() {
+        let mut rng = rand::rngs::StdRng::seed_from_u64(11);
+        let (mut lo, mut hi) = (u64::MAX, 0);
+        for _ in 0..4_000 {
+            let mut r = ClosedEarlyRetry::default();
+            r.schedule(NOW, &mut rng);
+            let wait = r.next_due.unwrap() - NOW;
+            lo = lo.min(wait);
+            hi = hi.max(wait);
+        }
+        assert!((720..=730).contains(&lo), "{lo}");
+        assert!((1_070..=1_080).contains(&hi), "{hi}");
+    }
+
+    fn early(last_seen: u64) -> SurveyRecord {
+        SurveyRecord { verdict: Verdict::ClosedEarly, shape: None, ..record(Fingerprint::Unknown, last_seen) }
+    }
+
+    /// A closed-early session never replaces a settled record, classified
+    /// at any confidence or fake: the record keeps its fingerprint, verdict
+    /// and transcript, its `last_seen` moves on, and it gets no retry. A
+    /// fake session replaces a classified record, and a classified session
+    /// any record.
+    #[test]
+    fn a_closed_early_session_keeps_a_settled_record() {
+        let mut store = SurveyStore::default();
+        let mut settled = Vec::new();
+        for (i, (fp, verdict)) in [
+            (Fingerprint::Known(Family::Core, Confidence::High), Verdict::Classified),
+            (Fingerprint::Known(Family::Btcd, Confidence::Low), Verdict::Classified),
+            (Fingerprint::Known(Family::Core, Confidence::Claimed), Verdict::Classified),
+            (Fingerprint::Mismatch { claimed: Family::Core, observed: Family::Btcd }, Verdict::Classified),
+            (Fingerprint::Unknown, Verdict::Classified),
+            (Fingerprint::Known(Family::Core, Confidence::Claimed), Verdict::Fake(Family::Core)),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut r = record(fp, NOW - 100);
+            r.verdict = verdict;
+            r.shape = Some(SurveyShape { commands: vec!["version".into(), "verack".into()], relay: true });
+            r.probes.set(Probe::Ping, ProbeOutcome::Answered(9));
+            store.insert(v4(i as u32), r.clone(), NOW - 100);
+            settled.push((v4(i as u32), r));
+        }
+        for (addr, before) in &settled {
+            let mut later = early(NOW);
+            later.v2 = !before.v2;
+            store.insert(addr.clone(), later, NOW);
+            let after = store.get(addr).unwrap();
+            assert_eq!(after.last_seen, NOW, "{addr:?}: last seen moves on");
+            assert_eq!(&SurveyRecord { last_seen: before.last_seen, ..after.clone() }, before, "{addr:?}: all else kept");
+            assert_eq!(after.retry, ClosedEarlyRetry::default(), "{addr:?}: no retry");
+        }
+        let agg = store.aggregate();
+        assert_eq!((agg.closed_early, agg.retries_pending, agg.retries_exhausted), (0, 0, 0));
+
+        // A fake session replaces a classified record.
+        let mut fake = record(Fingerprint::Known(Family::Core, Confidence::Claimed), NOW + 1);
+        fake.verdict = Verdict::Fake(Family::Core);
+        store.insert(v4(0), fake, NOW + 1);
+        assert_eq!(store.get(&v4(0)).unwrap().verdict, Verdict::Fake(Family::Core));
+        // A classified session replaces a fake one.
+        store.insert(v4(5), record(Fingerprint::Known(Family::Core, Confidence::High), NOW + 1), NOW + 1);
+        assert_eq!(store.get(&v4(5)).unwrap().verdict, Verdict::Classified);
+        assert_eq!(store.get(&v4(5)).unwrap().fingerprint, Fingerprint::Known(Family::Core, Confidence::High));
+    }
+
+    /// An address with no settled record is recorded closed early and given
+    /// a retry after each closed-early session, ten in all; the first
+    /// settled session clears the schedule. Once exhausted, a later
+    /// closed-early session schedules none. A retry that did not connect is
+    /// spent only while due.
+    #[test]
+    fn a_closed_early_address_is_retried_until_it_settles() {
+        let mut store = SurveyStore::default();
+        let mut rng = rand::rngs::StdRng::seed_from_u64(5);
+        store.insert_with(v4(1), early(NOW), NOW, &mut rng);
+        let r = store.get(&v4(1)).unwrap().retry;
+        assert_eq!(r.count, 1);
+        let due = r.next_due.unwrap();
+        assert!((NOW + 720..=NOW + 1_080).contains(&due));
+        assert!(store.due_retries(due - 1).is_empty());
+        assert_eq!(store.due_retries(due), vec![v4(1)]);
+        let agg = store.aggregate();
+        assert_eq!((agg.closed_early, agg.retries_pending, agg.retries_exhausted), (1, 1, 0));
+        let json = survey_json(&store, true, &serde_json::Value::Null);
+        assert_eq!(json["retries"], serde_json::json!({ "pending": 1, "exhausted": 0 }));
+        assert_eq!(json["peers"][0]["retry"], serde_json::json!({ "count": 1, "next_due": due }));
+
+        // A failed dial before the retry is due spends nothing; one when it
+        // is due spends it.
+        assert!(!store.retry_failed(&v4(1), due - 1));
+        assert_eq!(store.get(&v4(1)).unwrap().retry.count, 1);
+        assert!(store.retry_failed(&v4(1), due));
+        assert_eq!(store.get(&v4(1)).unwrap().retry.count, 2);
+        assert!(!store.retry_failed(&v4(9), due), "no record");
+
+        // Closed early again: each time the next retry, then a settled
+        // session clears it.
+        store.insert_with(v4(1), early(NOW + 10), NOW + 10, &mut rng);
+        assert_eq!(store.get(&v4(1)).unwrap().retry.count, 3);
+        store.insert_with(v4(1), record(Fingerprint::Known(Family::Core, Confidence::High), NOW + 20), NOW + 20, &mut rng);
+        let settled = store.get(&v4(1)).unwrap();
+        assert_eq!((settled.verdict, settled.retry), (Verdict::Classified, ClosedEarlyRetry::default()), "reset");
+        assert_eq!(settled.first_seen, NOW, "the first sighting is kept");
+
+        // Ten closed-early sessions after the first, then none scheduled.
+        store.insert_with(v4(2), early(NOW), NOW, &mut rng);
+        for i in 1..=10 {
+            store.insert_with(v4(2), early(NOW + i), NOW + i, &mut rng);
+        }
+        let r = store.get(&v4(2)).unwrap().retry;
+        assert_eq!((r.count, r.next_due), (CLOSED_EARLY_RETRIES, None));
+        assert!(store.due_retries(NOW + 1_000_000).is_empty());
+        assert!(!store.retry_failed(&v4(2), NOW + 1_000_000), "nothing due");
+        store.insert_with(v4(2), early(NOW + 100), NOW + 100, &mut rng);
+        assert_eq!(store.get(&v4(2)).unwrap().retry.next_due, None, "a later closed-early session does not restart it");
+        let agg = store.aggregate();
+        assert_eq!((agg.closed_early, agg.retries_pending, agg.retries_exhausted), (1, 0, 1));
+        let json = survey_json(&store, true, &serde_json::Value::Null);
+        assert_eq!(json["retries"], serde_json::json!({ "pending": 0, "exhausted": 1 }));
+        let rows = json["peers"].as_array().unwrap();
+        let row = rows.iter().find(|r| r["fingerprint"] == "closed-early").unwrap();
+        assert_eq!(row["retry"], serde_json::json!({ "count": 10, "next_due": null }));
+        assert!(rows.iter().find(|r| r["fingerprint"] != "closed-early").unwrap().get("retry").is_none());
+        // Settled after all: cleared.
+        store.insert_with(v4(2), record(Fingerprint::Unknown, NOW + 200), NOW + 200, &mut rng);
+        assert_eq!(store.get(&v4(2)).unwrap().retry, ClosedEarlyRetry::default());
+        assert_eq!(store.aggregate().retries_exhausted, 0);
+    }
+
+    /// Due retries come longest due first, then by address.
+    #[test]
+    fn due_retries_come_longest_due_first() {
+        let mut store = SurveyStore::default();
+        for i in 1..=3 {
+            store.insert(v4(i), early(NOW), NOW);
+        }
+        let due = |a: &PeerAddr| store.get(a).unwrap().retry.next_due.unwrap();
+        let mut want = vec![v4(1), v4(2), v4(3)];
+        want.sort_by_key(|a| (due(a), a.clone()));
+        assert_eq!(store.due_retries(NOW + 2_000), want);
+    }
+
+    /// A `satdsrv3` file, as the previous build wrote it, keeps every
+    /// record and its verdict, each with no retry scheduled; it is the
+    /// current format less the ten retry bytes per record, and still
+    /// checked whole.
+    #[test]
+    fn a_satdsrv3_file_keeps_its_records_with_no_retry() {
+        let mut store = SurveyStore::default();
+        store.insert(v4(1), record(Fingerprint::Known(Family::Core, Confidence::High), NOW), NOW);
+        store.insert(v4(2), early(NOW), NOW);
+        let mut fake = record(Fingerprint::Known(Family::Core, Confidence::Claimed), NOW);
+        fake.verdict = Verdict::Fake(Family::Core);
+        store.insert(v4(3), fake, NOW);
+        assert!(store.get(&v4(2)).unwrap().retry.pending(), "fixture");
+        let old = store.encode_as(MAGIC, 3);
+        assert_eq!(&old[..8], b"satdsrv3");
+        assert_eq!(old.len() + 10 * store.len(), store.encode(MAGIC).len());
+        let back = SurveyStore::decode(&old, MAGIC, NOW, MAX_RECORDS).unwrap();
+        assert_eq!((back.len(), back.dropped_old_format()), (3, 0));
+        for (addr, r) in store.rows() {
+            let b = back.get(addr).unwrap();
+            assert_eq!(b, &SurveyRecord { retry: ClosedEarlyRetry::default(), ..r.clone() }, "{addr:?}");
+        }
+        assert_eq!(back.get(&v4(2)).unwrap().verdict, Verdict::ClosedEarly);
+        assert_eq!(back.aggregate().retries_pending, 0);
+        assert_eq!(&back.encode(MAGIC)[..8], b"satdsrv4");
+        let mut flipped = old.clone();
+        flipped[20] ^= 1;
+        assert!(SurveyStore::decode(&flipped, MAGIC, NOW, MAX_RECORDS).unwrap_err().contains("checksum"));
+        let mut cut = old[..old.len() - 32 - 1].to_vec();
+        let sum = sha256d::Hash::hash(&cut);
+        cut.extend_from_slice(sum.as_byte_array());
+        assert!(SurveyStore::decode(&cut, MAGIC, NOW, MAX_RECORDS).is_err());
+    }
+
+    /// A retry schedule out of its range is refused, as a damaged file: a
+    /// count past ten, a bad presence byte, a due time with no count, a
+    /// time with no presence, or a schedule on a settled record.
+    #[test]
+    fn a_bad_retry_schedule_is_refused() {
+        let mut store = SurveyStore::default();
+        store.insert(v4(1), early(NOW), NOW);
+        let bytes = store.encode(MAGIC);
+        let body = &bytes[..bytes.len() - 32];
+        let reseal = |f: &dyn Fn(&mut Vec<u8>)| {
+            let mut body = body.to_vec();
+            f(&mut body);
+            let sum = sha256d::Hash::hash(&body);
+            body.extend_from_slice(sum.as_byte_array());
+            body
+        };
+        let n = body.len();
+        // The record ends: verdict (2), count, presence, time (8).
+        assert_eq!(body[n - 12], 2, "fixture: closed early");
+        assert!(SurveyStore::decode(&reseal(&|_| {}), MAGIC, NOW, MAX_RECORDS).is_ok());
+        let ten = SurveyStore::decode(&reseal(&|b| b[n - 10] = 10), MAGIC, NOW, MAX_RECORDS).unwrap();
+        assert_eq!(ten.get(&v4(1)).unwrap().retry.count, 10);
+        for (what, f) in [
+            ("count 11", &(|b: &mut Vec<u8>| b[n - 10] = 11) as &dyn Fn(&mut Vec<u8>)),
+            ("presence 2", &|b: &mut Vec<u8>| b[n - 9] = 2),
+            ("due with no count", &|b: &mut Vec<u8>| b[n - 10] = 0),
+            ("time with no presence", &|b: &mut Vec<u8>| b[n - 9] = 0),
+            ("on a classified record", &|b: &mut Vec<u8>| b[n - 12] = 0),
+        ] {
+            let err = SurveyStore::decode(&reseal(f), MAGIC, NOW, MAX_RECORDS).unwrap_err();
+            assert!(err.contains("retry"), "{what}: {err}");
+        }
+    }
+
     /// A shape out of its bounds is refused, as a damaged file.
     #[test]
     fn a_shape_past_its_bounds_is_refused() {
@@ -1158,11 +1590,11 @@ mod tests {
         r.shape = Some(SurveyShape { commands: vec!["version".into()], relay: true });
         store.insert(v4(1), r, NOW);
         let bytes = store.encode(MAGIC);
-        // The shape ends the record but for its two verdict bytes: tag,
-        // relay, count, then `version`.
-        let body = &bytes[..bytes.len() - 32 - 2];
+        // The shape ends the record but for its two verdict bytes and ten
+        // retry bytes: tag, relay, count, then `version`.
+        let body = &bytes[..bytes.len() - 32 - 12];
         let count_at = body.len() - 1 - "version".len() - 1;
-        let verdict = bytes[bytes.len() - 32 - 2..bytes.len() - 32].to_vec();
+        let verdict = bytes[bytes.len() - 32 - 12..bytes.len() - 32].to_vec();
         let reseal = |mut body: Vec<u8>| {
             body.extend_from_slice(&verdict);
             let sum = sha256d::Hash::hash(&body);
