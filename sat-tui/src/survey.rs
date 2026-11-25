@@ -18,6 +18,15 @@
 //! line only where `getcrawlinfo` says `-peersurvey` was asked for, so a
 //! node that never ran the survey shows no survey row.
 //!
+//! Each family's bar is its observed records plus its claimed ones (no row
+//! matched; the user agent names the family), the claimed part drawn
+//! apart. The node also counts fake records (a user agent naming a family
+//! on a session no release of it produces) and closed-early ones (the peer
+//! closed before its handshake settled); neither is in any bar. A node from
+//! before those counts reports no `closed_early`, and counted its claimed
+//! records inside `families.unknown`: for it the unknown bar is that count
+//! less the claimed ones, and the fake and closed-early lines are not drawn.
+//!
 //! Family names come from the node, which is not trusted to keep them
 //! printable: each goes through [`printable`] before it is drawn.
 
@@ -47,6 +56,23 @@ pub const TOP_AS: usize = 5;
 /// Claimed families listed.
 pub const TOP_CLAIMED: usize = 3;
 
+/// Fake families listed.
+pub const TOP_FAKE: usize = 3;
+
+/// One family bar: its observed records, and its claimed ones drawn apart.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FamilyBar {
+    pub name: String,
+    pub observed: u64,
+    pub claimed: u64,
+}
+
+impl FamilyBar {
+    pub fn total(&self) -> u64 {
+        self.observed + self.claimed
+    }
+}
+
 /// The survey's last connection to end.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LastConnection {
@@ -60,13 +86,19 @@ pub struct LastConnection {
 pub struct Survey {
     /// Addresses in the store: those reached in the last [`WINDOW_DAYS`].
     pub addresses: u64,
-    /// `(family, count)` for every family with a record, `unknown`
-    /// included, largest first.
+    /// `(family, count)` for every observed family with a record, and
+    /// `unknown` (no row matched and the user agent names no family),
+    /// largest first.
     pub families: Vec<(String, u64)>,
-    /// `(family, count)` of the `unknown` records whose user agent names a
-    /// family (no row matched), largest first; never in `families` but
-    /// their own. Empty from a node that does not report it.
+    /// `(family, count)` of the records no row matched whose user agent
+    /// names a family, largest first; never in `families`. Empty from a
+    /// node that does not report it.
     pub claimed: Vec<(String, u64)>,
+    /// `(family, count)` of the fake records, largest first; in no bar.
+    pub fake: Vec<(String, u64)>,
+    /// The closed-early records; `None` from a node that does not report
+    /// them (nor `fake`).
+    pub closed_early: Option<u64>,
     pub mismatches: u64,
     pub v2: u64,
     /// `(asn, count)`, largest first, as the node lists them.
@@ -138,8 +170,18 @@ pub fn parse(v: &Value) -> Option<Survey> {
         out.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         out
     };
-    let families = counts("families");
+    let mut families = counts("families");
     let claimed = counts("claimed");
+    let closed_early = v.get("closed_early").map(|c| count(c, "count"));
+    if closed_early.is_none() {
+        // An older node counted its claimed records under `unknown` too.
+        let claimed_total: u64 = claimed.iter().map(|(_, n)| n).sum();
+        if let Some(i) = families.iter().position(|(f, _)| f == "unknown") {
+            families[i].1 = families[i].1.saturating_sub(claimed_total);
+        }
+        families.retain(|(_, n)| *n > 0);
+        families.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    }
     let top_as = v
         .get("top_as")
         .and_then(Value::as_array)
@@ -156,6 +198,8 @@ pub fn parse(v: &Value) -> Option<Survey> {
         addresses,
         families,
         claimed,
+        fake: counts("fake"),
+        closed_early,
         mismatches: count(v, "mismatches"),
         v2: v.get("v2").map(|x| count(x, "count")).unwrap_or(0),
         top_as,
@@ -174,22 +218,42 @@ impl Survey {
         if self.addresses == 0 { 0.0 } else { n as f64 * 100.0 / self.addresses as f64 }
     }
 
-    /// The bars: the [`TOP_FAMILIES`] largest families, the rest folded
-    /// into `other`.
-    pub fn family_bars(&self) -> Vec<(String, u64)> {
-        if self.families.len() <= TOP_FAMILIES {
-            return self.families.clone();
+    /// The bars: each family's observed and claimed records together, the
+    /// [`TOP_FAMILIES`] largest, the rest folded into `other`. `unknown`
+    /// holds only the records no family is named for; fake and closed-early
+    /// records are in no bar.
+    pub fn family_bars(&self) -> Vec<FamilyBar> {
+        let mut bars: Vec<FamilyBar> =
+            self.families.iter().map(|(name, n)| FamilyBar { name: name.clone(), observed: *n, claimed: 0 }).collect();
+        for (name, n) in &self.claimed {
+            match bars.iter_mut().find(|b| b.name == *name) {
+                Some(b) => b.claimed += n,
+                None => bars.push(FamilyBar { name: name.clone(), observed: 0, claimed: *n }),
+            }
         }
-        let other = self.families[TOP_FAMILIES..].iter().map(|(_, n)| n).sum();
-        let mut out = self.families[..TOP_FAMILIES].to_vec();
-        out.push(("other".into(), other));
-        out
+        bars.sort_by(|a, b| b.total().cmp(&a.total()).then_with(|| a.name.cmp(&b.name)));
+        if bars.len() <= TOP_FAMILIES {
+            return bars;
+        }
+        let rest = bars.split_off(TOP_FAMILIES);
+        bars.push(FamilyBar {
+            name: "other".into(),
+            observed: rest.iter().map(|b| b.observed).sum(),
+            claimed: rest.iter().map(|b| b.claimed).sum(),
+        });
+        bars
+    }
+
+    /// The fake records of every family.
+    pub fn fake_total(&self) -> u64 {
+        self.fake.iter().map(|(_, n)| n).sum()
     }
 
     /// Records whose handshake matched a family other than Core's, as a
     /// percentage of the addresses. Core's forks share its networking code
     /// and count as Core; `unknown` is not counted, since it says nothing
-    /// about which implementation answered.
+    /// about which implementation answered, and neither is a claimed
+    /// family, which is the user agent's word alone.
     pub fn non_core_pct(&self) -> f64 {
         let non_core = self.families.iter().filter(|(f, _)| f != "core" && f != "unknown").map(|(_, n)| n).sum();
         self.pct(non_core)
@@ -229,7 +293,9 @@ pub(crate) mod tests {
     use super::*;
     use serde_json::json;
 
-    /// An answer in the shape satd's `getpeersurvey` gives with the survey on.
+    /// An answer in the shape satd's `getpeersurvey` gives with the survey
+    /// on: of the 1,204 records, 1,146 observed, 5 unknown, 43 claimed, 4
+    /// fake and 6 closed early.
     pub(crate) fn reply() -> Value {
         json!({
             "addresses": 1204,
@@ -243,13 +309,18 @@ pub(crate) mod tests {
                 "satd": {"count": 12, "share": 0.01},
                 "bitcoin-seeder": {"count": 6, "share": 0.005},
                 "bitnodes": {"count": 0, "share": 0.0},
-                "unknown": {"count": 58, "share": 0.048}
+                "unknown": {"count": 5, "share": 0.004}
             },
             "claimed": {
                 "core": {"count": 41, "share": 0.034},
                 "btcd": {"count": 2, "share": 0.002},
                 "bcoin": {"count": 0, "share": 0.0}
             },
+            "fake": {
+                "core": {"count": 4, "share": 0.003},
+                "btcd": {"count": 0, "share": 0.0}
+            },
+            "closed_early": {"count": 6, "share": 0.005},
             "mismatches": 5,
             "v2": {"count": 494, "share": 0.41},
             "top_as": [{"asn": 64496, "count": 84}, {"asn": 64497, "count": 61}],
@@ -268,8 +339,12 @@ pub(crate) mod tests {
         assert_eq!(s.addresses, 1204);
         assert_eq!(s.families.len(), 9, "bitnodes has no record");
         assert_eq!(s.families[0], ("core".to_string(), 1080));
-        assert_eq!(s.families[1], ("unknown".to_string(), 58));
+        assert_eq!(s.families[1], ("btcd".to_string(), 30));
+        assert!(s.families.contains(&("unknown".to_string(), 5)), "unknown as the node counts it");
         assert_eq!(s.claimed, [("core".to_string(), 41), ("btcd".to_string(), 2)], "apart from families, zeros left out");
+        assert_eq!(s.fake, [("core".to_string(), 4)]);
+        assert_eq!(s.fake_total(), 4);
+        assert_eq!(s.closed_early, Some(6));
         assert_eq!(s.v2, 494);
         assert_eq!(s.top_as, [(64496, 84), (64497, 61)]);
         assert_eq!((s.completed, s.failed, s.probed, s.probes), (1300, 2100, 600, true));
@@ -318,15 +393,51 @@ pub(crate) mod tests {
         assert!(matches!(classify(Ok(v)), Poll::On(s) if !s.superseded));
     }
 
+    /// A node from before the fake and closed-early counts (no
+    /// `closed_early`) counted its claimed records under `unknown`: the
+    /// unknown bar is that count less the claimed ones, and there are no
+    /// fake or closed-early counts to draw. A node from before `claimed`
+    /// too keeps its unknown count whole.
+    #[test]
+    fn an_older_node_without_the_new_counts() {
+        let mut v = reply();
+        v.as_object_mut().unwrap().remove("fake");
+        v.as_object_mut().unwrap().remove("closed_early");
+        v["families"]["unknown"]["count"] = json!(58);
+        let s = parse(&v).unwrap();
+        assert_eq!(s.closed_early, None);
+        assert!(s.fake.is_empty());
+        assert!(s.families.contains(&("unknown".to_string(), 15)), "58 less the 43 claimed: {:?}", s.families);
+        assert_eq!(s.families.iter().map(|(_, n)| n).sum::<u64>() + 43, 1204);
+        // Every unknown one claimed: no unknown bar.
+        v["families"]["unknown"]["count"] = json!(43);
+        assert!(!parse(&v).unwrap().families.iter().any(|(f, _)| f == "unknown"));
+        // Before `claimed` as well.
+        v.as_object_mut().unwrap().remove("claimed");
+        v["families"]["unknown"]["count"] = json!(58);
+        let s = parse(&v).unwrap();
+        assert!(s.families.contains(&("unknown".to_string(), 58)));
+        assert!(s.claimed.is_empty());
+    }
+
+    /// Each bar is the family's observed and claimed records together, the
+    /// eight largest, then `other`; fake and closed-early records are in
+    /// none.
     #[test]
     fn top_eight_families_then_other() {
         let s = parse(&reply()).unwrap();
         let bars = s.family_bars();
         assert_eq!(bars.len(), TOP_FAMILIES + 1);
-        assert_eq!(bars[TOP_FAMILIES], ("other".to_string(), 2), "floresta's 2 folded");
-        assert_eq!(bars.iter().map(|(_, n)| n).sum::<u64>(), 1204);
+        assert_eq!(bars[0], FamilyBar { name: "core".into(), observed: 1080, claimed: 41 });
+        assert_eq!(bars[1], FamilyBar { name: "btcd".into(), observed: 30, claimed: 2 });
+        assert_eq!(bars[TOP_FAMILIES], FamilyBar { name: "other".into(), observed: 2, claimed: 0 }, "floresta's 2 folded");
+        assert_eq!(bars.iter().map(FamilyBar::total).sum::<u64>(), 1204 - 4 - 6, "all but the fake and closed-early");
         let few = Survey { families: vec![("core".into(), 2)], addresses: 2, ..Default::default() };
-        assert_eq!(few.family_bars(), [("core".to_string(), 2)]);
+        assert_eq!(few.family_bars(), [FamilyBar { name: "core".into(), observed: 2, claimed: 0 }]);
+        // A family only claimed has a bar of its own.
+        let claimed_only =
+            Survey { families: vec![("core".into(), 2)], claimed: vec![("bcoin".into(), 3)], addresses: 5, ..Default::default() };
+        assert_eq!(claimed_only.family_bars()[0], FamilyBar { name: "bcoin".into(), observed: 0, claimed: 3 });
     }
 
     #[test]

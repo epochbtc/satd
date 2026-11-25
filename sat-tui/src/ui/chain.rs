@@ -396,26 +396,39 @@ fn draw_extra_rows(f: &mut Frame, area: Rect, state: &AppState) {
 }
 
 /// A bar per family, `pct` giving each count's share: two-cell indent,
-/// label, bar, share; `width` cells inside the panel's border.
-fn family_bar_lines(bars: Vec<(String, u64)>, pct: impl Fn(u64) -> f64, width: u16) -> Vec<Line<'static>> {
+/// label, bar, share; `width` cells inside the panel's border. A bar's
+/// observed records are full blocks, its claimed ones (the user agent's
+/// word alone) the dark shade after them, in the family's colour; the
+/// share is of both.
+fn family_bar_lines(bars: Vec<crate::survey::FamilyBar>, pct: impl Fn(u64) -> f64, width: u16) -> Vec<Line<'static>> {
     const LABEL: usize = 14;
     // Two-cell indent, label, space, bar, space, `100.0%`.
     let bar_width = (width as usize).saturating_sub(2 + LABEL + 1 + 1 + 6).clamp(4, 30);
+    let cells = |n: u64| (pct(n) / 100.0 * bar_width as f64).round() as usize;
     bars.into_iter()
-        .map(|(name, count)| {
-            let pct = pct(count);
-            // A family with any record shows at least one cell.
-            let filled = ((pct / 100.0 * bar_width as f64).round() as usize).clamp(usize::from(count > 0), bar_width);
-            let color = match name.as_str() {
+        .map(|bar| {
+            let total = bar.total();
+            let share = pct(total);
+            // A family with any record shows at least one cell, and each
+            // part with any record one of its own where there is room.
+            let filled = cells(total).clamp(usize::from(total > 0), bar_width);
+            let observed = cells(bar.observed).clamp(usize::from(bar.observed > 0), filled);
+            let mut claimed = filled - observed;
+            if bar.claimed > 0 && claimed == 0 && filled < bar_width {
+                claimed = 1;
+            }
+            let empty = bar_width - observed - claimed;
+            let color = match bar.name.as_str() {
                 "core" => Color::Green,
                 "unknown" | "other" => Color::DarkGray,
                 _ => Color::Yellow,
             };
             Line::from(vec![
-                Span::styled(format!("  {:<width$} ", truncate(&name, LABEL), width = LABEL), Style::default().fg(Color::White)),
-                Span::styled("\u{2588}".repeat(filled), Style::default().fg(color)),
-                Span::styled("\u{2591}".repeat(bar_width - filled), Style::default().fg(Color::DarkGray)),
-                Span::styled(format!(" {:>5.1}%", pct), Style::default().fg(Color::Gray)),
+                Span::styled(format!("  {:<width$} ", truncate(&bar.name, LABEL), width = LABEL), Style::default().fg(Color::White)),
+                Span::styled("\u{2588}".repeat(observed), Style::default().fg(color)),
+                Span::styled("\u{2593}".repeat(claimed), Style::default().fg(color)),
+                Span::styled("\u{2591}".repeat(empty), Style::default().fg(Color::DarkGray)),
+                Span::styled(format!(" {:>5.1}%", share), Style::default().fg(Color::Gray)),
             ])
         })
         .collect()
@@ -447,7 +460,8 @@ pub fn crawl_left_lines(c: &crate::crawl::Crawl, width: u16) -> Vec<Line<'static
         lines.push(Line::from(Span::styled("  no address reachable yet", Style::default().fg(Color::DarkGray))));
         return lines;
     }
-    lines.extend(family_bar_lines(c.family_bars(), |n| c.pct(n), width));
+    let bars = c.family_bars().into_iter().map(|(name, observed)| crate::survey::FamilyBar { name, observed, claimed: 0 });
+    lines.extend(family_bar_lines(bars.collect(), |n| c.pct(n), width));
     lines.push(non_core_line(c.non_core_pct()));
     lines
 }
@@ -484,8 +498,8 @@ pub fn crawl_right_lines(c: &crate::crawl::Crawl) -> Vec<Line<'static>> {
 }
 
 /// The Network survey panel, `width` cells inside its border: the
-/// addresses and the window, a bar per family (the eight largest, then
-/// `other`), and the non-Core share.
+/// addresses and the window, a bar per family (observed and claimed; the
+/// eight largest, then `other`), and the non-Core share.
 pub fn survey_left_lines(s: &crate::survey::Survey, width: u16) -> Vec<Line<'static>> {
     let mut lines = vec![Line::from(Span::styled(
         format!("  {} addrs, last {} d", format_num(s.addresses), crate::survey::WINDOW_DAYS),
@@ -500,29 +514,37 @@ pub fn survey_left_lines(s: &crate::survey::Survey, width: u16) -> Vec<Line<'sta
     lines
 }
 
-/// The Survey detail panel: v2 and mismatch shares, the five largest
-/// autonomous systems, the last survey connection against `now` (Unix
-/// seconds), the connection counts and, with probes on, how many
-/// addresses carry a probe outcome.
+/// The Survey detail panel: v2 and mismatch shares, the claimed, fake
+/// and closed-early shares, the five largest autonomous systems, the last
+/// survey connection against `now` (Unix seconds), the connection counts
+/// and, with probes on, how many addresses carry a probe outcome. The fake
+/// and closed-early lines are drawn for a node that reports them, zero or
+/// not.
 pub fn survey_right_lines(s: &crate::survey::Survey, now: u64) -> Vec<Line<'static>> {
     let row = |label: &str, value: String| {
         Line::from(vec![
-            Span::styled(format!("  {:<13}", label), Style::default().fg(Color::Gray)),
+            Span::styled(format!("  {:<14}", label), Style::default().fg(Color::Gray)),
             Span::styled(value, Style::default().fg(Color::White)),
         ])
     };
-    let mut lines = vec![
-        row("v2:", format!("{:.1} % ({})", s.pct(s.v2), format_num(s.v2))),
-        row("mismatches:", format!("{:.1} % ({})", s.pct(s.mismatches), format_num(s.mismatches))),
-    ];
-    // The unknown records whose user agent names a family: their own
-    // lines, never a family bar.
+    let share = |n: u64| format!("{:.1} % ({})", s.pct(n), format_num(n));
+    let mut lines = vec![row("v2:", share(s.v2)), row("mismatches:", share(s.mismatches))];
+    // The records no row matched whose user agent names a family: the
+    // dark part of that family's bar, listed here too.
     let claimed: u64 = s.claimed.iter().map(|(_, n)| n).sum();
     if claimed > 0 {
-        lines.push(row("claimed:", format!("{:.1} % ({})", s.pct(claimed), format_num(claimed))));
+        lines.push(row("claimed:", share(claimed)));
         for (family, n) in s.claimed.iter().take(crate::survey::TOP_CLAIMED) {
-            lines.push(row(&format!("  {family}"), format!("{:.1} % ({})", s.pct(*n), format_num(*n))));
+            lines.push(row(&format!("  {family}"), share(*n)));
         }
+    }
+    if let Some(closed_early) = s.closed_early {
+        let fake = s.fake_total();
+        lines.push(row("fake:", share(fake)));
+        for (family, n) in s.fake.iter().take(crate::survey::TOP_FAKE) {
+            lines.push(row(&format!("  {family}"), share(*n)));
+        }
+        lines.push(row("closed early:", share(closed_early)));
     }
     if s.top_as.is_empty() {
         let why = if s.addresses == 0 { "none" } else { "none (needs -asmap)" };
@@ -744,7 +766,12 @@ mod tests {
         let s = st.peer_survey.as_ref().unwrap();
         let left: Vec<String> = survey_left_lines(s, 38).iter().map(line_text).collect();
         assert_eq!(left[0], "  1,204 addrs, last 30 d");
-        assert!(left[1].starts_with("  core           ") && left[1].ends_with(" 89.7%"), "{left:?}");
+        // Core's 1,080 observed and 41 claimed: 93.1 %, the claimed part
+        // in the dark shade.
+        assert!(left[1].starts_with("  core           ") && left[1].ends_with(" 93.1%"), "{left:?}");
+        assert!(left[1].contains('\u{2593}'), "the claimed part: {left:?}");
+        assert!(left[2].starts_with("  btcd ") && left[2].contains('\u{2593}'), "{left:?}");
+        assert!(left.iter().any(|l| l.starts_with("  unknown ") && l.ends_with("  0.4%")), "only the truly unknown: {left:?}");
         assert!(left[9].starts_with("  other "), "{left:?}");
         assert_eq!(left.last().map(String::as_str), Some("  non-Core 5.5 %"));
         assert_eq!(left.len(), 11);
@@ -753,15 +780,18 @@ mod tests {
         }
 
         let right: Vec<String> = survey_right_lines(s, 1_790_000_042).iter().map(line_text).collect();
-        assert_eq!(right[0], "  v2:          41.0 % (494)");
-        assert_eq!(right[1], "  mismatches:  0.4 % (5)");
-        assert_eq!(right[2], "  claimed:     3.6 % (43)");
-        assert_eq!(right[3], "    core       3.4 % (41)");
-        assert_eq!(right[4], "    btcd       0.2 % (2)");
-        assert_eq!(right[6], "    AS64496    7.0 %");
-        assert!(right.contains(&"  last survey: 42s ago, completed".to_string()), "{right:?}");
-        assert!(right.contains(&"  connections: 1,300 ok, 2,100 failed".to_string()), "{right:?}");
-        assert_eq!(right.last().map(String::as_str), Some("  probed:      600 addrs"));
+        assert_eq!(right[0], "  v2:           41.0 % (494)");
+        assert_eq!(right[1], "  mismatches:   0.4 % (5)");
+        assert_eq!(right[2], "  claimed:      3.6 % (43)");
+        assert_eq!(right[3], "    core        3.4 % (41)");
+        assert_eq!(right[4], "    btcd        0.2 % (2)");
+        assert_eq!(right[5], "  fake:         0.3 % (4)");
+        assert_eq!(right[6], "    core        0.3 % (4)");
+        assert_eq!(right[7], "  closed early: 0.5 % (6)");
+        assert_eq!(right[9], "    AS64496     7.0 %");
+        assert!(right.contains(&"  last survey:  42s ago, completed".to_string()), "{right:?}");
+        assert!(right.contains(&"  connections:  1,300 ok, 2,100 failed".to_string()), "{right:?}");
+        assert_eq!(right.last().map(String::as_str), Some("  probed:       600 addrs"));
         for l in &right {
             assert!(l.chars().count() <= 38, "fits an 80-column terminal's panel: {l:?}");
         }
@@ -772,13 +802,23 @@ mod tests {
         let right: Vec<String> = survey_right_lines(&unclaimed, 1_790_000_042).iter().map(line_text).collect();
         assert!(!right.iter().any(|l| l.contains("claimed")), "{right:?}");
 
+        // A node that reports no fake or closed-early counts: no such
+        // lines. One that reports them at zero: both, at zero.
+        let older = crate::survey::Survey { closed_early: None, fake: Vec::new(), ..s.clone() };
+        let right: Vec<String> = survey_right_lines(&older, 1_790_000_042).iter().map(line_text).collect();
+        assert!(!right.iter().any(|l| l.contains("fake") || l.contains("closed early")), "{right:?}");
+        let none = crate::survey::Survey { closed_early: Some(0), fake: Vec::new(), ..s.clone() };
+        let right: Vec<String> = survey_right_lines(&none, 1_790_000_042).iter().map(line_text).collect();
+        assert!(right.contains(&"  fake:         0.0 % (0)".to_string()), "{right:?}");
+        assert!(right.contains(&"  closed early: 0.0 % (0)".to_string()), "{right:?}");
+
         // Probes off: no probe line. No `-asmap`: no AS list.
         let mut quiet = s.clone();
         quiet.probes = false;
         quiet.top_as.clear();
         let right: Vec<String> = survey_right_lines(&quiet, 1_790_000_042).iter().map(line_text).collect();
         assert!(!right.iter().any(|l| l.contains("probed")), "{right:?}");
-        assert!(right.contains(&"  top AS:      none (needs -asmap)".to_string()), "{right:?}");
+        assert!(right.contains(&"  top AS:       none (needs -asmap)".to_string()), "{right:?}");
 
         // A survey that has reached nobody yet.
         let empty = crate::survey::Survey::default();
@@ -923,7 +963,7 @@ mod tests {
     fn chain_view_draws_the_survey_row() {
         let st = survey_state();
 
-        let tall = render(&st, 100, 40);
+        let tall = render(&st, 100, 44);
         assert!(tall[25].contains("Network Survey") && tall[25].contains("Survey Detail"), "{tall:#?}");
         assert!(tall.iter().any(|l| l.contains("1,204 addrs, last 30 d")));
         assert!(tall.iter().any(|l| l.contains("Trivia")) && tall.iter().any(|l| l.contains("Peer Clients")));

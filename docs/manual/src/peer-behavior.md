@@ -236,6 +236,38 @@ The address book learns what a feeler would teach it: a completed handshake
 moves the address to the tried table, the peer's `version` updates its
 services, and a failed dial counts as an attempt. Nothing else.
 
+### Closed early and fake
+
+Two kinds of survey connection say nothing about which implementation
+answered, and are counted apart from every family:
+
+- **Closed early.** The peer closed the connection during the listening,
+  before its handshake transcript was complete. The record keeps what the
+  `version` said (user agent, protocol version, services) and gets no
+  fingerprint. The usual cause is an ordinary node whose inbound slots are
+  full: when a new inbound connection arrives, Bitcoin Core evicts one it
+  already has, protecting peers by network group, ping time, recent
+  transaction and block relay, and connection age, then dropping the
+  youngest connection of the largest network group. A survey connection a
+  few seconds old is that connection. This is Core's default behaviour; no
+  setting on either side is involved. Dialled again, the same address can
+  close at once one time and relay normally another. On a synced mainnet
+  node 105 of 183 records no row matched were closed early, almost all
+  under Core 26 to 32 user agents.
+- **Fake.** The user agent names Core, the common protocol version (the
+  lower of the peer's and the node's) is 70016 or more, the transcript is
+  exactly `version` then `verack`, and the connection was still open when
+  the 10 seconds of listening ran out. Every Core release since 0.21 sends
+  `wtxidrelay` and `sendaddrv2` before its `verack` at that version, and a
+  message after it within the wait, so such a peer is not the Core it
+  claims to be. On a synced mainnet node 74 such records claimed
+  `/Satoshi:25.0.0/` or `/Satoshi:25.1.0/`, and most did not answer a
+  `ping` probe. Only Core has this rule, since only Core's claim has been
+  seen used this way.
+
+A connection the node closes itself (`disconnectnode`, a ban,
+`setnetworkactive false`, shutdown) is neither, and records nothing.
+
 ### Probes
 
 With `-peersurveyprobes=1` (the default with the survey), each survey
@@ -266,13 +298,19 @@ node's own peers.
     "core": {"count": 690, "share": 0.8497},
     "btcd": {"count": 9, "share": 0.0111},
     "...": "...",
-    "unknown": {"count": 41, "share": 0.0505}
+    "unknown": {"count": 4, "share": 0.0049}
   },
   "claimed": {
     "core": {"count": 37, "share": 0.0456},
     "btcd": {"count": 2, "share": 0.0025},
     "...": "..."
   },
+  "fake": {
+    "core": {"count": 6, "share": 0.0074},
+    "btcd": {"count": 0, "share": 0.0},
+    "...": "..."
+  },
+  "closed_early": {"count": 9, "share": 0.0111},
   "mismatches": 3,
   "v2": {"count": 402, "share": 0.495},
   "top_as": [{"asn": 64496, "count": 57}],
@@ -288,11 +326,17 @@ node's own peers.
 | Field | What |
 |---|---|
 | `addresses` | Records in the store: addresses the survey reached in the last 30 days. |
-| `families` | Records per observed family (a mismatch counts under the family its handshake matched), with each one's share of `addresses`. `unknown` counts every record no row matched, the claimed ones included. |
-| `claimed` | The `unknown` records whose user agent names a family, per family, with each one's share of `addresses`: what the peers say they run, kept apart from what the survey saw. |
+| `families` | Records per observed family (a mismatch counts under the family its handshake matched), with each one's share of `addresses`. `unknown` counts the records no row matched whose user agent names no family, and nothing claimed, fake or closed early. |
+| `claimed` | The records no row matched whose user agent names a family, per family: what the peers say they run, kept apart from what the survey saw. |
+| `fake` | The [fake](#closed-early-and-fake) records, per family the user agent claims. Only `core` is ever counted. |
+| `closed_early` | The [closed-early](#closed-early-and-fake) records. |
 | `mismatches` | Records whose user agent names one family and handshake matches another. |
 | `v2` | Records reached over BIP 324. |
 | `top_as` | The ten autonomous systems with the most records. Empty without `-asmap`. |
+
+Each record is counted once among `families`, `claimed`, `fake` and
+`closed_early`, so their counts add up to `addresses`. Every `share` is of
+`addresses`, all records whatever their kind.
 | `probed` | Records with at least one probe outcome. |
 | `enabled`, `probes`, `interval` | The survey's settings. With the survey off, `enabled` is false and every count is zero. |
 | `connections` | Survey connections since start: `completed`, and `failed` at the dial or the handshake; `last`, the most recent to end, with its `time` (Unix seconds) and `result` (`completed` or `failed`), null until one ends. |
@@ -305,8 +349,10 @@ example `core/high`), `family`, `claimed` (the family the user agent names),
 `asn`, `first_seen`, `last_seen` (Unix seconds) and `probes`, each probe
 sent with its `result` (`answered`, `silent` or `disconnected`) and, when
 answered, its `value`. A claimed record has `fingerprint` `core/claimed`
-(for example) and a null `family`. A record no row matched, claimed or
-unknown, also carries `handshake`, the commands it was judged on, and
+(for example) and a null `family`; a fake one `fake/core`, and a
+closed-early one `closed-early`, each with a null `family` and the user
+agent's family in `claimed`. A record no row matched, claimed, fake,
+closed early or unknown, also carries `handshake`, the commands it was judged on, and
 `relay`, its `version`'s relay flag, so that the shapes no row knows can
 be told apart and given rows; with `-debug=net` the same is logged when its
 survey connection ends.
@@ -316,15 +362,17 @@ for a bearer token it needs `rpc:write`.
 
 ### The store
 
-`peersurvey.dat` keeps one record per address: the fingerprint, user agent,
-protocol version, services, whether it spoke v2, its autonomous system, when
-it was first and last seen, the last probe outcomes and, for a record no row
+`peersurvey.dat` (format `satdsrv3`) keeps one record per address: the
+fingerprint, user agent, protocol version, services, whether it spoke v2,
+its autonomous system, when it was first and last seen, the last probe
+outcomes, whether it was fake or closed early and, for a record no row
 matched, its handshake transcript (at most 16 commands) and `relay` flag. A
-file written before the transcript was kept (the `satdsrv1` format) is
-dropped at startup, with its record count logged, and the survey starts
-empty: its records were judged before the current rows, and a uniform draw
-from the address book revisits an address too rarely to replace them. A
-damaged old file is set aside like any other. A record not seen
+file in an older format is dropped at startup, with its record count
+logged, and the survey starts empty: `satdsrv1` records were judged before
+the current rows, `satdsrv2` records never stored whether the peer closed
+the connection early, and a uniform draw from the address book revisits an
+address too rarely to replace them. A damaged old file is set aside like
+any other. A record not seen
 for 30 days is dropped, and past 250,000 records (about 25 MB) the least
 recently seen go first. It is written every 10 minutes and at shutdown, and
 read at startup; a file that does not read is renamed with a `.bad-<unix time>` suffix, with a warning, and
@@ -335,10 +383,13 @@ the survey starts empty.
 - `satd_peer_survey_enabled`: 1 while the survey runs.
 - `satd_peer_survey_records`, `satd_peer_survey_family{family}`,
   `satd_peer_survey_mismatches` and `satd_peer_survey_v2`: the store's
-  counts. `family="unknown"` counts the claimed records too.
+  counts. `family="unknown"` counts only the records no row matched whose
+  user agent names no family.
 - `satd_peer_survey_claimed{family}`: the records no row matched whose user
-  agent names that family; never counted under the family in
-  `satd_peer_survey_family`.
+  agent names that family; never counted in `satd_peer_survey_family`.
+- `satd_peer_survey_fake{family}`: the fake records, by the family the user
+  agent claims.
+- `satd_peer_survey_closed_early`: the closed-early records.
 - `satd_peer_survey_connections_total{result}`: `completed` and `failed`
   survey connections.
 - `satd_peer_survey_probes_total{probe,outcome}`: probe outcomes.

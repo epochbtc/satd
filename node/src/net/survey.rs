@@ -65,8 +65,13 @@ pub const SAVE_INTERVAL: Duration = Duration::from_secs(10 * 60);
 pub const TOP_AS: usize = 10;
 
 /// The file as written: each record ends with its [`SurveyShape`], when it
-/// has one.
-const FILE_MAGIC: [u8; 8] = *b"satdsrv2";
+/// has one, then its [`Verdict`].
+const FILE_MAGIC: [u8; 8] = *b"satdsrv3";
+/// The second format: shapes, no verdict. It never stored whether the peer
+/// closed the connection during the passive wait, so a closed-early record
+/// cannot be told from the rest, and none of its records is kept: such a
+/// file reads as an empty store, as a `satdsrv1` one does.
+const FILE_MAGIC_V2: [u8; 8] = *b"satdsrv2";
 /// The first format. Its records were judged before the trait rows and
 /// hold no shape, so none of them is kept: such a file reads as an empty
 /// store, and the survey fills again from the current classifier.
@@ -273,6 +278,104 @@ pub struct SurveyRecord {
     /// fingerprint): what the classifier read that the fields above do not
     /// hold, so that the next round of unknown shapes can be told apart.
     pub shape: Option<SurveyShape>,
+    /// What the session showed besides its fingerprint: whether the peer
+    /// closed early, or claimed a family it did not behave as.
+    pub verdict: Verdict,
+}
+
+/// How a survey session's passive wait ended, as far as [`session_verdict`]
+/// reads it. A wait the node itself cut short (`disconnectnode`, a ban,
+/// `setnetworkactive false`, shutdown) is none of these.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PassiveEnd {
+    /// The peer's handshake transcript closed: it sent a message past its
+    /// announcements.
+    Settled,
+    /// The wait ran out with the connection still open.
+    Timeout,
+    /// The peer closed the connection.
+    PeerClosed,
+}
+
+/// What a survey session showed besides its [`Fingerprint`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Verdict {
+    /// The fingerprint stands: a row matched, the user agent's family is
+    /// claimed, or the record is unknown.
+    #[default]
+    Classified,
+    /// The session is [`is_fake_core`]'s: a user agent naming this family
+    /// (only Core has the rule) on a session no release of it produces.
+    /// Counted apart, never as the family, a claim or unknown.
+    Fake(Family),
+    /// The peer closed the connection before its handshake transcript
+    /// settled ([`session_verdict`]). The record keeps what the `version`
+    /// said and has no fingerprint ([`Fingerprint::Unknown`]): a node with
+    /// full inbound slots evicts its newest inbound connection, which a
+    /// survey connection seconds old is, so the short transcript says
+    /// nothing about the implementation.
+    ClosedEarly,
+}
+
+/// The lowest common protocol version at which Core sends `wtxidrelay`
+/// (BIP 339) and `sendaddrv2` (BIP 155) before its `verack`.
+pub const FAKE_CORE_MIN_COMMON_VERSION: u32 = 70016;
+
+/// Whether a survey session is an impostor claiming to be Core. All must
+/// hold:
+///
+/// - the user agent names Core ([`Family::claimed_by`]);
+/// - the common protocol version (the lower of the peer's and ours) is at
+///   least [`FAKE_CORE_MIN_COMMON_VERSION`], so a real Core (0.21 or later)
+///   sends both negotiation messages before its `verack`;
+/// - the transcript is exactly `version`, `verack`: no negotiation message
+///   between them, nothing after;
+/// - the passive wait ended by its timeout, the connection still open
+///   ([`PassiveEnd::Timeout`]). A peer that sent nothing more and then
+///   closed is closed early instead.
+///
+/// Every Core release since 0.21 sends both messages to the node that
+/// dials it, and a message after `verack` within the wait (the fixtures
+/// `core-*-outbound-survey*`); no trait row can match a transcript this
+/// short at these versions. Only Core has the rule: the evidence, peers
+/// that claim a Core user agent and stay connected and silent, exists for
+/// Core alone.
+pub fn is_fake_core(
+    user_agent: &str,
+    their_version: u32,
+    our_version: u32,
+    transcript: &[String],
+    passive: PassiveEnd,
+) -> bool {
+    Family::claimed_by(user_agent) == Some(Family::Core)
+        && their_version.min(our_version) >= FAKE_CORE_MIN_COMMON_VERSION
+        && transcript == ["version", "verack"]
+        && passive == PassiveEnd::Timeout
+}
+
+/// A survey session's [`Verdict`] from how its passive wait ended and what
+/// its transcript holds. The peer closing while its transcript is still
+/// open is [`Verdict::ClosedEarly`]; [`is_fake_core`] is
+/// [`Verdict::Fake`]; anything else keeps its fingerprint. `passive` is
+/// `None` where the node cut the wait short.
+pub fn session_verdict(
+    passive: Option<PassiveEnd>,
+    capture: &crate::net::behavior::HandshakeCapture,
+    user_agent: &str,
+    their_version: u32,
+    our_version: u32,
+) -> Verdict {
+    let Some(passive) = passive else {
+        return Verdict::Classified;
+    };
+    if passive == PassiveEnd::PeerClosed && capture.is_open() {
+        return Verdict::ClosedEarly;
+    }
+    let transcript: Vec<String> = capture.commands().collect();
+    if is_fake_core(user_agent, their_version, our_version, &transcript, passive) {
+        return Verdict::Fake(Family::Core);
+    }
+    Verdict::Classified
 }
 
 /// The raw features of a survey session no row matched. The `version`'s
@@ -301,13 +404,19 @@ pub struct Aggregate {
     pub addresses: usize,
     /// Records per observed family; [`Family::ALL`]'s order.
     pub families: [usize; Family::ALL.len()],
-    /// Records whose handshake matched no family, the claimed ones
-    /// included.
+    /// Records whose handshake matched no family and whose user agent
+    /// names none: neither claimed, fake nor closed early.
     pub unknown: usize,
-    /// The unknown records whose user agent names a family (a
+    /// The records no row matched whose user agent names a family (a
     /// [`Confidence::Claimed`] fingerprint), per family; [`Family::ALL`]'s
-    /// order. Never counted in `families`.
+    /// order. Never counted in `families` or `unknown`.
     pub claimed: [usize; Family::ALL.len()],
+    /// The [`Verdict::Fake`] records, per claimed family; [`Family::ALL`]'s
+    /// order. Never counted in `families`, `claimed` or `unknown`.
+    pub fake: [usize; Family::ALL.len()],
+    /// The [`Verdict::ClosedEarly`] records: counted nowhere else but the
+    /// v2, probe and autonomous-system tallies.
+    pub closed_early: usize,
     /// Records whose user agent names one family and handshake another.
     pub mismatches: usize,
     /// Records reached over BIP 324.
@@ -324,8 +433,8 @@ pub struct Aggregate {
 pub struct SurveyStore {
     records: HashMap<PeerAddr, SurveyRecord>,
     max_records: usize,
-    /// Records the file held in the first format, dropped as it was read.
-    /// Never written.
+    /// Records the file held in an older format (`satdsrv1`, `satdsrv2`),
+    /// dropped as it was read. Never written.
     dropped_old_format: usize,
 }
 
@@ -341,9 +450,10 @@ impl SurveyStore {
         SurveyStore { records: HashMap::new(), max_records, dropped_old_format: 0 }
     }
 
-    /// How many records the file read held in the first format
-    /// (`satdsrv1`), all of them dropped: they were judged before the trait
-    /// rows.
+    /// How many records the file read held in an older format, all of them
+    /// dropped: a `satdsrv1` file's were judged before the trait rows, and
+    /// neither it nor a `satdsrv2` file stored whether the peer closed the
+    /// connection early.
     pub fn dropped_old_format(&self) -> usize {
         self.dropped_old_format
     }
@@ -402,15 +512,18 @@ impl SurveyStore {
         let mut agg = Aggregate { addresses: self.records.len(), ..Aggregate::default() };
         let mut by_as: HashMap<u32, usize> = HashMap::new();
         for r in self.records.values() {
-            match r.fingerprint.observed() {
-                Some(f) => agg.families[family_index(f)] += 1,
-                None => agg.unknown += 1,
-            }
-            if let Some(f) = r.fingerprint.claimed_only() {
-                agg.claimed[family_index(f)] += 1;
-            }
-            if matches!(r.fingerprint, Fingerprint::Mismatch { .. }) {
-                agg.mismatches += 1;
+            match r.verdict {
+                Verdict::ClosedEarly => agg.closed_early += 1,
+                Verdict::Fake(f) => agg.fake[family_index(f)] += 1,
+                Verdict::Classified => match r.fingerprint {
+                    Fingerprint::Known(f, Confidence::Claimed) => agg.claimed[family_index(f)] += 1,
+                    Fingerprint::Known(f, _) => agg.families[family_index(f)] += 1,
+                    Fingerprint::Mismatch { observed, .. } => {
+                        agg.families[family_index(observed)] += 1;
+                        agg.mismatches += 1;
+                    }
+                    Fingerprint::Unknown => agg.unknown += 1,
+                },
             }
             if r.v2 {
                 agg.v2 += 1;
@@ -432,15 +545,19 @@ impl SurveyStore {
     /// The file's bytes: a magic, the network magic, the records, then the
     /// hash256 of everything before it.
     pub fn encode(&self, network_magic: [u8; 4]) -> Vec<u8> {
-        self.encode_as(network_magic, true)
+        self.encode_as(network_magic, 3)
     }
 
-    /// The bytes in the current format, or, with `with_shapes` false, in
-    /// the first (`satdsrv1`), which holds no shape: for the test that an
-    /// older file is dropped.
-    fn encode_as(&self, network_magic: [u8; 4], with_shapes: bool) -> Vec<u8> {
+    /// The bytes in format `format`: 3, the current one; 2 (`satdsrv2`),
+    /// which holds no verdict; or 1 (`satdsrv1`), which holds no shape
+    /// either. The older two are for the tests that such a file is dropped.
+    fn encode_as(&self, network_magic: [u8; 4], format: u8) -> Vec<u8> {
         let mut buf = Vec::with_capacity(16 + self.records.len() * 100);
-        buf.extend_from_slice(if with_shapes { &FILE_MAGIC } else { &FILE_MAGIC_V1 });
+        buf.extend_from_slice(match format {
+            1 => &FILE_MAGIC_V1,
+            2 => &FILE_MAGIC_V2,
+            _ => &FILE_MAGIC,
+        });
         buf.extend_from_slice(&network_magic);
         buf.extend_from_slice(&(self.records.len() as u32).to_le_bytes());
         let mut rows: Vec<(&PeerAddr, &SurveyRecord)> = self.records.iter().collect();
@@ -463,8 +580,11 @@ impl SurveyStore {
                 buf.push(code);
                 buf.extend_from_slice(&value.to_le_bytes());
             }
-            if with_shapes {
+            if format >= 2 {
                 encode_shape(&mut buf, r.shape.as_ref());
+            }
+            if format >= 3 {
+                encode_verdict(&mut buf, r.verdict);
             }
         }
         let checksum = sha256d::Hash::hash(&buf);
@@ -483,9 +603,10 @@ impl SurveyStore {
             return Err("checksum mismatch".to_string());
         }
         let mut r = Reader(body);
-        let with_shapes = match r.take(8)? {
-            m if m == FILE_MAGIC => true,
-            m if m == FILE_MAGIC_V1 => false,
+        let format = match r.take(8)? {
+            m if m == FILE_MAGIC => 3,
+            m if m == FILE_MAGIC_V2 => 2,
+            m if m == FILE_MAGIC_V1 => 1,
             _ => return Err("not a survey file".to_string()),
         };
         if r.take(4)? != network_magic {
@@ -512,7 +633,8 @@ impl SurveyStore {
                     probes.set(p, o);
                 }
             }
-            let shape = if with_shapes { decode_shape(&mut r)? } else { None };
+            let shape = if format >= 2 { decode_shape(&mut r)? } else { None };
+            let verdict = if format >= 3 { decode_verdict(&mut r)? } else { Verdict::Classified };
             store.records.insert(
                 addr,
                 SurveyRecord {
@@ -526,6 +648,7 @@ impl SurveyStore {
                     last_seen,
                     probes,
                     shape,
+                    verdict,
                 },
             );
         }
@@ -534,7 +657,7 @@ impl SurveyStore {
         }
         // Read whole first, so a damaged old file is still refused and set
         // aside like any other; then dropped, every record of it.
-        if !with_shapes {
+        if format < 3 {
             store.dropped_old_format = store.records.len();
             store.records.clear();
             return Ok(store);
@@ -634,6 +757,28 @@ pub(crate) fn decode_fingerprint(r: &mut Reader) -> Result<Fingerprint, String> 
         4 => Fingerprint::Known(family_from_byte(a)?, Confidence::Claimed),
         t => return Err(format!("bad fingerprint tag {t}")),
     })
+}
+
+/// A verdict: a tag (0 classified, 1 fake, 2 closed early), then the fake
+/// one's claimed family, `0xff` for the others.
+fn encode_verdict(buf: &mut Vec<u8>, verdict: Verdict) {
+    let (tag, family) = match verdict {
+        Verdict::Classified => (0, None),
+        Verdict::Fake(f) => (1, Some(f)),
+        Verdict::ClosedEarly => (2, None),
+    };
+    buf.extend_from_slice(&[tag, family_byte(family)]);
+}
+
+fn decode_verdict(r: &mut Reader) -> Result<Verdict, String> {
+    let tag = r.u8()?;
+    let family = r.u8()?;
+    match (tag, family) {
+        (0, 0xff) => Ok(Verdict::Classified),
+        (1, f) => Ok(Verdict::Fake(family_from_byte(f)?)),
+        (2, 0xff) => Ok(Verdict::ClosedEarly),
+        (t, f) => Err(format!("bad verdict {t}/{f}")),
+    }
 }
 
 /// A shape: a presence byte, then the relay flag, the command count and
@@ -770,14 +915,19 @@ pub fn aggregate_json(agg: &Aggregate, settings: &serde_json::Value) -> serde_js
         families.insert(f.name().to_string(), serde_json::json!({ "count": n, "share": share(n) }));
     }
     families.insert("unknown".to_string(), serde_json::json!({ "count": agg.unknown, "share": share(agg.unknown) }));
-    let mut claimed = serde_json::Map::new();
-    for (f, n) in Family::ALL.iter().zip(agg.claimed) {
-        claimed.insert(f.name().to_string(), serde_json::json!({ "count": n, "share": share(n) }));
-    }
+    let per_family = |counts: &[usize]| {
+        let mut out = serde_json::Map::new();
+        for (f, n) in Family::ALL.iter().zip(counts) {
+            out.insert(f.name().to_string(), serde_json::json!({ "count": n, "share": share(*n) }));
+        }
+        out
+    };
     let mut out = serde_json::json!({
         "addresses": agg.addresses,
         "families": families,
-        "claimed": claimed,
+        "claimed": per_family(&agg.claimed),
+        "fake": per_family(&agg.fake),
+        "closed_early": { "count": agg.closed_early, "share": share(agg.closed_early) },
         "mismatches": agg.mismatches,
         "v2": { "count": agg.v2, "share": share(agg.v2) },
         "top_as": agg.top_as.iter().map(|(asn, n)| serde_json::json!({ "asn": asn, "count": n })).collect::<Vec<_>>(),
@@ -803,7 +953,11 @@ fn row_json(addr: &PeerAddr, r: &SurveyRecord) -> serde_json::Value {
     let mut row = serde_json::json!({
         "addr": addr_text,
         "network": network_name(addr),
-        "fingerprint": r.fingerprint.to_string(),
+        "fingerprint": match r.verdict {
+            Verdict::Classified => r.fingerprint.to_string(),
+            Verdict::Fake(f) => format!("fake/{f}"),
+            Verdict::ClosedEarly => "closed-early".to_string(),
+        },
         "family": r.fingerprint.observed().map(Family::name),
         "claimed": claimed.or_else(|| Family::claimed_by(&r.user_agent).map(Family::name)),
         "mismatch": mismatch,
@@ -860,6 +1014,7 @@ mod tests {
             last_seen,
             probes: ProbeResults::default(),
             shape: None,
+            verdict: Verdict::Classified,
         }
     }
 
@@ -889,6 +1044,13 @@ mod tests {
         let mut claimed = record(Fingerprint::Known(Family::Core, Confidence::Claimed), NOW - 7);
         claimed.shape = Some(SurveyShape { commands: vec!["version".into(); SHAPE_COMMANDS_MAX], relay: true });
         store.insert(v4(3), claimed, NOW);
+        let mut fake = record(Fingerprint::Known(Family::Core, Confidence::Claimed), NOW - 8);
+        fake.verdict = Verdict::Fake(Family::Core);
+        fake.shape = Some(SurveyShape { commands: vec!["version".into(), "verack".into()], relay: true });
+        store.insert(v4(4), fake, NOW);
+        let mut early = record(Fingerprint::Unknown, NOW - 6);
+        early.verdict = Verdict::ClosedEarly;
+        store.insert(v4(5), early, NOW);
         let mut again = record(Fingerprint::Known(Family::Core, Confidence::High), NOW);
         again.first_seen = NOW;
         store.insert(v4(2), record(Fingerprint::Known(Family::Core, Confidence::High), NOW - 100), NOW);
@@ -898,44 +1060,83 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(SURVEY_FILE);
         store.save(&path, MAGIC).unwrap();
+        assert_eq!(&std::fs::read(&path).unwrap()[..8], b"satdsrv3");
         let back = SurveyStore::load(&path, MAGIC, NOW).unwrap();
-        assert_eq!(back.len(), 5);
+        assert_eq!(back.len(), 7);
+        assert_eq!(back.dropped_old_format(), 0);
+        assert_eq!(back.get(&v4(4)).unwrap().verdict, Verdict::Fake(Family::Core));
+        assert_eq!(back.get(&v4(5)).unwrap().verdict, Verdict::ClosedEarly);
         for (addr, r) in store.rows() {
             assert_eq!(back.get(addr), Some(r), "{addr:?}");
         }
     }
 
-    /// A file in the first format (`satdsrv1`, no shapes), as earlier
-    /// builds wrote it, reads as an empty store: its records were judged
-    /// before the trait rows, so none is kept to stand in the tallies, and
-    /// the count dropped is reported. It is the current format less one
-    /// byte per record, and still checked whole: a damaged one is refused.
+    /// A file in an older format, as earlier builds wrote it, reads as an
+    /// empty store and the count dropped is reported: `satdsrv1` (no
+    /// shapes; judged before the trait rows) and `satdsrv2` (no verdict;
+    /// whether the peer closed early was never stored). `satdsrv2` is the
+    /// current format less the two verdict bytes per record, `satdsrv1` less
+    /// the shape's byte too, and each is still checked whole: a damaged one
+    /// is refused, not read as empty.
     #[test]
-    fn a_file_from_before_the_shapes_is_dropped() {
+    fn a_file_in_an_older_format_is_dropped() {
         let mut store = SurveyStore::default();
         store.insert(v4(1), record(Fingerprint::Known(Family::Core, Confidence::High), NOW), NOW);
         store.insert(v4(2), record(Fingerprint::Mismatch { claimed: Family::Core, observed: Family::Btcd }, NOW), NOW);
         store.insert(v4(3), record(Fingerprint::Unknown, NOW - 3), NOW);
-        let old = store.encode_as(MAGIC, false);
-        assert_eq!(&old[..8], b"satdsrv1");
-        assert_eq!(old.len() + store.len(), store.encode(MAGIC).len());
-        let back = SurveyStore::decode(&old, MAGIC, NOW, MAX_RECORDS).unwrap();
-        assert!(back.is_empty());
-        assert_eq!(back.dropped_old_format(), 3);
-        assert_eq!(back.aggregate().addresses, 0);
-        // Written again, it is in the current format, empty.
-        let again = back.encode(MAGIC);
-        assert_eq!(&again[..8], b"satdsrv2");
-        assert_eq!(SurveyStore::decode(&again, MAGIC, NOW, MAX_RECORDS).unwrap().len(), 0);
+        let current_len = store.encode(MAGIC).len();
+        for (format, magic, less) in [(1u8, b"satdsrv1", 3), (2, b"satdsrv2", 2)] {
+            let old = store.encode_as(MAGIC, format);
+            assert_eq!(&old[..8], magic);
+            assert_eq!(old.len() + less * store.len(), current_len, "format {format}");
+            let back = SurveyStore::decode(&old, MAGIC, NOW, MAX_RECORDS).unwrap();
+            assert!(back.is_empty(), "format {format}");
+            assert_eq!(back.dropped_old_format(), 3, "format {format}");
+            assert_eq!(back.aggregate().addresses, 0);
+            // Written again, it is in the current format, empty.
+            let again = back.encode(MAGIC);
+            assert_eq!(&again[..8], b"satdsrv3");
+            assert_eq!(SurveyStore::decode(&again, MAGIC, NOW, MAX_RECORDS).unwrap().len(), 0);
+            // An old file cut short is refused, not read as empty.
+            let mut cut = old[..old.len() - 32 - 1].to_vec();
+            let sum = sha256d::Hash::hash(&cut);
+            cut.extend_from_slice(sum.as_byte_array());
+            assert!(SurveyStore::decode(&cut, MAGIC, NOW, MAX_RECORDS).is_err(), "format {format}");
+            // And one damaged in its body.
+            let mut flipped = old.clone();
+            flipped[20] ^= 1;
+            assert!(SurveyStore::decode(&flipped, MAGIC, NOW, MAX_RECORDS).unwrap_err().contains("checksum"));
+        }
         // A current-format file of the same records keeps them all.
         let current = SurveyStore::decode(&store.encode(MAGIC), MAGIC, NOW, MAX_RECORDS).unwrap();
         assert_eq!(current.len(), 3);
         assert_eq!(current.dropped_old_format(), 0);
-        // An old file cut short is refused, not read as empty.
-        let mut cut = old[..old.len() - 32 - 1].to_vec();
-        let sum = sha256d::Hash::hash(&cut);
-        cut.extend_from_slice(sum.as_byte_array());
-        assert!(SurveyStore::decode(&cut, MAGIC, NOW, MAX_RECORDS).is_err());
+    }
+
+    /// A verdict out of its range is refused, as a damaged file: an unknown
+    /// tag, a fake one naming no family, or a family on another verdict.
+    #[test]
+    fn a_bad_verdict_is_refused() {
+        let mut store = SurveyStore::default();
+        store.insert(v4(1), record(Fingerprint::Unknown, NOW), NOW);
+        let bytes = store.encode(MAGIC);
+        let body = &bytes[..bytes.len() - 32];
+        let reseal = |tag: u8, family: u8| {
+            let mut body = body.to_vec();
+            let n = body.len();
+            body[n - 2] = tag;
+            body[n - 1] = family;
+            let sum = sha256d::Hash::hash(&body);
+            body.extend_from_slice(sum.as_byte_array());
+            body
+        };
+        assert_eq!(SurveyStore::decode(&reseal(0, 0xff), MAGIC, NOW, MAX_RECORDS).unwrap().len(), 1);
+        let fake = SurveyStore::decode(&reseal(1, 0), MAGIC, NOW, MAX_RECORDS).unwrap();
+        assert_eq!(fake.get(&v4(1)).unwrap().verdict, Verdict::Fake(Family::Core));
+        for (tag, family) in [(3, 0xff), (1, 0xff), (0, 0), (2, 1)] {
+            let err = SurveyStore::decode(&reseal(tag, family), MAGIC, NOW, MAX_RECORDS).unwrap_err();
+            assert!(err.contains("verdict") || err.contains("family"), "{tag}/{family}: {err}");
+        }
     }
 
     /// A shape out of its bounds is refused, as a damaged file.
@@ -946,10 +1147,13 @@ mod tests {
         r.shape = Some(SurveyShape { commands: vec!["version".into()], relay: true });
         store.insert(v4(1), r, NOW);
         let bytes = store.encode(MAGIC);
-        // The shape is the record's tail: tag, relay, count, then `version`.
-        let body = &bytes[..bytes.len() - 32];
+        // The shape ends the record but for its two verdict bytes: tag,
+        // relay, count, then `version`.
+        let body = &bytes[..bytes.len() - 32 - 2];
         let count_at = body.len() - 1 - "version".len() - 1;
+        let verdict = bytes[bytes.len() - 32 - 2..bytes.len() - 32].to_vec();
         let reseal = |mut body: Vec<u8>| {
+            body.extend_from_slice(&verdict);
             let sum = sha256d::Hash::hash(&body);
             body.extend_from_slice(sum.as_byte_array());
             body
@@ -1053,31 +1257,142 @@ mod tests {
         add(Fingerprint::Unknown, false, None);
         add(Fingerprint::Known(Family::Core, Confidence::Claimed), false, None);
         add(Fingerprint::Known(Family::Btcd, Confidence::Claimed), false, None);
+        let mut special = |fp: Fingerprint, verdict: Verdict, ua: &str| {
+            let mut r = record(fp, NOW);
+            r.verdict = verdict;
+            r.user_agent = ua.to_string();
+            r.asn = None;
+            r.v2 = false;
+            i += 1;
+            store.insert(v4(i), r, NOW);
+        };
+        special(Fingerprint::Known(Family::Core, Confidence::Claimed), Verdict::Fake(Family::Core), "/Satoshi:25.0.0/");
+        special(Fingerprint::Known(Family::Core, Confidence::Claimed), Verdict::Fake(Family::Core), "/Satoshi:25.1.0/");
+        special(Fingerprint::Unknown, Verdict::ClosedEarly, "/Satoshi:28.1.0/");
         let agg = store.aggregate();
-        assert_eq!(agg.addresses, 6);
-        assert_eq!(agg.families[0], 2, "core, observed only: a claim is never counted as the family");
+        assert_eq!(agg.addresses, 9);
+        assert_eq!(agg.families[0], 2, "core, observed only: a claim or a fake is never counted as the family");
         assert_eq!(agg.families[1], 1, "btcd, observed");
-        assert_eq!((agg.unknown, agg.mismatches, agg.v2), (3, 1, 2), "the claimed ones are unknown");
-        assert_eq!(agg.claimed[0], 1, "core, claimed");
+        assert_eq!((agg.unknown, agg.mismatches, agg.v2), (1, 1, 2), "unknown: neither claimed, fake nor closed early");
+        assert_eq!(agg.claimed[0], 1, "core, claimed: the fakes are not");
         assert_eq!(agg.claimed[1], 1, "btcd, claimed");
         assert_eq!(agg.claimed.iter().sum::<usize>(), 2);
+        assert_eq!(agg.fake[0], 2, "core, fake");
+        assert_eq!(agg.fake.iter().sum::<usize>(), 2);
+        assert_eq!(agg.closed_early, 1);
+        let counted = agg.families.iter().sum::<usize>()
+            + agg.unknown
+            + agg.claimed.iter().sum::<usize>()
+            + agg.fake.iter().sum::<usize>()
+            + agg.closed_early;
+        assert_eq!(counted, agg.addresses, "each record in exactly one tally");
         assert_eq!(agg.top_as, vec![(1, 2), (2, 1)]);
 
         let json = survey_json(&store, true, &serde_json::json!({ "enabled": true }));
         assert_eq!(json["families"]["core"]["count"], 2);
-        assert_eq!(json["families"]["core"]["share"], 2.0 / 6.0);
-        assert_eq!(json["families"]["unknown"]["count"], 3);
+        assert_eq!(json["families"]["core"]["share"], 2.0 / 9.0);
+        assert_eq!(json["families"]["unknown"]["count"], 1);
         assert_eq!(json["claimed"]["core"]["count"], 1);
         assert_eq!(json["claimed"]["btcd"]["count"], 1);
         assert_eq!(json["claimed"]["satd"]["count"], 0);
         assert!(json["claimed"].get("unknown").is_none());
+        assert_eq!(json["fake"]["core"]["count"], 2);
+        assert_eq!(json["fake"]["core"]["share"], 2.0 / 9.0, "shares are of all records");
+        assert_eq!(json["fake"]["btcd"]["count"], 0);
+        assert!(json["fake"].get("unknown").is_none());
+        assert_eq!(json["closed_early"]["count"], 1);
+        assert_eq!(json["closed_early"]["share"], 1.0 / 9.0);
         assert_eq!(json["enabled"], true);
         let peers = json["peers"].as_array().unwrap();
-        assert_eq!(peers.len(), 6);
+        assert_eq!(peers.len(), 9);
         let claimed_row = peers.iter().find(|p| p["fingerprint"] == "core/claimed").unwrap();
         assert_eq!(claimed_row["family"], serde_json::Value::Null, "a claim is no observed family");
         assert_eq!(claimed_row["claimed"], "core");
+        let fake_rows: Vec<_> = peers.iter().filter(|p| p["fingerprint"] == "fake/core").collect();
+        assert_eq!(fake_rows.len(), 2);
+        assert_eq!(fake_rows[0]["family"], serde_json::Value::Null, "a fake is no observed family");
+        assert_eq!(fake_rows[0]["claimed"], "core");
+        let early = peers.iter().find(|p| p["fingerprint"] == "closed-early").unwrap();
+        assert_eq!(early["family"], serde_json::Value::Null);
+        assert_eq!(early["claimed"], "core", "the user agent's claim is kept");
+        assert_eq!(early["subver"], "/Satoshi:28.1.0/");
         assert!(survey_json(&store, false, &serde_json::Value::Null).get("peers").is_none());
+    }
+
+    fn capture_of(commands: &[&str]) -> crate::net::behavior::HandshakeCapture {
+        let mut c = crate::net::behavior::HandshakeCapture::default();
+        for cmd in commands {
+            c.observe(cmd, false);
+        }
+        c
+    }
+
+    fn transcript(commands: &[&str]) -> Vec<String> {
+        commands.iter().map(|c| c.to_string()).collect()
+    }
+
+    const CORE_25: &str = "/Satoshi:25.0.0/";
+    const BARE: &[&str] = &["version", "verack"];
+
+    /// The fake rule holds for a Core user agent at a common version of
+    /// 70016, a transcript of exactly `version`, `verack`, and a wait that
+    /// timed out; each condition turned the other way breaks it.
+    #[test]
+    fn the_fake_core_rule_needs_every_condition() {
+        let bare = transcript(BARE);
+        assert!(is_fake_core(CORE_25, 70016, 70016, &bare, PassiveEnd::Timeout));
+        assert!(is_fake_core("/Satoshi:25.1.0/", 70016, 70016, &bare, PassiveEnd::Timeout));
+        assert!(is_fake_core("/Satoshi:28.1.0/Knots:20250305/", 70016, 70016, &bare, PassiveEnd::Timeout), "Knots is Core");
+        assert!(is_fake_core(CORE_25, 70017, 70016, &bare, PassiveEnd::Timeout), "the common version is ours");
+
+        // A user agent naming another family, or none.
+        assert!(!is_fake_core("/btcwire:0.5.0/btcd:0.24.2/", 70016, 70016, &bare, PassiveEnd::Timeout), "btcd");
+        assert!(!is_fake_core("/satd:0.8.0/", 70016, 70016, &bare, PassiveEnd::Timeout), "satd");
+        assert!(!is_fake_core("/something:1.0/", 70016, 70016, &bare, PassiveEnd::Timeout), "no family");
+        // A common version below 70016, on either side.
+        assert!(!is_fake_core(CORE_25, 70015, 70016, &bare, PassiveEnd::Timeout), "theirs 70015");
+        assert!(!is_fake_core(CORE_25, 70016, 70015, &bare, PassiveEnd::Timeout), "ours 70015");
+        // A transcript with a negotiation message, or anything more.
+        for t in [
+            &["version", "wtxidrelay", "verack"][..],
+            &["version", "sendaddrv2", "verack"],
+            &["version", "wtxidrelay", "sendaddrv2", "verack"],
+            &["version", "verack", "ping"],
+            &["version"],
+        ] {
+            assert!(!is_fake_core(CORE_25, 70016, 70016, &transcript(t), PassiveEnd::Timeout), "{t:?}");
+        }
+        // A wait that did not time out.
+        assert!(!is_fake_core(CORE_25, 70016, 70016, &bare, PassiveEnd::PeerClosed), "the peer closed");
+        assert!(!is_fake_core(CORE_25, 70016, 70016, &bare, PassiveEnd::Settled), "settled");
+    }
+
+    /// The verdict a session gets: the peer closing on an open transcript
+    /// is closed early, whatever the user agent; the fake rule is fake;
+    /// the rest keep their fingerprint, and a wait the node cut short is
+    /// never judged.
+    #[test]
+    fn the_session_verdict() {
+        let bare = capture_of(BARE);
+        let negotiated = capture_of(&["version", "wtxidrelay", "sendaddrv2", "verack"]);
+        let settled = capture_of(&["version", "wtxidrelay", "sendaddrv2", "verack", "sendcmpct", "ping"]);
+        assert!(bare.is_open() && negotiated.is_open() && !settled.is_open(), "fixture");
+        let v = |p, c, ua, theirs| session_verdict(p, c, ua, theirs, 70016);
+
+        assert_eq!(v(Some(PassiveEnd::Timeout), &bare, CORE_25, 70016), Verdict::Fake(Family::Core));
+        assert_eq!(v(Some(PassiveEnd::PeerClosed), &bare, CORE_25, 70016), Verdict::ClosedEarly, "closed early, not fake");
+        assert_eq!(v(Some(PassiveEnd::PeerClosed), &negotiated, "/Satoshi:32.1.0/", 70016), Verdict::ClosedEarly);
+        assert_eq!(v(Some(PassiveEnd::PeerClosed), &negotiated, "/btcwire:0.5.0/btcd:0.27.0/", 70016), Verdict::ClosedEarly);
+        assert_eq!(v(Some(PassiveEnd::PeerClosed), &negotiated, "", 70016), Verdict::ClosedEarly, "with no user agent");
+        // The peer closing once its transcript has settled is judged as it is.
+        assert_eq!(v(Some(PassiveEnd::PeerClosed), &settled, "/Satoshi:32.1.0/", 70016), Verdict::Classified);
+        assert_eq!(v(Some(PassiveEnd::Settled), &settled, "/Satoshi:32.1.0/", 70016), Verdict::Classified);
+        // A timeout on a negotiated transcript (btcd's shape) is no fake.
+        assert_eq!(v(Some(PassiveEnd::Timeout), &negotiated, CORE_25, 70016), Verdict::Classified);
+        assert_eq!(v(Some(PassiveEnd::Timeout), &bare, "/btcwire:0.5.0/btcd:0.27.0/", 70016), Verdict::Classified);
+        assert_eq!(v(Some(PassiveEnd::Timeout), &bare, CORE_25, 70015), Verdict::Classified);
+        // The node cut the wait short: no verdict.
+        assert_eq!(v(None, &bare, CORE_25, 70016), Verdict::Classified);
     }
 
     /// Each connection's probes are a subset of the four, without repeats,

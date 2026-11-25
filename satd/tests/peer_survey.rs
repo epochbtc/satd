@@ -3,7 +3,9 @@
 //! with the shapes the fingerprint captures show for Core, btcd and
 //! libbitcoin, and a real satd), surveyed until each has a record; the
 //! aggregate must say so. Then the store survives a restart, and with the
-//! survey off the node dials nothing.
+//! survey off the node dials nothing. A peer claiming Core that sends only
+//! `version` and `verack` and stays silent is counted fake, and one that
+//! closes straight after the handshake closed early, neither as a family.
 
 mod common;
 
@@ -30,6 +32,11 @@ struct Shape {
     negotiation: Vec<NetworkMessage>,
     /// Once the dialler's `verack` arrives.
     after_verack: Vec<NetworkMessage>,
+    /// Answer `ping`, `getheaders` and `getdata`.
+    answers: bool,
+    /// Hang up once the dialler's `verack` arrives, as a node with full
+    /// inbound slots evicting its newest connection does.
+    close_after_verack: bool,
 }
 
 /// `core-31.2-outbound`: Core when dialled.
@@ -40,6 +47,8 @@ fn core() -> Shape {
         relay: true,
         negotiation: vec![NetworkMessage::WtxidRelay, NetworkMessage::SendAddrV2],
         after_verack: vec![NetworkMessage::SendCmpct(SendCmpct { send_compact: false, version: 2 }), NetworkMessage::Ping(7)],
+        answers: true,
+        close_after_verack: false,
     }
 }
 
@@ -51,6 +60,8 @@ fn btcd() -> Shape {
         relay: true,
         negotiation: vec![NetworkMessage::SendAddrV2],
         after_verack: vec![],
+        answers: true,
+        close_after_verack: false,
     }
 }
 
@@ -62,7 +73,30 @@ fn libbitcoin() -> Shape {
         relay: false,
         negotiation: vec![],
         after_verack: vec![],
+        answers: true,
+        close_after_verack: false,
     }
+}
+
+/// A peer claiming Core 25 at protocol 70016 that sends `version` and
+/// `verack` and nothing else, answering nothing, not even a `ping`: no
+/// Core release since 0.21 does that.
+fn fake_core() -> Shape {
+    Shape {
+        user_agent: "/Satoshi:25.0.0/",
+        protocol_version: 70016,
+        relay: true,
+        negotiation: vec![],
+        after_verack: vec![],
+        answers: false,
+        close_after_verack: false,
+    }
+}
+
+/// Core with its inbound slots full: it completes the handshake, then
+/// evicts the new connection before sending anything more.
+fn evicting_core() -> Shape {
+    Shape { after_verack: vec![], close_after_verack: true, ..core() }
 }
 
 fn send(stream: &mut TcpStream, msg: NetworkMessage) -> io::Result<()> {
@@ -112,10 +146,18 @@ fn serve(mut stream: TcpStream, shape: &Shape) -> io::Result<()> {
                 send(&mut stream, NetworkMessage::Verack)?;
             }
             NetworkMessage::Verack => {
+                if shape.close_after_verack {
+                    // A clean close: our end first, then read to the
+                    // dialler's, so no reset discards what it has not read.
+                    stream.shutdown(std::net::Shutdown::Write)?;
+                    while recv(&mut stream).is_ok() {}
+                    return Ok(());
+                }
                 for m in &shape.after_verack {
                     send(&mut stream, m.clone())?;
                 }
             }
+            _ if !shape.answers => {}
             NetworkMessage::Ping(n) => send(&mut stream, NetworkMessage::Pong(n))?,
             NetworkMessage::GetHeaders(_) => send(&mut stream, NetworkMessage::Headers(vec![]))?,
             NetworkMessage::GetData(inv) => send(&mut stream, NetworkMessage::NotFound(inv))?,
@@ -234,6 +276,76 @@ fn the_survey_aggregate_matches_the_families_it_reached() {
     assert_eq!(node.rpc_ok("getpeersurvey", vec![])["addresses"], 4);
     node.stop();
     target.stop();
+}
+
+/// A peer claiming Core that sends `version` and `verack` and then nothing,
+/// the connection open through the passive wait, is fake; one that closes
+/// the connection straight after the handshake is closed early. Each is
+/// counted on its own tally, in no family, claim or unknown, and shown so
+/// in the verbose rows and the metrics.
+#[test]
+fn the_survey_counts_fake_and_closed_early_apart() {
+    let metrics_port = find_available_port();
+    let mut node = TestNode::start(&[
+        "--maxconnections=0",
+        "--peersurvey=1",
+        "--peersurveyinterval=1",
+        &format!("--metricsport={metrics_port}"),
+    ]);
+    leave_ibd(&node);
+    let fake_port = scripted(fake_core()).0;
+    let early_port = scripted(evicting_core()).0;
+    add_address(&node, fake_port);
+    add_address(&node, early_port);
+
+    let survey = poll_until_json(
+        || node.rpc_ok("getpeersurvey", vec![]),
+        |v| v["addresses"] == 2,
+        test_timeout(240).as_secs(),
+    );
+    assert_eq!(survey["fake"]["core"]["count"], 1, "{survey}");
+    assert_eq!(survey["fake"]["core"]["share"], 0.5, "of all records: {survey}");
+    assert_eq!(survey["closed_early"]["count"], 1, "{survey}");
+    assert_eq!(survey["closed_early"]["share"], 0.5, "{survey}");
+    assert_eq!(survey["families"]["core"]["count"], 0, "{survey}");
+    assert_eq!(survey["families"]["unknown"]["count"], 0, "{survey}");
+    assert_eq!(survey["claimed"]["core"]["count"], 0, "{survey}");
+    assert_eq!(survey["mismatches"], 0);
+    assert_eq!(survey["connections"]["completed"].as_u64().map(|n| n >= 2), Some(true), "both completed: {survey}");
+
+    let verbose = node.rpc_ok("getpeersurvey", vec![json!(true)]);
+    let rows = verbose["peers"].as_array().unwrap();
+    let row = |port: u16| rows.iter().find(|r| r["addr"] == format!("127.0.0.1:{port}")).expect("a row");
+    let fake = row(fake_port);
+    assert_eq!(fake["fingerprint"], "fake/core", "{fake}");
+    assert_eq!(fake["family"], serde_json::Value::Null);
+    assert_eq!(fake["claimed"], "core");
+    assert_eq!(fake["handshake"], json!(["version", "verack"]));
+    let early = row(early_port);
+    assert_eq!(early["fingerprint"], "closed-early", "{early}");
+    assert_eq!(early["family"], serde_json::Value::Null);
+    assert_eq!(early["claimed"], "core");
+    assert_eq!(early["subver"], "/Satoshi:32.1.0/");
+    assert_eq!(early["version"], 70016);
+
+    let body = reqwest::blocking::get(format!("http://127.0.0.1:{metrics_port}/metrics")).unwrap().text().unwrap();
+    for line in [
+        "satd_peer_survey_records 2",
+        "satd_peer_survey_fake{family=\"core\"} 1",
+        "satd_peer_survey_closed_early 1",
+        "satd_peer_survey_family{family=\"core\"} 0",
+        "satd_peer_survey_family{family=\"unknown\"} 0",
+        "satd_peer_survey_claimed{family=\"core\"} 0",
+    ] {
+        assert!(body.lines().any(|l| l == line), "missing `{line}`");
+    }
+
+    // The verdicts survive a restart.
+    node.stop();
+    node.restart_preserving_datadir(&["--maxconnections=0", "--peersurvey=1", "--peersurveyinterval=3600"]);
+    let again = node.rpc_ok("getpeersurvey", vec![]);
+    assert_eq!((again["fake"]["core"]["count"].clone(), again["closed_early"]["count"].clone()), (json!(1), json!(1)), "{again}");
+    node.stop();
 }
 
 /// With the survey off (the default), a node with an address in its book

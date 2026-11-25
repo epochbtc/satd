@@ -18,14 +18,19 @@
 //! handshake transcript closes, then sends the probes
 //! (`-peersurveyprobes`) and closes.
 //!
+//! A peer that closes the connection before its transcript settles gets no
+//! fingerprint: its record is closed early ([`Verdict::ClosedEarly`]). One
+//! that claims Core and sends nothing but `version` and `verack` through
+//! the whole wait is fake ([`survey::is_fake_core`]).
+//!
 //! The address book learns what a feeler would teach it (Core's `Good` on a
 //! completed handshake, an attempt on a failed dial, the services the peer
 //! states), and nothing else.
 
 use super::*;
 use crate::net::survey::{
-    self, PASSIVE_WAIT, PROBE_REPLY_WAIT, Probe, ProbeContext, ProbeOutcome, ProbeResults, SurveyRecord,
-    SurveyShape, SurveyStore, UNKNOWN_PROBE_WAIT,
+    self, PASSIVE_WAIT, PROBE_REPLY_WAIT, PassiveEnd, Probe, ProbeContext, ProbeOutcome, ProbeResults,
+    SurveyRecord, SurveyShape, SurveyStore, UNKNOWN_PROBE_WAIT, Verdict,
 };
 use rand::seq::SliceRandom as _;
 
@@ -86,11 +91,16 @@ pub struct SurveyMetrics {
     /// Records by observed family, [`crate::net::fingerprint::Family::ALL`]'s
     /// order.
     pub families: [usize; crate::net::fingerprint::Family::ALL.len()],
-    /// Records no row matched, the claimed ones included.
+    /// Records no row matched whose user agent names no family: neither
+    /// claimed, fake nor closed early.
     pub unknown: usize,
-    /// The unknown records whose user agent names a family, per family:
-    /// never counted in `families`.
+    /// The records no row matched whose user agent names a family, per
+    /// family: never counted in `families` or `unknown`.
     pub claimed: [usize; crate::net::fingerprint::Family::ALL.len()],
+    /// The fake records ([`Verdict::Fake`]), per claimed family.
+    pub fake: [usize; crate::net::fingerprint::Family::ALL.len()],
+    /// The closed-early records ([`Verdict::ClosedEarly`]).
+    pub closed_early: usize,
     pub mismatches: usize,
     pub v2: usize,
     /// By [`Probe::ALL`] then answered, silent, disconnected.
@@ -138,13 +148,23 @@ pub(super) async fn next_message(
 }
 
 /// How [`listen_passive`] ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Listened {
     /// The wait ran out with the transcript still open.
     Timeout,
     /// The transcript closed.
     Settled,
+    /// The peer closed the connection, or a send to it failed.
+    PeerClosed,
+    /// The node closed it ([`Next::Aborted`]).
+    Aborted,
+}
+
+impl Listened {
     /// The connection closed, at the peer's end or the node's.
-    Closed,
+    pub(super) fn closed(self) -> bool {
+        matches!(self, Listened::PeerClosed | Listened::Aborted)
+    }
 }
 
 /// The passive wait of a survey or crawl session: take the peer's messages
@@ -163,14 +183,15 @@ pub(super) async fn listen_passive(
         let msg = match next_message(read_rx, deadline, abort).await {
             Next::Msg(msg) => msg,
             Next::Timeout => return Listened::Timeout,
-            Next::Closed | Next::Aborted => return Listened::Closed,
+            Next::Closed => return Listened::PeerClosed,
+            Next::Aborted => return Listened::Aborted,
         };
         log_received(id, &msg);
         let open = observe(&msg);
         if let NetworkMessage::Ping(nonce) = msg
             && writer.send(NetworkMessage::Pong(nonce)).await.is_err()
         {
-            return Listened::Closed;
+            return Listened::PeerClosed;
         }
         if !open {
             return Listened::Settled;
@@ -277,7 +298,7 @@ impl PeerManager {
                     if store.dropped_old_format() > 0 {
                         tracing::info!(
                             dropped = store.dropped_old_format(),
-                            "The network survey file is in the old format; its records are dropped and the survey starts empty"
+                            "The network survey file is in an older format (satdsrv1 or satdsrv2); its records are dropped and the survey starts empty"
                         );
                     } else {
                         tracing::info!(records = store.len(), "Loaded the network survey");
@@ -508,9 +529,15 @@ impl PeerManager {
             }
         });
 
-        let closed = self.survey_listen(id, &mut writer, &mut read_rx, &abort).await;
+        let listened = self.survey_listen(id, &mut writer, &mut read_rx, &abort).await;
+        let passive = match listened {
+            Listened::Timeout => Some(PassiveEnd::Timeout),
+            Listened::Settled => Some(PassiveEnd::Settled),
+            Listened::PeerClosed => Some(PassiveEnd::PeerClosed),
+            Listened::Aborted => None,
+        };
         let mut probes = ProbeResults::default();
-        let closed = closed
+        let closed = listened.closed()
             || (self.survey.get().is_some_and(|run| run.config.probes)
                 && self.survey_probe(id, &mut writer, &mut read_rx, &abort, &mut probes).await);
         read_task.abort();
@@ -521,14 +548,23 @@ impl PeerManager {
             return;
         };
         let info = &mut handle.info;
-        let fingerprint = crate::net::fingerprint::classify(false, &info.behavior.handshake, info.behavior.version.as_ref(), true);
+        let user_agent = crate::net::limits::sanitize_string(&version.user_agent);
+        let verdict =
+            survey::session_verdict(passive, &info.behavior.handshake, &user_agent, version.version, PROTOCOL_VERSION);
+        // A peer that closed before its transcript settled showed nothing
+        // of its implementation: no fingerprint.
+        let fingerprint = if verdict == Verdict::ClosedEarly {
+            crate::net::fingerprint::Fingerprint::Unknown
+        } else {
+            crate::net::fingerprint::classify(false, &info.behavior.handshake, info.behavior.version.as_ref(), true)
+        };
         let reason = if closed { "survey-peer-closed" } else { "survey-done" };
         // A shape no row matched keeps its raw features, in the record and
         // here, so the next round of unknown shapes can be told apart.
         let relay = info.behavior.version.as_ref().is_some_and(|v| v.relay);
         let shape = fingerprint.observed().is_none().then(|| SurveyShape::of(&info.behavior.handshake, relay));
         tracing::debug!(
-            "survey connection done ({reason}), fingerprint={fingerprint} v2={v2} probes={}{}, disconnecting peer={id}",
+            "survey connection done ({reason}), fingerprint={fingerprint} verdict={verdict:?} v2={v2} probes={}{}, disconnecting peer={id}",
             Probe::ALL
                 .iter()
                 .filter_map(|p| probes.get(*p).map(|o| format!("{}:{}", p.name(), o.name())))
@@ -559,7 +595,7 @@ impl PeerManager {
         };
         let record = SurveyRecord {
             fingerprint,
-            user_agent: crate::net::limits::sanitize_string(&version.user_agent),
+            user_agent,
             protocol_version: version.version,
             services: version.services.to_u64(),
             v2,
@@ -568,6 +604,7 @@ impl PeerManager {
             last_seen: now,
             probes,
             shape,
+            verdict,
         };
         let aggregate = {
             let mut store = run.store.lock();
@@ -580,15 +617,16 @@ impl PeerManager {
     /// The passive wait: send what a full-relay outbound sends after its
     /// `verack` (less `getaddr`, `getheaders` and our addresses), then take
     /// the peer's messages into its handshake transcript until it closes or
-    /// [`PASSIVE_WAIT`] passes, answering a `ping`. Returns whether the
-    /// connection closed, at the peer's end or the node's (`abort`).
+    /// [`PASSIVE_WAIT`] passes, answering a `ping`. Returns how it ended:
+    /// a send that fails is the peer's close, and a transcript that reads
+    /// as closed because the node dropped the peer's handle is the node's.
     async fn survey_listen(
         &self,
         id: PeerId,
         writer: &mut crate::net::connection::ConnectionWriter,
         read_rx: &mut mpsc::Receiver<NetworkMessage>,
         abort: &tokio::sync::Notify,
-    ) -> bool {
+    ) -> Listened {
         // `peer_task`'s, in its order: compact blocks in low-bandwidth mode,
         // then the fee filter.
         let cmpct = NetworkMessage::SendCmpct(bitcoin::p2p::message_compact_blocks::SendCmpct {
@@ -596,20 +634,19 @@ impl PeerManager {
             version: 2,
         });
         if writer.send(cmpct).await.is_err() {
-            return true;
+            return Listened::PeerClosed;
         }
         if let Some(rate) = self.fee_filter_for(id)
             && writer.send(NetworkMessage::FeeFilter(rate as i64)).await.is_err()
         {
-            return true;
+            return Listened::PeerClosed;
         }
         let deadline = tokio::time::Instant::now() + PASSIVE_WAIT;
         match listen_passive(id, writer, read_rx, abort, deadline, |msg| self.capture_handshake(id, msg)).await {
-            Listened::Timeout => false,
-            Listened::Closed => true,
             // A transcript reads as closed, too, once the node has dropped
             // the peer's handle.
-            Listened::Settled => !self.peers.read().contains_key(&id),
+            Listened::Settled if !self.peers.read().contains_key(&id) => Listened::Aborted,
+            other => other,
         }
     }
 
@@ -715,6 +752,8 @@ impl PeerManager {
             families: agg.families,
             unknown: agg.unknown,
             claimed: agg.claimed,
+            fake: agg.fake,
+            closed_early: agg.closed_early,
             mismatches: agg.mismatches,
             v2: agg.v2,
             probe_outcomes,
