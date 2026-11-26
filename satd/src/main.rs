@@ -743,6 +743,12 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
             node::shutdown::exit_now(1);
         }
     };
+    // -crawlproxy against -proxy/-onion given as host names: resolved once,
+    // here, never on a SIGHUP reload.
+    if let Err(e) = config.check_crawlproxy_tor_names() {
+        eprintln!("Error: {}", e);
+        node::shutdown::exit_now(1);
+    }
     replay_stop_budget.store(
         config.max_shutdown_secs,
         std::sync::atomic::Ordering::Relaxed,
@@ -3125,19 +3131,30 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
             tracing::warn!("The crawl is off: {e}");
         } else {
             peer_manager.spawn_crawl();
-            let from = match config.crawlbind.as_slice() {
-                [] => "this host's IP address".to_string(),
-                binds => binds
-                    .iter()
-                    .map(|ip| ip.to_string())
-                    .collect::<Vec<_>>()
-                    .join(" and "),
-            };
-            tracing::warn!(
-                "Crawl enabled: it will dial tens of thousands of addresses from {from}; other operators' monitors \
-                 will record that address as a crawler, and hosting providers may receive abuse reports. A dedicated \
-                 host, or -crawlbind, keeps the node's own address out of it."
-            );
+            if config.crawlproxy.is_some() {
+                // The proxy's address stays out of the log line: the line
+                // is about whose address the crawl shows.
+                tracing::warn!(
+                    "Crawl enabled: its IPv4 and IPv6 dials, tens of thousands of addresses, leave through the crawl \
+                     proxy (-crawlproxy), from the proxy host's address; other operators' monitors will record that \
+                     address as a crawler, and its hosting provider may receive abuse reports. With the proxy down \
+                     no clearnet dial is made. Onion dials go through -onion/-proxy as before."
+                );
+            } else {
+                let from = match config.crawlbind.as_slice() {
+                    [] => "this host's IP address".to_string(),
+                    binds => binds
+                        .iter()
+                        .map(|ip| ip.to_string())
+                        .collect::<Vec<_>>()
+                        .join(" and "),
+                };
+                tracing::warn!(
+                    "Crawl enabled: it will dial tens of thousands of addresses from {from}; other operators' monitors \
+                     will record that address as a crawler, and hosting providers may receive abuse reports. A dedicated \
+                     host, -crawlproxy, or -crawlbind keeps the node's own address out of it."
+                );
+            }
             if config.peersurvey {
                 tracing::info!(
                     "-peersurvey is superseded by -crawl: the survey opens no connection"

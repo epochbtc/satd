@@ -957,6 +957,21 @@ impl CrawlBook {
         }
     }
 
+    /// End the session `session` to `addr` with nothing recorded: its dial
+    /// failed at the crawl's proxy (`-crawlproxy`), so nothing is known of
+    /// the target. Only the open-session marker goes: no attempt, failure,
+    /// back-off, retry or reachability changes, and the address is due again
+    /// as it was. Returns whether `session` was the session open.
+    pub fn release(&mut self, addr: &PeerAddr, session: Option<u64>) -> bool {
+        match self.entries.get_mut(&CrawlAddr::Peer(addr.clone())) {
+            Some(e) if e.in_flight.map(|(_, token)| token) == session => {
+                e.in_flight = None;
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Record how a session of `kind` to `addr` went. A v1 recheck that
     /// fails is not a reachability failure; any other session that
     /// completes no handshake backs the address off, and drops it once it

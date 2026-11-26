@@ -1045,6 +1045,7 @@ fn field_specs() -> Vec<FieldSpec> {
         restart!("crawlmaxage", crawlmaxage),
         restart!("crawlnet", crawlnet),
         restart!("crawlbind", crawlbind),
+        restart!("crawlproxy", crawlproxy),
         restart!("crawlseed", crawlseed),
         restart!("crawluacomment", crawluacomment),
         restart!("crawlprobes", crawlprobes),
@@ -1531,6 +1532,18 @@ mod tests {
             find("rpcport").apply.is_none(),
             "rpcport should be restart-only"
         );
+    }
+
+    /// `-crawlproxy` is read once, into the crawl's config at startup: a
+    /// changed value is restart-required, never applied in place.
+    #[test]
+    fn crawlproxy_is_restart_only() {
+        let specs = field_specs();
+        let spec = specs
+            .iter()
+            .find(|s| s.key == "crawlproxy")
+            .expect("crawlproxy has a FieldSpec");
+        assert!(spec.apply.is_none(), "crawlproxy is restart-only");
     }
 
     /// An external-file key whose handler binds the path at startup must have a

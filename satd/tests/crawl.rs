@@ -1051,3 +1051,117 @@ fn a_bad_country_file_fails_startup() {
         "{missing_err}"
     );
 }
+
+/// A no-authentication SOCKS5 proxy on loopback that relays CONNECTs to
+/// IPv4 and IPv6 addresses, recording each target asked for, or with
+/// `refuse` answers every CONNECT with reply 0x05.
+fn socks_proxy(refuse: bool) -> (u16, Arc<std::sync::Mutex<Vec<SocketAddr>>>) {
+    let (listener, port) = bind();
+    let asked: Arc<std::sync::Mutex<Vec<SocketAddr>>> = Default::default();
+    let seen = asked.clone();
+    std::thread::spawn(move || {
+        for mut sock in listener.incoming().flatten() {
+            let seen = seen.clone();
+            std::thread::spawn(move || -> io::Result<()> {
+                let mut head = [0u8; 2];
+                sock.read_exact(&mut head)?;
+                let mut methods = vec![0u8; head[1] as usize];
+                sock.read_exact(&mut methods)?;
+                sock.write_all(&[0x05, 0x00])?;
+                let mut req = [0u8; 4];
+                sock.read_exact(&mut req)?;
+                let ip = match req[3] {
+                    0x01 => {
+                        let mut a = [0u8; 4];
+                        sock.read_exact(&mut a)?;
+                        std::net::IpAddr::from(a)
+                    }
+                    0x04 => {
+                        let mut a = [0u8; 16];
+                        sock.read_exact(&mut a)?;
+                        std::net::IpAddr::from(a)
+                    }
+                    _ => return Ok(()),
+                };
+                let mut port = [0u8; 2];
+                sock.read_exact(&mut port)?;
+                let target = SocketAddr::new(ip, u16::from_be_bytes(port));
+                seen.lock().unwrap().push(target);
+                let reply = |code: u8| [0x05, code, 0x00, 0x01, 0, 0, 0, 0, 0, 0];
+                let out = match (refuse, TcpStream::connect(target)) {
+                    (false, Ok(out)) => out,
+                    _ => return sock.write_all(&reply(0x05)),
+                };
+                sock.write_all(&reply(0x00))?;
+                let (mut a_in, mut b_out) = (sock.try_clone()?, out.try_clone()?);
+                let (mut b_in, mut a_out) = (out, sock);
+                std::thread::spawn(move || {
+                    let _ = io::copy(&mut a_in, &mut b_out);
+                    let _ = b_out.shutdown(std::net::Shutdown::Write);
+                });
+                let _ = io::copy(&mut b_in, &mut a_out);
+                let _ = a_out.shutdown(std::net::Shutdown::Write);
+                Ok(())
+            });
+        }
+    });
+    (port, asked)
+}
+
+/// `-crawlproxy`: the crawl's clearnet dials go through it and reach a
+/// real regtest node, even under `-proxy`, which is never asked for one.
+/// `getcrawlinfo` says a crawl proxy is set, with no failure, and never
+/// names it; the startup warning says the dials leave through the proxy.
+#[test]
+fn the_crawl_dials_clearnet_through_the_crawl_proxy() {
+    let mut x = TestNode::start(&[]);
+    let xp = x.p2p_port.unwrap();
+    let (crawl_proxy, crawl_asked) = socks_proxy(false);
+    let (tor_proxy, tor_asked) = socks_proxy(true);
+    let args = [
+        "--maxconnections=0".to_string(),
+        "--crawl=1".to_string(),
+        format!("--crawlseed=127.0.0.1:{xp}"),
+        format!("--crawlproxy=127.0.0.1:{crawl_proxy}"),
+        format!("--proxy=127.0.0.1:{tor_proxy}"),
+        "--loglevel=debug".to_string(),
+    ];
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let mut c = TestNode::start(&args);
+    c.rpc_ok("generatetoaddress", vec![json!(1), json!(ADDR)]);
+    wait_for("a session to the node", 300, || sessions_done(&c, xp) >= 1);
+    let target = SocketAddr::from(([127, 0, 0, 1], xp));
+    assert!(
+        crawl_asked.lock().unwrap().contains(&target),
+        "the crawl proxy was asked for the node"
+    );
+    assert!(tor_asked.lock().unwrap().is_empty(), "-proxy never was");
+    wait_for("the aggregate", 10, || {
+        c.rpc_ok("getcrawlinfo", vec![])["reachable"]["total"] == 1
+    });
+    let info = c.rpc_ok("getcrawlinfo", vec![]);
+    assert_eq!(
+        info["proxy"],
+        json!({ "set": true, "failures": 0 }),
+        "{info}"
+    );
+    assert!(
+        info["limits"]["networks"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("ipv4")),
+        "{info}"
+    );
+    let text = info.to_string();
+    assert!(
+        !text.contains(&format!("127.0.0.1:{crawl_proxy}")),
+        "no proxy address in getcrawlinfo: {text}"
+    );
+    let log = std::fs::read_to_string(&c.stderr_log).unwrap_or_default();
+    assert!(
+        log.contains("leave through the crawl proxy (-crawlproxy)"),
+        "the startup warning"
+    );
+    c.stop();
+    x.stop();
+}

@@ -2,7 +2,7 @@
 //! scripted peers on loopback. A regtest manager's book admits loopback
 //! addresses; nothing here dials off the host.
 
-use super::survey_tests::{ONION, book_add, mk_pm_live, mk_pm_proxied, mk_pm_with};
+use super::survey_tests::{ONION, book_add, mk_pm_live, mk_pm_proxied, mk_pm_proxies, mk_pm_with};
 use super::*;
 use crate::net::crawl::{CrawlConfig, Limits, Timings};
 use crate::net::crawlbook::{Attempt, CrawlAddr, GetaddrResult, SessionKind, SessionResult};
@@ -2240,4 +2240,605 @@ fn no_per_node_row_carries_a_country() {
         assert!(v["node"][7].is_null(), "{line}");
         check("an hourly line", &v);
     }
+}
+
+// ---- -crawlproxy ----
+
+/// How the in-test SOCKS5 proxy answers a CONNECT.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProxyMode {
+    /// Connect to the target and relay; reply 0x05 when it refuses.
+    Relay,
+    /// Reply with this code, and close.
+    Refuse(u8),
+    /// Accept, then close before the greeting reply: a proxy that is up
+    /// on its port and cannot serve.
+    Broken,
+}
+
+/// An in-test SOCKS5 proxy: no authentication, CONNECT to an IPv4 or IPv6
+/// address or a name. It records every target asked for (`ip:port` or
+/// `name:port`).
+struct TestProxy {
+    addr: SocketAddr,
+    asked: Arc<parking_lot::Mutex<Vec<String>>>,
+    mode: Arc<parking_lot::Mutex<ProxyMode>>,
+}
+
+async fn test_proxy(mode: ProxyMode) -> TestProxy {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let addr = listener.local_addr().unwrap();
+    let asked: Arc<parking_lot::Mutex<Vec<String>>> = Default::default();
+    let mode = Arc::new(parking_lot::Mutex::new(mode));
+    let (seen, how) = (asked.clone(), mode.clone());
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                return;
+            };
+            let (seen, how) = (seen.clone(), *how.lock());
+            tokio::spawn(async move {
+                if how == ProxyMode::Broken {
+                    return None;
+                }
+                let mut head = [0u8; 2];
+                sock.read_exact(&mut head).await.ok()?;
+                let mut methods = vec![0u8; head[1] as usize];
+                sock.read_exact(&mut methods).await.ok()?;
+                sock.write_all(&[0x05, 0x00]).await.ok()?;
+                let mut req = [0u8; 4];
+                sock.read_exact(&mut req).await.ok()?;
+                let host = match req[3] {
+                    0x01 => {
+                        let mut a = [0u8; 4];
+                        sock.read_exact(&mut a).await.ok()?;
+                        IpAddr::from(a).to_string()
+                    }
+                    0x04 => {
+                        let mut a = [0u8; 16];
+                        sock.read_exact(&mut a).await.ok()?;
+                        format!("[{}]", IpAddr::from(a))
+                    }
+                    _ => {
+                        let mut len = [0u8; 1];
+                        sock.read_exact(&mut len).await.ok()?;
+                        let mut name = vec![0u8; len[0] as usize];
+                        sock.read_exact(&mut name).await.ok()?;
+                        String::from_utf8_lossy(&name).into_owned()
+                    }
+                };
+                let mut port = [0u8; 2];
+                sock.read_exact(&mut port).await.ok()?;
+                let target = format!("{host}:{}", u16::from_be_bytes(port));
+                seen.lock().push(target.clone());
+                let reply = |code: u8| [0x05, code, 0x00, 0x01, 0, 0, 0, 0, 0, 0];
+                if let ProxyMode::Refuse(code) = how {
+                    let _ = sock.write_all(&reply(code)).await;
+                    return None;
+                }
+                match TcpStream::connect(target).await {
+                    Ok(mut out) => {
+                        sock.write_all(&reply(0x00)).await.ok()?;
+                        let _ = tokio::io::copy_bidirectional(&mut sock, &mut out).await;
+                    }
+                    Err(_) => {
+                        let _ = sock.write_all(&reply(0x05)).await;
+                    }
+                }
+                None::<()>
+            });
+        }
+    });
+    TestProxy { addr, asked, mode }
+}
+
+/// A loopback address nothing listens on: a proxy that is down.
+async fn down_proxy() -> SocketAddr {
+    let l = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    l.local_addr().unwrap()
+}
+
+fn with_crawl_proxy(proxy: SocketAddr) -> CrawlConfig {
+    CrawlConfig {
+        proxy: Some(proxy),
+        ..config()
+    }
+}
+
+/// The book's record of `addr` that a session's result moves: its
+/// attempts, reachability, failures, back-off, retry and observation.
+fn record_of(pm: &PeerManager, addr: &PeerAddr) -> impl PartialEq + std::fmt::Debug {
+    let e = pm
+        .crawl_book()
+        .unwrap()
+        .get(&CrawlAddr::Peer(addr.clone()))
+        .cloned()
+        .expect("in the book");
+    (
+        (e.attempts, e.last_attempt, e.last_success),
+        (e.failures, e.failing_since, e.retry_at),
+        (e.v2_ok, e.v1_ok, e.reachable_count),
+        e.observation,
+        e.closed_early_retry,
+    )
+}
+
+/// Seed `addr`, mark a session open and run it as the tick would.
+async fn crawl_once(pm: &Arc<PeerManager>, addr: &PeerAddr) {
+    let run = pm.crawl.get().unwrap();
+    let now = crate::time::now_secs();
+    run.book.lock().seed(addr.clone(), 0, now);
+    let token = run.book.lock().mark_dialling(addr, now);
+    assert!(token.is_some());
+    pm.run_crawl_session(addr.clone(), SessionKind::Discovery, token)
+        .await;
+}
+
+/// With `-crawlproxy`, a clearnet crawl dial goes through it: the proxy is
+/// asked for the target, the session reaches it and is recorded, and the
+/// `version` names the dummy address as the receiver, not the target.
+/// Perturbation: dial direct when `-crawlproxy` is set and the proxy is
+/// asked for nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_clearnet_crawl_dial_goes_through_the_crawl_proxy() {
+    let (pm, _dir) = mk_pm_with(None);
+    let proxy = test_proxy(ProxyMode::Relay).await;
+    enable(&pm, with_crawl_proxy(proxy.addr));
+    let (target, log) = scripted("127.0.0.1", core_script()).await;
+    let out = pm.crawl_session(&target, SessionKind::Liveness).await;
+    assert_eq!(out.result.v1, Attempt::Ok, "reached through the proxy");
+    assert!(!out.proxy_failed);
+    assert_eq!(*proxy.asked.lock(), vec![target.to_string()]);
+    let conns = log.lock().clone();
+    let Some(NetworkMessage::Version(v)) = conns[0].first() else {
+        panic!("a version first: {conns:?}");
+    };
+    assert_eq!(
+        v.receiver.socket_addr().unwrap(),
+        SocketAddr::from(([0, 0, 0, 0], 0)),
+        "the dummy receiver through a proxy"
+    );
+    assert_eq!(pm.get_crawl_info()["proxy"]["failures"], 0);
+}
+
+/// Under `-proxy` (a Tor proxy, say) clearnet is never crawled; with
+/// `-crawlproxy` set too it is, through `-crawlproxy` and never `-proxy`,
+/// a routable address included. `-crawlnet` still narrows.
+/// Perturbation: keep the `-proxy` rule ahead of `-crawlproxy` in
+/// `crawl_may_dial` and the routable address is refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn under_proxy_clearnet_is_crawled_through_the_crawl_proxy() {
+    use crate::net::crawlbook::Network as Net;
+    let tor = test_proxy(ProxyMode::Relay).await;
+    let crawl_proxy = test_proxy(ProxyMode::Relay).await;
+    let tor_addr = tor.addr.to_string();
+    let (pm, _dir) = mk_pm_proxied(&tor_addr);
+    enable(&pm, with_crawl_proxy(crawl_proxy.addr));
+    let public = PeerAddr::Socket("23.1.2.3:8333".parse().unwrap());
+    assert!(pm.crawl_may_dial(&public), "clearnet, through -crawlproxy");
+    let nets = pm.crawl_networks();
+    assert!(
+        nets.contains(&Net::Ipv4) && nets.contains(&Net::Ipv6),
+        "{nets:?}"
+    );
+    let (target, _log) = scripted("127.0.0.1", core_script()).await;
+    let out = pm.crawl_session(&target, SessionKind::Liveness).await;
+    assert_eq!(out.result.v1, Attempt::Ok);
+    assert_eq!(*crawl_proxy.asked.lock(), vec![target.to_string()]);
+    assert!(tor.asked.lock().is_empty(), "-proxy was not used");
+
+    let (pm, _dir) = mk_pm_proxied(&tor_addr);
+    enable(
+        &pm,
+        CrawlConfig {
+            networks: Some(vec![Net::Ipv6, Net::Onion]),
+            ..with_crawl_proxy(crawl_proxy.addr)
+        },
+    );
+    assert!(!pm.crawl_may_dial(&public), "-crawlnet left IPv4 out");
+    pm.set_reachable(crate::net::reachable::ReachableNets {
+        ipv4: false,
+        ipv6: false,
+        onion: true,
+        ..Default::default()
+    });
+    let v6 = PeerAddr::Socket("[2600::1]:8333".parse().unwrap());
+    assert!(!pm.crawl_may_dial(&v6), "-onlynet still narrows");
+}
+
+/// With the crawl proxy down, a clearnet dial is never made direct: the
+/// target sees no connection, the failure is the proxy's (counted in
+/// `getcrawlinfo`, the session in neither reached nor unreached), and the
+/// target's record is unchanged: no attempt, failure, back-off or
+/// reachability. The address stays due; proxied dials pause, then resume.
+/// A proxy that accepts and cannot greet is down the same way. Once the
+/// proxy answers again a session reaches the target.
+/// Perturbation: record the session as the target's (no `release`) and
+/// the record moves; fall back to a direct dial and the target sees a
+/// connection.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_crawl_proxy_failure_is_never_held_against_the_target() {
+    let (pm, _dir) = mk_pm_with(None);
+    let proxy = test_proxy(ProxyMode::Broken).await;
+    let run = enable(&pm, with_crawl_proxy(proxy.addr));
+    let (target, log) = scripted("127.0.0.1", core_script()).await;
+    let now = crate::time::now_secs();
+    run.book.lock().seed(target.clone(), 0, now);
+    let before = record_of(&pm, &target);
+
+    crawl_once(&pm, &target).await;
+    assert!(log.lock().is_empty(), "no direct dial");
+    assert_eq!(
+        record_of(&pm, &target),
+        before,
+        "not held against the target"
+    );
+    assert_eq!(run.proxy_failures.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        (
+            run.reached.load(Ordering::Relaxed),
+            run.unreached.load(Ordering::Relaxed)
+        ),
+        (0, 0)
+    );
+    let book = pm.crawl_book().unwrap();
+    assert!(
+        book.next_due(now, 10).iter().any(|(a, _)| *a == target),
+        "still due"
+    );
+    assert!(!pm.crawl_may_dial(&target), "proxied dials pause");
+    run.proxy_paused_until_ms.store(0, Ordering::Relaxed);
+    assert!(pm.crawl_may_dial(&target), "and resume");
+
+    // A proxy nothing listens on.
+    let (pm2, _dir2) = mk_pm_with(None);
+    let run2 = enable(&pm2, with_crawl_proxy(down_proxy().await));
+    let before2 = {
+        run2.book.lock().seed(target.clone(), 0, now);
+        record_of(&pm2, &target)
+    };
+    crawl_once(&pm2, &target).await;
+    assert!(log.lock().is_empty(), "no direct dial");
+    assert_eq!(record_of(&pm2, &target), before2);
+    assert_eq!(pm2.get_crawl_info()["proxy"]["failures"], 1);
+
+    // The proxy is back.
+    *proxy.mode.lock() = ProxyMode::Relay;
+    crawl_once(&pm, &target).await;
+    assert_eq!(
+        run.reached.load(Ordering::Relaxed),
+        1,
+        "reached once it is back"
+    );
+    assert_eq!(log.lock().len(), 1);
+    assert_eq!(*proxy.asked.lock(), vec![target.to_string()]);
+}
+
+/// A refusal the proxy reports for the target (SOCKS5 reply 0x05, and
+/// 0x01, general failure) is the target's: recorded as a failed dial,
+/// backed off, and not counted against the proxy. A reply the proxy gives
+/// for itself (0x08, address type not supported) is the proxy's.
+/// Perturbation: treat every SOCKS reply as the proxy's and the refusal
+/// is not recorded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_socks_refusal_is_the_targets_failed_dial() {
+    for code in [0x05u8, 0x01] {
+        let (pm, _dir) = mk_pm_with(None);
+        let proxy = test_proxy(ProxyMode::Refuse(code)).await;
+        let run = enable(&pm, with_crawl_proxy(proxy.addr));
+        let target = PeerAddr::Socket("127.0.0.9:8333".parse().unwrap());
+        crawl_once(&pm, &target).await;
+        let e = pm
+            .crawl_book()
+            .unwrap()
+            .get(&CrawlAddr::Peer(target.clone()))
+            .cloned()
+            .unwrap();
+        assert_eq!((e.attempts, e.failures), (1, 1), "{code:#04x}");
+        assert!(e.retry_at.is_some(), "backed off");
+        assert_eq!(run.unreached.load(Ordering::Relaxed), 1);
+        assert_eq!(run.proxy_failures.load(Ordering::Relaxed), 0);
+        assert!(
+            pm.crawl_may_dial(&target),
+            "no pause for the target's failure"
+        );
+    }
+    let (pm, _dir) = mk_pm_with(None);
+    let proxy = test_proxy(ProxyMode::Refuse(0x08)).await;
+    let run = enable(&pm, with_crawl_proxy(proxy.addr));
+    let target = PeerAddr::Socket("127.0.0.9:8333".parse().unwrap());
+    crawl_once(&pm, &target).await;
+    assert_eq!(run.proxy_failures.load(Ordering::Relaxed), 1);
+    assert_eq!(run.unreached.load(Ordering::Relaxed), 0);
+}
+
+/// Onion crawl dials keep `-onion` (or `-proxy`), with credentials of
+/// their own: `-crawlproxy` is never asked for an onion.
+/// Perturbation: send onions through `-crawlproxy` and its record is not
+/// empty.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn onion_crawl_dials_keep_the_onion_proxy() {
+    let tor = test_proxy(ProxyMode::Refuse(0x04)).await;
+    let crawl_proxy = test_proxy(ProxyMode::Relay).await;
+    let tor_addr = tor.addr.to_string();
+    let onion = PeerAddr::Onion {
+        host: ONION.to_string(),
+        port: 8333,
+    };
+    for (proxy, onion_proxy) in [
+        (Some(tor_addr.as_str()), None),
+        (None, Some(tor_addr.as_str())),
+    ] {
+        let (pm, _dir, _shutdown) = mk_pm_proxies(proxy, onion_proxy);
+        enable(&pm, with_crawl_proxy(crawl_proxy.addr));
+        assert!(pm.crawl_may_dial(&onion));
+        let got = pm.crawl_dial(&onion, Duration::from_secs(2)).await;
+        assert!(
+            matches!(got, Err(crawl_conn::DialFailure::Target(_))),
+            "{got:?}"
+        );
+    }
+    assert_eq!(
+        *tor.asked.lock(),
+        vec![format!("{ONION}:8333"), format!("{ONION}:8333")]
+    );
+    assert!(crawl_proxy.asked.lock().is_empty(), "never -crawlproxy");
+}
+
+/// `-crawlbind` does not apply to a proxied dial: with an address no
+/// interface has, a direct dial fails to bind, and the same dial through
+/// `-crawlproxy` connects.
+/// Perturbation: bind the proxied dial's socket and it fails too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn crawlbind_does_not_apply_to_a_proxied_dial() {
+    let (target, _log) = scripted("127.0.0.1", core_script()).await;
+    let unbindable = CrawlConfig {
+        bind_v4: Some("192.0.2.1".parse().unwrap()),
+        ..config()
+    };
+    let (pm, _dir) = mk_pm_with(None);
+    enable(&pm, unbindable.clone());
+    let direct = pm.crawl_dial(&target, Duration::from_secs(2)).await;
+    assert!(
+        matches!(&direct, Err(crawl_conn::DialFailure::Target(e)) if e.contains("bind")),
+        "the control: {direct:?}"
+    );
+    let proxy = test_proxy(ProxyMode::Relay).await;
+    let (pm, _dir) = mk_pm_with(None);
+    enable(
+        &pm,
+        CrawlConfig {
+            proxy: Some(proxy.addr),
+            ..unbindable
+        },
+    );
+    let proxied = pm.crawl_dial(&target, Duration::from_secs(2)).await;
+    assert!(proxied.is_ok(), "{proxied:?}");
+}
+
+/// `getcrawlinfo` says whether a crawl proxy is set and counts its
+/// failures, and never names its address or port; with the crawl off, or
+/// on without one, it is not set.
+/// Perturbation: put the address in the object and the text check fails.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn getcrawlinfo_states_a_crawl_proxy_and_never_its_address() {
+    let (pm, _dir) = mk_pm_with(None);
+    assert_eq!(
+        pm.get_crawl_info()["proxy"],
+        serde_json::json!({ "set": false, "failures": 0 })
+    );
+    enable(&pm, config());
+    assert_eq!(
+        pm.get_crawl_info()["proxy"],
+        serde_json::json!({ "set": false, "failures": 0 })
+    );
+
+    let (pm, _dir) = mk_pm_with(None);
+    let proxy = down_proxy().await;
+    enable(&pm, with_crawl_proxy(proxy));
+    let target = PeerAddr::Socket("127.0.0.9:8333".parse().unwrap());
+    crawl_once(&pm, &target).await;
+    let info = pm.get_crawl_info();
+    assert_eq!(
+        info["proxy"],
+        serde_json::json!({ "set": true, "failures": 1 })
+    );
+    let text = info.to_string();
+    assert!(
+        !text.contains(&proxy.to_string()) && !text.contains("127.0.0.1"),
+        "no proxy address in {text}"
+    );
+}
+
+/// The book's failure count for `addr`: 0 when nothing was recorded.
+fn failures_of(pm: &PeerManager, addr: &PeerAddr) -> u32 {
+    pm.crawl_book()
+        .unwrap()
+        .get(&CrawlAddr::Peer(addr.clone()))
+        .map_or(0, |e| e.failures)
+}
+
+fn loopback_target(i: u8) -> PeerAddr {
+    PeerAddr::Socket(SocketAddr::from(([127, 0, 9, i], 8333)))
+}
+
+/// A proxy that greets but whose targets never answer (0x04 for every
+/// CONNECT, as a SOCKS server with its own uplink down gives) is taken as
+/// down after `PROXY_SILENT_STREAK` such dials in a row: those before it
+/// are recorded against their targets; the dial that completes the streak
+/// and every silent one after it while the proxy is down are the proxy's
+/// (released, counted in `proxy.failures`); a success ends the outage and
+/// the streak, after which a silent failure is the target's again.
+/// Perturbation: never trip on the streak, or record a silent failure while
+/// the proxy is down, and this fails.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_proxy_whose_targets_never_answer_is_taken_as_down() {
+    use super::crawl_conn::PROXY_SILENT_STREAK;
+    let (pm, _dir) = mk_pm_with(None);
+    let proxy = test_proxy(ProxyMode::Refuse(0x04)).await;
+    let run = enable(&pm, with_crawl_proxy(proxy.addr));
+
+    let below = loopback_target(1);
+    crawl_once(&pm, &below).await;
+    assert_eq!(
+        failures_of(&pm, &below),
+        1,
+        "below the streak: the target's"
+    );
+    for _ in 0..PROXY_SILENT_STREAK - 2 {
+        let got = pm
+            .crawl_dial(&loopback_target(2), Duration::from_secs(2))
+            .await;
+        assert!(
+            matches!(got, Err(crawl_conn::DialFailure::Target(_))),
+            "{got:?}"
+        );
+    }
+    assert_eq!(run.proxy_failures.load(Ordering::Relaxed), 0);
+    assert!(!run.proxy_down.load(Ordering::Relaxed));
+
+    let trips = loopback_target(3);
+    run.book
+        .lock()
+        .seed(trips.clone(), 0, crate::time::now_secs());
+    let before = record_of(&pm, &trips);
+    crawl_once(&pm, &trips).await;
+    assert!(
+        run.proxy_down.load(Ordering::Relaxed),
+        "the streak puts the proxy down"
+    );
+    assert_eq!(run.proxy_failures.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        record_of(&pm, &trips),
+        before,
+        "the tripping dial is released"
+    );
+    assert!(!pm.crawl_may_dial(&trips), "proxied dials pause");
+
+    let next = loopback_target(4);
+    run.book
+        .lock()
+        .seed(next.clone(), 0, crate::time::now_secs());
+    let before = record_of(&pm, &next);
+    crawl_once(&pm, &next).await;
+    assert_eq!(
+        record_of(&pm, &next),
+        before,
+        "released while the proxy is down"
+    );
+    assert_eq!(run.proxy_failures.load(Ordering::Relaxed), 2);
+
+    *proxy.mode.lock() = ProxyMode::Relay;
+    let (live, _log) = scripted("127.0.0.1", core_script()).await;
+    let out = pm.crawl_session(&live, SessionKind::Liveness).await;
+    assert_eq!(out.result.v1, Attempt::Ok);
+    assert!(
+        !run.proxy_down.load(Ordering::Relaxed),
+        "a success ends the outage"
+    );
+    assert_eq!(run.proxy_silent_streak.load(Ordering::Relaxed), 0);
+
+    *proxy.mode.lock() = ProxyMode::Refuse(0x04);
+    let after = loopback_target(5);
+    crawl_once(&pm, &after).await;
+    assert_eq!(failures_of(&pm, &after), 1, "the target's again");
+    assert_eq!(run.proxy_failures.load(Ordering::Relaxed), 2);
+}
+
+/// A refusal (0x05) proves the proxy reaches the network: it is the
+/// target's failed dial, never counts toward the silent streak, and resets
+/// it, so a streak one short of the limit does not trip on it nor on the
+/// silent failure after it. A refusal also ends an outage.
+/// Perturbation: count a refusal toward the streak and it trips here.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refusal_resets_the_silent_streak() {
+    use super::crawl_conn::PROXY_SILENT_STREAK;
+    {
+        let code = 0x05u8;
+        let (pm, _dir) = mk_pm_with(None);
+        let proxy = test_proxy(ProxyMode::Refuse(code)).await;
+        let run = enable(&pm, with_crawl_proxy(proxy.addr));
+        run.proxy_silent_streak
+            .store(PROXY_SILENT_STREAK - 1, Ordering::Relaxed);
+        let refused = loopback_target(1);
+        crawl_once(&pm, &refused).await;
+        assert_eq!(failures_of(&pm, &refused), 1, "{code:#04x}: the target's");
+        assert_eq!(run.proxy_silent_streak.load(Ordering::Relaxed), 0);
+        assert!(!run.proxy_down.load(Ordering::Relaxed));
+        assert_eq!(run.proxy_failures.load(Ordering::Relaxed), 0);
+
+        *proxy.mode.lock() = ProxyMode::Refuse(0x04);
+        let silent = loopback_target(2);
+        crawl_once(&pm, &silent).await;
+        assert_eq!(failures_of(&pm, &silent), 1, "no trip after the reset");
+        assert_eq!(run.proxy_failures.load(Ordering::Relaxed), 0);
+
+        run.proxy_down.store(true, Ordering::Relaxed);
+        *proxy.mode.lock() = ProxyMode::Refuse(code);
+        crawl_once(&pm, &loopback_target(3)).await;
+        assert!(
+            !run.proxy_down.load(Ordering::Relaxed),
+            "a refusal ends an outage"
+        );
+    }
+}
+
+/// A proxy answering 0x02 (not allowed by ruleset) for everything decides by
+/// its own policy, never asking a target, so it proves nothing of its
+/// uplink: each such dial is its target's failure below the streak, counts
+/// toward it, trips it at `PROXY_SILENT_STREAK`, and while the proxy is down
+/// is released like any silent failure; 0x02 never ends the outage.
+/// Perturbation: put 0x02 back among the refusals and the streak never
+/// trips here.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_proxy_ruling_out_every_target_trips_the_silent_streak() {
+    use super::crawl_conn::PROXY_SILENT_STREAK;
+    let (pm, _dir) = mk_pm_with(None);
+    let proxy = test_proxy(ProxyMode::Refuse(0x02)).await;
+    let run = enable(&pm, with_crawl_proxy(proxy.addr));
+    let below = loopback_target(1);
+    crawl_once(&pm, &below).await;
+    assert_eq!(
+        failures_of(&pm, &below),
+        1,
+        "below the streak: the target's"
+    );
+    assert_eq!(
+        run.proxy_silent_streak.load(Ordering::Relaxed),
+        1,
+        "it counts"
+    );
+    for _ in 0..PROXY_SILENT_STREAK - 2 {
+        let _ = pm
+            .crawl_dial(&loopback_target(2), Duration::from_secs(2))
+            .await;
+    }
+    let trips = loopback_target(3);
+    run.book
+        .lock()
+        .seed(trips.clone(), 0, crate::time::now_secs());
+    let before = record_of(&pm, &trips);
+    crawl_once(&pm, &trips).await;
+    assert!(
+        run.proxy_down.load(Ordering::Relaxed),
+        "0x02 for everything trips the streak"
+    );
+    assert_eq!(run.proxy_failures.load(Ordering::Relaxed), 1);
+    assert_eq!(record_of(&pm, &trips), before, "released");
+    let next = loopback_target(4);
+    run.book
+        .lock()
+        .seed(next.clone(), 0, crate::time::now_secs());
+    let before = record_of(&pm, &next);
+    crawl_once(&pm, &next).await;
+    assert_eq!(record_of(&pm, &next), before, "released while down");
+    assert!(
+        run.proxy_down.load(Ordering::Relaxed),
+        "0x02 does not end the outage"
+    );
 }

@@ -797,6 +797,9 @@ pub struct Config {
     pub crawlnet: Vec<String>,
     /// `-crawlbind`: the crawl's source addresses, at most one per family.
     pub crawlbind: Vec<std::net::IpAddr>,
+    /// `-crawlproxy`: the SOCKS5 proxy the crawl's IPv4 and IPv6 dials go
+    /// through, an IP address and port.
+    pub crawlproxy: Option<std::net::SocketAddr>,
     /// `-crawlseed`: addresses the crawl starts from.
     pub crawlseed: Vec<String>,
     /// `-crawluacomment`: a comment for the crawl's user agent.
@@ -4430,6 +4433,10 @@ impl Config {
         let alt_slots =
             resolve_alt_slots(&cli.alt_slot_args, &file_get, &file_get_all, maxconnections)?;
         let crawl = resolve_crawl(&cli.crawl_args, &file_get, &file_get_all, network)?;
+        // Literal addresses only here: this runs on every SIGHUP reload
+        // too, where a name lookup could stall. Names are compared once, at
+        // startup (`Config::check_crawlproxy_tor_names`).
+        check_crawlproxy_not_tor(crawl.proxy, proxy.as_deref(), onion.as_deref(), false)?;
 
         Ok(Config {
             network,
@@ -4558,6 +4565,7 @@ impl Config {
             crawlmaxage: crawl.max_age,
             crawlnet: crawl.nets,
             crawlbind: crawl.binds,
+            crawlproxy: crawl.proxy,
             crawlseed: crawl.seeds,
             crawluacomment: crawl.ua_comment,
             crawlprobes: crawl.probes,
@@ -5379,6 +5387,7 @@ impl Config {
             "max_age_secs": self.crawlmaxage,
             "networks": self.crawlnet,
             "bind": self.crawlbind.iter().map(|ip| ip.to_string()).collect::<Vec<_>>(),
+            "proxy": self.crawlproxy.map(|p| p.to_string()),
             "seeds": self.crawlseed.len(),
             "uacomment": self.crawluacomment,
             "probes": self.crawlprobes,
@@ -8748,6 +8757,7 @@ pub struct CrawlArgs {
     pub crawlmaxage: Option<u64>,
     pub crawlnet: Vec<String>,
     pub crawlbind: Vec<String>,
+    pub crawlproxy: Option<String>,
     pub crawlseed: Vec<String>,
     pub crawluacomment: Option<String>,
     pub crawlprobes: Option<bool>,
@@ -8803,6 +8813,12 @@ const CRAWL_ARG_SPECS: &[(&str, &str, StratumArgKind, &str)] = &[
         "IP",
         StratumArgKind::TextList,
         "With -crawl, the source address of direct crawl dials, at most one IPv4 and one IPv6 (repeatable) (default: the system's choice)",
+    ),
+    (
+        "crawlproxy",
+        "IP:PORT",
+        StratumArgKind::Text,
+        "With -crawl, a SOCKS5 proxy (no authentication) every IPv4 and IPv6 crawl dial goes through, so they leave from the proxy's host; even under -proxy, with no direct fallback and -crawlbind not applying. Onion dials and the node's own connections do not use it (default: none)",
     ),
     (
         "crawlseed",
@@ -8869,6 +8885,7 @@ impl clap::FromArgMatches for CrawlArgs {
             crawlmaxage: m.remove_one("crawlmaxage"),
             crawlnet: list(m, "crawlnet"),
             crawlbind: list(m, "crawlbind"),
+            crawlproxy: m.remove_one("crawlproxy"),
             crawlseed: list(m, "crawlseed"),
             crawluacomment: m.remove_one("crawluacomment"),
             crawlprobes: m.remove_one("crawlprobes"),
@@ -8897,6 +8914,7 @@ struct CrawlSettings {
     max_age: u64,
     nets: Vec<String>,
     binds: Vec<std::net::IpAddr>,
+    proxy: Option<std::net::SocketAddr>,
     seeds: Vec<String>,
     ua_comment: Option<String>,
     probes: bool,
@@ -8908,9 +8926,9 @@ struct CrawlSettings {
 /// (concurrency 256, rate 100 a second), which no option lifts; the
 /// liveness interval below two hours (more than 14 sessions a target a
 /// day), a `-crawlnet` that names a network the crawl never dials, two
-/// `-crawlbind` addresses of one family, a `-crawlseed` that is not an IP
-/// address or onion, and a `-crawluacomment` that cannot go in a user agent
-/// are refused too. Command-line lists replace the config file's.
+/// `-crawlbind` addresses of one family, a `-crawlproxy` that is not an IP
+/// address and port, a `-crawlseed` that is not an IP address or onion, and
+/// a `-crawluacomment` that cannot go in a user agent are refused too. Command-line lists replace the config file's.
 #[inline(never)]
 fn resolve_crawl(
     cli: &CrawlArgs,
@@ -9002,6 +9020,29 @@ fn resolve_crawl(
         }
         binds.push(ip);
     }
+    // An IP address and port, never a name: a name would need a lookup of
+    // its own, outside the proxy.
+    let proxy = match cli.crawlproxy.clone().or_else(|| file_get("crawlproxy")) {
+        None => None,
+        Some(v) if v.trim().is_empty() => None,
+        Some(v) => {
+            let sa: std::net::SocketAddr = v.trim().parse().map_err(|_| {
+                format!("-crawlproxy={v}: an IP address and port (127.0.0.1:1080, [::1]:1080)")
+            })?;
+            if sa.port() == 0 {
+                return Err(format!("-crawlproxy={v}: port 0"));
+            }
+            // 0.0.0.0 and [::] name no proxy, and a connect to one reaches
+            // this host's loopback, where the Tor proxy may listen. Checked
+            // canonical, so [::ffff:0.0.0.0] is 0.0.0.0.
+            if sa.ip().to_canonical().is_unspecified() {
+                return Err(format!(
+                    "-crawlproxy={v}: an unspecified address (0.0.0.0, [::]) names no proxy"
+                ));
+            }
+            Some(sa)
+        }
+    };
     let port = node::net::peer::default_p2p_port(network);
     let mut seeds = Vec::new();
     for v in list(&cli.crawlseed, "crawlseed") {
@@ -9053,6 +9094,7 @@ fn resolve_crawl(
         max_age,
         nets,
         binds,
+        proxy,
         seeds,
         ua_comment,
         probes: cli
@@ -9064,7 +9106,81 @@ fn resolve_crawl(
     })
 }
 
+/// `-crawlproxy` must not be the node's Tor proxy (`-proxy` or `-onion`):
+/// the clearnet crawl would leave through Tor exits, which the crawl never
+/// does. Each of `-proxy` and `-onion` is taken as an IP address and port
+/// or, with `resolve_names`, failing that resolved as a host name and port
+/// (`ToSocketAddrs`); a value that resolves to nothing (no port, an
+/// unknown name, no resolver) is not refused on that basis. Nothing is
+/// resolved without `-crawlproxy`, nor without `resolve_names`: config
+/// parsing passes false (it runs on every reload), startup true, once.
+fn check_crawlproxy_not_tor(
+    crawlproxy: Option<std::net::SocketAddr>,
+    proxy: Option<&str>,
+    onion: Option<&str>,
+    resolve_names: bool,
+) -> Result<(), String> {
+    let Some(crawl) = crawlproxy else {
+        return Ok(());
+    };
+    let resolve = |value: Option<&str>| -> Vec<std::net::SocketAddr> {
+        use std::net::ToSocketAddrs as _;
+        let Some(v) = value.map(str::trim) else {
+            return Vec::new();
+        };
+        if let Ok(sa) = v.parse::<std::net::SocketAddr>() {
+            return vec![sa];
+        }
+        if !resolve_names {
+            return Vec::new();
+        }
+        v.to_socket_addrs()
+            .map(Iterator::collect)
+            .unwrap_or_default()
+    };
+    crawlproxy_clashes(
+        crawl,
+        &[("-proxy", resolve(proxy)), ("-onion", resolve(onion))],
+    )
+}
+
+/// Whether `crawl` is any of the addresses each Tor proxy option resolved
+/// to, compared as socket addresses with the IP canonical (`[::ffff:a.b.c.d]`
+/// is `a.b.c.d`), so another spelling of one address is caught. Every
+/// loopback address is one host: `127.0.0.1:9050` and `[::1]:9050` clash,
+/// since one Tor daemon may listen on both.
+fn crawlproxy_clashes(
+    crawl: std::net::SocketAddr,
+    tor: &[(&str, Vec<std::net::SocketAddr>)],
+) -> Result<(), String> {
+    let same = |a: &std::net::SocketAddr, b: &std::net::SocketAddr| {
+        let (ia, ib) = (a.ip().to_canonical(), b.ip().to_canonical());
+        a.port() == b.port() && (ia == ib || (ia.is_loopback() && ib.is_loopback()))
+    };
+    for (flag, addrs) in tor {
+        if addrs.iter().any(|sa| same(sa, &crawl)) {
+            return Err(format!(
+                "-crawlproxy must not be the Tor proxy ({flag}): the clearnet crawl would go through Tor exits"
+            ));
+        }
+    }
+    Ok(())
+}
+
 impl Config {
+    /// [`check_crawlproxy_not_tor`] with `-proxy` and `-onion` host names
+    /// resolved: called once at startup, never on a reload (a lookup there
+    /// could stall it). Literal addresses were already compared when the
+    /// config was read.
+    pub fn check_crawlproxy_tor_names(&self) -> Result<(), String> {
+        check_crawlproxy_not_tor(
+            self.crawlproxy,
+            self.proxy.as_deref(),
+            self.onion.as_deref(),
+            true,
+        )
+    }
+
     /// The crawl's settings as the peer manager takes them. Every value was
     /// checked when the config was read. `datadir`, the network's data
     /// directory, holds the book, the snapshots and the default export key,
@@ -9096,6 +9212,7 @@ impl Config {
                 std::net::IpAddr::V6(v6) => Some(*v6),
                 _ => None,
             }),
+            proxy: self.crawlproxy,
             seeds: self
                 .crawlseed
                 .iter()
@@ -10288,6 +10405,7 @@ pub fn normalize_args(args: Vec<String>) -> Vec<String> {
         "crawlmaxage",
         "crawlnet",
         "crawlbind",
+        "crawlproxy",
         "crawlseed",
         "crawluacomment",
         "crawlprobes",
@@ -11168,6 +11286,7 @@ pub const KNOWN_CONFIG_KEYS: &[&str] = &[
     "crawlmaxage",
     "crawlnet",
     "crawlbind",
+    "crawlproxy",
     "crawlseed",
     "crawluacomment",
     "crawlprobes",
@@ -13433,6 +13552,166 @@ blockmintxfee=0.00001
         assert!(load(&[]).is_err(), "the ceiling holds in the file too");
         std::fs::write(dir.path().join("bitcoin.conf"), "crawlnope=1\n").unwrap();
         assert!(load(&[]).is_err(), "an unknown crawl key is refused");
+    }
+
+    /// `-crawlproxy`: an IP address and port, v4 or v6, from the command
+    /// line or the file, into the crawl's config and the effective view; a
+    /// name, a bare address or port 0 is refused at startup. Unset, none.
+    #[test]
+    fn crawlproxy_is_an_ip_address_and_port() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let load = |extra: &[&str]| {
+            let mut args = vec![
+                "satd",
+                "--regtest",
+                "--datadir",
+                dir.path().to_str().unwrap(),
+            ];
+            args.extend_from_slice(extra);
+            Config::from_cli(
+                parse_cli(normalize_args(args.iter().map(|a| a.to_string()).collect())).unwrap(),
+            )
+        };
+        let c = load(&[]).unwrap();
+        assert_eq!(c.crawlproxy, None);
+        assert_eq!(c.crawl_config(None).proxy, None);
+        assert_eq!(
+            c.effective_view()["crawl"]["proxy"],
+            serde_json::Value::Null
+        );
+
+        let c = load(&["-crawlproxy=127.0.0.1:1081"]).unwrap();
+        let want: std::net::SocketAddr = "127.0.0.1:1081".parse().unwrap();
+        assert_eq!(c.crawlproxy, Some(want));
+        assert_eq!(c.crawl_config(None).proxy, Some(want));
+        assert_eq!(c.effective_view()["crawl"]["proxy"], "127.0.0.1:1081");
+        let c = load(&["-crawlproxy=[::1]:1081"]).unwrap();
+        assert_eq!(c.crawlproxy, Some("[::1]:1081".parse().unwrap()));
+
+        for bad in [
+            "-crawlproxy=proxy.example.com:1080",
+            "-crawlproxy=127.0.0.1",
+            "-crawlproxy=127.0.0.1:0",
+            "-crawlproxy=127.0.0.1:99999",
+            "-crawlproxy=::1:1080",
+            "-crawlproxy=0.0.0.0:9050",
+            "-crawlproxy=[::]:9050",
+            "-crawlproxy=[::ffff:0.0.0.0]:9050",
+        ] {
+            let err = load(&[bad]).expect_err(bad);
+            assert!(err.contains("-crawlproxy"), "{bad}: {err}");
+        }
+
+        std::fs::write(
+            dir.path().join("bitcoin.conf"),
+            "crawlproxy=192.0.2.7:1080\n",
+        )
+        .unwrap();
+        assert_eq!(
+            load(&[]).unwrap().crawlproxy,
+            Some("192.0.2.7:1080".parse().unwrap()),
+            "from the file"
+        );
+        std::fs::write(dir.path().join("bitcoin.conf"), "crawlproxy=nope\n").unwrap();
+        assert!(load(&[]).is_err(), "a bad value in the file is refused too");
+        std::fs::write(dir.path().join("bitcoin.conf"), "").unwrap();
+
+        // Never the Tor proxy: -proxy or -onion at the same address, in
+        // another spelling too.
+        for tor in [
+            "-proxy=127.0.0.1:9050",
+            "-onion=127.0.0.1:9050",
+            "-proxy=[::ffff:127.0.0.1]:9050",
+        ] {
+            let err = load(&[tor, "-crawlproxy=127.0.0.1:9050"]).expect_err(tor);
+            assert!(
+                err.contains("-crawlproxy must not be the Tor proxy"),
+                "{tor}: {err}"
+            );
+        }
+        let err = load(&[
+            "-proxy=127.0.0.1:9050",
+            "-crawlproxy=[::ffff:127.0.0.1]:9050",
+        ])
+        .expect_err("the crawl proxy spelled another way");
+        assert!(err.contains("Tor exits"), "{err}");
+        // Loopback in the other family, or another loopback address, is the
+        // same host: one Tor daemon may listen on all of them.
+        for (tor, crawl) in [
+            ("-proxy=127.0.0.1:9050", "-crawlproxy=[::1]:9050"),
+            ("-onion=[::1]:9050", "-crawlproxy=127.0.0.1:9050"),
+            ("-proxy=127.0.0.1:9050", "-crawlproxy=127.0.0.2:9050"),
+        ] {
+            let err = load(&[tor, crawl]).expect_err(crawl);
+            assert!(err.contains("Tor exits"), "{tor} {crawl}: {err}");
+        }
+        assert!(load(&["-proxy=127.0.0.1:9050", "-crawlproxy=[::1]:1081"]).is_ok());
+        assert!(load(&["-proxy=127.0.0.1:9050", "-crawlproxy=127.0.0.1:1081"]).is_ok());
+        // A host name is resolved, at startup only: whatever this host's
+        // `localhost` names first is refused there, never while the config
+        // is read (a reload must not wait on a lookup); a name that
+        // resolves to nothing is not refused.
+        use std::net::ToSocketAddrs as _;
+        if let Some(local) = "localhost:9050"
+            .to_socket_addrs()
+            .ok()
+            .and_then(|mut a| a.next())
+        {
+            let c = load(&["-proxy=localhost:9050", &format!("-crawlproxy={local}")])
+                .expect("no name is looked up while the config is read");
+            let err = c
+                .check_crawlproxy_tor_names()
+                .expect_err("a -proxy host name is resolved");
+            assert!(err.contains("(-proxy)"), "{err}");
+            let c = load(&["-onion=localhost:9050", &format!("-crawlproxy={local}")])
+                .expect("no name is looked up while the config is read");
+            let err = c
+                .check_crawlproxy_tor_names()
+                .expect_err("an -onion host name is resolved");
+            assert!(err.contains("(-onion)"), "{err}");
+        }
+        let c = load(&["-proxy=proxy.invalid:9050", "-crawlproxy=127.0.0.1:9050"]).unwrap();
+        assert!(c.check_crawlproxy_tor_names().is_ok());
+    }
+
+    /// The comparison against resolved addresses: any of a name's addresses
+    /// matching `-crawlproxy`, canonically, is refused; none matching is
+    /// not; an option that resolved to nothing never refuses.
+    #[test]
+    fn crawlproxy_clashes_with_any_resolved_tor_address() {
+        let localhost: Vec<std::net::SocketAddr> = vec![
+            "127.0.0.1:9050".parse().unwrap(),
+            "[::1]:9050".parse().unwrap(),
+        ];
+        for crawl in ["127.0.0.1:9050", "[::1]:9050", "[::ffff:127.0.0.1]:9050"] {
+            let err = crawlproxy_clashes(
+                crawl.parse().unwrap(),
+                &[("-proxy", localhost.clone()), ("-onion", Vec::new())],
+            )
+            .expect_err(crawl);
+            assert!(err.contains("(-proxy)"), "{crawl}: {err}");
+        }
+        let err = crawlproxy_clashes(
+            "[::1]:9050".parse().unwrap(),
+            &[("-proxy", Vec::new()), ("-onion", localhost.clone())],
+        )
+        .unwrap_err();
+        assert!(err.contains("(-onion)"), "{err}");
+        assert!(
+            crawlproxy_clashes(
+                "127.0.0.1:1081".parse().unwrap(),
+                &[("-proxy", localhost.clone()), ("-onion", localhost)],
+            )
+            .is_ok()
+        );
+        assert!(
+            crawlproxy_clashes(
+                "127.0.0.1:9050".parse().unwrap(),
+                &[("-proxy", Vec::new()), ("-onion", Vec::new())],
+            )
+            .is_ok(),
+            "unresolved: not refused"
+        );
     }
 
     /// The crawl's export options: `crawlexportkeyfile` relative to the
