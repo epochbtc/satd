@@ -11,7 +11,11 @@
 //! - reveals other people's addresses: `get_peer_info`, `get_ban_list`;
 //! - reveals the operator's machine or setup: `get_config`,
 //!   `get_policy_info` (the ruleset's file path), `get_system_info` (memory
-//!   use), `get_metrics_snapshot` (the full metrics dump).
+//!   use), `get_metrics_snapshot` (the full metrics dump);
+//! - costs the node far more than the request costs the caller:
+//!   `get_utxo_set_stats` (flushes the coin cache to disk under the
+//!   block-connection lock on every call), `get_block_template` (assembles
+//!   a template on every call).
 //!
 //! The lists are allowlists in both directions: every tool the server
 //! registers must be in exactly one of them, or the
@@ -58,9 +62,7 @@ pub const READ_TOOLS: &[&str] = &[
     // finalizes what the caller supplies. None signs.
     "psbt_workflow",
     "get_mining_info",
-    "get_block_template",
     "get_utxo",
-    "get_utxo_set_stats",
     "validate_address",
     "get_mempool_entries_bulk",
     "get_mempool_history",
@@ -82,6 +84,8 @@ pub const FULL_ONLY_TOOLS: &[&str] = &[
     "get_policy_info",
     "get_system_info",
     "get_metrics_snapshot",
+    "get_utxo_set_stats",
+    "get_block_template",
 ];
 
 impl McpProfile {

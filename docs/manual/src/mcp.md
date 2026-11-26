@@ -78,13 +78,21 @@ Two capabilities gate MCP:
   `manage_peer`), that shows other people's addresses (`get_peer_info`,
   `get_ban_list`), or that shows your machine or setup (`get_config`,
   `get_policy_info`, which names the ruleset's file, `get_system_info` and
-  `get_metrics_snapshot`). `psbt_workflow` and `create_transaction` stay in:
-  satd holds no keys, so neither signs anything.
+  `get_metrics_snapshot`), or that costs the node far more than the request
+  costs the caller (`get_utxo_set_stats`, which flushes the coin cache to
+  disk on every call, and `get_block_template`). `psbt_workflow` and
+  `create_transaction` stay in: satd holds no keys, so neither signs
+  anything.
 
 A tool an `mcp:read` token may not use is invisible to it: `tools/list`
 leaves it out, and calling it gets the same `tool not found` error as a name
 no tool has. `mcp:*` implies `mcp:read`. Without `--mcpauth` the loopback
 client gets every tool.
+
+Give a token you hand to the public a `rate_limit` (see
+[the authfile](authentication.md#the-authfile)). A token without one is
+unlimited, and the read-only tools still include ones that walk the whole
+mempool or return a full block.
 
 ## Posture: `mcp:*` is not read-only
 
