@@ -46,6 +46,7 @@ GITHUB_SOURCES = {
     "SRI_JD_CLIENT_IMAGE": ("stratum-mining/sv2-apps", r"^v(\d+)\.(\d+)\.(\d+)$"),
     "KIND_VERSION": ("kubernetes-sigs/kind", r"^v(\d+)\.(\d+)\.(\d+)$"),
     "HELM_VERSION": ("helm/helm", r"^v(\d+)\.(\d+)\.(\d+)$"),
+    "RBITCOIN_SPACE_VERSION": ("smolcars/rbitcoin-space", r"^v(\d+)\.(\d+)\.(\d+)$"),
 }
 # Crate pins, named the way PINS names its entries so a hold can refer to
 # them: HOLD_BDK_WALLET=<issue>.
@@ -61,6 +62,9 @@ SIDECARS = {"POSTGRES_IMAGE", "ELECTRUM_BASE_IMAGE", "ELECTRUM_APPIMAGE_SHA256",
             # so it is pinned by commit and bumped by hand; the two images are the
             # ones that image's recipe names.
             "RBITCOIN_COMMIT", "RBITCOIN_RUST_IMAGE", "RBITCOIN_BASE_IMAGE",
+            # The commit RBITCOIN_SPACE_VERSION's tag must resolve to; a re-pushed
+            # tag fails the explorer canary rather than testing other code.
+            "RBITCOIN_SPACE_COMMIT",
             "KIND_SHA256", "KIND_NODE_IMAGE", "KUBECTL_VERSION", "KUBECTL_SHA256", "HELM_SHA256"}
 
 # Images CI builds itself rather than pulls: satd, the Warnet lab variant

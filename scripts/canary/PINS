@@ -90,3 +90,9 @@ HELM_SHA256=0403a88ae20913d11b10a2467b50087721fea7581736da6b9d3992f5357fe54b
 RBITCOIN_COMMIT=2c1699cea22230469e3e61f8d6eca9defc03a0a1
 RBITCOIN_RUST_IMAGE=rust:1.95.0-bookworm@sha256:6258907abe69656e41cd992e0b705cdcfabcbbe3db374f92ed2d47121282d4a1
 RBITCOIN_BASE_IMAGE=debian:bookworm-slim@sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251
+
+# rbitcoin-space, the block explorer (github.com/smolcars/rbitcoin-space): the
+# release tag whose dev/regtest/regtest.py the explorer canary runs against
+# satd unmodified, and the commit that tag must resolve to.
+RBITCOIN_SPACE_VERSION=v0.5.0
+RBITCOIN_SPACE_COMMIT=6c0012ecc79f71a20221244b2a70aa50966748b3
