@@ -12,7 +12,7 @@
 
 use serde_json::Value;
 
-use crate::rpc::{RpcError, JSONRPC_METHOD_NOT_FOUND};
+use crate::rpc::{JSONRPC_METHOD_NOT_FOUND, RpcError};
 
 /// The message satd answers `listnapattestations` with when `nap=1` is off.
 pub const PUBLISHER_DISABLED: &str = "NAP is disabled";
@@ -76,7 +76,9 @@ pub fn classify<T>(
 /// `?`, so an escape sequence or control character in a holder-chosen string
 /// can neither reach the terminal nor vanish unnoticed.
 pub fn printable(s: &str) -> String {
-    s.chars().map(|c| if (' '..='~').contains(&c) { c } else { '?' }).collect()
+    s.chars()
+        .map(|c| if (' '..='~').contains(&c) { c } else { '?' })
+        .collect()
 }
 
 /// One attestation the node publishes.
@@ -122,7 +124,11 @@ fn amount_sat(amount: &Value, reply: &Value) -> Option<u64> {
         return None;
     }
     let frac: u64 = format!("{frac:0<8}").parse().ok()?;
-    whole.parse::<u64>().ok()?.checked_mul(100_000_000)?.checked_add(frac)
+    whole
+        .parse::<u64>()
+        .ok()?
+        .checked_mul(100_000_000)?
+        .checked_add(frac)
 }
 
 /// A weight and how many outpoints carry it.
@@ -188,7 +194,12 @@ pub struct Report {
 fn parse_buckets(v: &Value, label: &str) -> Option<Vec<Bucket>> {
     v.as_array()?
         .iter()
-        .map(|b| Some(Bucket { label: printable(b.get(label)?.as_str()?), sum: parse_sum(b)? }))
+        .map(|b| {
+            Some(Bucket {
+                label: printable(b.get(label)?.as_str()?),
+                sum: parse_sum(b)?,
+            })
+        })
         .collect()
 }
 
@@ -198,7 +209,11 @@ fn parse_value(v: &Value) -> Option<ReportValue> {
         .as_object()?
         .iter()
         .map(|(name, ppm)| {
-            let n = name.strip_prefix("top")?.strip_suffix("_ppm")?.parse().ok()?;
+            let n = name
+                .strip_prefix("top")?
+                .strip_suffix("_ppm")?
+                .parse()
+                .ok()?;
             Some((n, ppm.as_u64()?))
         })
         .collect::<Option<_>>()?;
@@ -228,7 +243,12 @@ pub fn parse_report(v: &Value) -> Option<Report> {
                 sum: parse_sum(k)?,
                 coverage_ppm: k.get("coverage_ppm")?.as_u64()?,
                 withdrawn: parse_sum(k.get("withdrawn")?)?,
-                values: k.get("values")?.as_array()?.iter().map(parse_value).collect::<Option<_>>()?,
+                values: k
+                    .get("values")?
+                    .as_array()?
+                    .iter()
+                    .map(parse_value)
+                    .collect::<Option<_>>()?,
             })
         })
         .collect::<Option<_>>()?;
@@ -293,20 +313,55 @@ pub(crate) mod tests {
     #[test]
     fn a_disabled_half_is_off_and_other_failures_say_nothing() {
         let rpc = |code: i64, message: &str| -> Result<Value, RpcError> {
-            Err(RpcError::Rpc { code, message: message.into() })
+            Err(RpcError::Rpc {
+                code,
+                message: message.into(),
+            })
         };
         let parse = |_: &Value| Some(());
-        assert!(matches!(classify(rpc(-1, PUBLISHER_DISABLED), PUBLISHER_DISABLED, parse), Poll::Off));
-        assert!(matches!(classify(rpc(-1, AGGREGATOR_DISABLED), AGGREGATOR_DISABLED, parse), Poll::Off));
+        assert!(matches!(
+            classify(rpc(-1, PUBLISHER_DISABLED), PUBLISHER_DISABLED, parse),
+            Poll::Off
+        ));
+        assert!(matches!(
+            classify(rpc(-1, AGGREGATOR_DISABLED), AGGREGATOR_DISABLED, parse),
+            Poll::Off
+        ));
         // An older satd, or one still reindexing: no answer either way.
-        assert!(matches!(classify(rpc(JSONRPC_METHOD_NOT_FOUND, "Method not found"), PUBLISHER_DISABLED, parse), Poll::Unanswered));
+        assert!(matches!(
+            classify(
+                rpc(JSONRPC_METHOD_NOT_FOUND, "Method not found"),
+                PUBLISHER_DISABLED,
+                parse
+            ),
+            Poll::Unanswered
+        ));
         // The other half's message, a busy node, a timeout: not off.
-        assert!(matches!(classify(rpc(-1, AGGREGATOR_DISABLED), PUBLISHER_DISABLED, parse), Poll::Failed(_)));
-        assert!(matches!(classify(rpc(-1, "the chain tip kept changing"), AGGREGATOR_DISABLED, parse), Poll::Failed(_)));
-        assert!(matches!(classify(Err(RpcError::Timeout), AGGREGATOR_DISABLED, parse), Poll::Failed(_)));
-        assert!(matches!(classify(Ok(json!([])), PUBLISHER_DISABLED, parse), Poll::On(())));
+        assert!(matches!(
+            classify(rpc(-1, AGGREGATOR_DISABLED), PUBLISHER_DISABLED, parse),
+            Poll::Failed(_)
+        ));
+        assert!(matches!(
+            classify(
+                rpc(-1, "the chain tip kept changing"),
+                AGGREGATOR_DISABLED,
+                parse
+            ),
+            Poll::Failed(_)
+        ));
+        assert!(matches!(
+            classify(Err(RpcError::Timeout), AGGREGATOR_DISABLED, parse),
+            Poll::Failed(_)
+        ));
+        assert!(matches!(
+            classify(Ok(json!([])), PUBLISHER_DISABLED, parse),
+            Poll::On(())
+        ));
         // A reply that does not parse is a failure, not "on with nothing".
-        assert!(matches!(classify(Ok(json!({})), PUBLISHER_DISABLED, parse_published), Poll::Failed(_)));
+        assert!(matches!(
+            classify(Ok(json!({})), PUBLISHER_DISABLED, parse_published),
+            Poll::Failed(_)
+        ));
     }
 
     #[test]
@@ -322,7 +377,10 @@ pub(crate) mod tests {
             parse_published(&json!([a])).unwrap().remove(0).amount_sat
         };
         assert_eq!(one(json!(0.0001), None), Some(10_000));
-        assert_eq!(one(serde_json::from_str("21000000.00000001").unwrap(), None), Some(2_100_000_000_000_001));
+        assert_eq!(
+            one(serde_json::from_str("21000000.00000001").unwrap(), None),
+            Some(2_100_000_000_000_001)
+        );
         assert_eq!(one(json!(12_345), Some("sats")), Some(12_345));
     }
 
@@ -342,9 +400,18 @@ pub(crate) mod tests {
     #[test]
     fn a_report_parses_with_every_breakdown() {
         let r = parse_report(&sample_report()).unwrap();
-        assert_eq!((r.height, r.attestations, r.counting, r.invalid), (900, 3, 3, 0));
+        assert_eq!(
+            (r.height, r.attestations, r.counting, r.invalid),
+            (900, 3, 3, 0)
+        );
         assert_eq!(r.keys[0].key, "fork.x");
-        assert_eq!(r.keys[0].withdrawn, Sum { weight_sat: 50_000, outpoints: 1 });
+        assert_eq!(
+            r.keys[0].withdrawn,
+            Sum {
+                weight_sat: 50_000,
+                outpoints: 1
+            }
+        );
         let v = &r.keys[0].values[0];
         assert_eq!(v.value, "yes");
         assert_eq!(v.coin_age[4].label, ">=262080");

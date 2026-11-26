@@ -83,9 +83,15 @@ async fn accept_errors_are_budgeted() {
     // and queues it, and the listener cannot take it.
     let _client = std::net::TcpStream::connect(addr).unwrap();
 
-    let mut limit = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
     // SAFETY: plain libc calls on a valid out-pointer.
-    assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) }, 0);
+    assert_eq!(
+        unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) },
+        0
+    );
     let saved = limit;
     limit.rlim_cur = limit.rlim_cur.min(1024);
     assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) }, 0);
@@ -110,5 +116,9 @@ async fn accept_errors_are_budgeted() {
 
     drop(filler);
     assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &saved) }, 0);
-    assert_eq!(logs.count("accept error"), 5, "the EMFILE retries are budgeted");
+    assert_eq!(
+        logs.count("accept error"),
+        5,
+        "the EMFILE retries are budgeted"
+    );
 }

@@ -72,11 +72,17 @@ fn after_txid_outside_the_history_is_422_after_txid_not_found() {
         locate_after_txid(&[txid(1)], &txid(99), confirmed_after(&[txid(10)])).unwrap(),
         None
     );
-    assert_eq!(locate_after_txid(&[], &txid(99), confirmed_after(&[])).unwrap(), None);
+    assert_eq!(
+        locate_after_txid(&[], &txid(99), confirmed_after(&[])).unwrap(),
+        None
+    );
 
     let err = after_txid_not_found();
     assert_eq!(err.to_string(), "after_txid not found");
-    assert_eq!(err.into_response().status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(
+        err.into_response().status(),
+        StatusCode::UNPROCESSABLE_ENTITY
+    );
 }
 
 #[test]
@@ -104,7 +110,12 @@ fn mempool_rows_sort_in_admission_order_then_by_txid() {
     sort_in_admission_order(&mut rows);
     assert_eq!(
         rows,
-        vec![(100, txid(3)), (200, txid(2)), (200, txid(9)), (300, txid(1))]
+        vec![
+            (100, txid(3)),
+            (200, txid(2)),
+            (200, txid(9)),
+            (300, txid(1))
+        ]
     );
 }
 
@@ -114,7 +125,10 @@ fn mempool_rows_sort_in_admission_order_then_by_txid() {
 fn mempool_rows_already_confirmed_are_listed_only_as_confirmed() {
     let confirmed: std::collections::HashSet<Txid> = [txid(10), txid(11)].into_iter().collect();
     assert_eq!(
-        without_confirmed(vec![txid(1), txid(10), txid(2)], |t| Ok(confirmed.contains(t))).unwrap(),
+        without_confirmed(vec![txid(1), txid(10), txid(2)], |t| Ok(
+            confirmed.contains(t)
+        ))
+        .unwrap(),
         vec![txid(1), txid(2)]
     );
     assert_eq!(

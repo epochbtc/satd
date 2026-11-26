@@ -42,8 +42,13 @@ pub enum Transport {
 }
 
 impl Transport {
-    pub const ALL: [Transport; 5] =
-        [Transport::Both, Transport::V1Only, Transport::V1V2Untried, Transport::V2Only, Transport::V2Unconfirmed];
+    pub const ALL: [Transport; 5] = [
+        Transport::Both,
+        Transport::V1Only,
+        Transport::V1V2Untried,
+        Transport::V2Only,
+        Transport::V2Unconfirmed,
+    ];
 
     pub fn name(self) -> &'static str {
         match self {
@@ -71,7 +76,10 @@ impl Transport {
     }
 
     fn index(self) -> usize {
-        Transport::ALL.iter().position(|t| *t == self).expect("every class is in ALL")
+        Transport::ALL
+            .iter()
+            .position(|t| *t == self)
+            .expect("every class is in ALL")
     }
 }
 
@@ -137,12 +145,18 @@ impl Aggregate {
 }
 
 fn network_index(n: Network) -> usize {
-    Network::ALL.iter().position(|x| *x == n).expect("every network is in ALL")
+    Network::ALL
+        .iter()
+        .position(|x| *x == n)
+        .expect("every network is in ALL")
 }
 
 /// The aggregate of `book` as of `now`.
 pub fn aggregate(book: &CrawlBook, now: u64) -> Aggregate {
-    let mut agg = Aggregate { entries: book.len(), ..Aggregate::default() };
+    let mut agg = Aggregate {
+        entries: book.len(),
+        ..Aggregate::default()
+    };
     for (addr, e) in book.rows() {
         let i = network_index(addr.network());
         agg.learned[i] += 1;
@@ -152,22 +166,39 @@ pub fn aggregate(book: &CrawlBook, now: u64) -> Aggregate {
         if e.closed_early_retry.pending() {
             agg.retries_pending += 1;
         }
-        if e.closed_early_retry.exhausted() && e.observation.as_ref().is_some_and(|o| o.verdict == Verdict::ClosedEarly) {
+        if e.closed_early_retry.exhausted()
+            && e.observation
+                .as_ref()
+                .is_some_and(|o| o.verdict == Verdict::ClosedEarly)
+        {
             agg.retries_exhausted += 1;
         }
     }
     for (peer, e) in book.snapshot(now) {
         let net = crate::net::crawl::network_of(peer);
-        let i = DIALLED.iter().position(|n| *n == net).expect("a reachable address is on a dialled network");
+        let i = DIALLED
+            .iter()
+            .position(|n| *n == net)
+            .expect("a reachable address is on a dialled network");
         agg.reachable[i] += 1;
         agg.transport[Transport::of(e).index()] += 1;
         if e.v2_advertised() {
             agg.v2_advertised += 1;
         }
-        let index = |f: Family| Family::ALL.iter().position(|x| *x == f).expect("every family is in ALL");
+        let index = |f: Family| {
+            Family::ALL
+                .iter()
+                .position(|x| *x == f)
+                .expect("every family is in ALL")
+        };
         // Each reachable address in exactly one of the family, claimed,
         // fake, closed-early and unknown tallies.
-        let (verdict, fp) = e.observation.as_ref().map_or((Verdict::Classified, Fingerprint::Unknown), |o| (o.verdict, o.fingerprint));
+        let (verdict, fp) = e
+            .observation
+            .as_ref()
+            .map_or((Verdict::Classified, Fingerprint::Unknown), |o| {
+                (o.verdict, o.fingerprint)
+            });
         match verdict {
             Verdict::ClosedEarly => agg.closed_early += 1,
             Verdict::Fake(f) => agg.fake[index(f)] += 1,
@@ -197,7 +228,13 @@ pub fn aggregate(book: &CrawlBook, now: u64) -> Aggregate {
 /// family's observed count.
 pub fn aggregate_json(agg: &Aggregate, max_entries: usize) -> serde_json::Value {
     let total = agg.reachable_total();
-    let share = |n: usize| if total == 0 { 0.0 } else { n as f64 / total as f64 };
+    let share = |n: usize| {
+        if total == 0 {
+            0.0
+        } else {
+            n as f64 / total as f64
+        }
+    };
     let per_network = |counts: &[usize; Network::ALL.len()]| {
         let mut m = serde_json::Map::new();
         for (n, c) in Network::ALL.iter().zip(counts) {
@@ -212,7 +249,10 @@ pub fn aggregate_json(agg: &Aggregate, max_entries: usize) -> serde_json::Value 
     }
     let mut transport = serde_json::Map::new();
     for (t, c) in Transport::ALL.iter().zip(agg.transport) {
-        transport.insert(t.name().to_string(), serde_json::json!({ "count": c, "share": share(c) }));
+        transport.insert(
+            t.name().to_string(),
+            serde_json::json!({ "count": c, "share": share(c) }),
+        );
     }
     transport.insert(
         "v2_advertised".to_string(),
@@ -220,13 +260,22 @@ pub fn aggregate_json(agg: &Aggregate, max_entries: usize) -> serde_json::Value 
     );
     let mut families = serde_json::Map::new();
     for (f, c) in Family::ALL.iter().zip(agg.families) {
-        families.insert(f.name().to_string(), serde_json::json!({ "count": c, "share": share(c) }));
+        families.insert(
+            f.name().to_string(),
+            serde_json::json!({ "count": c, "share": share(c) }),
+        );
     }
-    families.insert("unknown".to_string(), serde_json::json!({ "count": agg.unknown, "share": share(agg.unknown) }));
+    families.insert(
+        "unknown".to_string(),
+        serde_json::json!({ "count": agg.unknown, "share": share(agg.unknown) }),
+    );
     let per_family = |counts: &[usize; Family::ALL.len()]| {
         let mut out = serde_json::Map::new();
         for (f, c) in Family::ALL.iter().zip(counts) {
-            out.insert(f.name().to_string(), serde_json::json!({ "count": c, "share": share(*c) }));
+            out.insert(
+                f.name().to_string(),
+                serde_json::json!({ "count": c, "share": share(*c) }),
+            );
         }
         serde_json::Value::Object(out)
     };
@@ -254,7 +303,12 @@ pub fn addr_text(addr: &CrawlAddr) -> String {
     match addr {
         CrawlAddr::Peer(peer) => peer.to_string(),
         CrawlAddr::I2p { dest, port } => {
-            format!("{}.b32.i2p:{port}", data_encoding::BASE32_NOPAD.encode(dest).to_ascii_lowercase())
+            format!(
+                "{}.b32.i2p:{port}",
+                data_encoding::BASE32_NOPAD
+                    .encode(dest)
+                    .to_ascii_lowercase()
+            )
         }
         CrawlAddr::Cjdns { ip, port } => std::net::SocketAddr::from((*ip, *port)).to_string(),
     }
@@ -309,9 +363,16 @@ fn observation_json(o: &Observation) -> serde_json::Value {
 /// null), and for a closed-early address its `retry` schedule (`count`,
 /// `next_due`). With `verbose`: every field of the entry and of its last
 /// observation.
-pub fn row_json(addr: &CrawlAddr, e: &CrawlEntry, now: u64, liveness_secs: u64, verbose: bool) -> serde_json::Value {
-    let reachable =
-        addr.dialable() && e.last_success.is_some_and(|s| s >= now.saturating_sub(liveness_secs));
+pub fn row_json(
+    addr: &CrawlAddr,
+    e: &CrawlEntry,
+    now: u64,
+    liveness_secs: u64,
+    verbose: bool,
+) -> serde_json::Value {
+    let reachable = addr.dialable()
+        && e.last_success
+            .is_some_and(|s| s >= now.saturating_sub(liveness_secs));
     let transport = e.last_success.map(|_| Transport::of(e).name());
     let o = e.observation.as_ref();
     let mut row = serde_json::json!({
@@ -365,7 +426,9 @@ pub fn nodes_json(book: &CrawlBook, now: u64, verbose: bool) -> serde_json::Valu
     let liveness = book.params().liveness_secs;
     let mut rows: Vec<(&CrawlAddr, &CrawlEntry)> = book.rows().collect();
     rows.sort_unstable_by(|a, b| b.1.last_success.cmp(&a.1.last_success).then(a.0.cmp(b.0)));
-    rows.into_iter().map(|(addr, e)| row_json(addr, e, now, liveness, verbose)).collect()
+    rows.into_iter()
+        .map(|(addr, e)| row_json(addr, e, now, liveness, verbose))
+        .collect()
 }
 
 #[cfg(test)]

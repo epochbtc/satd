@@ -32,12 +32,23 @@ fn mk_pm() -> (Arc<PeerManager>, tempfile::TempDir) {
     let mempool = Arc::new(Mempool::new(1_000_000, 0));
     let fee_estimator = Arc::new(FeeEstimator::new());
     let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    let pm = PeerManager::new(chain_state, mempool, fee_estimator, Network::Regtest, shutdown_rx);
+    let pm = PeerManager::new(
+        chain_state,
+        mempool,
+        fee_estimator,
+        Network::Regtest,
+        shutdown_rx,
+    );
     (pm, dir)
 }
 
 /// A connected peer whose queue the test reads, `slots` messages deep.
-fn add_peer(pm: &PeerManager, id: PeerId, addr: SocketAddr, slots: usize) -> mpsc::Receiver<NetworkMessage> {
+fn add_peer(
+    pm: &PeerManager,
+    id: PeerId,
+    addr: SocketAddr,
+    slots: usize,
+) -> mpsc::Receiver<NetworkMessage> {
     let mut info = PeerInfo::new(id, addr, Direction::Inbound);
     info.state = PeerState::Connected;
     let (tx, rx) = mpsc::channel::<NetworkMessage>(slots);
@@ -103,10 +114,19 @@ fn drain(rx: &mut mpsc::Receiver<NetworkMessage>) -> Vec<NetworkMessage> {
 #[test]
 fn inv_and_getdata_past_max_inv_sz_are_misbehaviour() {
     let (pm, _dir) = mk_pm();
-    let entry = Inventory::Unknown { inv_type: 99, hash: [7u8; 32] };
+    let entry = Inventory::Unknown {
+        inv_type: 99,
+        hash: [7u8; 32],
+    };
     for (i, (make, name)) in [
-        (NetworkMessage::Inv as fn(Vec<Inventory>) -> NetworkMessage, "inv"),
-        (NetworkMessage::GetData as fn(Vec<Inventory>) -> NetworkMessage, "getdata"),
+        (
+            NetworkMessage::Inv as fn(Vec<Inventory>) -> NetworkMessage,
+            "inv",
+        ),
+        (
+            NetworkMessage::GetData as fn(Vec<Inventory>) -> NetworkMessage,
+            "getdata",
+        ),
     ]
     .into_iter()
     .enumerate()
@@ -114,12 +134,22 @@ fn inv_and_getdata_past_max_inv_sz_are_misbehaviour() {
         let (ok, over) = (2 * i as u8 + 1, 2 * i as u8 + 2);
         let _rx_ok = add_peer(&pm, ok.into(), addr(ok), 8);
         deliver(&pm, ok.into(), make(vec![entry; MAX_INV_PER_MSG]));
-        assert!(connected(&pm, ok.into()), "{name} of {MAX_INV_PER_MSG} entries is allowed");
+        assert!(
+            connected(&pm, ok.into()),
+            "{name} of {MAX_INV_PER_MSG} entries is allowed"
+        );
 
         let _rx_over = add_peer(&pm, over.into(), addr(over), 8);
         deliver(&pm, over.into(), make(vec![entry; MAX_INV_PER_MSG + 1]));
-        assert!(!connected(&pm, over.into()), "{name} of {} entries disconnects", MAX_INV_PER_MSG + 1);
-        assert!(pm.is_addr_banned(&addr(over)), "{name} past MAX_INV_SZ is misbehaviour");
+        assert!(
+            !connected(&pm, over.into()),
+            "{name} of {} entries disconnects",
+            MAX_INV_PER_MSG + 1
+        );
+        assert!(
+            pm.is_addr_banned(&addr(over)),
+            "{name} past MAX_INV_SZ is misbehaviour"
+        );
     }
 }
 
@@ -128,7 +158,11 @@ fn inv_and_getdata_past_max_inv_sz_are_misbehaviour() {
 #[test]
 fn headers_past_max_headers_results_are_misbehaviour() {
     let (pm, _dir) = mk_pm();
-    let genesis = pm.chain_state.get_block_index(&pm.chain_state.tip_hash()).unwrap().header;
+    let genesis = pm
+        .chain_state
+        .get_block_index(&pm.chain_state.tip_hash())
+        .unwrap()
+        .header;
 
     // 2000 headers that link up and meet their own proof of work, which
     // Core's `CheckHeadersPoW` asks of any message that size.
@@ -177,22 +211,39 @@ fn addr_and_addrv2_past_max_addr_to_send_are_misbehaviour() {
                 .map(|i| AddrV2Message {
                     time: 1_700_000_000,
                     services: ServiceFlags::NETWORK,
-                    addr: AddrV2::Ipv4(std::net::Ipv4Addr::new(45, 1, (i / 256) as u8, (i % 256) as u8)),
+                    addr: AddrV2::Ipv4(std::net::Ipv4Addr::new(
+                        45,
+                        1,
+                        (i / 256) as u8,
+                        (i % 256) as u8,
+                    )),
                     port: 8333,
                 })
                 .collect(),
         )
     };
-    for (i, make) in [&v1 as &dyn Fn(usize) -> NetworkMessage, &v2].into_iter().enumerate() {
+    for (i, make) in [&v1 as &dyn Fn(usize) -> NetworkMessage, &v2]
+        .into_iter()
+        .enumerate()
+    {
         let (ok, over) = (2 * i as u8 + 1, 2 * i as u8 + 2);
         let _rx = add_peer(&pm, ok.into(), addr(ok), 8);
         deliver(&pm, ok.into(), make(1000));
-        assert!(connected(&pm, ok.into()), "case {i}: 1000 addresses are allowed");
+        assert!(
+            connected(&pm, ok.into()),
+            "case {i}: 1000 addresses are allowed"
+        );
 
         let _rx = add_peer(&pm, over.into(), addr(over), 8);
         deliver(&pm, over.into(), make(1001));
-        assert!(!connected(&pm, over.into()), "case {i}: 1001 addresses disconnect");
-        assert!(pm.is_addr_banned(&addr(over)), "case {i}: 1001 addresses are misbehaviour");
+        assert!(
+            !connected(&pm, over.into()),
+            "case {i}: 1001 addresses disconnect"
+        );
+        assert!(
+            pm.is_addr_banned(&addr(over)),
+            "case {i}: 1001 addresses are misbehaviour"
+        );
     }
 }
 
@@ -206,7 +257,10 @@ fn notfound_past_the_limit_is_ignored() {
     use crate::net::limits::MAX_NOTFOUND_SZ;
     let (pm, _dir) = mk_pm();
     let hashes = mine_big(&pm, 4, 10);
-    let filler = Inventory::Unknown { inv_type: 99, hash: [7u8; 32] };
+    let filler = Inventory::Unknown {
+        inv_type: 99,
+        hash: [7u8; 32],
+    };
     let notfound = |len: usize| {
         let mut inv: Vec<Inventory> = hashes.iter().map(|h| Inventory::WitnessBlock(*h)).collect();
         inv.resize(len, filler);
@@ -221,10 +275,19 @@ fn notfound_past_the_limit_is_ignored() {
 
         deliver(&pm, 1, notfound(len));
         let ibd = pm.ibd.read();
-        let still = (1..=4).filter(|h| ibd.as_ref().unwrap().in_flight_contains(*h)).count();
-        assert_eq!(still == 0, released, "notfound of {len} entries: {still} heights still in flight");
+        let still = (1..=4)
+            .filter(|h| ibd.as_ref().unwrap().in_flight_contains(*h))
+            .count();
+        assert_eq!(
+            still == 0,
+            released,
+            "notfound of {len} entries: {still} heights still in flight"
+        );
         drop(ibd);
-        assert!(connected(&pm, 1), "notfound of {len} entries is not misbehaviour");
+        assert!(
+            connected(&pm, 1),
+            "notfound of {len} entries is not misbehaviour"
+        );
         *pm.ibd.write() = None;
     }
 }
@@ -241,7 +304,10 @@ fn getdata_stops_serving_past_the_send_buffer() {
     let hashes = mine_big(&pm, 30, 100_000);
     let mut rx = add_peer(&pm, 1, addr(1), 256);
 
-    pm.handle_getdata(1, hashes.iter().map(|h| Inventory::WitnessBlock(*h)).collect());
+    pm.handle_getdata(
+        1,
+        hashes.iter().map(|h| Inventory::WitnessBlock(*h)).collect(),
+    );
     let queued = drain(&mut rx);
     let bytes: usize = queued.iter().map(queued_size).sum();
     let largest = queued.iter().map(queued_size).max().unwrap_or(0);
@@ -269,9 +335,19 @@ fn getdata_resumes_as_the_queue_drains() {
 
     // As the write loop hands the request over.
     queue.note_getdata_forwarded();
-    deliver(&pm, 1, NetworkMessage::GetData(hashes.iter().map(|h| Inventory::WitnessBlock(*h)).collect()));
-    assert!(queue.getdata_backlog() > 0, "the bound held part of the request back");
-    assert!(queue.reading_paused(), "nothing more is read from the peer meanwhile");
+    deliver(
+        &pm,
+        1,
+        NetworkMessage::GetData(hashes.iter().map(|h| Inventory::WitnessBlock(*h)).collect()),
+    );
+    assert!(
+        queue.getdata_backlog() > 0,
+        "the bound held part of the request back"
+    );
+    assert!(
+        queue.reading_paused(),
+        "nothing more is read from the peer meanwhile"
+    );
 
     // The write loop, writing and asking for more.
     let mut served = Vec::new();
@@ -292,8 +368,14 @@ fn getdata_resumes_as_the_queue_drains() {
     assert_eq!(queue.getdata_backlog(), 0);
     assert!(!queue.reading_paused(), "the peer is read again");
     assert_eq!(queue.queued_bytes(), 0);
-    let charged: usize = served.iter().map(|h| pm.chain_state.get_block(h).unwrap().total_size()).sum();
-    assert_eq!(pm.upload_bytes.load(Ordering::Relaxed) - charged_before, charged as u64);
+    let charged: usize = served
+        .iter()
+        .map(|h| pm.chain_state.get_block(h).unwrap().total_size())
+        .sum();
+    assert_eq!(
+        pm.upload_bytes.load(Ordering::Relaxed) - charged_before,
+        charged as u64
+    );
 }
 
 /// A `MSG_CMPCT_BLOCK` entry whose `cmpctblock` could not be queued stays
@@ -343,7 +425,10 @@ fn peer_user_agent_is_sanitized() {
         start_height: 0,
         relay: true,
     });
-    assert_eq!(info.user_agent, "/Satoshi:27.0.0/2026-01-01T00:00:00Z INFO fake0m");
+    assert_eq!(
+        info.user_agent,
+        "/Satoshi:27.0.0/2026-01-01T00:00:00Z INFO fake0m"
+    );
 }
 
 /// Core reads the user agent as `LIMITED_STRING(strSubVer,
@@ -400,13 +485,22 @@ async fn version_with_an_oversized_user_agent_is_ignored() {
 
     let handshake = pm.perform_handshake(1, &mut ours, Direction::Inbound, crate::time::now_secs());
     let remote = async {
-        theirs.send(version("a".repeat(crate::MAX_SUBVERSION_LENGTH + 1))).await.unwrap();
+        theirs
+            .send(version("a".repeat(crate::MAX_SUBVERSION_LENGTH + 1)))
+            .await
+            .unwrap();
         // An inbound node answers a `version` with its own. Nothing comes
         // back for the oversized one.
         let reply = tokio::time::timeout(Duration::from_millis(500), theirs.recv()).await;
-        assert!(reply.is_err(), "an oversized user agent must not be answered, got {reply:?}");
+        assert!(
+            reply.is_err(),
+            "an oversized user agent must not be answered, got {reply:?}"
+        );
         // A user agent of exactly the limit is fine, and completes the handshake.
-        theirs.send(version("b".repeat(crate::MAX_SUBVERSION_LENGTH))).await.unwrap();
+        theirs
+            .send(version("b".repeat(crate::MAX_SUBVERSION_LENGTH)))
+            .await
+            .unwrap();
         loop {
             if matches!(theirs.recv().await.unwrap(), NetworkMessage::Verack) {
                 break;
@@ -416,7 +510,10 @@ async fn version_with_an_oversized_user_agent_is_ignored() {
     };
     let (handshake, ()) = tokio::join!(handshake, remote);
     let theirs_version = handshake.expect("the well-formed version completes the handshake");
-    assert_eq!(theirs_version.user_agent.len(), crate::MAX_SUBVERSION_LENGTH);
+    assert_eq!(
+        theirs_version.user_agent.len(),
+        crate::MAX_SUBVERSION_LENGTH
+    );
 }
 
 // ---- BIP 157 requests (Core's `PrepareBlockFilterRequest`) ----
@@ -456,7 +553,11 @@ mod bip157 {
     }
 
     fn cfheaders(start_height: u32, stop_hash: bitcoin::BlockHash) -> NetworkMessage {
-        NetworkMessage::GetCFHeaders(GetCFHeaders { filter_type: 0, start_height, stop_hash })
+        NetworkMessage::GetCFHeaders(GetCFHeaders {
+            filter_type: 0,
+            start_height,
+            stop_hash,
+        })
     }
 
     /// The request is answered and the peer kept: the must-succeed half of
@@ -472,7 +573,14 @@ mod bip157 {
             Ok(NetworkMessage::CFHeaders(h)) => assert_eq!(h.filter_hashes.len(), 5),
             other => panic!("expected cfheaders, got {other:?}"),
         }
-        deliver(&pm, 1, NetworkMessage::GetCFCheckpt(GetCFCheckpt { filter_type: 0, stop_hash: chain[4] }));
+        deliver(
+            &pm,
+            1,
+            NetworkMessage::GetCFCheckpt(GetCFCheckpt {
+                filter_type: 0,
+                stop_hash: chain[4],
+            }),
+        );
         assert!(matches!(rx.try_recv(), Ok(NetworkMessage::CFCheckpt(_))));
         assert!(connected(&pm, 1));
     }
@@ -489,22 +597,38 @@ mod bip157 {
         let cases: Vec<(&str, NetworkMessage)> = vec![
             (
                 "unsupported filter type",
-                NetworkMessage::GetCFilters(GetCFilters { filter_type: 0x99, start_height: 0, stop_hash: chain[4] }),
+                NetworkMessage::GetCFilters(GetCFilters {
+                    filter_type: 0x99,
+                    start_height: 0,
+                    stop_hash: chain[4],
+                }),
             ),
             ("unknown stop hash", cfheaders(0, unknown)),
             ("start above stop", cfheaders(5, chain[3])),
             (
                 "unsupported filter type, getcfcheckpt",
-                NetworkMessage::GetCFCheckpt(GetCFCheckpt { filter_type: 1, stop_hash: chain[4] }),
+                NetworkMessage::GetCFCheckpt(GetCFCheckpt {
+                    filter_type: 1,
+                    stop_hash: chain[4],
+                }),
             ),
-            ("unknown stop hash, getcfcheckpt", NetworkMessage::GetCFCheckpt(GetCFCheckpt { filter_type: 0, stop_hash: unknown })),
+            (
+                "unknown stop hash, getcfcheckpt",
+                NetworkMessage::GetCFCheckpt(GetCFCheckpt {
+                    filter_type: 0,
+                    stop_hash: unknown,
+                }),
+            ),
         ];
         for (i, (case, msg)) in cases.into_iter().enumerate() {
             let id = 10 + i as PeerId;
             let mut rx = add_peer(&pm, id, addr(10 + i as u8), 8);
             deliver(&pm, id, msg);
             assert!(!connected(&pm, id), "{case}: the peer is disconnected");
-            assert!(!pm.is_addr_banned(&addr(10 + i as u8)), "{case}: disconnected, not banned");
+            assert!(
+                !pm.is_addr_banned(&addr(10 + i as u8)),
+                "{case}: disconnected, not banned"
+            );
             assert!(rx.try_recv().is_err(), "{case}: nothing is served");
         }
     }
@@ -528,10 +652,26 @@ mod bip157 {
         let (pm, _dir) = serving_pm();
         let chain = mine_big(&pm, 1001, 1);
         let _rx = add_peer(&pm, 1, addr(1), 2048);
-        deliver(&pm, 1, NetworkMessage::GetCFilters(GetCFilters { filter_type: 0, start_height: 2, stop_hash: chain[1000] }));
+        deliver(
+            &pm,
+            1,
+            NetworkMessage::GetCFilters(GetCFilters {
+                filter_type: 0,
+                start_height: 2,
+                stop_hash: chain[1000],
+            }),
+        );
         assert!(connected(&pm, 1), "1000 filters are allowed");
         let _rx = add_peer(&pm, 2, addr(2), 8);
-        deliver(&pm, 2, NetworkMessage::GetCFilters(GetCFilters { filter_type: 0, start_height: 1, stop_hash: chain[1000] }));
+        deliver(
+            &pm,
+            2,
+            NetworkMessage::GetCFilters(GetCFilters {
+                filter_type: 0,
+                start_height: 1,
+                stop_hash: chain[1000],
+            }),
+        );
         assert!(!connected(&pm, 2), "1001 filters disconnect");
     }
 
@@ -550,19 +690,31 @@ mod bip157 {
         // validated, and stale.
         let (other, _other_dir) = mk_pm();
         for h in &chain[..2] {
-            other.chain_state.accept_block(&pm.chain_state.get_block(h).unwrap()).unwrap();
+            other
+                .chain_state
+                .accept_block(&pm.chain_state.get_block(h).unwrap())
+                .unwrap();
         }
         let branch = mine_big(&other, 2, 12);
         for h in &branch {
-            pm.chain_state.accept_block(&other.chain_state.get_block(h).unwrap()).unwrap();
+            pm.chain_state
+                .accept_block(&other.chain_state.get_block(h).unwrap())
+                .unwrap();
         }
-        assert_eq!(pm.chain_state.tip_hash(), branch[1], "the heavier branch is active");
+        assert_eq!(
+            pm.chain_state.tip_hash(),
+            branch[1],
+            "the heavier branch is active"
+        );
         let stale = pm.chain_state.get_block_index(&chain[2]).unwrap();
         assert_eq!(stale.status, crate::storage::blockindex::BlockStatus::Valid);
 
         let mut rx = add_peer(&pm, 1, addr(1), 8);
         deliver(&pm, 1, cfheaders(1, chain[2]));
-        assert!(connected(&pm, 1), "a recent, validated stale block is not grounds to disconnect");
+        assert!(
+            connected(&pm, 1),
+            "a recent, validated stale block is not grounds to disconnect"
+        );
         assert!(rx.try_recv().is_err(), "but satd has no filter for it");
 
         // A header with no block behind it.
@@ -573,10 +725,17 @@ mod bip157 {
         while header.validate_pow(header.target()).is_err() {
             header.nonce += 1;
         }
-        pm.chain_state.accept_headers(&[header]).1.map_or(Ok(()), Err).expect("header accepted");
+        pm.chain_state
+            .accept_headers(&[header])
+            .1
+            .map_or(Ok(()), Err)
+            .expect("header accepted");
         let _rx = add_peer(&pm, 2, addr(2), 8);
         deliver(&pm, 2, cfheaders(0, header.block_hash()));
-        assert!(!connected(&pm, 2), "a header satd never validated is not a block it would serve");
+        assert!(
+            !connected(&pm, 2),
+            "a header satd never validated is not a block it would serve"
+        );
     }
 }
 
@@ -592,8 +751,10 @@ async fn socket_pair() -> (
 ) {
     use crate::net::connection::Connection;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let (dialed, accepted) =
-        tokio::join!(tokio::net::TcpStream::connect(listener.local_addr().unwrap()), listener.accept());
+    let (dialed, accepted) = tokio::join!(
+        tokio::net::TcpStream::connect(listener.local_addr().unwrap()),
+        listener.accept()
+    );
     let (far, _) = accepted.unwrap();
     let conn = Connection::with_magic(dialed.unwrap(), bitcoin::p2p::Magic::REGTEST);
     let (reader, mut writer) = conn.split();
@@ -635,7 +796,12 @@ async fn run_loop() -> Loop {
     let drain_now = Arc::new(tokio::sync::Notify::new());
     let queue = msg_tx.queue().clone();
     let tx_inv_wake = Arc::new(tokio::sync::Notify::new());
-    let (s, d, w, t) = (stats.clone(), disconnect.clone(), drain_now.clone(), tx_inv_wake.clone());
+    let (s, d, w, t) = (
+        stats.clone(),
+        disconnect.clone(),
+        drain_now.clone(),
+        tx_inv_wake.clone(),
+    );
     let task = tokio::spawn(async move {
         let _keep = _reader;
         PeerManager::peer_write_loop(
@@ -653,7 +819,18 @@ async fn run_loop() -> Loop {
         )
         .await
     });
-    Loop { id: 7, event_rx, msg_tx, read_tx, disconnect, drain_now, tx_inv_wake, stats, far, task }
+    Loop {
+        id: 7,
+        event_rx,
+        msg_tx,
+        read_tx,
+        disconnect,
+        drain_now,
+        tx_inv_wake,
+        stats,
+        far,
+        task,
+    }
 }
 
 /// Queue big messages until the socket stops taking bytes: the far end is
@@ -683,7 +860,9 @@ async fn a_ping_wakes_the_announcement_flush() {
     let l = run_loop().await;
     let woken = l.tx_inv_wake.notified();
     l.read_tx.send(NetworkMessage::Ping(42)).await.unwrap();
-    tokio::time::timeout(Duration::from_secs(5), woken).await.expect("the ping wakes the flush");
+    tokio::time::timeout(Duration::from_secs(5), woken)
+        .await
+        .expect("the ping wakes the flush");
     drop(l.far);
 }
 
@@ -721,7 +900,8 @@ async fn a_write_that_makes_no_progress_times_out() {
     let err = ended.expect_err("the loop ends with an error");
     assert!(err.contains("sending timeout"), "{err}");
     assert!(
-        waited >= SEND_TIMEOUT - Duration::from_secs(60) && waited <= SEND_TIMEOUT + Duration::from_secs(60),
+        waited >= SEND_TIMEOUT - Duration::from_secs(60)
+            && waited <= SEND_TIMEOUT + Duration::from_secs(60),
         "dropped after {waited:?}"
     );
     drop(l.far);
@@ -735,26 +915,54 @@ async fn a_write_that_makes_no_progress_times_out() {
 async fn reading_waits_for_a_getdata_to_be_served() {
     let mut l = run_loop().await;
     let queue = l.msg_tx.queue().clone();
-    l.read_tx.send(NetworkMessage::GetData(vec![])).await.unwrap();
+    l.read_tx
+        .send(NetworkMessage::GetData(vec![]))
+        .await
+        .unwrap();
     l.read_tx.send(NetworkMessage::SendHeaders).await.unwrap();
-    let first = tokio::time::timeout(Duration::from_secs(5), l.event_rx.recv()).await.unwrap();
-    assert!(matches!(first, Some(NetEvent::MessageReceived { msg: NetworkMessage::GetData(_), .. })));
+    let first = tokio::time::timeout(Duration::from_secs(5), l.event_rx.recv())
+        .await
+        .unwrap();
+    assert!(matches!(
+        first,
+        Some(NetEvent::MessageReceived {
+            msg: NetworkMessage::GetData(_),
+            ..
+        })
+    ));
     tokio::time::timeout(Duration::from_secs(1), l.drain_now.notified())
         .await
         .expect("the manager is woken to serve the getdata, not left to its next tick");
     let early = tokio::time::timeout(Duration::from_millis(300), l.event_rx.recv()).await;
-    assert!(early.is_err(), "nothing after the getdata is read before it is served");
+    assert!(
+        early.is_err(),
+        "nothing after the getdata is read before it is served"
+    );
 
     // Taken in with one entry still to serve: still waiting.
-    queue.push_getdata(vec![Inventory::Unknown { inv_type: 99, hash: [1; 32] }]);
+    queue.push_getdata(vec![Inventory::Unknown {
+        inv_type: 99,
+        hash: [1; 32],
+    }]);
     queue.note_getdata_handled();
     let early = tokio::time::timeout(Duration::from_millis(300), l.event_rx.recv()).await;
-    assert!(early.is_err(), "an unserved entry still holds the peer's next message");
+    assert!(
+        early.is_err(),
+        "an unserved entry still holds the peer's next message"
+    );
 
     queue.pop_getdata();
     queue.wake_reader();
-    let next = tokio::time::timeout(Duration::from_secs(5), l.event_rx.recv()).await.unwrap();
-    assert!(matches!(next, Some(NetEvent::MessageReceived { msg: NetworkMessage::SendHeaders, .. })));
+    let next = tokio::time::timeout(Duration::from_secs(5), l.event_rx.recv())
+        .await
+        .unwrap();
+    assert!(matches!(
+        next,
+        Some(NetEvent::MessageReceived {
+            msg: NetworkMessage::SendHeaders,
+            ..
+        })
+    ));
     l.disconnect.notify_one();
     let _ = l.task.await;
 }
@@ -766,12 +974,17 @@ async fn reading_waits_for_a_getdata_to_be_served() {
 async fn a_block_or_headers_wakes_the_manager() {
     let mut l = run_loop().await;
     let block = bitcoin::constants::genesis_block(bitcoin::Network::Regtest);
-    for msg in [NetworkMessage::Block(block.clone()), NetworkMessage::Headers(vec![block.header])] {
+    for msg in [
+        NetworkMessage::Block(block.clone()),
+        NetworkMessage::Headers(vec![block.header]),
+    ] {
         let woken = l.drain_now.notified();
         tokio::pin!(woken);
         woken.as_mut().enable();
         l.read_tx.send(msg).await.unwrap();
-        let ev = tokio::time::timeout(Duration::from_secs(5), l.event_rx.recv()).await.unwrap();
+        let ev = tokio::time::timeout(Duration::from_secs(5), l.event_rx.recv())
+            .await
+            .unwrap();
         assert!(matches!(ev, Some(NetEvent::MessageReceived { .. })));
         tokio::time::timeout(Duration::from_secs(1), woken)
             .await
@@ -789,7 +1002,10 @@ async fn the_loop_asks_for_more_once_the_queue_drains() {
     use tokio::io::AsyncReadExt;
     let mut l = run_loop().await;
     let queue = l.msg_tx.queue().clone();
-    queue.push_getdata(vec![Inventory::Unknown { inv_type: 99, hash: [1; 32] }]);
+    queue.push_getdata(vec![Inventory::Unknown {
+        inv_type: 99,
+        hash: [1; 32],
+    }]);
     // Over the buffer: two messages of 600 kB.
     l.msg_tx.try_send(big(600_000)).unwrap();
     l.msg_tx.try_send(big(600_000)).unwrap();
@@ -827,7 +1043,11 @@ mod nap {
     use crate::nap::p2p::{GETNAPATT, GetNapAtt, MAX_GETNAPATT_KEYS, NAPATT, NapAtt, node_nap};
 
     /// A node publishing two coins' attestations, two keys each.
-    fn publishing_pm() -> (Arc<PeerManager>, Vec<tempfile::TempDir>, Vec<crate::nap::Attestation>) {
+    fn publishing_pm() -> (
+        Arc<PeerManager>,
+        Vec<tempfile::TempDir>,
+        Vec<crate::nap::Attestation>,
+    ) {
         let (pm, dir) = mk_pm();
         let (store, publisher, atts) = crate::nap::p2p_tests::serving_publisher(2, 2);
         pm.set_nap_publisher(Arc::new(publisher));
@@ -835,7 +1055,10 @@ mod nap {
     }
 
     fn unknown(command: &str, payload: Vec<u8>) -> NetworkMessage {
-        NetworkMessage::Unknown { command: command.to_string().try_into().unwrap(), payload }
+        NetworkMessage::Unknown {
+            command: command.to_string().try_into().unwrap(),
+            payload,
+        }
     }
 
     fn getnapatt(req: &GetNapAtt) -> NetworkMessage {
@@ -843,7 +1066,11 @@ mod nap {
     }
 
     fn pull() -> NetworkMessage {
-        getnapatt(&GetNapAtt { anchor_height_min: 0, keys: vec![], cursor: None })
+        getnapatt(&GetNapAtt {
+            anchor_height_min: 0,
+            keys: vec![],
+            cursor: None,
+        })
     }
 
     fn napatts(rx: &mut mpsc::Receiver<NetworkMessage>) -> Vec<NapAtt> {
@@ -861,8 +1088,10 @@ mod nap {
     fn nap_messages(rx: &mut mpsc::Receiver<NetworkMessage>) -> usize {
         drain(rx)
             .iter()
-            .filter(|m| matches!(m, NetworkMessage::Unknown { command, .. }
-                if [GETNAPATT, NAPATT].contains(&command.as_ref())))
+            .filter(|m| {
+                matches!(m, NetworkMessage::Unknown { command, .. }
+                if [GETNAPATT, NAPATT].contains(&command.as_ref()))
+            })
             .count()
     }
 
@@ -873,7 +1102,13 @@ mod nap {
         assert!(pm.local_services().has(node_nap()));
         let mut rx = add_peer(&pm, 1, addr(1), 8);
         deliver(&pm, 1, pull());
-        assert_eq!(napatts(&mut rx), vec![NapAtt { attestations: atts, next_cursor: None }]);
+        assert_eq!(
+            napatts(&mut rx),
+            vec![NapAtt {
+                attestations: atts,
+                next_cursor: None
+            }]
+        );
         assert!(connected(&pm, 1));
     }
 
@@ -891,7 +1126,12 @@ mod nap {
     #[test]
     fn a_malformed_getnapatt_is_misbehaviour() {
         let keys = (0..=MAX_GETNAPATT_KEYS).map(|i| format!("k{i}")).collect();
-        let over = GetNapAtt { anchor_height_min: 0, keys, cursor: None }.to_bytes();
+        let over = GetNapAtt {
+            anchor_height_min: 0,
+            keys,
+            cursor: None,
+        }
+        .to_bytes();
         let oversize = vec![0x01; 100_000];
         for (i, payload) in [over, oversize, vec![]].into_iter().enumerate() {
             let (pm, _dirs, _) = publishing_pm();
@@ -908,9 +1148,23 @@ mod nap {
     fn trailing_bytes_are_ignored() {
         let (pm, _dirs, atts) = publishing_pm();
         let mut rx = add_peer(&pm, 1, addr(1), 8);
-        let req = GetNapAtt { anchor_height_min: 0, keys: vec![], cursor: None };
-        deliver(&pm, 1, unknown(GETNAPATT, [req.to_bytes(), vec![1, 2, 3]].concat()));
-        assert_eq!(napatts(&mut rx), vec![NapAtt { attestations: atts, next_cursor: None }]);
+        let req = GetNapAtt {
+            anchor_height_min: 0,
+            keys: vec![],
+            cursor: None,
+        };
+        deliver(
+            &pm,
+            1,
+            unknown(GETNAPATT, [req.to_bytes(), vec![1, 2, 3]].concat()),
+        );
+        assert_eq!(
+            napatts(&mut rx),
+            vec![NapAtt {
+                attestations: atts,
+                next_cursor: None
+            }]
+        );
         assert!(connected(&pm, 1));
     }
 
@@ -918,7 +1172,18 @@ mod nap {
     fn an_unsolicited_napatt_is_ignored() {
         let (pm, _dirs, atts) = publishing_pm();
         let mut rx = add_peer(&pm, 1, addr(1), 8);
-        deliver(&pm, 1, unknown(NAPATT, NapAtt { attestations: atts, next_cursor: None }.to_bytes()));
+        deliver(
+            &pm,
+            1,
+            unknown(
+                NAPATT,
+                NapAtt {
+                    attestations: atts,
+                    next_cursor: None,
+                }
+                .to_bytes(),
+            ),
+        );
         assert_eq!(nap_messages(&mut rx), 0);
         assert!(connected(&pm, 1));
     }
@@ -931,7 +1196,15 @@ mod nap {
         assert_eq!(napatts(&mut rx).len(), 1);
         deliver(&pm, 1, pull());
         // A cursor it was never sent starts a pull too.
-        deliver(&pm, 1, getnapatt(&GetNapAtt { anchor_height_min: 0, keys: vec![], cursor: Some(Default::default()) }));
+        deliver(
+            &pm,
+            1,
+            getnapatt(&GetNapAtt {
+                anchor_height_min: 0,
+                keys: vec![],
+                cursor: Some(Default::default()),
+            }),
+        );
         assert_eq!(nap_messages(&mut rx), 0);
         assert!(connected(&pm, 1), "an honest aggregator can hit a limit");
         // Another connection in the same group is served.
@@ -977,12 +1250,18 @@ mod nap {
                 stop_hash: bitcoin::BlockHash::all_zeros(),
             }),
         );
-        deliver(&pm, 1, NetworkMessage::GetData(vec![Inventory::WitnessBlock(chain[2])]));
+        deliver(
+            &pm,
+            1,
+            NetworkMessage::GetData(vec![Inventory::WitnessBlock(chain[2])]),
+        );
         deliver(&pm, 1, NetworkMessage::GetAddr);
         let sent = drain(&mut rx);
         assert!(!sent.is_empty(), "the peer was served");
         assert!(
-            !sent.iter().any(|m| matches!(m, NetworkMessage::Unknown { .. })),
+            !sent
+                .iter()
+                .any(|m| matches!(m, NetworkMessage::Unknown { .. })),
             "no NAP message: {sent:?}"
         );
     }
@@ -995,14 +1274,24 @@ mod nap_aggregator {
     use crate::nap::p2p::{GETNAPATT, GetNapAtt, NAPATT, NapAtt, node_nap};
 
     /// A node aggregating, with an empty set, out of initial block download.
-    fn aggregating_pm() -> (Arc<PeerManager>, Vec<tempfile::TempDir>, Arc<crate::nap::pull::Puller>) {
+    fn aggregating_pm() -> (
+        Arc<PeerManager>,
+        Vec<tempfile::TempDir>,
+        Arc<crate::nap::pull::Puller>,
+    ) {
         let (pm, dir) = mk_pm();
         // A peer has announced a headers tip the node's tip is within 24 of.
         pm.headers_tip.store(1, Ordering::Relaxed);
         assert!(!pm.is_ibd(), "fixture: out of IBD");
         let store = tempfile::tempdir().unwrap();
-        let agg = crate::nap::aggregate::Aggregate::open(store.path().join("aggregate.dat"), &*pm.chain_state).unwrap();
-        let puller = Arc::new(crate::nap::pull::Puller::new(Arc::new(crate::nap::collect::Collector::new(agg))));
+        let agg = crate::nap::aggregate::Aggregate::open(
+            store.path().join("aggregate.dat"),
+            &*pm.chain_state,
+        )
+        .unwrap();
+        let puller = Arc::new(crate::nap::pull::Puller::new(Arc::new(
+            crate::nap::collect::Collector::new(agg),
+        )));
         pm.set_nap_aggregator(puller.clone());
         (pm, vec![dir, store], puller)
     }
@@ -1053,13 +1342,31 @@ mod nap_aggregator {
     fn a_connected_publisher_is_pulled_and_any_other_peer_is_not() {
         let (pm, _dirs, puller) = aggregating_pm();
         let mut publisher = peer_of(&pm, 1, ConnType::OutboundFullRelay, publisher_services());
-        let mut plain = peer_of(&pm, 2, ConnType::OutboundFullRelay, ServiceFlags::NETWORK | ServiceFlags::WITNESS);
+        let mut plain = peer_of(
+            &pm,
+            2,
+            ConnType::OutboundFullRelay,
+            ServiceFlags::NETWORK | ServiceFlags::WITNESS,
+        );
         pm.nap_peer_connected(1);
         pm.nap_peer_connected(2);
-        assert_eq!(getnapatts(&mut publisher), vec![GetNapAtt { anchor_height_min: 0, keys: vec![], cursor: None }]);
-        assert!(getnapatts(&mut plain).is_empty(), "a peer that does not advertise NODE_NAP is never asked");
+        assert_eq!(
+            getnapatts(&mut publisher),
+            vec![GetNapAtt {
+                anchor_height_min: 0,
+                keys: vec![],
+                cursor: None
+            }]
+        );
+        assert!(
+            getnapatts(&mut plain).is_empty(),
+            "a peer that does not advertise NODE_NAP is never asked"
+        );
         assert_eq!(puller.active(), 1);
-        assert!(connected(&pm, 1), "an ordinary connection stays up for its own sake");
+        assert!(
+            connected(&pm, 1),
+            "an ordinary connection stays up for its own sake"
+        );
     }
 
     #[test]
@@ -1069,16 +1376,34 @@ mod nap_aggregator {
         assert!(pm.is_ibd());
         let mut publisher = peer_of(&pm, 1, ConnType::OutboundFullRelay, publisher_services());
         pm.nap_peer_connected(1);
-        assert!(getnapatts(&mut publisher).is_empty(), "every anchor would fail on chain state");
-        assert!(puller.due(&addr(1).to_string(), Instant::now()), "still due, for the tick");
+        assert!(
+            getnapatts(&mut publisher).is_empty(),
+            "every anchor would fail on chain state"
+        );
+        assert!(
+            puller.due(&addr(1).to_string(), Instant::now()),
+            "still due, for the tick"
+        );
     }
 
     #[tokio::test]
     async fn only_connections_that_last_are_pulled() {
         let (pm, _dirs, puller) = aggregating_pm();
-        let brief = [(1, ConnType::AddrFetch), (2, ConnType::Feeler), (3, ConnType::BlockRelay)];
-        let lasting = [(4, ConnType::OutboundFullRelay), (5, ConnType::Manual), (6, ConnType::Inbound)];
-        let mut rxs: Vec<_> = brief.iter().chain(&lasting).map(|&(id, kind)| (id, peer_of(&pm, id, kind, publisher_services()))).collect();
+        let brief = [
+            (1, ConnType::AddrFetch),
+            (2, ConnType::Feeler),
+            (3, ConnType::BlockRelay),
+        ];
+        let lasting = [
+            (4, ConnType::OutboundFullRelay),
+            (5, ConnType::Manual),
+            (6, ConnType::Inbound),
+        ];
+        let mut rxs: Vec<_> = brief
+            .iter()
+            .chain(&lasting)
+            .map(|&(id, kind)| (id, peer_of(&pm, id, kind, publisher_services())))
+            .collect();
         for &(id, _) in brief.iter().chain(&lasting) {
             pm.nap_peer_connected(id);
         }
@@ -1086,7 +1411,11 @@ mod nap_aggregator {
         for (id, rx) in &mut rxs {
             let asked = !getnapatts(rx).is_empty();
             assert_eq!(asked, *id >= 4, "peer {id}");
-            assert_eq!(puller.due(&addr(*id as u8).to_string(), Instant::now()), !asked, "peer {id}");
+            assert_eq!(
+                puller.due(&addr(*id as u8).to_string(), Instant::now()),
+                !asked,
+                "peer {id}"
+            );
         }
     }
 
@@ -1097,10 +1426,18 @@ mod nap_aggregator {
         pm.headers_tip.store(10_000, Ordering::Relaxed);
         assert!(pm.is_ibd());
         pm.nap_collection_tick(&puller).await;
-        assert_eq!(puller.collector().deferred_len(), 1, "behind the publishers, its anchor may not be on the chain yet");
+        assert_eq!(
+            puller.collector().deferred_len(),
+            1,
+            "behind the publishers, its anchor may not be on the chain yet"
+        );
         pm.headers_tip.store(1, Ordering::Relaxed);
         pm.nap_collection_tick(&puller).await;
-        assert_eq!(puller.collector().deferred_len(), 0, "synced, it is judged, and this chain does not hold its anchor");
+        assert_eq!(
+            puller.collector().deferred_len(),
+            0,
+            "synced, it is judged, and this chain does not hold its anchor"
+        );
     }
 
     #[test]
@@ -1114,7 +1451,12 @@ mod nap_aggregator {
     #[test]
     fn a_pull_connection_to_a_peer_that_does_not_publish_is_closed() {
         let (pm, _dirs, _puller) = aggregating_pm();
-        let _rx = peer_of(&pm, 1, ConnType::NapPull, ServiceFlags::NETWORK | ServiceFlags::WITNESS);
+        let _rx = peer_of(
+            &pm,
+            1,
+            ConnType::NapPull,
+            ServiceFlags::NETWORK | ServiceFlags::WITNESS,
+        );
         pm.nap_peer_connected(1);
         assert!(!connected(&pm, 1));
     }
@@ -1133,13 +1475,27 @@ mod nap_aggregator {
         };
         deliver(&pm, 1, ask());
         deliver(&pm, 2, ask());
-        assert!(drain(&mut pull).is_empty(), "nothing is answered over a pull connection");
-        assert!(!drain(&mut full).is_empty(), "the same request is answered over an ordinary one");
+        assert!(
+            drain(&mut pull).is_empty(),
+            "nothing is answered over a pull connection"
+        );
+        assert!(
+            !drain(&mut full).is_empty(),
+            "the same request is answered over an ordinary one"
+        );
         let peers = pm.peers.read();
         let info = &peers[&1].info;
-        assert!(!info.serves_blocks() && !info.conn_type.wants_tx_relay() && !info.conn_type.relays_addrs());
+        assert!(
+            !info.serves_blocks()
+                && !info.conn_type.wants_tx_relay()
+                && !info.conn_type.relays_addrs()
+        );
         drop(peers);
-        assert_eq!(pm.automatic_outbound_peers(), 1, "a pull connection takes no outbound slot");
+        assert_eq!(
+            pm.automatic_outbound_peers(),
+            1,
+            "a pull connection takes no outbound slot"
+        );
     }
 
     #[test]
@@ -1162,15 +1518,29 @@ mod nap_aggregator {
         let _full = peer_of(&pm, 2, ConnType::OutboundFullRelay, publisher_services());
         pm.handle_peer_connected(1, version(publisher_services()));
         pm.handle_peer_connected(2, version(publisher_services()));
-        let tried = |a: SocketAddr| pm.addrman.read().iter().any(|e| e.addr == a.into() && e.tried);
-        assert!(!tried(addr(1)), "a pull connection proves nothing about the address");
-        assert!(tried(addr(2)), "an ordinary outbound connection still promotes it");
+        let tried = |a: SocketAddr| {
+            pm.addrman
+                .read()
+                .iter()
+                .any(|e| e.addr == a.into() && e.tried)
+        };
+        assert!(
+            !tried(addr(1)),
+            "a pull connection proves nothing about the address"
+        );
+        assert!(
+            tried(addr(2)),
+            "an ordinary outbound connection still promotes it"
+        );
     }
 
     #[test]
     fn a_pull_connection_cannot_be_opened_through_addconnection() {
         let (pm, _dir) = mk_pm();
-        assert!(pm.check_outbound_limit_for(ConnType::NapPull, &[], &DialsInFlight::default()).is_err());
+        assert!(
+            pm.check_outbound_limit_for(ConnType::NapPull, &[], &DialsInFlight::default())
+                .is_err()
+        );
         assert_eq!(ConnType::from_addconnection_str("nap-pull"), None);
     }
 
@@ -1180,7 +1550,11 @@ mod nap_aggregator {
         let _rx = peer_of(&pm, 1, ConnType::NapPull, publisher_services());
         pm.nap_peer_connected(1);
         assert_eq!(puller.active(), 1);
-        let last = NapAtt { attestations: vec![], next_cursor: None }.to_bytes();
+        let last = NapAtt {
+            attestations: vec![],
+            next_cursor: None,
+        }
+        .to_bytes();
         pm.handle_napatt(1, last, InFlight::adopt(None));
         wait_for(|| !connected(&pm, 1), "the pull connection to close").await;
         assert_eq!(puller.stats().pulls_completed, 1);
@@ -1193,7 +1567,11 @@ mod nap_aggregator {
         let _b = peer_of(&pm, 2, ConnType::OutboundFullRelay, publisher_services());
         // Peer 2 was never asked: its page is ignored, and it stays.
         pm.handle_napatt(2, vec![0xff], InFlight::adopt(None));
-        wait_for(|| puller.stats().unsolicited == 1, "the unasked page to be counted").await;
+        wait_for(
+            || puller.stats().unsolicited == 1,
+            "the unasked page to be counted",
+        )
+        .await;
         assert!(connected(&pm, 2));
         // Peer 1 was asked, and answers with garbage.
         pm.nap_peer_connected(1);

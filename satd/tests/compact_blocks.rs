@@ -74,7 +74,9 @@ mod p2p {
             let stream = loop {
                 match listener.accept() {
                     Ok((s, _)) => break s,
-                    Err(e) if e.kind() == io::ErrorKind::WouldBlock && Instant::now() < deadline => {
+                    Err(e)
+                        if e.kind() == io::ErrorKind::WouldBlock && Instant::now() < deadline =>
+                    {
                         std::thread::sleep(Duration::from_millis(20))
                     }
                     Err(e) => panic!("the node never dialled us: {e}"),
@@ -86,24 +88,33 @@ mod p2p {
 
         fn handshake(stream: TcpStream) -> Self {
             stream.set_nodelay(true).unwrap();
-            stream.set_write_timeout(Some(Duration::from_secs(10))).unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
             let mut reader = stream.try_clone().unwrap();
             let writer = Arc::new(Mutex::new(stream));
             let (tx, inbox) = channel();
             let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
-            let peer = RawPeer { writer: writer.clone(), inbox, closed: closed.clone(), early: Vec::new() };
+            let peer = RawPeer {
+                writer: writer.clone(),
+                inbox,
+                closed: closed.clone(),
+                early: Vec::new(),
+            };
             peer.send(NetworkMessage::Version(our_version()));
 
             std::thread::spawn(move || {
                 loop {
                     match recv_msg(&mut reader) {
                         Ok(NetworkMessage::Ping(n)) => {
-                            let raw = RawNetworkMessage::new(Magic::REGTEST, NetworkMessage::Pong(n));
+                            let raw =
+                                RawNetworkMessage::new(Magic::REGTEST, NetworkMessage::Pong(n));
                             let _ = writer.lock().unwrap().write_all(&serialize(&raw));
                         }
                         Ok(NetworkMessage::Version(_)) => {
-                            let raw = RawNetworkMessage::new(Magic::REGTEST, NetworkMessage::Verack);
+                            let raw =
+                                RawNetworkMessage::new(Magic::REGTEST, NetworkMessage::Verack);
                             let _ = writer.lock().unwrap().write_all(&serialize(&raw));
                         }
                         Ok(msg) => {
@@ -131,7 +142,10 @@ mod p2p {
             }
             // Speak BIP 152 version 2, low-bandwidth, as a Core peer does.
             peer.send(NetworkMessage::SendCmpct(
-                bitcoin::p2p::message_compact_blocks::SendCmpct { send_compact: false, version: 2 },
+                bitcoin::p2p::message_compact_blocks::SendCmpct {
+                    send_compact: false,
+                    version: 2,
+                },
             ));
             peer
         }
@@ -224,7 +238,10 @@ mod p2p {
         stream.read_exact(&mut header)?;
         let len = u32::from_le_bytes(header[16..20].try_into().unwrap()) as usize;
         if len > MAX_PAYLOAD_SIZE {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "payload too large"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "payload too large",
+            ));
         }
         let mut buf = Vec::with_capacity(HEADER_SIZE + len);
         buf.extend_from_slice(&header);
@@ -241,7 +258,11 @@ mod p2p {
 // ---------------------------------------------------------------------------
 
 fn best_hash(node: &TestNode) -> BlockHash {
-    node.rpc_ok("getbestblockhash", vec![]).as_str().unwrap().parse().unwrap()
+    node.rpc_ok("getbestblockhash", vec![])
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap()
 }
 
 fn height(node: &TestNode) -> u32 {
@@ -264,9 +285,17 @@ fn banned_count(node: &TestNode) -> usize {
 /// A regtest block on `prev`. With `valid_pow`, the header is ground under
 /// the regtest target; without, it is ground to *miss* it. A witness
 /// commitment is added whenever a transaction carries a witness.
-fn build_block(prev: &Block, height: u32, extra: Vec<Transaction>, valid_pow: bool, salt: u32) -> Block {
+fn build_block(
+    prev: &Block,
+    height: u32,
+    extra: Vec<Transaction>,
+    valid_pow: bool,
+    salt: u32,
+) -> Block {
     let subsidy = (50u64 * 100_000_000) >> (height / 150).min(63);
-    let has_witness = extra.iter().any(|tx| tx.input.iter().any(|i| !i.witness.is_empty()));
+    let has_witness = extra
+        .iter()
+        .any(|tx| tx.input.iter().any(|i| !i.witness.is_empty()));
     let script_sig = bitcoin::script::Builder::new()
         .push_int(height as i64)
         .push_int(salt as i64)
@@ -349,7 +378,9 @@ fn unknown_tx(seed: u32) -> Transaction {
 }
 
 fn cmpct(compact: HeaderAndShortIds) -> NetworkMessage {
-    NetworkMessage::CmpctBlock(CmpctBlock { compact_block: compact })
+    NetworkMessage::CmpctBlock(CmpctBlock {
+        compact_block: compact,
+    })
 }
 
 fn is_getblocktxn_for(hash: BlockHash) -> impl Fn(&NetworkMessage) -> bool {
@@ -410,7 +441,10 @@ fn promote(node: &TestNode, peer: &mut RawPeer) {
         |m| matches!(m, NetworkMessage::SendCmpct(s) if s.send_compact),
         test_timeout(20),
     );
-    assert!(got.is_some(), "a peer that delivers the tip must be promoted to high-bandwidth");
+    assert!(
+        got.is_some(),
+        "a peer that delivers the tip must be promoted to high-bandwidth"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -427,7 +461,11 @@ fn cmpctblock_with_bad_pow_is_ignored_without_state_or_ban() {
     let (node, _) = started_node(1);
     let port = node.p2p_port.unwrap();
     let mut peer = RawPeer::connect(port);
-    poll_until(|| peer_count(&node) == 1, test_timeout(20), "peer must connect");
+    poll_until(
+        || peer_count(&node) == 1,
+        test_timeout(20),
+        "peer must connect",
+    );
 
     let tip = block_at(&node, &best_hash(&node));
     for i in 0..200u32 {
@@ -442,9 +480,18 @@ fn cmpctblock_with_bad_pow_is_ignored_without_state_or_ban() {
         peer.send(cmpct(compact));
     }
 
-    let answered = peer.recv_until(|m| matches!(m, NetworkMessage::GetBlockTxn(_)), Duration::from_secs(3));
-    assert!(answered.is_none(), "a bad-PoW compact block must not be reconstructed: {answered:?}");
-    assert!(!peer.is_closed(), "an invalid pushed header is not misbehaviour");
+    let answered = peer.recv_until(
+        |m| matches!(m, NetworkMessage::GetBlockTxn(_)),
+        Duration::from_secs(3),
+    );
+    assert!(
+        answered.is_none(),
+        "a bad-PoW compact block must not be reconstructed: {answered:?}"
+    );
+    assert!(
+        !peer.is_closed(),
+        "an invalid pushed header is not misbehaviour"
+    );
     assert_eq!(peer_count(&node), 1);
     assert_eq!(banned_count(&node), 0);
 
@@ -471,17 +518,27 @@ fn cmpctblock_that_fails_merkle_check_is_refetched_in_full_without_ban() {
     // T: in the node's mempool. T': a different spend of the same coinbase,
     // which the node has never seen, mined into block B.
     let (t_hex, _) = common::build_signed_p2wpkh_spend_from_block1_coinbase(
-        &node, &wallet, dest.address.script_pubkey(), 1_000,
+        &node,
+        &wallet,
+        dest.address.script_pubkey(),
+        1_000,
     );
     let (t2_hex, _) = common::build_signed_p2wpkh_spend_from_block1_coinbase(
-        &node, &wallet, dest.address.script_pubkey(), 2_000,
+        &node,
+        &wallet,
+        dest.address.script_pubkey(),
+        2_000,
     );
     let t: Transaction = deserialize(&hex::decode(&t_hex).unwrap()).unwrap();
     let t2: Transaction = deserialize(&hex::decode(&t2_hex).unwrap()).unwrap();
     node.rpc_ok("sendrawtransaction", vec![json!(t_hex)]);
 
     let mut peer = RawPeer::connect(node.p2p_port.unwrap());
-    poll_until(|| peer_count(&node) == 1, test_timeout(20), "peer must connect");
+    poll_until(
+        || peer_count(&node) == 1,
+        test_timeout(20),
+        "peer must connect",
+    );
     promote(&node, &mut peer);
 
     let tip = block_at(&node, &best_hash(&node));
@@ -491,16 +548,24 @@ fn cmpctblock_that_fails_merkle_check_is_refetched_in_full_without_ban() {
     // Simulate a collision: announce T' under T's short ID, so the node fills
     // the slot with T and the merkle root no longer matches.
     let keys = ShortId::calculate_siphash_keys(&compact.header, compact.nonce);
-    compact.short_ids[0] = ShortId::with_siphash_keys(&node::validation::decode::wtxid(&t).to_raw_hash(), keys);
+    compact.short_ids[0] =
+        ShortId::with_siphash_keys(&node::validation::decode::wtxid(&t).to_raw_hash(), keys);
     peer.send(cmpct(compact));
 
     let got = peer.recv_until(is_getdata_for(hash), Duration::from_secs(15));
-    assert!(got.is_some(), "the node must fall back to fetching the full block");
+    assert!(
+        got.is_some(),
+        "the node must fall back to fetching the full block"
+    );
     assert!(!peer.is_closed(), "the relayer must not be disconnected");
     assert_eq!(banned_count(&node), 0, "the relayer must not be banned");
 
     peer.send(NetworkMessage::Block(b));
-    poll_until(|| best_hash(&node) == hash, test_timeout(20), "the full block must connect");
+    poll_until(
+        || best_hash(&node) == hash,
+        test_timeout(20),
+        "the full block must connect",
+    );
 }
 
 /// Build a block of `n` transactions the node has never seen on the current
@@ -524,7 +589,11 @@ fn partial_block(node: &TestNode, n: u32, salt: u32) -> (Block, HeaderAndShortId
 fn cmpctblock_on_a_header_only_parent_is_fetched_in_order() {
     let (node, _) = started_node(1);
     let mut peer = RawPeer::connect(node.p2p_port.unwrap());
-    poll_until(|| peer_count(&node) == 1, test_timeout(20), "peer must connect");
+    poll_until(
+        || peer_count(&node) == 1,
+        test_timeout(20),
+        "peer must connect",
+    );
     // Only a high-bandwidth peer's push reaches reconstruction at all.
     promote(&node, &mut peer);
 
@@ -538,11 +607,18 @@ fn cmpctblock_on_a_header_only_parent_is_fetched_in_order() {
     peer.send(cmpct(compact));
 
     let asked = peer.recv_until(is_getblocktxn_for(b3.block_hash()), Duration::from_secs(5));
-    assert!(asked.is_none(), "a block on a header-only parent must not be reconstructed: {asked:?}");
+    assert!(
+        asked.is_none(),
+        "a block on a header-only parent must not be reconstructed: {asked:?}"
+    );
     assert_eq!(banned_count(&node), 0);
 
     peer.send(NetworkMessage::Block(b2.clone()));
-    poll_until(|| best_hash(&node) == b2.block_hash(), test_timeout(20), "the parent must connect");
+    poll_until(
+        || best_hash(&node) == b2.block_hash(),
+        test_timeout(20),
+        "the parent must connect",
+    );
     assert!(!peer.is_closed());
 }
 
@@ -555,13 +631,20 @@ fn blocktxn_for_an_unrequested_block_is_ignored() {
     // A block that will connect: one spend the node has never seen.
     let dest = DeterministicWallet::from_secret([0x5e; 32]);
     let (tx_hex, _) = common::build_signed_p2wpkh_spend_from_block1_coinbase(
-        &node, &wallet, dest.address.script_pubkey(), 1_000,
+        &node,
+        &wallet,
+        dest.address.script_pubkey(),
+        1_000,
     );
     let tx: Transaction = deserialize(&hex::decode(&tx_hex).unwrap()).unwrap();
 
     let mut x = RawPeer::connect(node.p2p_port.unwrap());
     let mut y = RawPeer::connect(node.p2p_port.unwrap());
-    poll_until(|| peer_count(&node) == 2, test_timeout(20), "peers must connect");
+    poll_until(
+        || peer_count(&node) == 2,
+        test_timeout(20),
+        "peers must connect",
+    );
     promote(&node, &mut x);
 
     let tip = block_at(&node, &best_hash(&node));
@@ -571,19 +654,38 @@ fn blocktxn_for_an_unrequested_block_is_ignored() {
 
     x.send(cmpct(compact));
     let req = x.recv_until(is_getblocktxn_for(hash), Duration::from_secs(15));
-    assert!(req.is_some(), "the node must ask X for the missing transaction");
+    assert!(
+        req.is_some(),
+        "the node must ask X for the missing transaction"
+    );
 
-    let reply = || NetworkMessage::BlockTxn(BlockTxn {
-        transactions: BlockTransactions { block_hash: hash, transactions: vec![tx.clone()] },
-    });
+    let reply = || {
+        NetworkMessage::BlockTxn(BlockTxn {
+            transactions: BlockTransactions {
+                block_hash: hash,
+                transactions: vec![tx.clone()],
+            },
+        })
+    };
     // Y never received a getblocktxn for this block.
     y.send(reply());
     std::thread::sleep(Duration::from_secs(3));
-    assert_ne!(best_hash(&node), hash, "Y's unrequested blocktxn must not complete X's block");
-    assert!(!y.is_closed(), "an unexpected blocktxn is ignored, not punished");
+    assert_ne!(
+        best_hash(&node),
+        hash,
+        "Y's unrequested blocktxn must not complete X's block"
+    );
+    assert!(
+        !y.is_closed(),
+        "an unexpected blocktxn is ignored, not punished"
+    );
 
     x.send(reply());
-    poll_until(|| best_hash(&node) == hash, test_timeout(20), "X's own reply completes the block");
+    poll_until(
+        || best_hash(&node) == hash,
+        test_timeout(20),
+        "X's own reply completes the block",
+    );
     let _ = y.collect_for(Duration::from_millis(10));
 }
 
@@ -594,27 +696,47 @@ fn blocktxn_for_an_unrequested_block_is_ignored() {
 fn blocktxn_with_wrong_count_is_penalised() {
     let (node, _) = started_node(1);
     let mut peer = RawPeer::connect(node.p2p_port.unwrap());
-    poll_until(|| peer_count(&node) == 1, test_timeout(20), "peer must connect");
+    poll_until(
+        || peer_count(&node) == 1,
+        test_timeout(20),
+        "peer must connect",
+    );
     promote(&node, &mut peer);
 
     let (b, compact) = partial_block(&node, 2, 4);
     let hash = b.block_hash();
     peer.send(cmpct(compact));
     let req = peer.recv_until(is_getblocktxn_for(hash), Duration::from_secs(15));
-    assert!(req.is_some(), "the node must request the two missing transactions");
+    assert!(
+        req.is_some(),
+        "the node must request the two missing transactions"
+    );
 
     peer.send(NetworkMessage::BlockTxn(BlockTxn {
-        transactions: BlockTransactions { block_hash: hash, transactions: vec![b.txdata[1].clone()] },
+        transactions: BlockTransactions {
+            block_hash: hash,
+            transactions: vec![b.txdata[1].clone()],
+        },
     }));
-    assert!(peer.wait_closed(Duration::from_secs(15)), "a mismatched blocktxn must disconnect the peer");
+    assert!(
+        peer.wait_closed(Duration::from_secs(15)),
+        "a mismatched blocktxn must disconnect the peer"
+    );
     // The peer is on 127.0.0.1: Core disconnects a local peer without
     // punishing its address, which every local peer shares.
-    assert_eq!(banned_count(&node), 0, "a local peer's address is not banned");
+    assert_eq!(
+        banned_count(&node),
+        0,
+        "a local peer's address is not banned"
+    );
 }
 
 fn getblocktxn(hash: BlockHash, indexes: Vec<u64>) -> NetworkMessage {
     NetworkMessage::GetBlockTxn(GetBlockTxn {
-        txs_request: BlockTransactionsRequest { block_hash: hash, indexes },
+        txs_request: BlockTransactionsRequest {
+            block_hash: hash,
+            indexes,
+        },
     })
 }
 
@@ -625,10 +747,18 @@ fn getblocktxn(hash: BlockHash, indexes: Vec<u64>) -> NetworkMessage {
 fn getblocktxn_beyond_depth_ten_gets_a_full_block() {
     let (node, _) = started_node(30);
     let mut peer = RawPeer::connect(node.p2p_port.unwrap());
-    poll_until(|| peer_count(&node) == 1, test_timeout(20), "peer must connect");
+    poll_until(
+        || peer_count(&node) == 1,
+        test_timeout(20),
+        "peer must connect",
+    );
 
     let hash_at = |h: u32| -> BlockHash {
-        node.rpc_ok("getblockhash", vec![json!(h)]).as_str().unwrap().parse().unwrap()
+        node.rpc_ok("getblockhash", vec![json!(h)])
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap()
     };
 
     // Depth 10 (height 20 under a tip of 30): still a blocktxn.
@@ -662,13 +792,24 @@ fn getblocktxn_beyond_depth_ten_gets_a_full_block() {
 fn getblocktxn_out_of_range_index_is_penalised() {
     let (node, _) = started_node(3);
     let mut peer = RawPeer::connect(node.p2p_port.unwrap());
-    poll_until(|| peer_count(&node) == 1, test_timeout(20), "peer must connect");
+    poll_until(
+        || peer_count(&node) == 1,
+        test_timeout(20),
+        "peer must connect",
+    );
     // Every regtest block mined by `generatetoaddress` on an empty mempool
     // holds only its coinbase.
     peer.send(getblocktxn(best_hash(&node), vec![5]));
-    assert!(peer.wait_closed(Duration::from_secs(15)), "an out-of-range getblocktxn must disconnect");
+    assert!(
+        peer.wait_closed(Duration::from_secs(15)),
+        "an out-of-range getblocktxn must disconnect"
+    );
     // As above: a local peer is disconnected, its address not banned.
-    assert_eq!(banned_count(&node), 0, "a local peer's address is not banned");
+    assert_eq!(
+        banned_count(&node),
+        0,
+        "a local peer's address is not banned"
+    );
 }
 
 /// Core allows at most three peers to hold a partial reconstruction of the
@@ -679,7 +820,11 @@ fn a_second_compact_peer_for_the_same_hash_is_capped_at_three() {
     let (node, _) = started_node(1);
     let port = node.p2p_port.unwrap();
     let mut peers: Vec<RawPeer> = (0..4).map(|_| RawPeer::connect(port)).collect();
-    poll_until(|| peer_count(&node) == 4, test_timeout(20), "peers must connect");
+    poll_until(
+        || peer_count(&node) == 4,
+        test_timeout(20),
+        "peers must connect",
+    );
 
     let (b, compact) = partial_block(&node, 3, 5);
     let hash = b.block_hash();
@@ -691,7 +836,8 @@ fn a_second_compact_peer_for_the_same_hash_is_capped_at_three() {
     for (i, p) in peers.iter_mut().enumerate() {
         p.send(NetworkMessage::Inv(vec![Inventory::Block(hash)]));
         assert!(
-            p.recv_until(is_block_request_for(hash), test_timeout(20)).is_some(),
+            p.recv_until(is_block_request_for(hash), test_timeout(20))
+                .is_some(),
             "the node must request the block from peer {i}"
         );
     }
@@ -702,10 +848,16 @@ fn a_second_compact_peer_for_the_same_hash_is_capped_at_three() {
     }
     let asked = peers
         .iter_mut()
-        .map(|p| p.recv_until(is_getblocktxn_for(hash), Duration::from_secs(5)).is_some())
+        .map(|p| {
+            p.recv_until(is_getblocktxn_for(hash), Duration::from_secs(5))
+                .is_some()
+        })
         .filter(|asked| *asked)
         .count();
-    assert_eq!(asked, 3, "exactly three peers may reconstruct one block at once");
+    assert_eq!(
+        asked, 3,
+        "exactly three peers may reconstruct one block at once"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -725,15 +877,20 @@ fn metrics_body(port: u16) -> String {
         {
             return body;
         }
-        assert!(std::time::Instant::now() < deadline, "metrics endpoint never answered");
+        assert!(
+            std::time::Instant::now() < deadline,
+            "metrics endpoint never answered"
+        );
         std::thread::sleep(Duration::from_millis(100));
     }
 }
 
 /// The value of one sample, e.g. `metric(&body, "satd_x_total{a=\"b\"}")`.
 fn metric(body: &str, series: &str) -> Option<u64> {
-    body.lines()
-        .find_map(|l| l.strip_prefix(series).and_then(|rest| rest.trim().parse().ok()))
+    body.lines().find_map(|l| {
+        l.strip_prefix(series)
+            .and_then(|rest| rest.trim().parse().ok())
+    })
 }
 
 /// A node with a metrics port and `blocks` mined.
@@ -744,7 +901,10 @@ fn node_with_metrics(blocks: u64, extra_args: &[&str]) -> (TestNode, Determinist
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     let node = TestNode::start(&args);
     let wallet = DeterministicWallet::from_secret([0x5c; 32]);
-    node.rpc_ok("generatetoaddress", vec![json!(blocks), json!(wallet.address.to_string())]);
+    node.rpc_ok(
+        "generatetoaddress",
+        vec![json!(blocks), json!(wallet.address.to_string())],
+    );
     (node, wallet, metrics_port)
 }
 
@@ -752,11 +912,16 @@ fn node_with_metrics(blocks: u64, extra_args: &[&str]) -> (TestNode, Determinist
 /// had to ask for anything before the block connected.
 fn relay_compact(node: &TestNode, peer: &mut RawPeer, block: &Block) -> bool {
     let hash = block.block_hash();
-    peer.send(cmpct(HeaderAndShortIds::from_block(block, 0xfeed, 2, &[]).unwrap()));
+    peer.send(cmpct(
+        HeaderAndShortIds::from_block(block, 0xfeed, 2, &[]).unwrap(),
+    ));
     let mut asked = false;
     let deadline = std::time::Instant::now() + test_timeout(20);
     while best_hash(node) != hash {
-        assert!(std::time::Instant::now() < deadline, "block {hash} never connected");
+        assert!(
+            std::time::Instant::now() < deadline,
+            "block {hash} never connected"
+        );
         for m in peer.collect_for(Duration::from_millis(200)) {
             if let NetworkMessage::GetBlockTxn(g) = m
                 && g.txs_request.block_hash == hash
@@ -769,7 +934,10 @@ fn relay_compact(node: &TestNode, peer: &mut RawPeer, block: &Block) -> bool {
                     .map(|i| block.txdata[*i as usize].clone())
                     .collect();
                 peer.send(NetworkMessage::BlockTxn(BlockTxn {
-                    transactions: BlockTransactions { block_hash: hash, transactions: txs },
+                    transactions: BlockTransactions {
+                        block_hash: hash,
+                        transactions: txs,
+                    },
                 }));
             }
         }
@@ -782,21 +950,36 @@ fn relay_compact(node: &TestNode, peer: &mut RawPeer, block: &Block) -> bool {
 /// without a round trip — and with the cache sized to zero, it does not.
 #[test]
 fn compact_block_reconstructs_from_the_extra_pool_after_rbf() {
-    for (extra_args, expect_round_trip) in [(&[][..], false), (&["--blockreconstructionextratxn=0"][..], true)] {
+    for (extra_args, expect_round_trip) in [
+        (&[][..], false),
+        (&["--blockreconstructionextratxn=0"][..], true),
+    ] {
         let (node, wallet, metrics_port) = node_with_metrics(101, extra_args);
         let dest = DeterministicWallet::from_secret([0x60; 32]);
         let (t1_hex, _) = common::build_signed_p2wpkh_spend_seq(
-            &node, &wallet, dest.address.script_pubkey(), 1_000, 0xffff_fffd,
+            &node,
+            &wallet,
+            dest.address.script_pubkey(),
+            1_000,
+            0xffff_fffd,
         );
         let (t2_hex, _) = common::build_signed_p2wpkh_spend_seq(
-            &node, &wallet, dest.address.script_pubkey(), 5_000, 0xffff_fffd,
+            &node,
+            &wallet,
+            dest.address.script_pubkey(),
+            5_000,
+            0xffff_fffd,
         );
         node.rpc_ok("sendrawtransaction", vec![json!(t1_hex)]);
         node.rpc_ok("sendrawtransaction", vec![json!(t2_hex)]);
         let t1: Transaction = deserialize(&hex::decode(&t1_hex).unwrap()).unwrap();
 
         let mut peer = RawPeer::connect(node.p2p_port.unwrap());
-        poll_until(|| peer_count(&node) == 1, test_timeout(20), "peer must connect");
+        poll_until(
+            || peer_count(&node) == 1,
+            test_timeout(20),
+            "peer must connect",
+        );
         promote(&node, &mut peer);
         let tip = block_at(&node, &best_hash(&node));
         let b = build_block(&tip, height(&node) + 1, vec![t1], true, 6);
@@ -806,17 +989,34 @@ fn compact_block_reconstructs_from_the_extra_pool_after_rbf() {
 
         let body = metrics_body(metrics_port);
         let extra = metric(&body, "satd_net_compact_block_txs_total{source=\"extra\"}");
-        let direct = metric(&body, "satd_net_compact_block_reconstructions_total{outcome=\"direct\"}");
-        let round_trip = metric(&body, "satd_net_compact_block_reconstructions_total{outcome=\"round_trip\"}");
+        let direct = metric(
+            &body,
+            "satd_net_compact_block_reconstructions_total{outcome=\"direct\"}",
+        );
+        let round_trip = metric(
+            &body,
+            "satd_net_compact_block_reconstructions_total{outcome=\"round_trip\"}",
+        );
         if expect_round_trip {
-            assert_eq!((extra, direct, round_trip), (Some(0), Some(0), Some(1)), "{extra_args:?}");
             assert_eq!(
-                metric(&body, "satd_net_compact_block_txs_total{source=\"requested\"}"),
+                (extra, direct, round_trip),
+                (Some(0), Some(0), Some(1)),
+                "{extra_args:?}"
+            );
+            assert_eq!(
+                metric(
+                    &body,
+                    "satd_net_compact_block_txs_total{source=\"requested\"}"
+                ),
                 Some(1)
             );
             assert!(metric(&body, "satd_net_compact_block_fetched_bytes_total").unwrap() > 0);
         } else {
-            assert_eq!((extra, direct, round_trip), (Some(1), Some(1), Some(0)), "{extra_args:?}");
+            assert_eq!(
+                (extra, direct, round_trip),
+                (Some(1), Some(1), Some(0)),
+                "{extra_args:?}"
+            );
         }
     }
 }
@@ -828,17 +1028,28 @@ fn a_policy_refused_relayed_tx_is_kept_for_reconstruction() {
     let (node, wallet, metrics_port) = node_with_metrics(101, &[]);
     let dest = DeterministicWallet::from_secret([0x61; 32]);
     let (free_hex, free_txid) = common::build_signed_p2wpkh_spend_from_block1_coinbase(
-        &node, &wallet, dest.address.script_pubkey(), 0,
+        &node,
+        &wallet,
+        dest.address.script_pubkey(),
+        0,
     );
     let free: Transaction = deserialize(&hex::decode(&free_hex).unwrap()).unwrap();
 
     let mut peer = RawPeer::connect(node.p2p_port.unwrap());
-    poll_until(|| peer_count(&node) == 1, test_timeout(20), "peer must connect");
+    poll_until(
+        || peer_count(&node) == 1,
+        test_timeout(20),
+        "peer must connect",
+    );
     peer.send(NetworkMessage::Tx(free.clone()));
     std::thread::sleep(Duration::from_secs(2));
     let in_pool = node.rpc_ok("getrawmempool", vec![]);
     assert!(
-        !in_pool.as_array().unwrap().iter().any(|t| t == &json!(free_txid)),
+        !in_pool
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t == &json!(free_txid)),
         "the zero-fee transaction must be refused"
     );
     assert!(!peer.is_closed(), "a policy refusal is not misbehaviour");
@@ -846,9 +1057,15 @@ fn a_policy_refused_relayed_tx_is_kept_for_reconstruction() {
     promote(&node, &mut peer);
     let tip = block_at(&node, &best_hash(&node));
     let b = build_block(&tip, height(&node) + 1, vec![free], true, 7);
-    assert!(!relay_compact(&node, &mut peer, &b), "the refused tx must fill its slot");
+    assert!(
+        !relay_compact(&node, &mut peer, &b),
+        "the refused tx must fill its slot"
+    );
     let body = metrics_body(metrics_port);
-    assert_eq!(metric(&body, "satd_net_compact_block_txs_total{source=\"extra\"}"), Some(1));
+    assert_eq!(
+        metric(&body, "satd_net_compact_block_txs_total{source=\"extra\"}"),
+        Some(1)
+    );
 }
 
 /// `getpeerinfo` reports the peer's high-bandwidth request. It was hardcoded
@@ -858,13 +1075,31 @@ fn getpeerinfo_reports_bip152_high_bandwidth_state() {
     use bitcoin::p2p::message_compact_blocks::SendCmpct;
     let (node, _) = started_node(1);
     let peer = RawPeer::connect(node.p2p_port.unwrap());
-    poll_until(|| peer_count(&node) == 1, test_timeout(20), "peer must connect");
+    poll_until(
+        || peer_count(&node) == 1,
+        test_timeout(20),
+        "peer must connect",
+    );
     let hb_from = || node.rpc_ok("getpeerinfo", vec![])[0]["bip152_hb_from"].clone();
     assert_eq!(hb_from(), json!(false));
-    peer.send(NetworkMessage::SendCmpct(SendCmpct { send_compact: true, version: 2 }));
-    poll_until(|| hb_from() == json!(true), test_timeout(20), "bip152_hb_from must turn true");
-    peer.send(NetworkMessage::SendCmpct(SendCmpct { send_compact: false, version: 2 }));
-    poll_until(|| hb_from() == json!(false), test_timeout(20), "and back to false");
+    peer.send(NetworkMessage::SendCmpct(SendCmpct {
+        send_compact: true,
+        version: 2,
+    }));
+    poll_until(
+        || hb_from() == json!(true),
+        test_timeout(20),
+        "bip152_hb_from must turn true",
+    );
+    peer.send(NetworkMessage::SendCmpct(SendCmpct {
+        send_compact: false,
+        version: 2,
+    }));
+    poll_until(
+        || hb_from() == json!(false),
+        test_timeout(20),
+        "and back to false",
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -899,16 +1134,19 @@ fn hb_to_by_port(node: &TestNode) -> std::collections::HashMap<u16, bool> {
 fn sendcmpct_is_low_bandwidth_at_handshake() {
     let (node, _) = started_node(1);
     let mut peer = RawPeer::connect(node.p2p_port.unwrap());
-    let first = peer
-        .early
-        .iter()
-        .find_map(sendcmpct_hb)
-        .or_else(|| {
-            peer.recv_until(|m| sendcmpct_hb(m).is_some(), test_timeout(20))
-                .and_then(|m| sendcmpct_hb(&m))
-        });
-    assert_eq!(first, Some(false), "the first sendcmpct must be low-bandwidth version 2");
-    assert_eq!(node.rpc_ok("getpeerinfo", vec![])[0]["bip152_hb_to"], json!(false));
+    let first = peer.early.iter().find_map(sendcmpct_hb).or_else(|| {
+        peer.recv_until(|m| sendcmpct_hb(m).is_some(), test_timeout(20))
+            .and_then(|m| sendcmpct_hb(&m))
+    });
+    assert_eq!(
+        first,
+        Some(false),
+        "the first sendcmpct must be low-bandwidth version 2"
+    );
+    assert_eq!(
+        node.rpc_ok("getpeerinfo", vec![])[0]["bip152_hb_to"],
+        json!(false)
+    );
 }
 
 /// A peer that delivers a block that becomes the tip is asked for
@@ -917,7 +1155,11 @@ fn sendcmpct_is_low_bandwidth_at_handshake() {
 fn a_peer_that_delivers_our_tip_is_promoted_to_high_bandwidth() {
     let (node, _) = started_node(1);
     let mut peer = RawPeer::connect(node.p2p_port.unwrap());
-    poll_until(|| peer_count(&node) == 1, test_timeout(20), "peer must connect");
+    poll_until(
+        || peer_count(&node) == 1,
+        test_timeout(20),
+        "peer must connect",
+    );
     // Delivered by hand rather than through `promote`, which discards what
     // arrives before the `sendcmpct` -- where an echo would be.
     let tip = block_at(&node, &best_hash(&node));
@@ -937,12 +1179,17 @@ fn a_peer_that_delivers_our_tip_is_promoted_to_high_bandwidth() {
     );
     // The block the peer delivered is not announced back to it.
     let echoed = seen.into_iter().find(|m| match m {
-        NetworkMessage::Inv(inv) => inv.iter().any(|i| matches!(i, Inventory::Block(h) if *h == delivered)),
+        NetworkMessage::Inv(inv) => inv
+            .iter()
+            .any(|i| matches!(i, Inventory::Block(h) if *h == delivered)),
         NetworkMessage::Headers(hs) => hs.iter().any(|h| h.block_hash() == delivered),
         NetworkMessage::CmpctBlock(c) => c.compact_block.header.block_hash() == delivered,
         _ => false,
     });
-    assert!(echoed.is_none(), "the node announced a block back to its source: {echoed:?}");
+    assert!(
+        echoed.is_none(),
+        "the node announced a block back to its source: {echoed:?}"
+    );
 }
 
 /// BIP 152: at most three high-bandwidth peers. A fourth promotion demotes
@@ -952,15 +1199,26 @@ fn at_most_three_peers_are_high_bandwidth_and_the_oldest_is_demoted() {
     let (node, _) = started_node(1);
     let port = node.p2p_port.unwrap();
     let mut peers: Vec<RawPeer> = (0..4).map(|_| RawPeer::connect(port)).collect();
-    poll_until(|| peer_count(&node) == 4, test_timeout(20), "peers must connect");
+    poll_until(
+        || peer_count(&node) == 4,
+        test_timeout(20),
+        "peers must connect",
+    );
     for p in peers.iter_mut() {
         promote(&node, p);
     }
     let demoted = peers[0].recv_until(|m| sendcmpct_hb(m) == Some(false), test_timeout(20));
-    assert!(demoted.is_some(), "the first peer must be demoted when the fourth is promoted");
+    assert!(
+        demoted.is_some(),
+        "the first peer must be demoted when the fourth is promoted"
+    );
     for (i, p) in peers.iter_mut().enumerate().skip(1) {
         assert!(
-            p.recv_until(|m| sendcmpct_hb(m) == Some(false), Duration::from_millis(500)).is_none(),
+            p.recv_until(
+                |m| sendcmpct_hb(m) == Some(false),
+                Duration::from_millis(500)
+            )
+            .is_none(),
             "peer {i} must stay high-bandwidth"
         );
     }
@@ -980,14 +1238,22 @@ fn an_inbound_promotion_never_evicts_the_last_outbound_hb_peer() {
     let out = node
         .rpc_call_with_params(
             "addconnection",
-            vec![json!(listener.local_addr().unwrap().to_string()), json!("outbound-full-relay"), json!(false)],
+            vec![
+                json!(listener.local_addr().unwrap().to_string()),
+                json!("outbound-full-relay"),
+                json!(false),
+            ],
         )
         .unwrap();
     assert!(out["error"].is_null(), "addconnection: {out}");
     let mut outbound = RawPeer::accept(&listener);
     let port = node.p2p_port.unwrap();
     let mut inbound: Vec<RawPeer> = (0..3).map(|_| RawPeer::connect(port)).collect();
-    poll_until(|| peer_count(&node) == 4, test_timeout(20), "peers must connect");
+    poll_until(
+        || peer_count(&node) == 4,
+        test_timeout(20),
+        "peers must connect",
+    );
 
     // Selection order: outbound, inbound 0, inbound 1 — the outbound peer is
     // the oldest and would be the one to go.
@@ -999,11 +1265,18 @@ fn an_inbound_promotion_never_evicts_the_last_outbound_hb_peer() {
     let demoted = inbound[0].recv_until(|m| sendcmpct_hb(m) == Some(false), test_timeout(20));
     assert!(demoted.is_some(), "the oldest inbound peer is demoted");
     assert!(
-        outbound.recv_until(|m| sendcmpct_hb(m) == Some(false), Duration::from_secs(1)).is_none(),
+        outbound
+            .recv_until(|m| sendcmpct_hb(m) == Some(false), Duration::from_secs(1))
+            .is_none(),
         "the only outbound high-bandwidth peer must not be demoted"
     );
     let info = node.rpc_ok("getpeerinfo", vec![]);
-    let out_peer = info.as_array().unwrap().iter().find(|p| p["inbound"] == json!(false)).unwrap();
+    let out_peer = info
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["inbound"] == json!(false))
+        .unwrap();
     assert_eq!(out_peer["bip152_hb_to"], json!(true));
 }
 
@@ -1031,34 +1304,62 @@ fn a_high_bandwidth_peer_receives_new_blocks_as_cmpctblock() {
     let (node, wallet) = started_node(101);
     let dest = DeterministicWallet::from_secret([0x62; 32]);
     let (tx_hex, _) = common::build_signed_p2wpkh_spend_from_block1_coinbase(
-        &node, &wallet, dest.address.script_pubkey(), 1_000,
+        &node,
+        &wallet,
+        dest.address.script_pubkey(),
+        1_000,
     );
     node.rpc_ok("sendrawtransaction", vec![json!(tx_hex)]);
 
     let port = node.p2p_port.unwrap();
     let mut hb = RawPeer::connect(port);
     let mut lb = RawPeer::connect(port);
-    poll_until(|| peer_count(&node) == 2, test_timeout(20), "peers must connect");
-    hb.send(NetworkMessage::SendCmpct(SendCmpct { send_compact: true, version: 2 }));
     poll_until(
-        || node.rpc_ok("getpeerinfo", vec![]).as_array().unwrap().iter().any(|p| p["bip152_hb_from"] == json!(true)),
+        || peer_count(&node) == 2,
+        test_timeout(20),
+        "peers must connect",
+    );
+    hb.send(NetworkMessage::SendCmpct(SendCmpct {
+        send_compact: true,
+        version: 2,
+    }));
+    poll_until(
+        || {
+            node.rpc_ok("getpeerinfo", vec![])
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|p| p["bip152_hb_from"] == json!(true))
+        },
         test_timeout(20),
         "the node must record the high-bandwidth request",
     );
 
-    let mined = node.rpc_ok("generatetoaddress", vec![json!(1), json!(wallet.address.to_string())]);
+    let mined = node.rpc_ok(
+        "generatetoaddress",
+        vec![json!(1), json!(wallet.address.to_string())],
+    );
     let hash: BlockHash = mined[0].as_str().unwrap().parse().unwrap();
     let block = block_at(&node, &hash);
-    assert_eq!(block.txdata.len(), 2, "the block carries the mempool transaction");
+    assert_eq!(
+        block.txdata.len(),
+        2,
+        "the block carries the mempool transaction"
+    );
 
     let got = hb.recv_until(is_cmpctblock_for(hash), test_timeout(20));
     let Some(NetworkMessage::CmpctBlock(c)) = got else {
         panic!("the high-bandwidth peer must receive a cmpctblock");
     };
-    assert_eq!(c.compact_block, expected_compact(&block, c.compact_block.nonce));
+    assert_eq!(
+        c.compact_block,
+        expected_compact(&block, c.compact_block.nonce)
+    );
     let again = hb.collect_for(Duration::from_secs(2));
     let repeat = again.iter().find(|m| match m {
-        NetworkMessage::Inv(inv) => inv.iter().any(|i| matches!(i, Inventory::Block(h) if *h == hash)),
+        NetworkMessage::Inv(inv) => inv
+            .iter()
+            .any(|i| matches!(i, Inventory::Block(h) if *h == hash)),
         NetworkMessage::Headers(hs) => hs.iter().any(|h| h.block_hash() == hash),
         m => is_cmpctblock_for(hash)(m),
     });
@@ -1073,7 +1374,9 @@ fn a_high_bandwidth_peer_receives_new_blocks_as_cmpctblock() {
         "a low-bandwidth peer must not be pushed a cmpctblock"
     );
     assert!(
-        lb_msgs.iter().any(|m| matches!(m, NetworkMessage::Inv(_) | NetworkMessage::Headers(_))),
+        lb_msgs
+            .iter()
+            .any(|m| matches!(m, NetworkMessage::Inv(_) | NetworkMessage::Headers(_))),
         "a low-bandwidth peer still hears about the block: {lb_msgs:?}"
     );
 }
@@ -1084,9 +1387,17 @@ fn a_high_bandwidth_peer_receives_new_blocks_as_cmpctblock() {
 fn msg_cmpct_block_getdata_is_answered_by_depth() {
     let (node, _) = started_node(20);
     let mut peer = RawPeer::connect(node.p2p_port.unwrap());
-    poll_until(|| peer_count(&node) == 1, test_timeout(20), "peer must connect");
+    poll_until(
+        || peer_count(&node) == 1,
+        test_timeout(20),
+        "peer must connect",
+    );
     let hash_at = |h: u32| -> BlockHash {
-        node.rpc_ok("getblockhash", vec![json!(h)]).as_str().unwrap().parse().unwrap()
+        node.rpc_ok("getblockhash", vec![json!(h)])
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap()
     };
     let answer = |peer: &mut RawPeer, hash: BlockHash| {
         peer.send(NetworkMessage::GetData(vec![Inventory::CompactBlock(hash)]));
@@ -1101,9 +1412,16 @@ fn msg_cmpct_block_getdata_is_answered_by_depth() {
         match answer(&mut peer, hash) {
             Some(NetworkMessage::CmpctBlock(c)) => {
                 let block = block_at(&node, &hash);
-                assert_eq!(c.compact_block, expected_compact(&block, c.compact_block.nonce), "height {h}");
+                assert_eq!(
+                    c.compact_block,
+                    expected_compact(&block, c.compact_block.nonce),
+                    "height {h}"
+                );
             }
-            other => panic!("height {h} (depth {}) must be a cmpctblock, got {other:?}", 20 - h),
+            other => panic!(
+                "height {h} (depth {}) must be a cmpctblock, got {other:?}",
+                20 - h
+            ),
         }
     }
     let deep = hash_at(14);
@@ -1112,7 +1430,12 @@ fn msg_cmpct_block_getdata_is_answered_by_depth() {
         "depth 6 must be a full block"
     );
     let body = node.rpc_ok("getpeerinfo", vec![]);
-    assert!(body[0]["bytessent_per_msg"]["cmpctblock"].as_u64().unwrap_or(0) > 0);
+    assert!(
+        body[0]["bytessent_per_msg"]["cmpctblock"]
+            .as_u64()
+            .unwrap_or(0)
+            > 0
+    );
 }
 
 /// Two satd nodes: once B has taken a block from A, B selects A for
@@ -1123,26 +1446,48 @@ fn two_satd_nodes_relay_a_block_as_cmpctblock() {
     let p2p_port_a = common::find_available_port();
     let node_a = TestNode::start(&[&format!("--port={p2p_port_a}")]);
     let node_b = TestNode::start(&[&format!("--connect=127.0.0.1:{p2p_port_a}")]);
-    poll_until(|| peer_count(&node_a) >= 1 && peer_count(&node_b) >= 1, test_timeout(20), "nodes must connect");
-    let addr = DeterministicWallet::from_secret([0x63; 32]).address.to_string();
+    poll_until(
+        || peer_count(&node_a) >= 1 && peer_count(&node_b) >= 1,
+        test_timeout(20),
+        "nodes must connect",
+    );
+    let addr = DeterministicWallet::from_secret([0x63; 32])
+        .address
+        .to_string();
 
     let per_msg = |node: &TestNode, dir: &str, msg: &str| -> u64 {
-        node.rpc_ok("getpeerinfo", vec![])[0][dir][msg].as_u64().unwrap_or(0)
+        node.rpc_ok("getpeerinfo", vec![])[0][dir][msg]
+            .as_u64()
+            .unwrap_or(0)
     };
 
     node_a.rpc_ok("generatetoaddress", vec![json!(1), json!(addr)]);
-    poll_until(|| height(&node_b) == 1, test_timeout(20), "B must take A's first block");
+    poll_until(
+        || height(&node_b) == 1,
+        test_timeout(20),
+        "B must take A's first block",
+    );
     poll_until(
         || node_a.rpc_ok("getpeerinfo", vec![])[0]["bip152_hb_from"] == json!(true),
         test_timeout(20),
         "B must select A for high-bandwidth relay",
     );
-    assert_eq!(node_b.rpc_ok("getpeerinfo", vec![])[0]["bip152_hb_to"], json!(true));
+    assert_eq!(
+        node_b.rpc_ok("getpeerinfo", vec![])[0]["bip152_hb_to"],
+        json!(true)
+    );
 
     let blocks_before = per_msg(&node_b, "bytesrecv_per_msg", "block");
     node_a.rpc_ok("generatetoaddress", vec![json!(1), json!(addr)]);
-    poll_until(|| best_hash(&node_b) == best_hash(&node_a), test_timeout(20), "B must follow A");
-    assert!(per_msg(&node_b, "bytesrecv_per_msg", "cmpctblock") > 0, "the block must arrive as a cmpctblock");
+    poll_until(
+        || best_hash(&node_b) == best_hash(&node_a),
+        test_timeout(20),
+        "B must follow A",
+    );
+    assert!(
+        per_msg(&node_b, "bytesrecv_per_msg", "cmpctblock") > 0,
+        "the block must arrive as a cmpctblock"
+    );
     assert_eq!(
         per_msg(&node_b, "bytesrecv_per_msg", "block"),
         blocks_before,
@@ -1160,8 +1505,15 @@ fn a_block_is_announced_to_high_bandwidth_peers_before_it_is_connected() {
     use bitcoin::p2p::message_compact_blocks::SendCmpct;
     let (node, _) = started_node(5);
     let mut hb = RawPeer::connect(node.p2p_port.unwrap());
-    poll_until(|| peer_count(&node) == 1, test_timeout(20), "peer must connect");
-    hb.send(NetworkMessage::SendCmpct(SendCmpct { send_compact: true, version: 2 }));
+    poll_until(
+        || peer_count(&node) == 1,
+        test_timeout(20),
+        "peer must connect",
+    );
+    hb.send(NetworkMessage::SendCmpct(SendCmpct {
+        send_compact: true,
+        version: 2,
+    }));
     poll_until(
         || node.rpc_ok("getpeerinfo", vec![])[0]["bip152_hb_from"] == json!(true),
         test_timeout(20),
@@ -1173,12 +1525,24 @@ fn a_block_is_announced_to_high_bandwidth_peers_before_it_is_connected() {
     let bad = build_block(&tip, height(&node) + 1, vec![unknown_tx(1)], true, 8);
     let hash = bad.block_hash();
     let hex = hex::encode(bitcoin::consensus::serialize(&bad));
-    let submitted = node.rpc_call_with_params("submitblock", vec![json!(hex)]).unwrap();
-    assert!(!submitted["result"].is_null(), "submitblock must reject the block: {submitted}");
+    let submitted = node
+        .rpc_call_with_params("submitblock", vec![json!(hex)])
+        .unwrap();
+    assert!(
+        !submitted["result"].is_null(),
+        "submitblock must reject the block: {submitted}"
+    );
 
     let got = hb.recv_until(is_cmpctblock_for(hash), test_timeout(20));
-    assert!(got.is_some(), "the block must be announced before connection is attempted");
-    assert_eq!(best_hash(&node), tip_before, "and it must not have connected");
+    assert!(
+        got.is_some(),
+        "the block must be announced before connection is attempted"
+    );
+    assert_eq!(
+        best_hash(&node),
+        tip_before,
+        "and it must not have connected"
+    );
 }
 
 /// A peer we did not select for high-bandwidth relay, pushing a `cmpctblock`
@@ -1189,7 +1553,11 @@ fn a_block_is_announced_to_high_bandwidth_peers_before_it_is_connected() {
 fn unsolicited_cmpctblock_from_a_low_bandwidth_peer_is_a_header_announcement() {
     let (node, _) = started_node(1);
     let mut peer = RawPeer::connect(node.p2p_port.unwrap());
-    poll_until(|| peer_count(&node) == 1, test_timeout(20), "peer must connect");
+    poll_until(
+        || peer_count(&node) == 1,
+        test_timeout(20),
+        "peer must connect",
+    );
 
     let (b, compact) = partial_block(&node, 2, 9);
     let hash = b.block_hash();
@@ -1199,9 +1567,17 @@ fn unsolicited_cmpctblock_from_a_low_bandwidth_peer_is_a_header_announcement() {
         !msgs.iter().any(is_getblocktxn_for(hash)),
         "an unsolicited push from a low-bandwidth peer must not be reconstructed"
     );
-    assert!(msgs.iter().any(is_getdata_for(hash)), "the block is fetched in full instead: {msgs:?}");
-    let header = node.rpc_call_with_params("getblockheader", vec![json!(hash.to_string())]).unwrap();
-    assert!(header["error"].is_null(), "the header must have been accepted: {header}");
+    assert!(
+        msgs.iter().any(is_getdata_for(hash)),
+        "the block is fetched in full instead: {msgs:?}"
+    );
+    let header = node
+        .rpc_call_with_params("getblockheader", vec![json!(hash.to_string())])
+        .unwrap();
+    assert!(
+        header["error"].is_null(),
+        "the header must have been accepted: {header}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1229,17 +1605,31 @@ fn prefilled_cmpctblock_reconstructs_without_a_round_trip() {
         let args_a: Vec<&str> = args_a.iter().map(String::as_str).collect();
         let node_a = TestNode::start(&args_a);
         let wallet = DeterministicWallet::from_secret([0x64; 32]);
-        node_a.rpc_ok("generatetoaddress", vec![json!(101), json!(wallet.address.to_string())]);
+        node_a.rpc_ok(
+            "generatetoaddress",
+            vec![json!(101), json!(wallet.address.to_string())],
+        );
 
         let metrics_b = common::find_available_port();
         let node_b = TestNode::start(&[
             &format!("--connect=127.0.0.1:{p2p_port_a}"),
             &format!("--metricsport={metrics_b}"),
         ]);
-        poll_until(|| height(&node_b) == 101, test_timeout(60), "B must sync A's chain");
+        poll_until(
+            || height(&node_b) == 101,
+            test_timeout(60),
+            "B must sync A's chain",
+        );
         // One block delivered by A makes B select A for high-bandwidth relay.
-        node_a.rpc_ok("generatetoaddress", vec![json!(1), json!(wallet.address.to_string())]);
-        poll_until(|| best_hash(&node_b) == best_hash(&node_a), test_timeout(20), "B must follow A");
+        node_a.rpc_ok(
+            "generatetoaddress",
+            vec![json!(1), json!(wallet.address.to_string())],
+        );
+        poll_until(
+            || best_hash(&node_b) == best_hash(&node_a),
+            test_timeout(20),
+            "B must follow A",
+        );
         poll_until(
             || node_a.rpc_ok("getpeerinfo", vec![])[0]["bip152_hb_from"] == json!(true),
             test_timeout(20),
@@ -1248,7 +1638,10 @@ fn prefilled_cmpctblock_reconstructs_without_a_round_trip() {
 
         let dest = DeterministicWallet::from_secret([0x65; 32]);
         let (x_hex, _) = common::build_signed_p2wpkh_spend_from_block1_coinbase(
-            &node_a, &wallet, dest.address.script_pubkey(), 1_000,
+            &node_a,
+            &wallet,
+            dest.address.script_pubkey(),
+            1_000,
         );
         let x: Transaction = deserialize(&hex::decode(&x_hex).unwrap()).unwrap();
 
@@ -1258,21 +1651,41 @@ fn prefilled_cmpctblock_reconstructs_without_a_round_trip() {
         let before = [direct, round_trip, prefilled].map(|s| metric_or_zero(metrics_b, s));
 
         let p = RawPeer::connect(node_a.p2p_port.unwrap());
-        poll_until(|| peer_count(&node_a) == 2, test_timeout(20), "the raw peer must connect to A");
+        poll_until(
+            || peer_count(&node_a) == 2,
+            test_timeout(20),
+            "the raw peer must connect to A",
+        );
         let tip = block_at(&node_a, &best_hash(&node_a));
         let block = build_block(&tip, height(&node_a) + 1, vec![x], true, 64);
         let hash = block.block_hash();
         p.send(NetworkMessage::Headers(vec![block.header]));
         p.send(NetworkMessage::Block(block));
-        poll_until(|| best_hash(&node_a) == hash, test_timeout(20), "A must connect the block");
-        poll_until(|| best_hash(&node_b) == hash, test_timeout(20), "B must follow A");
+        poll_until(
+            || best_hash(&node_a) == hash,
+            test_timeout(20),
+            "A must connect the block",
+        );
+        poll_until(
+            || best_hash(&node_b) == hash,
+            test_timeout(20),
+            "B must follow A",
+        );
 
         let after = [direct, round_trip, prefilled].map(|s| metric_or_zero(metrics_b, s));
         let delta: Vec<u64> = after.iter().zip(before).map(|(a, b)| a - b).collect();
         if expect_round_trip {
-            assert_eq!(delta, vec![0, 1, 1], "prefill off: coinbase only, and B must ask for X");
+            assert_eq!(
+                delta,
+                vec![0, 1, 1],
+                "prefill off: coinbase only, and B must ask for X"
+            );
         } else {
-            assert_eq!(delta, vec![1, 0, 2], "prefill on: X arrives prefilled and B needs nothing");
+            assert_eq!(
+                delta,
+                vec![1, 0, 2],
+                "prefill on: X arrives prefilled and B needs nothing"
+            );
         }
     }
 }
@@ -1280,7 +1693,8 @@ fn prefilled_cmpctblock_reconstructs_without_a_round_trip() {
 /// A transaction nobody has, about `bytes` long.
 fn bulky_unknown_tx(seed: u32, bytes: usize) -> Transaction {
     let mut tx = unknown_tx(seed);
-    tx.output[0].script_pubkey = bitcoin::ScriptBuf::from_bytes(vec![0x6a; bytes.saturating_sub(60)]);
+    tx.output[0].script_pubkey =
+        bitcoin::ScriptBuf::from_bytes(vec![0x6a; bytes.saturating_sub(60)]);
     tx
 }
 
@@ -1291,12 +1705,25 @@ fn bulky_unknown_tx(seed: u32, bytes: usize) -> Transaction {
 fn prefill_never_exceeds_its_budget() {
     use bitcoin::p2p::message_compact_blocks::SendCmpct;
     let budget = 4_000usize;
-    let node = TestNode::start(&["--cmpctblockprefill=1", &format!("--cmpctblockprefillbytes={budget}")]);
+    let node = TestNode::start(&[
+        "--cmpctblockprefill=1",
+        &format!("--cmpctblockprefillbytes={budget}"),
+    ]);
     let wallet = DeterministicWallet::from_secret([0x66; 32]);
-    node.rpc_ok("generatetoaddress", vec![json!(5), json!(wallet.address.to_string())]);
+    node.rpc_ok(
+        "generatetoaddress",
+        vec![json!(5), json!(wallet.address.to_string())],
+    );
     let mut hb = RawPeer::connect(node.p2p_port.unwrap());
-    poll_until(|| peer_count(&node) == 1, test_timeout(20), "peer must connect");
-    hb.send(NetworkMessage::SendCmpct(SendCmpct { send_compact: true, version: 2 }));
+    poll_until(
+        || peer_count(&node) == 1,
+        test_timeout(20),
+        "peer must connect",
+    );
+    hb.send(NetworkMessage::SendCmpct(SendCmpct {
+        send_compact: true,
+        version: 2,
+    }));
     poll_until(
         || node.rpc_ok("getpeerinfo", vec![])[0]["bip152_hb_from"] == json!(true),
         test_timeout(20),
@@ -1310,16 +1737,31 @@ fn prefill_never_exceeds_its_budget() {
     // It spends coins that do not exist, so it never connects; it is still
     // announced, which is all this test needs.
     let hex = hex::encode(bitcoin::consensus::serialize(&block));
-    let _ = node.rpc_call_with_params("submitblock", vec![json!(hex)]).unwrap();
+    let _ = node
+        .rpc_call_with_params("submitblock", vec![json!(hex)])
+        .unwrap();
 
-    let Some(NetworkMessage::CmpctBlock(c)) = hb.recv_until(is_cmpctblock_for(hash), test_timeout(20)) else {
+    let Some(NetworkMessage::CmpctBlock(c)) =
+        hb.recv_until(is_cmpctblock_for(hash), test_timeout(20))
+    else {
         panic!("the block must be announced");
     };
     let prefilled = &c.compact_block.prefilled_txs;
     let used: usize = prefilled.iter().skip(1).map(|p| p.tx.total_size()).sum();
-    assert!(used <= budget, "{used} bytes prefilled against a {budget}-byte budget");
-    assert_eq!(prefilled.len(), 1 + budget / 1_500, "as many as fit, beyond the coinbase");
-    assert_eq!(prefilled.len() + c.compact_block.short_ids.len(), 6, "the rest go as short IDs");
+    assert!(
+        used <= budget,
+        "{used} bytes prefilled against a {budget}-byte budget"
+    );
+    assert_eq!(
+        prefilled.len(),
+        1 + budget / 1_500,
+        "as many as fit, beyond the coinbase"
+    );
+    assert_eq!(
+        prefilled.len() + c.compact_block.short_ids.len(),
+        6,
+        "the rest go as short IDs"
+    );
 }
 
 /// Which transactions a node lacked can only be read off the mempool before
@@ -1331,21 +1773,44 @@ fn prefill_never_exceeds_its_budget() {
 fn a_cmpctblock_built_after_connection_is_not_prefilled() {
     let node = TestNode::start(&["--cmpctblockprefill=1"]);
     let wallet = DeterministicWallet::from_secret([0x67; 32]);
-    node.rpc_ok("generatetoaddress", vec![json!(101), json!(wallet.address.to_string())]);
+    node.rpc_ok(
+        "generatetoaddress",
+        vec![json!(101), json!(wallet.address.to_string())],
+    );
     let dest = DeterministicWallet::from_secret([0x68; 32]);
     let (tx_hex, _) = common::build_signed_p2wpkh_spend_from_block1_coinbase(
-        &node, &wallet, dest.address.script_pubkey(), 1_000,
+        &node,
+        &wallet,
+        dest.address.script_pubkey(),
+        1_000,
     );
     node.rpc_ok("sendrawtransaction", vec![json!(tx_hex)]);
-    let mined = node.rpc_ok("generatetoaddress", vec![json!(1), json!(wallet.address.to_string())]);
+    let mined = node.rpc_ok(
+        "generatetoaddress",
+        vec![json!(1), json!(wallet.address.to_string())],
+    );
     let hash: BlockHash = mined[0].as_str().unwrap().parse().unwrap();
-    assert_eq!(block_at(&node, &hash).txdata.len(), 2, "the block must carry the mempool transaction");
-    node.rpc_ok("generatetoaddress", vec![json!(1), json!(wallet.address.to_string())]);
+    assert_eq!(
+        block_at(&node, &hash).txdata.len(),
+        2,
+        "the block must carry the mempool transaction"
+    );
+    node.rpc_ok(
+        "generatetoaddress",
+        vec![json!(1), json!(wallet.address.to_string())],
+    );
 
     let mut peer = RawPeer::connect(node.p2p_port.unwrap());
-    poll_until(|| peer_count(&node) == 1, test_timeout(20), "peer must connect");
+    poll_until(
+        || peer_count(&node) == 1,
+        test_timeout(20),
+        "peer must connect",
+    );
     peer.send(NetworkMessage::GetData(vec![Inventory::CompactBlock(hash)]));
-    match peer.recv_until(|m| matches!(m, NetworkMessage::CmpctBlock(_) | NetworkMessage::Block(_)), test_timeout(20)) {
+    match peer.recv_until(
+        |m| matches!(m, NetworkMessage::CmpctBlock(_) | NetworkMessage::Block(_)),
+        test_timeout(20),
+    ) {
         Some(NetworkMessage::CmpctBlock(c)) => {
             assert_eq!(c.compact_block.prefilled_txs.len(), 1, "coinbase only");
             assert_eq!(c.compact_block.short_ids.len(), 1);
@@ -1379,7 +1844,11 @@ fn a_cmpctblock_announcement_makes_the_peer_a_download_source() {
 
     let (node, _) = started_node(1);
     let mut peer = RawPeer::connect(node.p2p_port.unwrap());
-    poll_until(|| peer_count(&node) == 1, test_timeout(20), "peer must connect");
+    poll_until(
+        || peer_count(&node) == 1,
+        test_timeout(20),
+        "peer must connect",
+    );
     // Only a high-bandwidth peer's pushes reach the compact path at all, and
     // promotion is also the last thing to teach the node this peer's height
     // through a `headers` message. Everything after it is compact, which is
@@ -1394,16 +1863,21 @@ fn a_cmpctblock_announcement_makes_the_peer_a_download_source() {
     // what keeps its data behind its header — and every later block then
     // lands on a header-only parent.
     let first = build_block(&tip, h + 1, vec![unknown_tx(9_100)], true, 91);
-    peer.send(cmpct(HeaderAndShortIds::from_block(&first, 91, 2, &[]).unwrap()));
+    peer.send(cmpct(
+        HeaderAndShortIds::from_block(&first, 91, 2, &[]).unwrap(),
+    ));
     assert!(
-        peer.recv_until(is_getblocktxn_for(first.block_hash()), test_timeout(20)).is_some(),
+        peer.recv_until(is_getblocktxn_for(first.block_hash()), test_timeout(20))
+            .is_some(),
         "the node should try to reconstruct the first announcement"
     );
 
     let mut parent = first.clone();
     for i in 1..ANNOUNCED {
         let next = build_block(&parent, h + 1 + i, vec![], true, 9_200 + i);
-        peer.send(cmpct(HeaderAndShortIds::from_block(&next, u64::from(9_200 + i), 2, &[]).unwrap()));
+        peer.send(cmpct(
+            HeaderAndShortIds::from_block(&next, u64::from(9_200 + i), 2, &[]).unwrap(),
+        ));
         parent = next;
     }
 
@@ -1424,7 +1898,12 @@ fn a_cmpctblock_announcement_makes_the_peer_a_download_source() {
 
 /// Everything `peer` receives until a message matching `pred` arrives, that
 /// message included. Panics if none does within `timeout`.
-fn collect_until(peer: &mut RawPeer, pred: impl Fn(&NetworkMessage) -> bool, timeout: Duration, what: &str) -> Vec<NetworkMessage> {
+fn collect_until(
+    peer: &mut RawPeer,
+    pred: impl Fn(&NetworkMessage) -> bool,
+    timeout: Duration,
+    what: &str,
+) -> Vec<NetworkMessage> {
     let deadline = std::time::Instant::now() + timeout;
     let mut seen = Vec::new();
     loop {
@@ -1451,33 +1930,77 @@ fn a_block_announced_by_headers_is_fetched_as_a_cmpctblock() {
     let (node, wallet) = started_node(101);
     let dest = DeterministicWallet::from_secret([0x69; 32]);
     let (tx_hex, _) = common::build_signed_p2wpkh_spend_from_block1_coinbase(
-        &node, &wallet, dest.address.script_pubkey(), 1_000,
+        &node,
+        &wallet,
+        dest.address.script_pubkey(),
+        1_000,
     );
     let tx: Transaction = deserialize(&hex::decode(&tx_hex).unwrap()).unwrap();
 
     let mut peer = RawPeer::connect(node.p2p_port.unwrap());
-    poll_until(|| peer_count(&node) == 1, test_timeout(20), "peer must connect");
-    assert_eq!(node.rpc_ok("getpeerinfo", vec![])[0]["bip152_hb_to"], json!(false), "a low-bandwidth peer");
+    poll_until(
+        || peer_count(&node) == 1,
+        test_timeout(20),
+        "peer must connect",
+    );
+    assert_eq!(
+        node.rpc_ok("getpeerinfo", vec![])[0]["bip152_hb_to"],
+        json!(false),
+        "a low-bandwidth peer"
+    );
 
     let tip = block_at(&node, &best_hash(&node));
     let b = build_block(&tip, height(&node) + 1, vec![tx.clone()], true, 71);
     let hash = b.block_hash();
     peer.send(NetworkMessage::Headers(vec![b.header]));
-    let mut seen = collect_until(&mut peer, is_block_request_for(hash), test_timeout(20), "a request for the block");
-    assert_eq!(block_requests(&seen, hash), vec![true], "the block must be asked for as a cmpctblock");
+    let mut seen = collect_until(
+        &mut peer,
+        is_block_request_for(hash),
+        test_timeout(20),
+        "a request for the block",
+    );
+    assert_eq!(
+        block_requests(&seen, hash),
+        vec![true],
+        "the block must be asked for as a cmpctblock"
+    );
 
-    peer.send(cmpct(HeaderAndShortIds::from_block(&b, 71, 2, &[]).unwrap()));
-    let asked = collect_until(&mut peer, is_getblocktxn_for(hash), test_timeout(20), "a getblocktxn");
-    let Some(NetworkMessage::GetBlockTxn(g)) = asked.last() else { unreachable!() };
-    assert_eq!(g.txs_request.indexes, vec![1], "only the transaction the node lacks");
+    peer.send(cmpct(
+        HeaderAndShortIds::from_block(&b, 71, 2, &[]).unwrap(),
+    ));
+    let asked = collect_until(
+        &mut peer,
+        is_getblocktxn_for(hash),
+        test_timeout(20),
+        "a getblocktxn",
+    );
+    let Some(NetworkMessage::GetBlockTxn(g)) = asked.last() else {
+        unreachable!()
+    };
+    assert_eq!(
+        g.txs_request.indexes,
+        vec![1],
+        "only the transaction the node lacks"
+    );
     seen.extend(asked.iter().cloned());
 
     peer.send(NetworkMessage::BlockTxn(BlockTxn {
-        transactions: BlockTransactions { block_hash: hash, transactions: vec![tx] },
+        transactions: BlockTransactions {
+            block_hash: hash,
+            transactions: vec![tx],
+        },
     }));
-    poll_until(|| best_hash(&node) == hash, test_timeout(20), "the rebuilt block must connect");
+    poll_until(
+        || best_hash(&node) == hash,
+        test_timeout(20),
+        "the rebuilt block must connect",
+    );
     seen.extend(peer.collect_for(Duration::from_secs(1)));
-    assert_eq!(block_requests(&seen, hash), vec![true], "never fetched in full");
+    assert_eq!(
+        block_requests(&seen, hash),
+        vec![true],
+        "never fetched in full"
+    );
     assert_eq!(banned_count(&node), 0);
 }
 
@@ -1491,34 +2014,66 @@ fn a_fetched_cmpctblock_that_fails_reconstruction_falls_back_to_the_full_block()
     let (node, wallet) = started_node(101);
     let dest = DeterministicWallet::from_secret([0x6a; 32]);
     let (t_hex, _) = common::build_signed_p2wpkh_spend_from_block1_coinbase(
-        &node, &wallet, dest.address.script_pubkey(), 1_000,
+        &node,
+        &wallet,
+        dest.address.script_pubkey(),
+        1_000,
     );
     let (t2_hex, _) = common::build_signed_p2wpkh_spend_from_block1_coinbase(
-        &node, &wallet, dest.address.script_pubkey(), 2_000,
+        &node,
+        &wallet,
+        dest.address.script_pubkey(),
+        2_000,
     );
     let t: Transaction = deserialize(&hex::decode(&t_hex).unwrap()).unwrap();
     let t2: Transaction = deserialize(&hex::decode(&t2_hex).unwrap()).unwrap();
     node.rpc_ok("sendrawtransaction", vec![json!(t_hex)]);
 
     let mut peer = RawPeer::connect(node.p2p_port.unwrap());
-    poll_until(|| peer_count(&node) == 1, test_timeout(20), "peer must connect");
+    poll_until(
+        || peer_count(&node) == 1,
+        test_timeout(20),
+        "peer must connect",
+    );
 
     let tip = block_at(&node, &best_hash(&node));
     let b = build_block(&tip, height(&node) + 1, vec![t2], true, 72);
     let hash = b.block_hash();
     peer.send(NetworkMessage::Headers(vec![b.header]));
-    let seen = collect_until(&mut peer, is_block_request_for(hash), test_timeout(20), "a request for the block");
-    assert_eq!(block_requests(&seen, hash), vec![true], "the block must be asked for as a cmpctblock");
+    let seen = collect_until(
+        &mut peer,
+        is_block_request_for(hash),
+        test_timeout(20),
+        "a request for the block",
+    );
+    assert_eq!(
+        block_requests(&seen, hash),
+        vec![true],
+        "the block must be asked for as a cmpctblock"
+    );
 
     let mut compact = HeaderAndShortIds::from_block(&b, 0x4321, 2, &[]).unwrap();
     let keys = ShortId::calculate_siphash_keys(&compact.header, compact.nonce);
-    compact.short_ids[0] = ShortId::with_siphash_keys(&node::validation::decode::wtxid(&t).to_raw_hash(), keys);
+    compact.short_ids[0] =
+        ShortId::with_siphash_keys(&node::validation::decode::wtxid(&t).to_raw_hash(), keys);
     peer.send(cmpct(compact));
 
-    let fallback = collect_until(&mut peer, is_getdata_for(hash), test_timeout(20), "a full getdata");
-    assert!(!fallback.iter().any(is_getblocktxn_for(hash)), "a complete but wrong block needs no getblocktxn");
+    let fallback = collect_until(
+        &mut peer,
+        is_getdata_for(hash),
+        test_timeout(20),
+        "a full getdata",
+    );
+    assert!(
+        !fallback.iter().any(is_getblocktxn_for(hash)),
+        "a complete but wrong block needs no getblocktxn"
+    );
     peer.send(NetworkMessage::Block(b));
-    poll_until(|| best_hash(&node) == hash, test_timeout(20), "the full block must connect");
+    poll_until(
+        || best_hash(&node) == hash,
+        test_timeout(20),
+        "the full block must connect",
+    );
     assert!(!peer.is_closed(), "a collision is not misbehaviour");
     assert_eq!(banned_count(&node), 0);
 }
@@ -1530,19 +2085,37 @@ fn a_fetched_cmpctblock_that_fails_reconstruction_falls_back_to_the_full_block()
 fn an_unanswered_compact_request_is_followed_by_a_full_fetch() {
     let (node, _) = started_node(1);
     let mut peer = RawPeer::connect(node.p2p_port.unwrap());
-    poll_until(|| peer_count(&node) == 1, test_timeout(20), "peer must connect");
+    poll_until(
+        || peer_count(&node) == 1,
+        test_timeout(20),
+        "peer must connect",
+    );
 
     let tip = block_at(&node, &best_hash(&node));
     let b = build_block(&tip, height(&node) + 1, vec![], true, 73);
     let hash = b.block_hash();
     peer.send(NetworkMessage::Headers(vec![b.header]));
-    let seen = collect_until(&mut peer, is_block_request_for(hash), test_timeout(20), "a request for the block");
+    let seen = collect_until(
+        &mut peer,
+        is_block_request_for(hash),
+        test_timeout(20),
+        "a request for the block",
+    );
     assert_eq!(block_requests(&seen, hash), vec![true]);
 
     // Say nothing. The full request must follow.
-    collect_until(&mut peer, is_getdata_for(hash), test_timeout(30), "a full getdata after the compact one");
+    collect_until(
+        &mut peer,
+        is_getdata_for(hash),
+        test_timeout(30),
+        "a full getdata after the compact one",
+    );
     peer.send(NetworkMessage::Block(b));
-    poll_until(|| best_hash(&node) == hash, test_timeout(20), "the block must connect");
+    poll_until(
+        || best_hash(&node) == hash,
+        test_timeout(20),
+        "the block must connect",
+    );
 }
 
 /// Core asks for a `cmpctblock` only when the announcement leaves exactly one
@@ -1552,20 +2125,33 @@ fn an_unanswered_compact_request_is_followed_by_a_full_fetch() {
 fn an_announcement_leaving_two_blocks_to_fetch_is_fetched_in_full() {
     let (node, _) = started_node(1);
     let mut peer = RawPeer::connect(node.p2p_port.unwrap());
-    poll_until(|| peer_count(&node) == 1, test_timeout(20), "peer must connect");
+    poll_until(
+        || peer_count(&node) == 1,
+        test_timeout(20),
+        "peer must connect",
+    );
 
     let tip = block_at(&node, &best_hash(&node));
     let b2 = build_block(&tip, height(&node) + 1, vec![], true, 74);
     let b3 = build_block(&b2, height(&node) + 2, vec![], true, 75);
     peer.send(NetworkMessage::Headers(vec![b2.header, b3.header]));
-    let mut seen = collect_until(&mut peer, is_getdata_for(b3.block_hash()), test_timeout(20), "a request for both");
+    let mut seen = collect_until(
+        &mut peer,
+        is_getdata_for(b3.block_hash()),
+        test_timeout(20),
+        "a request for both",
+    );
     seen.extend(peer.collect_for(Duration::from_secs(1)));
     assert_eq!(block_requests(&seen, b2.block_hash()), vec![false]);
     assert_eq!(block_requests(&seen, b3.block_hash()), vec![false]);
 
     peer.send(NetworkMessage::Block(b2));
     peer.send(NetworkMessage::Block(b3.clone()));
-    poll_until(|| best_hash(&node) == b3.block_hash(), test_timeout(20), "both must connect");
+    poll_until(
+        || best_hash(&node) == b3.block_hash(),
+        test_timeout(20),
+        "both must connect",
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1573,11 +2159,17 @@ fn an_announcement_leaving_two_blocks_to_fetch_is_fetched_in_full() {
 // ---------------------------------------------------------------------------
 
 fn sendheaders_count(msgs: &[NetworkMessage]) -> usize {
-    msgs.iter().filter(|m| matches!(m, NetworkMessage::SendHeaders)).count()
+    msgs.iter()
+        .filter(|m| matches!(m, NetworkMessage::SendHeaders))
+        .count()
 }
 
 fn hash_at(node: &TestNode, h: u32) -> BlockHash {
-    node.rpc_ok("getblockhash", vec![json!(h)]).as_str().unwrap().parse().unwrap()
+    node.rpc_ok("getblockhash", vec![json!(h)])
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap()
 }
 
 /// The connection opens with a `getheaders` whose locator starts one below
@@ -1590,7 +2182,9 @@ fn initial_getheaders(node: &TestNode, peer: &mut RawPeer) -> Vec<NetworkMessage
         test_timeout(20),
         "the connection's getheaders",
     );
-    let Some(NetworkMessage::GetHeaders(g)) = seen.last() else { unreachable!() };
+    let Some(NetworkMessage::GetHeaders(g)) = seen.last() else {
+        unreachable!()
+    };
     assert_eq!(
         g.locator_hashes.first(),
         Some(&hash_at(node, height(node) - 1)),
@@ -1610,12 +2204,21 @@ fn an_inbound_peer_is_sent_sendheaders_once_it_shows_a_block() {
     let mut before = peer.early.clone();
     before.extend(initial_getheaders(&node, &mut peer));
     before.extend(peer.collect_for(Duration::from_secs(1)));
-    assert_eq!(sendheaders_count(&before), 0, "not before the peer has shown a block: {before:?}");
+    assert_eq!(
+        sendheaders_count(&before),
+        0,
+        "not before the peer has shown a block: {before:?}"
+    );
 
     // The answer to that getheaders: the tip's header.
     let tip = block_at(&node, &best_hash(&node));
     peer.send(NetworkMessage::Headers(vec![tip.header]));
-    let got = collect_until(&mut peer, |m| matches!(m, NetworkMessage::SendHeaders), test_timeout(20), "sendheaders");
+    let got = collect_until(
+        &mut peer,
+        |m| matches!(m, NetworkMessage::SendHeaders),
+        test_timeout(20),
+        "sendheaders",
+    );
     assert_eq!(sendheaders_count(&got), 1);
 
     // More blocks shown, by header and by a new block: no second one.
@@ -1623,9 +2226,17 @@ fn an_inbound_peer_is_sent_sendheaders_once_it_shows_a_block() {
     let b = build_block(&tip, height(&node) + 1, vec![], true, 76);
     peer.send(NetworkMessage::Headers(vec![b.header]));
     peer.send(NetworkMessage::Block(b.clone()));
-    poll_until(|| best_hash(&node) == b.block_hash(), test_timeout(20), "the block must connect");
+    poll_until(
+        || best_hash(&node) == b.block_hash(),
+        test_timeout(20),
+        "the block must connect",
+    );
     let after = peer.collect_for(Duration::from_secs(2));
-    assert_eq!(sendheaders_count(&after), 0, "sendheaders goes out once per connection: {after:?}");
+    assert_eq!(
+        sendheaders_count(&after),
+        0,
+        "sendheaders goes out once per connection: {after:?}"
+    );
 }
 
 /// An outbound peer is still sent `sendheaders` as the connection comes up,
@@ -1640,7 +2251,11 @@ fn an_outbound_peer_is_sent_sendheaders_in_the_handshake_and_only_then() {
     let out = node
         .rpc_call_with_params(
             "addconnection",
-            vec![json!(listener.local_addr().unwrap().to_string()), json!("outbound-full-relay"), json!(false)],
+            vec![
+                json!(listener.local_addr().unwrap().to_string()),
+                json!("outbound-full-relay"),
+                json!(false),
+            ],
         )
         .unwrap();
     assert!(out["error"].is_null(), "addconnection: {out}");
@@ -1648,16 +2263,28 @@ fn an_outbound_peer_is_sent_sendheaders_in_the_handshake_and_only_then() {
     let mut before = peer.early.clone();
     before.extend(initial_getheaders(&node, &mut peer));
     before.extend(peer.collect_for(Duration::from_secs(1)));
-    assert_eq!(sendheaders_count(&before), 1, "sent once as the connection comes up: {before:?}");
+    assert_eq!(
+        sendheaders_count(&before),
+        1,
+        "sent once as the connection comes up: {before:?}"
+    );
 
     let tip = block_at(&node, &best_hash(&node));
     peer.send(NetworkMessage::Headers(vec![tip.header]));
     let b = build_block(&tip, height(&node) + 1, vec![], true, 77);
     peer.send(NetworkMessage::Headers(vec![b.header]));
     peer.send(NetworkMessage::Block(b.clone()));
-    poll_until(|| best_hash(&node) == b.block_hash(), test_timeout(20), "the block must connect");
+    poll_until(
+        || best_hash(&node) == b.block_hash(),
+        test_timeout(20),
+        "the block must connect",
+    );
     let after = peer.collect_for(Duration::from_secs(2));
-    assert_eq!(sendheaders_count(&after), 0, "once per connection: {after:?}");
+    assert_eq!(
+        sendheaders_count(&after),
+        0,
+        "once per connection: {after:?}"
+    );
 }
 
 /// Under `-blocksonly` every `cmpctblock` is ignored, as Core v32 does
@@ -1668,10 +2295,17 @@ fn an_outbound_peer_is_sent_sendheaders_in_the_handshake_and_only_then() {
 fn a_blocksonly_node_ignores_a_requested_cmpctblock() {
     let node = TestNode::start(&["--blocksonly"]);
     let wallet = DeterministicWallet::from_secret([0x5e; 32]);
-    node.rpc_ok("generatetoaddress", vec![json!(1), json!(wallet.address.to_string())]);
+    node.rpc_ok(
+        "generatetoaddress",
+        vec![json!(1), json!(wallet.address.to_string())],
+    );
     let port = node.p2p_port.unwrap();
     let mut peer = RawPeer::connect(port);
-    poll_until(|| peer_count(&node) == 1, test_timeout(20), "peer must connect");
+    poll_until(
+        || peer_count(&node) == 1,
+        test_timeout(20),
+        "peer must connect",
+    );
 
     let tip = block_at(&node, &best_hash(&node));
     let b = build_block(&tip, 2, vec![], true, 61_000);
@@ -1681,9 +2315,17 @@ fn a_blocksonly_node_ignores_a_requested_cmpctblock() {
     let compact = HeaderAndShortIds::from_block(&b, 7, 2, &[]).unwrap();
     peer.send(cmpct(compact));
     std::thread::sleep(Duration::from_secs(2));
-    assert_ne!(best_hash(&node), b.block_hash(), "the compact block must be ignored");
+    assert_ne!(
+        best_hash(&node),
+        b.block_hash(),
+        "the compact block must be ignored"
+    );
     peer.send(NetworkMessage::Block(b.clone()));
-    poll_until(|| best_hash(&node) == b.block_hash(), test_timeout(20), "the full block connects");
+    poll_until(
+        || best_hash(&node) == b.block_hash(),
+        test_timeout(20),
+        "the full block connects",
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1691,7 +2333,12 @@ fn a_blocksonly_node_ignores_a_requested_cmpctblock() {
 // ---------------------------------------------------------------------------
 
 fn block_at_height(node: &TestNode, h: u32) -> Block {
-    let hash: BlockHash = node.rpc_ok("getblockhash", vec![json!(h)]).as_str().unwrap().parse().unwrap();
+    let hash: BlockHash = node
+        .rpc_ok("getblockhash", vec![json!(h)])
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
     block_at(node, &hash)
 }
 
@@ -1720,7 +2367,11 @@ fn chain_tip_status(node: &TestNode, hash: &BlockHash) -> Option<String> {
 fn unrequested_low_work_blocks_are_not_written() {
     let (node, _) = started_node(300);
     let peer = RawPeer::connect(node.p2p_port.unwrap());
-    poll_until(|| peer_count(&node) == 1, test_timeout(20), "peer must connect");
+    poll_until(
+        || peer_count(&node) == 1,
+        test_timeout(20),
+        "peer must connect",
+    );
 
     let deep = build_block(&block_at_height(&node, 100), 101, vec![], true, 7_001);
     peer.send(NetworkMessage::Block(deep.clone()));
@@ -1731,11 +2382,21 @@ fn unrequested_low_work_blocks_are_not_written() {
     let tip = block_at(&node, &best_hash(&node));
     let next = build_block(&tip, 301, vec![], true, 7_003);
     peer.send(NetworkMessage::Block(next.clone()));
-    poll_until(|| best_hash(&node) == next.block_hash(), test_timeout(20), "the next block must connect");
+    poll_until(
+        || best_hash(&node) == next.block_hash(),
+        test_timeout(20),
+        "the next block must connect",
+    );
 
-    assert!(!has_header(&node, &deep.block_hash()), "the deep low-work block left a header");
+    assert!(
+        !has_header(&node, &deep.block_hash()),
+        "the deep low-work block left a header"
+    );
     assert_eq!(chain_tip_status(&node, &deep.block_hash()), None);
-    assert!(has_header(&node, &near.block_hash()), "the near fork's header is indexed, as in Core");
+    assert!(
+        has_header(&node, &near.block_hash()),
+        "the near fork's header is indexed, as in Core"
+    );
     assert_eq!(
         chain_tip_status(&node, &near.block_hash()).as_deref(),
         Some("headers-only"),
@@ -1753,15 +2414,30 @@ fn unrequested_low_work_blocks_are_not_written() {
 fn a_low_work_cmpctblock_is_ignored() {
     let (node, _) = started_node(300);
     let mut peer = RawPeer::connect(node.p2p_port.unwrap());
-    poll_until(|| peer_count(&node) == 1, test_timeout(20), "peer must connect");
+    poll_until(
+        || peer_count(&node) == 1,
+        test_timeout(20),
+        "peer must connect",
+    );
     promote(&node, &mut peer);
 
     let deep = build_block(&block_at_height(&node, 100), 101, vec![], true, 7_101);
-    peer.send(cmpct(HeaderAndShortIds::from_block(&deep, 1, 2, &[]).unwrap()));
+    peer.send(cmpct(
+        HeaderAndShortIds::from_block(&deep, 1, 2, &[]).unwrap(),
+    ));
     let tip = block_at(&node, &best_hash(&node));
     let next = build_block(&tip, height(&node) + 1, vec![], true, 7_102);
-    peer.send(cmpct(HeaderAndShortIds::from_block(&next, 2, 2, &[]).unwrap()));
-    poll_until(|| best_hash(&node) == next.block_hash(), test_timeout(20), "the next cmpctblock must connect");
+    peer.send(cmpct(
+        HeaderAndShortIds::from_block(&next, 2, 2, &[]).unwrap(),
+    ));
+    poll_until(
+        || best_hash(&node) == next.block_hash(),
+        test_timeout(20),
+        "the next cmpctblock must connect",
+    );
 
-    assert!(!has_header(&node, &deep.block_hash()), "the low-work cmpctblock's header was indexed");
+    assert!(
+        !has_header(&node, &deep.block_hash()),
+        "the low-work cmpctblock's header was indexed"
+    );
 }

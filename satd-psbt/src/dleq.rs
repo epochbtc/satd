@@ -142,8 +142,12 @@ pub fn generate_proof_with_generator(
 ) -> Result<[u8; 64], DleqError> {
     let secp = secp();
     let a_scalar = Scalar::from_be_bytes(a.secret_bytes()).map_err(|_| DleqError::BadSecret)?;
-    let big_a = g.mul_tweak(secp, &a_scalar).map_err(|_| DleqError::BadSecret)?;
-    let big_c = b.mul_tweak(secp, &a_scalar).map_err(|_| DleqError::BadSecret)?;
+    let big_a = g
+        .mul_tweak(secp, &a_scalar)
+        .map_err(|_| DleqError::BadSecret)?;
+    let big_c = b
+        .mul_tweak(secp, &a_scalar)
+        .map_err(|_| DleqError::BadSecret)?;
 
     // t = bytes(32, a) XOR hash_BIP0374/aux(r), so that a proof built with
     // all-zero auxiliary randomness still differs between messages.
@@ -168,8 +172,12 @@ pub fn generate_proof_with_generator(
     }
     let k_secret = SecretKey::from_slice(&k).map_err(|_| DleqError::ZeroNonce)?;
     let k_scalar = Scalar::from_be_bytes(k).map_err(|_| DleqError::ZeroNonce)?;
-    let r1 = g.mul_tweak(secp, &k_scalar).map_err(|_| DleqError::ZeroNonce)?;
-    let r2 = b.mul_tweak(secp, &k_scalar).map_err(|_| DleqError::ZeroNonce)?;
+    let r1 = g
+        .mul_tweak(secp, &k_scalar)
+        .map_err(|_| DleqError::ZeroNonce)?;
+    let r2 = b
+        .mul_tweak(secp, &k_scalar)
+        .map_err(|_| DleqError::ZeroNonce)?;
 
     let e = challenge(&big_a, b, &big_c, g, &r1, &r2, message);
 

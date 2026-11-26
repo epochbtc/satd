@@ -25,7 +25,7 @@
 //! per-phase deltas since the previous heartbeat tell us how far the
 //! current iteration progressed before getting stuck.
 
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Distinct phases of the IBD connect path. Ordered roughly by the

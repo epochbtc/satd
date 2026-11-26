@@ -173,7 +173,8 @@ mod tests {
         assert!(!p.has(Capability::RpcWrite));
 
         assert_eq!(
-            v.resolve(Credential::Bearer { token: "wrong" }).unwrap_err(),
+            v.resolve(Credential::Bearer { token: "wrong" })
+                .unwrap_err(),
             AuthError::Unauthenticated
         );
     }
@@ -193,9 +194,8 @@ mod tests {
         // Build a store whose single token expires at t=1000.
         let dir = tempfile::tempdir().unwrap();
         let h = format!("sha256:{}", hex::encode(Sha256::digest(b"tok")));
-        let toml = format!(
-            "version=1\n[[token]]\nid=\"x\"\nhash=\"{h}\"\nexpires=1970-01-01T00:16:40Z\n"
-        );
+        let toml =
+            format!("version=1\n[[token]]\nid=\"x\"\nhash=\"{h}\"\nexpires=1970-01-01T00:16:40Z\n");
         let p = dir.path().join("auth.toml");
         let mut f = std::fs::File::create(&p).unwrap();
         f.write_all(toml.as_bytes()).unwrap();
@@ -211,7 +211,9 @@ mod tests {
         assert!(before.resolve(Credential::Bearer { token: "tok" }).is_ok());
         let after = Verifier::with_clock(OperatorCreds::default(), Some(store), || 1000);
         assert_eq!(
-            after.resolve(Credential::Bearer { token: "tok" }).unwrap_err(),
+            after
+                .resolve(Credential::Bearer { token: "tok" })
+                .unwrap_err(),
             AuthError::Unauthenticated
         );
     }
@@ -222,17 +224,39 @@ mod tests {
             OperatorCreds::from_user_pass("alice".into(), "secret".into()),
             None,
         );
-        assert!(v.resolve(Credential::Basic { user: "alice", pass: "secret" }).is_ok());
-        v.reload_operator(OperatorCreds::from_user_pass("bob".into(), "newpass".into()));
-        assert!(v.resolve(Credential::Basic { user: "alice", pass: "secret" }).is_err());
-        assert!(v.resolve(Credential::Basic { user: "bob", pass: "newpass" }).is_ok());
+        assert!(
+            v.resolve(Credential::Basic {
+                user: "alice",
+                pass: "secret"
+            })
+            .is_ok()
+        );
+        v.reload_operator(OperatorCreds::from_user_pass(
+            "bob".into(),
+            "newpass".into(),
+        ));
+        assert!(
+            v.resolve(Credential::Basic {
+                user: "alice",
+                pass: "secret"
+            })
+            .is_err()
+        );
+        assert!(
+            v.resolve(Credential::Basic {
+                user: "bob",
+                pass: "newpass"
+            })
+            .is_ok()
+        );
     }
 
     #[test]
     fn client_cert_unsupported_for_now() {
         let v = Verifier::new(OperatorCreds::default(), None);
         assert_eq!(
-            v.resolve(Credential::ClientCert { subject: "cn=x" }).unwrap_err(),
+            v.resolve(Credential::ClientCert { subject: "cn=x" })
+                .unwrap_err(),
             AuthError::Unsupported
         );
     }

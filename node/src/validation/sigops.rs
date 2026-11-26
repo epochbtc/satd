@@ -123,7 +123,11 @@ fn get_op<'a>(script: &'a [u8], pc: &mut usize) -> Option<(u8, &'a [u8])> {
 /// Core's `CScript::DecodeOP_N`, for `OP_0` and `OP_1`..`OP_16`.
 fn decode_op_n(opcode: u8) -> u8 {
     debug_assert!(opcode == OP_0 || (OP_1..=OP_16).contains(&opcode));
-    if opcode == OP_0 { 0 } else { opcode - (OP_1 - 1) }
+    if opcode == OP_0 {
+        0
+    } else {
+        opcode - (OP_1 - 1)
+    }
 }
 
 /// Core's `CScript::IsPayToScriptHash`.
@@ -269,8 +273,16 @@ pub fn witness_sigop_count(
 /// Core's `GetLegacySigOpCount`: the inaccurate count of every scriptSig and
 /// every output script of `tx`.
 pub fn legacy_sigop_count(tx: &Transaction) -> u64 {
-    let inputs: u64 = tx.input.iter().map(|i| script_sigop_count(&i.script_sig, false)).sum();
-    let outputs: u64 = tx.output.iter().map(|o| script_sigop_count(&o.script_pubkey, false)).sum();
+    let inputs: u64 = tx
+        .input
+        .iter()
+        .map(|i| script_sigop_count(&i.script_sig, false))
+        .sum();
+    let outputs: u64 = tx
+        .output
+        .iter()
+        .map(|o| script_sigop_count(&o.script_pubkey, false))
+        .sum();
     inputs + outputs
 }
 
@@ -316,7 +328,12 @@ pub fn transaction_sigop_cost(tx: &Transaction, prevouts: &[TxOut], flags: SigOp
         cost += transaction_p2sh_sigop_count(tx, prevouts) * WITNESS_SCALE_FACTOR;
     }
     for (input, prevout) in tx.input.iter().zip(prevouts) {
-        cost += witness_sigop_count(&input.script_sig, &prevout.script_pubkey, &input.witness, flags);
+        cost += witness_sigop_count(
+            &input.script_sig,
+            &prevout.script_pubkey,
+            &input.witness,
+            flags,
+        );
     }
     cost
 }

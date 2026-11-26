@@ -157,6 +157,10 @@ pub fn extend_tip(chain: &ChainState, salt: u32) -> BlockHash {
     let (tip, height) = chain.tip_snapshot();
     let block = regtest_block(tip, height + 1, salt);
     chain.accept_block(&block).expect("connect test block");
-    assert_eq!(chain.tip_snapshot().0, block.block_hash(), "the block became the tip");
+    assert_eq!(
+        chain.tip_snapshot().0,
+        block.block_hash(),
+        "the block became the tip"
+    );
     block.block_hash()
 }

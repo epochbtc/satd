@@ -10,7 +10,11 @@ fn block_of(size: usize) -> NetworkMessage {
 /// The count is the message's v1 wire size, exactly.
 #[test]
 fn queued_size_is_the_v1_wire_size() {
-    for msg in [NetworkMessage::Verack, NetworkMessage::Ping(9), block_of(123_456)] {
+    for msg in [
+        NetworkMessage::Verack,
+        NetworkMessage::Ping(9),
+        block_of(123_456),
+    ] {
         let wire = bitcoin::consensus::serialize(&bitcoin::p2p::message::RawNetworkMessage::new(
             bitcoin::p2p::Magic::REGTEST,
             msg.clone(),
@@ -67,12 +71,17 @@ fn reading_pauses_for_an_unserved_getdata() {
     assert!(!q.reading_paused());
     q.note_getdata_forwarded();
     assert!(q.reading_paused(), "forwarded, not yet taken in");
-    q.push_getdata(vec![Inventory::Block(bitcoin::BlockHash::from_byte_array([1; 32]))]);
+    q.push_getdata(vec![Inventory::Block(bitcoin::BlockHash::from_byte_array(
+        [1; 32],
+    ))]);
     q.note_getdata_handled();
     assert!(q.reading_paused(), "taken in, one entry unserved");
     assert_eq!(q.getdata_backlog(), 1);
     assert!(q.front_getdata().is_some());
-    assert!(q.reading_paused(), "still unserved while it is being worked on");
+    assert!(
+        q.reading_paused(),
+        "still unserved while it is being worked on"
+    );
     q.pop_getdata();
     assert!(!q.reading_paused());
 
@@ -87,7 +96,9 @@ fn reading_pauses_for_an_unserved_getdata() {
 fn a_resume_is_requested_once_until_taken() {
     let q = SendQueue::new();
     assert!(!q.take_resume(), "nothing to resume");
-    q.push_getdata(vec![Inventory::Block(bitcoin::BlockHash::from_byte_array([1; 32]))]);
+    q.push_getdata(vec![Inventory::Block(bitcoin::BlockHash::from_byte_array(
+        [1; 32],
+    ))]);
     q.add(MAX_SEND_BUFFER_BYTES + 1);
     assert!(!q.take_resume(), "no room yet");
     q.sent(MAX_SEND_BUFFER_BYTES + 1);

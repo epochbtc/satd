@@ -30,10 +30,11 @@ fn make_test_ctx() -> (McpContext, tempfile::TempDir) {
             Box::new(NoopVerifier),
             AssumeValid::Disabled,
             450,
-        4,
-        Default::default(),
-        Default::default(),
-            Default::default(),)
+            4,
+            Default::default(),
+            Default::default(),
+            Default::default(),
+        )
         .unwrap(),
     );
     let mempool = Arc::new(Mempool::new(1_000_000, 0));
@@ -331,13 +332,11 @@ mod mempool {
         let (ctx, _dir) = make_test_ctx();
 
         // getpolicyinfo reports unloaded.
-        let info: serde_json::Value =
-            serde_json::from_str(&pol::get_policy_info(&ctx)).unwrap();
+        let info: serde_json::Value = serde_json::from_str(&pol::get_policy_info(&ctx)).unwrap();
         assert_eq!(info["loaded"], serde_json::json!(false));
 
         // getquarantineinfo + listquarantine return empty, never error.
-        let q: serde_json::Value =
-            serde_json::from_str(&pol::get_quarantine_info(&ctx)).unwrap();
+        let q: serde_json::Value = serde_json::from_str(&pol::get_quarantine_info(&ctx)).unwrap();
         assert_eq!(q["count"], serde_json::json!(0));
         let list: serde_json::Value =
             serde_json::from_str(&pol::list_quarantine(&ctx, None, 0, 0)).unwrap();
@@ -578,7 +577,12 @@ mod construction {
             .as_array()
             .expect("an array")
             .iter()
-            .find(|v| v["description"].as_str().unwrap_or_default().starts_with(prefix))
+            .find(|v| {
+                v["description"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .starts_with(prefix)
+            })
             .unwrap_or_else(|| panic!("no vector starting {prefix:?}"))["psbt"]
             .as_str()
             .expect("base64")
@@ -664,7 +668,10 @@ mod construction {
         ))
         .unwrap();
         assert!(
-            joined["error"].as_str().unwrap_or_default().contains("computed"),
+            joined["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("computed"),
             "{joined}"
         );
     }
@@ -679,8 +686,12 @@ mod construction {
         let (ctx, _dir) = make_test_ctx();
         let secp = Secp256k1::new();
         let address = SpAddress::new(
-            SecretKey::from_slice(&[0x51u8; 32]).unwrap().public_key(&secp),
-            SecretKey::from_slice(&[0x52u8; 32]).unwrap().public_key(&secp),
+            SecretKey::from_slice(&[0x51u8; 32])
+                .unwrap()
+                .public_key(&secp),
+            SecretKey::from_slice(&[0x52u8; 32])
+                .unwrap()
+                .public_key(&secp),
         );
         let sp1 = address.encode(ctx.network);
         let inputs = serde_json::json!([{
@@ -751,7 +762,12 @@ mod construction {
         let (ctx, _dir) = make_test_ctx();
         let result = cst::psbt_workflow(&ctx, "foobar", &serde_json::json!({}));
         let json: serde_json::Value = serde_json::from_str(&result).unwrap();
-        assert!(json["error"].as_str().unwrap().contains("Unknown PSBT action"));
+        assert!(
+            json["error"]
+                .as_str()
+                .unwrap()
+                .contains("Unknown PSBT action")
+        );
     }
 }
 
@@ -798,17 +814,23 @@ mod mining {
                 Box::new(NoopVerifier),
                 AssumeValid::Disabled,
                 450,
-            4,
-            Default::default(),
-            Default::default(),
-            Default::default(),)
+                4,
+                Default::default(),
+                Default::default(),
+                Default::default(),
+            )
             .unwrap(),
         );
         let mempool = Arc::new(Mempool::new(1_000_000, 0));
         let fee_estimator = Arc::new(FeeEstimator::new());
         let (_tx, rx) = tokio::sync::watch::channel(false);
-        let peer_manager =
-            PeerManager::new(chain_state.clone(), mempool.clone(), fee_estimator.clone(), Network::Bitcoin, rx);
+        let peer_manager = PeerManager::new(
+            chain_state.clone(),
+            mempool.clone(),
+            fee_estimator.clone(),
+            Network::Bitcoin,
+            rx,
+        );
 
         let ctx = McpContext {
             chain_state,
@@ -1160,9 +1182,8 @@ mod ergonomics {
     #[test]
     fn test_get_mempool_entries_bulk_missing_is_null() {
         let (ctx, _dir) = make_test_ctx();
-        let fake = vec![
-            "0000000000000000000000000000000000000000000000000000000000000001".to_string(),
-        ];
+        let fake =
+            vec!["0000000000000000000000000000000000000000000000000000000000000001".to_string()];
         let out = mempool::get_mempool_entries_bulk(&ctx, &fake);
         let json: serde_json::Value = serde_json::from_str(&out).unwrap();
         let obj = json.as_object().unwrap();

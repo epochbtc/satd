@@ -20,8 +20,17 @@ fn hash(height: u32, salt: u8) -> BlockHash {
 
 impl FakeChain {
     fn new(hurdles: &[u64]) -> Self {
-        let blocks = hurdles.iter().enumerate().map(|(h, &r)| (hash(h as u32, 0), Some(r))).collect();
-        Self { blocks, missing_below: 0, ibd: false, broken_parent: None }
+        let blocks = hurdles
+            .iter()
+            .enumerate()
+            .map(|(h, &r)| (hash(h as u32, 0), Some(r)))
+            .collect();
+        Self {
+            blocks,
+            missing_below: 0,
+            ibd: false,
+            broken_parent: None,
+        }
     }
     fn push(&mut self, hurdle: u64, salt: u8) {
         let h = self.blocks.len() as u32;
@@ -35,7 +44,10 @@ impl FakeChain {
         }
     }
     fn height_of(&self, hash: &BlockHash) -> Option<u32> {
-        self.blocks.iter().position(|(h, _)| h == hash).map(|i| i as u32)
+        self.blocks
+            .iter()
+            .position(|(h, _)| h == hash)
+            .map(|i| i as u32)
     }
 }
 
@@ -76,7 +88,9 @@ fn sync_full(hist: &mut HurdleHistory, chain: &FakeChain) {
 /// A calm market around 1,000 sat/kvB, with a little variation so that
 /// quantiles are not all one value.
 fn calm(n: usize, seed: usize) -> Vec<u64> {
-    (0..n).map(|i| 900 + ((i * 37 + seed * 11) % 200) as u64).collect()
+    (0..n)
+        .map(|i| 900 + ((i * 37 + seed * 11) % 200) as u64)
+        .collect()
 }
 
 /// 3,200 blocks: calm, a 400-block spike at 50,000 in the middle, calm
@@ -96,7 +110,10 @@ fn a_past_spike_does_not_raise_a_calm_market_estimate() {
     let hurdles = history_with_past_spike();
     let e = estimate_from_hurdles(&hurdles, 6).unwrap();
     assert_eq!(e.source, HistorySource::Analog);
-    assert!(e.economical < 1_200, "analog estimate followed the old spike: {e:?}");
+    assert!(
+        e.economical < 1_200,
+        "analog estimate followed the old spike: {e:?}"
+    );
     // Paired: the same windows, read as a plain quantile, are steered by it.
     let mut plain = window_outcomes(&hurdles, lookback(6), 6);
     plain.sort_unstable();
@@ -114,7 +131,10 @@ fn a_spike_in_progress_raises_the_estimate() {
     }
     let e = estimate_from_hurdles(&hurdles, 6).unwrap();
     assert_eq!(e.source, HistorySource::Analog);
-    assert!(e.economical >= 40_000, "estimate did not follow the spike: {e:?}");
+    assert!(
+        e.economical >= 40_000,
+        "estimate did not follow the spike: {e:?}"
+    );
 }
 
 /// When fewer than 200 windows sit within ×1.25 of now, the 200 nearest by
@@ -136,7 +156,10 @@ fn the_200_nearest_windows_stand_in_for_a_thin_band() {
 /// The store built one block at a time equals the store rebuilt at once.
 #[test]
 fn an_incremental_update_equals_a_rebuild() {
-    let all: Vec<u64> = history_with_past_spike().into_iter().chain(calm(30, 3)).collect();
+    let all: Vec<u64> = history_with_past_spike()
+        .into_iter()
+        .chain(calm(30, 3))
+        .collect();
     let mut chain = FakeChain::new(&all[..3_200]);
     let mut inc = HurdleHistory::new();
     sync_full(&mut inc, &chain);
@@ -166,9 +189,17 @@ fn a_reorg_replaces_the_abandoned_rows() {
     assert_eq!((h, newest), (chain.tip().1, chain.tip().0));
     assert!(hist.rows.iter().all(|r| r.hash != old_tip));
     let top: Vec<Option<u64>> = hist.rows.iter().rev().take(4).map(|r| r.hurdle).collect();
-    assert_eq!(top, vec![Some(10_000), Some(9_000), Some(8_000), Some(7_000)]);
+    assert_eq!(
+        top,
+        vec![Some(10_000), Some(9_000), Some(8_000), Some(7_000)]
+    );
     // Still contiguous below the fork.
-    assert!(hist.rows.iter().zip(hist.rows.iter().skip(1)).all(|(a, b)| b.height == a.height + 1));
+    assert!(
+        hist.rows
+            .iter()
+            .zip(hist.rows.iter().skip(1))
+            .all(|(a, b)| b.height == a.height + 1)
+    );
 }
 
 /// Blocks connected while the task saw no event (an IBD catch-up, a lagged
@@ -233,9 +264,18 @@ fn the_store_keeps_its_capacity() {
 fn readiness_goes_none_then_plain_then_analog() {
     // N = 6, L = 3: windows = len − 8.
     assert_eq!(estimate_from_hurdles(&calm(8, 1), 6), None);
-    assert_eq!(estimate_from_hurdles(&calm(9, 1), 6).unwrap().source, HistorySource::Plain);
-    assert_eq!(estimate_from_hurdles(&calm(2_007, 1), 6).unwrap().source, HistorySource::Plain);
-    assert_eq!(estimate_from_hurdles(&calm(2_008, 1), 6).unwrap().source, HistorySource::Analog);
+    assert_eq!(
+        estimate_from_hurdles(&calm(9, 1), 6).unwrap().source,
+        HistorySource::Plain
+    );
+    assert_eq!(
+        estimate_from_hurdles(&calm(2_007, 1), 6).unwrap().source,
+        HistorySource::Plain
+    );
+    assert_eq!(
+        estimate_from_hurdles(&calm(2_008, 1), 6).unwrap().source,
+        HistorySource::Analog
+    );
 }
 
 /// Blocks with no hurdle are not observations: they are skipped, not
@@ -268,7 +308,10 @@ fn the_answers_are_monotone_across_targets() {
     let mut prev = (u64::MAX, u64::MAX);
     for t in 1..=MAX_TARGET {
         let Some(e) = hist.estimate(t) else { continue };
-        assert!(e.economical <= prev.0 && e.conservative <= prev.1, "target {t}: {e:?}");
+        assert!(
+            e.economical <= prev.0 && e.conservative <= prev.1,
+            "target {t}: {e:?}"
+        );
         assert!(e.conservative >= e.economical, "target {t}: {e:?}");
         prev = (e.economical, e.conservative);
     }
@@ -297,7 +340,11 @@ fn block_policy_and_auto_read_the_chain_history() {
             .unwrap()
             .feerate_sat_per_kvb
     };
-    assert_eq!(ask(FeeRateEstimator::BlockPolicy), 5_000, "no window yet: the flat percentile");
+    assert_eq!(
+        ask(FeeRateEstimator::BlockPolicy),
+        5_000,
+        "no window yet: the flat percentile"
+    );
     let chain = FakeChain::new(&[2_000; 100]);
     sync_full(&mut est.history().write(), &chain);
     assert_eq!(ask(FeeRateEstimator::BlockPolicy), 2_000);
@@ -322,7 +369,11 @@ fn a_restart_keeps_the_history() {
     chain.push(3_100, 0);
     let mut after = HurdleHistory::new();
     assert_eq!(after.load(&path, MAGIC).unwrap(), FEE_HISTORY_BLOCKS);
-    assert_eq!(after.estimate(6), before.estimate(6), "answers as soon as it loads");
+    assert_eq!(
+        after.estimate(6),
+        before.estimate(6),
+        "answers as soon as it loads"
+    );
     // Two new blocks at the top, nothing below to read: one pass, no
     // backfill.
     assert!(!after.sync(&chain, 0, 0));
@@ -371,7 +422,12 @@ fn a_file_with_a_gap_is_refused() {
     sync_full(&mut hist, &FakeChain::new(&calm(20, 1)));
     hist.rows.remove(5);
     let bytes = hist.serialize(MAGIC);
-    assert!(HurdleHistory::new().load_bytes(&bytes, MAGIC).unwrap_err().contains("consecutive"));
+    assert!(
+        HurdleHistory::new()
+            .load_bytes(&bytes, MAGIC)
+            .unwrap_err()
+            .contains("consecutive")
+    );
 }
 
 /// A reorg while the node was down: the loaded rows of the abandoned
@@ -391,7 +447,14 @@ fn a_reorg_while_down_drops_the_stale_rows() {
     sync_full(&mut rebuilt, &chain);
     assert_eq!(after.rows, rebuilt.rows);
     assert_eq!(after.newest().unwrap(), (chain.tip().1, chain.tip().0));
-    assert_eq!(after.rows.iter().filter(|r| r.hurdle == Some(9_000)).count(), 8);
+    assert_eq!(
+        after
+            .rows
+            .iter()
+            .filter(|r| r.hurdle == Some(9_000))
+            .count(),
+        8
+    );
 }
 
 /// A pruned node keeps the file's rows it could no longer read from the
@@ -429,7 +492,10 @@ fn a_file_older_than_the_span_starts_again_at_the_tip() {
     }
     let mut after = HurdleHistory::with_capacity(50);
     after.load_bytes(&bytes, MAGIC).unwrap();
-    assert!(after.sync(&chain, 0, 0), "the backfill has the rest to read");
+    assert!(
+        after.sync(&chain, 0, 0),
+        "the backfill has the rest to read"
+    );
     assert_eq!(after.len(), 1);
     sync_full(&mut after, &chain);
     assert_eq!(after.rows.front().unwrap().height, 110);
@@ -459,7 +525,9 @@ impl HurdleSource for Synced<'_> {
 /// down to genesis is held, and the live IBD check holds the store empty.
 #[test]
 fn the_chain_state_source_prices_blocks_from_undo_data() {
-    use crate::chain::state::tests::{build_test_block, build_test_block_spending, make_chain_state};
+    use crate::chain::state::tests::{
+        build_test_block, build_test_block_spending, make_chain_state,
+    };
     use bitcoin::{Network, OutPoint};
     let (cs, dir) = make_chain_state();
     let mut parent = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
@@ -467,7 +535,10 @@ fn the_chain_state_source_prices_blocks_from_undo_data() {
     for h in 1..=103u32 {
         let time = 1_300_000_000 + h * 600;
         let b = if h == 102 {
-            let spend = OutPoint { txid: blocks[0].txdata[0].compute_txid(), vout: 0 };
+            let spend = OutPoint {
+                txid: blocks[0].txdata[0].compute_txid(),
+                vout: 0,
+            };
             build_test_block_spending(parent, h, time, spend)
         } else {
             build_test_block(parent, h, time)
@@ -482,7 +553,10 @@ fn the_chain_state_source_prices_blocks_from_undo_data() {
     let rate = crate::mempool::policy::fee_rate_sat_per_kvb(fee, spend.weight().to_wu());
 
     let mut live = HurdleHistory::new();
-    assert!(!live.sync(&cs, 0, 1_000), "the old test chain counts as IBD");
+    assert!(
+        !live.sync(&cs, 0, 1_000),
+        "the old test chain counts as IBD"
+    );
     assert!(live.is_empty());
 
     let mut hist = HurdleHistory::new();
@@ -495,7 +569,12 @@ fn the_chain_state_source_prices_blocks_from_undo_data() {
     assert_eq!(hist.newest(), Some((103, blocks[102].block_hash())));
     let hurdles: Vec<(u32, Option<u64>)> = hist.rows.iter().map(|r| (r.height, r.hurdle)).collect();
     assert_eq!(hurdles[102], (102, Some(rate)));
-    assert!(hurdles.iter().filter(|(h, _)| *h != 102).all(|(_, r)| r.is_none()));
+    assert!(
+        hurdles
+            .iter()
+            .filter(|(h, _)| *h != 102)
+            .all(|(_, r)| r.is_none())
+    );
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -515,10 +594,19 @@ fn a_load_keeps_the_newest_rows_that_fit() {
 fn the_file_is_saved_every_144_blocks_and_after_a_backfill() {
     assert!(save_due(Some(244), Some(100), false, false));
     assert!(!save_due(Some(243), Some(100), false, false));
-    assert!(save_due(Some(90), Some(100), false, false), "a reorg below the saved tip");
+    assert!(
+        save_due(Some(90), Some(100), false, false),
+        "a reorg below the saved tip"
+    );
     assert!(save_due(Some(5), None, false, false), "never saved");
-    assert!(save_due(Some(101), Some(100), true, false), "a backfill just finished");
-    assert!(!save_due(Some(400), Some(100), true, true), "a backfill still runs");
+    assert!(
+        save_due(Some(101), Some(100), true, false),
+        "a backfill just finished"
+    );
+    assert!(
+        !save_due(Some(400), Some(100), true, true),
+        "a backfill still runs"
+    );
     assert!(!save_due(None, None, false, false));
 }
 
@@ -536,7 +624,12 @@ fn a_walk_that_loses_the_parent_starts_again_at_the_tip() {
     chain.broken_parent = Some(102);
     sync_full(&mut hist, &chain);
     assert_eq!(hist.newest().unwrap(), (104, chain.tip().0));
-    assert!(hist.rows.iter().zip(hist.rows.iter().skip(1)).all(|(a, b)| b.height == a.height + 1));
+    assert!(
+        hist.rows
+            .iter()
+            .zip(hist.rows.iter().skip(1))
+            .all(|(a, b)| b.height == a.height + 1)
+    );
     assert_eq!(hist.rows.front().unwrap().height, 102);
 }
 
@@ -544,10 +637,19 @@ fn a_walk_that_loses_the_parent_starts_again_at_the_tip() {
 /// and passes over targets with no answer.
 #[test]
 fn a_longer_target_is_lowered_to_the_shorter_ones_answer() {
-    let e = |economical, conservative| Some(HistoryEstimate { economical, conservative, source: HistorySource::Analog });
+    let e = |economical, conservative| {
+        Some(HistoryEstimate {
+            economical,
+            conservative,
+            source: HistorySource::Analog,
+        })
+    };
     let mut table = [e(5_000, 9_000), None, e(6_000, 8_000), e(2_000, 9_500)];
     clamp_monotone(&mut table);
-    assert_eq!(table, [e(5_000, 9_000), None, e(5_000, 8_000), e(2_000, 8_000)]);
+    assert_eq!(
+        table,
+        [e(5_000, 9_000), None, e(5_000, 8_000), e(2_000, 8_000)]
+    );
 }
 
 /// While the store has windows for short targets but not a deep one, the
@@ -556,7 +658,9 @@ fn a_longer_target_is_lowered_to_the_shorter_ones_answer() {
 /// the target, and `conservative` under the default never drops below it.
 #[test]
 fn a_flat_fallback_never_rises_above_a_shorter_analog_answer() {
-    use crate::mempool::estimate::{EstimateMode, FeeRateEstimator, estimate_smart_fee, history_rate};
+    use crate::mempool::estimate::{
+        EstimateMode, FeeRateEstimator, estimate_smart_fee, history_rate,
+    };
     let est = crate::mempool::fee::FeeEstimator::new();
     est.record_block(&[50_000; 50]); // the flat percentile says 50,000
     let chain = FakeChain::new(&[2_000; 100]); // windows for 6 blocks, none for 144
@@ -565,11 +669,17 @@ fn a_flat_fallback_never_rises_above_a_shorter_analog_answer() {
     assert_eq!(est.history_estimate(144, true), None);
     for conservative in [false, true] {
         let short = history_rate(&est, 6, conservative).unwrap();
-        assert_eq!(history_rate(&est, 144, conservative), Some(short), "flat 50,000 capped");
+        assert_eq!(
+            history_rate(&est, 144, conservative),
+            Some(short),
+            "flat 50,000 capped"
+        );
     }
     let mempool = crate::mempool::pool::Mempool::new(300_000_000, 1_000);
     let ask = |t: u32, e: FeeRateEstimator| {
-        estimate_smart_fee(&mempool, &est, t, EstimateMode::Blend, e, true).unwrap().feerate_sat_per_kvb
+        estimate_smart_fee(&mempool, &est, t, EstimateMode::Blend, e, true)
+            .unwrap()
+            .feerate_sat_per_kvb
     };
     assert!(ask(144, FeeRateEstimator::Auto) >= ask(144, FeeRateEstimator::BlockPolicy));
 }

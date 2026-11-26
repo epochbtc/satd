@@ -1684,7 +1684,11 @@ impl Config {
     /// `-addrindexmaxhistory` as the history cap the index surfaces
     /// enforce: `0` (no cap) is `usize::MAX`.
     pub fn address_history_cap(&self) -> usize {
-        if self.addrindexmaxhistory == 0 { usize::MAX } else { self.addrindexmaxhistory }
+        if self.addrindexmaxhistory == 0 {
+            usize::MAX
+        } else {
+            self.addrindexmaxhistory
+        }
     }
 
     /// Load configuration by merging CLI args → config file → defaults.
@@ -1728,19 +1732,28 @@ impl Config {
         {
             let mut past_separator = false;
             for (i, arg) in normalized.iter().enumerate() {
-                if i == 0 { continue; } // binary name
-                if arg == "--" { past_separator = true; continue; }
-                if past_separator { continue; } // after `--`, everything is positional
-                if arg.starts_with("--") || !arg.starts_with('-') { continue; }
+                if i == 0 {
+                    continue;
+                } // binary name
+                if arg == "--" {
+                    past_separator = true;
+                    continue;
+                }
+                if past_separator {
+                    continue;
+                } // after `--`, everything is positional
+                if arg.starts_with("--") || !arg.starts_with('-') {
+                    continue;
+                }
                 // The flag part is everything after the dash, up to `=`.
                 let flag = &arg[1..];
                 let flag_name = flag.split('=').next().unwrap_or(flag);
                 // Single-character flags pass through to clap (e.g. `-h`, `-V`).
-                if flag_name.len() <= 1 { continue; }
+                if flag_name.len() <= 1 {
+                    continue;
+                }
                 // Multi-character, single-dashed arg that nothing recognised.
-                eprintln!(
-                    "Error: Error parsing command line arguments: Invalid parameter {arg}"
-                );
+                eprintln!("Error: Error parsing command line arguments: Invalid parameter {arg}");
                 node::shutdown::exit_now(1);
             }
         }
@@ -1973,10 +1986,7 @@ impl Config {
                 .unwrap_or(false)
         });
         let mut include_notes: Vec<ConfigNote> = Vec::new();
-        let skip_includes = cli
-            .includeconf
-            .iter()
-            .any(|v| v == INCLUDECONF_NEGATED);
+        let skip_includes = cli.includeconf.iter().any(|v| v == INCLUDECONF_NEGATED);
         if let Some(cf) = config_file.as_mut()
             && !skip_includes
         {
@@ -2007,11 +2017,12 @@ impl Config {
             // Format the value exactly as Bitcoin Core does: boolean-like
             // values (`true`/`false`) are bare, file paths are quoted.
             let val = cli_includeconf[0];
-            let display_val = if val == "true" || val == "false" || val == "1" || val == "0" || val.is_empty() {
-                format!("-includeconf={val}")
-            } else {
-                format!("-includeconf=\"{val}\"")
-            };
+            let display_val =
+                if val == "true" || val == "false" || val == "1" || val == "0" || val.is_empty() {
+                    format!("-includeconf={val}")
+                } else {
+                    format!("-includeconf=\"{val}\"")
+                };
             return Err(format!(
                 "Error parsing command line arguments: \
                  -includeconf cannot be used from commandline; {display_val}",
@@ -2062,7 +2073,11 @@ impl Config {
         let caps_at_default: Vec<&'static str> = {
             let in_file = |key: &str, signed: bool| {
                 file_get(key).is_some_and(|v| {
-                    if signed { v.parse::<i32>().is_ok() } else { v.parse::<usize>().is_ok() }
+                    if signed {
+                        v.parse::<i32>().is_ok()
+                    } else {
+                        v.parse::<usize>().is_ok()
+                    }
                 })
             };
             [
@@ -2071,9 +2086,21 @@ impl Config {
                 ("esploramaxconns", cli.esploramaxconns.is_some(), false),
                 ("esplorasseconns", cli.esplorasseconns.is_some(), false),
                 ("electrummaxconns", cli.electrummaxconns.is_some(), false),
-                ("stratummaxconns", cli.stratum_args.stratummaxconns.is_some(), false),
-                ("eventsgrpcmaxconns", cli.events_grpc_max_conns.is_some(), false),
-                ("streamwsmaxsockets", cli.streamws_max_sockets.is_some(), false),
+                (
+                    "stratummaxconns",
+                    cli.stratum_args.stratummaxconns.is_some(),
+                    false,
+                ),
+                (
+                    "eventsgrpcmaxconns",
+                    cli.events_grpc_max_conns.is_some(),
+                    false,
+                ),
+                (
+                    "streamwsmaxsockets",
+                    cli.streamws_max_sockets.is_some(),
+                    false,
+                ),
                 ("streamwsmaxconns", cli.streamws_max_conns.is_some(), false),
             ]
             .into_iter()
@@ -2093,7 +2120,8 @@ impl Config {
         // is `addr[:port]` per Bitcoin Core; bare addresses inherit
         // `rpcport`. Resolved to concrete `SocketAddr`s here so the
         // server-side binding code doesn't have to re-parse.
-        let rpcbind_raw: Vec<String> = merge_list(cli.rpcbind.clone(), file_get_all("rpcbind"), None);
+        let rpcbind_raw: Vec<String> =
+            merge_list(cli.rpcbind.clone(), file_get_all("rpcbind"), None);
         let mut rpcbind: Vec<SocketAddr> = Vec::new();
         let rpcbind_is_default = rpcbind_raw.is_empty();
         if rpcbind_is_default {
@@ -2109,9 +2137,8 @@ impl Config {
                 if rpcbind_port_is_invalid(entry) {
                     return Err(format!("Invalid port specified in -rpcbind: '{entry}'"));
                 }
-                let parsed = parse_rpcbind_entry(entry, rpcport).map_err(|e| {
-                    format!("invalid --rpcbind value {entry:?}: {e}")
-                })?;
+                let parsed = parse_rpcbind_entry(entry, rpcport)
+                    .map_err(|e| format!("invalid --rpcbind value {entry:?}: {e}"))?;
                 rpcbind.push(parsed);
             }
         }
@@ -2120,7 +2147,8 @@ impl Config {
         // Defer the "non-loopback bind requires non-empty allowlist"
         // check until both are parsed so the operator gets one clear
         // error message instead of two.
-        let rpcallowip_raw: Vec<String> = merge_list(cli.rpcallowip.clone(), file_get_all("rpcallowip"), None);
+        let rpcallowip_raw: Vec<String> =
+            merge_list(cli.rpcallowip.clone(), file_get_all("rpcallowip"), None);
         let mut rpcallowip: Vec<IpAllowEntry> = Vec::new();
         // satd has no CJDNS transport, so `-cjdnsreachable` does one thing
         // here, the thing Core does to the RPC allowlist: with it set, an
@@ -2152,8 +2180,11 @@ impl Config {
         // satd is more explicit about the why.
         let any_non_loopback = rpcbind.iter().any(|a| !a.ip().is_loopback());
         if any_non_loopback && rpcallowip.is_empty() {
-            let exposed: Vec<String> =
-                rpcbind.iter().filter(|a| !a.ip().is_loopback()).map(|a| a.to_string()).collect();
+            let exposed: Vec<String> = rpcbind
+                .iter()
+                .filter(|a| !a.ip().is_loopback())
+                .map(|a| a.to_string())
+                .collect();
             return Err(format!(
                 "--rpcbind on non-loopback address(es) {exposed:?} requires at least one \
                 --rpcallowip entry. Add `--rpcallowip=<ip-or-cidr>` (or the matching \
@@ -2166,8 +2197,11 @@ impl Config {
         // --rpcauth resolution: command line, then config file (see
         // `merge_list`). A `-norpcauth` discards the entries before it, and
         // the config file's unless an entry follows it.
-        let rpcauth_raw: Vec<String> =
-            merge_list(cli.rpcauth.clone(), file_get_all("rpcauth"), Some(RPCAUTH_NEGATED));
+        let rpcauth_raw: Vec<String> = merge_list(
+            cli.rpcauth.clone(),
+            file_get_all("rpcauth"),
+            Some(RPCAUTH_NEGATED),
+        );
         let mut rpcauth: Vec<RpcAuthEntry> = Vec::new();
         for entry in &rpcauth_raw {
             // Core refuses to start on an empty or malformed `-rpcauth`, with
@@ -2349,8 +2383,9 @@ impl Config {
         // listener's `rpctls*`, mirroring the per-surface TLS shape used by
         // Esplora/Electrum. The handshake timeout is shared with the main RPC
         // TLS surface (`rpc_tls_handshake_timeout`), not a separate knob.
-        let rpc_readonly_tls_bind =
-            cli.rpcreadonlytlsbind.or_else(|| file_get("rpcreadonlytlsbind"));
+        let rpc_readonly_tls_bind = cli
+            .rpcreadonlytlsbind
+            .or_else(|| file_get("rpcreadonlytlsbind"));
         let rpc_readonly_tls_cert = cli
             .rpcreadonlytlscert
             .or_else(|| file_get("rpcreadonlytlscert").map(std::path::PathBuf::from));
@@ -2420,7 +2455,11 @@ impl Config {
         // value is parsed and stored but unused. Logging a warning
         // when set off-signet would be noisy for operators with a
         // single config used across networks via `[signet]` sections.
-        let signet_seed_nodes: Vec<String> = merge_list(cli.signetseednode.clone(), file_get_all("signetseednode"), None);
+        let signet_seed_nodes: Vec<String> = merge_list(
+            cli.signetseednode.clone(),
+            file_get_all("signetseednode"),
+            None,
+        );
 
         // -signetchallenge selects a custom signet (BIP 325). Parsed
         // from hex; rejected on non-signet networks (it has no meaning
@@ -2431,7 +2470,11 @@ impl Config {
             // (`ReadSigNetArgs`), where other scalar options take the last:
             // two challenges name two different signets, and picking one
             // would join the node to a network the operator may not mean.
-            let raw = merge_list(cli.signetchallenge.clone(), file_get_all("signetchallenge"), None);
+            let raw = merge_list(
+                cli.signetchallenge.clone(),
+                file_get_all("signetchallenge"),
+                None,
+            );
             if raw.len() > 1 {
                 return Err("-signetchallenge cannot be multiple values.".to_string());
             }
@@ -2536,9 +2579,7 @@ impl Config {
             .unwrap_or(false);
         let rpc_tls_handshake_timeout = cli
             .rpctlshandshaketimeout
-            .or_else(|| {
-                file_get("rpctlshandshaketimeout").and_then(|v| v.parse().ok())
-            })
+            .or_else(|| file_get("rpctlshandshaketimeout").and_then(|v| v.parse().ok()))
             .unwrap_or(10);
 
         // mTLS validation, mirroring the other surfaces.
@@ -2610,7 +2651,8 @@ impl Config {
 
         // -externalip: command line, then config file. Each entry is
         // `IP` or `IP:port`; a bare IP inherits the network P2P port.
-        let externalip_raw: Vec<String> = merge_list(cli.externalip.clone(), file_get_all("externalip"), None);
+        let externalip_raw: Vec<String> =
+            merge_list(cli.externalip.clone(), file_get_all("externalip"), None);
         let mut externalip: Vec<SocketAddr> = Vec::with_capacity(externalip_raw.len());
         let mut externalip_onion: Vec<(String, u16)> = Vec::new();
         for raw in &externalip_raw {
@@ -2633,7 +2675,8 @@ impl Config {
         }
 
         // -whitelist: per-subnet net permissions.
-        let whitelist_raw: Vec<String> = merge_list(cli.whitelist.clone(), file_get_all("whitelist"), None);
+        let whitelist_raw: Vec<String> =
+            merge_list(cli.whitelist.clone(), file_get_all("whitelist"), None);
         let mut whitelist: Vec<node::net::permissions::WhitelistEntry> =
             Vec::with_capacity(whitelist_raw.len());
         for raw in &whitelist_raw {
@@ -2660,7 +2703,8 @@ impl Config {
 
         // -whitebind: extra permissioned listeners. `[perms@]addr`, addr
         // is a literal `IP:port` (a bare IP inherits the network port).
-        let whitebind_raw: Vec<String> = merge_list(cli.whitebind.clone(), file_get_all("whitebind"), None);
+        let whitebind_raw: Vec<String> =
+            merge_list(cli.whitebind.clone(), file_get_all("whitebind"), None);
         let mut whitebind: Vec<(SocketAddr, node::net::permissions::NetPermissions)> =
             Vec::with_capacity(whitebind_raw.len());
         for raw in &whitebind_raw {
@@ -2685,9 +2729,7 @@ impl Config {
             } else if let Ok(ip) = addr_str.parse::<std::net::IpAddr>() {
                 SocketAddr::new(ip, default_p2p_port(network))
             } else {
-                return Err(format!(
-                    "whitebind: {addr_str:?} is not an IP or IP:port"
-                ));
+                return Err(format!("whitebind: {addr_str:?} is not an IP or IP:port"));
             };
             whitebind.push((sa, perms));
         }
@@ -2727,9 +2769,7 @@ impl Config {
             // node that binds nothing while its config plainly names listeners
             // -- discovered only when no peer ever connects in.
             if !listen && (!raw.is_empty() || !whitebind_raw.is_empty()) {
-                return Err(
-                    "Cannot set -bind or -whitebind together with -listen=0".to_string()
-                );
+                return Err("Cannot set -bind or -whitebind together with -listen=0".to_string());
             }
             if raw.is_empty() {
                 vec![BindSpec {
@@ -2901,8 +2941,7 @@ impl Config {
             .or(profile_defaults.maxconnections)
             .unwrap_or(node::net::manager::DEFAULT_MAX_PEER_CONNECTIONS);
         let binds_requested = !bind_raw.is_empty() || !whitebind_raw.is_empty();
-        if !listen_explicit && !binds_requested && (!automatic_outbound || maxconnections == 0)
-        {
+        if !listen_explicit && !binds_requested && (!automatic_outbound || maxconnections == 0) {
             listen = false;
         }
         // `-proxy` soft-sets `-listen=0`, "to protect privacy, do not listen
@@ -2949,9 +2988,7 @@ impl Config {
 
         // `-onlynet`, as Core's `AppInitMain` resolves it into
         // `g_reachable_nets`, with its startup refusals.
-        let onlynet_raw = {
-            merge_list(cli.onlynet.clone(), file_get_all("onlynet"), None)
-        };
+        let onlynet_raw = { merge_list(cli.onlynet.clone(), file_get_all("onlynet"), None) };
         let reachable = resolve_reachable(&ReachableInputs {
             onlynet: &onlynet_raw,
             cjdnsreachable_set,
@@ -2966,9 +3003,11 @@ impl Config {
         // `-dnsseed=1` (`InitParameterInteraction`, `AppInitMain`).
         let dnsseed = match dnsseed_setting {
             Some(true) if !reachable.clearnet() => {
-                return Err("Incompatible options: -dnsseed=1 was explicitly specified, but -onlynet \
+                return Err(
+                    "Incompatible options: -dnsseed=1 was explicitly specified, but -onlynet \
                      forbids connections to IPv4/IPv6"
-                    .to_string());
+                        .to_string(),
+                );
             }
             Some(v) => v,
             None if !reachable.clearnet() => {
@@ -3028,9 +3067,7 @@ impl Config {
             if values.is_empty() {
                 None
             } else if network != Network::Regtest {
-                eprintln!(
-                    "Warning: ignoring -testactivationheight, which applies only to regtest"
-                );
+                eprintln!("Warning: ignoring -testactivationheight, which applies only to regtest");
                 None
             } else {
                 let mut o = node::validation::script::TestActivationOverrides::default();
@@ -3044,9 +3081,7 @@ impl Config {
                     // negatives and anything >= INT_MAX; its from_chars-based
                     // parse also rejects a leading '+'.
                     let height = match height.parse::<i64>() {
-                        Ok(h) if (0..i32::MAX as i64).contains(&h)
-                            && !height.starts_with('+') =>
-                        {
+                        Ok(h) if (0..i32::MAX as i64).contains(&h) && !height.starts_with('+') => {
                             h as u32
                         }
                         _ => {
@@ -3119,7 +3154,9 @@ impl Config {
                 for v in &values {
                     let parts: Vec<&str> = v.split(':').collect();
                     if parts.len() < 3 || parts.len() > 4 {
-                        return Err(format!("Invalid vbparams (expecting deployment:start:end[:min_activation_height]): {v}"));
+                        return Err(format!(
+                            "Invalid vbparams (expecting deployment:start:end[:min_activation_height]): {v}"
+                        ));
                     }
                     // satd has no version-bits enforcement: every consensus
                     // rule it has is gated on a height. `testdummy` exists
@@ -3441,7 +3478,8 @@ impl Config {
         // raise this.
         // Resolved in a helper, to keep `from_cli`'s debug-build stack frame
         // from growing.
-        let (addrindexsubscriptions, addrindexmaxhistory) = resolve_addrindex_limits(cli.addrindex_args, &file_get);
+        let (addrindexsubscriptions, addrindexmaxhistory) =
+            resolve_addrindex_limits(cli.addrindex_args, &file_get);
 
         // BIP 158 compact-block-filter index + peerblockfilters: see
         // the resolution block below near line 833 (it includes the
@@ -3588,10 +3626,14 @@ impl Config {
             return Err("--events-grpc-mtls=1 requires --events-grpc-mtls-client-ca".to_string());
         }
         if !events_grpc_mtls && !events_grpc_mtls_client_allow.is_empty() {
-            return Err("--events-grpc-mtls-client-allow requires --events-grpc-mtls=1".to_string());
+            return Err(
+                "--events-grpc-mtls-client-allow requires --events-grpc-mtls=1".to_string(),
+            );
         }
         let events_grpc_allow_remote = cli.events_grpc_allow_remote.unwrap_or_else(|| {
-            file_get("eventsgrpcallowremote").and_then(|v| parse_bool(&v)).unwrap_or(false)
+            file_get("eventsgrpcallowremote")
+                .and_then(|v| parse_bool(&v))
+                .unwrap_or(false)
         });
         // A routable events-gRPC bind must be authenticated — without bearer
         // auth or mTLS a public bind is an unauthenticated firehose of
@@ -3639,7 +3681,9 @@ impl Config {
             );
         }
         let streamws_allow_remote = cli.streamws_allow_remote.unwrap_or_else(|| {
-            file_get("streamwsallowremote").and_then(|v| parse_bool(&v)).unwrap_or(false)
+            file_get("streamwsallowremote")
+                .and_then(|v| parse_bool(&v))
+                .unwrap_or(false)
         });
         // A routable streamws bind must be authenticated — same rule as the
         // events-gRPC sink. The transport has no TLS of its own, so a public
@@ -3806,9 +3850,7 @@ impl Config {
         if !esplora_mtls && !esplora_mtls_client_allow.is_empty() {
             return Err("--esploramtlsclientallow requires --esploramtls=1".to_string());
         }
-        if esplora_tls_bind.is_some()
-            && (esplora_tls_cert.is_none() || esplora_tls_key.is_none())
-        {
+        if esplora_tls_bind.is_some() && (esplora_tls_cert.is_none() || esplora_tls_key.is_none()) {
             return Err(
                 "--esploratlsbind requires --esploratlscert AND --esploratlskey".to_string(),
             );
@@ -3847,7 +3889,9 @@ impl Config {
                 .collect()
         };
         let metrics_port_set = cli.metricsport.is_some()
-            || file_get("metricsport").and_then(|v| v.parse::<u16>().ok()).is_some();
+            || file_get("metricsport")
+                .and_then(|v| v.parse::<u16>().ok())
+                .is_some();
         if metrics_tls_bind.is_some() && !metrics_port_set {
             // The TLS listener is an addition to the plain one, never a
             // replacement: without the plain listener the image's
@@ -3863,9 +3907,7 @@ impl Config {
         if !metrics_mtls && !metrics_mtls_client_allow.is_empty() {
             return Err("--metricsmtlsclientallow requires --metricsmtls=1".to_string());
         }
-        if metrics_tls_bind.is_some()
-            && (metrics_tls_cert.is_none() || metrics_tls_key.is_none())
-        {
+        if metrics_tls_bind.is_some() && (metrics_tls_cert.is_none() || metrics_tls_key.is_none()) {
             return Err(
                 "--metricstlsbind requires --metricstlscert AND --metricstlskey".to_string(),
             );
@@ -3992,12 +4034,7 @@ impl Config {
             stratum_v2_key,
             stratum_v2_max_channels,
             stratum_v2_jd,
-        } = resolve_stratum(
-            cli.stratum_args,
-            network,
-            &file_get,
-            &file_get_all,
-        )?;
+        } = resolve_stratum(cli.stratum_args, network, &file_get, &file_get_all)?;
 
         // BIP 158 filter index. CLI `--blockfilterindex=<0|1|basic>`,
         // config `blockfilterindex=<0|1|basic>`, or
@@ -4013,9 +4050,10 @@ impl Config {
                 // instead would start the node with filters off and say
                 // nothing, discovered only when a light client gets no
                 // NODE_COMPACT_FILTERS.
-                Some(v) => Some(parse_blockfilterindex_value(v.clone()).ok_or_else(|| {
-                    format!("Unknown -blockfilterindex value {v}.")
-                })?),
+                Some(v) => Some(
+                    parse_blockfilterindex_value(v.clone())
+                        .ok_or_else(|| format!("Unknown -blockfilterindex value {v}."))?,
+                ),
                 None => None,
             })
             .unwrap_or(false);
@@ -4088,7 +4126,11 @@ impl Config {
         // the surfaces that need txindex -- applies to both. The budget is 0
         // in manual mode, so `prune > 0` is not that question; this is.
         let pruning = prune > 0 || prune_manual;
-        let prune_display = if prune_manual { "1".to_string() } else { prune.to_string() };
+        let prune_display = if prune_manual {
+            "1".to_string()
+        } else {
+            prune.to_string()
+        };
 
         // AssumeUTXO --fast-start source resolution + validation.
         //   - Remote sources MUST be https:// (TLS, validated certs).
@@ -4171,13 +4213,18 @@ impl Config {
         // Resolved in a helper, to keep this function's debug-build stack
         // frame from growing.
         let zmq = resolve_zmq_pub(cli.zmq_pub_args, config_file.as_ref(), section, &file_get)?;
-        pending_notes.extend(
-            zmq.notes.into_iter().map(|message| ConfigNote { level: NoteLevel::Warn, message }),
-        );
+        pending_notes.extend(zmq.notes.into_iter().map(|message| ConfigNote {
+            level: NoteLevel::Warn,
+            message,
+        }));
         // `-deprecatedrpc`. Core takes any name without checking it; satd
         // warns about a name it has no deprecated form for, so a migrated
         // `deprecatedrpc=` line is not silently a no-op.
-        let deprecatedrpc = merge_list(cli.deprecatedrpc.clone(), file_get_all("deprecatedrpc"), None);
+        let deprecatedrpc = merge_list(
+            cli.deprecatedrpc.clone(),
+            file_get_all("deprecatedrpc"),
+            None,
+        );
         for name in &deprecatedrpc {
             if !node::rpc::deprecated::KNOWN.contains(&name.as_str()) {
                 pending_notes.push(ConfigNote {
@@ -4275,8 +4322,7 @@ impl Config {
                 .and_then(parse_blockfilterindex_value)
                 .map(|v| !v)
                 .unwrap_or(false);
-        if peerblockfilters && !blockfilterindex_resolved && !blockfilterindex_explicitly_disabled
-        {
+        if peerblockfilters && !blockfilterindex_resolved && !blockfilterindex_explicitly_disabled {
             pending_notes.push(ConfigNote {
                 level: NoteLevel::Info,
                 message: "peerblockfilters is enabled; auto-enabling --blockfilterindex=basic \
@@ -4307,12 +4353,10 @@ impl Config {
             return Err("Prune mode is incompatible with -txospenderindex.".to_string());
         }
         if txospenderindex && !addressindex {
-            return Err(
-                "txospenderindex=1 with addressindex=0: refusing to start. \
+            return Err("txospenderindex=1 with addressindex=0: refusing to start. \
                  satd's spender index is kept by the address index — enable it with \
                  --addressindex=1, or set --txospenderindex=0."
-                    .into(),
-            );
+                .into());
         }
 
         // Validate auth consistency
@@ -4356,7 +4400,8 @@ impl Config {
             parsed
         };
 
-        let alt_slots = resolve_alt_slots(&cli.alt_slot_args, &file_get, &file_get_all, maxconnections)?;
+        let alt_slots =
+            resolve_alt_slots(&cli.alt_slot_args, &file_get, &file_get_all, maxconnections)?;
         let crawl = resolve_crawl(&cli.crawl_args, &file_get, &file_get_all, network)?;
 
         Ok(Config {
@@ -4448,8 +4493,17 @@ impl Config {
             acceptnonstdtxn,
             allowdangerousfilters,
             nap: resolve_nap(&cli.nap_args.nap, "nap", &file_get),
-            napstorerecover: resolve_nap(&cli.nap_args.napstorerecover, "napstorerecover", &file_get),
-            napmaxattestations: resolve_nap_count(&cli.nap_args.napmaxattestations, "napmaxattestations", 0, &file_get)?,
+            napstorerecover: resolve_nap(
+                &cli.nap_args.napstorerecover,
+                "napstorerecover",
+                &file_get,
+            ),
+            napmaxattestations: resolve_nap_count(
+                &cli.nap_args.napmaxattestations,
+                "napmaxattestations",
+                0,
+                &file_get,
+            )?,
             napaggregator: resolve_nap(&cli.nap_args.napaggregator, "napaggregator", &file_get),
             napaggregatormax: resolve_nap_count(
                 &cli.nap_args.napaggregatormax,
@@ -4458,7 +4512,10 @@ impl Config {
                 &file_get,
             )?,
             peersurvey: resolve_nap(&cli.peer_survey_args.peersurvey, "peersurvey", &file_get),
-            peersurveyinterval: resolve_survey_interval(&cli.peer_survey_args.peersurveyinterval, &file_get)?,
+            peersurveyinterval: resolve_survey_interval(
+                &cli.peer_survey_args.peersurveyinterval,
+                &file_get,
+            )?,
             peersurveyprobes: cli
                 .peer_survey_args
                 .peersurveyprobes
@@ -4555,12 +4612,26 @@ impl Config {
             // `reindex=` asks for a rebuild there too.
             reindex: cli
                 .reindex
-                .or_else(|| file_get("reindex").and_then(|v| if v.is_empty() { Some(true) } else { parse_bool(&v) }))
+                .or_else(|| {
+                    file_get("reindex").and_then(|v| {
+                        if v.is_empty() {
+                            Some(true)
+                        } else {
+                            parse_bool(&v)
+                        }
+                    })
+                })
                 .unwrap_or(false),
             reindex_chainstate: cli
                 .reindex_chainstate
                 .or_else(|| {
-                    file_get("reindexchainstate").and_then(|v| if v.is_empty() { Some(true) } else { parse_bool(&v) })
+                    file_get("reindexchainstate").and_then(|v| {
+                        if v.is_empty() {
+                            Some(true)
+                        } else {
+                            parse_bool(&v)
+                        }
+                    })
                 })
                 .unwrap_or(false),
             // Read from the config file as well as the command line: the
@@ -4589,9 +4660,7 @@ impl Config {
             restore_opreturns,
             // Default on for regtest (matches Core's -checkblockindex), off
             // elsewhere — on a mainnet index the walk is ~1M point lookups.
-            check_block_index: cli
-                .checkblockindex
-                .unwrap_or(network == Network::Regtest),
+            check_block_index: cli.checkblockindex.unwrap_or(network == Network::Regtest),
             maxconnections,
             maxinboundperip: cli
                 .maxinboundperip
@@ -4601,17 +4670,23 @@ impl Config {
             // (v32.1 `init.cpp`).
             inboundrelaypercent: cli
                 .inboundrelaypercent
-                .or_else(|| file_get("inboundrelaypercent").and_then(|v| v.trim().parse::<i64>().ok()))
-                .map_or(node::net::manager::DEFAULT_INBOUND_RELAY_PERCENT, |n| n.clamp(0, 100) as usize),
+                .or_else(|| {
+                    file_get("inboundrelaypercent").and_then(|v| v.trim().parse::<i64>().ok())
+                })
+                .map_or(node::net::manager::DEFAULT_INBOUND_RELAY_PERCENT, |n| {
+                    n.clamp(0, 100) as usize
+                }),
             blockreconstructionextratxn: match cli
                 .blockreconstructionextratxn
                 .map(|n| n.to_string())
                 .or_else(|| file_get("blockreconstructionextratxn"))
             {
                 None => node::net::compact::DEFAULT_BLOCK_RECONSTRUCTION_EXTRA_TXN,
-                Some(v) => v.trim().parse::<i64>().map(|n| n.max(0) as usize).map_err(|_| {
-                    format!("blockreconstructionextratxn: invalid number {v:?}")
-                })?,
+                Some(v) => v
+                    .trim()
+                    .parse::<i64>()
+                    .map(|n| n.max(0) as usize)
+                    .map_err(|_| format!("blockreconstructionextratxn: invalid number {v:?}"))?,
             },
             cmpctblockprefill,
             cmpctblockprefillbytes,
@@ -4640,9 +4715,7 @@ impl Config {
                     None => 5000,
                 }
             },
-            addnode: {
-                merge_list(cli.addnode, file_get_all("addnode"), None)
-            },
+            addnode: { merge_list(cli.addnode, file_get_all("addnode"), None) },
             user_agent: {
                 // Repeatable, and both sources accumulate: Core's
                 // `GetSettingsList` walks command line then config file and
@@ -4656,9 +4729,7 @@ impl Config {
                 // Core's own wording, not a silently-dropped option.
                 node::format_user_agent(&comments)?
             },
-            seednode: {
-                merge_list(cli.seednode, file_get_all("seednode"), None)
-            },
+            seednode: { merge_list(cli.seednode, file_get_all("seednode"), None) },
             dns: cli
                 .dns
                 .or_else(|| file_get("dns").and_then(|v| parse_bool(&v)))
@@ -4709,7 +4780,9 @@ impl Config {
                 .or_else(|| file_get("blockversion").and_then(|v| v.parse().ok())),
             pid: cli.pid.or_else(|| file_get("pid")),
             mcp: cli.mcp.unwrap_or_else(|| {
-                file_get("mcp").and_then(|v| parse_bool(&v)).unwrap_or(false)
+                file_get("mcp")
+                    .and_then(|v| parse_bool(&v))
+                    .unwrap_or(false)
             }),
             mcp_port: cli
                 .mcpport
@@ -4852,10 +4925,14 @@ impl Config {
                 })
                 .unwrap_or(4),
             server: cli.server.unwrap_or_else(|| {
-                file_get("server").and_then(|v| parse_bool(&v)).unwrap_or(false)
+                file_get("server")
+                    .and_then(|v| parse_bool(&v))
+                    .unwrap_or(false)
             }),
             daemon: cli.daemon.unwrap_or_else(|| {
-                file_get("daemon").and_then(|v| parse_bool(&v)).unwrap_or(false)
+                file_get("daemon")
+                    .and_then(|v| parse_bool(&v))
+                    .unwrap_or(false)
             }),
             metricsport,
             statuspage,
@@ -4871,7 +4948,9 @@ impl Config {
             metrics_mtls_client_ca,
             metrics_mtls_client_allow,
             rpc_extended_errors: cli.rpcextendederrors.unwrap_or_else(|| {
-                file_get("rpcextendederrors").and_then(|v| parse_bool(&v)).unwrap_or(false)
+                file_get("rpcextendederrors")
+                    .and_then(|v| parse_bool(&v))
+                    .unwrap_or(false)
             }),
             max_shutdown_secs: cli
                 .maxshutdownsecs
@@ -4904,15 +4983,9 @@ impl Config {
                 .logsourcelocations
                 .or_else(|| file_get("logsourcelocations").and_then(|v| parse_bool(&v)))
                 .unwrap_or(false),
-            debug: {
-                merge_list(cli.debug, file_get_all("debug"), None)
-            },
-            debugexclude: {
-                merge_list(cli.debugexclude, file_get_all("debugexclude"), None)
-            },
-            log_level: {
-                merge_list(cli.loglevel.clone(), file_get_all("loglevel"), None)
-            },
+            debug: { merge_list(cli.debug, file_get_all("debug"), None) },
+            debugexclude: { merge_list(cli.debugexclude, file_get_all("debugexclude"), None) },
+            log_level: { merge_list(cli.loglevel.clone(), file_get_all("loglevel"), None) },
             enforce_checkpoints: cli
                 .checkpoints
                 .or_else(|| file_get("checkpoints").and_then(|v| parse_bool(&v)))
@@ -4946,7 +5019,10 @@ impl Config {
                 .alert_reorg_depth
                 .or_else(|| file_get("alertreorgdepth").and_then(|v| v.parse().ok()))
                 .unwrap_or(node::health::defaults::reorg_depth_for(network)),
-            startup_notify: cli.startupnotify.clone().or_else(|| file_get("startupnotify")),
+            startup_notify: cli
+                .startupnotify
+                .clone()
+                .or_else(|| file_get("startupnotify")),
             shutdown_notify: cli
                 .shutdownnotify
                 .clone()
@@ -5457,7 +5533,11 @@ pub struct CliArgs {
     /// Repeatable. Recognised on the command line for compatibility
     /// but, like Core, only honoured inside a config file — a
     /// command-line value is ignored with a warning.
-    #[arg(long, value_name = "FILE", help = "Additional config file (config-file only)")]
+    #[arg(
+        long,
+        value_name = "FILE",
+        help = "Additional config file (config-file only)"
+    )]
     pub includeconf: Vec<String>,
 
     /// Additional signet seed nodes. Mirrors Bitcoin Core's
@@ -5814,26 +5894,42 @@ pub struct CliArgs {
     /// Declare an external address to advertise to peers. Mirrors Bitcoin
     /// Core's `-externalip=<ip[:port]>`. Repeatable. `IP` or `IP:port`
     /// (bare IP inherits the network's default P2P port).
-    #[arg(long, value_name = "IP[:PORT]", help = "External address to advertise (repeatable)")]
+    #[arg(
+        long,
+        value_name = "IP[:PORT]",
+        help = "External address to advertise (repeatable)"
+    )]
     pub externalip: Vec<String>,
 
     /// Grant net permissions to peers from a subnet. Mirrors Bitcoin
     /// Core's `-whitelist=[perms@]IP/subnet`. Repeatable. `perms` is a
     /// comma list (noban,relay,forcerelay,mempool,download,addr,all);
     /// omitted = the implicit default set.
-    #[arg(long, value_name = "[PERMS@]NET", help = "Whitelist peers by subnet (repeatable)")]
+    #[arg(
+        long,
+        value_name = "[PERMS@]NET",
+        help = "Whitelist peers by subnet (repeatable)"
+    )]
     pub whitelist: Vec<String>,
 
     /// Bind an extra P2P listener whose inbound peers get net
     /// permissions. Mirrors Bitcoin Core's `-whitebind=[perms@]addr`.
     /// Repeatable.
-    #[arg(long, value_name = "[PERMS@]ADDR", help = "Permissioned bind address (repeatable)")]
+    #[arg(
+        long,
+        value_name = "[PERMS@]ADDR",
+        help = "Permissioned bind address (repeatable)"
+    )]
     pub whitebind: Vec<String>,
 
     /// Path to a Bitcoin Core `-asmap` file for ASN-based addrman
     /// bucketing (eclipse resistance). Relative paths resolve against
     /// `--datadir`.
-    #[arg(long, value_name = "FILE", help = "asmap file for ASN-based peer bucketing")]
+    #[arg(
+        long,
+        value_name = "FILE",
+        help = "asmap file for ASN-based peer bucketing"
+    )]
     pub asmap: Option<String>,
 
     #[arg(
@@ -6541,7 +6637,11 @@ pub struct CliArgs {
     /// Bitcoin Core's `-maxuploadtarget`: cap historical block upload per
     /// 24h. Plain number = MiB; suffix `B/K/M/G/T` (or `KiB`/`MiB`/…)
     /// overrides. 0 = unlimited.
-    #[arg(long, value_name = "SIZE", help = "Max historical upload per 24h (e.g. 500M; 0=off)")]
+    #[arg(
+        long,
+        value_name = "SIZE",
+        help = "Max historical upload per 24h (e.g. 500M; 0=off)"
+    )]
     pub maxuploadtarget: Option<String>,
 
     /// Bitcoin Core's `-bind=addr[:port][=onion]`. Repeatable: a node may
@@ -7667,22 +7767,102 @@ enum StratumArgKind {
 
 /// `(name, value name, kind, help)` for every Stratum flag.
 const STRATUM_ARG_SPECS: &[(&str, &str, StratumArgKind, &str)] = &[
-    ("stratum", "BOOL", StratumArgKind::Bool, "Run the Stratum V1 solo-mining server (default: false). Not available on signet."),
-    ("stratumbind", "ADDR:PORT", StratumArgKind::Text, "Bind the plaintext Stratum listener (default: 127.0.0.1:3333)"),
-    ("stratumtlsbind", "ADDR:PORT", StratumArgKind::Text, "Bind the Stratum TLS listener (requires --stratumtlscert and --stratumtlskey)"),
-    ("stratumtlscert", "PATH", StratumArgKind::Path, "Path to PEM-encoded TLS certificate for the Stratum server"),
-    ("stratumtlskey", "PATH", StratumArgKind::Path, "Path to PEM-encoded TLS private key for the Stratum server"),
-    ("stratummtls", "BOOL", StratumArgKind::Bool, "Require mutual TLS on the Stratum TLS listener (default: false). Requires --stratumtlsbind and --stratummtlsclientca."),
-    ("stratummtlsclientca", "PATH", StratumArgKind::Path, "Path to PEM CA bundle used to verify client certificates when --stratummtls=1"),
-    ("stratummtlsclientallow", "NAME", StratumArgKind::TextList, "Allowlist of accepted Stratum client-cert CN / DNS-SAN values (repeatable, comma-separated). Empty = any cert validly signed by the CA."),
-    ("stratumaddress", "ADDRESS", StratumArgKind::Text, "Payout address for a miner whose username is not a valid address for this network"),
-    ("stratumdifficulty", "N", StratumArgKind::U64, "Initial Stratum share difficulty (default: 10000 mainnet, 1000 testnet, 1 regtest)"),
-    ("stratummaxconns", "N", StratumArgKind::Usize, "Hard cap on simultaneously-open Stratum connections (default: 64)"),
-    ("stratumallowplaintextremote", "BOOL", StratumArgKind::Bool, "Accept a non-loopback --stratumbind with no --stratumtlsbind (default: false)"),
-    ("stratumv2bind", "ADDR:PORT", StratumArgKind::Text, "Bind the Stratum V2 listener (Noise-encrypted; requires --stratum=1)"),
-    ("stratumv2key", "PATH", StratumArgKind::Path, "Stratum V2 authority key file (default: <datadir>/stratum_v2.key; created if absent)"),
-    ("stratumv2maxchannels", "N", StratumArgKind::Usize, "Channels one Stratum V2 connection may open (default: 16)"),
-    ("stratumv2jd", "BOOL", StratumArgKind::Bool, "Serve Stratum V2 Job Declaration on the V2 listener (default: false). Requires --stratumv2bind."),
+    (
+        "stratum",
+        "BOOL",
+        StratumArgKind::Bool,
+        "Run the Stratum V1 solo-mining server (default: false). Not available on signet.",
+    ),
+    (
+        "stratumbind",
+        "ADDR:PORT",
+        StratumArgKind::Text,
+        "Bind the plaintext Stratum listener (default: 127.0.0.1:3333)",
+    ),
+    (
+        "stratumtlsbind",
+        "ADDR:PORT",
+        StratumArgKind::Text,
+        "Bind the Stratum TLS listener (requires --stratumtlscert and --stratumtlskey)",
+    ),
+    (
+        "stratumtlscert",
+        "PATH",
+        StratumArgKind::Path,
+        "Path to PEM-encoded TLS certificate for the Stratum server",
+    ),
+    (
+        "stratumtlskey",
+        "PATH",
+        StratumArgKind::Path,
+        "Path to PEM-encoded TLS private key for the Stratum server",
+    ),
+    (
+        "stratummtls",
+        "BOOL",
+        StratumArgKind::Bool,
+        "Require mutual TLS on the Stratum TLS listener (default: false). Requires --stratumtlsbind and --stratummtlsclientca.",
+    ),
+    (
+        "stratummtlsclientca",
+        "PATH",
+        StratumArgKind::Path,
+        "Path to PEM CA bundle used to verify client certificates when --stratummtls=1",
+    ),
+    (
+        "stratummtlsclientallow",
+        "NAME",
+        StratumArgKind::TextList,
+        "Allowlist of accepted Stratum client-cert CN / DNS-SAN values (repeatable, comma-separated). Empty = any cert validly signed by the CA.",
+    ),
+    (
+        "stratumaddress",
+        "ADDRESS",
+        StratumArgKind::Text,
+        "Payout address for a miner whose username is not a valid address for this network",
+    ),
+    (
+        "stratumdifficulty",
+        "N",
+        StratumArgKind::U64,
+        "Initial Stratum share difficulty (default: 10000 mainnet, 1000 testnet, 1 regtest)",
+    ),
+    (
+        "stratummaxconns",
+        "N",
+        StratumArgKind::Usize,
+        "Hard cap on simultaneously-open Stratum connections (default: 64)",
+    ),
+    (
+        "stratumallowplaintextremote",
+        "BOOL",
+        StratumArgKind::Bool,
+        "Accept a non-loopback --stratumbind with no --stratumtlsbind (default: false)",
+    ),
+    (
+        "stratumv2bind",
+        "ADDR:PORT",
+        StratumArgKind::Text,
+        "Bind the Stratum V2 listener (Noise-encrypted; requires --stratum=1)",
+    ),
+    (
+        "stratumv2key",
+        "PATH",
+        StratumArgKind::Path,
+        "Stratum V2 authority key file (default: <datadir>/stratum_v2.key; created if absent)",
+    ),
+    (
+        "stratumv2maxchannels",
+        "N",
+        StratumArgKind::Usize,
+        "Channels one Stratum V2 connection may open (default: 16)",
+    ),
+    (
+        "stratumv2jd",
+        "BOOL",
+        StratumArgKind::Bool,
+        "Serve Stratum V2 Job Declaration on the V2 listener (default: false). Requires --stratumv2bind.",
+    ),
 ];
 
 #[inline(never)]
@@ -7696,15 +7876,19 @@ fn stratum_arg(spec: &(&'static str, &'static str, StratumArgKind, &'static str)
             .value_parser(parse_bool_arg)
             .num_args(0..=1)
             .default_missing_value("1"),
-        StratumArgKind::Text => arg.action(ArgAction::Set).value_parser(value_parser!(String)),
-        StratumArgKind::Path => {
-            arg.action(ArgAction::Set).value_parser(value_parser!(std::path::PathBuf))
-        }
-        StratumArgKind::TextList => {
-            arg.action(ArgAction::Append).value_parser(value_parser!(String))
-        }
+        StratumArgKind::Text => arg
+            .action(ArgAction::Set)
+            .value_parser(value_parser!(String)),
+        StratumArgKind::Path => arg
+            .action(ArgAction::Set)
+            .value_parser(value_parser!(std::path::PathBuf)),
+        StratumArgKind::TextList => arg
+            .action(ArgAction::Append)
+            .value_parser(value_parser!(String)),
         StratumArgKind::U64 => arg.action(ArgAction::Set).value_parser(value_parser!(u64)),
-        StratumArgKind::Usize => arg.action(ArgAction::Set).value_parser(value_parser!(usize)),
+        StratumArgKind::Usize => arg
+            .action(ArgAction::Set)
+            .value_parser(value_parser!(usize)),
     }
 }
 
@@ -7768,8 +7952,18 @@ pub struct CompactPrefillArgs {
 }
 
 const COMPACT_PREFILL_ARG_SPECS: &[(&str, &str, StratumArgKind, &str)] = &[
-    ("cmpctblockprefill", "BOOL", StratumArgKind::Bool, "Prefill the transactions this node lacked when announcing a block as a cmpctblock (default: false)"),
-    ("cmpctblockprefillbytes", "BYTES", StratumArgKind::Usize, "Transaction bytes a cmpctblock prefill may carry beyond the coinbase (default: 8192)"),
+    (
+        "cmpctblockprefill",
+        "BOOL",
+        StratumArgKind::Bool,
+        "Prefill the transactions this node lacked when announcing a block as a cmpctblock (default: false)",
+    ),
+    (
+        "cmpctblockprefillbytes",
+        "BYTES",
+        StratumArgKind::Usize,
+        "Transaction bytes a cmpctblock prefill may carry beyond the coinbase (default: 8192)",
+    ),
 ];
 
 impl clap::Args for CompactPrefillArgs {
@@ -7817,8 +8011,18 @@ pub struct RpcWhitelistArgs {
 
 /// Help text is Core's own (v31.1 `src/init.cpp:717-718`).
 const RPC_WHITELIST_ARG_SPECS: &[(&str, &str, StratumArgKind, &str)] = &[
-    ("rpcwhitelist", "WHITELIST", StratumArgKind::TextList, "Set a whitelist to filter incoming RPC calls for a specific user. The field <whitelist> comes in the format: <USERNAME>:<rpc 1>,<rpc 2>,...,<rpc n>. If multiple whitelists are set for a given user, they are set-intersected. See -rpcwhitelistdefault documentation for information on default whitelist behavior."),
-    ("rpcwhitelistdefault", "BOOL", StratumArgKind::Bool, "Sets default behavior for rpc whitelisting. Unless rpcwhitelistdefault is set to 0, if any -rpcwhitelist is set, the rpc server acts as if all rpc users are subject to empty-unless-otherwise-specified whitelists. If rpcwhitelistdefault is set to 1 and no -rpcwhitelist is set, rpc server acts as if all rpc users are subject to empty whitelists."),
+    (
+        "rpcwhitelist",
+        "WHITELIST",
+        StratumArgKind::TextList,
+        "Set a whitelist to filter incoming RPC calls for a specific user. The field <whitelist> comes in the format: <USERNAME>:<rpc 1>,<rpc 2>,...,<rpc n>. If multiple whitelists are set for a given user, they are set-intersected. See -rpcwhitelistdefault documentation for information on default whitelist behavior.",
+    ),
+    (
+        "rpcwhitelistdefault",
+        "BOOL",
+        StratumArgKind::Bool,
+        "Sets default behavior for rpc whitelisting. Unless rpcwhitelistdefault is set to 0, if any -rpcwhitelist is set, the rpc server acts as if all rpc users are subject to empty-unless-otherwise-specified whitelists. If rpcwhitelistdefault is set to 1 and no -rpcwhitelist is set, rpc server acts as if all rpc users are subject to empty whitelists.",
+    ),
 ];
 
 impl clap::Args for RpcWhitelistArgs {
@@ -7863,8 +8067,15 @@ impl clap::FromArgMatches for RpcWhitelistArgs {
 /// Out of line, as the other `resolve_*`, to keep `Config::from_cli`'s
 /// frame from growing (the test threads' stack is tight).
 #[inline(never)]
-fn resolve_bytes_per_sigop(cli: &PolicySizeArgs, file_get: &dyn Fn(&str) -> Option<String>) -> Result<u32, String> {
-    match cli.bytespersigop.clone().or_else(|| file_get("bytespersigop")) {
+fn resolve_bytes_per_sigop(
+    cli: &PolicySizeArgs,
+    file_get: &dyn Fn(&str) -> Option<String>,
+) -> Result<u32, String> {
+    match cli
+        .bytespersigop
+        .clone()
+        .or_else(|| file_get("bytespersigop"))
+    {
         Some(v) => v
             .trim()
             .parse::<u32>()
@@ -7876,12 +8087,18 @@ fn resolve_bytes_per_sigop(cli: &PolicySizeArgs, file_get: &dyn Fn(&str) -> Opti
 /// Core v31's `-limitclustersize`, kvB, out of `CliArgs` for the same
 /// reason as [`resolve_bytes_per_sigop`].
 #[inline(never)]
-fn resolve_limit_cluster_size(cli: &PolicySizeArgs, file_get: &dyn Fn(&str) -> Option<String>) -> Result<u64, String> {
-    match cli.limitclustersize.clone().or_else(|| file_get("limitclustersize")) {
-        Some(v) => v
-            .trim()
-            .parse::<u64>()
-            .map_err(|_| format!("invalid limitclustersize {v:?}: expected a non-negative integer")),
+fn resolve_limit_cluster_size(
+    cli: &PolicySizeArgs,
+    file_get: &dyn Fn(&str) -> Option<String>,
+) -> Result<u64, String> {
+    match cli
+        .limitclustersize
+        .clone()
+        .or_else(|| file_get("limitclustersize"))
+    {
+        Some(v) => v.trim().parse::<u64>().map_err(|_| {
+            format!("invalid limitclustersize {v:?}: expected a non-negative integer")
+        }),
         None => Ok(node::mempool::policy::DEFAULT_CLUSTER_SIZE_LIMIT_KVB),
     }
 }
@@ -7911,8 +8128,18 @@ const POLICY_SIZE_ARG_SPECS: &[(&str, &str, StratumArgKind, &str)] = &[
         StratumArgKind::Text,
         "Do not accept transactions whose virtual size with all in-mempool connected transactions exceeds <n> kilobytes (default: 101)",
     ),
-    ("limitancestorcount", "N", StratumArgKind::Usize, "Maximum unconfirmed ancestor count (default: 25)"),
-    ("limitdescendantcount", "N", StratumArgKind::Usize, "Maximum unconfirmed descendant count (default: 25)"),
+    (
+        "limitancestorcount",
+        "N",
+        StratumArgKind::Usize,
+        "Maximum unconfirmed ancestor count (default: 25)",
+    ),
+    (
+        "limitdescendantcount",
+        "N",
+        StratumArgKind::Usize,
+        "Maximum unconfirmed descendant count (default: 25)",
+    ),
     (
         "limitclustercount",
         "N",
@@ -7962,8 +8189,13 @@ impl clap::FromArgMatches for PolicySizeArgs {
 /// `-txannouncedelay`, a satd extension, out of `CliArgs` for the same
 /// reason as [`resolve_bytes_per_sigop`]. Default true: Core's timers.
 #[inline(never)]
-fn resolve_tx_announce_delay(cli: &TxAnnounceArgs, file_get: &dyn Fn(&str) -> Option<String>) -> bool {
-    cli.txannouncedelay.or_else(|| file_get("txannouncedelay").and_then(|v| parse_bool(&v))).unwrap_or(true)
+fn resolve_tx_announce_delay(
+    cli: &TxAnnounceArgs,
+    file_get: &dyn Fn(&str) -> Option<String>,
+) -> bool {
+    cli.txannouncedelay
+        .or_else(|| file_get("txannouncedelay").and_then(|v| parse_bool(&v)))
+        .unwrap_or(true)
 }
 
 /// `-txannouncedelay` (see [`CliArgs::tx_announce_args`]).
@@ -7998,7 +8230,9 @@ impl clap::FromArgMatches for TxAnnounceArgs {
     }
 
     fn from_arg_matches_mut(m: &mut clap::ArgMatches) -> Result<Self, clap::Error> {
-        Ok(Self { txannouncedelay: m.remove_one("txannouncedelay") })
+        Ok(Self {
+            txannouncedelay: m.remove_one("txannouncedelay"),
+        })
     }
 
     fn update_from_arg_matches(&mut self, matches: &clap::ArgMatches) -> Result<(), clap::Error> {
@@ -8070,10 +8304,20 @@ impl clap::Args for OpReturnPruneArgs {
         for spec in OPRETURN_PRUNE_ARG_SPECS {
             cmd = cmd.arg(stratum_arg(spec));
         }
-        cmd.arg(stratum_arg(&("restoreopreturns", "BOOL", StratumArgKind::Bool, RESTORE_OPRETURNS_HELP)))
-            .arg(
-            stratum_arg(&("allowteststrip", "BOOL", StratumArgKind::Bool, "Register the test-only stripopreturns RPC (regtest only)"))
-                .hide(true),
+        cmd.arg(stratum_arg(&(
+            "restoreopreturns",
+            "BOOL",
+            StratumArgKind::Bool,
+            RESTORE_OPRETURNS_HELP,
+        )))
+        .arg(
+            stratum_arg(&(
+                "allowteststrip",
+                "BOOL",
+                StratumArgKind::Bool,
+                "Register the test-only stripopreturns RPC (regtest only)",
+            ))
+            .hide(true),
         )
     }
 
@@ -8152,16 +8396,23 @@ fn parse_opreturn_prune_size(v: &str) -> Result<u64, String> {
         "MiB" => 1_048_576,
         _ => return Err(refuse("unknown unit")),
     };
-    let bytes = n.checked_mul(multiplier).filter(|b| *b <= MAX).ok_or_else(|| refuse("too large"))?;
+    let bytes = n
+        .checked_mul(multiplier)
+        .filter(|b| *b <= MAX)
+        .ok_or_else(|| refuse("too large"))?;
     Ok(bytes)
 }
 
-fn parse_opreturn_prune_peers(v: &str) -> Result<node::storage::opreturn_strip::PrunePeers, String> {
+fn parse_opreturn_prune_peers(
+    v: &str,
+) -> Result<node::storage::opreturn_strip::PrunePeers, String> {
     use node::storage::opreturn_strip::PrunePeers;
     match v {
         "limited" => Ok(PrunePeers::Limited),
         "intact" => Ok(PrunePeers::Intact),
-        _ => Err(format!("-pruneopreturnpeers={v}: must be limited or intact")),
+        _ => Err(format!(
+            "-pruneopreturnpeers={v}: must be limited or intact"
+        )),
     }
 }
 
@@ -8200,9 +8451,8 @@ fn resolve_opreturn_restore(
 ) -> Result<bool, String> {
     let restore = match (cli.restoreopreturns, file_get("restoreopreturns")) {
         (Some(on), _) => on,
-        (None, Some(v)) => {
-            parse_bool(&v).ok_or_else(|| format!("-restoreopreturns must be 0 or 1, not \"{v}\""))?
-        }
+        (None, Some(v)) => parse_bool(&v)
+            .ok_or_else(|| format!("-restoreopreturns must be 0 or 1, not \"{v}\""))?,
         (None, None) => false,
     };
     if !restore {
@@ -8232,7 +8482,8 @@ fn resolve_opreturn_restore(
 /// false.
 #[inline(never)]
 fn resolve_nap(cli: &Option<bool>, key: &str, file_get: &dyn Fn(&str) -> Option<String>) -> bool {
-    cli.or_else(|| file_get(key).and_then(|v| parse_bool(&v))).unwrap_or(false)
+    cli.or_else(|| file_get(key).and_then(|v| parse_bool(&v)))
+        .unwrap_or(false)
 }
 
 /// `-napmaxattestations` and `-napaggregatormax`, out of `CliArgs` for the
@@ -8341,13 +8592,15 @@ impl clap::FromArgMatches for NapArgs {
 /// [`resolve_nap`]. Whole seconds, at least one; a config-file value that
 /// is not one is refused, as the command line refuses one.
 #[inline(never)]
-fn resolve_survey_interval(cli: &Option<u64>, file_get: &dyn Fn(&str) -> Option<String>) -> Result<u64, String> {
+fn resolve_survey_interval(
+    cli: &Option<u64>,
+    file_get: &dyn Fn(&str) -> Option<String>,
+) -> Result<u64, String> {
     let secs = match (cli, file_get("peersurveyinterval")) {
         (Some(n), _) => *n,
-        (None, Some(v)) => v
-            .trim()
-            .parse()
-            .map_err(|_| format!("-peersurveyinterval must be a whole number of seconds, not \"{v}\""))?,
+        (None, Some(v)) => v.trim().parse().map_err(|_| {
+            format!("-peersurveyinterval must be a whole number of seconds, not \"{v}\"")
+        })?,
         (None, None) => node::net::survey::DEFAULT_INTERVAL_SECS,
     };
     if secs == 0 {
@@ -8359,7 +8612,10 @@ fn resolve_survey_interval(cli: &Option<u64>, file_get: &dyn Fn(&str) -> Option<
 /// `-peerflagpolicy`, the command line over the file. A value other than
 /// `observe` or `evict` is a startup error, as the command line refuses one.
 #[inline(never)]
-fn resolve_flag_policy(cli: &Option<String>, file_get: &dyn Fn(&str) -> Option<String>) -> Result<String, String> {
+fn resolve_flag_policy(
+    cli: &Option<String>,
+    file_get: &dyn Fn(&str) -> Option<String>,
+) -> Result<String, String> {
     let policy = match cli.clone().or_else(|| file_get("peerflagpolicy")) {
         Some(v) => node::net::flags::FlagPolicy::parse(&v)?,
         None => node::net::flags::FlagPolicy::default(),
@@ -8560,7 +8816,9 @@ impl clap::FromArgMatches for CrawlArgs {
 
     fn from_arg_matches_mut(m: &mut clap::ArgMatches) -> Result<Self, clap::Error> {
         let list = |m: &mut clap::ArgMatches, key: &str| -> Vec<String> {
-            m.remove_many::<String>(key).map(Iterator::collect).unwrap_or_default()
+            m.remove_many::<String>(key)
+                .map(Iterator::collect)
+                .unwrap_or_default()
         };
         Ok(Self {
             crawl: m.remove_one("crawl"),
@@ -8621,17 +8879,21 @@ fn resolve_crawl(
     network: Network,
 ) -> Result<CrawlSettings, String> {
     use node::net::crawl;
-    let number = |cli: Option<u64>, key: &str, default: u64, lo: u64, hi: u64| -> Result<u64, String> {
-        let n = match (cli, file_get(key)) {
-            (Some(n), _) => n,
-            (None, Some(v)) => v.trim().parse().map_err(|_| format!("-{key} must be a whole number, not \"{v}\""))?,
-            (None, None) => default,
+    let number =
+        |cli: Option<u64>, key: &str, default: u64, lo: u64, hi: u64| -> Result<u64, String> {
+            let n = match (cli, file_get(key)) {
+                (Some(n), _) => n,
+                (None, Some(v)) => v
+                    .trim()
+                    .parse()
+                    .map_err(|_| format!("-{key} must be a whole number, not \"{v}\""))?,
+                (None, None) => default,
+            };
+            if n < lo || n > hi {
+                return Err(format!("-{key}={n} is out of range: {lo} to {hi}"));
+            }
+            Ok(n)
         };
-        if n < lo || n > hi {
-            return Err(format!("-{key}={n} is out of range: {lo} to {hi}"));
-        }
-        Ok(n)
-    };
     let max = crawl::MAX_CONCURRENCY as u64;
     let concurrency = number(
         cli.crawlconcurrency.map(|n| n as u64),
@@ -8647,7 +8909,13 @@ fn resolve_crawl(
         1,
         max,
     )? as usize;
-    let rate = number(cli.crawlrate, "crawlrate", u64::from(crawl::DEFAULT_RATE), 1, u64::from(crawl::MAX_RATE))? as u32;
+    let rate = number(
+        cli.crawlrate,
+        "crawlrate",
+        u64::from(crawl::DEFAULT_RATE),
+        1,
+        u64::from(crawl::MAX_RATE),
+    )? as u32;
     let liveness = number(
         cli.crawlliveness,
         "crawlliveness",
@@ -8662,7 +8930,13 @@ fn resolve_crawl(
         crawl::MIN_MAX_AGE_SECS,
         u64::from(u32::MAX),
     )?;
-    let list = |cli: &Vec<String>, key: &str| if cli.is_empty() { file_get_all(key) } else { cli.clone() };
+    let list = |cli: &Vec<String>, key: &str| {
+        if cli.is_empty() {
+            file_get_all(key)
+        } else {
+            cli.clone()
+        }
+    };
     let mut nets = Vec::new();
     for v in list(&cli.crawlnet, "crawlnet") {
         for part in v.split(',').map(str::trim).filter(|p| !p.is_empty()) {
@@ -8681,7 +8955,10 @@ fn resolve_crawl(
             .parse()
             .map_err(|_| format!("-crawlbind={v}: not an IP address"))?;
         if binds.iter().any(|b| b.is_ipv4() == ip.is_ipv4()) {
-            return Err(format!("-crawlbind={v}: a second {} address", if ip.is_ipv4() { "IPv4" } else { "IPv6" }));
+            return Err(format!(
+                "-crawlbind={v}: a second {} address",
+                if ip.is_ipv4() { "IPv4" } else { "IPv6" }
+            ));
         }
         binds.push(ip);
     }
@@ -8690,22 +8967,34 @@ fn resolve_crawl(
     for v in list(&cli.crawlseed, "crawlseed") {
         let mut v = v.trim().to_string();
         if node::net::dns::is_name_target(&v) {
-            return Err(format!("-crawlseed={v}: an IP address or onion, not a name"));
+            return Err(format!(
+                "-crawlseed={v}: an IP address or onion, not a name"
+            ));
         }
         // An onion with no port takes the network's, as a bare IP does: the
         // shared parser (also -connect's) asks for a port on an onion.
         if v.ends_with(".onion") {
             v = format!("{v}:{port}");
         }
-        node::net::peer::PeerAddr::parse_with_default_port(&v, port).map_err(|e| format!("-crawlseed={v}: {e}"))?;
+        node::net::peer::PeerAddr::parse_with_default_port(&v, port)
+            .map_err(|e| format!("-crawlseed={v}: {e}"))?;
         seeds.push(v);
     }
-    let ua_comment = cli.crawluacomment.clone().or_else(|| file_get("crawluacomment"));
+    let ua_comment = cli
+        .crawluacomment
+        .clone()
+        .or_else(|| file_get("crawluacomment"));
     if let Some(c) = &ua_comment {
         crawl::user_agent(Some(c))?;
     }
-    let export_key_file = cli.crawlexportkeyfile.clone().or_else(|| file_get("crawlexportkeyfile"));
-    if export_key_file.as_deref().is_some_and(|f| f.trim().is_empty()) {
+    let export_key_file = cli
+        .crawlexportkeyfile
+        .clone()
+        .or_else(|| file_get("crawlexportkeyfile"));
+    if export_key_file
+        .as_deref()
+        .is_some_and(|f| f.trim().is_empty())
+    {
         return Err("-crawlexportkeyfile: an empty path".to_string());
     }
     let export_min_k = number(
@@ -8726,7 +9015,10 @@ fn resolve_crawl(
         binds,
         seeds,
         ua_comment,
-        probes: cli.crawlprobes.or_else(|| file_get("crawlprobes").and_then(|v| parse_bool(&v))).unwrap_or(true),
+        probes: cli
+            .crawlprobes
+            .or_else(|| file_get("crawlprobes").and_then(|v| parse_bool(&v)))
+            .unwrap_or(true),
         export_key_file: export_key_file.map(|f| std::path::PathBuf::from(f.trim())),
         export_min_k,
     })
@@ -8740,11 +9032,19 @@ impl Config {
     /// crawl keeps no file.
     pub fn crawl_config(&self, datadir: Option<&std::path::Path>) -> node::net::crawl::CrawlConfig {
         use node::net::{crawl, crawlsnapshot};
-        let networks = (!self.crawlnet.is_empty())
-            .then(|| self.crawlnet.iter().filter_map(|n| crawl::parse_network(n).ok()).collect());
+        let networks = (!self.crawlnet.is_empty()).then(|| {
+            self.crawlnet
+                .iter()
+                .filter_map(|n| crawl::parse_network(n).ok())
+                .collect()
+        });
         let port = node::net::peer::default_p2p_port(self.network);
         crawl::CrawlConfig {
-            limits: crawl::Limits::new(self.crawlconcurrency, self.crawltorconcurrency, self.crawlrate),
+            limits: crawl::Limits::new(
+                self.crawlconcurrency,
+                self.crawltorconcurrency,
+                self.crawlrate,
+            ),
             liveness_secs: self.crawlliveness,
             max_age_secs: self.crawlmaxage,
             networks,
@@ -8853,7 +9153,10 @@ impl clap::FromArgMatches for AltSlotArgs {
             maxoutboundfullrelay: m.remove_one("maxoutboundfullrelay"),
             dangerous_outbound_limit: m.remove_one("enable-dangerously-large-outbound-peer-limit"),
             altslots: m.remove_one("altslots"),
-            altprefer: m.remove_many("altprefer").map(|v| v.collect()).unwrap_or_default(),
+            altprefer: m
+                .remove_many("altprefer")
+                .map(|v| v.collect())
+                .unwrap_or_default(),
             altuatrust: m.remove_one("altuatrust"),
             altfillwait: m.remove_one("altfillwait"),
         })
@@ -8894,7 +9197,10 @@ fn resolve_alt_slots(
     let count = |cli: Option<usize>, key: &str, default: usize| -> Result<usize, String> {
         match (cli, file_get(key)) {
             (Some(n), _) => Ok(n),
-            (None, Some(v)) => v.trim().parse().map_err(|_| format!("-{key} must be a whole number, not \"{v}\"")),
+            (None, Some(v)) => v
+                .trim()
+                .parse()
+                .map_err(|_| format!("-{key} must be a whole number, not \"{v}\"")),
             (None, None) => Ok(default),
         }
     };
@@ -8909,8 +9215,17 @@ fn resolve_alt_slots(
         file_get,
     );
     let slots = count(cli.altslots, "altslots", 0)?;
-    altslots::check_outbound_limits(maxoutboundfullrelay, dangerous_outbound_limit, slots, maxconnections)?;
-    let raw = if cli.altprefer.is_empty() { file_get_all("altprefer") } else { cli.altprefer.clone() };
+    altslots::check_outbound_limits(
+        maxoutboundfullrelay,
+        dangerous_outbound_limit,
+        slots,
+        maxconnections,
+    )?;
+    let raw = if cli.altprefer.is_empty() {
+        file_get_all("altprefer")
+    } else {
+        cli.altprefer.clone()
+    };
     let mut altprefer = Vec::with_capacity(raw.len());
     for v in &raw {
         altprefer.push(altslots::Rule::parse(v)?.to_string());
@@ -8929,7 +9244,14 @@ fn resolve_alt_slots(
             .map_err(|_| format!("-altfillwait must be a whole number of seconds, not \"{v}\""))?,
         (None, None) => altslots::DEFAULT_ALT_FILL_WAIT_SECS,
     };
-    Ok(AltSlotSettings { maxoutboundfullrelay, dangerous_outbound_limit, altslots: slots, altprefer, altuatrust, altfillwait })
+    Ok(AltSlotSettings {
+        maxoutboundfullrelay,
+        dangerous_outbound_limit,
+        altslots: slots,
+        altprefer,
+        altuatrust,
+        altfillwait,
+    })
 }
 
 impl Config {
@@ -8944,7 +9266,10 @@ impl Config {
         use node::net::altslots;
         altslots::AltConfig::new(
             self.altslots,
-            self.altprefer.iter().filter_map(|r| altslots::Rule::parse(r).ok()).collect(),
+            self.altprefer
+                .iter()
+                .filter_map(|r| altslots::Rule::parse(r).ok())
+                .collect(),
             altslots::UaTrust::parse(&self.altuatrust).unwrap_or_default(),
             std::time::Duration::from_secs(self.altfillwait),
         )
@@ -8959,7 +9284,12 @@ pub struct AddrIndexArgs {
 }
 
 const ADDRINDEX_ARG_SPECS: &[(&str, &str, StratumArgKind, &str)] = &[
-    ("addrindexsubscriptions", "N", StratumArgKind::Usize, "Maximum concurrent per-scripthash subscriptions, server-wide (default: 50000)"),
+    (
+        "addrindexsubscriptions",
+        "N",
+        StratumArgKind::Usize,
+        "Maximum concurrent per-scripthash subscriptions, server-wide (default: 50000)",
+    ),
     (
         "addrindexmaxhistory",
         "N",
@@ -9037,7 +9367,9 @@ impl clap::FromArgMatches for ChainWorkArgs {
     }
 
     fn from_arg_matches_mut(m: &mut clap::ArgMatches) -> Result<Self, clap::Error> {
-        Ok(Self { minimumchainwork: m.remove_one("minimumchainwork") })
+        Ok(Self {
+            minimumchainwork: m.remove_one("minimumchainwork"),
+        })
     }
 
     fn update_from_arg_matches(&mut self, matches: &clap::ArgMatches) -> Result<(), clap::Error> {
@@ -9063,16 +9395,66 @@ pub struct ZmqPubArgs {
 
 /// Help text is Core's own (v31.1 `src/init.cpp:617-626`).
 const ZMQ_PUB_ARG_SPECS: &[(&str, &str, StratumArgKind, &str)] = &[
-    ("zmqpubhashblock", "ADDRESS", StratumArgKind::TextList, "Enable publish hash block in <address>"),
-    ("zmqpubhashtx", "ADDRESS", StratumArgKind::TextList, "Enable publish hash transaction in <address>"),
-    ("zmqpubrawblock", "ADDRESS", StratumArgKind::TextList, "Enable publish raw block in <address>"),
-    ("zmqpubrawtx", "ADDRESS", StratumArgKind::TextList, "Enable publish raw transaction in <address>"),
-    ("zmqpubsequence", "ADDRESS", StratumArgKind::TextList, "Enable publish hash block and tx sequence in <address>"),
-    ("zmqpubhashblockhwm", "N", StratumArgKind::Text, "Set publish hash block outbound message high water mark (default: 1000)"),
-    ("zmqpubhashtxhwm", "N", StratumArgKind::Text, "Set publish hash transaction outbound message high water mark (default: 1000)"),
-    ("zmqpubrawblockhwm", "N", StratumArgKind::Text, "Set publish raw block outbound message high water mark (default: 1000)"),
-    ("zmqpubrawtxhwm", "N", StratumArgKind::Text, "Set publish raw transaction outbound message high water mark (default: 1000)"),
-    ("zmqpubsequencehwm", "N", StratumArgKind::Text, "Set publish hash sequence message high water mark (default: 1000)"),
+    (
+        "zmqpubhashblock",
+        "ADDRESS",
+        StratumArgKind::TextList,
+        "Enable publish hash block in <address>",
+    ),
+    (
+        "zmqpubhashtx",
+        "ADDRESS",
+        StratumArgKind::TextList,
+        "Enable publish hash transaction in <address>",
+    ),
+    (
+        "zmqpubrawblock",
+        "ADDRESS",
+        StratumArgKind::TextList,
+        "Enable publish raw block in <address>",
+    ),
+    (
+        "zmqpubrawtx",
+        "ADDRESS",
+        StratumArgKind::TextList,
+        "Enable publish raw transaction in <address>",
+    ),
+    (
+        "zmqpubsequence",
+        "ADDRESS",
+        StratumArgKind::TextList,
+        "Enable publish hash block and tx sequence in <address>",
+    ),
+    (
+        "zmqpubhashblockhwm",
+        "N",
+        StratumArgKind::Text,
+        "Set publish hash block outbound message high water mark (default: 1000)",
+    ),
+    (
+        "zmqpubhashtxhwm",
+        "N",
+        StratumArgKind::Text,
+        "Set publish hash transaction outbound message high water mark (default: 1000)",
+    ),
+    (
+        "zmqpubrawblockhwm",
+        "N",
+        StratumArgKind::Text,
+        "Set publish raw block outbound message high water mark (default: 1000)",
+    ),
+    (
+        "zmqpubrawtxhwm",
+        "N",
+        StratumArgKind::Text,
+        "Set publish raw transaction outbound message high water mark (default: 1000)",
+    ),
+    (
+        "zmqpubsequencehwm",
+        "N",
+        StratumArgKind::Text,
+        "Set publish hash sequence message high water mark (default: 1000)",
+    ),
 ];
 
 impl clap::Args for ZmqPubArgs {
@@ -9096,8 +9478,10 @@ impl clap::FromArgMatches for ZmqPubArgs {
     fn from_arg_matches_mut(m: &mut clap::ArgMatches) -> Result<Self, clap::Error> {
         let mut args = Self::default();
         for topic in CoreZmqTopic::ALL {
-            args.addresses[topic.index()] =
-                m.remove_many(topic.option()).map(|v| v.collect()).unwrap_or_default();
+            args.addresses[topic.index()] = m
+                .remove_many(topic.option())
+                .map(|v| v.collect())
+                .unwrap_or_default();
             args.hwm[topic.index()] = m.remove_one(topic.hwm_option());
         }
         Ok(args)
@@ -9135,14 +9519,22 @@ fn core_atoi_i64(value: &str) -> i64 {
         Some(rest) => (true, rest),
         None => (false, s),
     };
-    let end = digits.find(|c: char| !c.is_ascii_digit()).unwrap_or(digits.len());
+    let end = digits
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(digits.len());
     if end == 0 {
         return 0;
     }
     let mut n: i64 = 0;
     for b in digits[..end].bytes() {
         let d = i64::from(b - b'0');
-        n = match n.checked_mul(10).and_then(|n| if negative { n.checked_sub(d) } else { n.checked_add(d) }) {
+        n = match n.checked_mul(10).and_then(|n| {
+            if negative {
+                n.checked_sub(d)
+            } else {
+                n.checked_add(d)
+            }
+        }) {
             Some(n) => n,
             None => return if negative { i64::MIN } else { i64::MAX },
         };
@@ -9179,7 +9571,10 @@ fn resolve_zmq_pub(
     let mut zmq_hwm = [DEFAULT_ZMQ_SNDHWM; 5];
     let mut notes = Vec::new();
     let ZmqPubArgs { addresses, hwm } = cli;
-    for (topic, (cli_values, cli_hwm)) in CoreZmqTopic::ALL.into_iter().zip(addresses.into_iter().zip(hwm)) {
+    for (topic, (cli_values, cli_hwm)) in CoreZmqTopic::ALL
+        .into_iter()
+        .zip(addresses.into_iter().zip(hwm))
+    {
         let option = topic.option();
         let mut values = cli_values;
         if let Some(cf) = config_file {
@@ -9223,7 +9618,11 @@ fn resolve_zmq_pub(
             }
         }
     }
-    Ok(ZmqPubFields { zmq_pub, zmq_hwm, notes })
+    Ok(ZmqPubFields {
+        zmq_pub,
+        zmq_hwm,
+        notes,
+    })
 }
 
 /// The resolved Stratum [`Config`] fields.
@@ -9286,7 +9685,10 @@ fn resolve_rpc_whitelist(
 /// Resolve `-addrindexsubscriptions` and `-addrindexmaxhistory` from CLI
 /// then config file.
 #[inline(never)]
-fn resolve_addrindex_limits(cli: AddrIndexArgs, file_get: &dyn Fn(&str) -> Option<String>) -> (usize, usize) {
+fn resolve_addrindex_limits(
+    cli: AddrIndexArgs,
+    file_get: &dyn Fn(&str) -> Option<String>,
+) -> (usize, usize) {
     let subscriptions = cli
         .addrindexsubscriptions
         .or_else(|| file_get("addrindexsubscriptions").and_then(|v| v.parse().ok()))
@@ -9309,7 +9711,11 @@ fn resolve_cmpctblock_prefill(
         .cmpctblockprefill
         .or_else(|| file_get("cmpctblockprefill").and_then(|v| parse_bool(&v)))
         .unwrap_or(false);
-    let bytes = match cli.cmpctblockprefillbytes.map(|n| n.to_string()).or_else(|| file_get("cmpctblockprefillbytes")) {
+    let bytes = match cli
+        .cmpctblockprefillbytes
+        .map(|n| n.to_string())
+        .or_else(|| file_get("cmpctblockprefillbytes"))
+    {
         None => node::net::compact::DEFAULT_CMPCTBLOCK_PREFILL_BYTES,
         Some(v) => v
             .trim()
@@ -9368,11 +9774,9 @@ fn resolve_stratum(
     let stratum_difficulty = match cli.stratumdifficulty {
         Some(d) => Some(d),
         None => match file_get("stratumdifficulty") {
-            Some(v) => Some(
-                v.trim()
-                    .parse::<u64>()
-                    .map_err(|_| format!("invalid stratumdifficulty={v:?}: expected a positive integer"))?,
-            ),
+            Some(v) => Some(v.trim().parse::<u64>().map_err(|_| {
+                format!("invalid stratumdifficulty={v:?}: expected a positive integer")
+            })?),
             None => None,
         },
     };
@@ -9512,7 +9916,9 @@ fn validate_stratum(s: &StratumSettings<'_>) -> Result<(), String> {
             .parse::<bitcoin::Address<bitcoin::address::NetworkUnchecked>>()
             .map_err(|e| format!("invalid --stratumaddress {address:?}: {e}"))?
             .require_network(s.network)
-            .map_err(|_| format!("--stratumaddress {address:?} is not an address for this network"))?;
+            .map_err(|_| {
+                format!("--stratumaddress {address:?} is not an address for this network")
+            })?;
     }
     if s.difficulty == Some(0) {
         return Err("--stratumdifficulty must be at least 1".to_string());
@@ -9543,12 +9949,11 @@ fn validate_stratum(s: &StratumSettings<'_>) -> Result<(), String> {
 /// keeps them: Core's "zombie" config values, which it preserves for
 /// backwards compatibility.
 fn merge_list(cli: Vec<String>, file: Vec<String>, negation: Option<&str>) -> Vec<String> {
-    let after_last_negation = |values: Vec<String>| match negation
-        .and_then(|n| values.iter().rposition(|v| v == n))
-    {
-        Some(i) => values[i + 1..].to_vec(),
-        None => values,
-    };
+    let after_last_negation =
+        |values: Vec<String>| match negation.and_then(|n| values.iter().rposition(|v| v == n)) {
+            Some(i) => values[i + 1..].to_vec(),
+            None => values,
+        };
     let cli_ends_negated = negation.is_some_and(|n| cli.last().is_some_and(|v| v == n));
     let mut merged = after_last_negation(cli);
     if !cli_ends_negated {
@@ -9688,13 +10093,24 @@ struct ReachableInputs<'a> {
 /// messages. satd has no I2P or CJDNS transport, so it never dials either
 /// automatically; `-onlynet=i2p` is refused as Core refuses it without
 /// `-i2psam`, which satd does not implement.
-fn resolve_reachable(i: &ReachableInputs<'_>) -> Result<node::net::reachable::ReachableNets, String> {
+fn resolve_reachable(
+    i: &ReachableInputs<'_>,
+) -> Result<node::net::reachable::ReachableNets, String> {
     use node::net::reachable::{Network, ReachableNets, parse_network};
     // An onion proxy is `-onion`, or `-proxy` unless `-onion=0`.
     let onion_proxy = i.onion || (i.proxy && !i.noonion);
-    let mut nets = ReachableNets { cjdns_flip: i.cjdnsreachable, ..ReachableNets::default() };
+    let mut nets = ReachableNets {
+        cjdns_flip: i.cjdnsreachable,
+        ..ReachableNets::default()
+    };
     if !i.onlynet.is_empty() {
-        nets = ReachableNets { ipv4: false, ipv6: false, onion: false, cjdns: false, cjdns_flip: i.cjdnsreachable };
+        nets = ReachableNets {
+            ipv4: false,
+            ipv6: false,
+            onion: false,
+            cjdns: false,
+            cjdns_flip: i.cjdnsreachable,
+        };
         let mut i2p = false;
         for name in i.onlynet {
             match parse_network(name) {
@@ -9707,9 +10123,11 @@ fn resolve_reachable(i: &ReachableInputs<'_>) -> Result<node::net::reachable::Re
             }
         }
         if nets.cjdns && !i.cjdnsreachable_set {
-            return Err("Outbound connections restricted to CJDNS (-onlynet=cjdns) but -cjdnsreachable is \
+            return Err(
+                "Outbound connections restricted to CJDNS (-onlynet=cjdns) but -cjdnsreachable is \
                  not provided"
-                .to_string());
+                    .to_string(),
+            );
         }
         if nets.onion && i.noonion {
             return Err("Outbound connections restricted to Tor (-onlynet=onion) but the proxy for reaching \
@@ -9732,8 +10150,10 @@ fn resolve_reachable(i: &ReachableInputs<'_>) -> Result<node::net::reachable::Re
                 .to_string());
         }
         if i2p {
-            return Err("Outbound connections restricted to i2p (-onlynet=i2p) but -i2psam is not provided"
-                .to_string());
+            return Err(
+                "Outbound connections restricted to i2p (-onlynet=i2p) but -i2psam is not provided"
+                    .to_string(),
+            );
         }
     }
     if !i.cjdnsreachable_set {
@@ -10131,7 +10551,9 @@ fn negated_bool_with_value(arg: &str) -> Option<(&str, &str)> {
     }
     let (key, value) = arg.trim_start_matches('-').split_once('=')?;
     let flag = key.strip_prefix("no")?;
-    NEGATABLE_BOOL_FLAGS.contains(&flag).then_some((flag, value))
+    NEGATABLE_BOOL_FLAGS
+        .contains(&flag)
+        .then_some((flag, value))
 }
 
 /// Core's `InterpretBool`: empty is true, otherwise the leading integer is
@@ -10142,7 +10564,9 @@ fn core_interpret_bool(value: &str) -> bool {
     }
     let s = value.trim_start();
     let digits = s.strip_prefix(['-', '+']).unwrap_or(s);
-    let end = digits.find(|c: char| !c.is_ascii_digit()).unwrap_or(digits.len());
+    let end = digits
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(digits.len());
     digits[..end].bytes().any(|b| b != b'0')
 }
 
@@ -10153,7 +10577,9 @@ pub fn double_negative_warnings(args: &[String]) -> Vec<String> {
         .skip(1)
         .filter_map(|arg| negated_bool_with_value(arg))
         .filter(|(_, value)| !core_interpret_bool(value))
-        .map(|(flag, value)| format!("Parsed potentially confusing double-negative -{flag}={value}"))
+        .map(|(flag, value)| {
+            format!("Parsed potentially confusing double-negative -{flag}={value}")
+        })
         .collect()
 }
 
@@ -10246,7 +10672,10 @@ pub fn filter_unsupported_core_cli_args(
         let key = rest.split('=').next().unwrap_or(rest);
         // Core negates a boolean with a `-no` prefix; classify on the base key
         // so `-nodebuglogfile` is recognised as `debuglogfile`.
-        let base = key.strip_prefix("no").filter(|b| is_core_v30_key(b)).unwrap_or(key);
+        let base = key
+            .strip_prefix("no")
+            .filter(|b| is_core_v30_key(b))
+            .unwrap_or(key);
 
         if !is_core_v30_key(base) {
             kept.push(arg.clone());
@@ -10894,32 +11323,68 @@ pub const KNOWN_CONFIG_KEYS: &[&str] = &[
 /// actionable reason naming the satd equivalent. (Default is warn-and-continue;
 /// only auth / exposure / privacy keys belong here.)
 const FATAL_UNSUPPORTED_KEYS: &[(&str, &str)] = &[
-    ("i2psam", "I2P is out of scope; Tor is satd's supported anonymity network (-proxy / -onion / -torcontrol). Leaving this in place would route traffic over clearnet instead of the privacy network you configured."),
-    ("i2pacceptincoming", "I2P is out of scope (see i2psam); Tor is satd's supported anonymity network."),
-    ("privatebroadcast", "satd does not implement Bitcoin Core's private broadcast. Leaving this in place would announce transactions submitted by sendrawtransaction to every peer instead of only through short-lived Tor or I2P connections."),
+    (
+        "i2psam",
+        "I2P is out of scope; Tor is satd's supported anonymity network (-proxy / -onion / -torcontrol). Leaving this in place would route traffic over clearnet instead of the privacy network you configured.",
+    ),
+    (
+        "i2pacceptincoming",
+        "I2P is out of scope (see i2psam); Tor is satd's supported anonymity network.",
+    ),
+    (
+        "privatebroadcast",
+        "satd does not implement Bitcoin Core's private broadcast. Leaving this in place would announce transactions submitted by sendrawtransaction to every peer instead of only through short-lived Tor or I2P connections.",
+    ),
 ];
 
 /// Optional, richer guidance appended to the warning when a *skipped* Core key
 /// has a satd-specific replacement the operator should switch to. Keys not
 /// listed here get a generic "recognized but not implemented" warning.
 const SKIP_GUIDANCE: &[(&str, &str)] = &[
-    ("rest", "satd ships a native Esplora REST API instead of Core's /rest/ surface; enable it with -esplora (on by default)."),
-    ("peerbloomfilters", "BIP37 bloom filters are intentionally unsupported (privacy / DoS); use BIP157/158 compact filters via -blockfilterindex / -peerblockfilters."),
-    ("maxorphantx", "this option was removed in Bitcoin Core v30 as well."),
-    ("natpmp", "satd does not implement PCP/NAT-PMP port mapping; configure port forwarding externally."),
-    ("debuglogfile", "satd logs to stdout/journald and has no debug.log; manage retention via journald or your container runtime."),
-    ("shrinkdebugfile", "satd logs to stdout/journald and has no debug.log to shrink; manage retention via journald or your container runtime."),
-    ("printtoconsole", "satd always logs to stdout; there is no debug.log alternative to toggle."),
+    (
+        "rest",
+        "satd ships a native Esplora REST API instead of Core's /rest/ surface; enable it with -esplora (on by default).",
+    ),
+    (
+        "peerbloomfilters",
+        "BIP37 bloom filters are intentionally unsupported (privacy / DoS); use BIP157/158 compact filters via -blockfilterindex / -peerblockfilters.",
+    ),
+    (
+        "maxorphantx",
+        "this option was removed in Bitcoin Core v30 as well.",
+    ),
+    (
+        "natpmp",
+        "satd does not implement PCP/NAT-PMP port mapping; configure port forwarding externally.",
+    ),
+    (
+        "debuglogfile",
+        "satd logs to stdout/journald and has no debug.log; manage retention via journald or your container runtime.",
+    ),
+    (
+        "shrinkdebugfile",
+        "satd logs to stdout/journald and has no debug.log to shrink; manage retention via journald or your container runtime.",
+    ),
+    (
+        "printtoconsole",
+        "satd always logs to stdout; there is no debug.log alternative to toggle.",
+    ),
     // The *notify shell-hook family. satd honors -blocknotify, -alertnotify,
     // -startupnotify and -shutdownnotify for Core convenience (see
     // KNOWN_CONFIG_KEYS), but the supported way to build on satd is the
     // Streaming Consumption API (reorg-safe, replayable, decoupled from
     // consensus). Only -walletnotify is unsupported — satd is keyless.
-    ("walletnotify", "satd is keyless (no wallet), so -walletnotify has nothing to fire on; watch addresses/scripts via the Streaming Consumption API or the Esplora API."),
+    (
+        "walletnotify",
+        "satd is keyless (no wallet), so -walletnotify has nothing to fire on; watch addresses/scripts via the Streaming Consumption API or the Esplora API.",
+    ),
     // satd's structured logger always emits high-precision (sub-second)
     // timestamps; there is no seconds-only mode to toggle, so this Core knob
     // is a no-op rather than a behavior change. Skipped, not honored.
-    ("logtimemicros", "satd's logger always emits sub-second timestamps; there is no seconds-only mode, so this toggle has no effect. Use -logtimestamps=0 to drop timestamps entirely."),
+    (
+        "logtimemicros",
+        "satd's logger always emits sub-second timestamps; there is no seconds-only mode, so this toggle has no effect. Use -logtimestamps=0 to drop timestamps entirely.",
+    ),
 ];
 
 /// The frozen set of Bitcoin Core **v30** config keys (bitcoind node + wallet +
@@ -10939,42 +11404,196 @@ const SKIP_GUIDANCE: &[(&str, &str)] = &[
 /// (the same extraction at `v32.1`, listed last). Keys Core adds in later
 /// releases are treated as typos until this list is bumped.
 const CORE_V30_KEYS: &[&str] = &[
-    "acceptnonstdtxn", "acceptstalefeeestimates", "addnode", "addresstype", "alertnotify", "allowignoredconf",
-    "asmap", "assumevalid", "avoidpartialspends", "bantime", "bind", "blockfilterindex",
-    "blockmaxweight", "blockmintxfee", "blocknotify", "blockreconstructionextratxn", "blockreservedweight", "blocksdir",
-    "blocksonly", "blockversion", "bytespersigop", "capturemessages", "chain",
-    "changetype", "checkaddrman", "checkblockindex", "checkblocks", "checklevel", "checkmempool",
-    "checkpoints", "cjdnsreachable", "coinstatsindex", "conf", "connect", "consolidatefeerate",
-    "daemon", "daemonwait", "datacarrier", "datacarriersize", "datadir", "dbbatchsize",
-    "dbcache", "debug", "debugexclude", "debuglogfile", "deprecatedrpc", "disablewallet",
-    "discardfee", "discover", "dns",
-    "dnsseed", "dustrelayfee", "externalip", "fallbackfee", "fastprune", "fixedseeds",
-    "forcednsseed", "help", "help-debug", "i2pacceptincoming", "i2psam", "includeconf",
-    "incrementalrelayfee", "ipcbind", "keypool", "limitancestorcount", "limitancestorsize", "limitdescendantcount",
-    "limitdescendantsize", "listen", "listenonion", "loadblock", "logips", "loglevel",
-    "loglevelalways", "logratelimit", "logsourcelocations", "logthreadnames", "logtimemicros", "logtimestamps",
-    "maxapsfee", "maxconnections", "maxmempool", "maxorphantx", "maxreceivebuffer", "maxsendbuffer",
-    "maxsigcachesize", "maxtipage", "maxtxfee", "maxuploadtarget", "mempoolexpiry", "minimumchainwork",
-    "minrelaytxfee", "mintxfee", "mocktime", "natpmp", "networkactive", "onion",
-    "onlynet", "par", "paytxfee", "peerblockfilters", "peerbloomfilters", "peertimeout",
-    "permitbaremultisig", "persistmempool", "persistmempoolv1", "pid", "port", "printpriority",
-    "printtoconsole", "proxy", "proxyrandomize", "prune", "regtest", "reindex",
+    "acceptnonstdtxn",
+    "acceptstalefeeestimates",
+    "addnode",
+    "addresstype",
+    "alertnotify",
+    "allowignoredconf",
+    "asmap",
+    "assumevalid",
+    "avoidpartialspends",
+    "bantime",
+    "bind",
+    "blockfilterindex",
+    "blockmaxweight",
+    "blockmintxfee",
+    "blocknotify",
+    "blockreconstructionextratxn",
+    "blockreservedweight",
+    "blocksdir",
+    "blocksonly",
+    "blockversion",
+    "bytespersigop",
+    "capturemessages",
+    "chain",
+    "changetype",
+    "checkaddrman",
+    "checkblockindex",
+    "checkblocks",
+    "checklevel",
+    "checkmempool",
+    "checkpoints",
+    "cjdnsreachable",
+    "coinstatsindex",
+    "conf",
+    "connect",
+    "consolidatefeerate",
+    "daemon",
+    "daemonwait",
+    "datacarrier",
+    "datacarriersize",
+    "datadir",
+    "dbbatchsize",
+    "dbcache",
+    "debug",
+    "debugexclude",
+    "debuglogfile",
+    "deprecatedrpc",
+    "disablewallet",
+    "discardfee",
+    "discover",
+    "dns",
+    "dnsseed",
+    "dustrelayfee",
+    "externalip",
+    "fallbackfee",
+    "fastprune",
+    "fixedseeds",
+    "forcednsseed",
+    "help",
+    "help-debug",
+    "i2pacceptincoming",
+    "i2psam",
+    "includeconf",
+    "incrementalrelayfee",
+    "ipcbind",
+    "keypool",
+    "limitancestorcount",
+    "limitancestorsize",
+    "limitdescendantcount",
+    "limitdescendantsize",
+    "listen",
+    "listenonion",
+    "loadblock",
+    "logips",
+    "loglevel",
+    "loglevelalways",
+    "logratelimit",
+    "logsourcelocations",
+    "logthreadnames",
+    "logtimemicros",
+    "logtimestamps",
+    "maxapsfee",
+    "maxconnections",
+    "maxmempool",
+    "maxorphantx",
+    "maxreceivebuffer",
+    "maxsendbuffer",
+    "maxsigcachesize",
+    "maxtipage",
+    "maxtxfee",
+    "maxuploadtarget",
+    "mempoolexpiry",
+    "minimumchainwork",
+    "minrelaytxfee",
+    "mintxfee",
+    "mocktime",
+    "natpmp",
+    "networkactive",
+    "onion",
+    "onlynet",
+    "par",
+    "paytxfee",
+    "peerblockfilters",
+    "peerbloomfilters",
+    "peertimeout",
+    "permitbaremultisig",
+    "persistmempool",
+    "persistmempoolv1",
+    "pid",
+    "port",
+    "printpriority",
+    "printtoconsole",
+    "proxy",
+    "proxyrandomize",
+    "prune",
+    "regtest",
+    "reindex",
     "reindex-chainstate",
-    "rest", "rpcallowip", "rpcauth", "rpcbind", "rpccookiefile", "rpccookieperms",
-    "rpcdoccheck", "rpcpassword", "rpcport", "rpcservertimeout", "rpcthreads", "rpcuser",
-    "rpcwhitelist", "rpcwhitelistdefault", "rpcworkqueue", "seednode", "server", "settings",
-    "shrinkdebugfile", "shutdownnotify", "signer", "signet", "signetchallenge", "signetseednode",
+    "rest",
+    "rpcallowip",
+    "rpcauth",
+    "rpcbind",
+    "rpccookiefile",
+    "rpccookieperms",
+    "rpcdoccheck",
+    "rpcpassword",
+    "rpcport",
+    "rpcservertimeout",
+    "rpcthreads",
+    "rpcuser",
+    "rpcwhitelist",
+    "rpcwhitelistdefault",
+    "rpcworkqueue",
+    "seednode",
+    "server",
+    "settings",
+    "shrinkdebugfile",
+    "shutdownnotify",
+    "signer",
+    "signet",
+    "signetchallenge",
+    "signetseednode",
     "spendzeroconfchange",
-    "startupnotify", "stopafterblockimport", "stopatheight", "test", "testactivationheight", "testnet",
-    "testnet4", "timeout", "torcontrol", "torpassword", "txconfirmtarget", "txindex",
-    "txospenderindex", "txreconciliation", "uacomment", "unsafesqlitesync", "v2transport", "vbparams", "version",
-    "wallet", "walletbroadcast", "walletcrosschain", "walletdir", "walletnotify", "walletrbf",
-    "walletrejectlongchains", "whitebind", "whitelist", "whitelistforcerelay", "whitelistrelay", "zmqpubhashblock",
-    "zmqpubhashblockhwm", "zmqpubhashtx", "zmqpubhashtxhwm", "zmqpubrawblock", "zmqpubrawblockhwm", "zmqpubrawtx",
-    "zmqpubrawtxhwm", "zmqpubsequence", "zmqpubsequencehwm",
+    "startupnotify",
+    "stopafterblockimport",
+    "stopatheight",
+    "test",
+    "testactivationheight",
+    "testnet",
+    "testnet4",
+    "timeout",
+    "torcontrol",
+    "torpassword",
+    "txconfirmtarget",
+    "txindex",
+    "txospenderindex",
+    "txreconciliation",
+    "uacomment",
+    "unsafesqlitesync",
+    "v2transport",
+    "vbparams",
+    "version",
+    "wallet",
+    "walletbroadcast",
+    "walletcrosschain",
+    "walletdir",
+    "walletnotify",
+    "walletrbf",
+    "walletrejectlongchains",
+    "whitebind",
+    "whitelist",
+    "whitelistforcerelay",
+    "whitelistrelay",
+    "zmqpubhashblock",
+    "zmqpubhashblockhwm",
+    "zmqpubhashtx",
+    "zmqpubhashtxhwm",
+    "zmqpubrawblock",
+    "zmqpubrawblockhwm",
+    "zmqpubrawtx",
+    "zmqpubrawtxhwm",
+    "zmqpubsequence",
+    "zmqpubsequencehwm",
     // Added by Core v31 and v32.1.
-    "inboundrelaypercent", "limitclustercount", "limitclustersize", "prevoutfetchthreads",
-    "privatebroadcast", "rpcmaxconnections", "txsendrate",
+    "inboundrelaypercent",
+    "limitclustercount",
+    "limitclustersize",
+    "prevoutfetchthreads",
+    "privatebroadcast",
+    "rpcmaxconnections",
+    "txsendrate",
 ];
 
 /// Is the given config-file key recognised? Returns true for any
@@ -11081,11 +11700,16 @@ pub fn debug_directives(debug: &[String], debugexclude: &[String]) -> (bool, Vec
     // Core's `SetLoggingCategories` (`src/init/common.cpp`): categories
     // before the last `0` or `none` are disregarded, and the ones after it
     // still apply. `-debug=net -debug=0` enabled `net` here.
-    let debug = match debug.iter().rposition(|c| matches!(norm(c).as_str(), "0" | "none")) {
+    let debug = match debug
+        .iter()
+        .rposition(|c| matches!(norm(c).as_str(), "0" | "none"))
+    {
         Some(i) => &debug[i + 1..],
         None => debug,
     };
-    let enable_all = debug.iter().any(|c| matches!(norm(c).as_str(), "1" | "all"));
+    let enable_all = debug
+        .iter()
+        .any(|c| matches!(norm(c).as_str(), "1" | "all"));
 
     let excluded: std::collections::BTreeSet<&'static str> = debugexclude
         .iter()
@@ -11405,7 +12029,9 @@ fn parse_maxuploadtarget(s: &str) -> Result<u64, String> {
     if s.is_empty() {
         return Err("maxuploadtarget: empty value".to_string());
     }
-    let split = s.find(|c: char| !c.is_ascii_digit() && c != '.').unwrap_or(s.len());
+    let split = s
+        .find(|c: char| !c.is_ascii_digit() && c != '.')
+        .unwrap_or(s.len());
     let (num_str, unit) = s.split_at(split);
     let num: f64 = num_str
         .parse()
@@ -11528,11 +12154,19 @@ pub fn parse_bind_spec(raw: &str, default_port: u16) -> Result<BindSpec, String>
     let addr = match addr_part.parse::<SocketAddr>() {
         Ok(sa) => sa,
         Err(_) => {
-            let port = if onion { default_port.wrapping_add(1) } else { default_port };
+            let port = if onion {
+                default_port.wrapping_add(1)
+            } else {
+                default_port
+            };
             parse_p2p_bind(addr_part, port)?
         }
     };
-    Ok(BindSpec { addr, onion, derived: false })
+    Ok(BindSpec {
+        addr,
+        onion,
+        derived: false,
+    })
 }
 
 /// Join a `-bind` address and `-port` into a P2P socket address.
@@ -11693,7 +12327,11 @@ mod tests {
             .filter_map(|a| a.get_long().map(str::to_string))
             .filter(|l| l != "help" && l != "version")
             .collect();
-        assert!(longs.len() > 100, "expected a large CLI surface, got {}", longs.len());
+        assert!(
+            longs.len() > 100,
+            "expected a large CLI surface, got {}",
+            longs.len()
+        );
 
         let mut unreachable = Vec::new();
         for long in &longs {
@@ -11740,7 +12378,12 @@ mod tests {
     /// unsupported options and dropped.
     #[test]
     fn core_named_satd_flags_are_not_dropped() {
-        for flag in ["-blockfilterindex=1", "-peerblockfilters=1", "-txindex=1", "-prune=550"] {
+        for flag in [
+            "-blockfilterindex=1",
+            "-peerblockfilters=1",
+            "-txindex=1",
+            "-prune=550",
+        ] {
             let args = normalize_args(vec!["satd".to_string(), flag.to_string()]);
             let (kept, warnings) = filter_unsupported_core_cli_args(args).expect("no fatal key");
             assert_eq!(kept.len(), 2, "{flag} was dropped");
@@ -11770,7 +12413,10 @@ mod tests {
         // absurd rate is an error rather than a number the node then has to
         // saturate around in every fee computation. 21 million BTC/kvB is the
         // ceiling, in either spelling.
-        assert_eq!(parse_fee_rate_value("21000000.0"), Ok(21_000_000 * 100_000_000));
+        assert_eq!(
+            parse_fee_rate_value("21000000.0"),
+            Ok(21_000_000 * 100_000_000)
+        );
         assert!(parse_fee_rate_value("21000001.0").is_err());
         assert_eq!(
             parse_fee_rate_value("2100000000000000"),
@@ -11784,7 +12430,16 @@ mod tests {
     /// or truncated to something the operator did not ask for.
     #[test]
     fn unrepresentable_fee_rates_are_rejected() {
-        for bad in ["-0.001", "abc", "", ".", "0.000000001", "1.2.3", "0x10", "1e-5"] {
+        for bad in [
+            "-0.001",
+            "abc",
+            "",
+            ".",
+            "0.000000001",
+            "1.2.3",
+            "0x10",
+            "1e-5",
+        ] {
             assert!(parse_fee_rate_value(bad).is_err(), "{bad:?} was accepted");
         }
     }
@@ -11809,7 +12464,11 @@ mod tests {
     /// failed to start.
     #[test]
     fn bare_blockfilterindex_means_basic() {
-        for spelling in ["-blockfilterindex", "-blockfilterindex=basic", "-blockfilterindex=1"] {
+        for spelling in [
+            "-blockfilterindex",
+            "-blockfilterindex=basic",
+            "-blockfilterindex=1",
+        ] {
             let args = normalize_args(vec!["satd".to_string(), spelling.to_string()]);
             let cli = parse_cli(args).unwrap_or_else(|e| panic!("{spelling}: {e}"));
             assert_eq!(cli.blockfilterindex, Some(true), "{spelling}");
@@ -11844,9 +12503,14 @@ mod tests {
         ] {
             assert_eq!(parse_opreturn_prune_size(v), Ok(want), "{v}");
         }
-        for v in ["", "1.5k", "10 k", "10kib", "-5", "5G", "1GiB", "4000001", "5MiB", "k", "10KiBs"] {
+        for v in [
+            "", "1.5k", "10 k", "10kib", "-5", "5G", "1GiB", "4000001", "5MiB", "k", "10KiBs",
+        ] {
             let err = parse_opreturn_prune_size(v).expect_err(v);
-            assert!(err.contains("KiB or MiB"), "{v}: lists the accepted forms: {err}");
+            assert!(
+                err.contains("KiB or MiB"),
+                "{v}: lists the accepted forms: {err}"
+            );
         }
     }
 
@@ -11878,26 +12542,64 @@ mod tests {
         let build = |body: &str, extra: &[&str]| {
             let conf = dir.path().join("strip.conf");
             std::fs::write(&conf, body).unwrap();
-            let mut args = vec!["satd", "--datadir", dir.path().to_str().unwrap(), "--conf", conf.to_str().unwrap()];
+            let mut args = vec![
+                "satd",
+                "--datadir",
+                dir.path().to_str().unwrap(),
+                "--conf",
+                conf.to_str().unwrap(),
+            ];
             args.extend_from_slice(extra);
             Config::from_cli(parse_cli(args).unwrap())
         };
         let off = build("", &[]).unwrap();
         assert_eq!(
-            (off.opreturn_prune_depth, off.opreturn_prune_size, off.opreturn_prune_peers),
+            (
+                off.opreturn_prune_depth,
+                off.opreturn_prune_size,
+                off.opreturn_prune_peers
+            ),
             (0, 4096, PrunePeers::Limited),
             "defaults: off, 4096, limited"
         );
-        let file = build("pruneopreturn=all\npruneopreturnsize=10KiB\npruneopreturnpeers=intact\n", &[]).unwrap();
+        let file = build(
+            "pruneopreturn=all\npruneopreturnsize=10KiB\npruneopreturnpeers=intact\n",
+            &[],
+        )
+        .unwrap();
         assert_eq!(
-            (file.opreturn_prune_depth, file.opreturn_prune_size, file.opreturn_prune_peers),
+            (
+                file.opreturn_prune_depth,
+                file.opreturn_prune_size,
+                file.opreturn_prune_peers
+            ),
             (288, 10_240, PrunePeers::Intact)
         );
-        let cli = build("pruneopreturn=4320\n", &["--pruneopreturn=52560", "--pruneopreturnsize=1k"]).unwrap();
-        assert_eq!((cli.opreturn_prune_depth, cli.opreturn_prune_size), (52560, 1000), "the CLI wins");
-        assert!(build("pruneopreturn=100\n", &[]).unwrap_err().contains("at least 288"));
-        assert!(build("", &["--pruneopreturnsize=1.5k"]).unwrap_err().contains("KiB or MiB"));
-        assert!(build("pruneopreturnpeers=open\n", &[]).unwrap_err().contains("limited or intact"));
+        let cli = build(
+            "pruneopreturn=4320\n",
+            &["--pruneopreturn=52560", "--pruneopreturnsize=1k"],
+        )
+        .unwrap();
+        assert_eq!(
+            (cli.opreturn_prune_depth, cli.opreturn_prune_size),
+            (52560, 1000),
+            "the CLI wins"
+        );
+        assert!(
+            build("pruneopreturn=100\n", &[])
+                .unwrap_err()
+                .contains("at least 288")
+        );
+        assert!(
+            build("", &["--pruneopreturnsize=1.5k"])
+                .unwrap_err()
+                .contains("KiB or MiB")
+        );
+        assert!(
+            build("pruneopreturnpeers=open\n", &[])
+                .unwrap_err()
+                .contains("limited or intact")
+        );
     }
 
     /// Plan §11.3: `-restoreopreturns` with any OP_RETURN pruning option, at
@@ -11908,30 +12610,68 @@ mod tests {
         let build = |body: &str, extra: &[&str]| {
             let conf = dir.path().join("restore.conf");
             std::fs::write(&conf, body).unwrap();
-            let mut args = vec!["satd", "--datadir", dir.path().to_str().unwrap(), "--conf", conf.to_str().unwrap()];
+            let mut args = vec![
+                "satd",
+                "--datadir",
+                dir.path().to_str().unwrap(),
+                "--conf",
+                conf.to_str().unwrap(),
+            ];
             args.extend_from_slice(extra);
             Config::from_cli(parse_cli(args).unwrap())
         };
         assert!(!build("", &[]).unwrap().restore_opreturns, "off by default");
-        assert!(build("", &["--restoreopreturns"]).unwrap().restore_opreturns, "alone, from the CLI");
-        assert!(build("restoreopreturns=1\n", &[]).unwrap().restore_opreturns, "alone, from the file");
-        for option in ["pruneopreturn=0", "pruneopreturn=all", "pruneopreturnsize=0", "pruneopreturnpeers=limited"] {
+        assert!(
+            build("", &["--restoreopreturns"])
+                .unwrap()
+                .restore_opreturns,
+            "alone, from the CLI"
+        );
+        assert!(
+            build("restoreopreturns=1\n", &[])
+                .unwrap()
+                .restore_opreturns,
+            "alone, from the file"
+        );
+        for option in [
+            "pruneopreturn=0",
+            "pruneopreturn=all",
+            "pruneopreturnsize=0",
+            "pruneopreturnpeers=limited",
+        ] {
             let key = option.split('=').next().unwrap();
             for (body, cli) in [
                 (format!("restoreopreturns=1\n{option}\n"), vec![]),
-                (String::new(), vec!["--restoreopreturns".to_string(), format!("--{option}")]),
-                (format!("{option}\n"), vec!["--restoreopreturns=1".to_string()]),
+                (
+                    String::new(),
+                    vec!["--restoreopreturns".to_string(), format!("--{option}")],
+                ),
+                (
+                    format!("{option}\n"),
+                    vec!["--restoreopreturns=1".to_string()],
+                ),
             ] {
                 let cli: Vec<&str> = cli.iter().map(String::as_str).collect();
                 let err = build(&body, &cli).expect_err(option);
-                assert!(err.contains("-restoreopreturns") && err.contains(&format!("-{key}")), "{option}: {err}");
+                assert!(
+                    err.contains("-restoreopreturns") && err.contains(&format!("-{key}")),
+                    "{option}: {err}"
+                );
             }
         }
         // Turned off, it conflicts with nothing.
-        assert!(!build("restoreopreturns=0\npruneopreturn=all\n", &[]).unwrap().restore_opreturns);
+        assert!(
+            !build("restoreopreturns=0\npruneopreturn=all\n", &[])
+                .unwrap()
+                .restore_opreturns
+        );
         let err = build("", &["--restoreopreturns", "--allowteststrip"]).unwrap_err();
         assert!(err.contains("-allowteststrip"), "{err}");
-        assert!(build("restoreopreturns=maybe\n", &[]).unwrap_err().contains("0 or 1"));
+        assert!(
+            build("restoreopreturns=maybe\n", &[])
+                .unwrap_err()
+                .contains("0 or 1")
+        );
     }
 
     #[test]
@@ -11950,24 +12690,52 @@ mod tests {
             args.extend_from_slice(extra);
             Config::from_cli(parse_cli(args).unwrap())
         };
-        let core_refusal = "Specified -blockmaxweight (4000001) exceeds consensus maximum block weight (4000000)";
+        let core_refusal =
+            "Specified -blockmaxweight (4000001) exceeds consensus maximum block weight (4000000)";
 
-        assert_eq!(build("", &[]).unwrap().blockmaxweight, 4_000_000, "Core's default is the consensus maximum");
-        assert_eq!(build("blockmaxweight=4000000\n", &[]).unwrap().blockmaxweight, 4_000_000);
-        assert_eq!(build("blockmaxweight=100000\n", &[]).unwrap().blockmaxweight, 100_000);
-        assert_eq!(build("blockmaxweight=100\n", &[]).unwrap().blockmaxweight, 100);
-        assert_eq!(build("", &["--blockmaxweight=4000000"]).unwrap().blockmaxweight, 4_000_000);
+        assert_eq!(
+            build("", &[]).unwrap().blockmaxweight,
+            4_000_000,
+            "Core's default is the consensus maximum"
+        );
+        assert_eq!(
+            build("blockmaxweight=4000000\n", &[])
+                .unwrap()
+                .blockmaxweight,
+            4_000_000
+        );
+        assert_eq!(
+            build("blockmaxweight=100000\n", &[])
+                .unwrap()
+                .blockmaxweight,
+            100_000
+        );
+        assert_eq!(
+            build("blockmaxweight=100\n", &[]).unwrap().blockmaxweight,
+            100
+        );
+        assert_eq!(
+            build("", &["--blockmaxweight=4000000"])
+                .unwrap()
+                .blockmaxweight,
+            4_000_000
+        );
         assert_eq!(
             build("blockmaxweight=4000001\n", &[]).expect_err("above the maximum in the file"),
             core_refusal
         );
         assert_eq!(
-            build("", &["--blockmaxweight=4000001"]).expect_err("above the maximum on the command line"),
+            build("", &["--blockmaxweight=4000001"])
+                .expect_err("above the maximum on the command line"),
             core_refusal
         );
         let err = build("blockmaxweight=abc\n", &[]).expect_err("garbage must not be accepted");
-        assert!(err.contains("blockmaxweight in config file") && err.contains("\"abc\""), "unhelpful error: {err}");
-        let err = build("blockmaxweight=-1\n", &[]).expect_err("a negative weight must not be accepted");
+        assert!(
+            err.contains("blockmaxweight in config file") && err.contains("\"abc\""),
+            "unhelpful error: {err}"
+        );
+        let err =
+            build("blockmaxweight=-1\n", &[]).expect_err("a negative weight must not be accepted");
         assert!(err.contains("blockmaxweight"), "unhelpful error: {err}");
     }
 
@@ -11993,25 +12761,36 @@ mod tests {
             )
         };
 
-        let cfg = build("minrelaytxfee=0.00002
+        let cfg = build(
+            "minrelaytxfee=0.00002
 dustrelayfee=0.00005
 blockmintxfee=0.00001
-")
-            .expect("Core-spelled fee rates must be honoured");
+",
+        )
+        .expect("Core-spelled fee rates must be honoured");
         assert_eq!(cfg.minrelaytxfee, 2_000, "BTC/kvB was not applied");
         assert_eq!(cfg.dustrelayfee, 5_000, "BTC/kvB was not applied");
         assert_eq!(cfg.blockmintxfee, 1_000, "BTC/kvB was not applied");
 
         // satd's own spelling keeps working.
-        let cfg = build("minrelaytxfee=1500
-").expect("sat/kvB must still be honoured");
+        let cfg = build(
+            "minrelaytxfee=1500
+",
+        )
+        .expect("sat/kvB must still be honoured");
         assert_eq!(cfg.minrelaytxfee, 1_500);
 
-        let err = build("minrelaytxfee=wat
-").expect_err("garbage must not be accepted");
+        let err = build(
+            "minrelaytxfee=wat
+",
+        )
+        .expect_err("garbage must not be accepted");
         assert!(err.contains("minrelaytxfee"), "unhelpful error: {err}");
-        let err = build("blockmintxfee=wat
-").expect_err("garbage must not be accepted");
+        let err = build(
+            "blockmintxfee=wat
+",
+        )
+        .expect_err("garbage must not be accepted");
         assert!(err.contains("blockmintxfee"), "unhelpful error: {err}");
     }
 
@@ -12041,13 +12820,19 @@ blockmintxfee=0.00001
     #[test]
     fn a_repeated_scalar_option_takes_the_last_value() {
         let args = normalize_args(
-            ["satd", "-v2transport=0", "-v2transport=1"].iter().map(|s| s.to_string()).collect(),
+            ["satd", "-v2transport=0", "-v2transport=1"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
         );
         let cli = parse_cli(args).expect("a repeated option must not abort startup");
         assert_eq!(cli.v2transport, Some(true), "the last value must win");
 
         let args = normalize_args(
-            ["satd", "-port=1111", "-port=2222"].iter().map(|s| s.to_string()).collect(),
+            ["satd", "-port=1111", "-port=2222"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
         );
         assert_eq!(parse_cli(args).unwrap().port, Some(2222));
     }
@@ -12058,10 +12843,16 @@ blockmintxfee=0.00001
     #[test]
     fn repeatable_options_still_accumulate() {
         let args = normalize_args(
-            ["satd", "-bind=127.0.0.1", "-bind=127.0.0.2", "-connect=10.0.0.1:8333", "-connect=10.0.0.2:8333"]
-                .iter()
-                .map(|s| s.to_string())
-                .collect(),
+            [
+                "satd",
+                "-bind=127.0.0.1",
+                "-bind=127.0.0.2",
+                "-connect=10.0.0.1:8333",
+                "-connect=10.0.0.2:8333",
+            ]
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
         );
         let cli = parse_cli(args).expect("repeatable options must parse");
         assert_eq!(cli.bind.len(), 2, "-bind must accumulate: {:?}", cli.bind);
@@ -12085,7 +12876,10 @@ blockmintxfee=0.00001
                 .unwrap(),
             )
         };
-        assert_eq!(load("4").err().as_deref(), Some("-maxmempool must be at least 5 MB"));
+        assert_eq!(
+            load("4").err().as_deref(),
+            Some("-maxmempool must be at least 5 MB")
+        );
         assert_eq!(load("5").expect("Core's floor is allowed").maxmempool, 5);
         assert_eq!(load("0").expect("Core allows 0").maxmempool, 0);
     }
@@ -12096,11 +12890,18 @@ blockmintxfee=0.00001
     fn txannouncedelay_is_on_by_default_and_can_be_turned_off() {
         let dir = tempfile::tempdir().expect("tempdir");
         let load = |extra: &[&str]| {
-            let mut args = vec!["satd", "--regtest", "--datadir", dir.path().to_str().unwrap()];
+            let mut args = vec![
+                "satd",
+                "--regtest",
+                "--datadir",
+                dir.path().to_str().unwrap(),
+            ];
             args.extend_from_slice(extra);
-            Config::from_cli(parse_cli(normalize_args(args.iter().map(|a| a.to_string()).collect())).unwrap())
-                .expect("loads")
-                .txannouncedelay
+            Config::from_cli(
+                parse_cli(normalize_args(args.iter().map(|a| a.to_string()).collect())).unwrap(),
+            )
+            .expect("loads")
+            .txannouncedelay
         };
         assert!(load(&[]));
         assert!(!load(&["-txannouncedelay=0"]));
@@ -12117,19 +12918,41 @@ blockmintxfee=0.00001
     fn deprecatedrpc_is_read_and_unknown_names_warned() {
         let dir = tempfile::tempdir().expect("tempdir");
         let load = |extra: &[&str]| {
-            let mut args = vec!["satd", "--regtest", "--datadir", dir.path().to_str().unwrap()];
+            let mut args = vec![
+                "satd",
+                "--regtest",
+                "--datadir",
+                dir.path().to_str().unwrap(),
+            ];
             args.extend_from_slice(extra);
-            Config::from_cli(parse_cli(normalize_args(args.iter().map(|a| a.to_string()).collect())).unwrap())
-                .expect("loads")
+            Config::from_cli(
+                parse_cli(normalize_args(args.iter().map(|a| a.to_string()).collect())).unwrap(),
+            )
+            .expect("loads")
         };
         assert!(load(&[]).deprecatedrpc.is_empty());
-        assert_eq!(load(&["-deprecatedrpc=warnings"]).deprecatedrpc, vec!["warnings"]);
-        std::fs::write(dir.path().join("bitcoin.conf"), "deprecatedrpc=warnings\ndeprecatedrpc=create_bdb\n").unwrap();
+        assert_eq!(
+            load(&["-deprecatedrpc=warnings"]).deprecatedrpc,
+            vec!["warnings"]
+        );
+        std::fs::write(
+            dir.path().join("bitcoin.conf"),
+            "deprecatedrpc=warnings\ndeprecatedrpc=create_bdb\n",
+        )
+        .unwrap();
         let c = load(&[]);
         assert_eq!(c.deprecatedrpc, vec!["warnings", "create_bdb"]);
         let notes: Vec<&str> = c.pending_notes.iter().map(|n| n.message.as_str()).collect();
-        assert!(notes.iter().any(|m| m.contains("-deprecatedrpc=create_bdb")), "{notes:?}");
-        assert!(!notes.iter().any(|m| m.contains("-deprecatedrpc=warnings")), "{notes:?}");
+        assert!(
+            notes
+                .iter()
+                .any(|m| m.contains("-deprecatedrpc=create_bdb")),
+            "{notes:?}"
+        );
+        assert!(
+            !notes.iter().any(|m| m.contains("-deprecatedrpc=warnings")),
+            "{notes:?}"
+        );
     }
 
     /// `reindex` and `reindexchainstate` are read from the file, as Core
@@ -12139,16 +12962,27 @@ blockmintxfee=0.00001
     fn reindex_keys_are_read_from_the_config_file() {
         let dir = tempfile::tempdir().expect("tempdir");
         let load = |extra: &[&str]| {
-            let mut args = vec!["satd", "--regtest", "--datadir", dir.path().to_str().unwrap()];
+            let mut args = vec![
+                "satd",
+                "--regtest",
+                "--datadir",
+                dir.path().to_str().unwrap(),
+            ];
             args.extend_from_slice(extra);
-            let c = Config::from_cli(parse_cli(normalize_args(args.iter().map(|a| a.to_string()).collect())).unwrap())
-                .expect("loads");
+            let c = Config::from_cli(
+                parse_cli(normalize_args(args.iter().map(|a| a.to_string()).collect())).unwrap(),
+            )
+            .expect("loads");
             (c.reindex, c.reindex_chainstate)
         };
         assert_eq!(load(&[]), (false, false));
         std::fs::write(dir.path().join("bitcoin.conf"), "reindex=1\n").unwrap();
         assert_eq!(load(&[]), (true, false), "reindex from the file");
-        assert_eq!(load(&["-reindex=0"]), (false, false), "the command line wins");
+        assert_eq!(
+            load(&["-reindex=0"]),
+            (false, false),
+            "the command line wins"
+        );
         std::fs::write(dir.path().join("bitcoin.conf"), "reindexchainstate=1\n").unwrap();
         assert_eq!(load(&[]), (false, true), "reindexchainstate from the file");
         std::fs::write(dir.path().join("bitcoin.conf"), "reindex-chainstate=1\n").unwrap();
@@ -12156,8 +12990,16 @@ blockmintxfee=0.00001
         std::fs::write(dir.path().join("bitcoin.conf"), "reindex=0\n").unwrap();
         assert_eq!(load(&[]), (false, false));
         // Core's `InterpretBool("")` is true.
-        std::fs::write(dir.path().join("bitcoin.conf"), "reindex=\nreindexchainstate=\n").unwrap();
-        assert_eq!(load(&[]), (true, true), "an empty value asks for the rebuild, as in Core");
+        std::fs::write(
+            dir.path().join("bitcoin.conf"),
+            "reindex=\nreindexchainstate=\n",
+        )
+        .unwrap();
+        assert_eq!(
+            load(&[]),
+            (true, true),
+            "an empty value asks for the rebuild, as in Core"
+        );
     }
 
     /// `-nap`, a satd extension: off by default, on from the command line in
@@ -12166,11 +13008,18 @@ blockmintxfee=0.00001
     fn nap_is_off_by_default_and_can_be_turned_on() {
         let dir = tempfile::tempdir().expect("tempdir");
         let load = |extra: &[&str]| {
-            let mut args = vec!["satd", "--regtest", "--datadir", dir.path().to_str().unwrap()];
+            let mut args = vec![
+                "satd",
+                "--regtest",
+                "--datadir",
+                dir.path().to_str().unwrap(),
+            ];
             args.extend_from_slice(extra);
-            Config::from_cli(parse_cli(normalize_args(args.iter().map(|a| a.to_string()).collect())).unwrap())
-                .expect("loads")
-                .nap
+            Config::from_cli(
+                parse_cli(normalize_args(args.iter().map(|a| a.to_string()).collect())).unwrap(),
+            )
+            .expect("loads")
+            .nap
         };
         assert!(!load(&[]));
         assert!(load(&["-nap"]));
@@ -12187,16 +13036,31 @@ blockmintxfee=0.00001
     fn napaggregator_defaults_off_and_reads_both_sources() {
         let dir = tempfile::tempdir().expect("tempdir");
         let load = |extra: &[&str]| {
-            let mut args = vec!["satd", "--regtest", "--datadir", dir.path().to_str().unwrap()];
+            let mut args = vec![
+                "satd",
+                "--regtest",
+                "--datadir",
+                dir.path().to_str().unwrap(),
+            ];
             args.extend_from_slice(extra);
-            Config::from_cli(parse_cli(normalize_args(args.iter().map(|a| a.to_string()).collect())).unwrap())
-                .map(|c| (c.napaggregator, c.nap))
+            Config::from_cli(
+                parse_cli(normalize_args(args.iter().map(|a| a.to_string()).collect())).unwrap(),
+            )
+            .map(|c| (c.napaggregator, c.nap))
         };
         assert_eq!(load(&[]), Ok((false, false)));
-        assert_eq!(load(&["-napaggregator=1"]), Ok((true, false)), "independent of -nap");
+        assert_eq!(
+            load(&["-napaggregator=1"]),
+            Ok((true, false)),
+            "independent of -nap"
+        );
         std::fs::write(dir.path().join("bitcoin.conf"), "napaggregator=1\n").unwrap();
         assert_eq!(load(&[]), Ok((true, false)), "from the file");
-        assert_eq!(load(&["--napaggregator=0"]), Ok((false, false)), "the command line wins");
+        assert_eq!(
+            load(&["--napaggregator=0"]),
+            Ok((false, false)),
+            "the command line wins"
+        );
     }
 
     /// `-napaggregatormax`: 1,000,000 by default, from either source, the
@@ -12205,16 +13069,27 @@ blockmintxfee=0.00001
     fn napaggregatormax_defaults_to_a_million() {
         let dir = tempfile::tempdir().expect("tempdir");
         let load = |extra: &[&str]| {
-            let mut args = vec!["satd", "--regtest", "--datadir", dir.path().to_str().unwrap()];
+            let mut args = vec![
+                "satd",
+                "--regtest",
+                "--datadir",
+                dir.path().to_str().unwrap(),
+            ];
             args.extend_from_slice(extra);
-            Config::from_cli(parse_cli(normalize_args(args.iter().map(|a| a.to_string()).collect())).unwrap())
-                .map(|c| c.napaggregatormax)
+            Config::from_cli(
+                parse_cli(normalize_args(args.iter().map(|a| a.to_string()).collect())).unwrap(),
+            )
+            .map(|c| c.napaggregatormax)
         };
         assert_eq!(load(&[]), Ok(1_000_000));
         assert_eq!(load(&["-napaggregatormax=5"]), Ok(5));
         std::fs::write(dir.path().join("bitcoin.conf"), "napaggregatormax=40\n").unwrap();
         assert_eq!(load(&[]), Ok(40), "from the file");
-        assert_eq!(load(&["--napaggregatormax=7"]), Ok(7), "the command line wins");
+        assert_eq!(
+            load(&["--napaggregatormax=7"]),
+            Ok(7),
+            "the command line wins"
+        );
         std::fs::write(dir.path().join("bitcoin.conf"), "napaggregatormax=lots\n").unwrap();
         assert!(load(&[]).unwrap_err().contains("-napaggregatormax"));
     }
@@ -12225,16 +13100,27 @@ blockmintxfee=0.00001
     fn napmaxattestations_defaults_to_no_limit() {
         let dir = tempfile::tempdir().expect("tempdir");
         let load = |extra: &[&str]| {
-            let mut args = vec!["satd", "--regtest", "--datadir", dir.path().to_str().unwrap()];
+            let mut args = vec![
+                "satd",
+                "--regtest",
+                "--datadir",
+                dir.path().to_str().unwrap(),
+            ];
             args.extend_from_slice(extra);
-            Config::from_cli(parse_cli(normalize_args(args.iter().map(|a| a.to_string()).collect())).unwrap())
-                .map(|c| c.napmaxattestations)
+            Config::from_cli(
+                parse_cli(normalize_args(args.iter().map(|a| a.to_string()).collect())).unwrap(),
+            )
+            .map(|c| c.napmaxattestations)
         };
         assert_eq!(load(&[]), Ok(0));
         assert_eq!(load(&["-napmaxattestations=500"]), Ok(500));
         std::fs::write(dir.path().join("bitcoin.conf"), "napmaxattestations=40\n").unwrap();
         assert_eq!(load(&[]), Ok(40), "from the file");
-        assert_eq!(load(&["--napmaxattestations=7"]), Ok(7), "the command line wins");
+        assert_eq!(
+            load(&["--napmaxattestations=7"]),
+            Ok(7),
+            "the command line wins"
+        );
         std::fs::write(dir.path().join("bitcoin.conf"), "napmaxattestations=lots\n").unwrap();
         assert!(load(&[]).unwrap_err().contains("-napmaxattestations"));
         assert!(parse_cli(["satd", "--napmaxattestations=-1"]).is_err());
@@ -12247,18 +13133,36 @@ blockmintxfee=0.00001
     fn peerflagpolicy() {
         let dir = tempfile::tempdir().expect("tempdir");
         let load = |extra: &[&str]| {
-            let mut args = vec!["satd", "--regtest", "--datadir", dir.path().to_str().unwrap()];
+            let mut args = vec![
+                "satd",
+                "--regtest",
+                "--datadir",
+                dir.path().to_str().unwrap(),
+            ];
             args.extend_from_slice(extra);
-            Config::from_cli(parse_cli(normalize_args(args.iter().map(|a| a.to_string()).collect())).unwrap())
+            Config::from_cli(
+                parse_cli(normalize_args(args.iter().map(|a| a.to_string()).collect())).unwrap(),
+            )
         };
         let c = load(&[]).unwrap();
         assert_eq!(c.flag_policy(), node::net::flags::FlagPolicy::Observe);
         assert_eq!(c.effective_view()["p2p"]["peer_flag_policy"], "observe");
         let c = load(&["-peerflagpolicy=EVICT"]).unwrap();
-        assert_eq!((c.peerflagpolicy.as_str(), c.flag_policy()), ("evict", node::net::flags::FlagPolicy::Evict));
-        assert!(load(&["-peerflagpolicy=ban"]).unwrap_err().contains("-peerflagpolicy must be observe or evict"));
+        assert_eq!(
+            (c.peerflagpolicy.as_str(), c.flag_policy()),
+            ("evict", node::net::flags::FlagPolicy::Evict)
+        );
+        assert!(
+            load(&["-peerflagpolicy=ban"])
+                .unwrap_err()
+                .contains("-peerflagpolicy must be observe or evict")
+        );
         std::fs::write(dir.path().join("bitcoin.conf"), "peerflagpolicy=evict\n").unwrap();
-        assert_eq!(load(&[]).unwrap().flag_policy(), node::net::flags::FlagPolicy::Evict, "from the file");
+        assert_eq!(
+            load(&[]).unwrap().flag_policy(),
+            node::net::flags::FlagPolicy::Evict,
+            "from the file"
+        );
         assert_eq!(
             load(&["--peerflagpolicy=observe"]).unwrap().flag_policy(),
             node::net::flags::FlagPolicy::Observe,
@@ -12273,34 +13177,97 @@ blockmintxfee=0.00001
     fn maxoutboundfullrelay_and_altslots() {
         let dir = tempfile::tempdir().expect("tempdir");
         let load = |extra: &[&str]| {
-            let mut args = vec!["satd", "--regtest", "--datadir", dir.path().to_str().unwrap()];
+            let mut args = vec![
+                "satd",
+                "--regtest",
+                "--datadir",
+                dir.path().to_str().unwrap(),
+            ];
             args.extend_from_slice(extra);
-            Config::from_cli(parse_cli(normalize_args(args.iter().map(|a| a.to_string()).collect())).unwrap())
+            Config::from_cli(
+                parse_cli(normalize_args(args.iter().map(|a| a.to_string()).collect())).unwrap(),
+            )
         };
         let c = load(&[]).unwrap();
-        assert_eq!((c.maxoutboundfullrelay, c.altslots, c.altfillwait), (8, 0, 600));
+        assert_eq!(
+            (c.maxoutboundfullrelay, c.altslots, c.altfillwait),
+            (8, 0, 600)
+        );
         assert_eq!(c.altuatrust, "consistent");
         assert_eq!(c.alt_slot_config().rules.len(), 1, "family:non-core");
-        assert_eq!(load(&["-maxoutboundfullrelay=16"]).unwrap().maxoutboundfullrelay, 16);
-        assert!(load(&["-maxoutboundfullrelay=17"]).unwrap_err().contains("-enable-dangerously-large-outbound-peer-limit"));
-        let c = load(&["-maxoutboundfullrelay=17", "-enable-dangerously-large-outbound-peer-limit"]).unwrap();
+        assert_eq!(
+            load(&["-maxoutboundfullrelay=16"])
+                .unwrap()
+                .maxoutboundfullrelay,
+            16
+        );
+        assert!(
+            load(&["-maxoutboundfullrelay=17"])
+                .unwrap_err()
+                .contains("-enable-dangerously-large-outbound-peer-limit")
+        );
+        let c = load(&[
+            "-maxoutboundfullrelay=17",
+            "-enable-dangerously-large-outbound-peer-limit",
+        ])
+        .unwrap();
         assert!(c.dangerous_outbound_limit && c.maxoutboundfullrelay == 17);
-        assert!(load(&["-maxoutboundfullrelay=65", "-enable-dangerously-large-outbound-peer-limit"]).is_err());
+        assert!(
+            load(&[
+                "-maxoutboundfullrelay=65",
+                "-enable-dangerously-large-outbound-peer-limit"
+            ])
+            .is_err()
+        );
         assert!(load(&["-maxoutboundfullrelay=0"]).is_err());
         assert!(load(&["-altslots=9"]).unwrap_err().contains("-altslots"));
-        assert!(load(&["-altslots=4", "-maxconnections=3"]).unwrap_err().contains("-maxconnections"));
-        assert!(load(&["-altslots=2", "-altprefer=family:knots"]).unwrap_err().contains("unknown family"));
+        assert!(
+            load(&["-altslots=4", "-maxconnections=3"])
+                .unwrap_err()
+                .contains("-maxconnections")
+        );
+        assert!(
+            load(&["-altslots=2", "-altprefer=family:knots"])
+                .unwrap_err()
+                .contains("unknown family")
+        );
         assert!(load(&["-altuatrust=sometimes"]).is_err());
-        let c = load(&["-altslots=3", "-altprefer=FAMILY:btcd@1", "-altprefer=svc:COMPACT_FILTERS", "-altuatrust=strict", "-altfillwait=30"])
-            .unwrap();
-        assert_eq!(c.altprefer, vec!["family:btcd@1".to_string(), "svc:compact_filters".to_string()]);
+        let c = load(&[
+            "-altslots=3",
+            "-altprefer=FAMILY:btcd@1",
+            "-altprefer=svc:COMPACT_FILTERS",
+            "-altuatrust=strict",
+            "-altfillwait=30",
+        ])
+        .unwrap();
+        assert_eq!(
+            c.altprefer,
+            vec![
+                "family:btcd@1".to_string(),
+                "svc:compact_filters".to_string()
+            ]
+        );
         let alt = c.alt_slot_config();
-        assert_eq!((alt.slots, alt.rules.len(), alt.ua_trust), (3, 2, node::net::altslots::UaTrust::Strict));
+        assert_eq!(
+            (alt.slots, alt.rules.len(), alt.ua_trust),
+            (3, 2, node::net::altslots::UaTrust::Strict)
+        );
         assert_eq!(alt.fill_wait, std::time::Duration::from_secs(30));
-        std::fs::write(dir.path().join("bitcoin.conf"), "altslots=2\naltprefer=family:floresta\naltprefer=family:btcd\n").unwrap();
+        std::fs::write(
+            dir.path().join("bitcoin.conf"),
+            "altslots=2\naltprefer=family:floresta\naltprefer=family:btcd\n",
+        )
+        .unwrap();
         let c = load(&[]).unwrap();
-        assert_eq!((c.altslots, c.altprefer.len()), (2, 2), "from the file, repeatable");
-        assert_eq!(load(&["-altprefer=family:bcoin"]).unwrap().altprefer, vec!["family:bcoin".to_string()]);
+        assert_eq!(
+            (c.altslots, c.altprefer.len()),
+            (2, 2),
+            "from the file, repeatable"
+        );
+        assert_eq!(
+            load(&["-altprefer=family:bcoin"]).unwrap().altprefer,
+            vec!["family:bcoin".to_string()]
+        );
         std::fs::write(dir.path().join("bitcoin.conf"), "altslots=lots\n").unwrap();
         assert!(load(&[]).is_err());
     }
@@ -12313,22 +13280,40 @@ blockmintxfee=0.00001
     fn crawl_options() {
         let dir = tempfile::tempdir().expect("tempdir");
         let load = |extra: &[&str]| {
-            let mut args = vec!["satd", "--regtest", "--datadir", dir.path().to_str().unwrap()];
+            let mut args = vec![
+                "satd",
+                "--regtest",
+                "--datadir",
+                dir.path().to_str().unwrap(),
+            ];
             args.extend_from_slice(extra);
-            Config::from_cli(parse_cli(normalize_args(args.iter().map(|a| a.to_string()).collect())).unwrap())
+            Config::from_cli(
+                parse_cli(normalize_args(args.iter().map(|a| a.to_string()).collect())).unwrap(),
+            )
         };
         let c = load(&[]).unwrap();
         assert!(!c.crawl);
-        assert_eq!((c.crawlconcurrency, c.crawltorconcurrency, c.crawlrate), (32, 8, 10));
+        assert_eq!(
+            (c.crawlconcurrency, c.crawltorconcurrency, c.crawlrate),
+            (32, 8, 10)
+        );
         assert_eq!((c.crawlliveness, c.crawlmaxage), (7200, 432000));
-        assert!(c.crawlprobes && c.crawlnet.is_empty() && c.crawlbind.is_empty() && c.crawlseed.is_empty());
+        assert!(
+            c.crawlprobes
+                && c.crawlnet.is_empty()
+                && c.crawlbind.is_empty()
+                && c.crawlseed.is_empty()
+        );
         let cc = c.crawl_config(None);
         assert_eq!(cc.limits, node::net::crawl::Limits::new(32, 8, 10));
         assert_eq!(cc.networks, None);
 
         assert!(load(&["-crawl"]).unwrap().crawl);
         assert!(!load(&["-nocrawl"]).unwrap().crawl);
-        assert_eq!(load(&["-crawlconcurrency=256"]).unwrap().crawlconcurrency, 256);
+        assert_eq!(
+            load(&["-crawlconcurrency=256"]).unwrap().crawlconcurrency,
+            256
+        );
         for bad in [
             "-crawlconcurrency=257",
             "-crawlconcurrency=0",
@@ -12346,11 +13331,19 @@ blockmintxfee=0.00001
         ] {
             assert!(load(&[bad]).is_err(), "{bad} accepted");
         }
-        assert!(load(&["-crawlbind=192.0.2.1", "-crawlbind=192.0.2.2"]).unwrap_err().contains("second IPv4"));
+        assert!(
+            load(&["-crawlbind=192.0.2.1", "-crawlbind=192.0.2.2"])
+                .unwrap_err()
+                .contains("second IPv4")
+        );
         // An onion with no port takes the network's, as a bare IP does.
         let onion = "pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.onion";
         let c = load(&[&format!("-crawlseed={onion}")]).expect("a portless onion seed");
-        assert_eq!(c.crawlseed, vec![format!("{onion}:18444")], "the regtest port");
+        assert_eq!(
+            c.crawlseed,
+            vec![format!("{onion}:18444")],
+            "the regtest port"
+        );
 
         let c = load(&[
             "-crawl=1",
@@ -12376,13 +13369,24 @@ blockmintxfee=0.00001
         assert!(!cc.probes);
         assert_eq!(cc.liveness_secs, 10800);
 
-        std::fs::write(dir.path().join("bitcoin.conf"), "crawl=1\ncrawlrate=20\ncrawlseed=203.0.113.1\ncrawlseed=203.0.113.2\n")
-            .unwrap();
+        std::fs::write(
+            dir.path().join("bitcoin.conf"),
+            "crawl=1\ncrawlrate=20\ncrawlseed=203.0.113.1\ncrawlseed=203.0.113.2\n",
+        )
+        .unwrap();
         let c = load(&[]).unwrap();
         assert!(c.crawl);
-        assert_eq!((c.crawlrate, c.crawlseed.len()), (20, 2), "from the file, repeatable");
+        assert_eq!(
+            (c.crawlrate, c.crawlseed.len()),
+            (20, 2),
+            "from the file, repeatable"
+        );
         let c = load(&["-crawlrate=5", "-crawlseed=203.0.113.3"]).unwrap();
-        assert_eq!((c.crawlrate, c.crawlseed.len()), (5, 1), "the command line wins");
+        assert_eq!(
+            (c.crawlrate, c.crawlseed.len()),
+            (5, 1),
+            "the command line wins"
+        );
         std::fs::write(dir.path().join("bitcoin.conf"), "crawlrate=1000\n").unwrap();
         assert!(load(&[]).is_err(), "the ceiling holds in the file too");
         std::fs::write(dir.path().join("bitcoin.conf"), "crawlnope=1\n").unwrap();
@@ -12399,35 +13403,71 @@ blockmintxfee=0.00001
         use node::net::crawlsnapshot::KeySource;
         let dir = tempfile::tempdir().expect("tempdir");
         let load = |extra: &[&str]| {
-            let mut args = vec!["satd", "--regtest", "--datadir", dir.path().to_str().unwrap()];
+            let mut args = vec![
+                "satd",
+                "--regtest",
+                "--datadir",
+                dir.path().to_str().unwrap(),
+            ];
             args.extend_from_slice(extra);
-            Config::from_cli(parse_cli(normalize_args(args.iter().map(|a| a.to_string()).collect())).unwrap())
+            Config::from_cli(
+                parse_cli(normalize_args(args.iter().map(|a| a.to_string()).collect())).unwrap(),
+            )
         };
         let net = std::path::Path::new("/data/regtest");
         let c = load(&[]).unwrap();
-        assert_eq!((c.crawlexportkeyfile.as_ref(), c.crawlexportmink), (None, 10));
+        assert_eq!(
+            (c.crawlexportkeyfile.as_ref(), c.crawlexportmink),
+            (None, 10)
+        );
         let cc = c.crawl_config(Some(net));
         assert_eq!(cc.path, Some(net.join("crawlbook.dat")));
         assert_eq!(cc.snapshot_dir, Some(net.join("crawl")));
-        assert_eq!(cc.export_key, Some(KeySource::Default(net.join("crawlexport.key"))));
+        assert_eq!(
+            cc.export_key,
+            Some(KeySource::Default(net.join("crawlexport.key")))
+        );
         assert_eq!(cc.export_min_k, 10);
         let none = c.crawl_config(None);
         assert!(none.path.is_none() && none.snapshot_dir.is_none() && none.export_key.is_none());
 
         let c = load(&["-crawlexportkeyfile=census.key", "-crawlexportmink=25"]).unwrap();
         let cc = c.crawl_config(Some(net));
-        assert_eq!(cc.export_key, Some(KeySource::Supplied(net.join("census.key"))), "relative to the data directory");
+        assert_eq!(
+            cc.export_key,
+            Some(KeySource::Supplied(net.join("census.key"))),
+            "relative to the data directory"
+        );
         assert_eq!(cc.export_min_k, 25);
         let c = load(&["-crawlexportkeyfile=/keys/census.key"]).unwrap();
-        assert_eq!(c.crawl_config(Some(net)).export_key, Some(KeySource::Supplied("/keys/census.key".into())));
-        for bad in ["-crawlexportmink=0", "-crawlexportmink=100001", "-crawlexportkeyfile="] {
+        assert_eq!(
+            c.crawl_config(Some(net)).export_key,
+            Some(KeySource::Supplied("/keys/census.key".into()))
+        );
+        for bad in [
+            "-crawlexportmink=0",
+            "-crawlexportmink=100001",
+            "-crawlexportkeyfile=",
+        ] {
             assert!(load(&[bad]).is_err(), "{bad} accepted");
         }
         assert_eq!(load(&["-crawlexportmink=1"]).unwrap().crawlexportmink, 1);
-        std::fs::write(dir.path().join("bitcoin.conf"), "crawlexportmink=12\ncrawlexportkeyfile=k\n").unwrap();
+        std::fs::write(
+            dir.path().join("bitcoin.conf"),
+            "crawlexportmink=12\ncrawlexportkeyfile=k\n",
+        )
+        .unwrap();
         let c = load(&[]).unwrap();
-        assert_eq!((c.crawlexportmink, c.crawlexportkeyfile), (12, Some("k".into())), "from the file");
-        assert_eq!(load(&["-crawlexportmink=3"]).unwrap().crawlexportmink, 3, "the command line wins");
+        assert_eq!(
+            (c.crawlexportmink, c.crawlexportkeyfile),
+            (12, Some("k".into())),
+            "from the file"
+        );
+        assert_eq!(
+            load(&["-crawlexportmink=3"]).unwrap().crawlexportmink,
+            3,
+            "the command line wins"
+        );
     }
 
     /// `-napstorerecover`: off by default, on from the command line in either
@@ -12436,10 +13476,17 @@ blockmintxfee=0.00001
     fn napstorerecover_is_off_by_default_and_can_be_turned_on() {
         let dir = tempfile::tempdir().expect("tempdir");
         let load = |extra: &[&str]| {
-            let mut args = vec!["satd", "--regtest", "--datadir", dir.path().to_str().unwrap()];
+            let mut args = vec![
+                "satd",
+                "--regtest",
+                "--datadir",
+                dir.path().to_str().unwrap(),
+            ];
             args.extend_from_slice(extra);
-            let c = Config::from_cli(parse_cli(normalize_args(args.iter().map(|a| a.to_string()).collect())).unwrap())
-                .expect("loads");
+            let c = Config::from_cli(
+                parse_cli(normalize_args(args.iter().map(|a| a.to_string()).collect())).unwrap(),
+            )
+            .expect("loads");
             (c.nap, c.napstorerecover)
         };
         assert_eq!(load(&[]), (false, false));
@@ -12448,7 +13495,11 @@ blockmintxfee=0.00001
         assert_eq!(load(&["-nonapstorerecover"]), (false, false));
         std::fs::write(dir.path().join("bitcoin.conf"), "napstorerecover=1\n").unwrap();
         assert_eq!(load(&[]), (false, true), "from the file");
-        assert_eq!(load(&["-napstorerecover=0"]), (false, false), "the command line wins");
+        assert_eq!(
+            load(&["-napstorerecover=0"]),
+            (false, false),
+            "the command line wins"
+        );
     }
 
     /// The derived builder runs on [`on_cli_stack`]'s own thread, so a caller
@@ -12459,7 +13510,10 @@ blockmintxfee=0.00001
             .stack_size(512 * 1024)
             .spawn(|| {
                 let cfg = Config::from_cli(parse_cli(["satd", "--regtest"]).unwrap()).unwrap();
-                (cfg.limitclustercount, cli_command().get_arguments().count() > 100)
+                (
+                    cfg.limitclustercount,
+                    cli_command().get_arguments().count() > 100,
+                )
             })
             .unwrap()
             .join()
@@ -12482,9 +13536,19 @@ blockmintxfee=0.00001
             .unwrap(),
         )
         .unwrap();
-        assert_eq!((cfg.limitancestorcount, cfg.limitdescendantcount, cfg.limitclustercount), (7, 8, 9));
+        assert_eq!(
+            (
+                cfg.limitancestorcount,
+                cfg.limitdescendantcount,
+                cfg.limitclustercount
+            ),
+            (7, 8, 9)
+        );
         assert!(parse_cli(["satd", "--limitclustercount=x"]).is_err());
-        assert!(Config::from_cli(parse_cli(["satd", "--regtest", "--limitclustercount=65"]).unwrap()).is_err());
+        assert!(
+            Config::from_cli(parse_cli(["satd", "--regtest", "--limitclustercount=65"]).unwrap())
+                .is_err()
+        );
     }
 
     /// `-limitclustersize` is Core v31's, in kvB, and moves the `-maxmempool`
@@ -12494,17 +13558,36 @@ blockmintxfee=0.00001
     fn limitclustersize_is_read_and_moves_the_maxmempool_floor() {
         let dir = tempfile::tempdir().expect("tempdir");
         let load = |extra: &[&str]| {
-            let mut args = vec!["satd", "--regtest", "--datadir", dir.path().to_str().unwrap()];
+            let mut args = vec![
+                "satd",
+                "--regtest",
+                "--datadir",
+                dir.path().to_str().unwrap(),
+            ];
             args.extend_from_slice(extra);
-            Config::from_cli(parse_cli(normalize_args(args.iter().map(|a| a.to_string()).collect())).unwrap())
+            Config::from_cli(
+                parse_cli(normalize_args(args.iter().map(|a| a.to_string()).collect())).unwrap(),
+            )
         };
         assert_eq!(load(&[]).expect("defaults").limitclustersize, 101);
-        assert_eq!(load(&["-limitclustersize=10"]).expect("Core's spelling").limitclustersize, 10);
         assert_eq!(
-            load(&["-limitclustersize=200", "-maxmempool=7"]).err().as_deref(),
+            load(&["-limitclustersize=10"])
+                .expect("Core's spelling")
+                .limitclustersize,
+            10
+        );
+        assert_eq!(
+            load(&["-limitclustersize=200", "-maxmempool=7"])
+                .err()
+                .as_deref(),
             Some("-maxmempool must be at least 8 MB")
         );
-        assert_eq!(load(&["-limitclustersize=200", "-maxmempool=8"]).expect("at the floor").maxmempool, 8);
+        assert_eq!(
+            load(&["-limitclustersize=200", "-maxmempool=8"])
+                .expect("at the floor")
+                .maxmempool,
+            8
+        );
     }
 
     /// `-txospenderindex` is refused with pruning, as in Core, and without the
@@ -12513,19 +13596,43 @@ blockmintxfee=0.00001
     fn txospenderindex_needs_the_address_index_and_no_pruning() {
         let dir = tempfile::tempdir().expect("tempdir");
         let load = |extra: &[&str]| {
-            let mut args = vec!["satd", "--regtest", "--datadir", dir.path().to_str().unwrap()];
+            let mut args = vec![
+                "satd",
+                "--regtest",
+                "--datadir",
+                dir.path().to_str().unwrap(),
+            ];
             args.extend_from_slice(extra);
-            Config::from_cli(parse_cli(normalize_args(args.iter().map(|a| a.to_string()).collect())).unwrap())
+            Config::from_cli(
+                parse_cli(normalize_args(args.iter().map(|a| a.to_string()).collect())).unwrap(),
+            )
         };
-        assert!(load(&["-txospenderindex"]).expect("with the default address index").txospenderindex);
+        assert!(
+            load(&["-txospenderindex"])
+                .expect("with the default address index")
+                .txospenderindex
+        );
         assert_eq!(
             load(&["-txospenderindex", "-prune=550"]).err().as_deref(),
             Some("Prune mode is incompatible with -txospenderindex.")
         );
         assert!(load(&["-prune=550"]).is_ok(), "pruning alone still loads");
-        let without = load(&["-txospenderindex", "-addressindex=0", "-esplora=0", "-electrum=0"]).err().unwrap_or_default();
-        assert!(without.starts_with("txospenderindex=1 with addressindex=0"), "{without}");
-        assert!(load(&["-addressindex=0", "-esplora=0", "-electrum=0"]).is_ok(), "no address index alone still loads");
+        let without = load(&[
+            "-txospenderindex",
+            "-addressindex=0",
+            "-esplora=0",
+            "-electrum=0",
+        ])
+        .err()
+        .unwrap_or_default();
+        assert!(
+            without.starts_with("txospenderindex=1 with addressindex=0"),
+            "{without}"
+        );
+        assert!(
+            load(&["-addressindex=0", "-esplora=0", "-electrum=0"]).is_ok(),
+            "no address index alone still loads"
+        );
     }
 
     /// Core's stock Tor configuration must load: the two bare entries are
@@ -12556,7 +13663,12 @@ blockmintxfee=0.00001
     fn bind_with_listen_disabled_is_refused_like_core() {
         let dir = tempfile::tempdir().expect("tempdir");
         let with = |extra: &[&str]| {
-            let mut argv = vec!["satd", "--regtest", "--datadir", dir.path().to_str().unwrap()];
+            let mut argv = vec![
+                "satd",
+                "--regtest",
+                "--datadir",
+                dir.path().to_str().unwrap(),
+            ];
             argv.extend_from_slice(extra);
             Config::from_cli(parse_cli(argv).unwrap())
         };
@@ -12587,9 +13699,15 @@ blockmintxfee=0.00001
             "0.0.0.0:7777"
         );
         // IPv6, bare and bracketed.
-        assert_eq!(parse_bind_spec("::1", 7777).unwrap().addr.to_string(), "[::1]:7777");
         assert_eq!(
-            parse_bind_spec("[::1]:8888", 7777).unwrap().addr.to_string(),
+            parse_bind_spec("::1", 7777).unwrap().addr.to_string(),
+            "[::1]:7777"
+        );
+        assert_eq!(
+            parse_bind_spec("[::1]:8888", 7777)
+                .unwrap()
+                .addr
+                .to_string(),
             "[::1]:8888"
         );
         // The onion suffix is recognised, with and without a port.
@@ -12616,7 +13734,12 @@ blockmintxfee=0.00001
     fn multiple_binds_resolve_to_multiple_listeners() {
         let dir = tempfile::tempdir().expect("tempdir");
         let with = |extra: &[&str]| {
-            let mut a = vec!["satd", "--regtest", "--datadir", dir.path().to_str().unwrap()];
+            let mut a = vec![
+                "satd",
+                "--regtest",
+                "--datadir",
+                dir.path().to_str().unwrap(),
+            ];
             a.extend_from_slice(extra);
             Config::from_cli(parse_cli(a).unwrap()).unwrap()
         };
@@ -12628,17 +13751,26 @@ blockmintxfee=0.00001
         let cfg = with(&["--bind", "127.0.0.1:8001", "--bind", "127.0.0.2:8002=onion"]);
         assert_eq!(cfg.binds.len(), 2);
         assert_eq!(cfg.binds[0].addr.to_string(), "127.0.0.1:8001");
-        assert!(cfg.binds[1].onion, "the =onion suffix must survive resolution");
         assert!(
-            !cfg.binds.iter().any(|b| b.addr.ip().to_string() == "0.0.0.0"),
+            cfg.binds[1].onion,
+            "the =onion suffix must survive resolution"
+        );
+        assert!(
+            !cfg.binds
+                .iter()
+                .any(|b| b.addr.ip().to_string() == "0.0.0.0"),
             "an explicit -bind must replace the default, not add to it",
         );
 
         // The config file is the same namespace, and repeatable there too.
         let conf = dir.path().join("bind.conf");
-        std::fs::write(&conf, "bind=127.0.0.1:9001
+        std::fs::write(
+            &conf,
+            "bind=127.0.0.1:9001
 bind=127.0.0.1:9002
-").unwrap();
+",
+        )
+        .unwrap();
         let cfg = Config::from_cli(
             parse_cli([
                 "satd",
@@ -12651,7 +13783,11 @@ bind=127.0.0.1:9002
             .unwrap(),
         )
         .unwrap();
-        assert_eq!(cfg.binds.len(), 2, "bind= is repeatable in bitcoin.conf too");
+        assert_eq!(
+            cfg.binds.len(),
+            2,
+            "bind= is repeatable in bitcoin.conf too"
+        );
     }
 
     /// Two listeners cannot share an address, so Core refuses the config up
@@ -12662,7 +13798,12 @@ bind=127.0.0.1:9002
     fn a_duplicate_binding_is_refused() {
         let dir = tempfile::tempdir().expect("tempdir");
         let cfg = |extra: &[&str]| {
-            let mut a = vec!["satd", "--regtest", "--datadir", dir.path().to_str().unwrap()];
+            let mut a = vec![
+                "satd",
+                "--regtest",
+                "--datadir",
+                dir.path().to_str().unwrap(),
+            ];
             a.extend_from_slice(extra);
             Config::from_cli(parse_cli(a).unwrap())
         };
@@ -12671,7 +13812,10 @@ bind=127.0.0.1:9002
             [format!("--bind={A}"), format!("--bind={A}")],
             [format!("--bind={A}"), format!("--bind={A}=onion")],
             [format!("--bind={A}"), format!("--whitebind=noban@{A}")],
-            [format!("--bind={A}=onion"), format!("--whitebind=noban@{A}")],
+            [
+                format!("--bind={A}=onion"),
+                format!("--whitebind=noban@{A}"),
+            ],
         ] {
             let args: Vec<&str> = pair.iter().map(|s| s.as_str()).collect();
             let err = cfg(&args).expect_err(&format!("{pair:?} must be refused"));
@@ -12738,7 +13882,10 @@ bind=127.0.0.1:9002
 
         // Only incrementalrelayfee set, and higher: the raise applies. This is
         // the "allow only setting incremental fee to control both" case.
-        assert_eq!(base(&["--incrementalrelayfee=0.00001"]).minrelaytxfee, 1_000);
+        assert_eq!(
+            base(&["--incrementalrelayfee=0.00001"]).minrelaytxfee,
+            1_000
+        );
 
         // Both set: the operator's floor stands, even below the incremental.
         assert_eq!(
@@ -12757,8 +13904,11 @@ bind=127.0.0.1:9002
         // Set from the config file rather than the command line: same rule.
         let confdir = tempfile::tempdir().expect("tempdir");
         let conf = confdir.path().join("bitcoin.conf");
-        std::fs::write(&conf, "regtest=1\nminrelaytxfee=0\nincrementalrelayfee=0.00001\n")
-            .unwrap();
+        std::fs::write(
+            &conf,
+            "regtest=1\nminrelaytxfee=0\nincrementalrelayfee=0.00001\n",
+        )
+        .unwrap();
         let cfg = Config::from_cli(
             parse_cli([
                 "satd",
@@ -12792,10 +13942,26 @@ bind=127.0.0.1:9002
             Config::from_cli(parse_cli(argv).unwrap())
         };
 
-        assert!(load("regtest=1\nblockfilterindex=\n").unwrap().blockfilterindex);
-        assert!(load("regtest=1\nblockfilterindex=basic\n").unwrap().blockfilterindex);
-        assert!(load("regtest=1\nblockfilterindex=1\n").unwrap().blockfilterindex);
-        assert!(!load("regtest=1\nblockfilterindex=0\n").unwrap().blockfilterindex);
+        assert!(
+            load("regtest=1\nblockfilterindex=\n")
+                .unwrap()
+                .blockfilterindex
+        );
+        assert!(
+            load("regtest=1\nblockfilterindex=basic\n")
+                .unwrap()
+                .blockfilterindex
+        );
+        assert!(
+            load("regtest=1\nblockfilterindex=1\n")
+                .unwrap()
+                .blockfilterindex
+        );
+        assert!(
+            !load("regtest=1\nblockfilterindex=0\n")
+                .unwrap()
+                .blockfilterindex
+        );
 
         let err = load("regtest=1\nblockfilterindex=basci\n").unwrap_err();
         assert!(err.contains("Unknown -blockfilterindex value"), "{err}");
@@ -12809,7 +13975,10 @@ bind=127.0.0.1:9002
         let addr = parse_p2p_bind("::1", 18444).expect("-bind=::1 must resolve");
         assert!(addr.is_ipv6());
         assert_eq!(addr.to_string(), "[::1]:18444");
-        assert_eq!(parse_p2p_bind("[::1]", 18444).map(|a| a.to_string()), Ok("[::1]:18444".into()));
+        assert_eq!(
+            parse_p2p_bind("[::1]", 18444).map(|a| a.to_string()),
+            Ok("[::1]:18444".into())
+        );
         assert_eq!(
             parse_p2p_bind("0.0.0.0", 18444).map(|a| a.to_string()),
             Ok("0.0.0.0:18444".into())
@@ -12823,10 +13992,16 @@ bind=127.0.0.1:9002
     #[test]
     fn unsupported_core_cli_options_warn_instead_of_aborting() {
         let args = normalize_args(
-            ["satd", "-datadir=/tmp/x", "-fallbackfee=0.0002", "-uacomment=node0", "-logtimemicros"]
-                .iter()
-                .map(|s| s.to_string())
-                .collect(),
+            [
+                "satd",
+                "-datadir=/tmp/x",
+                "-fallbackfee=0.0002",
+                "-uacomment=node0",
+                "-logtimemicros",
+            ]
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
         );
         let (kept, warnings) = filter_unsupported_core_cli_args(args).expect("no fatal key");
         // -uacomment is implemented, so it survives the filter rather than
@@ -12863,7 +14038,10 @@ bind=127.0.0.1:9002
     fn typos_are_left_for_clap_to_reject() {
         let args = normalize_args(vec!["satd".to_string(), "-daatdir=/tmp/x".to_string()]);
         let (kept, warnings) = filter_unsupported_core_cli_args(args).expect("no fatal key");
-        assert_eq!(kept, vec!["satd".to_string(), "-daatdir=/tmp/x".to_string()]);
+        assert_eq!(
+            kept,
+            vec!["satd".to_string(), "-daatdir=/tmp/x".to_string()]
+        );
         assert!(warnings.is_empty());
         assert!(parse_cli(kept).is_err(), "clap must still reject the typo");
     }
@@ -12891,13 +14069,16 @@ bind=127.0.0.1:9002
     fn negated_supported_option_is_not_silently_dropped() {
         for flag in ["-noonion", "-noproxy"] {
             let args = normalize_args(vec!["satd".to_string(), flag.to_string()]);
-            let (kept, warnings) =
-                filter_unsupported_core_cli_args(args).expect("not a fatal key");
+            let (kept, warnings) = filter_unsupported_core_cli_args(args).expect("not a fatal key");
             assert!(
-                kept.iter().any(|a| a.contains(flag.trim_start_matches('-'))),
+                kept.iter()
+                    .any(|a| a.contains(flag.trim_start_matches('-'))),
                 "{flag} was dropped: kept={kept:?} warnings={warnings:?}"
             );
-            assert!(warnings.is_empty(), "{flag} warned instead of erroring: {warnings:?}");
+            assert!(
+                warnings.is_empty(),
+                "{flag} warned instead of erroring: {warnings:?}"
+            );
             assert!(
                 parse_cli(kept).is_err(),
                 "{flag} must reach clap and be rejected"
@@ -12926,10 +14107,36 @@ bind=127.0.0.1:9002
         // The reverse direction: every category the mapping honours must be
         // listed. Core's full category set is the search space.
         for cat in [
-            "addrman", "bench", "blockstorage", "cmpctblock", "coindb", "estimatefee", "http",
-            "i2p", "leveldb", "libevent", "lock", "mempool", "mempoolrej", "net", "prune",
-            "proxy", "qt", "rand", "reindex", "rpc", "scan", "selectcoins", "tor", "txpackages",
-            "txreconciliation", "validation", "walletdb", "zmq", "kernel", "privatebroadcast",
+            "addrman",
+            "bench",
+            "blockstorage",
+            "cmpctblock",
+            "coindb",
+            "estimatefee",
+            "http",
+            "i2p",
+            "leveldb",
+            "libevent",
+            "lock",
+            "mempool",
+            "mempoolrej",
+            "net",
+            "prune",
+            "proxy",
+            "qt",
+            "rand",
+            "reindex",
+            "rpc",
+            "scan",
+            "selectcoins",
+            "tor",
+            "txpackages",
+            "txreconciliation",
+            "validation",
+            "walletdb",
+            "zmq",
+            "kernel",
+            "privatebroadcast",
             // satd-only categories.
             "stratum",
         ] {
@@ -12957,11 +14164,19 @@ bind=127.0.0.1:9002
         // No -listenonion: no onion bind, and the clearnet default is intact.
         let cfg = parse_negation(&["satd", "--regtest", "--datadir", dd, "--port=19000"])
             .expect("starts");
-        assert!(!cfg.binds.iter().any(|b| b.onion), "no -listenonion, no onion bind");
+        assert!(
+            !cfg.binds.iter().any(|b| b.onion),
+            "no -listenonion, no onion bind"
+        );
 
         // -listenonion with no explicit entry: Core's port+1 default.
         let cfg = parse_negation(&[
-            "satd", "--regtest", "--datadir", dd, "--port=19000", "--listenonion=1",
+            "satd",
+            "--regtest",
+            "--datadir",
+            dd,
+            "--port=19000",
+            "--listenonion=1",
         ])
         .expect("starts");
         let onion: Vec<_> = cfg.binds.iter().filter(|b| b.onion).collect();
@@ -12972,7 +14187,11 @@ bind=127.0.0.1:9002
 
         // An explicit `=onion` entry wins; no default is added beside it.
         let cfg = parse_negation(&[
-            "satd", "--regtest", "--datadir", dd, "--listenonion=1",
+            "satd",
+            "--regtest",
+            "--datadir",
+            dd,
+            "--listenonion=1",
             "--bind=127.0.0.1:19500=onion",
         ])
         .expect("starts");
@@ -12984,12 +14203,20 @@ bind=127.0.0.1:9002
         // listener on the same address would turn a working config into a
         // duplicate-binding startup error.
         let cfg = parse_negation(&[
-            "satd", "--regtest", "--datadir", dd, "--port=19000", "--listenonion=1",
+            "satd",
+            "--regtest",
+            "--datadir",
+            dd,
+            "--port=19000",
+            "--listenonion=1",
             "--bind=127.0.0.1:19001",
         ])
         .expect("an already-bound port+1 must not become a startup error");
         assert_eq!(
-            cfg.binds.iter().filter(|b| b.addr.to_string() == "127.0.0.1:19001").count(),
+            cfg.binds
+                .iter()
+                .filter(|b| b.addr.to_string() == "127.0.0.1:19001")
+                .count(),
             1,
             "{:?}",
             cfg.binds
@@ -12998,7 +14225,12 @@ bind=127.0.0.1:9002
         // With -listen=0 there is no accept loop to serve it, so no phantom
         // bind is invented.
         let cfg = parse_negation(&[
-            "satd", "--regtest", "--datadir", dd, "--listenonion=1", "--listen=0",
+            "satd",
+            "--regtest",
+            "--datadir",
+            dd,
+            "--listenonion=1",
+            "--listen=0",
         ])
         .expect("starts");
         assert!(!cfg.binds.iter().any(|b| b.onion), "{:?}", cfg.binds);
@@ -13075,15 +14307,22 @@ rpcport=8332
         let cf = ConfigFile::parse(content)
             .expect("config carrying rpcthreads/rpcworkqueue should parse");
         assert_eq!(cf.global.get("rpcthreads").unwrap().last().unwrap(), "8");
-        assert_eq!(cf.global.get("rpcworkqueue").unwrap().last().unwrap(), "128");
+        assert_eq!(
+            cf.global.get("rpcworkqueue").unwrap().last().unwrap(),
+            "128"
+        );
     }
 
     #[test]
     fn rpc_admission_defaults_match_core() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let cli =
-            parse_cli(["satd", "--regtest", "--datadir", dir.path().to_str().unwrap()])
-                .unwrap();
+        let cli = parse_cli([
+            "satd",
+            "--regtest",
+            "--datadir",
+            dir.path().to_str().unwrap(),
+        ])
+        .unwrap();
         let cfg = Config::from_cli(cli).unwrap();
         // Bitcoin Core's defaults.
         assert_eq!(cfg.rpc_threads, 16);
@@ -13115,7 +14354,12 @@ rpcport=8332
 
         // Defaults come from the single source of truth in `node::health`, so
         // the config layer and the detector can never disagree about them.
-        let cfg = parse_boxed(&["satd", "--regtest", "--datadir", dir.path().to_str().unwrap()]);
+        let cfg = parse_boxed(&[
+            "satd",
+            "--regtest",
+            "--datadir",
+            dir.path().to_str().unwrap(),
+        ]);
         assert_eq!(cfg.alert_disk_free_mb, 10_240);
         assert_eq!(cfg.alert_mempool_full_pct, 90);
         // Three defaults are network-dependent, all because the alert would
@@ -13125,27 +14369,53 @@ rpcport=8332
         // and constantly — competing-chain and `invalidateblock` tests are the
         // point of the harness — and only has blocks when a test mines them, so
         // an idle chain is its resting state rather than a stall.
-        assert_eq!(cfg.alert_tip_stall_seconds, 0, "regtest only has blocks on demand");
-        assert_eq!(cfg.alert_peer_floor, 0, "regtest defaults the peer floor off");
+        assert_eq!(
+            cfg.alert_tip_stall_seconds, 0,
+            "regtest only has blocks on demand"
+        );
+        assert_eq!(
+            cfg.alert_peer_floor, 0,
+            "regtest defaults the peer floor off"
+        );
         assert_eq!(cfg.alert_reorg_depth, 0, "regtest reorgs deliberately");
 
         // ...all armed where the condition really does mean something is
         // wrong.
         let cfg_mainnet = parse_boxed(&["satd", "--datadir", dir.path().to_str().unwrap()]);
-        assert_eq!(cfg_mainnet.alert_tip_stall_seconds, 3_600, "mainnet keeps the hour");
+        assert_eq!(
+            cfg_mainnet.alert_tip_stall_seconds, 3_600,
+            "mainnet keeps the hour"
+        );
         assert_eq!(cfg_mainnet.alert_peer_floor, 3, "mainnet keeps the floor");
-        assert_eq!(cfg_mainnet.alert_reorg_depth, 3, "3 deep is an incident on mainnet");
+        assert_eq!(
+            cfg_mainnet.alert_reorg_depth, 3,
+            "3 deep is an incident on mainnet"
+        );
 
         // Test networks reorg a few blocks deep as an ordinary consequence of
         // thin hashrate. Paging on that trains the operator to ignore the
         // alert, which costs them the mainnet one too — so the floor is raised
         // rather than defaulted to mainnet's sensitivity.
-        let cfg_signet = parse_boxed(&["satd", "--signet", "--datadir", dir.path().to_str().unwrap()]);
-        assert_eq!(cfg_signet.alert_reorg_depth, 10, "signet does not page on routine reorgs");
-        assert_eq!(cfg_signet.alert_peer_floor, 3, "but signet is a real network with peers");
+        let cfg_signet = parse_boxed(&[
+            "satd",
+            "--signet",
+            "--datadir",
+            dir.path().to_str().unwrap(),
+        ]);
+        assert_eq!(
+            cfg_signet.alert_reorg_depth, 10,
+            "signet does not page on routine reorgs"
+        );
+        assert_eq!(
+            cfg_signet.alert_peer_floor, 3,
+            "but signet is a real network with peers"
+        );
         // A stall is not an ordinary property of a thin-hashrate chain the way
         // a shallow reorg is, so the hour holds on the test networks.
-        assert_eq!(cfg_signet.alert_tip_stall_seconds, 3_600, "and it should still make blocks");
+        assert_eq!(
+            cfg_signet.alert_tip_stall_seconds, 3_600,
+            "and it should still make blocks"
+        );
 
         // Explicit CLI values parse through, including 0 (= detector off),
         // which must not be swallowed by the `unwrap_or(default)`.
@@ -13213,10 +14483,7 @@ rpcport=8332
             "--testactivationheight=segwit@700",
         ])
         .unwrap();
-        assert_eq!(
-            cfg.test_activation_overrides.unwrap().segwit,
-            Some(700)
-        );
+        assert_eq!(cfg.test_activation_overrides.unwrap().segwit, Some(700));
 
         // Malformed values are startup errors, mirroring Core's messages.
         let err = with(&["--regtest", "--testactivationheight=segwit"]).unwrap_err();
@@ -13228,13 +14495,21 @@ rpcport=8332
 
         // Core parses the height as int32_t: negatives, >= INT_MAX, and a
         // leading '+' (rejected by its from_chars parse) are all invalid.
-        for bad in ["segwit@-1", "segwit@2147483647", "segwit@99999999999", "segwit@+5"] {
+        for bad in [
+            "segwit@-1",
+            "segwit@2147483647",
+            "segwit@99999999999",
+            "segwit@+5",
+        ] {
             let err = with(&["--regtest", &format!("--testactivationheight={bad}")]).unwrap_err();
             assert!(err.contains("Invalid height value"), "{bad}: {err}");
         }
         // One below INT_MAX is the largest Core accepts.
         let cfg = with(&["--regtest", "--testactivationheight=segwit@2147483646"]).unwrap();
-        assert_eq!(cfg.test_activation_overrides.unwrap().segwit, Some(2147483646));
+        assert_eq!(
+            cfg.test_activation_overrides.unwrap().segwit,
+            Some(2147483646)
+        );
 
         // Off regtest Core never reads the key (ReadRegTestArgs runs only for
         // the regtest branch), so satd warns and ignores rather than refusing
@@ -13411,10 +14686,20 @@ testactivationheight=bip34@2
         // threshold governs, so a node wired to eight peers is not held to
         // needing all eight.
         let many: Vec<&str> = vec![
-            "--connect", "10.0.0.1:8333", "--connect", "10.0.0.2:8333", "--connect",
-            "10.0.0.3:8333", "--connect", "10.0.0.4:8333",
+            "--connect",
+            "10.0.0.1:8333",
+            "--connect",
+            "10.0.0.2:8333",
+            "--connect",
+            "10.0.0.3:8333",
+            "--connect",
+            "10.0.0.4:8333",
         ];
-        assert_eq!(with(&many).alert_peer_floor, 3, "the cap is the stock floor");
+        assert_eq!(
+            with(&many).alert_peer_floor,
+            3,
+            "the cap is the stock floor"
+        );
 
         // An explicit value still wins over the derived default, in both
         // directions.
@@ -13450,8 +14735,15 @@ testactivationheight=bip34@2
             .unwrap(),
         )
         .unwrap();
-        assert_eq!(cfg.connect.len(), 2, "the fixture must actually take effect");
-        assert_eq!(cfg.alert_peer_floor, 2, "connect= from bitcoin.conf counts too");
+        assert_eq!(
+            cfg.connect.len(),
+            2,
+            "the fixture must actually take effect"
+        );
+        assert_eq!(
+            cfg.alert_peer_floor, 2,
+            "connect= from bitcoin.conf counts too"
+        );
     }
 
     #[test]
@@ -13468,10 +14760,17 @@ testactivationheight=bip34@2
         let cf = ConfigFile::parse("alerttipstallseconds=120\nalertpeerfloor=1\n")
             .expect("alert threshold keys should parse from bitcoin.conf");
         assert_eq!(
-            cf.global.get("alerttipstallseconds").unwrap().last().unwrap(),
+            cf.global
+                .get("alerttipstallseconds")
+                .unwrap()
+                .last()
+                .unwrap(),
             "120"
         );
-        assert_eq!(cf.global.get("alertpeerfloor").unwrap().last().unwrap(), "1");
+        assert_eq!(
+            cf.global.get("alertpeerfloor").unwrap().last().unwrap(),
+            "1"
+        );
     }
 
     #[test]
@@ -13479,9 +14778,13 @@ testactivationheight=bip34@2
         let dir = tempfile::tempdir().expect("tempdir");
 
         // Defaults: no policy file, 50 MB quarantine budget.
-        let cli =
-            parse_cli(["satd", "--regtest", "--datadir", dir.path().to_str().unwrap()])
-                .unwrap();
+        let cli = parse_cli([
+            "satd",
+            "--regtest",
+            "--datadir",
+            dir.path().to_str().unwrap(),
+        ])
+        .unwrap();
         let cfg = Config::from_cli(cli).unwrap();
         assert!(cfg.policyfile.is_none());
         assert_eq!(cfg.quarantinemempool, 50);
@@ -13499,7 +14802,10 @@ testactivationheight=bip34@2
         ])
         .unwrap();
         let cfg = Config::from_cli(cli).unwrap();
-        assert_eq!(cfg.policyfile.as_deref(), Some(std::path::Path::new("/etc/satd/policy.conf")));
+        assert_eq!(
+            cfg.policyfile.as_deref(),
+            Some(std::path::Path::new("/etc/satd/policy.conf"))
+        );
         assert_eq!(cfg.quarantinemempool, 200);
     }
 
@@ -13525,9 +14831,13 @@ testactivationheight=bip34@2
     #[test]
     fn rpc_readonly_listener_disabled_by_default() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let cli =
-            parse_cli(["satd", "--regtest", "--datadir", dir.path().to_str().unwrap()])
-                .unwrap();
+        let cli = parse_cli([
+            "satd",
+            "--regtest",
+            "--datadir",
+            dir.path().to_str().unwrap(),
+        ])
+        .unwrap();
         let cfg = Config::from_cli(cli).unwrap();
         // Opt-in: no read-only listener unless -rpcreadonlybind is set.
         assert!(cfg.rpc_readonly_bind.is_empty());
@@ -13590,7 +14900,11 @@ testactivationheight=bip34@2
     fn server_and_peer_timeouts_come_from_the_config_file() {
         let dir = tempfile::tempdir().expect("tempdir");
         let conf = dir.path().join("bitcoin.conf");
-        std::fs::write(&conf, "regtest=1\n[regtest]\nrpcservertimeout=99000\npeertimeout=7\n").unwrap();
+        std::fs::write(
+            &conf,
+            "regtest=1\n[regtest]\nrpcservertimeout=99000\npeertimeout=7\n",
+        )
+        .unwrap();
         let argv = [
             "satd",
             "--datadir",
@@ -13599,7 +14913,10 @@ testactivationheight=bip34@2
             conf.to_str().unwrap(),
         ];
         let cfg = Config::from_cli(parse_cli(argv).unwrap()).unwrap();
-        assert_eq!(cfg.rpc_server_timeout, Some(std::time::Duration::from_secs(99_000)));
+        assert_eq!(
+            cfg.rpc_server_timeout,
+            Some(std::time::Duration::from_secs(99_000))
+        );
         assert_eq!(cfg.peertimeout, 7);
         assert!(is_known_config_key("rpcservertimeout"));
         assert!(is_known_config_key("peertimeout"));
@@ -13732,12 +15049,20 @@ testactivationheight=bip34@2
     fn api_threads_default_and_override() {
         // Default: max(2, cores/4), and never below the floor of 2.
         assert!(default_api_threads() >= 2, "API thread floor is 2");
-        assert!(is_known_config_key("apithreads"), "apithreads must be known");
+        assert!(
+            is_known_config_key("apithreads"),
+            "apithreads must be known"
+        );
 
         let dir = tempfile::tempdir().expect("tempdir");
         let cfg = Config::from_cli(
-            parse_cli(["satd", "--regtest", "--datadir", dir.path().to_str().unwrap()])
-                .unwrap(),
+            parse_cli([
+                "satd",
+                "--regtest",
+                "--datadir",
+                dir.path().to_str().unwrap(),
+            ])
+            .unwrap(),
         )
         .unwrap();
         assert_eq!(cfg.api_threads, default_api_threads());
@@ -14411,7 +15736,10 @@ testactivationheight=bip34@2
             "--fast-start=http://example.com/utxo-840000.dat",
         ];
         let err = fast_start_config(&args).unwrap_err();
-        assert!(err.contains("https://"), "expected https-required error, got: {err}");
+        assert!(
+            err.contains("https://"),
+            "expected https-required error, got: {err}"
+        );
 
         // https:// is accepted and preserved.
         let args = [
@@ -14445,7 +15773,10 @@ testactivationheight=bip34@2
             "--prune=550",
         ];
         let err = fast_start_config(&args).unwrap_err();
-        assert!(err.contains("prune"), "expected prune-conflict error, got: {err}");
+        assert!(
+            err.contains("prune"),
+            "expected prune-conflict error, got: {err}"
+        );
 
         // An unsupported scheme is rejected.
         let args = [
@@ -14542,10 +15873,7 @@ testactivationheight=bip34@2
         ])
         .unwrap();
         let config = Config::from_cli(cli).expect("complete --esploratls* triple should load");
-        assert_eq!(
-            config.esplora_tls_bind.as_deref(),
-            Some("127.0.0.1:3001")
-        );
+        assert_eq!(config.esplora_tls_bind.as_deref(), Some("127.0.0.1:3001"));
     }
 
     /// The metrics TLS listener refuses every partial configuration, and a
@@ -14564,15 +15892,24 @@ testactivationheight=bip34@2
             "--metricstlskey=/tmp/key.pem",
         ];
         let without = |flag: &str| -> Vec<&str> {
-            full.iter().copied().filter(|a| !a.starts_with(flag)).collect()
+            full.iter()
+                .copied()
+                .filter(|a| !a.starts_with(flag))
+                .collect()
         };
 
         let err = load(&without("--metricsport=")).unwrap_err();
         assert!(err.contains("requires --metricsport"), "got: {err}");
         let err = load(&without("--metricstlscert=")).unwrap_err();
-        assert!(err.contains("--metricstlscert AND --metricstlskey"), "got: {err}");
+        assert!(
+            err.contains("--metricstlscert AND --metricstlskey"),
+            "got: {err}"
+        );
         let err = load(&without("--metricstlskey=")).unwrap_err();
-        assert!(err.contains("--metricstlscert AND --metricstlskey"), "got: {err}");
+        assert!(
+            err.contains("--metricstlscert AND --metricstlskey"),
+            "got: {err}"
+        );
 
         let mut bad = without("--metricstlsbind=");
         bad.push("--metricstlsbind=localhost");
@@ -14580,7 +15917,10 @@ testactivationheight=bip34@2
         assert!(err.contains("invalid --metricstlsbind"), "got: {err}");
 
         let err = load(&["--metricsport=9332", "--metricsmtls=1"]).unwrap_err();
-        assert!(err.contains("--metricsmtls=1 requires --metricstlsbind"), "got: {err}");
+        assert!(
+            err.contains("--metricsmtls=1 requires --metricstlsbind"),
+            "got: {err}"
+        );
         let mut mtls = full.to_vec();
         mtls.push("--metricsmtls=1");
         let err = load(&mtls).unwrap_err();
@@ -14599,7 +15939,10 @@ testactivationheight=bip34@2
         mtls.push("--metricsmtlsclientallow=prometheus,grafana");
         let config = load(&mtls).expect("a complete mTLS set loads");
         assert!(config.metrics_mtls);
-        assert_eq!(config.metrics_mtls_client_allow, vec!["prometheus", "grafana"]);
+        assert_eq!(
+            config.metrics_mtls_client_allow,
+            vec!["prometheus", "grafana"]
+        );
     }
 
     /// `--rpctlsbind` without the matching cert/key flags must be
@@ -14887,19 +16230,20 @@ testactivationheight=bip34@2
             "--rpcmtlsclientca=/tmp/ca.pem",
             "--rpcdisableauth=1",
         ];
-        let ok = Config::from_cli(parse_cli(base).unwrap())
-            .expect("auth-disabled mTLS alone loads");
+        let ok =
+            Config::from_cli(parse_cli(base).unwrap()).expect("auth-disabled mTLS alone loads");
         assert!(ok.rpc_whitelist.is_inert());
-        for extra in [
-            "--rpcwhitelist=u:getblockcount",
-            "--rpcwhitelistdefault=1",
-        ] {
+        for extra in ["--rpcwhitelist=u:getblockcount", "--rpcwhitelistdefault=1"] {
             let argv: Vec<&str> = base.iter().copied().chain([extra]).collect();
             let err = Config::from_cli(parse_cli(argv).unwrap()).unwrap_err();
             assert!(err.contains("rpcwhitelist"), "{extra}: {err}");
         }
         // An explicit default of 0 with no list restricts nobody: allowed.
-        let argv: Vec<&str> = base.iter().copied().chain(["--rpcwhitelistdefault=0"]).collect();
+        let argv: Vec<&str> = base
+            .iter()
+            .copied()
+            .chain(["--rpcwhitelistdefault=0"])
+            .collect();
         Config::from_cli(parse_cli(argv).unwrap()).expect("inert whitelist");
     }
 
@@ -14918,12 +16262,19 @@ testactivationheight=bip34@2
         .unwrap();
         let dirs = dir.path().to_str().unwrap();
         let confs = conf.to_str().unwrap();
-        let cfg = Config::from_cli(
-            parse_cli(["satd", "--datadir", dirs, "--conf", confs]).unwrap(),
-        )
-        .unwrap();
-        assert!(!cfg.rpc_whitelist.default_deny(), "the file's default=0 applies");
-        assert!(cfg.rpc_whitelist.scope_for("u").unwrap().allows("getbestblockhash"));
+        let cfg =
+            Config::from_cli(parse_cli(["satd", "--datadir", dirs, "--conf", confs]).unwrap())
+                .unwrap();
+        assert!(
+            !cfg.rpc_whitelist.default_deny(),
+            "the file's default=0 applies"
+        );
+        assert!(
+            cfg.rpc_whitelist
+                .scope_for("u")
+                .unwrap()
+                .allows("getbestblockhash")
+        );
         assert_eq!(cfg.rpc_whitelist.scope_for("other"), None);
 
         let cfg = Config::from_cli(
@@ -14942,8 +16293,14 @@ testactivationheight=bip34@2
         let scope = cfg.rpc_whitelist.scope_for("u").unwrap();
         assert!(scope.allows("getblockcount"));
         assert!(!scope.allows("getbestblockhash"), "command line ∩ file");
-        assert!(cfg.rpc_whitelist.default_deny(), "the command line's default wins");
-        assert_eq!(cfg.rpc_whitelist.scope_for("other"), Some(MethodScope::DenyAll));
+        assert!(
+            cfg.rpc_whitelist.default_deny(),
+            "the command line's default wins"
+        );
+        assert_eq!(
+            cfg.rpc_whitelist.scope_for("other"),
+            Some(MethodScope::DenyAll)
+        );
     }
 
     /// An empty `rpcwhitelistdefault=` in the file is true, as in Core; a
@@ -14966,9 +16323,24 @@ testactivationheight=bip34@2
                 .unwrap(),
             )
         };
-        assert!(load("rpcwhitelistdefault=\n").unwrap().rpc_whitelist.default_deny());
-        assert!(load("rpcwhitelistdefault=1\n").unwrap().rpc_whitelist.default_deny());
-        assert!(!load("rpcwhitelistdefault=0\n").unwrap().rpc_whitelist.default_deny());
+        assert!(
+            load("rpcwhitelistdefault=\n")
+                .unwrap()
+                .rpc_whitelist
+                .default_deny()
+        );
+        assert!(
+            load("rpcwhitelistdefault=1\n")
+                .unwrap()
+                .rpc_whitelist
+                .default_deny()
+        );
+        assert!(
+            !load("rpcwhitelistdefault=0\n")
+                .unwrap()
+                .rpc_whitelist
+                .default_deny()
+        );
         let err = load("rpcwhitelistdefault=on\n").unwrap_err();
         assert!(err.contains("rpcwhitelistdefault"), "{err}");
     }
@@ -14987,8 +16359,16 @@ testactivationheight=bip34@2
             let (kept, _) = filter_unsupported_core_cli_args(normalize_args(argv)).unwrap();
             Config::from_cli(parse_cli(kept).unwrap()).unwrap()
         };
-        assert!(parse(&["-rpcwhitelistdefault"]).rpc_whitelist.default_deny());
-        assert!(!parse(&["-norpcwhitelistdefault"]).rpc_whitelist.default_deny());
+        assert!(
+            parse(&["-rpcwhitelistdefault"])
+                .rpc_whitelist
+                .default_deny()
+        );
+        assert!(
+            !parse(&["-norpcwhitelistdefault"])
+                .rpc_whitelist
+                .default_deny()
+        );
         let bare = parse(&["-rpcwhitelist"]).rpc_whitelist;
         assert!(bare.default_deny());
         assert_eq!(bare.users().map(|(u, _)| u).collect::<Vec<_>>(), vec![""]);
@@ -15096,12 +16476,7 @@ testactivationheight=bip34@2
     /// on the Config. Default 10s when unset.
     #[test]
     fn test_rpc_tls_handshake_timeout_parses() {
-        let cli = parse_cli([
-            "satd",
-            "--regtest",
-            "--datadir=/tmp/satd-test",
-        ])
-        .unwrap();
+        let cli = parse_cli(["satd", "--regtest", "--datadir=/tmp/satd-test"]).unwrap();
         let config = Config::from_cli(cli).unwrap();
         assert_eq!(config.rpc_tls_handshake_timeout, 10);
 
@@ -15245,7 +16620,10 @@ testactivationheight=bip34@2
         assert!(config.stratum, "a bare flag means 1");
         assert_eq!(config.stratum_bind, "127.0.0.1:3400");
         assert_eq!(config.stratum_tls_bind.as_deref(), Some("127.0.0.1:4400"));
-        assert_eq!(config.stratum_tls_key, Some(std::path::PathBuf::from("/tmp/key.pem")));
+        assert_eq!(
+            config.stratum_tls_key,
+            Some(std::path::PathBuf::from("/tmp/key.pem"))
+        );
         assert!(config.stratum_mtls);
         let mut names = config.stratum_mtls_client_allow.clone();
         names.sort();
@@ -15262,17 +16640,26 @@ testactivationheight=bip34@2
     /// network-reachable without TLS; it still needs the server enabled.
     #[test]
     fn stratum_v2_bind_rules() {
-        let config = stratum_config(&["--regtest", "--stratum=1", "--stratumv2bind=0.0.0.0:3336"]).unwrap();
+        let config =
+            stratum_config(&["--regtest", "--stratum=1", "--stratumv2bind=0.0.0.0:3336"]).unwrap();
         assert_eq!(config.stratum_v2_bind.as_deref(), Some("0.0.0.0:3336"));
         assert_eq!(config.stratum_v2_max_channels, 16);
         assert_eq!(config.stratum_v2_key, None);
 
         let err = stratum_config(&["--regtest", "--stratumv2bind=127.0.0.1:3336"]).unwrap_err();
-        assert!(err.contains("--stratumv2bind requires --stratum=1"), "got: {err}");
-        let err = stratum_config(&["--regtest", "--stratum=1", "--stratumv2bind=nope"]).unwrap_err();
+        assert!(
+            err.contains("--stratumv2bind requires --stratum=1"),
+            "got: {err}"
+        );
+        let err =
+            stratum_config(&["--regtest", "--stratum=1", "--stratumv2bind=nope"]).unwrap_err();
         assert!(err.contains("invalid --stratumv2bind"), "got: {err}");
-        let err = stratum_config(&["--regtest", "--stratum=1", "--stratumv2maxchannels=0"]).unwrap_err();
-        assert!(err.contains("--stratumv2maxchannels must be at least 1"), "got: {err}");
+        let err =
+            stratum_config(&["--regtest", "--stratum=1", "--stratumv2maxchannels=0"]).unwrap_err();
+        assert!(
+            err.contains("--stratumv2maxchannels must be at least 1"),
+            "got: {err}"
+        );
         let config = stratum_config(&[
             "--regtest",
             "--stratum=1",
@@ -15280,12 +16667,18 @@ testactivationheight=bip34@2
             "--stratumv2maxchannels=2",
         ])
         .unwrap();
-        assert_eq!(config.stratum_v2_key, Some(std::path::PathBuf::from("/tmp/k.key")));
+        assert_eq!(
+            config.stratum_v2_key,
+            Some(std::path::PathBuf::from("/tmp/k.key"))
+        );
         assert_eq!(config.stratum_v2_max_channels, 2);
         assert!(!config.stratum_v2_jd, "Job Declaration is off by default");
 
         let err = stratum_config(&["--regtest", "--stratum=1", "--stratumv2jd=1"]).unwrap_err();
-        assert!(err.contains("--stratumv2jd=1 requires --stratumv2bind"), "got: {err}");
+        assert!(
+            err.contains("--stratumv2jd=1 requires --stratumv2bind"),
+            "got: {err}"
+        );
         let config = stratum_config(&[
             "--regtest",
             "--stratum=1",
@@ -15318,9 +16711,15 @@ testactivationheight=bip34@2
             "--stratummtls=1",
         ])
         .unwrap_err();
-        assert!(err.contains("--stratummtls=1 requires --stratummtlsclientca"), "got: {err}");
+        assert!(
+            err.contains("--stratummtls=1 requires --stratummtlsclientca"),
+            "got: {err}"
+        );
         let err = stratum_config(&["--regtest", "--stratummtlsclientallow=rig"]).unwrap_err();
-        assert!(err.contains("--stratummtlsclientallow requires --stratummtls=1"), "got: {err}");
+        assert!(
+            err.contains("--stratummtlsclientallow requires --stratummtls=1"),
+            "got: {err}"
+        );
 
         // A mainnet address is not a regtest payout.
         let err = stratum_config(&[
@@ -15329,9 +16728,16 @@ testactivationheight=bip34@2
             "--stratumaddress=bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq",
         ])
         .unwrap_err();
-        assert!(err.contains("not an address for this network"), "got: {err}");
-        let err = stratum_config(&["--regtest", "--stratum=1", "--stratumdifficulty=0"]).unwrap_err();
-        assert!(err.contains("--stratumdifficulty must be at least 1"), "got: {err}");
+        assert!(
+            err.contains("not an address for this network"),
+            "got: {err}"
+        );
+        let err =
+            stratum_config(&["--regtest", "--stratum=1", "--stratumdifficulty=0"]).unwrap_err();
+        assert!(
+            err.contains("--stratumdifficulty must be at least 1"),
+            "got: {err}"
+        );
     }
 
     // ---- PR-1: --rpcbind / --rpcallowip / --rpcauth / cookie tests ----
@@ -15508,12 +16914,7 @@ testactivationheight=bip34@2
 
     #[test]
     fn default_rpcbind_is_both_loopbacks() {
-        let cli = parse_cli([
-            "satd",
-            "--regtest",
-            "--datadir=/tmp/satd-rpc-compat-test4",
-        ])
-        .unwrap();
+        let cli = parse_cli(["satd", "--regtest", "--datadir=/tmp/satd-rpc-compat-test4"]).unwrap();
         let cfg = Config::from_cli(cli).unwrap();
         // Core's `HTTPBindAddresses` default: 127.0.0.1 first, then ::1.
         assert!(cfg.rpcbind_is_default);
@@ -15546,7 +16947,10 @@ testactivationheight=bip34@2
             ])
             .unwrap();
             let err = Config::from_cli(cli).unwrap_err();
-            assert_eq!(err, format!("Invalid port specified in -rpcbind: '{entry}'"));
+            assert_eq!(
+                err,
+                format!("Invalid port specified in -rpcbind: '{entry}'")
+            );
         }
         // A valid port, and forms with no port at all, are not port errors.
         for entry in ["127.0.0.1:8332", "[::1]:8332", "127.0.0.1", "[::1]", "::1"] {
@@ -15572,12 +16976,7 @@ testactivationheight=bip34@2
 
     #[test]
     fn authfile_defaults_to_none() {
-        let cli = parse_cli([
-            "satd",
-            "--regtest",
-            "--datadir=/tmp/satd-authfile-test1",
-        ])
-        .unwrap();
+        let cli = parse_cli(["satd", "--regtest", "--datadir=/tmp/satd-authfile-test1"]).unwrap();
         let cfg = Config::from_cli(cli).unwrap();
         assert!(cfg.authfile.is_none());
     }
@@ -15592,7 +16991,10 @@ testactivationheight=bip34@2
         ])
         .unwrap();
         let cfg = Config::from_cli(cli).unwrap();
-        assert_eq!(cfg.authfile.as_deref(), Some(std::path::Path::new("/etc/satd/auth.toml")));
+        assert_eq!(
+            cfg.authfile.as_deref(),
+            Some(std::path::Path::new("/etc/satd/auth.toml"))
+        );
     }
 
     #[test]
@@ -15619,12 +17021,7 @@ testactivationheight=bip34@2
 
     #[test]
     fn rpcauthbearer_defaults_off() {
-        let cli = parse_cli([
-            "satd",
-            "--regtest",
-            "--datadir=/tmp/satd-bearer-test1",
-        ])
-        .unwrap();
+        let cli = parse_cli(["satd", "--regtest", "--datadir=/tmp/satd-bearer-test1"]).unwrap();
         let cfg = Config::from_cli(cli).unwrap();
         assert!(!cfg.rpc_auth_bearer);
     }
@@ -15639,7 +17036,10 @@ testactivationheight=bip34@2
         ])
         .unwrap();
         let err = Config::from_cli(cli).unwrap_err();
-        assert!(err.contains("authfile"), "expected authfile requirement, got: {err}");
+        assert!(
+            err.contains("authfile"),
+            "expected authfile requirement, got: {err}"
+        );
     }
 
     #[test]
@@ -15955,12 +17355,8 @@ testactivationheight=bip34@2
 
     #[test]
     fn chain_flag_routes_to_network() {
-        let cli = parse_cli([
-            "satd",
-            "--chain=regtest",
-            "--datadir=/tmp/satd-chain-test1",
-        ])
-        .unwrap();
+        let cli =
+            parse_cli(["satd", "--chain=regtest", "--datadir=/tmp/satd-chain-test1"]).unwrap();
         let cfg = Config::from_cli(cli).unwrap();
         assert_eq!(cfg.network, Network::Regtest);
     }
@@ -16029,12 +17425,7 @@ testactivationheight=bip34@2
 
     #[test]
     fn blocksdir_defaults_to_none() {
-        let cli = parse_cli([
-            "satd",
-            "--regtest",
-            "--datadir=/tmp/satd-chain-test5",
-        ])
-        .unwrap();
+        let cli = parse_cli(["satd", "--regtest", "--datadir=/tmp/satd-chain-test5"]).unwrap();
         let cfg = Config::from_cli(cli).unwrap();
         assert!(cfg.blocksdir.is_none());
     }
@@ -16186,20 +17577,31 @@ rpcport=39999
             "includeconf=override.conf\nrpcport=18443\n",
             &[("override.conf", "rpcport=19999\n")],
         );
-        assert_eq!(before.unwrap().rpcport, 18443, "includeconf before the setting");
+        assert_eq!(
+            before.unwrap().rpcport,
+            18443,
+            "includeconf before the setting"
+        );
 
         let (_d2, after) = load_with_files(
             "rpcport=18443\nincludeconf=override.conf\n",
             &[("override.conf", "rpcport=19999\n")],
         );
-        assert_eq!(after.unwrap().rpcport, 18443, "includeconf after the setting");
+        assert_eq!(
+            after.unwrap().rpcport,
+            18443,
+            "includeconf after the setting"
+        );
     }
 
     #[test]
     fn includeconf_multiple_files_in_order() {
         let (_d, cfg) = load_with_files(
             "includeconf=a.conf\nincludeconf=b.conf\n",
-            &[("a.conf", "rpcuser=from_a\n"), ("b.conf", "rpcpassword=from_b\n")],
+            &[
+                ("a.conf", "rpcuser=from_a\n"),
+                ("b.conf", "rpcpassword=from_b\n"),
+            ],
         );
         let cfg = cfg.unwrap();
         assert_eq!(cfg.rpcuser.as_deref(), Some("from_a"));
@@ -16220,7 +17622,10 @@ rpcport=39999
         );
         let cfg = cfg.unwrap();
         assert_eq!(cfg.maxconnections, 42, "mid.conf value should apply");
-        assert_ne!(cfg.maxconnections, 999, "nested include must not be followed");
+        assert_ne!(
+            cfg.maxconnections, 999,
+            "nested include must not be followed"
+        );
         assert!(
             cfg.pending_notes
                 .iter()
@@ -16233,8 +17638,14 @@ rpcport=39999
     fn includeconf_missing_file_hard_errors() {
         let (_d, cfg) = load_with_files("includeconf=nope.conf\n", &[]);
         let err = cfg.unwrap_err();
-        assert!(err.contains("includeconf"), "error should name includeconf: {err}");
-        assert!(err.contains("nope.conf"), "error should name the missing file: {err}");
+        assert!(
+            err.contains("includeconf"),
+            "error should name includeconf: {err}"
+        );
+        assert!(
+            err.contains("nope.conf"),
+            "error should name the missing file: {err}"
+        );
     }
 
     #[test]
@@ -16243,7 +17654,10 @@ rpcport=39999
         let (_d, cfg) =
             load_with_files("includeconf=bad.conf\n", &[("bad.conf", "rpusser=typo\n")]);
         let err = cfg.unwrap_err();
-        assert!(err.contains("rpusser"), "should reject the typo'd key: {err}");
+        assert!(
+            err.contains("rpusser"),
+            "should reject the typo'd key: {err}"
+        );
     }
 
     #[test]
@@ -16254,7 +17668,11 @@ rpcport=39999
         let inc = [("rt.conf", "rpcport=19999\n")];
 
         let (_d, cfg) = load_with_files(main, &inc);
-        assert_eq!(cfg.unwrap().rpcport, 19999, "regtest section include should apply");
+        assert_eq!(
+            cfg.unwrap().rpcport,
+            19999,
+            "regtest section include should apply"
+        );
 
         // Same files, but loaded on mainnet → the [regtest] include is
         // never processed.
@@ -16271,7 +17689,10 @@ rpcport=39999
         ])
         .unwrap();
         let cfg = Config::from_cli(cli).unwrap();
-        assert_eq!(cfg.rpcport, 8332, "mainnet must not process the [regtest] include");
+        assert_eq!(
+            cfg.rpcport, 8332,
+            "mainnet must not process the [regtest] include"
+        );
     }
 
     #[test]
@@ -16352,7 +17773,10 @@ rpcport=39999
             );
             assert!(cfg.connect.is_empty(), "{spelling} names no peer to dial");
             // ...and the same `-listen` interaction a `-connect` triggers.
-            assert!(!cfg.listen, "{spelling} must soft-set listen=0 as Core does");
+            assert!(
+                !cfg.listen,
+                "{spelling} must soft-set listen=0 as Core does"
+            );
         }
 
         // Core's double negation resolves to the address `1` and dials it.
@@ -16493,9 +17917,16 @@ rpcport=39999
         assert!(!cfg.listenonion);
 
         // Soft, as Core's `SoftSetBoolArg` is: a stated -listenonion wins.
-        let cfg = load(&["-connect=1.2.3.4", "-torcontrol=127.0.0.1:9051", "-listenonion=1"]);
+        let cfg = load(&[
+            "-connect=1.2.3.4",
+            "-torcontrol=127.0.0.1:9051",
+            "-listenonion=1",
+        ]);
         assert!(!cfg.listen);
-        assert!(cfg.listenonion, "an explicit -listenonion=1 is not overridden");
+        assert!(
+            cfg.listenonion,
+            "an explicit -listenonion=1 is not overridden"
+        );
 
         // And a listening node is untouched.
         let cfg = load(&["-torcontrol=127.0.0.1:9051"]);
@@ -16610,19 +18041,34 @@ mcpallowedhost=node.local
                 .filter(|m| m.starts_with("Reducing -maxconnections"))
                 .collect()
         };
-        for (arg, parsed) in [("-maxconnections=2001", 2001u64), ("-maxconnections=18446744073709551616", 2147483647)] {
+        for (arg, parsed) in [
+            ("-maxconnections=2001", 2001u64),
+            ("-maxconnections=18446744073709551616", 2147483647),
+        ] {
             let cfg = parse_negation(&["satd", "--regtest", "--datadir", dd, arg]).expect("starts");
             assert_eq!(cfg.maxconnections, 2000, "{arg}");
-            assert_eq!(warned(&cfg), vec![format!("Reducing -maxconnections from {parsed} to 2000.")], "{arg}");
+            assert_eq!(
+                warned(&cfg),
+                vec![format!("Reducing -maxconnections from {parsed} to 2000.")],
+                "{arg}"
+            );
         }
-        let cfg = parse_negation(&["satd", "--regtest", "--datadir", dd, "-maxconnections=2000"]).expect("starts");
+        let cfg = parse_negation(&["satd", "--regtest", "--datadir", dd, "-maxconnections=2000"])
+            .expect("starts");
         assert_eq!(cfg.maxconnections, 2000);
         assert!(warned(&cfg).is_empty(), "2000 itself is taken as given");
 
-        std::fs::write(tmpdir.path().join("bitcoin.conf"), "maxconnections=99999999999999999999\n").unwrap();
+        std::fs::write(
+            tmpdir.path().join("bitcoin.conf"),
+            "maxconnections=99999999999999999999\n",
+        )
+        .unwrap();
         let cfg = parse_negation(&["satd", "--regtest", "--datadir", dd]).expect("starts");
         assert_eq!(cfg.maxconnections, 2000);
-        assert_eq!(warned(&cfg), vec!["Reducing -maxconnections from 2147483647 to 2000.".to_string()]);
+        assert_eq!(
+            warned(&cfg),
+            vec!["Reducing -maxconnections from 2147483647 to 2000.".to_string()]
+        );
     }
 
     /// Core v32's connection defaults: `-maxconnections` 200 and
@@ -16636,11 +18082,19 @@ mcpallowedhost=node.local
         let cfg = parse_negation(&["satd", "--regtest", "--datadir", dd]).expect("starts");
         assert_eq!((cfg.maxconnections, cfg.inboundrelaypercent), (200, 50));
         assert_eq!(Profile::Mining.defaults().maxconnections, Some(200));
-        for (arg, pct) in [("-inboundrelaypercent=100", 100), ("-inboundrelaypercent=-5", 0), ("-inboundrelaypercent=250", 100)] {
+        for (arg, pct) in [
+            ("-inboundrelaypercent=100", 100),
+            ("-inboundrelaypercent=-5", 0),
+            ("-inboundrelaypercent=250", 100),
+        ] {
             let cfg = parse_negation(&["satd", "--regtest", "--datadir", dd, arg]).expect("starts");
             assert_eq!(cfg.inboundrelaypercent, pct, "{arg}");
         }
-        std::fs::write(tmpdir.path().join("bitcoin.conf"), "inboundrelaypercent=30\n").unwrap();
+        std::fs::write(
+            tmpdir.path().join("bitcoin.conf"),
+            "inboundrelaypercent=30\n",
+        )
+        .unwrap();
         let cfg = parse_negation(&["satd", "--regtest", "--datadir", dd]).expect("starts");
         assert_eq!(cfg.inboundrelaypercent, 30);
     }
@@ -16669,16 +18123,25 @@ mcpallowedhost=node.local
         assert!(!listen_with(&["-maxconnections=0"]), "-maxconnections=0");
 
         // An explicit -listen wins, from the command line...
-        assert!(listen_with(&["-connect=1.2.3.4", "-listen=1"]), "explicit -listen=1");
+        assert!(
+            listen_with(&["-connect=1.2.3.4", "-listen=1"]),
+            "explicit -listen=1"
+        );
         // ...and -bind holds the default up, as Core's earlier SoftSet does.
-        assert!(listen_with(&["-connect=1.2.3.4", "-bind=127.0.0.1"]), "-bind");
+        assert!(
+            listen_with(&["-connect=1.2.3.4", "-bind=127.0.0.1"]),
+            "-bind"
+        );
         assert!(
             listen_with(&["-connect=1.2.3.4", "-whitebind=noban@127.0.0.1:19999"]),
             "-whitebind"
         );
 
         // -addnode is not -connect: it does not disable anything.
-        assert!(listen_with(&["-addnode=1.2.3.4"]), "-addnode does not pin the node");
+        assert!(
+            listen_with(&["-addnode=1.2.3.4"]),
+            "-addnode does not pin the node"
+        );
     }
 
     /// An explicit `listen=1` in `bitcoin.conf` is as explicit as the flag:
@@ -16690,7 +18153,10 @@ mcpallowedhost=node.local
         let dd = tmpdir.path().to_str().unwrap();
         let cfg = parse_negation(&["satd", "--regtest", "--datadir", dd, "-connect=1.2.3.4"])
             .expect("starts");
-        assert!(cfg.listen, "a config-file listen=1 must beat the interaction");
+        assert!(
+            cfg.listen,
+            "a config-file listen=1 must beat the interaction"
+        );
     }
 
     #[test]
@@ -16726,7 +18192,11 @@ mcpallowedhost=node.local
             "-noregtest",
         ])
         .unwrap();
-        assert_eq!(cfg.network, Network::Bitcoin, "-noregtest should leave mainnet");
+        assert_eq!(
+            cfg.network,
+            Network::Bitcoin,
+            "-noregtest should leave mainnet"
+        );
     }
 
     #[test]
@@ -16860,7 +18330,10 @@ mcpallowedhost=node.local
 
     #[test]
     fn config_file_testnet4_selector_selects_testnet4() {
-        assert_eq!(network_from_conf("testnet4=1\n").unwrap(), Network::Testnet4);
+        assert_eq!(
+            network_from_conf("testnet4=1\n").unwrap(),
+            Network::Testnet4
+        );
     }
 
     #[test]
@@ -16888,10 +18361,7 @@ mcpallowedhost=node.local
     #[test]
     fn config_file_chain_and_conflicting_selector_error() {
         let err = network_from_conf("chain=signet\ntestnet4=1\n").unwrap_err();
-        assert!(
-            err.contains("conflicting network selector"),
-            "got: {err}"
-        );
+        assert!(err.contains("conflicting network selector"), "got: {err}");
     }
 
     #[test]
@@ -16967,8 +18437,7 @@ mcpallowedhost=node.local
     #[test]
     fn forcednsseed_and_fixedseeds_flags() {
         let cfg = Config::from_cli(
-            parse_cli(["satd", "--regtest", "--forcednsseed", "--fixedseeds=0"])
-                .unwrap(),
+            parse_cli(["satd", "--regtest", "--forcednsseed", "--fixedseeds=0"]).unwrap(),
         )
         .unwrap();
         assert!(cfg.forcednsseed);
@@ -16978,7 +18447,10 @@ mcpallowedhost=node.local
     #[test]
     fn forcednsseed_fixedseeds_negation() {
         let argv = normalize_args(
-            ["satd", "--regtest", "-nofixedseeds"].iter().map(|s| s.to_string()).collect(),
+            ["satd", "--regtest", "-nofixedseeds"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
         );
         let cfg = Config::from_cli(parse_cli(argv).unwrap()).unwrap();
         assert!(!cfg.fixedseeds);
@@ -16999,12 +18471,18 @@ mcpallowedhost=node.local
     fn discover_is_off_by_default() {
         let cfg = Config::from_cli(parse_cli(["satd", "--regtest"]).unwrap()).unwrap();
         assert!(!cfg.discover, "discover defaults off");
-        for argv in [vec!["satd", "--regtest", "-discover"], vec!["satd", "--regtest", "-discover=1"]] {
+        for argv in [
+            vec!["satd", "--regtest", "-discover"],
+            vec!["satd", "--regtest", "-discover=1"],
+        ] {
             let argv = normalize_args(argv.iter().map(|s| s.to_string()).collect());
             assert!(Config::from_cli(parse_cli(argv).unwrap()).unwrap().discover);
         }
         let argv = normalize_args(
-            ["satd", "--regtest", "-discover", "-nodiscover"].iter().map(|s| s.to_string()).collect(),
+            ["satd", "--regtest", "-discover", "-nodiscover"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
         );
         assert!(!Config::from_cli(parse_cli(argv).unwrap()).unwrap().discover);
         assert!(is_known_config_key("discover"));
@@ -17018,9 +18496,12 @@ mcpallowedhost=node.local
         let tmpdir = tempfile::tempdir().unwrap();
         std::fs::write(tmpdir.path().join("ip_asn.map"), b"\x00\x00").unwrap();
         let cli = parse_cli([
-            "satd", "--regtest",
-            "--datadir", tmpdir.path().to_str().unwrap(),
-            "--asmap", "ip_asn.map",
+            "satd",
+            "--regtest",
+            "--datadir",
+            tmpdir.path().to_str().unwrap(),
+            "--asmap",
+            "ip_asn.map",
         ])
         .unwrap();
         let cfg = Config::from_cli(cli).unwrap();
@@ -17031,12 +18512,19 @@ mcpallowedhost=node.local
     fn asmap_missing_file_errors() {
         let tmpdir = tempfile::tempdir().unwrap();
         let cli = parse_cli([
-            "satd", "--regtest",
-            "--datadir", tmpdir.path().to_str().unwrap(),
-            "--asmap", "nope.map",
+            "satd",
+            "--regtest",
+            "--datadir",
+            tmpdir.path().to_str().unwrap(),
+            "--asmap",
+            "nope.map",
         ])
         .unwrap();
-        assert!(Config::from_cli(cli).unwrap_err().contains("asmap file not found"));
+        assert!(
+            Config::from_cli(cli)
+                .unwrap_err()
+                .contains("asmap file not found")
+        );
     }
 
     #[test]
@@ -17061,8 +18549,7 @@ mcpallowedhost=node.local
 
     #[test]
     fn maxuploadtarget_flows_to_config() {
-        let cli =
-            parse_cli(["satd", "--regtest", "--maxuploadtarget", "250M"]).unwrap();
+        let cli = parse_cli(["satd", "--regtest", "--maxuploadtarget", "250M"]).unwrap();
         let cfg = Config::from_cli(cli).unwrap();
         assert_eq!(cfg.max_upload_target, 250 * 1024 * 1024);
         // default off
@@ -17075,9 +18562,12 @@ mcpallowedhost=node.local
     #[test]
     fn whitelist_parses_perms_and_subnet() {
         let cli = parse_cli([
-            "satd", "--regtest",
-            "--whitelist", "noban,relay@10.0.0.0/8",
-            "--whitelist", "192.168.1.5",
+            "satd",
+            "--regtest",
+            "--whitelist",
+            "noban,relay@10.0.0.0/8",
+            "--whitelist",
+            "192.168.1.5",
         ])
         .unwrap();
         let cfg = Config::from_cli(cli).unwrap();
@@ -17092,11 +18582,7 @@ mcpallowedhost=node.local
 
     #[test]
     fn whitebind_parses_addr_and_perms() {
-        let cli = parse_cli([
-            "satd", "--regtest",
-            "--whitebind", "noban@127.0.0.1:19999",
-        ])
-        .unwrap();
+        let cli = parse_cli(["satd", "--regtest", "--whitebind", "noban@127.0.0.1:19999"]).unwrap();
         let cfg = Config::from_cli(cli).unwrap();
         assert_eq!(cfg.whitebind.len(), 1);
         assert_eq!(cfg.whitebind[0].0.to_string(), "127.0.0.1:19999");
@@ -17105,9 +18591,7 @@ mcpallowedhost=node.local
 
     #[test]
     fn whitelist_invalid_subnet_errors() {
-        let cli =
-            parse_cli(["satd", "--regtest", "--whitelist", "relay@not-an-ip"])
-                .unwrap();
+        let cli = parse_cli(["satd", "--regtest", "--whitelist", "relay@not-an-ip"]).unwrap();
         assert!(Config::from_cli(cli).unwrap_err().contains("whitelist"));
     }
 
@@ -17123,9 +18607,12 @@ mcpallowedhost=node.local
     #[test]
     fn externalip_parses_ip_and_ip_port() {
         let cli = parse_cli([
-            "satd", "--regtest",
-            "--externalip", "203.0.113.7",
-            "--externalip", "198.51.100.9:12345",
+            "satd",
+            "--regtest",
+            "--externalip",
+            "203.0.113.7",
+            "--externalip",
+            "198.51.100.9:12345",
         ])
         .unwrap();
         let cfg = Config::from_cli(cli).unwrap();
@@ -17137,9 +18624,7 @@ mcpallowedhost=node.local
 
     #[test]
     fn externalip_rejects_hostname() {
-        let cli =
-            parse_cli(["satd", "--regtest", "--externalip", "node.example.com"])
-                .unwrap();
+        let cli = parse_cli(["satd", "--regtest", "--externalip", "node.example.com"]).unwrap();
         let err = Config::from_cli(cli).unwrap_err();
         assert!(err.contains("externalip"), "got: {err}");
     }
@@ -17158,7 +18643,10 @@ mcpallowedhost=node.local
         assert!(Config::from_cli(cli).unwrap().blocksonly);
 
         let argv = normalize_args(
-            ["satd", "--regtest", "-noblocksonly"].iter().map(|s| s.to_string()).collect(),
+            ["satd", "--regtest", "-noblocksonly"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
         );
         let cli = parse_cli(argv).unwrap();
         assert!(!Config::from_cli(cli).unwrap().blocksonly);
@@ -17170,13 +18658,24 @@ mcpallowedhost=node.local
     fn blockreconstructionextratxn_defaults_to_cores_100_and_clamps_negative_to_zero() {
         let parse = |argv: &[&str]| {
             let argv = normalize_args(argv.iter().map(|s| s.to_string()).collect());
-            Config::from_cli(parse_cli(argv).unwrap()).unwrap().blockreconstructionextratxn
+            Config::from_cli(parse_cli(argv).unwrap())
+                .unwrap()
+                .blockreconstructionextratxn
         };
         assert_eq!(parse(&["satd", "--regtest"]), 100);
-        assert_eq!(parse(&["satd", "--regtest", "-blockreconstructionextratxn=7"]), 7);
-        assert_eq!(parse(&["satd", "--regtest", "--blockreconstructionextratxn=0"]), 0);
+        assert_eq!(
+            parse(&["satd", "--regtest", "-blockreconstructionextratxn=7"]),
+            7
+        );
+        assert_eq!(
+            parse(&["satd", "--regtest", "--blockreconstructionextratxn=0"]),
+            0
+        );
         // Core: `std::max(GetIntArg(...), 0)`.
-        assert_eq!(parse(&["satd", "--regtest", "--blockreconstructionextratxn=-5"]), 0);
+        assert_eq!(
+            parse(&["satd", "--regtest", "--blockreconstructionextratxn=-5"]),
+            0
+        );
     }
 
     // ---- cmpctblockprefill ----
@@ -17189,9 +18688,28 @@ mcpallowedhost=node.local
             (c.cmpctblockprefill, c.cmpctblockprefillbytes)
         };
         assert_eq!(parse(&["satd", "--regtest"]), (false, 8192));
-        assert_eq!(parse(&["satd", "--regtest", "-cmpctblockprefill"]), (true, 8192));
-        assert_eq!(parse(&["satd", "--regtest", "-cmpctblockprefill=1", "-cmpctblockprefillbytes=4096"]), (true, 4096));
-        assert_eq!(parse(&["satd", "--regtest", "-cmpctblockprefill", "-nocmpctblockprefill"]), (false, 8192));
+        assert_eq!(
+            parse(&["satd", "--regtest", "-cmpctblockprefill"]),
+            (true, 8192)
+        );
+        assert_eq!(
+            parse(&[
+                "satd",
+                "--regtest",
+                "-cmpctblockprefill=1",
+                "-cmpctblockprefillbytes=4096"
+            ]),
+            (true, 4096)
+        );
+        assert_eq!(
+            parse(&[
+                "satd",
+                "--regtest",
+                "-cmpctblockprefill",
+                "-nocmpctblockprefill"
+            ]),
+            (false, 8192)
+        );
     }
 
     // ---- logging format knobs ----
@@ -17222,7 +18740,10 @@ mcpallowedhost=node.local
 
         // Core-style `-nologtimestamps` disables the timestamp column.
         let argv = normalize_args(
-            ["satd", "--regtest", "-nologtimestamps"].iter().map(|s| s.to_string()).collect(),
+            ["satd", "--regtest", "-nologtimestamps"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
         );
         let cfg = Config::from_cli(parse_cli(argv).unwrap()).unwrap();
         assert!(!cfg.log_timestamps);
@@ -17231,7 +18752,10 @@ mcpallowedhost=node.local
     #[test]
     fn log_format_knobs_via_config_file() {
         let cf = ConfigFile::parse("logthreadnames=1\nlogtimestamps=0\n").unwrap();
-        assert_eq!(cf.global.get("logthreadnames").map(|v| v.as_slice()), Some(&["1".to_string()][..]));
+        assert_eq!(
+            cf.global.get("logthreadnames").map(|v| v.as_slice()),
+            Some(&["1".to_string()][..])
+        );
         assert!(is_known_config_key("logtimestamps"));
         assert!(is_known_config_key("logthreadnames"));
         assert!(is_known_config_key("logsourcelocations"));
@@ -17245,10 +18769,8 @@ mcpallowedhost=node.local
         assert!(is_known_config_key("loglevel"));
 
         // CLI bare level.
-        let cfg = Config::from_cli(
-            parse_cli(["satd", "--regtest", "--loglevel=debug"]).unwrap(),
-        )
-        .unwrap();
+        let cfg = Config::from_cli(parse_cli(["satd", "--regtest", "--loglevel=debug"]).unwrap())
+            .unwrap();
         assert_eq!(cfg.log_level, vec!["debug".to_string()]);
 
         // Config-file per-category form is recognized + stored.
@@ -17295,10 +18817,9 @@ mcpallowedhost=node.local
     fn loglevel_builds_env_filter_directives() {
         // A bare global level and a per-category override both reach the
         // EnvFilter (build succeeds — invalid tokens would warn, not panic).
-        let cfg = Config::from_cli(
-            parse_cli(["satd", "--regtest", "--loglevel=net:debug"]).unwrap(),
-        )
-        .unwrap();
+        let cfg =
+            Config::from_cli(parse_cli(["satd", "--regtest", "--loglevel=net:debug"]).unwrap())
+                .unwrap();
         let rendered = format!("{}", build_env_filter(&cfg));
         assert!(
             rendered.contains("node::net"),
@@ -17315,15 +18836,16 @@ mcpallowedhost=node.local
         assert!(cfg.enforce_checkpoints, "checkpoints enforced by default");
         assert!(is_known_config_key("checkpoints"));
 
-        let cfg = Config::from_cli(
-            parse_cli(["satd", "--regtest", "--checkpoints=0"]).unwrap(),
-        )
-        .unwrap();
+        let cfg =
+            Config::from_cli(parse_cli(["satd", "--regtest", "--checkpoints=0"]).unwrap()).unwrap();
         assert!(!cfg.enforce_checkpoints);
 
         // Core-style `-nocheckpoints` negation.
         let argv = normalize_args(
-            ["satd", "--regtest", "-nocheckpoints"].iter().map(|s| s.to_string()).collect(),
+            ["satd", "--regtest", "-nocheckpoints"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
         );
         let cfg = Config::from_cli(parse_cli(argv).unwrap()).unwrap();
         assert!(!cfg.enforce_checkpoints);
@@ -17332,13 +18854,15 @@ mcpallowedhost=node.local
     #[test]
     fn acceptnonstdtxn_defaults_off_and_is_honored() {
         let cfg = Config::from_cli(parse_cli(["satd", "--regtest"]).unwrap()).unwrap();
-        assert!(!cfg.acceptnonstdtxn, "standard relay by default (Core parity)");
+        assert!(
+            !cfg.acceptnonstdtxn,
+            "standard relay by default (Core parity)"
+        );
         assert!(is_known_config_key("acceptnonstdtxn"));
 
-        let cfg = Config::from_cli(
-            parse_cli(["satd", "--regtest", "--acceptnonstdtxn=1"]).unwrap(),
-        )
-        .unwrap();
+        let cfg =
+            Config::from_cli(parse_cli(["satd", "--regtest", "--acceptnonstdtxn=1"]).unwrap())
+                .unwrap();
         assert!(cfg.acceptnonstdtxn);
 
         let cf = ConfigFile::parse("acceptnonstdtxn=1\n").unwrap();
@@ -17351,15 +18875,16 @@ mcpallowedhost=node.local
         assert!(cfg.networkactive, "networking enabled by default");
         assert!(is_known_config_key("networkactive"));
 
-        let cfg = Config::from_cli(
-            parse_cli(["satd", "--regtest", "--networkactive=0"]).unwrap(),
-        )
-        .unwrap();
+        let cfg = Config::from_cli(parse_cli(["satd", "--regtest", "--networkactive=0"]).unwrap())
+            .unwrap();
         assert!(!cfg.networkactive);
 
         // Core-style `-nonetworkactive` negation.
         let argv = normalize_args(
-            ["satd", "--regtest", "-nonetworkactive"].iter().map(|s| s.to_string()).collect(),
+            ["satd", "--regtest", "-nonetworkactive"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
         );
         let cfg = Config::from_cli(parse_cli(argv).unwrap()).unwrap();
         assert!(!cfg.networkactive);
@@ -17381,15 +18906,16 @@ mcpallowedhost=node.local
         let cfg = Config::from_cli(parse_cli(["satd", "--regtest"]).unwrap()).unwrap();
         assert_eq!(cfg.blocksxor, None);
 
-        let cfg = Config::from_cli(
-            parse_cli(["satd", "--regtest", "--blocksxor=1"]).unwrap(),
-        )
-        .unwrap();
+        let cfg =
+            Config::from_cli(parse_cli(["satd", "--regtest", "--blocksxor=1"]).unwrap()).unwrap();
         assert_eq!(cfg.blocksxor, Some(true));
 
         // Core-style `-noblocksxor` negation and single-dash form.
         let argv = normalize_args(
-            ["satd", "--regtest", "-noblocksxor"].iter().map(|s| s.to_string()).collect(),
+            ["satd", "--regtest", "-noblocksxor"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
         );
         let cfg = Config::from_cli(parse_cli(argv).unwrap()).unwrap();
         assert_eq!(cfg.blocksxor, Some(false));
@@ -17420,20 +18946,17 @@ mcpallowedhost=node.local
         assert!(!cfg.allow_ignored_conf);
         assert!(is_known_config_key("allowignoredconf"));
 
-        let cfg = Config::from_cli(
-            parse_cli(["satd", "--regtest", "--allowignoredconf"]).unwrap(),
-        )
-        .unwrap();
+        let cfg = Config::from_cli(parse_cli(["satd", "--regtest", "--allowignoredconf"]).unwrap())
+            .unwrap();
         assert!(cfg.allow_ignored_conf);
     }
 
     #[test]
     fn whitelistrelay_modifies_implicit_entry_perms() {
         // Default: implicit whitelist entry keeps relay, no forcerelay.
-        let cfg = Config::from_cli(
-            parse_cli(["satd", "--regtest", "--whitelist=127.0.0.1"]).unwrap(),
-        )
-        .unwrap();
+        let cfg =
+            Config::from_cli(parse_cli(["satd", "--regtest", "--whitelist=127.0.0.1"]).unwrap())
+                .unwrap();
         assert!(cfg.whitelist_relay && !cfg.whitelist_force_relay);
         assert!(cfg.whitelist[0].perms.relay);
         assert!(!cfg.whitelist[0].perms.force_relay);
@@ -17495,8 +19018,7 @@ mcpallowedhost=node.local
 
         // CLI: the %s placeholder is preserved verbatim for runtime substitution.
         let cfg = Config::from_cli(
-            parse_cli(["satd", "--regtest", "--blocknotify=/usr/bin/notify %s"])
-                .unwrap(),
+            parse_cli(["satd", "--regtest", "--blocknotify=/usr/bin/notify %s"]).unwrap(),
         )
         .unwrap();
         assert_eq!(cfg.block_notify.as_deref(), Some("/usr/bin/notify %s"));
@@ -17519,7 +19041,10 @@ mcpallowedhost=node.local
         .unwrap();
         for k in ["alertnotify", "startupnotify", "shutdownnotify"] {
             assert!(is_known_config_key(k), "{k} should be a known config key");
-            assert!(cf.global.contains_key(k), "{k} should be honored, not skipped");
+            assert!(
+                cf.global.contains_key(k),
+                "{k} should be honored, not skipped"
+            );
             assert!(
                 !cf.ignored.iter().any(|m| m.contains(k)),
                 "{k} should not warn-and-skip"
@@ -17548,7 +19073,11 @@ mcpallowedhost=node.local
         assert!(cf.global.contains_key("server"));
         assert!(!cf.global.contains_key("walletnotify"));
         assert!(cf.ignored.iter().any(|m| m.contains("walletnotify")));
-        assert!(skip_guidance("walletnotify").unwrap().contains("Streaming Consumption API"));
+        assert!(
+            skip_guidance("walletnotify")
+                .unwrap()
+                .contains("Streaming Consumption API")
+        );
     }
 
     #[test]
@@ -17570,14 +19099,20 @@ mcpallowedhost=node.local
     fn v2transport_defaults_true_v2only_false() {
         let cli = parse_cli(["satd", "--regtest"]).unwrap();
         let cfg = Config::from_cli(cli).unwrap();
-        assert!(cfg.v2transport, "v2transport should default on (Core parity)");
+        assert!(
+            cfg.v2transport,
+            "v2transport should default on (Core parity)"
+        );
         assert!(!cfg.v2only);
     }
 
     #[test]
     fn v2transport_negation_and_v2only_flag() {
         let argv = normalize_args(
-            ["satd", "--regtest", "-nov2transport"].iter().map(|s| s.to_string()).collect(),
+            ["satd", "--regtest", "-nov2transport"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
         );
         let cli = parse_cli(argv).unwrap();
         assert!(!Config::from_cli(cli).unwrap().v2transport);
@@ -17612,8 +19147,7 @@ mcpallowedhost=node.local
 
     #[test]
     fn signetchallenge_invalid_hex_errors() {
-        let cli =
-            parse_cli(["satd", "--signet", "--signetchallenge", "zzzz"]).unwrap();
+        let cli = parse_cli(["satd", "--signet", "--signetchallenge", "zzzz"]).unwrap();
         let err = Config::from_cli(cli).unwrap_err();
         // Core's `ReadSigNetArgs` wording; feature_signet.py matches it.
         assert_eq!(err, "-signetchallenge must be hex, not 'zzzz'.");
@@ -17622,7 +19156,12 @@ mcpallowedhost=node.local
     #[test]
     fn signetchallenge_refuses_multiple_values() {
         let cli = parse_cli([
-            "satd", "--signet", "--signetchallenge", "51", "--signetchallenge", "51",
+            "satd",
+            "--signet",
+            "--signetchallenge",
+            "51",
+            "--signetchallenge",
+            "51",
         ])
         .unwrap();
         let err = Config::from_cli(cli).unwrap_err();
@@ -17643,12 +19182,18 @@ mcpallowedhost=node.local
         };
         assert_eq!(
             dirs(&[]),
-            (PathBuf::from("/data/signet"), PathBuf::from("/data/signet/blocks"))
+            (
+                PathBuf::from("/data/signet"),
+                PathBuf::from("/data/signet/blocks")
+            )
         );
         let default = "512103ad5e0edad18cb1f0fc0d28a3d4f1f3e445640337489abb10404f2d1e086be430210359ef5021964fe22d6f8e05b2463c9540ce96883fe3b278760f048f5189f2e6c452ae";
         assert_eq!(
             dirs(&["--signetchallenge", default]),
-            (PathBuf::from("/data/signet"), PathBuf::from("/data/signet/blocks"))
+            (
+                PathBuf::from("/data/signet"),
+                PathBuf::from("/data/signet/blocks")
+            )
         );
         assert_eq!(
             dirs(&["--signetchallenge", "51"]),
@@ -17664,7 +19209,10 @@ mcpallowedhost=node.local
                 PathBuf::from("/mnt/signet_54d26fbd/blocks")
             )
         );
-        assert_eq!(dirs(&["--signetchallenge="]).0, PathBuf::from("/data/signet_1406e058"));
+        assert_eq!(
+            dirs(&["--signetchallenge="]).0,
+            PathBuf::from("/data/signet_1406e058")
+        );
     }
 
     #[test]
@@ -17719,7 +19267,10 @@ notarealkey=1
         // are recognized Core keys → skipped with a warning, NOT fatal, so the
         // node still starts. (They are not auth/exposure/privacy keys.)
         let cf = ConfigFile::parse("wallet=mywallet.dat\nserver=1\n").unwrap();
-        assert!(!cf.global.contains_key("wallet"), "wallet should be skipped");
+        assert!(
+            !cf.global.contains_key("wallet"),
+            "wallet should be skipped"
+        );
         assert!(cf.global.contains_key("server"));
         assert!(
             cf.ignored.iter().any(|m| m.contains("wallet")),
@@ -17737,10 +19288,17 @@ notarealkey=1
         for k in ["prevoutfetchthreads", "rpcmaxconnections", "txsendrate"] {
             let cf = ConfigFile::parse(&format!("{k}=1\nserver=1\n"))
                 .unwrap_or_else(|e| panic!("{k} must load: {e}"));
-            assert!(cf.ignored.iter().any(|m| m.contains(k)), "{k}: {:?}", cf.ignored);
+            assert!(
+                cf.ignored.iter().any(|m| m.contains(k)),
+                "{k}: {:?}",
+                cf.ignored
+            );
         }
         let err = ConfigFile::parse("privatebroadcast=1\n").unwrap_err();
-        assert!(err.contains("privatebroadcast") && err.contains("Remove this line"), "{err}");
+        assert!(
+            err.contains("privatebroadcast") && err.contains("Remove this line"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -17791,7 +19349,10 @@ notarealkey=1
         // about security / exposure / privacy. These stay fatal with an
         // actionable, per-key message.
         for (k, _) in FATAL_UNSUPPORTED_KEYS {
-            assert!(classify_unsupported_key(k).is_some(), "{k:?} should be fatal");
+            assert!(
+                classify_unsupported_key(k).is_some(),
+                "{k:?} should be fatal"
+            );
             assert!(!is_known_config_key(k), "{k:?} must not be honored");
             let err = ConfigFile::parse(&format!("{k}=1")).unwrap_err();
             assert!(
@@ -17846,7 +19407,9 @@ notarealkey=1
                 .unwrap_or_else(|e| panic!("{k:?} should be skipped, not rejected: {e}"));
             assert!(!cf.global.contains_key(k), "{k:?} should not be honored");
             assert!(
-                cf.ignored.iter().any(|m| m.contains(k) && m.contains("debug.log")),
+                cf.ignored
+                    .iter()
+                    .any(|m| m.contains(k) && m.contains("debug.log")),
                 "{k:?} warning should explain the no-debug.log behavior, got: {:?}",
                 cf.ignored
             );
@@ -17858,10 +19421,8 @@ notarealkey=1
         // Drop-in goal: a recognized-but-unsupported Core v30 key does NOT
         // stop the node — it is skipped with a warning and the rest of the
         // config still loads.
-        let cf = ConfigFile::parse(
-            "maxorphantx=100\nnatpmp=1\nprintpriority=1\nserver=1\n",
-        )
-        .unwrap();
+        let cf =
+            ConfigFile::parse("maxorphantx=100\nnatpmp=1\nprintpriority=1\nserver=1\n").unwrap();
         // The supported key is stored; the skipped ones are not.
         assert!(cf.global.contains_key("server"));
         assert!(!cf.global.contains_key("maxorphantx"));
@@ -17883,7 +19444,9 @@ notarealkey=1
         for (k, needle) in cases {
             let cf = ConfigFile::parse(&format!("{k}=1\n")).unwrap();
             assert!(
-                cf.ignored.iter().any(|m| m.contains(needle) && m.contains(k)),
+                cf.ignored
+                    .iter()
+                    .any(|m| m.contains(needle) && m.contains(k)),
                 "expected {k:?} warning to mention {needle:?}, got: {:?}",
                 cf.ignored
             );
@@ -17910,7 +19473,10 @@ notarealkey=1
         // now honoured, so the bare parse stores it rather than
         // rejecting it; resolution happens later against the datadir.
         let cf = ConfigFile::parse("includeconf=secrets.conf\nserver=1\n").unwrap();
-        assert_eq!(cf.global.get("includeconf").map(|v| v.as_slice()), Some(&["secrets.conf".to_string()][..]));
+        assert_eq!(
+            cf.global.get("includeconf").map(|v| v.as_slice()),
+            Some(&["secrets.conf".to_string()][..])
+        );
         assert_eq!(classify_unsupported_key("includeconf"), None);
         assert!(is_known_config_key("includeconf"));
     }
@@ -17977,8 +19543,7 @@ notarealkey=1
 
     #[test]
     fn listenonion_defaults_off() {
-        let cli =
-            parse_cli(["satd", "--regtest", "--datadir=/tmp/satd-lo-1"]).unwrap();
+        let cli = parse_cli(["satd", "--regtest", "--datadir=/tmp/satd-lo-1"]).unwrap();
         assert!(!Config::from_cli(cli).unwrap().listenonion);
     }
 
@@ -18023,8 +19588,7 @@ notarealkey=1
 
     #[test]
     fn dnsseed_defaults_true_and_parses_false() {
-        let cli =
-            parse_cli(["satd", "--regtest", "--datadir=/tmp/satd-ds-1"]).unwrap();
+        let cli = parse_cli(["satd", "--regtest", "--datadir=/tmp/satd-ds-1"]).unwrap();
         assert!(Config::from_cli(cli).unwrap().dnsseed);
         let cli = parse_cli([
             "satd",
@@ -18052,8 +19616,7 @@ notarealkey=1
 
     #[test]
     fn persistmempool_defaults_on_and_parses_off() {
-        let cli =
-            parse_cli(["satd", "--regtest", "--datadir=/tmp/satd-pm-1"]).unwrap();
+        let cli = parse_cli(["satd", "--regtest", "--datadir=/tmp/satd-pm-1"]).unwrap();
         assert!(Config::from_cli(cli).unwrap().persistmempool);
         let cli = parse_cli([
             "satd",
@@ -18081,8 +19644,7 @@ notarealkey=1
 
     #[test]
     fn debug_directives_maps_known_categories() {
-        let (all, dirs) =
-            debug_directives(&["net".to_string(), "mempool".to_string()], &[]);
+        let (all, dirs) = debug_directives(&["net".to_string(), "mempool".to_string()], &[]);
         assert!(!all);
         assert!(dirs.contains(&"node::net=debug".to_string()));
         assert!(dirs.contains(&"node::mempool=debug".to_string()));
@@ -18132,7 +19694,8 @@ notarealkey=1
     /// `bitcoin.conf` with `conf` as its content.
     fn zmq_config(args: &[&str], conf: Option<&str>) -> Result<Config, String> {
         let dir = tempfile::tempdir().expect("tempdir");
-        let mut argv: Vec<String> = vec!["satd".into(), format!("-datadir={}", dir.path().display())];
+        let mut argv: Vec<String> =
+            vec!["satd".into(), format!("-datadir={}", dir.path().display())];
         if let Some(conf) = conf {
             let path = dir.path().join("bitcoin.conf");
             std::fs::write(&path, conf).unwrap();
@@ -18161,7 +19724,10 @@ notarealkey=1
         let conf = "regtest=1\nzmqpubrawtx=tcp://127.0.0.1:3\nzmqpubrawtxhwm=7\n\
                     [regtest]\nzmqpubrawtx=tcp://127.0.0.1:2\nzmqpubhashblock=unix:/tmp/h.sock\n";
         let cfg = zmq_config(
-            &["-zmqpubsequence=tcp://127.0.0.1:9", "-zmqpubrawtx=tcp://127.0.0.1:1"],
+            &[
+                "-zmqpubsequence=tcp://127.0.0.1:9",
+                "-zmqpubrawtx=tcp://127.0.0.1:1",
+            ],
             Some(conf),
         )
         .unwrap();
@@ -18184,11 +19750,16 @@ notarealkey=1
     /// one.
     #[test]
     fn zmqpub_hwm_precedence_is_cores() {
-        let conf = "regtest=1\nzmqpubhashtxhwm=11\n[regtest]\nzmqpubhashtxhwm=22\nzmqpubhashtxhwm=33\n";
+        let conf =
+            "regtest=1\nzmqpubhashtxhwm=11\n[regtest]\nzmqpubhashtxhwm=22\nzmqpubhashtxhwm=33\n";
         let cfg = zmq_config(&["-zmqpubhashtx=tcp://127.0.0.1:1"], Some(conf)).unwrap();
         assert_eq!(cfg.zmq_hwm[CoreZmqTopic::HashTx.index()], 22);
         let cfg = zmq_config(
-            &["-zmqpubhashtx=tcp://127.0.0.1:1", "-zmqpubhashtxhwm=5", "-zmqpubhashtxhwm=6"],
+            &[
+                "-zmqpubhashtx=tcp://127.0.0.1:1",
+                "-zmqpubhashtxhwm=5",
+                "-zmqpubhashtxhwm=6",
+            ],
             Some(conf),
         )
         .unwrap();
@@ -18211,12 +19782,18 @@ notarealkey=1
             ("2147483648", 1000, true),
         ] {
             let cfg = zmq_config(
-                &["-zmqpubrawblock=tcp://127.0.0.1:1", &format!("-zmqpubrawblockhwm={value}")],
+                &[
+                    "-zmqpubrawblock=tcp://127.0.0.1:1",
+                    &format!("-zmqpubrawblockhwm={value}"),
+                ],
                 None,
             )
             .unwrap_or_else(|e| panic!("{value}: {e}"));
             assert_eq!(cfg.zmq_hwm[CoreZmqTopic::RawBlock.index()], want, "{value}");
-            let note = cfg.pending_notes.iter().any(|n| n.message.contains("zmqpubrawblockhwm"));
+            let note = cfg
+                .pending_notes
+                .iter()
+                .any(|n| n.message.contains("zmqpubrawblockhwm"));
             assert_eq!(note, noted, "{value}: {:?}", cfg.pending_notes);
         }
         assert_eq!(core_atoi_i64("99999999999999999999"), i64::MAX);
@@ -18232,11 +19809,17 @@ notarealkey=1
     fn zmqpub_port_validation_matches_core() {
         for bad in ["127.0.0.1:abc", "localhost:0", "[::1]:70000", ":x"] {
             let err = zmq_config(&[&format!("-zmqpubrawtx={bad}")], None).expect_err(bad);
-            assert_eq!(err, format!("Invalid port specified in -zmqpubrawtx: '{bad}'"));
+            assert_eq!(
+                err,
+                format!("Invalid port specified in -zmqpubrawtx: '{bad}'")
+            );
         }
         let conf = "regtest=1\nzmqpubsequence=host:notaport\n";
         let err = zmq_config(&[], Some(conf)).expect_err("config file values are checked too");
-        assert_eq!(err, "Invalid port specified in -zmqpubsequence: 'host:notaport'");
+        assert_eq!(
+            err,
+            "Invalid port specified in -zmqpubsequence: 'host:notaport'"
+        );
         for ok in [
             "tcp://127.0.0.1:28332",
             "tcp://[::1]:28332",
@@ -18246,7 +19829,8 @@ notarealkey=1
             "ipc:///tmp/a.sock",
             "localhost:28332",
         ] {
-            zmq_config(&[&format!("-zmqpubrawtx={ok}")], None).unwrap_or_else(|e| panic!("{ok}: {e}"));
+            zmq_config(&[&format!("-zmqpubrawtx={ok}")], None)
+                .unwrap_or_else(|e| panic!("{ok}: {e}"));
         }
     }
 
@@ -18271,7 +19855,12 @@ notarealkey=1
     fn bare_single_dash_listenonion_parses_true() {
         // `satd -listenonion` (Core-style bare boolean) must enable it,
         // not error with "a value is required".
-        let cfg = parse_raw(&["satd", "-regtest", "-listenonion", "-datadir=/tmp/satd-h1-1"]);
+        let cfg = parse_raw(&[
+            "satd",
+            "-regtest",
+            "-listenonion",
+            "-datadir=/tmp/satd-h1-1",
+        ]);
         assert!(cfg.listenonion);
     }
 
@@ -18340,8 +19929,15 @@ notarealkey=1
     #[test]
     fn connect_zero_means_no_peers_and_no_automatic_outbound() {
         let cfg = parse_raw(&["satd", "-regtest", "-connect=0", "-datadir=/tmp/satd-h1-6"]);
-        assert!(cfg.connect.is_empty(), "`0` is not an address to dial: {:?}", cfg.connect);
-        assert!(!cfg.automatic_outbound, "-connect=0 must stop gossip dialling");
+        assert!(
+            cfg.connect.is_empty(),
+            "`0` is not an address to dial: {:?}",
+            cfg.connect
+        );
+        assert!(
+            !cfg.automatic_outbound,
+            "-connect=0 must stop gossip dialling"
+        );
 
         // Any other `-connect` keeps its peers and still disables gossip.
         let cfg = parse_raw(&[
@@ -18366,7 +19962,10 @@ notarealkey=1
     #[test]
     fn connect_zero_does_not_raise_the_peer_floor() {
         let isolated = parse_raw(&["satd", "-signet", "-connect=0", "-datadir=/tmp/satd-h1-9"]);
-        assert_eq!(isolated.alert_peer_floor, 0, "a node told to have no peers must not alert");
+        assert_eq!(
+            isolated.alert_peer_floor, 0,
+            "a node told to have no peers must not alert"
+        );
 
         let pinned = parse_raw(&[
             "satd",
@@ -18374,7 +19973,10 @@ notarealkey=1
             "-connect=1.2.3.4",
             "-datadir=/tmp/satd-h1-10",
         ]);
-        assert_eq!(pinned.alert_peer_floor, 1, "one named peer, one expected peer");
+        assert_eq!(
+            pinned.alert_peer_floor, 1,
+            "one named peer, one expected peer"
+        );
 
         let normal = parse_raw(&["satd", "-signet", "-datadir=/tmp/satd-h1-11"]);
         assert_eq!(normal.alert_peer_floor, 3, "the default is unchanged");

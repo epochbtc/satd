@@ -272,7 +272,9 @@ impl CrawlStatus {
     pub fn from_metrics(m: &crate::net::manager::CrawlMetrics) -> Self {
         use crate::net::crawlreport::Transport;
         let a = &m.aggregate;
-        let t = |c: Transport| a.transport[Transport::ALL.iter().position(|x| *x == c).expect("in ALL")];
+        let t = |c: Transport| {
+            a.transport[Transport::ALL.iter().position(|x| *x == c).expect("in ALL")]
+        };
         CrawlStatus {
             state: if m.stopped {
                 "stopped"
@@ -400,7 +402,10 @@ fn build_at(ctx: &MetricsContext, sources: &StatusSources, now: u64) -> StatusSn
     let cs = &ctx.chain_state;
     let (tip_hash, tip_height) = cs.tip_snapshot();
     let headers = cs.headers_tip_height().max(tip_height);
-    let tip_time = cs.get_block_index(&tip_hash).map(|e| e.header.time).unwrap_or(0);
+    let tip_time = cs
+        .get_block_index(&tip_hash)
+        .map(|e| e.header.time)
+        .unwrap_or(0);
     let header_time = cs
         .get_block_index(&cs.best_header_hash())
         .map(|e| e.header.time)
@@ -444,15 +449,24 @@ fn build_at(ctx: &MetricsContext, sources: &StatusSources, now: u64) -> StatusSn
     );
 
     let (blocks_per_sec, headers_per_sec) =
-        sources.rates.lock().observe(Instant::now(), tip_height, headers);
+        sources
+            .rates
+            .lock()
+            .observe(Instant::now(), tip_height, headers);
 
     let service = |enabled: bool, bound: bool| match (enabled, bound) {
         (_, true) => ServiceState::Serving,
         (true, false) => ServiceState::Starting,
         (false, false) => ServiceState::Off,
     };
-    let esplora = service(sources.esplora_enabled, sources.listener_status.esplora_serving());
-    let electrum = service(sources.electrum_enabled, sources.listener_status.electrum_serving());
+    let esplora = service(
+        sources.esplora_enabled,
+        sources.listener_status.esplora_serving(),
+    );
+    let electrum = service(
+        sources.electrum_enabled,
+        sources.listener_status.electrum_serving(),
+    );
     let address_synced = indexes
         .iter()
         .find(|i| i.name == "address")
@@ -467,7 +481,11 @@ fn build_at(ctx: &MetricsContext, sources: &StatusSources, now: u64) -> StatusSn
         .into_iter()
         .map(|(user_agent, count)| ClientCount { user_agent, count })
         .collect();
-    clients.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.user_agent.cmp(&b.user_agent)));
+    clients.sort_by(|a, b| {
+        b.count
+            .cmp(&a.count)
+            .then_with(|| a.user_agent.cmp(&b.user_agent))
+    });
 
     let info = ctx.mempool.info();
 
@@ -515,7 +533,11 @@ fn build_at(ctx: &MetricsContext, sources: &StatusSources, now: u64) -> StatusSn
             clients,
             flagged: flag_counts(&ctx.peer_manager.peer_flag_counts()),
         },
-        crawl: ctx.peer_manager.crawl_metrics().as_ref().map(CrawlStatus::from_metrics),
+        crawl: ctx
+            .peer_manager
+            .crawl_metrics()
+            .as_ref()
+            .map(CrawlStatus::from_metrics),
         mempool: MempoolStatus {
             transactions: info.size,
             bytes: info.bytes,
@@ -536,7 +558,11 @@ pub fn flag_counts(counts: &crate::net::flags::FlagCounts) -> Vec<FlagCount> {
         .iter()
         .zip(counts.flagged)
         .filter(|(_, n)| *n > 0)
-        .map(|(f, count)| FlagCount { code: f.code(), name: f.name(), count })
+        .map(|(f, count)| FlagCount {
+            code: f.code(),
+            name: f.name(),
+            count,
+        })
         .collect()
 }
 
@@ -544,7 +570,8 @@ fn index_states(ctx: &MetricsContext, sources: &StatusSources) -> Vec<NamedIndex
     let store = ctx.chain_state.store_ref();
     let mut out = Vec::new();
 
-    let addr = crate::index::address::render_status(sources.addr_backfill.as_deref(), ctx.addr_enabled);
+    let addr =
+        crate::index::address::render_status(sources.addr_backfill.as_deref(), ctx.addr_enabled);
     out.push(NamedIndex {
         name: "address",
         state: classify(&IndexReport {
@@ -662,8 +689,10 @@ fn latest_block(
         time: block.header.time,
         transactions: block.txdata.len(),
         weight: block.weight().to_wu(),
-        fees_sat: claimed
-            .saturating_sub(crate::chain::connect::block_subsidy(ctx.network, tip_height)),
+        fees_sat: claimed.saturating_sub(crate::chain::connect::block_subsidy(
+            ctx.network,
+            tip_height,
+        )),
     };
     *cached = Some(fresh.clone());
     Some(fresh)

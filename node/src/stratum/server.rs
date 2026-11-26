@@ -7,9 +7,9 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
 use bitcoin::{Block, Network};
+use tls_config::{ClientAllowList, ClientAuthPolicy, TlsAcceptor, TlsConfigError};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Semaphore, broadcast, watch};
-use tls_config::{ClientAllowList, ClientAuthPolicy, TlsAcceptor, TlsConfigError};
 
 use super::config::{StratumConfig, should_issue_work};
 use super::template::Work;
@@ -45,7 +45,10 @@ pub enum StratumServerError {
     #[error("--stratummtls=1 requires --stratummtlsclientca")]
     MtlsMissingCa,
     #[error("Stratum V2 authority key {path}: {source}")]
-    AuthorityKey { path: std::path::PathBuf, source: io::Error },
+    AuthorityKey {
+        path: std::path::PathBuf,
+        source: io::Error,
+    },
     #[error("this build has no Stratum V2 support (the `stratum-v2` feature is off)")]
     V2Unavailable,
 }
@@ -235,7 +238,9 @@ impl Shared {
     /// the life of the process (until it wraps), so no two miners hash the
     /// same coinbase.
     pub fn next_extranonce1(&self) -> [u8; 4] {
-        self.next_extranonce1.fetch_add(1, Ordering::Relaxed).to_be_bytes()
+        self.next_extranonce1
+            .fetch_add(1, Ordering::Relaxed)
+            .to_be_bytes()
     }
 }
 
@@ -250,7 +255,11 @@ impl Shared {
 
     /// A server state over a given chain and mempool, for tests that need
     /// coins or transactions.
-    pub(crate) fn for_test_with(config: StratumConfig, chain: ChainState, mempool: Mempool) -> Arc<Self> {
+    pub(crate) fn for_test_with(
+        config: StratumConfig,
+        chain: ChainState,
+        mempool: Mempool,
+    ) -> Arc<Self> {
         let (work, _) = watch::channel(None);
         Arc::new(Self {
             config: Arc::new(config),
@@ -377,7 +386,9 @@ impl AcceptWarnings {
 /// `-stratummaxconns`, clamped to [`crate::http_serve::CAP_CEILING`] (tokio's
 /// `Semaphore::new` panics above `usize::MAX >> 3`), at least 1.
 fn connection_semaphore(max_conns: usize) -> Arc<Semaphore> {
-    Arc::new(Semaphore::new(crate::http_serve::clamp_cap(max_conns).max(1)))
+    Arc::new(Semaphore::new(
+        crate::http_serve::clamp_cap(max_conns).max(1),
+    ))
 }
 
 #[cfg(test)]
@@ -413,15 +424,25 @@ impl StratumServer {
         peers: Option<Arc<PeerManager>>,
         core: tokio::runtime::Handle,
     ) -> Result<Self, StratumServerError> {
-        let listener = TcpListener::bind(config.bind)
-            .await
-            .map_err(|source| StratumServerError::Bind { addr: config.bind, source })?;
-        let tls = match (config.tls_bind, config.tls_cert.as_ref(), config.tls_key.as_ref()) {
+        let listener =
+            TcpListener::bind(config.bind)
+                .await
+                .map_err(|source| StratumServerError::Bind {
+                    addr: config.bind,
+                    source,
+                })?;
+        let tls = match (
+            config.tls_bind,
+            config.tls_cert.as_ref(),
+            config.tls_key.as_ref(),
+        ) {
             (None, _, _) => None,
             (Some(addr), Some(cert), Some(key)) => {
                 let policy = match (config.mtls, config.mtls_client_ca.as_ref()) {
                     (false, _) => ClientAuthPolicy::Disabled,
-                    (true, Some(ca)) => ClientAuthPolicy::Required { ca_path: ca.clone() },
+                    (true, Some(ca)) => ClientAuthPolicy::Required {
+                        ca_path: ca.clone(),
+                    },
                     (true, None) => return Err(StratumServerError::MtlsMissingCa),
                 };
                 let acceptor = tls_config::build_acceptor(cert, key, &policy)?;
@@ -482,7 +503,9 @@ impl StratumServer {
 
     /// A read handle for `getstratuminfo`.
     pub fn handle(&self) -> StratumHandle {
-        StratumHandle { shared: self.shared.clone() }
+        StratumHandle {
+            shared: self.shared.clone(),
+        }
     }
 
     /// The plaintext listener's bound address.
@@ -513,7 +536,11 @@ impl StratumServer {
 
     /// Serve until `shutdown` flips to `true`.
     pub async fn run(self, mut shutdown: watch::Receiver<bool>) {
-        tokio::spawn(refresh_loop(self.shared.clone(), self.peers.clone(), shutdown.clone()));
+        tokio::spawn(refresh_loop(
+            self.shared.clone(),
+            self.peers.clone(),
+            shutdown.clone(),
+        ));
         loop {
             tokio::select! {
                 biased;
@@ -618,23 +645,30 @@ impl StratumServer {
     }
 
     fn at_capacity(&self, arm: Arm, peer: SocketAddr) {
-        self.warnings.at_capacity(arm, peer, self.shared.config.max_conns);
+        self.warnings
+            .at_capacity(arm, peer, self.shared.config.max_conns);
     }
 }
-
 
 /// Load (or create) the authority key and bind the Stratum V2 listener.
 #[cfg(feature = "stratum-v2")]
 async fn bind_v2(config: &super::config::V2Config) -> Result<V2Listener, StratumServerError> {
     use super::v2::authority;
-    let key_error = |source| StratumServerError::AuthorityKey { path: config.key_path.clone(), source };
+    let key_error = |source| StratumServerError::AuthorityKey {
+        path: config.key_path.clone(),
+        source,
+    };
     let (private, origin) = authority::load_or_create(&config.key_path).map_err(key_error)?;
     let private = zeroize::Zeroizing::new(private);
     let public = authority::authority_pubkey(&private)
         .map_err(|e| key_error(io::Error::new(io::ErrorKind::InvalidData, e.to_string())))?;
-    let listener = TcpListener::bind(config.bind)
-        .await
-        .map_err(|source| StratumServerError::Bind { addr: config.bind, source })?;
+    let listener =
+        TcpListener::bind(config.bind)
+            .await
+            .map_err(|source| StratumServerError::Bind {
+                addr: config.bind,
+                source,
+            })?;
     tracing::info!(
         target: "node::stratum",
         path = %config.key_path.display(),
@@ -650,7 +684,9 @@ async fn bind_v2(config: &super::config::V2Config) -> Result<V2Listener, Stratum
             authority_public: public,
             authority_private: private,
             max_channels: config.max_channels,
-            jd: config.job_declaration.then(|| Arc::new(super::v2::jd::JobDeclaration::default())),
+            jd: config
+                .job_declaration
+                .then(|| Arc::new(super::v2::jd::JobDeclaration::default())),
         }),
     })
 }
@@ -681,7 +717,11 @@ async fn refresh_loop(
     let mut no_peers_warned = false;
     let mut next_work_id = 1u64;
     let network = shared.config.network;
-    let mut verdicts = shared.chain.template_validity().full_checker().map(|c| c.verdicts());
+    let mut verdicts = shared
+        .chain
+        .template_validity()
+        .full_checker()
+        .map(|c| c.verdicts());
     // The tip and time of the last full check queued, for FULL_RECHECK_INTERVAL.
     let mut last_full_check: Option<(bitcoin::BlockHash, std::time::Instant)> = None;
 
@@ -803,7 +843,11 @@ async fn refresh_loop(
                     let now = std::time::Instant::now();
                     if full_check_due(last_full_check, template.prev_hash, now) {
                         last_full_check = Some((template.prev_hash, now));
-                        checker.submit(work.id, template, crate::mining::validity::CheckOrigin::Stratum);
+                        checker.submit(
+                            work.id,
+                            template,
+                            crate::mining::validity::CheckOrigin::Stratum,
+                        );
                     }
                 }
                 if withheld_warned {
@@ -870,13 +914,21 @@ fn checked_template(chain: &ChainState, mempool: &Mempool, coinbase_only: bool) 
         let full = check_template(chain, &template, Check::Full);
         validity.record(Check::Full, &full, CheckOrigin::Stratum);
         return match full.verdict {
-            TemplateVerdict::Valid => CheckedTemplate { template, full_check: None, coinbase_only: false },
+            TemplateVerdict::Valid => CheckedTemplate {
+                template,
+                full_check: None,
+                coinbase_only: false,
+            },
             _ => fallback(),
         };
     }
     // A template with no transactions has nothing a full check could find.
     let full_check = (!template.transactions.is_empty()).then(|| Arc::new(template.clone()));
-    CheckedTemplate { template, full_check, coinbase_only: false }
+    CheckedTemplate {
+        template,
+        full_check,
+        coinbase_only: false,
+    }
 }
 
 /// Whether a template on `tip` should be queued for a full check, given the
@@ -887,7 +939,9 @@ fn full_check_due(
     tip: bitcoin::BlockHash,
     now: std::time::Instant,
 ) -> bool {
-    last.is_none_or(|(last_tip, at)| last_tip != tip || now.saturating_duration_since(at) >= FULL_RECHECK_INTERVAL)
+    last.is_none_or(|(last_tip, at)| {
+        last_tip != tip || now.saturating_duration_since(at) >= FULL_RECHECK_INTERVAL
+    })
 }
 
 /// The next background full-check verdict, or `None` when the checker is
@@ -942,22 +996,33 @@ pub(crate) async fn submit_found_block(
         .filter(|_| crate::validation::pow::check_proof_of_work(&block.header).is_ok());
     // Where the copy lands. Worked out here rather than returned from the
     // blocking task, because a task that panics returns nothing.
-    let expected = dir.as_deref().map(|d| super::found::found_block_path(d, height, &block));
+    let expected = dir
+        .as_deref()
+        .map(|d| super::found::found_block_path(d, height, &block));
     // Saved on the same blocking thread, ahead of the submission, so a panic
     // in `accept_block` cannot take the only copy with it.
     let outcome = shared
         .core
         .spawn_blocking(move || {
-            super::found::save_then_submit(dir.as_deref(), height, &block, |b| submit_block(&chain, &mempool, b)).1
+            super::found::save_then_submit(dir.as_deref(), height, &block, |b| {
+                submit_block(&chain, &mempool, b)
+            })
+            .1
         })
         .await;
-    let saved = expected.filter(|p| p.exists()).map(|p| p.display().to_string()).unwrap_or_default();
+    let saved = expected
+        .filter(|p| p.exists())
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
     let address = payout.address.as_deref().unwrap_or("<--stratumaddress>");
     match outcome {
         Ok(Ok(true)) => {
             shared.stats.blocks_found.fetch_add(1, Ordering::Relaxed);
-            *shared.stats.last_block.lock() =
-                Some(LastBlock { height, hash, time: crate::time::now_secs() });
+            *shared.stats.last_block.lock() = Some(LastBlock {
+                height,
+                hash,
+                time: crate::time::now_secs(),
+            });
             tracing::info!(
                 target: "node::stratum",
                 %peer,
@@ -1039,8 +1104,14 @@ mod tests {
         let peer: SocketAddr = "192.0.2.1:3333".parse().unwrap();
         let logged = (0..10).filter(|_| w.at_capacity(Arm::V1, peer, 1)).count();
         assert_eq!(logged, 5, "the V1 flood is budgeted");
-        assert!(w.at_capacity(Arm::V2, peer, 1), "V2 is not silenced by a V1 flood");
-        assert!(w.at_capacity(Arm::V1Tls, peer, 1), "V1-TLS is not silenced by a V1 flood");
+        assert!(
+            w.at_capacity(Arm::V2, peer, 1),
+            "V2 is not silenced by a V1 flood"
+        );
+        assert!(
+            w.at_capacity(Arm::V1Tls, peer, 1),
+            "V1-TLS is not silenced by a V1 flood"
+        );
     }
     use crate::mining::validity::{Check, FullChecker};
     use crate::validation::script::RustVerifier;
@@ -1060,7 +1131,10 @@ mod tests {
         assert!(checked.coinbase_only);
         assert!(checked.full_check.is_none());
         assert!(cs.template_validity().is_failing());
-        assert!(mp.get(&bad).is_some(), "left in the mempool, where the bug stays visible");
+        assert!(
+            mp.get(&bad).is_some(),
+            "left in the mempool, where the bug stays visible"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1085,7 +1159,10 @@ mod tests {
         admit(&mp, spend(0xA1, 90_000, 1), 10_000);
         let bad = admit(&mp, spend(0xB1, 90_000, 2), 10_000);
         let checked = checked_template(&cs, &mp, true);
-        assert!(checked.template.transactions.is_empty(), "the script failure keeps it coinbase-only");
+        assert!(
+            checked.template.transactions.is_empty(),
+            "the script failure keeps it coinbase-only"
+        );
         assert!(checked.coinbase_only);
         assert_eq!(cs.template_validity().count(Check::Full, "invalid"), 1);
 
@@ -1108,15 +1185,26 @@ mod tests {
         let b = bitcoin::BlockHash::from_byte_array([2; 32]);
         let t0 = std::time::Instant::now();
         assert!(full_check_due(None, a, t0));
-        assert!(!full_check_due(Some((a, t0)), a, t0 + FULL_RECHECK_INTERVAL - std::time::Duration::from_secs(1)));
+        assert!(!full_check_due(
+            Some((a, t0)),
+            a,
+            t0 + FULL_RECHECK_INTERVAL - std::time::Duration::from_secs(1)
+        ));
         assert!(full_check_due(Some((a, t0)), a, t0 + FULL_RECHECK_INTERVAL));
         assert!(full_check_due(Some((a, t0)), b, t0), "a new tip");
-        assert_eq!(FULL_RECHECK_INTERVAL, std::time::Duration::from_secs(120), "the manual says two minutes");
+        assert_eq!(
+            FULL_RECHECK_INTERVAL,
+            std::time::Duration::from_secs(120),
+            "the manual says two minutes"
+        );
     }
 
     async fn next_work(rx: &mut watch::Receiver<Option<Arc<Work>>>) -> Arc<Work> {
         loop {
-            tokio::time::timeout(std::time::Duration::from_secs(30), rx.changed()).await.unwrap().unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(30), rx.changed())
+                .await
+                .unwrap()
+                .unwrap();
             if let Some(work) = rx.borrow_and_update().clone() {
                 return work;
             }
@@ -1142,16 +1230,28 @@ mod tests {
         let first = next_work(&mut rx).await;
         assert_eq!(first.txdata.len(), 1, "the structural check passes it");
         let second = next_work(&mut rx).await;
-        assert!(second.txdata.is_empty(), "coinbase-only after the full check failed");
+        assert!(
+            second.txdata.is_empty(),
+            "coinbase-only after the full check failed"
+        );
         assert_eq!(second.prev_hash, first.prev_hash);
         assert!(shared.coinbase_only.load(Ordering::Relaxed));
-        let info = StratumHandle { shared: shared.clone() }.info();
+        let info = StratumHandle {
+            shared: shared.clone(),
+        }
+        .info();
         assert_eq!(info["current_job"]["coinbase_only"], true, "{info}");
         assert_eq!(info["current_job"]["template_txs"], 0, "{info}");
         assert!(shared.chain.template_validity().is_failing());
         // Once in the background; once more when the rebuild offered the
         // same template again and it had to pass before any miner saw it.
-        assert_eq!(shared.chain.template_validity().count(Check::Full, "invalid"), 2);
+        assert_eq!(
+            shared
+                .chain
+                .template_validity()
+                .count(Check::Full, "invalid"),
+            2
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

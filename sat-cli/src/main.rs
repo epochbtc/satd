@@ -53,7 +53,12 @@ struct Cli {
 
     /// Bitcoin Core's `-signetchallenge=<hex>`: a custom signet keeps its
     /// data, and so its cookie, in `signet_<message start>`.
-    #[arg(long, value_name = "HEX", help = "Custom signet challenge (locates its cookie)", global = true)]
+    #[arg(
+        long,
+        value_name = "HEX",
+        help = "Custom signet challenge (locates its cookie)",
+        global = true
+    )]
     signetchallenge: Option<String>,
 
     /// Bitcoin Core's `-chain=<name>`: main, test, testnet4, signet, regtest.
@@ -425,7 +430,9 @@ fn read_stdin_args(rpcpass: bool, args: bool) -> Result<(Option<String>, Vec<Str
         match lines.next() {
             Some(Ok(line)) => Some(line),
             _ => {
-                return Err("-stdinrpcpass specified but failed to read from standard input".into());
+                return Err(
+                    "-stdinrpcpass specified but failed to read from standard input".into(),
+                );
             }
         }
     };
@@ -627,7 +634,9 @@ fn render_storage_footprint(result: &serde_json::Value) -> String {
             (
                 c.get("name").and_then(|v| v.as_str()).unwrap_or("?"),
                 c.get("sst_bytes").and_then(|v| v.as_u64()).unwrap_or(0),
-                c.get("estimated_keys").and_then(|v| v.as_u64()).unwrap_or(0),
+                c.get("estimated_keys")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0),
                 c.get("pending_compaction_bytes")
                     .and_then(|v| v.as_u64())
                     .unwrap_or(0),
@@ -658,7 +667,10 @@ fn render_storage_footprint(result: &serde_json::Value) -> String {
             *pending as f64 / 1_048_576.0,
         ));
     }
-    let total = result.get("total_sst_bytes").and_then(|v| v.as_u64()).unwrap_or(0);
+    let total = result
+        .get("total_sst_bytes")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
     let total_pending = result
         .get("total_pending_compaction_bytes")
         .and_then(|v| v.as_u64())
@@ -678,7 +690,10 @@ fn render_blockfile_audit(result: &serde_json::Value) -> String {
     let Some(files) = result.get("files").and_then(|v| v.as_array()) else {
         return format!("{}\n", serde_json::to_string_pretty(result).unwrap());
     };
-    let totals = result.get("totals").cloned().unwrap_or(serde_json::Value::Null);
+    let totals = result
+        .get("totals")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
     let blocks_dir = result
         .get("blocks_dir")
         .and_then(|v| v.as_str())
@@ -724,7 +739,10 @@ fn render_blockfile_audit(result: &serde_json::Value) -> String {
     for f in files {
         let file_no = f.get("file_no").and_then(|v| v.as_u64()).unwrap_or(0);
         let size = f.get("file_size").and_then(|v| v.as_u64()).unwrap_or(0);
-        let referenced = f.get("referenced_bytes").and_then(|v| v.as_u64()).unwrap_or(0);
+        let referenced = f
+            .get("referenced_bytes")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
         let slack = f.get("slack_bytes").and_then(|v| v.as_i64()).unwrap_or(0);
         let blocks = f
             .get("indexed_block_count")
@@ -747,12 +765,18 @@ fn render_blockfile_audit(result: &serde_json::Value) -> String {
     }
 
     if let Some(t) = totals.as_object() {
-        let size = t.get("file_bytes_total").and_then(|v| v.as_u64()).unwrap_or(0);
+        let size = t
+            .get("file_bytes_total")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
         let referenced = t
             .get("referenced_bytes_total")
             .and_then(|v| v.as_u64())
             .unwrap_or(0);
-        let slack = t.get("slack_bytes_total").and_then(|v| v.as_i64()).unwrap_or(0);
+        let slack = t
+            .get("slack_bytes_total")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
         let file_count = t.get("file_count").and_then(|v| v.as_u64()).unwrap_or(0);
         let pct = if size > 0 {
             (slack as f64 / size as f64) * 100.0
@@ -771,7 +795,10 @@ fn render_blockfile_audit(result: &serde_json::Value) -> String {
             .get("trailing_slack_total")
             .and_then(|v| v.as_u64())
             .unwrap_or(0);
-        let gap = t.get("gap_slack_total").and_then(|v| v.as_u64()).unwrap_or(0);
+        let gap = t
+            .get("gap_slack_total")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
         out.push_str(&format!(
             "  trailing slack: {:.2} GB  |  gap slack: {:.2} GB\n",
             trailing as f64 / 1_073_741_824.0,
@@ -869,10 +896,7 @@ async fn main() {
             // Without this branch the help/version output would be
             // emitted as a parse-error and sat-cli would exit 1.
             use clap::error::ErrorKind;
-            if matches!(
-                e.kind(),
-                ErrorKind::DisplayVersion | ErrorKind::DisplayHelp
-            ) {
+            if matches!(e.kind(), ErrorKind::DisplayVersion | ErrorKind::DisplayHelp) {
                 e.print().ok();
                 std::process::exit(0);
             }
@@ -1422,9 +1446,7 @@ fn run_sign_with_signer_v2(
     // to, or a signature over a transaction whose outputs are still
     // undetermined. Both are checked here, with the same code the node runs,
     // because the device is exactly the party a host cannot take on trust.
-    if has_silent_payments
-        && let Err(why) = verify_signer_reply(&original, &psbt)
-    {
+    if has_silent_payments && let Err(why) = verify_signer_reply(&original, &psbt) {
         eprintln!("error: {why}");
         return 1;
     }
@@ -1507,8 +1529,10 @@ fn verify_signer_reply(
     let signed = view.inputs().any(|i| {
         i.map().contains_type(satd_psbt::keys::input::PARTIAL_SIG)
             || i.map().contains_type(satd_psbt::keys::input::TAP_KEY_SIG)
-            || i.map().contains_type(satd_psbt::keys::input::FINAL_SCRIPTWITNESS)
-            || i.map().contains_type(satd_psbt::keys::input::FINAL_SCRIPTSIG)
+            || i.map()
+                .contains_type(satd_psbt::keys::input::FINAL_SCRIPTWITNESS)
+            || i.map()
+                .contains_type(satd_psbt::keys::input::FINAL_SCRIPTSIG)
     });
 
     for output in &report.outputs {
@@ -1729,7 +1753,9 @@ mod tests {
             "protocolversion": 70016,
             "localservices": "0000000000000409",
         });
-        let cmd = Cmd::Node { sub: NodeCmd::Version };
+        let cmd = Cmd::Node {
+            sub: NodeCmd::Version,
+        };
         let rendered = render_to_string(&cmd, &body, &OutputFormat::Pretty);
         assert!(rendered.contains("version:         270000"));
         assert!(rendered.contains("subversion:      /satd:0.1.0/"));

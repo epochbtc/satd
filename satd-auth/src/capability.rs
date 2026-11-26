@@ -264,7 +264,13 @@ mod tests {
         // No two capabilities collide on a bit (would silently grant extra access).
         for (i, a) in ALL_CAPS.iter().enumerate() {
             for b in &ALL_CAPS[i + 1..] {
-                assert_ne!(a.bit(), b.bit(), "{} and {} share a bit", a.as_str(), b.as_str());
+                assert_ne!(
+                    a.bit(),
+                    b.bit(),
+                    "{} and {} share a bit",
+                    a.as_str(),
+                    b.as_str()
+                );
             }
         }
     }

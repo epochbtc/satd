@@ -74,11 +74,18 @@ mod tests {
         assert_eq!(permits.available_permits(), node::http_serve::CAP_CEILING);
 
         let (mut state, _dir) = regtest_state();
-        state.config = Arc::new(crate::EsploraConfig { max_concurrency: usize::MAX, ..Default::default() });
+        state.config = Arc::new(crate::EsploraConfig {
+            max_concurrency: usize::MAX,
+            ..Default::default()
+        });
         state.work_permits = Some(permits);
         let router = crate::build_router(state).unwrap();
         let resp = router
-            .oneshot(Request::get("/blocks/tip/height").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::get("/blocks/tip/height")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);

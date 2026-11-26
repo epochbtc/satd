@@ -85,7 +85,12 @@ pub fn classify(r: &IndexReport) -> IndexState {
                 eta_secs: (r.eta_secs > 0).then_some(r.eta_secs),
             };
         }
-        "paused" => return IndexState::Paused { pass: r.pass, progress },
+        "paused" => {
+            return IndexState::Paused {
+                pass: r.pass,
+                progress,
+            };
+        }
         "failed" => return IndexState::Failed,
         _ => {}
     }
@@ -117,8 +122,17 @@ mod tests {
 
     #[test]
     fn a_visible_backfill_wins_over_the_steady_label() {
-        assert!(matches!(classify(&report("running")), IndexState::Backfill { pass: Some(2), .. }));
-        assert_eq!(classify(&report("paused")), IndexState::Paused { pass: Some(2), progress: 0.4 });
+        assert!(matches!(
+            classify(&report("running")),
+            IndexState::Backfill { pass: Some(2), .. }
+        ));
+        assert_eq!(
+            classify(&report("paused")),
+            IndexState::Paused {
+                pass: Some(2),
+                progress: 0.4
+            }
+        );
         assert_eq!(classify(&report("failed")), IndexState::Failed);
     }
 
@@ -126,23 +140,43 @@ mod tests {
     fn steady_states() {
         for idle in ["idle", "completed", "cancelled", "rejected"] {
             assert_eq!(classify(&report(idle)), IndexState::Synced, "{idle}");
-            let syncing = IndexReport { complete: false, ..report(idle) };
+            let syncing = IndexReport {
+                complete: false,
+                ..report(idle)
+            };
             assert_eq!(classify(&syncing), IndexState::Syncing, "{idle}");
-            let off = IndexReport { enabled: false, ..report(idle) };
+            let off = IndexReport {
+                enabled: false,
+                ..report(idle)
+            };
             assert_eq!(classify(&off), IndexState::Off, "{idle}");
         }
     }
 
     #[test]
     fn no_eta_is_absent_not_zero() {
-        let r = IndexReport { eta_secs: 0, ..report("running") };
-        let IndexState::Backfill { eta_secs, .. } = classify(&r) else { panic!() };
+        let r = IndexReport {
+            eta_secs: 0,
+            ..report("running")
+        };
+        let IndexState::Backfill { eta_secs, .. } = classify(&r) else {
+            panic!()
+        };
         assert_eq!(eta_secs, None);
     }
 
     #[test]
     fn progress_is_clamped() {
-        let r = IndexReport { progress: 1.7, ..report("paused") };
-        assert_eq!(classify(&r), IndexState::Paused { pass: Some(2), progress: 1.0 });
+        let r = IndexReport {
+            progress: 1.7,
+            ..report("paused")
+        };
+        assert_eq!(
+            classify(&r),
+            IndexState::Paused {
+                pass: Some(2),
+                progress: 1.0
+            }
+        );
     }
 }

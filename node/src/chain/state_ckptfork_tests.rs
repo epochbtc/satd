@@ -59,16 +59,28 @@ fn a_header_forking_below_the_last_checkpoint_is_refused_and_not_stored() {
     let fork = fork_block(&blocks[1], 3);
     let hash = fork.block_hash();
 
-    let err = cs.accept_header(&fork.header).expect_err("accept_header refuses the fork");
+    let err = cs
+        .accept_header(&fork.header)
+        .expect_err("accept_header refuses the fork");
     assert!(is_fork_refusal(&err, 3), "accept_header: {err:?}");
     assert_eq!(err.to_string(), "bad-fork-prior-to-checkpoint");
 
     let (accepted, err) = cs.accept_headers(&[fork.header]);
     assert_eq!(accepted, 0);
-    assert!(err.as_ref().is_some_and(|e| is_fork_refusal(e, 3)), "accept_headers: {err:?}");
+    assert!(
+        err.as_ref().is_some_and(|e| is_fork_refusal(e, 3)),
+        "accept_headers: {err:?}"
+    );
 
-    assert!(cs.get_block_index(&hash).is_none(), "the refused header has no index row");
-    assert_eq!(cs.best_header_hash(), blocks[5].block_hash(), "best header unchanged");
+    assert!(
+        cs.get_block_index(&hash).is_none(),
+        "the refused header has no index row"
+    );
+    assert_eq!(
+        cs.best_header_hash(),
+        blocks[5].block_hash(),
+        "best header unchanged"
+    );
 }
 
 /// A block that arrives without its header announced first takes the same
@@ -79,12 +91,19 @@ fn a_block_forking_below_the_last_checkpoint_is_refused_and_not_stored() {
     let fork = fork_block(&blocks[1], 3);
     let hash = fork.block_hash();
 
-    let err = cs.accept_block(&fork).expect_err("accept_block refuses the fork");
+    let err = cs
+        .accept_block(&fork)
+        .expect_err("accept_block refuses the fork");
     assert!(is_fork_refusal(&err, 3), "accept_block: {err:?}");
-    let err = cs.store_block(&fork).expect_err("store_block refuses the fork");
+    let err = cs
+        .store_block(&fork)
+        .expect_err("store_block refuses the fork");
     assert!(is_fork_refusal(&err, 3), "store_block: {err:?}");
 
-    assert!(cs.get_block_index(&hash).is_none(), "the refused block has no index row");
+    assert!(
+        cs.get_block_index(&hash).is_none(),
+        "the refused block has no index row"
+    );
     assert_eq!(cs.tip_hash(), blocks[5].block_hash(), "tip unchanged");
 }
 
@@ -94,7 +113,8 @@ fn a_block_forking_below_the_last_checkpoint_is_refused_and_not_stored() {
 fn a_header_forking_above_the_last_checkpoint_is_accepted() {
     let (cs, _dir, blocks) = pinned_chain_state();
     let fork = fork_block(&blocks[3], 5);
-    cs.accept_header(&fork.header).expect("a fork above the checkpoint is accepted");
+    cs.accept_header(&fork.header)
+        .expect("a fork above the checkpoint is accepted");
     let entry = cs.get_block_index(&fork.block_hash()).expect("indexed");
     assert_eq!(entry.height, 5);
 
@@ -112,7 +132,10 @@ fn known_main_chain_headers_below_the_checkpoint_stay_harmless() {
     let (accepted, err) = cs.accept_headers(&headers);
     assert_eq!((accepted, err.map(|e| e.to_string())), (0, None));
     let err = cs.accept_header(&blocks[1].header).expect_err("known");
-    assert!(matches!(err, ChainError::Duplicate), "accept_header: {err:?}");
+    assert!(
+        matches!(err, ChainError::Duplicate),
+        "accept_header: {err:?}"
+    );
 }
 
 /// A fresh node is unaffected until its headers reach a checkpoint: with no
@@ -125,7 +148,8 @@ fn a_fresh_header_sync_from_genesis_is_unaffected() {
     cs.set_checkpoints_for_test(checkpoint_on(&blocks));
 
     let early_fork = fork_block(&blocks[1], 3);
-    let (accepted, err) = cs.accept_headers(&[blocks[0].header, blocks[1].header, early_fork.header]);
+    let (accepted, err) =
+        cs.accept_headers(&[blocks[0].header, blocks[1].header, early_fork.header]);
     assert_eq!(
         (accepted, err.map(|e| e.to_string())),
         (3, None),
@@ -151,7 +175,10 @@ fn a_checkpoint_earlier_in_the_batch_counts() {
     headers.push(fork.header);
     let (accepted, err) = cs.accept_headers(&headers);
     assert_eq!(accepted, 6, "the main chain before the fork is committed");
-    assert!(err.as_ref().is_some_and(|e| is_fork_refusal(e, 3)), "accept_headers: {err:?}");
+    assert!(
+        err.as_ref().is_some_and(|e| is_fork_refusal(e, 3)),
+        "accept_headers: {err:?}"
+    );
     assert!(cs.get_block_index(&fork.block_hash()).is_none());
 }
 
@@ -167,8 +194,10 @@ fn with_checkpoints_disabled_the_fork_is_accepted() {
         cs.accept_block(b).expect("connect fixture block");
     }
     let fork = fork_block(&blocks[1], 3);
-    cs.accept_header(&fork.header).expect("no checkpoint enforcement: the fork is accepted");
+    cs.accept_header(&fork.header)
+        .expect("no checkpoint enforcement: the fork is accepted");
     assert!(cs.get_block_index(&fork.block_hash()).is_some());
     let fork_block_2 = fork_block(&blocks[2], 4);
-    cs.store_block(&fork_block_2).expect("and so is a fork block");
+    cs.store_block(&fork_block_2)
+        .expect("and so is a fork block");
 }

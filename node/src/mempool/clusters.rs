@@ -12,7 +12,7 @@ use std::collections::BinaryHeap;
 
 use bitcoin::Txid;
 
-use crate::mempool::feefrac::{feerate_compare, linearize, FeeFrac, MAX_CHUNKED_CLUSTER};
+use crate::mempool::feefrac::{FeeFrac, MAX_CHUNKED_CLUSTER, feerate_compare, linearize};
 
 /// Transactions and the spends between them. `ff[i]` is the modified fee
 /// and sigop-adjusted weight of `txids[i]`; `parents[i]` the indices of the
@@ -37,7 +37,12 @@ impl Graph {
     /// The connected groups of `members` through the spends `linked` keeps
     /// (`linked(parent, child)`), each in txid order, the groups in the
     /// order of their lowest txid.
-    fn components(&self, kids: &[Vec<usize>], members: &[usize], linked: impl Fn(usize, usize) -> bool) -> Vec<Vec<usize>> {
+    fn components(
+        &self,
+        kids: &[Vec<usize>],
+        members: &[usize],
+        linked: impl Fn(usize, usize) -> bool,
+    ) -> Vec<Vec<usize>> {
         let mut inside = vec![false; self.txids.len()];
         for &m in members {
             inside[m] = true;
@@ -82,7 +87,10 @@ impl Graph {
             let txs: Vec<(FeeFrac, u64)> = group
                 .iter()
                 .map(|&g| {
-                    let mask = self.parents[g].iter().filter_map(|p| local.get(p)).fold(0u64, |m, &i| m | (1u64 << i));
+                    let mask = self.parents[g]
+                        .iter()
+                        .filter_map(|p| local.get(p))
+                        .fold(0u64, |m, &i| m | (1u64 << i));
                     (self.ff[g], mask)
                 })
                 .collect();
@@ -98,7 +106,11 @@ impl Graph {
         for &g in group {
             waiting[g] = self.parents[g].iter().filter(|&&p| inside[p]).count();
             if waiting[g] == 0 {
-                ready.push(Best { ff: self.ff[g], txid: self.txids[g], index: g });
+                ready.push(Best {
+                    ff: self.ff[g],
+                    txid: self.txids[g],
+                    index: g,
+                });
             }
         }
         let mut order = Vec::with_capacity(group.len());
@@ -108,7 +120,11 @@ impl Graph {
                 if inside[c] {
                     waiting[c] -= 1;
                     if waiting[c] == 0 {
-                        ready.push(Best { ff: self.ff[c], txid: self.txids[c], index: c });
+                        ready.push(Best {
+                            ff: self.ff[c],
+                            txid: self.txids[c],
+                            index: c,
+                        });
                     }
                 }
             }
@@ -182,7 +198,10 @@ impl Eq for Best {}
 /// [`linearize`] finds the linearization Core does, which it does for
 /// chains and other simple shapes.
 pub fn mining_order(g: &Graph) -> Vec<usize> {
-    main_chunks(g).into_iter().flat_map(|(_, txs)| txs).collect()
+    main_chunks(g)
+        .into_iter()
+        .flat_map(|(_, txs)| txs)
+        .collect()
 }
 
 /// The chunks of [`mining_order`], each with its summed fee and weight:
@@ -201,12 +220,23 @@ fn main_chunks(g: &Graph) -> Vec<(FeeFrac, Vec<usize>)> {
             } else {
                 run = run + ff;
             }
-            let top = txs.iter().map(|&i| g.txids[i]).max().expect("a chunk is not empty");
+            let top = txs
+                .iter()
+                .map(|&i| g.txids[i])
+                .max()
+                .expect("a chunk is not empty");
             chunks.push((ff, run.size, top, txs));
         }
     }
-    chunks.sort_by(|a, b| feerate_compare(b.0, a.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
-    chunks.into_iter().map(|(ff, _, _, txs)| (ff, txs)).collect()
+    chunks.sort_by(|a, b| {
+        feerate_compare(b.0, a.0)
+            .then(a.1.cmp(&b.1))
+            .then(a.2.cmp(&b.2))
+    });
+    chunks
+        .into_iter()
+        .map(|(ff, _, _, txs)| (ff, txs))
+        .collect()
 }
 
 /// Core's `CTxMemPool::GetFeerateDiagram` (`getmempoolfeeratediagram`):
@@ -320,7 +350,11 @@ pub fn trim(g: &Graph, returned: &[bool], max_count: usize, max_weight: u64) -> 
         let mut heap = BinaryHeap::new();
         for &i in &cluster {
             if waits[i] == 0 {
-                heap.push(Best { ff: chunk_ff[i], txid: g.txids[i], index: i });
+                heap.push(Best {
+                    ff: chunk_ff[i],
+                    txid: g.txids[i],
+                    index: i,
+                });
             }
         }
         let mut included = vec![false; n];
@@ -342,7 +376,11 @@ pub fn trim(g: &Graph, returned: &[bool], max_count: usize, max_weight: u64) -> 
             for &c in &next[i] {
                 waits[c] -= 1;
                 if waits[c] == 0 {
-                    heap.push(Best { ff: chunk_ff[c], txid: g.txids[c], index: c });
+                    heap.push(Best {
+                        ff: chunk_ff[c],
+                        txid: g.txids[c],
+                        index: c,
+                    });
                 }
             }
         }
@@ -362,16 +400,26 @@ mod tests {
 
     /// A graph of `(id, fee, size, parents)`, parents by id.
     fn graph(txs: &[(u8, i64, i64, &[u8])]) -> Graph {
-        let index = |n: u8| txs.iter().position(|t| t.0 == n).expect("a parent in the graph");
+        let index = |n: u8| {
+            txs.iter()
+                .position(|t| t.0 == n)
+                .expect("a parent in the graph")
+        };
         Graph {
             txids: txs.iter().map(|t| id(t.0)).collect(),
             ff: txs.iter().map(|t| FeeFrac::new(t.1, t.2)).collect(),
-            parents: txs.iter().map(|t| t.3.iter().map(|&p| index(p)).collect()).collect(),
+            parents: txs
+                .iter()
+                .map(|t| t.3.iter().map(|&p| index(p)).collect())
+                .collect(),
         }
     }
 
     fn ids(g: &Graph, order: &[usize]) -> Vec<u8> {
-        order.iter().map(|&i| g.txids[i].to_byte_array()[0]).collect()
+        order
+            .iter()
+            .map(|&i| g.txids[i].to_byte_array()[0])
+            .collect()
     }
 
     /// A cluster past the bitset limit, which only a reorg leaves, is laid
@@ -379,8 +427,20 @@ mod tests {
     #[test]
     fn mining_order_keeps_every_transaction_of_a_cluster_past_sixty_four() {
         let parents: Vec<[u8; 1]> = (1..=70u8).map(|n| [n - 1]).collect();
-        let txs: Vec<(u8, i64, i64, &[u8])> =
-            (1..=70u8).map(|n| (n, 100, 100, if n == 1 { &[][..] } else { &parents[usize::from(n) - 1][..] })).collect();
+        let txs: Vec<(u8, i64, i64, &[u8])> = (1..=70u8)
+            .map(|n| {
+                (
+                    n,
+                    100,
+                    100,
+                    if n == 1 {
+                        &[][..]
+                    } else {
+                        &parents[usize::from(n) - 1][..]
+                    },
+                )
+            })
+            .collect();
         let g = graph(&txs);
         assert!(g.txids.len() > MAX_CHUNKED_CLUSTER);
         assert_eq!(ids(&g, &mining_order(&g)), (1..=70u8).collect::<Vec<_>>());
@@ -390,7 +450,11 @@ mod tests {
     /// transaction that pays more than the parent alone.
     #[test]
     fn a_child_paying_for_its_parent_lists_them_together_first() {
-        let g = graph(&[(1, 100, 100, &[]), (2, 1_000, 100, &[1]), (3, 300, 100, &[])]);
+        let g = graph(&[
+            (1, 100, 100, &[]),
+            (2, 1_000, 100, &[1]),
+            (3, 300, 100, &[]),
+        ]);
         assert_eq!(ids(&g, &mining_order(&g)), vec![1, 2, 3]);
     }
 
@@ -408,13 +472,21 @@ mod tests {
     /// graph lists them in. Iterating the mempool's map, it did.
     #[test]
     fn the_order_does_not_depend_on_the_graphs_order() {
-        let txs: Vec<(u8, i64, i64, &[u8])> =
-            vec![(1, 500, 100, &[]), (2, 500, 100, &[1]), (3, 500, 100, &[]), (4, 700, 200, &[3]), (5, 50, 100, &[])];
+        let txs: Vec<(u8, i64, i64, &[u8])> = vec![
+            (1, 500, 100, &[]),
+            (2, 500, 100, &[1]),
+            (3, 500, 100, &[]),
+            (4, 700, 200, &[3]),
+            (5, 50, 100, &[]),
+        ];
         let forward = graph(&txs);
         let mut reversed = txs.clone();
         reversed.reverse();
         let backward = graph(&reversed);
-        assert_eq!(ids(&forward, &mining_order(&forward)), ids(&backward, &mining_order(&backward)));
+        assert_eq!(
+            ids(&forward, &mining_order(&forward)),
+            ids(&backward, &mining_order(&backward))
+        );
     }
 
     /// The chunks Core v32.1 reports for a chain of three 437-weight
@@ -423,10 +495,18 @@ mod tests {
     /// own.
     #[test]
     fn a_child_paying_for_its_parent_shares_its_chunk() {
-        let g = graph(&[(1, 100, 437, &[]), (2, 10_000, 437, &[1]), (3, 200, 437, &[2])]);
+        let g = graph(&[
+            (1, 100, 437, &[]),
+            (2, 10_000, 437, &[1]),
+            (3, 200, 437, &[2]),
+        ]);
         assert_eq!(
             chunk_feerates(&g),
-            vec![FeeFrac::new(10_100, 874), FeeFrac::new(10_100, 874), FeeFrac::new(200, 437)]
+            vec![
+                FeeFrac::new(10_100, 874),
+                FeeFrac::new(10_100, 874),
+                FeeFrac::new(200, 437)
+            ]
         );
     }
 
@@ -435,7 +515,11 @@ mod tests {
     /// the whole chain as one chunk paying -9 700 sat for 1311 weight.
     #[test]
     fn a_negative_parent_pulls_its_descendants_into_its_chunk() {
-        let g = graph(&[(1, -19_900, 437, &[]), (2, 10_000, 437, &[1]), (3, 200, 437, &[2])]);
+        let g = graph(&[
+            (1, -19_900, 437, &[]),
+            (2, 10_000, 437, &[1]),
+            (3, 200, 437, &[2]),
+        ]);
         assert_eq!(chunk_feerates(&g), vec![FeeFrac::new(-9_700, 1311); 3]);
     }
 
@@ -471,7 +555,12 @@ mod tests {
     fn what_follows_a_dropped_transaction_in_its_piece_goes_with_it() {
         // Returned 1; the mempool's 2 spends it; 3 (big) and 4 (small)
         // both spend 2, and 3 pays the better feerate, so it comes first.
-        let g = graph(&[(1, 1_000, 100, &[]), (2, 1_000, 100, &[1]), (3, 600, 1_000, &[2]), (4, 5, 10, &[2])]);
+        let g = graph(&[
+            (1, 1_000, 100, &[]),
+            (2, 1_000, 100, &[1]),
+            (3, 600, 1_000, &[2]),
+            (4, 5, 10, &[2]),
+        ]);
         let removed = trim(&g, &[true, false, false, false], 10, 500);
         assert_eq!(ids(&g, &removed), vec![3, 4]);
     }
@@ -479,7 +568,11 @@ mod tests {
     /// The size limit cuts as the count does.
     #[test]
     fn a_cluster_is_cut_back_to_its_size() {
-        let g = graph(&[(1, 1_000, 100, &[]), (2, 100, 100, &[1]), (3, 100, 100, &[2])]);
+        let g = graph(&[
+            (1, 1_000, 100, &[]),
+            (2, 100, 100, &[1]),
+            (3, 100, 100, &[2]),
+        ]);
         let removed = trim(&g, &[true, false, false], 64, 200);
         assert_eq!(ids(&g, &removed), vec![3]);
     }
@@ -489,7 +582,11 @@ mod tests {
     #[test]
     fn a_spender_waits_for_the_returned_parent() {
         // Returned 1 -> 2 (cheap); the mempool's 3 spends 2 and pays well.
-        let g = graph(&[(1, 10, 100, &[]), (2, 10, 100, &[1]), (3, 10_000, 100, &[2])]);
+        let g = graph(&[
+            (1, 10, 100, &[]),
+            (2, 10, 100, &[1]),
+            (3, 10_000, 100, &[2]),
+        ]);
         let removed = trim(&g, &[true, true, false], 2, u64::MAX);
         assert_eq!(ids(&g, &removed), vec![3]);
     }

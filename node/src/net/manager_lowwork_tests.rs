@@ -8,8 +8,8 @@
 //! it the node stopped fetching and accepting relayed transactions. Core
 //! reports the most-work header (`m_best_header`) instead, and so does satd.
 
-use super::*;
 use super::txrequest_tests::{MockClock, add_peer};
+use super::*;
 
 fn mk_pm() -> (Arc<PeerManager>, tempfile::TempDir) {
     use crate::chain::state::AssumeValid;
@@ -38,7 +38,13 @@ fn mk_pm() -> (Arc<PeerManager>, tempfile::TempDir) {
     let fee_estimator = Arc::new(FeeEstimator::new());
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     std::mem::forget(shutdown_tx);
-    let pm = PeerManager::new(chain_state, mempool, fee_estimator, Network::Regtest, shutdown_rx);
+    let pm = PeerManager::new(
+        chain_state,
+        mempool,
+        fee_estimator,
+        Network::Regtest,
+        shutdown_rx,
+    );
     (pm, dir)
 }
 
@@ -86,9 +92,16 @@ fn a_tall_low_work_header_chain_leaves_the_node_out_of_ibd() {
     let fork = header_chain(130, now - 100_000);
     pm.handle_headers(1, fork.clone());
     let fork_tip = fork.last().unwrap().block_hash();
-    assert!(cs.get_block_index(&fork_tip).is_some(), "fixture: the fork headers were accepted");
+    assert!(
+        cs.get_block_index(&fork_tip).is_some(),
+        "fixture: the fork headers were accepted"
+    );
 
-    assert_eq!(cs.headers_tip_height(), 30, "the low-work chain raised the header tip");
+    assert_eq!(
+        cs.headers_tip_height(),
+        30,
+        "the low-work chain raised the header tip"
+    );
     assert_eq!(cs.best_header_hash(), parent);
     assert_eq!(pm.headers_tip.load(Ordering::Relaxed), 30);
     assert!(!pm.is_ibd(), "the low-work chain put the node in IBD");
@@ -107,7 +120,11 @@ fn a_tall_low_work_header_chain_leaves_the_node_out_of_ibd() {
         })
         .flatten()
         .collect();
-    assert_eq!(asked, vec![Inventory::WTx(w)], "the announced transaction was not requested");
+    assert_eq!(
+        asked,
+        vec![Inventory::WTx(w)],
+        "the announced transaction was not requested"
+    );
 }
 
 /// A heavier-but-shorter switch that arrives as a block, not as headers:

@@ -365,7 +365,10 @@ mod tests {
 
     #[test]
     fn mempool_submit_is_allowed_on_readonly() {
-        assert_eq!(classify("sendrawtransaction"), Some(RpcAccess::MempoolSubmit));
+        assert_eq!(
+            classify("sendrawtransaction"),
+            Some(RpcAccess::MempoolSubmit)
+        );
         assert!(readonly_listener_allows("sendrawtransaction"));
         assert_eq!(classify("submitpackage"), Some(RpcAccess::MempoolSubmit));
         assert!(readonly_listener_allows("submitpackage"));

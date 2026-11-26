@@ -253,10 +253,15 @@ mod tests {
         );
         let quota = acct.quota();
         let l1 = p.acquire_watch(1).expect("first watch within quota");
-        let l2 = p.acquire_watch(1).expect("second watch hits the cap exactly");
+        let l2 = p
+            .acquire_watch(1)
+            .expect("second watch hits the cap exactly");
         assert_eq!(quota.current("tenant"), 2);
         // Third exceeds the watch_quota=2 ceiling.
-        assert!(matches!(p.acquire_watch(1), Err(WatchReject::QuotaExceeded(_))));
+        assert!(matches!(
+            p.acquire_watch(1),
+            Err(WatchReject::QuotaExceeded(_))
+        ));
         // Dropping a lease frees a unit (disconnect reconciliation) → room again.
         drop(l2);
         assert_eq!(quota.current("tenant"), 1);

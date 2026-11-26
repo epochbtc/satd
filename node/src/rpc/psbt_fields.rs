@@ -14,8 +14,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use satd_psbt::raw::{RawMap, RawPair};
 use satd_psbt::keys;
+use satd_psbt::raw::{RawMap, RawPair};
 use serde_json::{Map, Value, json};
 
 /// The key types of each map that Core reads; every other pair is Core's
@@ -23,8 +23,8 @@ use serde_json::{Map, Value, json};
 /// they are in Core.
 const CORE_GLOBAL: &[u64] = &[0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0xfb, 0xfc];
 const CORE_INPUT: &[u64] = &[
-    0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
-    0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x1a, 0x1b, 0x1c, 0xfc,
+    0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10,
+    0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x1a, 0x1b, 0x1c, 0xfc,
 ];
 const CORE_OUTPUT: &[u64] = &[0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0xfc];
 
@@ -73,7 +73,10 @@ fn key_origin(value: &[u8]) -> Option<([u8; 4], Vec<u32>)> {
         return None;
     }
     let fingerprint = value[..4].try_into().ok()?;
-    let path = value[4..].chunks(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+    let path = value[4..]
+        .chunks(4)
+        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
     Some((fingerprint, path))
 }
 
@@ -90,8 +93,14 @@ fn origin_json(pubkey: &[u8], fingerprint: [u8; 4], path: &[u32]) -> Value {
 fn read_compact(b: &[u8]) -> Option<(u64, &[u8])> {
     let (&first, rest) = b.split_first()?;
     let (n, len) = match first {
-        0xfd => (u64::from(u16::from_le_bytes(rest.get(..2)?.try_into().ok()?)), 2),
-        0xfe => (u64::from(u32::from_le_bytes(rest.get(..4)?.try_into().ok()?)), 4),
+        0xfd => (
+            u64::from(u16::from_le_bytes(rest.get(..2)?.try_into().ok()?)),
+            2,
+        ),
+        0xfe => (
+            u64::from(u32::from_le_bytes(rest.get(..4)?.try_into().ok()?)),
+            4,
+        ),
         0xff => (u64::from_le_bytes(rest.get(..8)?.try_into().ok()?), 8),
         n => (u64::from(n), 0),
     };
@@ -114,9 +123,15 @@ fn is_pubkey(b: &[u8]) -> bool {
 fn proprietary_json(map: &RawMap, key_type: u64, used: &mut BTreeSet<Vec<u8>>) -> Vec<Value> {
     let mut rows: BTreeMap<Vec<u8>, Value> = BTreeMap::new();
     for pair in map.pairs().iter().filter(|p| p.key_type == key_type) {
-        let Some((len, rest)) = read_compact(&pair.key_data) else { continue };
-        let Some(identifier) = usize::try_from(len).ok().and_then(|l| rest.get(..l)) else { continue };
-        let Some((subtype, _)) = read_compact(&rest[identifier.len()..]) else { continue };
+        let Some((len, rest)) = read_compact(&pair.key_data) else {
+            continue;
+        };
+        let Some(identifier) = usize::try_from(len).ok().and_then(|l| rest.get(..l)) else {
+            continue;
+        };
+        let Some((subtype, _)) = read_compact(&rest[identifier.len()..]) else {
+            continue;
+        };
         let key = full_key(pair);
         used.insert(key.clone());
         rows.insert(
@@ -191,14 +206,20 @@ const THEIRS_GLOBAL: &[(u64, &str)] = &[
     (0x06, "inputs_modifiable"),
     (0xfb, "psbt_version"),
 ];
-const THEIRS_OUTPUT: &[(u64, &str)] =
-    &[(0x00, "redeem_script"), (0x01, "witness_script"), (0x03, "amount"), (0x04, "script")];
+const THEIRS_OUTPUT: &[(u64, &str)] = &[
+    (0x00, "redeem_script"),
+    (0x01, "witness_script"),
+    (0x03, "amount"),
+    (0x04, "script"),
+];
 
 /// The key types this module renders, in each map. Core's other known
 /// types are the callers'.
 const MINE_GLOBAL: &[u64] = &[0x01, 0xfc];
-const MINE_INPUT: &[u64] =
-    &[0x00, 0x02, 0x03, 0x06, 0x0a, 0x0b, 0x0c, 0x0d, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x1a, 0x1b, 0x1c, 0xfc];
+const MINE_INPUT: &[u64] = &[
+    0x00, 0x02, 0x03, 0x06, 0x0a, 0x0b, 0x0c, 0x0d, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x1a, 0x1b,
+    0x1c, 0xfc,
+];
 const MINE_OUTPUT: &[u64] = &[0x02, 0x05, 0x06, 0x07, 0x08, 0xfc];
 
 /// The top-level fields of Core's `decodepsbt` that come from the global
@@ -209,8 +230,14 @@ pub(crate) fn global_fields(map: &RawMap, out: &mut Value) {
     // `std::map<KeyOriginInfo, std::set<CExtPubKey>>`: by fingerprint, then
     // path length, then path; then by the key and its chain code.
     let mut xpubs: Vec<(XpubOrder, Value)> = Vec::new();
-    for pair in map.pairs().iter().filter(|p| p.key_type == keys::global::XPUB) {
-        let Some((fingerprint, path)) = key_origin(&pair.value) else { continue };
+    for pair in map
+        .pairs()
+        .iter()
+        .filter(|p| p.key_type == keys::global::XPUB)
+    {
+        let Some((fingerprint, path)) = key_origin(&pair.value) else {
+            continue;
+        };
         if pair.key_data.len() != 78 || !is_pubkey(&pair.key_data[45..]) {
             continue;
         }
@@ -219,7 +246,10 @@ pub(crate) fn global_fields(map: &RawMap, out: &mut Value) {
         // `std::set<CExtPubKey>` compares the key and chain code only, so a
         // second encoding of the same key under the same origin is one
         // entry, the first read.
-        let order = ((fingerprint, path.len(), path.clone()), (pubkey.clone(), chaincode.clone()));
+        let order = (
+            (fingerprint, path.len(), path.clone()),
+            (pubkey.clone(), chaincode.clone()),
+        );
         if xpubs.iter().any(|(o, _)| *o == order) {
             continue;
         }
@@ -266,7 +296,9 @@ pub(crate) fn input_fields(map: &RawMap, out: &mut Value, network: bitcoin::Netw
         out["partial_signatures"] = Value::Object(sigs);
     }
 
-    if let Some(pair) = pairs(keys::input::SIGHASH_TYPE).find(|p| p.key_data.is_empty() && p.value.len() == 4) {
+    if let Some(pair) =
+        pairs(keys::input::SIGHASH_TYPE).find(|p| p.key_data.is_empty() && p.value.len() == 4)
+    {
         mark(&mut used, pair);
         let v = u32::from_le_bytes(pair.value[..4].try_into().expect("four bytes"));
         out["sighash"] = json!(sighash_to_str(v));
@@ -321,7 +353,9 @@ pub(crate) fn input_fields(map: &RawMap, out: &mut Value, network: bitcoin::Netw
     // blocks shortest first.
     let mut leaves: BTreeMap<LeafKey, BTreeSet<(usize, Vec<u8>)>> = BTreeMap::new();
     for pair in pairs(keys::input::TAP_LEAF_SCRIPT) {
-        let Some((&leaf_ver, script)) = pair.value.split_last() else { continue };
+        let Some((&leaf_ver, script)) = pair.value.split_last() else {
+            continue;
+        };
         mark(&mut used, pair);
         leaves
             .entry((script.to_vec(), leaf_ver))
@@ -388,11 +422,18 @@ pub(crate) fn output_fields(map: &RawMap, out: &mut Value) {
     if !derivs.is_empty() {
         out["bip32_derivs"] = Value::Array(derivs);
     }
-    if let Some(pair) = map.pairs().iter().find(|p| p.key_type == keys::output::TAP_INTERNAL_KEY && p.key_data.is_empty()) {
+    if let Some(pair) = map
+        .pairs()
+        .iter()
+        .find(|p| p.key_type == keys::output::TAP_INTERNAL_KEY && p.key_data.is_empty())
+    {
         used.insert(full_key(pair));
         out["taproot_internal_key"] = json!(hex::encode(&pair.value));
     }
-    if let Some(pair) = map.pairs().iter().find(|p| p.key_type == keys::output::TAP_TREE && p.key_data.is_empty())
+    if let Some(pair) = map
+        .pairs()
+        .iter()
+        .find(|p| p.key_type == keys::output::TAP_TREE && p.key_data.is_empty())
         && let Some(tree) = tap_tree(&pair.value)
     {
         used.insert(full_key(pair));
@@ -419,10 +460,19 @@ pub(crate) fn output_fields(map: &RawMap, out: &mut Value) {
 /// `std::map<CPubKey, KeyOriginInfo>`, in key byte order.
 fn bip32_derivs(map: &RawMap, key_type: u64, used: &mut BTreeSet<Vec<u8>>) -> Vec<Value> {
     let mut rows: BTreeMap<Vec<u8>, Value> = BTreeMap::new();
-    for pair in map.pairs().iter().filter(|p| p.key_type == key_type && is_pubkey(&p.key_data)) {
-        let Some((fingerprint, path)) = key_origin(&pair.value) else { continue };
+    for pair in map
+        .pairs()
+        .iter()
+        .filter(|p| p.key_type == key_type && is_pubkey(&p.key_data))
+    {
+        let Some((fingerprint, path)) = key_origin(&pair.value) else {
+            continue;
+        };
         used.insert(full_key(pair));
-        rows.insert(pair.key_data.clone(), origin_json(&pair.key_data, fingerprint, &path));
+        rows.insert(
+            pair.key_data.clone(),
+            origin_json(&pair.key_data, fingerprint, &path),
+        );
     }
     rows.into_values().collect()
 }
@@ -431,13 +481,23 @@ fn bip32_derivs(map: &RawMap, key_type: u64, used: &mut BTreeSet<Vec<u8>>) -> Ve
 /// by key, the leaf hashes in byte order.
 fn tap_bip32_derivs(map: &RawMap, key_type: u64, used: &mut BTreeSet<Vec<u8>>) -> Vec<Value> {
     let mut rows: BTreeMap<Vec<u8>, Value> = BTreeMap::new();
-    for pair in map.pairs().iter().filter(|p| p.key_type == key_type && p.key_data.len() == 32) {
-        let Some((n, rest)) = read_compact(&pair.value) else { continue };
-        let Some(hashes_len) = usize::try_from(n).ok().and_then(|n| n.checked_mul(32)) else { continue };
+    for pair in map
+        .pairs()
+        .iter()
+        .filter(|p| p.key_type == key_type && p.key_data.len() == 32)
+    {
+        let Some((n, rest)) = read_compact(&pair.value) else {
+            continue;
+        };
+        let Some(hashes_len) = usize::try_from(n).ok().and_then(|n| n.checked_mul(32)) else {
+            continue;
+        };
         if rest.len() < hashes_len {
             continue;
         }
-        let Some((fingerprint, path)) = key_origin(&rest[hashes_len..]) else { continue };
+        let Some((fingerprint, path)) = key_origin(&rest[hashes_len..]) else {
+            continue;
+        };
         let hashes: BTreeSet<&[u8]> = rest[..hashes_len].chunks(32).collect();
         used.insert(full_key(pair));
         let mut row = origin_json(&pair.key_data, fingerprint, &path);
@@ -467,7 +527,11 @@ fn tap_tree(value: &[u8]) -> Option<Vec<Value>> {
 /// participants, in the order the PSBT lists them.
 fn musig2_participants(map: &RawMap, key_type: u64, used: &mut BTreeSet<Vec<u8>>) -> Vec<Value> {
     let mut rows: BTreeMap<Vec<u8>, Value> = BTreeMap::new();
-    for pair in map.pairs().iter().filter(|p| p.key_type == key_type && p.key_data.len() == 33) {
+    for pair in map
+        .pairs()
+        .iter()
+        .filter(|p| p.key_type == key_type && p.key_data.len() == 33)
+    {
         if pair.value.is_empty() || pair.value.len() % 33 != 0 {
             continue;
         }
@@ -502,7 +566,11 @@ fn musig2_per_participant(
             continue;
         }
         let (part, agg) = (&k[..33], &k[33..66]);
-        let leaf: [u8; 32] = if k.len() == 98 { k[66..].try_into().expect("32 bytes") } else { [0; 32] };
+        let leaf: [u8; 32] = if k.len() == 98 {
+            k[66..].try_into().expect("32 bytes")
+        } else {
+            [0; 32]
+        };
         used.insert(full_key(pair));
         let mut row = json!({
             "participant_pubkey": hex::encode(part),

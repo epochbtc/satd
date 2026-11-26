@@ -137,10 +137,7 @@ pub fn notify_status(message: &str) {
 ///
 /// Call exactly once, after every listener is bound.
 pub fn notify_ready() {
-    if let Err(e) = sd_notify::notify(&[
-        NotifyState::Ready,
-        NotifyState::Status("Ready"),
-    ]) {
+    if let Err(e) = sd_notify::notify(&[NotifyState::Ready, NotifyState::Status("Ready")]) {
         tracing::warn!(error = %e, "sd_notify READY failed");
     }
 }
@@ -457,7 +454,10 @@ mod tests {
             msg.contains("STATUS=Replaying blocks (500/1000, 50%)"),
             "got: {msg:?}"
         );
-        assert!(msg.contains("EXTEND_TIMEOUT_USEC=120000000"), "got: {msg:?}");
+        assert!(
+            msg.contains("EXTEND_TIMEOUT_USEC=120000000"),
+            "got: {msg:?}"
+        );
 
         // Stop signal — task should drop out of its select arm and finish.
         stop_tx.send(()).unwrap();
@@ -533,10 +533,7 @@ mod tests {
         );
 
         unsafe {
-            std::env::set_var(
-                "WATCHDOG_PID",
-                std::process::id().to_string(),
-            );
+            std::env::set_var("WATCHDOG_PID", std::process::id().to_string());
         }
         assert_eq!(
             read_watchdog_usec(),
@@ -577,11 +574,8 @@ mod tests {
         let probes: Vec<Box<dyn WatchdogProbe>> = vec![Box::new(probe.clone())];
 
         let (stop_tx, stop_rx) = oneshot::channel::<()>();
-        let handle = spawn_watchdog_heartbeat_with_interval(
-            probes,
-            stop_rx,
-            Duration::from_millis(50),
-        );
+        let handle =
+            spawn_watchdog_heartbeat_with_interval(probes, stop_rx, Duration::from_millis(50));
 
         // First tick is skipped, so the first datagram lands ~100ms in.
         let recv_task = tokio::task::spawn_blocking(move || {
@@ -631,11 +625,8 @@ mod tests {
         let probes: Vec<Box<dyn WatchdogProbe>> = vec![Box::new(probe.clone())];
 
         let (stop_tx, stop_rx) = oneshot::channel::<()>();
-        let handle = spawn_watchdog_heartbeat_with_interval(
-            probes,
-            stop_rx,
-            Duration::from_millis(50),
-        );
+        let handle =
+            spawn_watchdog_heartbeat_with_interval(probes, stop_rx, Duration::from_millis(50));
 
         // 500ms read timeout × ticker fires every 50ms = expected several
         // suppressed ticks. None should reach the socket.
@@ -646,9 +637,7 @@ mod tests {
                     "unexpected datagram while probe unhealthy: {:?}",
                     String::from_utf8_lossy(&buf[..n])
                 )),
-                Err(e) if e.kind() == ErrorKind::WouldBlock
-                    || e.kind() == ErrorKind::TimedOut =>
-                {
+                Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => {
                     Ok(())
                 }
                 Err(e) => Err(format!("unexpected recv error: {e}")),

@@ -1,14 +1,14 @@
 use bitcoin::{BlockHash, OutPoint, Txid};
 use lru::LruCache;
+use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
-use parking_lot::{Mutex, RwLock};
 use std::sync::atomic::{AtomicI64, AtomicU8, AtomicU32, AtomicU64, Ordering};
 
 use super::blockindex::{BlockIndexEntry, BlockStatus};
 use super::coinview::Coin;
-use super::undo::UndoData;
 use super::flatfile::PendingRecord;
+use super::undo::UndoData;
 use super::{Store, StoreBatch, StoreError, WriteMode};
 
 /// The dirty-coin count at which the cache flushes: the whole clean-coin
@@ -457,7 +457,12 @@ impl CoinCache {
     /// is full or old enough ([`Self::commit_held_rows_if_due`]).
     pub fn hold_block_row(&self, hash: BlockHash, entry: BlockIndexEntry, pending: PendingRecord) {
         self.block_index_cache.lock().put(hash, entry.clone());
-        self.held_rows.lock().push(HeldRow { hash, entry, at: std::time::Instant::now(), _pending: pending });
+        self.held_rows.lock().push(HeldRow {
+            hash,
+            entry,
+            at: std::time::Instant::now(),
+            _pending: pending,
+        });
     }
 
     /// Drop a held row whose store did not complete: the caller's own write
@@ -475,7 +480,10 @@ impl CoinCache {
     pub fn commit_held_rows_if_due(&self) -> Result<(), StoreError> {
         let due = {
             let held = self.held_rows.lock();
-            held.len() >= HELD_ROWS_MAX || held.first().is_some_and(|r| r.at.elapsed() >= HELD_ROWS_MAX_AGE)
+            held.len() >= HELD_ROWS_MAX
+                || held
+                    .first()
+                    .is_some_and(|r| r.at.elapsed() >= HELD_ROWS_MAX_AGE)
         };
         if due { self.commit_held_rows() } else { Ok(()) }
     }
@@ -504,11 +512,15 @@ impl CoinCache {
         let batch = {
             let held = self.held_rows.lock();
             StoreBatch {
-                block_index_puts: held[..n.min(held.len())].iter().map(|r| (r.hash, r.entry.clone())).collect(),
+                block_index_puts: held[..n.min(held.len())]
+                    .iter()
+                    .map(|r| (r.hash, r.entry.clone()))
+                    .collect(),
                 ..StoreBatch::default()
             }
         };
-        self.inner.write_batch_mode(batch, self.current_write_mode())?;
+        self.inner
+            .write_batch_mode(batch, self.current_write_mode())?;
         let mut held = self.held_rows.lock();
         let n = n.min(held.len());
         held.drain(..n);
@@ -517,7 +529,12 @@ impl CoinCache {
 
     /// The held row for `hash`, if any; the last one wins.
     fn held_row(&self, hash: &BlockHash) -> Option<BlockIndexEntry> {
-        self.held_rows.lock().iter().rev().find(|r| r.hash == *hash).map(|r| r.entry.clone())
+        self.held_rows
+            .lock()
+            .iter()
+            .rev()
+            .find(|r| r.hash == *hash)
+            .map(|r| r.entry.clone())
     }
 
     /// Flush dirty coins to the backing store.
@@ -640,7 +657,10 @@ impl CoinCache {
             let needs_commit = {
                 let held = self.held_rows.lock();
                 !held.is_empty()
-                    && pending.block_index_puts.iter().any(|(h, _)| held.iter().any(|r| r.hash == *h))
+                    && pending
+                        .block_index_puts
+                        .iter()
+                        .any(|(h, _)| held.iter().any(|r| r.hash == *h))
             };
             if !needs_commit {
                 break (dirty, pending);
@@ -661,7 +681,8 @@ impl CoinCache {
         // The removes of coins with no known stored row (`Spent::row_unknown`).
         // `coin_removes` has no room for that, and a failed write hands the
         // batch back to `restore_after_failed_flush`, which needs it.
-        let mut rowless_removes: std::collections::HashSet<OutPoint> = std::collections::HashSet::new();
+        let mut rowless_removes: std::collections::HashSet<OutPoint> =
+            std::collections::HashSet::new();
 
         for (outpoint, entry) in dirty.drain() {
             match entry {
@@ -674,7 +695,12 @@ impl CoinCache {
                     // Move (not clone) into promote list for LRU insertion
                     promote.push((outpoint, coin));
                 }
-                DirtyEntry::Spent { amount, height, row_unknown, .. } => {
+                DirtyEntry::Spent {
+                    amount,
+                    height,
+                    row_unknown,
+                    ..
+                } => {
                     if row_unknown {
                         rowless_removes.insert(outpoint);
                     }
@@ -868,7 +894,9 @@ impl CoinCache {
         // the failure path must not take them in the other order.
         let newer = std::mem::take(&mut *pending);
         batch.merge(newer);
-        self.pending_bi_hashes.lock().extend(batch.block_index_puts.iter().map(|(h, _)| *h));
+        self.pending_bi_hashes
+            .lock()
+            .extend(batch.block_index_puts.iter().map(|(h, _)| *h));
         *pending = batch;
         drop(pending);
 
@@ -1511,7 +1539,10 @@ impl CoinCache {
                             // when the LRU has evicted the held entry.
                             Some(row)
                                 if e.status == BlockStatus::HeaderOnly
-                                    && matches!(row.entry.status, BlockStatus::DataStored | BlockStatus::Valid) =>
+                                    && matches!(
+                                        row.entry.status,
+                                        BlockStatus::DataStored | BlockStatus::Valid
+                                    ) =>
                             {
                                 lru.put(*h, row.entry.clone());
                                 false
@@ -1550,7 +1581,9 @@ impl CoinCache {
                 self.write_pass_through(pass_through, mode)?;
             } else {
                 let mut pending = self.pending_batch.lock();
-                self.pending_bi_hashes.lock().extend(batch.block_index_puts.iter().map(|(h, _)| *h));
+                self.pending_bi_hashes
+                    .lock()
+                    .extend(batch.block_index_puts.iter().map(|(h, _)| *h));
                 pending.block_index_puts.extend(batch.block_index_puts);
                 pending.undo_puts.extend(batch.undo_puts);
                 pending.chain_tx_puts.extend(batch.chain_tx_puts);
@@ -1648,10 +1681,12 @@ impl CoinCache {
             use std::collections::HashSet;
             let filter_puts: HashSet<FilterKey> =
                 pass_through.filter_puts.iter().map(|r| r.key).collect();
-            let header_puts: HashSet<FilterKey> =
-                pass_through.filter_header_puts.iter().map(|r| r.key).collect();
-            let removes: HashSet<FilterKey> =
-                pass_through.filter_removes.iter().copied().collect();
+            let header_puts: HashSet<FilterKey> = pass_through
+                .filter_header_puts
+                .iter()
+                .map(|r| r.key)
+                .collect();
+            let removes: HashSet<FilterKey> = pass_through.filter_removes.iter().copied().collect();
             let mut pending = self.pending_batch.lock();
             self.inner.write_batch_recoverable(pass_through, mode)?;
             pending
@@ -1727,7 +1762,10 @@ impl Store for CoinCache {
     /// Straight to the inner store: strip records travel in coin-free
     /// batches, which skip the pending batch, so nothing is held back here
     /// but the odd removal riding a coin batch, for at most a flush.
-    fn for_each_opreturn_strip(&self, f: &mut dyn FnMut(&BlockHash, &[u8])) -> Result<(), StoreError> {
+    fn for_each_opreturn_strip(
+        &self,
+        f: &mut dyn FnMut(&BlockHash, &[u8]),
+    ) -> Result<(), StoreError> {
         self.inner.for_each_opreturn_strip(f)
     }
 
@@ -1956,8 +1994,12 @@ impl Store for CoinCache {
             // block's connect row is newer than its store row. A Vec of puts
             // may name the same hash twice; the last write wins, which is
             // what `collect` into a map gives.
-            let mut rows: std::collections::HashMap<BlockHash, BlockIndexEntry> =
-                self.held_rows.lock().iter().map(|r| (r.hash, r.entry.clone())).collect();
+            let mut rows: std::collections::HashMap<BlockHash, BlockIndexEntry> = self
+                .held_rows
+                .lock()
+                .iter()
+                .map(|r| (r.hash, r.entry.clone()))
+                .collect();
             let pending = self.pending_batch.lock();
             rows.extend(pending.block_index_puts.iter().cloned());
             rows
@@ -2355,11 +2397,8 @@ impl Store for CoinCache {
                 .collect();
             (removes, raw)
         };
-        let pending_puts = crate::storage::rocksdb_store::resolve_funding_rows_for(
-            self,
-            sh,
-            pending_raw,
-        );
+        let pending_puts =
+            crate::storage::rocksdb_store::resolve_funding_rows_for(self, sh, pending_raw);
 
         // Round-1 review M4: bound the inner scan. The handler only
         // needs to know "is there more than `cap`?", so asking inner
@@ -2403,9 +2442,7 @@ impl Store for CoinCache {
             .filter(|(k, _)| !removed_resolved.contains(k) && !pending_keys.contains(k))
             .chain(pending_puts)
             .collect();
-        all.sort_by(|(a, _), (b, _)| {
-            (a.height, a.txid, a.vout).cmp(&(b.height, b.txid, b.vout))
-        });
+        all.sort_by(|(a, _), (b, _)| (a.height, a.txid, a.vout).cmp(&(b.height, b.txid, b.vout)));
         // Round-2 review M3: honor the trait contract — return at
         // most `limit` rows. Without this truncate a large in-flight
         // pending batch could push the merged result past `limit + 1`,
@@ -2476,9 +2513,7 @@ impl Store for CoinCache {
             .filter(|(k, _)| !removed_resolved.contains(k) && !pending_keys.contains(k))
             .chain(pending_puts)
             .collect();
-        all.sort_by(|(a, _), (b, _)| {
-            (a.height, a.txid, a.vin).cmp(&(b.height, b.txid, b.vin))
-        });
+        all.sort_by(|(a, _), (b, _)| (a.height, a.txid, a.vin).cmp(&(b.height, b.txid, b.vin)));
         // Round-2 review M3: honor the trait contract — see
         // iter_addr_funding_limited for the rationale.
         all.truncate(limit);
@@ -2676,7 +2711,12 @@ impl Store for CoinCache {
         if pending.filter_removes.contains(&key) {
             return None;
         }
-        if let Some(row) = pending.filter_header_puts.iter().rev().find(|r| r.key == key) {
+        if let Some(row) = pending
+            .filter_header_puts
+            .iter()
+            .rev()
+            .find(|r| r.key == key)
+        {
             return Some(row.header);
         }
         drop(pending);
@@ -2742,7 +2782,12 @@ impl Store for CoinCache {
         if pending.sp_tweak_removes.contains(&height) {
             return Ok(None);
         }
-        if let Some((_, row)) = pending.sp_tweak_puts.iter().rev().find(|(h, _)| *h == height) {
+        if let Some((_, row)) = pending
+            .sp_tweak_puts
+            .iter()
+            .rev()
+            .find(|(h, _)| *h == height)
+        {
             return Ok(Some(row.clone()));
         }
         drop(pending);
@@ -3498,7 +3543,8 @@ mod tests {
         // Coins dirty => non-coin ops are BUFFERED into `pending_batch`
         // rather than passed straight through to the store.
         let mut warm = StoreBatch::default();
-        warm.coin_puts.push((make_outpoint(0x01, 0), make_coin(50, 1)));
+        warm.coin_puts
+            .push((make_outpoint(0x01, 0), make_coin(50, 1)));
         cache.write_batch(warm).unwrap();
 
         // 1. The reorg disconnects the old block at height H.
@@ -3564,7 +3610,8 @@ mod tests {
 
         // Now dirty the coins so subsequent index ops buffer instead.
         let mut warm = StoreBatch::default();
-        warm.coin_puts.push((make_outpoint(0x41, 0), make_coin(50, 1)));
+        warm.coin_puts
+            .push((make_outpoint(0x41, 0), make_coin(50, 1)));
         cache.write_batch(warm).unwrap();
 
         let mut buffered_batch = StoreBatch::default();
@@ -3575,8 +3622,7 @@ mod tests {
         buffered_batch.height_hash_removes.push(100);
         cache.write_batch(buffered_batch).unwrap();
 
-        let mut seen: std::collections::HashMap<u32, BlockHash> =
-            std::collections::HashMap::new();
+        let mut seen: std::collections::HashMap<u32, BlockHash> = std::collections::HashMap::new();
         cache
             .for_each_height_hash(&mut |h, hash| {
                 seen.insert(h, hash);
@@ -3604,7 +3650,8 @@ mod tests {
         const H: u32 = 956337;
 
         let mut warm = StoreBatch::default();
-        warm.coin_puts.push((make_outpoint(0x21, 0), make_coin(50, 1)));
+        warm.coin_puts
+            .push((make_outpoint(0x21, 0), make_coin(50, 1)));
         cache.write_batch(warm).unwrap();
 
         let mut connect = StoreBatch::default();
@@ -3649,7 +3696,9 @@ mod tests {
         let mut batch = StoreBatch::default();
         // A coin forces the buffered branch: with `coin_dirty == 0` the
         // whole batch takes the pass-through literal instead.
-        batch.coin_puts.push((make_outpoint(0x5c, 0), make_coin(77, 1)));
+        batch
+            .coin_puts
+            .push((make_outpoint(0x5c, 0), make_coin(77, 1)));
         batch.height_hash_puts.push((9, hash));
         batch.tx_loc_puts.push((txid, 4));
         batch.txseq_txid_puts.push((4, txid));
@@ -3752,7 +3801,8 @@ mod tests {
         const NEW_SEQ: u64 = 42;
 
         let mut warm = StoreBatch::default();
-        warm.coin_puts.push((make_outpoint(0x11, 0), make_coin(50, 1)));
+        warm.coin_puts
+            .push((make_outpoint(0x11, 0), make_coin(50, 1)));
         cache.write_batch(warm).unwrap();
 
         let mut disconnect = StoreBatch::default();
@@ -3876,7 +3926,8 @@ mod tests {
         ));
 
         let mut warm = StoreBatch::default();
-        warm.coin_puts.push((make_outpoint(0x31, 0), make_coin(50, 1)));
+        warm.coin_puts
+            .push((make_outpoint(0x31, 0), make_coin(50, 1)));
         cache.write_batch(warm).unwrap();
 
         const SEQ: u64 = 43;
@@ -4371,9 +4422,7 @@ mod tests {
         let (f, s) = row_pair(1);
         pending.addr_funding_puts.push(f);
         pending.addr_spending_puts.push(s);
-        pending
-            .coin_puts
-            .push((make_outpoint(0x61, 0), a_coin(7)));
+        pending.coin_puts.push((make_outpoint(0x61, 0), a_coin(7)));
         cache.write_batch(pending).unwrap();
 
         let mut expected = txids.to_vec();
@@ -4700,13 +4749,13 @@ mod tests {
         connect.block_index_puts.push((hash, entry));
         connect.height_hash_puts.push((5, hash));
         connect.txseq_block_puts.push((10, 5));
-        connect.tx_loc_puts.extend([(coinbase, 10), (funding.txid, 11)]);
+        connect
+            .tx_loc_puts
+            .extend([(coinbase, 10), (funding.txid, 11)]);
         connect
             .txseq_txid_puts
             .extend([(10, coinbase), (11, funding.txid)]);
-        connect
-            .coin_puts
-            .push((make_outpoint(0x45, 0), a_coin(5)));
+        connect.coin_puts.push((make_outpoint(0x45, 0), a_coin(5)));
         cache.write_batch(connect).unwrap();
         assert_eq!(cache.get_tx_seq(&funding.txid), Some(11));
 
@@ -4949,9 +4998,17 @@ mod tests {
             assert!(cache.get_coin(&z).is_none(), "Z created and spent {when}");
             assert_eq!(cache.get_tip(), Some(block), "tip {when}");
             assert!(cache.get_block_index(&block).is_some(), "index row {when}");
-            assert_eq!(cache.get_block_hash_by_height(2), Some(block), "height row {when}");
+            assert_eq!(
+                cache.get_block_hash_by_height(2),
+                Some(block),
+                "height row {when}"
+            );
             assert!(cache.get_undo(&block).is_some(), "undo {when}");
-            assert_eq!(cache.get_cumulative_tx_count(&block), Some(42), "chain_tx {when}");
+            assert_eq!(
+                cache.get_cumulative_tx_count(&block),
+                Some(42),
+                "chain_tx {when}"
+            );
             assert_eq!(cache.coin_count(), base_count, "coin_count {when}");
             assert_eq!(
                 cache.coin_total_amount(),
@@ -4982,7 +5039,10 @@ mod tests {
         let excl = cache.lock_flush_exclusion();
         assert_eq!(cache.discard_uncommitted(&excl), Ok(()));
         drop(excl);
-        assert!(cache.get_block_index(&block).is_some(), "index row reached disk");
+        assert!(
+            cache.get_block_index(&block).is_some(),
+            "index row reached disk"
+        );
         assert_eq!(cache.get_block_hash_by_height(2), Some(block));
         assert!(cache.get_undo(&block).is_some());
         assert_eq!(cache.get_cumulative_tx_count(&block), Some(42));
@@ -5018,11 +5078,18 @@ mod tests {
         controls.fail_next_write();
         cache.flush().expect_err("the injected fault must surface");
         assert_eq!(cache.coin_count(), 1, "coin_count after the failed flush");
-        assert_eq!(cache.coin_total_amount(), 5_000, "total amount after the failed flush");
+        assert_eq!(
+            cache.coin_total_amount(),
+            5_000,
+            "total amount after the failed flush"
+        );
         assert!(
             matches!(
                 cache.dirty.read().get(&x),
-                Some(DirtyEntry::Present { replaces: Some((5_000, 1)), .. })
+                Some(DirtyEntry::Present {
+                    replaces: Some((5_000, 1)),
+                    ..
+                })
             ),
             "the restored entry must still name the row it replaces"
         );
@@ -5052,7 +5119,11 @@ mod tests {
         cache.flush().expect_err("the injected fault must surface");
         assert!(matches!(
             cache.dirty.read().get(&y),
-            Some(DirtyEntry::Present { fresh: false, replaces: None, .. })
+            Some(DirtyEntry::Present {
+                fresh: false,
+                replaces: None,
+                ..
+            })
         ));
 
         let mut spend = StoreBatch::default();
@@ -5064,7 +5135,11 @@ mod tests {
         assert!(
             matches!(
                 cache.dirty.read().get(&y),
-                Some(DirtyEntry::Present { fresh: false, replaces: None, .. })
+                Some(DirtyEntry::Present {
+                    fresh: false,
+                    replaces: None,
+                    ..
+                })
             ),
             "no stored row is known, so the put-back must not name one"
         );
@@ -5098,17 +5173,24 @@ mod tests {
         create.coin_puts.push((z, make_coin(8_000, 3)));
         cache.write_batch(create).unwrap();
         controls.fail_next_write();
-        cache.flush().expect_err("the first injected fault must surface");
+        cache
+            .flush()
+            .expect_err("the first injected fault must surface");
 
         let mut spend = StoreBatch::default();
         spend.coin_removes.push((z, 8_000, 3));
         cache.write_batch(spend).unwrap();
         controls.fail_next_write();
-        cache.flush().expect_err("the second injected fault must surface");
+        cache
+            .flush()
+            .expect_err("the second injected fault must surface");
         assert!(
             matches!(
                 cache.dirty.read().get(&z),
-                Some(DirtyEntry::Spent { row_unknown: true, .. })
+                Some(DirtyEntry::Spent {
+                    row_unknown: true,
+                    ..
+                })
             ),
             "the restored remove must still have no known row"
         );
@@ -5119,7 +5201,11 @@ mod tests {
         assert!(
             matches!(
                 cache.dirty.read().get(&z),
-                Some(DirtyEntry::Present { fresh: false, replaces: None, .. })
+                Some(DirtyEntry::Present {
+                    fresh: false,
+                    replaces: None,
+                    ..
+                })
             ),
             "no stored row is known, so the put-back must not name one"
         );
@@ -5144,14 +5230,20 @@ mod tests {
 
         let hash = BlockHash::from_byte_array([0x5C; 32]);
         let mut connect = StoreBatch::default();
-        connect.coin_puts.push((make_outpoint(0xF5, 0), make_coin(1_000, 7)));
+        connect
+            .coin_puts
+            .push((make_outpoint(0xF5, 0), make_coin(1_000, 7)));
         connect.block_index_puts.push((hash, make_test_entry(7)));
         cache.write_batch(connect).unwrap();
 
         controls.fail_next_write();
         assert!(cache.flush().is_err());
         cache.block_index_cache.lock().clear();
-        assert_eq!(cache.get_block_index(&hash).map(|e| e.height), Some(7), "the handed-back row is read");
+        assert_eq!(
+            cache.get_block_index(&hash).map(|e| e.height),
+            Some(7),
+            "the handed-back row is read"
+        );
     }
 
     /// A coin created and spent between two flushes leaves nothing behind,
@@ -5177,7 +5269,10 @@ mod tests {
 
         cache.flush().unwrap();
         assert!(cache.get_coin(&y).is_none());
-        assert!(cache.inner.get_coin(&y).is_none(), "nothing reached the store");
+        assert!(
+            cache.inner.get_coin(&y).is_none(),
+            "nothing reached the store"
+        );
     }
 
     /// The index rows buffered with the coins count toward the flush, so
@@ -5187,13 +5282,18 @@ mod tests {
         let cache = make_cache(10);
         let threshold = cache.flush_threshold() as usize;
         let mut small = StoreBatch::default();
-        small.coin_puts.push((make_outpoint(0xE4, 0), make_coin(1_000, 1)));
-        small.tx_loc_puts.push((bitcoin::Txid::from_byte_array([0xE4; 32]), 1));
+        small
+            .coin_puts
+            .push((make_outpoint(0xE4, 0), make_coin(1_000, 1)));
+        small
+            .tx_loc_puts
+            .push((bitcoin::Txid::from_byte_array([0xE4; 32]), 1));
         cache.write_batch(small).unwrap();
         assert!(!cache.needs_flush(), "two rows are under the threshold");
 
         let mut rows = StoreBatch::default();
-        rows.coin_puts.push((make_outpoint(0xE5, 0), make_coin(1_000, 1)));
+        rows.coin_puts
+            .push((make_outpoint(0xE5, 0), make_coin(1_000, 1)));
         rows.tx_loc_puts = (0..threshold as u64)
             .map(|i| {
                 let mut txid = [0u8; 32];
@@ -5233,16 +5333,28 @@ mod tests {
 
         let y = make_outpoint(0xE3, 0);
         for batch in [
-            StoreBatch { coin_puts: vec![(y, make_coin(2_000, 2))], ..Default::default() },
-            StoreBatch { coin_removes: vec![(y, 2_000, 2)], ..Default::default() },
-            StoreBatch { coin_puts: vec![(y, make_coin(2_000, 2))], ..Default::default() },
+            StoreBatch {
+                coin_puts: vec![(y, make_coin(2_000, 2))],
+                ..Default::default()
+            },
+            StoreBatch {
+                coin_removes: vec![(y, 2_000, 2)],
+                ..Default::default()
+            },
+            StoreBatch {
+                coin_puts: vec![(y, make_coin(2_000, 2))],
+                ..Default::default()
+            },
         ] {
             cache.write_batch(batch).unwrap();
         }
         assert_eq!(cache.dirty_count(), 2);
         assert_eq!(cache.dirty.read().len(), 2);
         cache.flush().unwrap();
-        assert!(cache.inner.get_coin(&y).is_some(), "the re-created coin is written");
+        assert!(
+            cache.inner.get_coin(&y).is_some(),
+            "the re-created coin is written"
+        );
         assert!(cache.inner.get_coin(&stored).is_some());
     }
 
@@ -5269,7 +5381,11 @@ mod tests {
         spend.coin_removes.push((y, 7_000, 2));
         cache.write_batch(spend).unwrap();
         let gauge_before = cache.dirty_count();
-        cache.restore_after_failed_flush(drained, &std::collections::HashSet::new(), cache.pending_batch.lock());
+        cache.restore_after_failed_flush(
+            drained,
+            &std::collections::HashSet::new(),
+            cache.pending_batch.lock(),
+        );
 
         assert!(
             cache.get_coin(&y).is_none(),
@@ -5310,7 +5426,9 @@ mod tests {
         // and a new tip. The coin makes the batch buffer (coin-free batches
         // pass through and would not model the pending-batch collision).
         let mut newer = StoreBatch::default();
-        newer.coin_puts.push((make_outpoint(0xF4, 0), make_coin(1_000, 2)));
+        newer
+            .coin_puts
+            .push((make_outpoint(0xF4, 0), make_coin(1_000, 2)));
         newer.height_hash_puts.push((2, hash_b));
         newer.height_hash_puts.push((3, hash_c));
         newer.tip = Some(tip_new);
@@ -5322,7 +5440,11 @@ mod tests {
         older.height_hash_puts.push((2, hash_a));
         older.height_hash_removes.push(3);
         older.tip = Some(tip_old);
-        cache.restore_after_failed_flush(older, &std::collections::HashSet::new(), cache.pending_batch.lock());
+        cache.restore_after_failed_flush(
+            older,
+            &std::collections::HashSet::new(),
+            cache.pending_batch.lock(),
+        );
 
         // Newer values win immediately...
         assert_eq!(cache.get_block_hash_by_height(2), Some(hash_b));
@@ -5374,8 +5496,14 @@ mod tests {
         delta.tip = Some(make_block_hash(0x02));
         cache.write_batch(delta).unwrap();
         assert!(cache.dirty_count() > 0, "delta is dirty before discard");
-        assert!(cache.get_coin(&y).is_some(), "fresh coin visible pre-discard");
-        assert!(cache.get_coin(&x).is_none(), "X spent in the delta pre-discard");
+        assert!(
+            cache.get_coin(&y).is_some(),
+            "fresh coin visible pre-discard"
+        );
+        assert!(
+            cache.get_coin(&x).is_none(),
+            "X spent in the delta pre-discard"
+        );
         assert_eq!(cache.get_tip(), Some(make_block_hash(0x02)));
 
         // Discard the delta: cache returns to exactly the flushed state.
@@ -5392,8 +5520,16 @@ mod tests {
             cache.get_coin(&x).is_some(),
             "committed coin X must be restored (the spend was discarded)"
         );
-        assert_eq!(cache.get_tip(), Some(make_block_hash(0x01)), "tip back to flushed");
-        assert_eq!(cache.coin_count(), base_count, "coin_count back to baseline");
+        assert_eq!(
+            cache.get_tip(),
+            Some(make_block_hash(0x01)),
+            "tip back to flushed"
+        );
+        assert_eq!(
+            cache.coin_count(),
+            base_count,
+            "coin_count back to baseline"
+        );
 
         // A subsequent flush must NOT elide or drop the restored coin —
         // the exact failure the fix prevents.
@@ -5402,7 +5538,10 @@ mod tests {
             cache.get_coin(&x).is_some(),
             "committed coin survives the post-discard flush"
         );
-        assert!(cache.get_coin(&y).is_none(), "discarded coin stays gone after flush");
+        assert!(
+            cache.get_coin(&y).is_none(),
+            "discarded coin stays gone after flush"
+        );
         assert_eq!(cache.coin_count(), base_count);
     }
 
@@ -5485,7 +5624,8 @@ mod tests {
         let excl = cache.lock_flush_exclusion();
         for i in 0..4u8 {
             let mut b = StoreBatch::default();
-            b.coin_puts.push((make_outpoint(0xD4, i as u32), make_coin(100, 1)));
+            b.coin_puts
+                .push((make_outpoint(0xD4, i as u32), make_coin(100, 1)));
             cache.write_batch(b).unwrap();
         }
         assert_eq!(cache.discard_uncommitted(&excl), Ok(()));
@@ -5541,7 +5681,9 @@ mod tests {
         std::thread::scope(|s| {
             s.spawn(|| {
                 let b = StoreBatch {
-                    tip: Some(bitcoin::constants::genesis_block(bitcoin::Network::Regtest).block_hash()),
+                    tip: Some(
+                        bitcoin::constants::genesis_block(bitcoin::Network::Regtest).block_hash(),
+                    ),
                     ..Default::default()
                 };
                 cache.write_batch(b).unwrap();
@@ -5606,7 +5748,8 @@ mod tests {
         std::thread::scope(|s| {
             s.spawn(|| {
                 let mut b = StoreBatch::default();
-                b.coin_puts.push((make_outpoint(0xD5, 0), make_coin(100, 1)));
+                b.coin_puts
+                    .push((make_outpoint(0xD5, 0), make_coin(100, 1)));
                 cache.write_batch(b).unwrap();
             });
         });
@@ -5617,7 +5760,8 @@ mod tests {
             std::thread::scope(|s| {
                 s.spawn(|| {
                     let mut b = StoreBatch::default();
-                    b.coin_puts.push((make_outpoint(0xD5, 1), make_coin(100, 1)));
+                    b.coin_puts
+                        .push((make_outpoint(0xD5, 1), make_coin(100, 1)));
                     cache.write_batch(b).unwrap();
                 });
             });
@@ -5630,7 +5774,8 @@ mod tests {
         // A second reorg with a clean window discards normally.
         let excl = cache.lock_flush_exclusion();
         let mut b = StoreBatch::default();
-        b.coin_puts.push((make_outpoint(0xD5, 2), make_coin(100, 1)));
+        b.coin_puts
+            .push((make_outpoint(0xD5, 2), make_coin(100, 1)));
         cache.write_batch(b).unwrap();
         assert_eq!(cache.discard_uncommitted(&excl), Ok(()));
     }
@@ -5733,7 +5878,10 @@ mod tests {
         );
         // The transition drained the cache's dirty map too (flush_durable
         // flushes the cache before the inner store), so the write survived.
-        assert_eq!(cache.get_coin(&make_outpoint(0xEE, 0)).unwrap().amount, 9_999);
+        assert_eq!(
+            cache.get_coin(&make_outpoint(0xEE, 0)).unwrap().amount,
+            9_999
+        );
 
         // Normal -> Normal and Normal -> BulkLoad are not transitions out
         // of BulkLoad and must not flush.
@@ -5899,7 +6047,10 @@ mod tests {
         fn opreturn_strip_meta(&self) -> Result<Option<Vec<u8>>, StoreError> {
             self.inner.opreturn_strip_meta()
         }
-        fn for_each_opreturn_strip(&self, f: &mut dyn FnMut(&BlockHash, &[u8])) -> Result<(), StoreError> {
+        fn for_each_opreturn_strip(
+            &self,
+            f: &mut dyn FnMut(&BlockHash, &[u8]),
+        ) -> Result<(), StoreError> {
             self.inner.for_each_opreturn_strip(f)
         }
         fn drop_opreturn_strip_cf(&self) -> Result<(), StoreError> {
@@ -6030,7 +6181,9 @@ mod tests {
         store_row.block_index_puts.push((hash, stored));
         cache.write_batch(store_row).unwrap();
         let mut connect = StoreBatch::default();
-        connect.coin_puts.push((make_outpoint(0xD5, 0), make_coin(1_000, 9)));
+        connect
+            .coin_puts
+            .push((make_outpoint(0xD5, 0), make_coin(1_000, 9)));
         connect.block_index_puts.push((hash, valid));
         cache.write_batch(connect).unwrap();
 
@@ -6044,13 +6197,18 @@ mod tests {
             // The flush is parked inside its write. The LRU has lost the row.
             cache.block_index_cache.lock().clear();
             let cache = cache.clone();
-            *reader.lock().unwrap() =
-                Some(std::thread::spawn(move || cache.get_block_index(&hash).map(|e| e.status)));
+            *reader.lock().unwrap() = Some(std::thread::spawn(move || {
+                cache.get_block_index(&hash).map(|e| e.status)
+            }));
             std::thread::sleep(std::time::Duration::from_millis(200));
         });
         flusher.join().unwrap();
         let read = reader.lock().unwrap().take().unwrap().join().unwrap();
-        assert_eq!(read, Some(BlockStatus::Valid), "the in-flight row was read as its pre-flush status");
+        assert_eq!(
+            read,
+            Some(BlockStatus::Valid),
+            "the in-flight row was read as its pre-flush status"
+        );
     }
 
     #[test]

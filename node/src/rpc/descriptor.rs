@@ -140,8 +140,19 @@ const RPC_INVALID_PARAMETER: i32 = -8;
 /// unsupported-but-real descriptor say so, and keeps a typo (`addrr(...)`)
 /// reading as a malformed descriptor rather than an unimplemented feature.
 const KNOWN_FUNCS: &[&str] = &[
-    "combo", "pk", "pkh", "wpkh", "sh", "wsh", "tr", "rawtr", "multi", "sortedmulti", "multi_a",
-    "sortedmulti_a", "musig",
+    "combo",
+    "pk",
+    "pkh",
+    "wpkh",
+    "sh",
+    "wsh",
+    "tr",
+    "rawtr",
+    "multi",
+    "sortedmulti",
+    "multi_a",
+    "sortedmulti_a",
+    "musig",
 ];
 
 /// Core's `ParseRange` + `ParseDescriptorRange`.
@@ -353,12 +364,15 @@ pub struct ParsedDescriptorSet {
 
 /// Parse a child-number step like `0`, `1h`, `2'`, `44h`.
 fn parse_child_num(s: &str) -> Result<ChildNumber, String> {
-    let (num_str, hardened) = if let Some(n) = s.strip_suffix('h').or_else(|| s.strip_suffix('\'')) {
+    let (num_str, hardened) = if let Some(n) = s.strip_suffix('h').or_else(|| s.strip_suffix('\''))
+    {
         (n, true)
     } else {
         (s, false)
     };
-    let num: u32 = num_str.parse().map_err(|_| format!("'{s}' is not a valid key path step"))?;
+    let num: u32 = num_str
+        .parse()
+        .map_err(|_| format!("'{s}' is not a valid key path step"))?;
     if hardened {
         ChildNumber::from_hardened_idx(num)
             .map_err(|_| format!("Key path value {num} is out of range"))
@@ -437,18 +451,14 @@ fn parse_path_elem(s: &str) -> Result<DescPathElem, String> {
 ///
 /// `ctx` is the descriptor function name for error messages, e.g.
 /// `"pk()"` or `"Multi:"`.
-fn parse_key_expr(
-    expr: &str,
-    ctx: &str,
-    permit_uncompressed: bool,
-) -> Result<DescKeyExpr, String> {
+fn parse_key_expr(expr: &str, ctx: &str, permit_uncompressed: bool) -> Result<DescKeyExpr, String> {
     // Check for whitespace.
-    if expr.starts_with(' ') || expr.starts_with('\t')
-        || expr.ends_with(' ') || expr.ends_with('\t')
+    if expr.starts_with(' ')
+        || expr.starts_with('\t')
+        || expr.ends_with(' ')
+        || expr.ends_with('\t')
     {
-        return Err(format!(
-            "{ctx} Key '{expr}' is invalid due to whitespace"
-        ));
+        return Err(format!("{ctx} Key '{expr}' is invalid due to whitespace"));
     }
 
     let (origin, rest) = parse_origin(expr)?;
@@ -523,7 +533,9 @@ fn parse_key_expr(
         .count()
         > 1
     {
-        return Err(format!("{ctx} Multiple multipath key path specifiers found"));
+        return Err(format!(
+            "{ctx} Multiple multipath key path specifiers found"
+        ));
     }
 
     // An uncompressed key cannot go under a witness program: the script would
@@ -717,7 +729,9 @@ fn parse_multi(inner: &str, sorted: bool, ctx: ParseCtx) -> Result<FullDescripto
     // `multi()` produces a bare script, so it cannot sit under a wpkh() or at
     // any depth Core does not reach.
     if !matches!(ctx, ParseCtx::Top | ParseCtx::P2sh | ParseCtx::P2wsh) {
-        return Err("Can only have multi/sortedmulti at top level, in sh(), or in wsh()".to_string());
+        return Err(
+            "Can only have multi/sortedmulti at top level, in sh(), or in wsh()".to_string(),
+        );
     }
 
     let parts = split_top_level_commas(inner);
@@ -885,9 +899,7 @@ fn descriptor_multipath_count(desc: &FullDescriptor) -> Result<usize, String> {
         FullDescriptor::Sh(inner) | FullDescriptor::Wsh(inner) => {
             return descriptor_multipath_count(inner);
         }
-        FullDescriptor::Multi { keys, .. } => {
-            keys.iter().map(key_multipath_count).collect()
-        }
+        FullDescriptor::Multi { keys, .. } => keys.iter().map(key_multipath_count).collect(),
         FullDescriptor::Addr(_) | FullDescriptor::Raw(_) => return Ok(0),
     };
 
@@ -999,10 +1011,7 @@ fn key_is_ranged(key: &DescKeyExpr) -> bool {
 /// Derive the concrete public key from a key expression at the given
 /// position (for ranged descriptors). Returns the public key and whether
 /// it is compressed.
-fn derive_pubkey(
-    key: &DescKeyExpr,
-    pos: u32,
-) -> Result<bitcoin::PublicKey, String> {
+fn derive_pubkey(key: &DescKeyExpr, pos: u32) -> Result<bitcoin::PublicKey, String> {
     let secp = bitcoin::secp256k1::Secp256k1::new();
 
     match &key.key {
@@ -1016,9 +1025,7 @@ fn derive_pubkey(
             // All path steps must be non-hardened for xpub derivation.
             for cn in &child_path {
                 if let ChildNumber::Hardened { .. } = cn {
-                    return Err(
-                        "Cannot derive script without private keys".to_string()
-                    );
+                    return Err("Cannot derive script without private keys".to_string());
                 }
             }
             let derived = xpub
@@ -1051,15 +1058,12 @@ fn resolve_path(path: &[DescPathElem], pos: u32) -> Result<Vec<ChildNumber>, Str
                     );
                 } else {
                     result.push(
-                        ChildNumber::from_normal_idx(pos)
-                            .map_err(|_| "Position out of range")?,
+                        ChildNumber::from_normal_idx(pos).map_err(|_| "Position out of range")?,
                     );
                 }
             }
             DescPathElem::Multipath(_) => {
-                return Err(
-                    "Multipath elements should be expanded before derivation".to_string()
-                );
+                return Err("Multipath elements should be expanded before derivation".to_string());
             }
         }
     }
@@ -1075,11 +1079,7 @@ impl FullDescriptor {
     /// returns 2 (uncompressed) or 4 (compressed) scripts in Core's
     /// order: P2PK, P2PKH, [P2WPKH, P2SH-P2WPKH].
     #[allow(clippy::only_used_in_recursion)]
-    pub fn expand(
-        &self,
-        pos: u32,
-        network: Network,
-    ) -> Result<Vec<ScriptBuf>, String> {
+    pub fn expand(&self, pos: u32, network: Network) -> Result<Vec<ScriptBuf>, String> {
         match self {
             FullDescriptor::Pk(key) => {
                 let pk = derive_pubkey(key, pos)?;
@@ -1169,8 +1169,7 @@ fn make_p2pk_script(pubkey: &bitcoin::PublicKey) -> ScriptBuf {
 
 /// Build a bare multisig script: `OP_m <key1>...<keyn> OP_n OP_CHECKMULTISIG`.
 fn make_multisig_script(threshold: u32, keys: &[bitcoin::PublicKey]) -> ScriptBuf {
-    let mut builder = bitcoin::blockdata::script::Builder::new()
-        .push_int(threshold as i64);
+    let mut builder = bitcoin::blockdata::script::Builder::new().push_int(threshold as i64);
     for key in keys {
         builder = builder.push_key(key);
     }
@@ -1265,8 +1264,7 @@ impl FullDescriptor {
                 sorted,
             } => {
                 let name = if *sorted { "sortedmulti" } else { "multi" };
-                let key_strs: Vec<String> =
-                    keys.iter().map(|k| k.to_public_string()).collect();
+                let key_strs: Vec<String> = keys.iter().map(|k| k.to_public_string()).collect();
                 format!("{name}({threshold},{})", key_strs.join(","))
             }
             // Re-rendering the descriptor is not the place to enforce the
@@ -1292,8 +1290,7 @@ pub fn descriptor_to_coinbase_script(
     desc: &str,
     network: Network,
 ) -> Result<ScriptBuf, (i32, String)> {
-    let parsed = parse_full_descriptor(desc, false)
-        .map_err(|e| (RPC_INVALID_ADDRESS_OR_KEY, e))?;
+    let parsed = parse_full_descriptor(desc, false).map_err(|e| (RPC_INVALID_ADDRESS_OR_KEY, e))?;
 
     if parsed.descriptors.len() > 1 {
         return Err((
@@ -1307,8 +1304,7 @@ pub fn descriptor_to_coinbase_script(
     if descriptor.is_range() {
         return Err((
             RPC_INVALID_PARAMETER,
-            "Ranged descriptor not accepted. Maybe pass through deriveaddresses first?"
-                .to_string(),
+            "Ranged descriptor not accepted. Maybe pass through deriveaddresses first?".to_string(),
         ));
     }
 
@@ -1344,8 +1340,8 @@ pub fn descriptor_to_coinbase_script(
 
 /// Implements `getdescriptorinfo`.
 pub fn get_descriptor_info(descriptor: &str) -> Result<serde_json::Value, (i32, String)> {
-    let parsed = parse_full_descriptor(descriptor, false)
-        .map_err(|e| (RPC_INVALID_ADDRESS_OR_KEY, e))?;
+    let parsed =
+        parse_full_descriptor(descriptor, false).map_err(|e| (RPC_INVALID_ADDRESS_OR_KEY, e))?;
 
     let primary = &parsed.descriptors[0];
 
@@ -1371,12 +1367,13 @@ pub fn get_descriptor_info(descriptor: &str) -> Result<serde_json::Value, (i32, 
     }
 
     // Checksum of the input payload.
-    let cksum = checksum(&parsed.input_payload)
-        .ok_or_else(|| (RPC_INVALID_ADDRESS_OR_KEY, "Invalid characters in payload".to_string()))?;
-    result.insert(
-        "checksum".to_string(),
-        serde_json::Value::String(cksum),
-    );
+    let cksum = checksum(&parsed.input_payload).ok_or_else(|| {
+        (
+            RPC_INVALID_ADDRESS_OR_KEY,
+            "Invalid characters in payload".to_string(),
+        )
+    })?;
+    result.insert("checksum".to_string(), serde_json::Value::String(cksum));
 
     result.insert(
         "isrange".to_string(),
@@ -1400,8 +1397,8 @@ pub fn derive_addresses(
     range: Option<&serde_json::Value>,
     network: Network,
 ) -> Result<serde_json::Value, (i32, String)> {
-    let parsed = parse_full_descriptor(descriptor, true)
-        .map_err(|e| (RPC_INVALID_ADDRESS_OR_KEY, e))?;
+    let parsed =
+        parse_full_descriptor(descriptor, true).map_err(|e| (RPC_INVALID_ADDRESS_OR_KEY, e))?;
 
     let primary = &parsed.descriptors[0];
 
@@ -1529,9 +1526,7 @@ pub fn infer_descriptor(script: &bitcoin::Script, network: Network) -> String {
 
     // P2TR is checked ahead of the address fallback so an on-curve output
     // key is named rather than re-encoded as an address.
-    if script.is_p2tr()
-        && bitcoin::secp256k1::XOnlyPublicKey::from_slice(&bytes[2..34]).is_ok()
-    {
+    if script.is_p2tr() && bitcoin::secp256k1::XOnlyPublicKey::from_slice(&bytes[2..34]).is_ok() {
         return add_checksum(&format!("rawtr({})", hex::encode(&bytes[2..34])));
     }
 
@@ -1584,7 +1579,9 @@ pub fn infer_p2wsh_descriptor(witness_script: &bitcoin::Script, network: Network
         let joined: Vec<String> = keys.iter().map(hex::encode).collect();
         return add_checksum(&format!("wsh(multi({threshold},{}))", joined.join(",")));
     }
-    if let Ok(ms) = miniscript::Miniscript::<bitcoin::PublicKey, miniscript::Segwitv0>::parse(witness_script) {
+    if let Ok(ms) =
+        miniscript::Miniscript::<bitcoin::PublicKey, miniscript::Segwitv0>::parse(witness_script)
+    {
         return add_checksum(&format!("wsh({ms})"));
     }
     let address = Address::p2wsh(witness_script, network);
@@ -1682,10 +1679,16 @@ mod tests {
     #[test]
     fn checksums_match_cores_reference_implementation() {
         let cases = [
-            ("raw(76a91411b366edfc0a8b66feebae5c2e25a7b6a5d1cf3188ac)", "fm24fxxy"),
+            (
+                "raw(76a91411b366edfc0a8b66feebae5c2e25a7b6a5d1cf3188ac)",
+                "fm24fxxy",
+            ),
             ("raw(51)", "8lvh9jxk"),
             ("raw()", "58lrscpx"),
-            ("addr(bcrt1qxwj8ny5j8dz4rx0vqhcmzqsmv8h3zsjq5eqvrn)", "u9yvmetn"),
+            (
+                "addr(bcrt1qxwj8ny5j8dz4rx0vqhcmzqsmv8h3zsjq5eqvrn)",
+                "u9yvmetn",
+            ),
             ("addr(1BgGZ9tcN4rm9KBzDn7KprQz87SZ26SAMH)", "45hf9yxk"),
             (
                 "pk(0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798)",
@@ -1783,52 +1786,81 @@ mod tests {
     fn inference_matches_bitcoin_core() {
         let cases: &[(&str, &str)] = &[
             // Key-carrying scripts are named by key.
-            ("210279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798ac",
-             "pk(0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798)#gn28ywm7"),
-            ("410479be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798483ada7726a3c4655da4fbfc0e1108a8fd17b448a68554199c47d08ffb10d4b8ac",
-             "pk(0479be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798483ada7726a3c4655da4fbfc0e1108a8fd17b448a68554199c47d08ffb10d4b8)#fsjyjr2x"),
-            ("512079be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
-             "rawtr(79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798)#xsjqcczm"),
-            ("51210279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f817982102c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee552ae",
-             "multi(1,0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798,02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5)#l5sy3u48"),
-            ("52210279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f817982102c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee552ae",
-             "multi(2,0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798,02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5)#52kq63aa"),
-
+            (
+                "210279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798ac",
+                "pk(0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798)#gn28ywm7",
+            ),
+            (
+                "410479be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798483ada7726a3c4655da4fbfc0e1108a8fd17b448a68554199c47d08ffb10d4b8ac",
+                "pk(0479be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798483ada7726a3c4655da4fbfc0e1108a8fd17b448a68554199c47d08ffb10d4b8)#fsjyjr2x",
+            ),
+            (
+                "512079be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+                "rawtr(79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798)#xsjqcczm",
+            ),
+            (
+                "51210279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f817982102c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee552ae",
+                "multi(1,0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798,02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5)#l5sy3u48",
+            ),
+            (
+                "52210279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f817982102c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee552ae",
+                "multi(2,0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798,02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5)#52kq63aa",
+            ),
             // Hash-committed scripts fall through to the address form.
-            ("76a91411b366edfc0a8b66feebae5c2e25a7b6a5d1cf3188ac",
-             "addr(mh8YhPYEAYs3E7EVyKtB5xrcfMExkkdEMF)#csqdsq99"),
-            ("a91411b366edfc0a8b66feebae5c2e25a7b6a5d1cf3187",
-             "addr(2MtrpPcsiWtFWjx5s3zCGJczVAE99BWkZwJ)#sx9nz3sr"),
-            ("001411b366edfc0a8b66feebae5c2e25a7b6a5d1cf31",
-             "addr(bcrt1qzxekdm0up29kdlht4ewzufd8k6jarne3636jrk)#s0c4m6g7"),
-            ("0020a60869f0dbcf1dc659c9cecbaf8050135ea9e8cdc487053f1dc6880949dc684c",
-             "addr(bcrt1q5cyxnuxmeuwuvkwfem96lqzszd02n6xdcjrs20cac6yqjjwudpxqxl3r02)#swac23xe"),
+            (
+                "76a91411b366edfc0a8b66feebae5c2e25a7b6a5d1cf3188ac",
+                "addr(mh8YhPYEAYs3E7EVyKtB5xrcfMExkkdEMF)#csqdsq99",
+            ),
+            (
+                "a91411b366edfc0a8b66feebae5c2e25a7b6a5d1cf3187",
+                "addr(2MtrpPcsiWtFWjx5s3zCGJczVAE99BWkZwJ)#sx9nz3sr",
+            ),
+            (
+                "001411b366edfc0a8b66feebae5c2e25a7b6a5d1cf31",
+                "addr(bcrt1qzxekdm0up29kdlht4ewzufd8k6jarne3636jrk)#s0c4m6g7",
+            ),
+            (
+                "0020a60869f0dbcf1dc659c9cecbaf8050135ea9e8cdc487053f1dc6880949dc684c",
+                "addr(bcrt1q5cyxnuxmeuwuvkwfem96lqzszd02n6xdcjrs20cac6yqjjwudpxqxl3r02)#swac23xe",
+            ),
             // Pay-to-anchor and an unknown witness version are still
             // addressable, so they are named that way rather than as raw.
             ("51024e73", "addr(bcrt1pfeesnyr2tx)#swxgse0y"),
-            ("521411b366edfc0a8b66feebae5c2e25a7b6a5d1cf31",
-             "addr(bcrt1zzxekdm0up29kdlht4ewzufd8k6jarne3ecdguz)#tu76kusy"),
-
+            (
+                "521411b366edfc0a8b66feebae5c2e25a7b6a5d1cf31",
+                "addr(bcrt1zzxekdm0up29kdlht4ewzufd8k6jarne3ecdguz)#tu76kusy",
+            ),
             // A taproot output key that is not on the curve cannot be a
             // rawtr() key, but the output is still addressable.
-            ("51200000000000000000000000000000000000000000000000000000000000000005",
-             "addr(bcrt1pqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqzssr24l3)#2a5jhpn9"),
+            (
+                "51200000000000000000000000000000000000000000000000000000000000000005",
+                "addr(bcrt1pqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqzssr24l3)#2a5jhpn9",
+            ),
             // A P2PK key that is well-formed but off the curve is still
             // named by key: Core checks the prefix and length, not the curve.
-            ("21020000000000000000000000000000000000000000000000000000000000000005ac",
-             "pk(020000000000000000000000000000000000000000000000000000000000000005)#2rnwvw4c"),
+            (
+                "21020000000000000000000000000000000000000000000000000000000000000005ac",
+                "pk(020000000000000000000000000000000000000000000000000000000000000005)#2rnwvw4c",
+            ),
             // ... but a bad prefix, or a hybrid key, is not a key at all.
-            ("21050000000000000000000000000000000000000000000000000000000000000005ac",
-             "raw(21050000000000000000000000000000000000000000000000000000000000000005ac)#p0735ysy"),
-            ("410679be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798483ada7726a3c4655da4fbfc0e1108a8fd17b448a68554199c47d08ffb10d4b8ac",
-             "raw(410679be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798483ada7726a3c4655da4fbfc0e1108a8fd17b448a68554199c47d08ffb10d4b8ac)#qhj9gd8d"),
+            (
+                "21050000000000000000000000000000000000000000000000000000000000000005ac",
+                "raw(21050000000000000000000000000000000000000000000000000000000000000005ac)#p0735ysy",
+            ),
+            (
+                "410679be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798483ada7726a3c4655da4fbfc0e1108a8fd17b448a68554199c47d08ffb10d4b8ac",
+                "raw(410679be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798483ada7726a3c4655da4fbfc0e1108a8fd17b448a68554199c47d08ffb10d4b8ac)#qhj9gd8d",
+            ),
             // One unusable key poisons the whole multisig inference.
-            ("51210500000000000000000000000000000000000000000000000000000000000000052102c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee552ae",
-             "raw(51210500000000000000000000000000000000000000000000000000000000000000052102c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee552ae)#d4v8smd4"),
+            (
+                "51210500000000000000000000000000000000000000000000000000000000000000052102c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee552ae",
+                "raw(51210500000000000000000000000000000000000000000000000000000000000000052102c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee552ae)#d4v8smd4",
+            ),
             // An off-curve key does not, for the same reason as pk() above.
-            ("51210200000000000000000000000000000000000000000000000000000000000000052102c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee552ae",
-             "multi(1,020000000000000000000000000000000000000000000000000000000000000005,02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5)#0wwgafnz"),
-
+            (
+                "51210200000000000000000000000000000000000000000000000000000000000000052102c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee552ae",
+                "multi(1,020000000000000000000000000000000000000000000000000000000000000005,02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5)#0wwgafnz",
+            ),
             // Neither a key nor an address.
             ("5151", "raw(5151)#xf09ykut"),
         ];
@@ -1865,14 +1897,10 @@ mod tests {
 
         // Threshold above the key count is not a multisig.
         let bad = format!("5321{A}21{B}52ae");
-        assert!(
-            infer_descriptor(script(&bad).as_script(), Network::Regtest).starts_with("raw("),
-        );
+        assert!(infer_descriptor(script(&bad).as_script(), Network::Regtest).starts_with("raw("),);
         // Nor is a key count that disagrees with the keys present.
         let bad2 = format!("5121{A}21{B}53ae");
-        assert!(
-            infer_descriptor(script(&bad2).as_script(), Network::Regtest).starts_with("raw("),
-        );
+        assert!(infer_descriptor(script(&bad2).as_script(), Network::Regtest).starts_with("raw("),);
     }
 
     /// The parser must refuse nesting Core refuses, which is what bounds its
@@ -1923,7 +1951,10 @@ mod tests {
             format!("wsh(pkh({K}))"),
             format!("sh(wpkh({K}))"),
         ] {
-            assert!(parse_full_descriptor(&ok, false).is_ok(), "{ok} should parse");
+            assert!(
+                parse_full_descriptor(&ok, false).is_ok(),
+                "{ok} should parse"
+            );
         }
 
         // wsh(wpkh(k)) builds a P2WSH whose witnessScript is itself a witness
@@ -1935,13 +1966,28 @@ mod tests {
             "Can only have wpkh() at top level or inside sh()"
         );
         for (desc, want) in [
-            (format!("wsh(sh(pkh({K})))"), "Can only have sh() at top level"),
-            ("sh(addr(bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080))".to_string(),
-             "Can only have addr() at top level"),
-            ("wsh(raw(51))".to_string(), "Can only have raw() at top level"),
-            (format!("sh(combo({K}))"), "Can only have combo() at top level"),
+            (
+                format!("wsh(sh(pkh({K})))"),
+                "Can only have sh() at top level",
+            ),
+            (
+                "sh(addr(bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080))".to_string(),
+                "Can only have addr() at top level",
+            ),
+            (
+                "wsh(raw(51))".to_string(),
+                "Can only have raw() at top level",
+            ),
+            (
+                format!("sh(combo({K}))"),
+                "Can only have combo() at top level",
+            ),
         ] {
-            assert_eq!(parse_full_descriptor(&desc, false).unwrap_err(), want, "{desc}");
+            assert_eq!(
+                parse_full_descriptor(&desc, false).unwrap_err(),
+                want,
+                "{desc}"
+            );
         }
     }
 
@@ -2030,7 +2076,11 @@ mod tests {
 
         assert!(parse_full_descriptor(&format!("pkh({U})"), false).is_ok());
         assert!(parse_full_descriptor(&format!("sh(pkh({U}))"), false).is_ok());
-        for desc in [format!("wsh(pkh({U}))"), format!("wpkh({U})"), format!("sh(wpkh({U}))")] {
+        for desc in [
+            format!("wsh(pkh({U}))"),
+            format!("wpkh({U})"),
+            format!("sh(wpkh({U}))"),
+        ] {
             assert!(
                 parse_full_descriptor(&desc, false)
                     .unwrap_err()
@@ -2044,11 +2094,11 @@ mod tests {
     fn parses_raw_and_addr_descriptors() {
         let spk = "76a91411b366edfc0a8b66feebae5c2e25a7b6a5d1cf3188ac";
         // With and without a checksum, and via the object form.
-        for desc in [
-            format!("raw({spk})"),
-            format!("raw({spk})#fm24fxxy"),
-        ] {
-            assert_eq!(parse_descriptor(&desc, Network::Regtest).unwrap(), script(spk));
+        for desc in [format!("raw({spk})"), format!("raw({spk})#fm24fxxy")] {
+            assert_eq!(
+                parse_descriptor(&desc, Network::Regtest).unwrap(),
+                script(spk)
+            );
         }
         assert_eq!(
             parse_descriptor("addr(mh8YhPYEAYs3E7EVyKtB5xrcfMExkkdEMF)", Network::Regtest).unwrap(),
@@ -2138,13 +2188,19 @@ mod tests {
         // 20 is the ceiling; 21 is not a multisig.
         let keys20 = format!("21{A}").repeat(20);
         assert!(
-            infer_descriptor(script(&format!("0114{keys20}0114ae")).as_script(), Network::Regtest)
-                .starts_with("multi(20,")
+            infer_descriptor(
+                script(&format!("0114{keys20}0114ae")).as_script(),
+                Network::Regtest
+            )
+            .starts_with("multi(20,")
         );
         let keys21 = format!("21{A}").repeat(21);
         assert!(
-            infer_descriptor(script(&format!("0115{keys21}0115ae")).as_script(), Network::Regtest)
-                .starts_with("raw(")
+            infer_descriptor(
+                script(&format!("0115{keys21}0115ae")).as_script(),
+                Network::Regtest
+            )
+            .starts_with("raw(")
         );
     }
 
@@ -2161,7 +2217,10 @@ mod tests {
         // The five rows `rpc_scantxoutset.py` asserts, verbatim. Note a bare
         // `-1` becomes the range {0, -1}, so it is the *end* that is rejected.
         bad(serde_json::json!(-1), "End of range is too high");
-        bad(serde_json::json!([-1, 10]), "Range should be greater or equal than 0");
+        bad(
+            serde_json::json!([-1, 10]),
+            "Range should be greater or equal than 0",
+        );
         bad(
             serde_json::json!([(2i64 << 32) - 1_000_000, 2i64 << 32]),
             "End of range is too high",
@@ -2210,11 +2269,17 @@ mod tests {
         );
         assert_eq!(
             scan_object_to_scripts(&serde_json::json!({"nope": 1}), Network::Regtest).unwrap_err(),
-            (-8, "Descriptor needs to be provided in scan object".to_string())
+            (
+                -8,
+                "Descriptor needs to be provided in scan object".to_string()
+            )
         );
         assert_eq!(
             scan_object_to_scripts(&serde_json::json!(42), Network::Regtest).unwrap_err(),
-            (-8, "Scan object needs to be either a string or an object".to_string())
+            (
+                -8,
+                "Scan object needs to be either a string or an object".to_string()
+            )
         );
     }
 }

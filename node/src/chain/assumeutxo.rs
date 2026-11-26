@@ -200,8 +200,7 @@ mod tests {
     #[test]
     fn heights_are_unique() {
         let anchors = assumeutxo_for_network(Network::Bitcoin);
-        let heights: std::collections::HashSet<u32> =
-            anchors.iter().map(|a| a.height).collect();
+        let heights: std::collections::HashSet<u32> = anchors.iter().map(|a| a.height).collect();
         assert_eq!(heights.len(), anchors.len());
     }
 
@@ -275,10 +274,9 @@ mod tests {
 
     #[test]
     fn lookup_by_blockhash_finds_known_anchor() {
-        let hash: BlockHash =
-            "0000000000000000000320283a032748cef8227873ff4872689bf23f1cda83a5"
-                .parse()
-                .unwrap();
+        let hash: BlockHash = "0000000000000000000320283a032748cef8227873ff4872689bf23f1cda83a5"
+            .parse()
+            .unwrap();
         let a = lookup_by_blockhash(Network::Bitcoin, &hash).expect("found");
         assert_eq!(a.height, 840_000);
     }
@@ -301,10 +299,9 @@ mod tests {
     /// this block is the one `loadtxoutset` and `--fast-start` accept.
     #[test]
     fn mainnet_965000_anchor_is_core_v32_1() {
-        let hash: BlockHash =
-            "00000000000000000001595977e6000ce56129f5c9b4073e31ccc30b90b97da9"
-                .parse()
-                .unwrap();
+        let hash: BlockHash = "00000000000000000001595977e6000ce56129f5c9b4073e31ccc30b90b97da9"
+            .parse()
+            .unwrap();
         let a = lookup_by_blockhash(Network::Bitcoin, &hash).expect("965,000 anchor");
         assert_eq!(a.height, 965_000);
         assert_eq!(a.nchaintx, 1_429_611_231);
@@ -317,10 +314,9 @@ mod tests {
 
     #[test]
     fn lookup_by_blockhash_returns_none_for_unknown() {
-        let hash: BlockHash =
-            "0000000000000000000000000000000000000000000000000000000000000001"
-                .parse()
-                .unwrap();
+        let hash: BlockHash = "0000000000000000000000000000000000000000000000000000000000000001"
+            .parse()
+            .unwrap();
         assert!(lookup_by_blockhash(Network::Bitcoin, &hash).is_none());
     }
 

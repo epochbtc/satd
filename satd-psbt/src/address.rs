@@ -46,9 +46,7 @@ pub enum AddressError {
     #[error("silent payment address version {0} is not defined")]
     UnknownVersion(u8),
 
-    #[error(
-        "silent payment address version {version} carries {len} bytes, expected {expected}"
-    )]
+    #[error("silent payment address version {version} carries {len} bytes, expected {expected}")]
     BadPayloadLength {
         version: u8,
         len: usize,
@@ -172,8 +170,7 @@ impl SpAddress {
             _ => {}
         }
 
-        let scan_key =
-            PublicKey::from_slice(&payload[..33]).map_err(|_| AddressError::BadKeys)?;
+        let scan_key = PublicKey::from_slice(&payload[..33]).map_err(|_| AddressError::BadKeys)?;
         let spend_key =
             PublicKey::from_slice(&payload[33..66]).map_err(|_| AddressError::BadKeys)?;
         Ok((

@@ -126,10 +126,18 @@ impl MempoolEvent {
     /// [`MempoolEvent::Enter`]).
     pub fn mempool_sequence(&self) -> u64 {
         match self {
-            Self::Enter { mempool_sequence, .. }
-            | Self::LeaveConfirmed { mempool_sequence, .. }
-            | Self::LeaveEvicted { mempool_sequence, .. }
-            | Self::LeaveReplaced { mempool_sequence, .. } => *mempool_sequence,
+            Self::Enter {
+                mempool_sequence, ..
+            }
+            | Self::LeaveConfirmed {
+                mempool_sequence, ..
+            }
+            | Self::LeaveEvicted {
+                mempool_sequence, ..
+            }
+            | Self::LeaveReplaced {
+                mempool_sequence, ..
+            } => *mempool_sequence,
         }
     }
 
@@ -272,7 +280,14 @@ mod tests {
             },
         ];
         let expected_keys: [&[&str]; 4] = [
-            &["kind", "txid", "fee", "vsize", "fee_rate_sat_per_kvb", "time"],
+            &[
+                "kind",
+                "txid",
+                "fee",
+                "vsize",
+                "fee_rate_sat_per_kvb",
+                "time",
+            ],
             &["kind", "txid", "block_hash", "height"],
             &["kind", "txid", "reason"],
             &["kind", "txid", "replacing_txid"],
@@ -286,7 +301,10 @@ mod tests {
             assert_eq!(got, want, "{ev:?}");
         }
         assert_eq!(
-            events.iter().map(MempoolEvent::mempool_sequence).collect::<Vec<_>>(),
+            events
+                .iter()
+                .map(MempoolEvent::mempool_sequence)
+                .collect::<Vec<_>>(),
             [7, 8, 9, 10]
         );
         let MempoolEvent::Enter { raw_tx, .. } = events[0].without_raw_tx() else {
@@ -328,7 +346,11 @@ mod tests {
                 | EvictReason::Policy
                 | EvictReason::Reorg => {}
             }
-            let ev = MempoolEvent::LeaveEvicted { txid: tx(3), reason, mempool_sequence: 1 };
+            let ev = MempoolEvent::LeaveEvicted {
+                txid: tx(3),
+                reason,
+                mempool_sequence: 1,
+            };
             let j = serde_json::to_value(&ev).unwrap();
             assert_eq!(j["kind"], "leave_evicted");
             assert_eq!(j["reason"], expected);
@@ -377,7 +399,10 @@ mod tests {
         assert_eq!(j["rule"], "no-inscriptions");
         assert_eq!(j["relay"], true);
 
-        let p = QuarantineEvent::Promoted { txid: tx(8), time: 1_700_000_001 };
+        let p = QuarantineEvent::Promoted {
+            txid: tx(8),
+            time: 1_700_000_001,
+        };
         let j = serde_json::to_value(&p).unwrap();
         assert_eq!(j["kind"], "promoted");
         assert!(j["txid"].is_string());

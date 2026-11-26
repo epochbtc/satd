@@ -200,7 +200,11 @@ pub trait BlockView {
 
 /// The ancestor of `hash` at `height`, or `None` if that is below genesis or
 /// the chain of parents is broken.
-fn ancestor<V: BlockView>(view: &V, hash: &BlockHash, height: u32) -> Option<(BlockHash, HeaderInfo)> {
+fn ancestor<V: BlockView>(
+    view: &V,
+    hash: &BlockHash,
+    height: u32,
+) -> Option<(BlockHash, HeaderInfo)> {
     let mut cur_hash = *hash;
     let mut cur = view.header(&cur_hash)?;
     if height > cur.height {
@@ -545,7 +549,9 @@ pub const VERSIONBITS_NUM_BITS: u8 = 29;
 /// stays in a period.
 #[derive(Default)]
 pub struct UnknownBitsMonitor {
-    cache: std::sync::Mutex<std::collections::HashMap<BlockHash, [ThresholdState; VERSIONBITS_NUM_BITS as usize]>>,
+    cache: std::sync::Mutex<
+        std::collections::HashMap<BlockHash, [ThresholdState; VERSIONBITS_NUM_BITS as usize]>,
+    >,
 }
 
 /// One network's parameters for [`UnknownBitsMonitor`].
@@ -561,11 +567,27 @@ impl UnknownBitsParams {
     pub fn for_network(network: Network) -> Self {
         match network {
             // Taproot's activation height plus a confirmation window.
-            Network::Bitcoin => Self { period: 2016, threshold: 1815, min_height: 711_648 },
-            Network::Testnet => Self { period: 2016, threshold: 1512, min_height: 2_013_984 },
+            Network::Bitcoin => Self {
+                period: 2016,
+                threshold: 1815,
+                min_height: 711_648,
+            },
+            Network::Testnet => Self {
+                period: 2016,
+                threshold: 1512,
+                min_height: 2_013_984,
+            },
             // Regtest retargets daily (`nPowTargetTimespan` of a day).
-            Network::Regtest => Self { period: 144, threshold: 108, min_height: 0 },
-            _ => Self { period: 2016, threshold: 1512, min_height: 0 },
+            Network::Regtest => Self {
+                period: 144,
+                threshold: 108,
+                min_height: 0,
+            },
+            _ => Self {
+                period: 2016,
+                threshold: 1512,
+                min_height: 0,
+            },
         }
     }
 }
@@ -617,7 +639,12 @@ impl UnknownBitsMonitor {
                 break *s;
             }
             to_compute.push(cursor);
-            match cursor.1.height.checked_sub(period).and_then(|h| ancestor(view, &cursor.0, h)) {
+            match cursor
+                .1
+                .height
+                .checked_sub(period)
+                .and_then(|h| ancestor(view, &cursor.0, h))
+            {
                 Some(older) => cursor = older,
                 None => break defined,
             }
@@ -628,7 +655,9 @@ impl UnknownBitsMonitor {
                 states[bit] = match states[bit] {
                     // Start time 0: started at the first period boundary.
                     ThresholdState::Defined => ThresholdState::Started,
-                    ThresholdState::Started if counts[bit] >= params.threshold => ThresholdState::LockedIn,
+                    ThresholdState::Started if counts[bit] >= params.threshold => {
+                        ThresholdState::LockedIn
+                    }
                     ThresholdState::LockedIn => ThresholdState::Active,
                     other => other,
                 };
@@ -653,7 +682,9 @@ impl UnknownBitsMonitor {
         let mut expected: std::collections::HashMap<u32, i32> = std::collections::HashMap::new();
         let mut cur = end;
         for _ in 0..period {
-            if cur.height >= min_height && (cur.version & VERSIONBITS_TOP_MASK) == VERSIONBITS_TOP_BITS {
+            if cur.height >= min_height
+                && (cur.version & VERSIONBITS_TOP_MASK) == VERSIONBITS_TOP_BITS
+            {
                 let window = cur.height / known.period.max(1);
                 let mask = *expected.entry(window).or_insert_with(|| {
                     let prev = (cur.height > 0).then_some(cur.prev);
@@ -753,7 +784,11 @@ mod tests {
         }
     }
 
-    const P: UnknownBitsParams = UnknownBitsParams { period: 2016, threshold: 1512, min_height: 0 };
+    const P: UnknownBitsParams = UnknownBitsParams {
+        period: 2016,
+        threshold: 1512,
+        min_height: 0,
+    };
 
     /// #976: a bit this node does not know that 75% of a period signals is
     /// locked in for the next period, and active for the one after: Core's
@@ -764,10 +799,25 @@ mod tests {
         let chain = FakeChain::new(6100, 5, |h| (2016..2016 + 1512).contains(&h));
         let mon = UnknownBitsMonitor::default();
         let td = testdummy_deployment(Network::Testnet4);
-        assert_eq!(mon.check(&chain, &chain.by_height[4030], P, &td), vec![], "still counting");
-        assert_eq!(mon.check(&chain, &chain.by_height[4031], P, &td), vec![(5, false)], "locked in");
-        assert_eq!(mon.check(&chain, &chain.by_height[6046], P, &td), vec![(5, false)]);
-        assert_eq!(mon.check(&chain, &chain.by_height[6047], P, &td), vec![(5, true)], "active");
+        assert_eq!(
+            mon.check(&chain, &chain.by_height[4030], P, &td),
+            vec![],
+            "still counting"
+        );
+        assert_eq!(
+            mon.check(&chain, &chain.by_height[4031], P, &td),
+            vec![(5, false)],
+            "locked in"
+        );
+        assert_eq!(
+            mon.check(&chain, &chain.by_height[6046], P, &td),
+            vec![(5, false)]
+        );
+        assert_eq!(
+            mon.check(&chain, &chain.by_height[6047], P, &td),
+            vec![(5, true)],
+            "active"
+        );
 
         // One block short of the threshold: nothing.
         let chain = FakeChain::new(6100, 5, |h| (2016..2016 + 1511).contains(&h));
@@ -784,13 +834,27 @@ mod tests {
         // Signalled by every block but one per 144-block window, so a known
         // deployment needing all 144 stays started throughout.
         let chain = FakeChain::new(6100, 28, |h| h >= 2016 && h % 144 != 0);
-        let running = Bip9Deployment { threshold: 144, ..regtest_testdummy() };
-        let mon = UnknownBitsMonitor::default();
-        assert_eq!(state_for(&chain, Some(chain.by_height[6047]), &running), ThresholdState::Started);
-        assert_eq!(mon.check(&chain, &chain.by_height[6047], P, &running), vec![]);
+        let running = Bip9Deployment {
+            threshold: 144,
+            ..regtest_testdummy()
+        };
         let mon = UnknownBitsMonitor::default();
         assert_eq!(
-            mon.check(&chain, &chain.by_height[6047], P, &testdummy_deployment(Network::Testnet4)),
+            state_for(&chain, Some(chain.by_height[6047]), &running),
+            ThresholdState::Started
+        );
+        assert_eq!(
+            mon.check(&chain, &chain.by_height[6047], P, &running),
+            vec![]
+        );
+        let mon = UnknownBitsMonitor::default();
+        assert_eq!(
+            mon.check(
+                &chain,
+                &chain.by_height[6047],
+                P,
+                &testdummy_deployment(Network::Testnet4)
+            ),
             vec![(28, true)]
         );
     }
@@ -801,9 +865,18 @@ mod tests {
     fn blocks_below_the_warning_height_do_not_count() {
         let chain = FakeChain::new(6100, 2, |h| (2016..4032).contains(&h));
         let td = testdummy_deployment(Network::Testnet4);
-        let params = UnknownBitsParams { min_height: 4032, ..P };
-        assert_eq!(UnknownBitsMonitor::default().check(&chain, &chain.by_height[6047], params, &td), vec![]);
-        assert_eq!(UnknownBitsMonitor::default().check(&chain, &chain.by_height[6047], P, &td), vec![(2, true)]);
+        let params = UnknownBitsParams {
+            min_height: 4032,
+            ..P
+        };
+        assert_eq!(
+            UnknownBitsMonitor::default().check(&chain, &chain.by_height[6047], params, &td),
+            vec![]
+        );
+        assert_eq!(
+            UnknownBitsMonitor::default().check(&chain, &chain.by_height[6047], P, &td),
+            vec![(2, true)]
+        );
     }
 
     /// A second check in the same period reads only the tip's ancestry down
@@ -818,7 +891,11 @@ mod tests {
         assert!(first.1.get() > 6000, "the first check counts every period");
         let again = Counting(&chain, std::cell::Cell::new(0));
         mon.check(&again, &chain.by_height[6060], P, &td);
-        assert!(again.1.get() < 50, "the second read {} headers", again.1.get());
+        assert!(
+            again.1.get() < 50,
+            "the second read {} headers",
+            again.1.get()
+        );
     }
 
     fn regtest_testdummy() -> Bip9Deployment {
@@ -1019,7 +1096,10 @@ mod tests {
         assert_eq!((main.threshold, main.period), (1815, 2016));
 
         let t3 = taproot_deployment(Network::Testnet);
-        assert_eq!(t3.min_activation_height, 0, "no activation delay on testnet3");
+        assert_eq!(
+            t3.min_activation_height, 0,
+            "no activation delay on testnet3"
+        );
         assert_eq!(t3.threshold, 1512);
 
         for net in [Network::Regtest, Network::Signet] {
@@ -1030,13 +1110,32 @@ mod tests {
         // row: testnet3 ran a real signalling window, and regtest's period is
         // its own 144.
         let field = |d: Bip9Deployment| {
-            (d.bit, d.start_time, d.timeout, d.min_activation_height, d.threshold, d.period)
+            (
+                d.bit,
+                d.start_time,
+                d.timeout,
+                d.min_activation_height,
+                d.threshold,
+                d.period,
+            )
         };
         for (net, want) in [
-            (Network::Testnet, (2, 1_619_222_400, 1_628_640_000, 0, 1512, 2016)),
-            (Network::Testnet4, (2, ALWAYS_ACTIVE, NO_TIMEOUT, 0, 1512, 2016)),
-            (Network::Signet, (2, ALWAYS_ACTIVE, NO_TIMEOUT, 0, 1815, 2016)),
-            (Network::Regtest, (2, ALWAYS_ACTIVE, NO_TIMEOUT, 0, 108, 144)),
+            (
+                Network::Testnet,
+                (2, 1_619_222_400, 1_628_640_000, 0, 1512, 2016),
+            ),
+            (
+                Network::Testnet4,
+                (2, ALWAYS_ACTIVE, NO_TIMEOUT, 0, 1512, 2016),
+            ),
+            (
+                Network::Signet,
+                (2, ALWAYS_ACTIVE, NO_TIMEOUT, 0, 1815, 2016),
+            ),
+            (
+                Network::Regtest,
+                (2, ALWAYS_ACTIVE, NO_TIMEOUT, 0, 108, 144),
+            ),
         ] {
             assert_eq!(field(taproot_deployment(net)), want, "{net}");
         }

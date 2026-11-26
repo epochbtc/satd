@@ -85,7 +85,11 @@ impl AvAncestry {
             self.av_chain = None;
             return false;
         }
-        if self.av_chain.as_ref().is_none_or(|(built_for, _)| built_for != av) {
+        if self
+            .av_chain
+            .as_ref()
+            .is_none_or(|(built_for, _)| built_for != av)
+        {
             let Some(chain) = ancestors_down_to(av, av_height, 0, &get) else {
                 return false;
             };
@@ -142,7 +146,9 @@ impl AvAncestry {
             return;
         }
         match reason {
-            Some(r) => tracing::info!("Enabling script verification at block #{height} ({hash}): {r}."),
+            Some(r) => {
+                tracing::info!("Enabling script verification at block #{height} ({hash}): {r}.")
+            }
             None => tracing::info!("Disabling script verification at block #{height} ({hash})."),
         }
         self.last_logged = Some(reason);
@@ -167,7 +173,12 @@ where
 
 /// `from` and its ancestors down to `floor`, indexed by height (entries
 /// below `floor` are zero hashes). `None` on a missing entry.
-fn ancestors_down_to<G>(from: &BlockHash, from_height: u32, floor: u32, get: &G) -> Option<Vec<BlockHash>>
+fn ancestors_down_to<G>(
+    from: &BlockHash,
+    from_height: u32,
+    floor: u32,
+    get: &G,
+) -> Option<Vec<BlockHash>>
 where
     G: Fn(&BlockHash) -> Option<BlockIndexEntry>,
 {
@@ -224,7 +235,10 @@ pub fn proof_equivalent_time_at_least(
         // beyond it is not a real network. Distinguish the two.
         return low_u128(&diff).is_none() && low_u128(&proof).is_some();
     };
-    match (diff.checked_mul(POW_TARGET_SPACING), proof.checked_mul(secs)) {
+    match (
+        diff.checked_mul(POW_TARGET_SPACING),
+        proof.checked_mul(secs),
+    ) {
         (Some(lhs), Some(rhs)) => lhs >= rhs,
         // `diff * 600` overflowed: the difference is far beyond two weeks.
         (None, _) => true,
@@ -259,11 +273,18 @@ mod tests {
         let bits = CompactTarget::from_consensus(0x207fffff);
         assert_eq!(work_for_bits(bits), u256(2));
         let block = u256(1000);
-        assert!(!more_than_two_weeks_on_top(&u256(1000 + 4032), &block, bits));
+        assert!(!more_than_two_weeks_on_top(
+            &u256(1000 + 4032),
+            &block,
+            bits
+        ));
         // 4033 * 600 / 2 = 1_209_900, past two weeks once floored to seconds.
         assert!(more_than_two_weeks_on_top(&u256(1000 + 4033), &block, bits));
         assert!(!more_than_two_weeks_on_top(&block, &block, bits));
-        assert!(!more_than_two_weeks_on_top(&u256(10), &block, bits), "best below block");
+        assert!(
+            !more_than_two_weeks_on_top(&u256(10), &block, bits),
+            "best below block"
+        );
     }
 
     /// A fake block index: `chain` is a list of (hash byte, parent byte, height).
@@ -273,7 +294,8 @@ mod tests {
         chain
             .iter()
             .map(|&(id, parent, height)| {
-                let mut header = bitcoin::constants::genesis_block(bitcoin::Network::Regtest).header;
+                let mut header =
+                    bitcoin::constants::genesis_block(bitcoin::Network::Regtest).header;
                 header.prev_blockhash = h(parent);
                 (
                     h(id),
@@ -299,7 +321,8 @@ mod tests {
     /// Main chain 1..=10 (ids 1..=10), a branch forking at 3: ids 23..=29 at
     /// heights 4..=10. The assumevalid block is 5.
     fn fixture() -> std::collections::HashMap<BlockHash, BlockIndexEntry> {
-        let mut chain: Vec<(u8, u8, u32)> = (1..=10u8).map(|i| (i, i - 1, u32::from(i) - 1)).collect();
+        let mut chain: Vec<(u8, u8, u32)> =
+            (1..=10u8).map(|i| (i, i - 1, u32::from(i) - 1)).collect();
         chain.push((23, 3, 3));
         chain.extend((24..=29u8).map(|i| (i, i - 1, u32::from(i) - 20)));
         index(&chain)
@@ -313,8 +336,14 @@ mod tests {
         // Id 5 sits at height 4.
         assert!(a.is_av_ancestor(&hash(5), 4, &hash(2), 1, get));
         assert!(a.is_av_ancestor(&hash(5), 4, &hash(5), 4, get));
-        assert!(!a.is_av_ancestor(&hash(5), 4, &hash(23), 3, get), "branch block at height 3");
-        assert!(!a.is_av_ancestor(&hash(5), 4, &hash(6), 5, get), "above the AV height");
+        assert!(
+            !a.is_av_ancestor(&hash(5), 4, &hash(23), 3, get),
+            "branch block at height 3"
+        );
+        assert!(
+            !a.is_av_ancestor(&hash(5), 4, &hash(6), 5, get),
+            "above the AV height"
+        );
     }
 
     #[test]
@@ -352,9 +381,15 @@ mod tests {
         let mut idx = fixture();
         let missing = idx.remove(&hash(3)).unwrap();
         let mut a = AvAncestry::default();
-        assert!(!a.is_av_ancestor(&hash(5), 4, &hash(2), 1, |h: &BlockHash| idx.get(h).cloned()));
+        assert!(
+            !a.is_av_ancestor(&hash(5), 4, &hash(2), 1, |h: &BlockHash| idx
+                .get(h)
+                .cloned())
+        );
         idx.insert(hash(3), missing);
-        assert!(a.is_av_ancestor(&hash(5), 4, &hash(2), 1, |h: &BlockHash| idx.get(h).cloned()));
+        assert!(a.is_av_ancestor(&hash(5), 4, &hash(2), 1, |h: &BlockHash| {
+            idx.get(h).cloned()
+        }));
     }
 
     /// The first decision is logged even when it is a skip, and a decision
@@ -380,9 +415,22 @@ mod tests {
         let proof = u128::from_be_bytes(work_for_bits(bits)[16..].try_into().unwrap());
         let block = u256(1000);
         let month = 30 * 24 * 60 * 60;
-        assert!(proof_equivalent_time_at_least(&u256(1000 + 4320 * proof), &block, bits, month));
-        assert!(!proof_equivalent_time_at_least(&u256(1000 + 4320 * proof - 1), &block, bits, month));
-        assert!(!proof_equivalent_time_at_least(&block, &u256(1000 + 4320 * proof), bits, month), "less work on top");
+        assert!(proof_equivalent_time_at_least(
+            &u256(1000 + 4320 * proof),
+            &block,
+            bits,
+            month
+        ));
+        assert!(!proof_equivalent_time_at_least(
+            &u256(1000 + 4320 * proof - 1),
+            &block,
+            bits,
+            month
+        ));
+        assert!(
+            !proof_equivalent_time_at_least(&block, &u256(1000 + 4320 * proof), bits, month),
+            "less work on top"
+        );
     }
 
     #[test]

@@ -59,7 +59,12 @@ fn get(esplora: &EsploraClient, path: &str) -> (u16, Option<String>, String) {
 
 fn broadcast(esplora: &EsploraClient, raw: &str) {
     let r = esplora.post_tx(raw);
-    assert_eq!(r.status(), 200, "broadcast: {}", r.text().unwrap_or_default());
+    assert_eq!(
+        r.status(),
+        200,
+        "broadcast: {}",
+        r.text().unwrap_or_default()
+    );
 }
 
 fn push(bytes: &[u8]) -> PushBytesBuf {
@@ -77,18 +82,28 @@ fn unsigned(prevout: OutPoint, value: u64, dest: ScriptBuf) -> Transaction {
             sequence: Sequence::MAX,
             witness: Witness::new(),
         }],
-        output: vec![TxOut { value: Amount::from_sat(value), script_pubkey: dest }],
+        output: vec![TxOut {
+            value: Amount::from_sat(value),
+            script_pubkey: dest,
+        }],
     }
 }
 
 /// A SIGHASH_ALL signature of `tx`'s only input under the pre-segwit rules,
 /// for `script_code` (the spent script, or the P2SH redeem script).
-fn legacy_signature(tx: &Transaction, script_code: &bitcoin::Script, sk: &SecretKey) -> PushBytesBuf {
+fn legacy_signature(
+    tx: &Transaction,
+    script_code: &bitcoin::Script,
+    sk: &SecretKey,
+) -> PushBytesBuf {
     let sighash = SighashCache::new(tx)
         .legacy_signature_hash(0, script_code, EcdsaSighashType::All.to_u32())
         .expect("legacy sighash");
     let msg = Message::from_digest(sighash.to_byte_array());
-    let mut sig = Secp256k1::new().sign_ecdsa(&msg, sk).serialize_der().to_vec();
+    let mut sig = Secp256k1::new()
+        .sign_ecdsa(&msg, sk)
+        .serialize_der()
+        .to_vec();
     sig.push(EcdsaSighashType::All as u8);
     push(&sig)
 }
@@ -102,7 +117,12 @@ fn sigops_by_txid(list: &Value) -> std::collections::HashMap<String, Value> {
     list.as_array()
         .expect("a list of transactions")
         .iter()
-        .map(|tx| (tx["txid"].as_str().expect("txid").to_string(), tx["sigops"].clone()))
+        .map(|tx| {
+            (
+                tx["txid"].as_str().expect("txid").to_string(),
+                tx["sigops"].clone(),
+            )
+        })
         .collect()
 }
 
@@ -135,10 +155,22 @@ fn test_e2e_esplora_sigops_and_txs_outspends() {
         &e2e.node,
         &w,
         vec![
-            TxOut { value: Amount::from_sat(COIN), script_pubkey: p2pkh.clone() },
-            TxOut { value: Amount::from_sat(COIN), script_pubkey: p2sh.clone() },
-            TxOut { value: Amount::from_sat(COIN), script_pubkey: p2tr.clone() },
-            TxOut { value: Amount::from_sat(change), script_pubkey: dest.script_pubkey() },
+            TxOut {
+                value: Amount::from_sat(COIN),
+                script_pubkey: p2pkh.clone(),
+            },
+            TxOut {
+                value: Amount::from_sat(COIN),
+                script_pubkey: p2sh.clone(),
+            },
+            TxOut {
+                value: Amount::from_sat(COIN),
+                script_pubkey: p2tr.clone(),
+            },
+            TxOut {
+                value: Amount::from_sat(change),
+                script_pubkey: dest.script_pubkey(),
+            },
         ],
     );
     broadcast(&esplora, &fund_raw);
@@ -157,14 +189,27 @@ fn test_e2e_esplora_sigops_and_txs_outspends() {
 
     // Legacy P2PKH spend paying a P2PKH output: the scriptSig only pushes,
     // the output holds one OP_CHECKSIG. 4.
-    let mut spend_p2pkh = unsigned(OutPoint { txid: fund_txid, vout: 0 }, COIN - FEE, p2pkh.clone());
+    let mut spend_p2pkh = unsigned(
+        OutPoint {
+            txid: fund_txid,
+            vout: 0,
+        },
+        COIN - FEE,
+        p2pkh.clone(),
+    );
     let sig = legacy_signature(&spend_p2pkh, &p2pkh, &w.sk);
     spend_p2pkh.input[0].script_sig = Builder::new().push_slice(sig).push_key(&w.pk).into_script();
 
     // P2SH 1-of-2 multisig spend paying P2WPKH: the redeem script's two
     // keys at 4 each. 8.
-    let mut spend_p2sh =
-        unsigned(OutPoint { txid: fund_txid, vout: 1 }, COIN - FEE, dest.script_pubkey());
+    let mut spend_p2sh = unsigned(
+        OutPoint {
+            txid: fund_txid,
+            vout: 1,
+        },
+        COIN - FEE,
+        dest.script_pubkey(),
+    );
     let sig = legacy_signature(&spend_p2sh, &redeem, &w.sk);
     spend_p2sh.input[0].script_sig = Builder::new()
         .push_opcode(bitcoin::opcodes::OP_FALSE)
@@ -176,7 +221,10 @@ fn test_e2e_esplora_sigops_and_txs_outspends() {
     let (spend_p2tr_raw, spend_p2tr) = build_signed_p2tr_keypath_spend(
         &secp,
         &taproot_key,
-        OutPoint { txid: fund_txid, vout: 2 },
+        OutPoint {
+            txid: fund_txid,
+            vout: 2,
+        },
         p2tr,
         COIN,
         dest.script_pubkey(),
@@ -189,7 +237,12 @@ fn test_e2e_esplora_sigops_and_txs_outspends() {
 
     let spend_p2pkh_txid = spend_p2pkh.compute_txid().to_string();
     let spend_p2sh_txid = spend_p2sh.compute_txid().to_string();
-    for raw_tx in [&raw(&spend_p2pkh), &raw(&spend_p2sh), &spend_p2tr_raw, &spend_p2wpkh_raw] {
+    for raw_tx in [
+        &raw(&spend_p2pkh),
+        &raw(&spend_p2sh),
+        &spend_p2tr_raw,
+        &spend_p2wpkh_raw,
+    ] {
         broadcast(&esplora, raw_tx);
     }
     let expected: Vec<(&str, u64)> = vec![
@@ -205,7 +258,10 @@ fn test_e2e_esplora_sigops_and_txs_outspends() {
         assert_eq!(tx["status"]["confirmed"], false);
         assert_eq!(tx["sigops"], json!(sigops), "unconfirmed {txid}: {tx}");
     }
-    let listed = sigops_by_txid(&esplora_get_json(&esplora, &format!("/address/{dest}/txs/mempool")));
+    let listed = sigops_by_txid(&esplora_get_json(
+        &esplora,
+        &format!("/address/{dest}/txs/mempool"),
+    ));
     assert_eq!(listed.len(), 3, "the three spends paying `dest`");
     for (txid, sigops) in &expected[1..] {
         assert_eq!(listed[*txid], json!(sigops), "mempool list, {txid}");
@@ -215,7 +271,8 @@ fn test_e2e_esplora_sigops_and_txs_outspends() {
     let unknown = "ff".repeat(32);
     let single = |txid: &str| esplora_get_json(&esplora, &format!("/tx/{txid}/outspends"));
     let fund_spends = single(&fund);
-    let unconfirmed = |txid: &str| json!({"spent": true, "txid": txid, "vin": 0, "status": {"confirmed": false}});
+    let unconfirmed =
+        |txid: &str| json!({"spent": true, "txid": txid, "vin": 0, "status": {"confirmed": false}});
     assert_eq!(
         fund_spends,
         json!([
@@ -233,7 +290,11 @@ fn test_e2e_esplora_sigops_and_txs_outspends() {
     let path = format!("/txs/outspends?txids={coinbase1},{fund},{unknown},zz,{coinbase1}");
     let (status, tip, body) = get(&esplora, &path);
     assert_eq!(status, 200, "{body}");
-    assert_eq!(tip.as_deref(), Some(h102.as_str()), "stamped with the tip it was read at");
+    assert_eq!(
+        tip.as_deref(),
+        Some(h102.as_str()),
+        "stamped with the tip it was read at"
+    );
     assert_eq!(
         serde_json::from_str::<Value>(&body).expect("JSON"),
         json!([coinbase1_spends, fund_spends, [], [], coinbase1_spends])
@@ -252,18 +313,34 @@ fn test_e2e_esplora_sigops_and_txs_outspends() {
     );
     let unspent = json!({"spent": false});
     assert_eq!(asof, json!([[unspent, unspent, unspent, unspent], []]));
-    assert_eq!(asof[0], esplora_get_json(&esplora, &format!("/tx/{fund}/outspends?asof={h102}")));
-    assert_eq!(get(&esplora, &format!("/tx/{spend_p2tr}/outspends?asof={h102}")).0, 404);
+    assert_eq!(
+        asof[0],
+        esplora_get_json(&esplora, &format!("/tx/{fund}/outspends?asof={h102}"))
+    );
+    assert_eq!(
+        get(&esplora, &format!("/tx/{spend_p2tr}/outspends?asof={h102}")).0,
+        404
+    );
 
     // The refusals.
     for path in ["/txs/outspends", "/txs/outspends?txids="] {
         let (status, _, body) = get(&esplora, path);
-        assert_eq!((status, body.as_str()), (400, "No txids specified"), "{path}");
+        assert_eq!(
+            (status, body.as_str()),
+            (400, "No txids specified"),
+            "{path}"
+        );
     }
     let list = |n: usize| vec![fund.as_str(); n].join(",");
     let fifty = esplora_get_json(&esplora, &format!("/txs/outspends?txids={}", list(50)));
     assert_eq!(fifty.as_array().expect("an array").len(), 50);
-    assert!(fifty.as_array().unwrap().iter().all(|row| *row == fund_spends));
+    assert!(
+        fifty
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|row| *row == fund_spends)
+    );
     let (status, _, body) = get(&esplora, &format!("/txs/outspends?txids={}", list(51)));
     assert_eq!((status, body.as_str()), (400, "Too many txids requested"));
 
@@ -284,7 +361,10 @@ fn test_e2e_esplora_sigops_and_txs_outspends() {
         assert_eq!(listed[*txid], json!(sigops), "block list, {txid}");
     }
     // The address's confirmed list.
-    let listed = sigops_by_txid(&esplora_get_json(&esplora, &format!("/address/{dest}/txs/chain")));
+    let listed = sigops_by_txid(&esplora_get_json(
+        &esplora,
+        &format!("/address/{dest}/txs/chain"),
+    ));
     assert_eq!(listed.len(), 4, "`fund` and the three spends paying `dest`");
     assert_eq!(listed[&fund], json!(5));
     for (txid, sigops) in &expected[1..] {
@@ -305,16 +385,26 @@ fn test_e2e_esplora_sigops_and_txs_outspends() {
         {"spent": false},
     ]);
     assert_eq!(single(&fund), fund_spends);
-    let (status, tip, body) = get(&esplora, &format!("/txs/outspends?txids={fund},{spend_p2tr}"));
+    let (status, tip, body) = get(
+        &esplora,
+        &format!("/txs/outspends?txids={fund},{spend_p2tr}"),
+    );
     assert_eq!(status, 200, "{body}");
     assert_eq!(tip.as_deref(), Some(h103.as_str()));
     assert_eq!(
         serde_json::from_str::<Value>(&body).expect("JSON"),
         json!([fund_spends, [{"spent": false}]])
     );
-    let (status, tip, body) = get(&esplora, &format!("/txs/outspends?txids={fund}&asof={h102}"));
+    let (status, tip, body) = get(
+        &esplora,
+        &format!("/txs/outspends?txids={fund}&asof={h102}"),
+    );
     assert_eq!(status, 200, "{body}");
-    assert_eq!(tip.as_deref(), Some(h102.as_str()), "stamped with the asof block");
+    assert_eq!(
+        tip.as_deref(),
+        Some(h102.as_str()),
+        "stamped with the asof block"
+    );
     assert_eq!(
         serde_json::from_str::<Value>(&body).expect("JSON"),
         json!([[unspent, unspent, unspent, unspent]])

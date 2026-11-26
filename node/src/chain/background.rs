@@ -32,12 +32,12 @@ use parking_lot::RwLock;
 use crate::chain::checkpoints::{self, Checkpoint};
 use crate::chain::connect;
 use crate::chain::state::ChainError;
+use crate::storage::Store;
 use crate::storage::coin_cache::CoinCache;
 use crate::storage::compressed_coin::hash_utxo_set;
 use crate::storage::profile::StorageTuning;
 use crate::storage::rocksdb_store::RocksDbStore;
 use crate::storage::split_store::SplitStore;
-use crate::storage::Store;
 use crate::validation;
 use crate::validation::script::ScriptVerifier;
 
@@ -91,11 +91,17 @@ pub enum HandoffOutcome {
     Validated,
     /// The recomputed `hash_serialized_3` does not match the anchor —
     /// the snapshot was buggy or malicious.
-    HashMismatch { expected: [u8; 32], actual: [u8; 32] },
+    HashMismatch {
+        expected: [u8; 32],
+        actual: [u8; 32],
+    },
     /// The background tip block at `snapshot_height` is not the anchor's
     /// block hash (should be impossible if headers were validated, but
     /// checked defensively).
-    BaseMismatch { expected: BlockHash, actual: BlockHash },
+    BaseMismatch {
+        expected: BlockHash,
+        actual: BlockHash,
+    },
 }
 
 /// A chainstate that validates genesis→`snapshot_height` behind a loaded
@@ -293,12 +299,9 @@ impl BackgroundChainState {
         // which cannot occur on this linear in-order replay).
         validation::block::check_block(block, self.network, new_height)?;
         validation::pow::check_proof_of_work_bounded(&block.header, self.network)?;
-        validation::pow::check_difficulty(
-            &block.header,
-            &parent,
-            self.network,
-            |h| store_ref.get_block_index(h),
-        )?;
+        validation::pow::check_difficulty(&block.header, &parent, self.network, |h| {
+            store_ref.get_block_index(h)
+        })?;
         // MTP walks the candidate's own parent pointers (see `check_timestamp`).
         validation::pow::check_timestamp(&block.header, &parent, |h| store_ref.get_block_index(h))?;
         // Mandatory block-version gate (Core: bad-version) — BIP34/66/65.

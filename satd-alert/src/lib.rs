@@ -26,13 +26,12 @@ pub mod contract;
 pub mod retry;
 
 pub use config::{
-    AlertFile, AlertFileError, Hook, HookFilter, HOOK_QUEUE_CAPACITY, MAX_HOOK_ID_LEN,
+    AlertFile, AlertFileError, HOOK_QUEUE_CAPACITY, Hook, HookFilter, MAX_HOOK_ID_LEN,
     RESERVED_LEGACY_REORG_ID,
 };
 pub use contract::{
-    delivery_id, sign_body, sign_v2, v2_signing_string,
-    ATTEMPT_HEADER,
-    DELIVERY_HEADER, HOOK_HEADER, LEGACY_WEBHOOK_VERSION, MAX_TIMESTAMP_SKEW_SECS,
-    SIGNATURE_HEADER, TIMESTAMP_HEADER, WEBHOOK_VERSION, WEBHOOK_VERSION_HEADER,
+    ATTEMPT_HEADER, DELIVERY_HEADER, HOOK_HEADER, LEGACY_WEBHOOK_VERSION, MAX_TIMESTAMP_SKEW_SECS,
+    SIGNATURE_HEADER, TIMESTAMP_HEADER, WEBHOOK_VERSION, WEBHOOK_VERSION_HEADER, delivery_id,
+    sign_body, sign_v2, v2_signing_string,
 };
-pub use retry::{classify_response, retry_delay, Disposition, MAX_BACKOFF};
+pub use retry::{Disposition, MAX_BACKOFF, classify_response, retry_delay};

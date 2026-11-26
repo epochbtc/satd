@@ -58,8 +58,8 @@ use std::sync::Arc;
 
 use bitcoin::secp256k1::{PublicKey, Scalar, Secp256k1, SecretKey};
 use satd_events_client::{
-    display_hex, Categories, Cursor, Event, FileCursorStore, ResilientConfig, StreamClient,
-    SubscribeOptions, TweakEntry,
+    Categories, Cursor, Event, FileCursorStore, ResilientConfig, StreamClient, SubscribeOptions,
+    TweakEntry, display_hex,
 };
 
 /// How many outputs per transaction to probe (`k = 0..N`). A real scanner keeps
@@ -74,7 +74,9 @@ const LABELS: &[u32] = &[0];
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
-    let endpoint = args.next().unwrap_or_else(|| "http://127.0.0.1:50051".into());
+    let endpoint = args
+        .next()
+        .unwrap_or_else(|| "http://127.0.0.1:50051".into());
     let cursor_path = args.next().unwrap_or_else(|| "/tmp/satd-sp.cursor".into());
     // First height to scan on a cold start. A cursor names the last height
     // already *done*, so anchoring at `h - 1` makes `h` itself the first block
@@ -91,7 +93,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let b_spend = SecretKey::from_slice(&[0x22; 32])?;
     let spend_pubkey = PublicKey::from_secret_key(&secp, &b_spend);
 
-    let client = StreamClient::builder(endpoint).keepalive_default().connect().await?;
+    let client = StreamClient::builder(endpoint)
+        .keepalive_default()
+        .connect()
+        .await?;
     // Request ONLY the tweaks category (bit 8, explicit — not in the default),
     // opt into mempool-time tweaks so payments surface at admission too, and set
     // `tweak_outputs` so confirmed `BlockTweaks` entries carry the transaction's
@@ -135,9 +140,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
         match next {
             // Confirmed: one entry per SP-eligible tx in the connected block.
-            Event::BlockTweaks { height, entries, .. } => {
+            Event::BlockTweaks {
+                height, entries, ..
+            } => {
                 for entry in &entries {
-                    scan_entry(&secp, &b_scan, &spend_pubkey, &b_spend, entry, &format!("block {height}"))?;
+                    scan_entry(
+                        &secp,
+                        &b_scan,
+                        &spend_pubkey,
+                        &b_spend,
+                        entry,
+                        &format!("block {height}"),
+                    )?;
                 }
             }
             // Mempool (Tier 1.5): one accepted-but-unconfirmed tx. Same scan;
@@ -155,7 +169,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             //
             // If it does arrive, blocks went unscanned — for a wallet that is
             // missed money, not a warning. Stop rather than continue with a hole.
-            Event::ReplayGap { resume_height, first_height } => {
+            Event::ReplayGap {
+                resume_height,
+                first_height,
+            } => {
                 return Err(format!(
                     "replay gap: blocks [{resume_height}, {}] were never scanned; \
                      re-derive that range via getblock before trusting this wallet's balance",

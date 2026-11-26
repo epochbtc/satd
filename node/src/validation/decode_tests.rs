@@ -21,28 +21,47 @@ fn spend(witness: &[&[u8]]) -> Transaction {
         version: transaction::Version::TWO,
         lock_time: absolute::LockTime::from_consensus(7),
         input: vec![TxIn {
-            previous_output: OutPoint { txid: Txid::from_byte_array([3; 32]), vout: 1 },
+            previous_output: OutPoint {
+                txid: Txid::from_byte_array([3; 32]),
+                vout: 1,
+            },
             script_sig: ScriptBuf::from_bytes(vec![0x51]),
             sequence: Sequence::MAX,
             witness: Witness::from_slice(witness),
         }],
-        output: vec![TxOut { value: Amount::from_sat(5000), script_pubkey: ScriptBuf::from_bytes(vec![0x51]) }],
+        output: vec![TxOut {
+            value: Amount::from_sat(5000),
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+        }],
     }
 }
 
 #[test]
 fn the_ten_byte_empty_transaction_reads_as_core_reads_it() {
     let raw = bytes(EMPTY);
-    assert!(deserialize::<Transaction>(&raw).is_err(), "rust-bitcoin refuses it; the reason this module exists");
+    assert!(
+        deserialize::<Transaction>(&raw).is_err(),
+        "rust-bitcoin refuses it; the reason this module exists"
+    );
     let tx = deserialize_transaction(&raw).expect("Core reads it");
     assert_eq!(tx.version, transaction::Version::TWO);
     assert!(tx.input.is_empty() && tx.output.is_empty());
     assert_eq!(tx.lock_time.to_consensus_u32(), 0);
     assert_eq!(tx.compute_txid().to_string(), EMPTY_TXID);
-    assert_eq!(wtxid(&tx).to_string(), EMPTY_TXID, "Core's wtxid is the txid");
-    assert_ne!(tx.compute_wtxid().to_string(), EMPTY_TXID, "rust-bitcoin hashes its extended form");
     assert_eq!(
-        crate::validation::tx::check_transaction(&tx).unwrap_err().to_string(),
+        wtxid(&tx).to_string(),
+        EMPTY_TXID,
+        "Core's wtxid is the txid"
+    );
+    assert_ne!(
+        tx.compute_wtxid().to_string(),
+        EMPTY_TXID,
+        "rust-bitcoin hashes its extended form"
+    );
+    assert_eq!(
+        crate::validation::tx::check_transaction(&tx)
+            .unwrap_err()
+            .to_string(),
         "bad-txns-vin-empty"
     );
 }
@@ -52,7 +71,10 @@ fn a_witness_flag_with_no_inputs_is_refused_as_core_refuses_it() {
     // version | 00 01 | no inputs | no outputs | lock_time: what rust-bitcoin
     // writes for a transaction with no inputs.
     let raw = bytes("020000000001000000000000");
-    assert!(deserialize::<Transaction>(&raw).is_ok(), "rust-bitcoin reads it");
+    assert!(
+        deserialize::<Transaction>(&raw).is_ok(),
+        "rust-bitcoin reads it"
+    );
     assert_eq!(
         deserialize_transaction(&raw).unwrap_err().to_string(),
         encode::Error::ParseFailed("Superfluous witness record").to_string()
@@ -88,15 +110,22 @@ fn unknown_flags_are_refused() {
 
 #[test]
 fn transactions_with_inputs_read_as_rust_bitcoin_reads_them() {
-    let coinbase = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest).txdata[0].clone();
+    let coinbase =
+        bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest).txdata[0].clone();
     for tx in [spend(&[]), spend(&[b"sig", b"key"]), coinbase] {
         let raw = serialize(&tx);
         assert_eq!(deserialize_transaction(&raw).unwrap(), tx);
         assert_eq!(wtxid(&tx), tx.compute_wtxid());
         let mut extra = raw.clone();
         extra.push(0);
-        assert!(deserialize_transaction(&extra).is_err(), "bytes left over are refused");
-        assert!(deserialize_transaction(&raw[..raw.len() - 1]).is_err(), "a short read is refused");
+        assert!(
+            deserialize_transaction(&extra).is_err(),
+            "bytes left over are refused"
+        );
+        assert!(
+            deserialize_transaction(&raw[..raw.len() - 1]).is_err(),
+            "a short read is refused"
+        );
     }
 }
 
@@ -126,14 +155,26 @@ fn compact_block_messages_read_their_transactions_as_core_reads_them() {
         nonce: 9,
         short_ids: vec![ShortId::from([1, 2, 3, 4, 5, 6])],
         prefilled_txs: vec![
-            PrefilledTransaction { idx: 0, tx: genesis.txdata[0].clone() },
-            PrefilledTransaction { idx: 1, tx: spend(&[b"w"]) },
+            PrefilledTransaction {
+                idx: 0,
+                tx: genesis.txdata[0].clone(),
+            },
+            PrefilledTransaction {
+                idx: 1,
+                tx: spend(&[b"w"]),
+            },
         ],
     };
     let raw = serialize(&cmpct);
-    assert_eq!(read_header_and_short_ids(&mut raw.as_slice()).unwrap(), cmpct);
+    assert_eq!(
+        read_header_and_short_ids(&mut raw.as_slice()).unwrap(),
+        cmpct
+    );
 
-    let txn = BlockTransactions { block_hash: genesis.block_hash(), transactions: vec![spend(&[]), spend(&[b"w"])] };
+    let txn = BlockTransactions {
+        block_hash: genesis.block_hash(),
+        transactions: vec![spend(&[]), spend(&[b"w"])],
+    };
     let raw = serialize(&txn);
     assert_eq!(read_block_transactions(&mut raw.as_slice()).unwrap(), txn);
 
@@ -150,7 +191,13 @@ fn compact_block_messages_read_their_transactions_as_core_reads_them() {
     raw.push(0x01);
     raw.extend(bytes(EMPTY));
     assert!(deserialize::<BlockTransactions>(&raw).is_err());
-    assert!(read_block_transactions(&mut raw.as_slice()).unwrap().transactions[0].input.is_empty());
+    assert!(
+        read_block_transactions(&mut raw.as_slice())
+            .unwrap()
+            .transactions[0]
+            .input
+            .is_empty()
+    );
 }
 
 /// Core writes, measures and hashes a transaction with no inputs without the
@@ -165,14 +212,27 @@ fn a_transaction_with_no_inputs_is_written_and_measured_as_core_does() {
     assert_eq!(total_size(&tx), 10);
     assert_eq!(weight(&tx).to_wu(), 40);
     assert_eq!(vsize(&tx), 10);
-    assert_eq!(serialize(&tx).len(), 12, "rust-bitcoin writes the marker and flag");
+    assert_eq!(
+        serialize(&tx).len(),
+        12,
+        "rust-bitcoin writes the marker and flag"
+    );
 
     let data = Transaction {
-        output: vec![TxOut { value: Amount::ZERO, script_pubkey: ScriptBuf::from_bytes(vec![0x6a, 0x01, 0x00]) }],
+        output: vec![TxOut {
+            value: Amount::ZERO,
+            script_pubkey: ScriptBuf::from_bytes(vec![0x6a, 0x01, 0x00]),
+        }],
         ..tx
     };
-    assert_eq!(hex::encode(serialize_transaction(&data)), "0200000000010000000000000000036a010000000000");
-    assert_eq!((total_size(&data), weight(&data).to_wu(), vsize(&data)), (22, 88, 22));
+    assert_eq!(
+        hex::encode(serialize_transaction(&data)),
+        "0200000000010000000000000000036a010000000000"
+    );
+    assert_eq!(
+        (total_size(&data), weight(&data).to_wu(), vsize(&data)),
+        (22, 88, 22)
+    );
 
     // Every transaction with an input is written and measured as before.
     for t in [spend(&[]), spend(&[b"w"])] {

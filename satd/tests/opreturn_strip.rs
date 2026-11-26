@@ -10,7 +10,9 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 mod common;
-use common::{DeterministicWallet, TestNode, find_available_port, fresh_test_datadir, test_timeout};
+use common::{
+    DeterministicWallet, TestNode, find_available_port, fresh_test_datadir, test_timeout,
+};
 
 const THRESHOLD: u64 = 4096;
 /// Big enough to cover whole 4 KiB filesystem blocks whatever its alignment.
@@ -18,8 +20,15 @@ const PAYLOAD: usize = 20_000;
 const PAYLOAD_BYTE: u8 = 0x5a;
 
 fn mine(node: &TestNode, n: u64, addr: &str) -> Vec<String> {
-    let resp = node.rpc_ok("generatetoaddress", vec![serde_json::json!(n), serde_json::json!(addr)]);
-    resp.as_array().unwrap().iter().map(|h| h.as_str().unwrap().to_string()).collect()
+    let resp = node.rpc_ok(
+        "generatetoaddress",
+        vec![serde_json::json!(n), serde_json::json!(addr)],
+    );
+    resp.as_array()
+        .unwrap()
+        .iter()
+        .map(|h| h.as_str().unwrap().to_string())
+        .collect()
 }
 
 /// Mine a block whose second transaction carries a `PAYLOAD`-byte
@@ -48,12 +57,23 @@ fn block_with_a_big_op_return(node: &TestNode) -> String {
     // burns half the coinbase: allow it.
     node.rpc_ok(
         "sendrawtransaction",
-        vec![serde_json::json!(raw), serde_json::json!(0.1), serde_json::json!(50)],
+        vec![
+            serde_json::json!(raw),
+            serde_json::json!(0.1),
+            serde_json::json!(50),
+        ],
     );
     let hash = mine(node, 1, &addr).remove(0);
-    let block = node.rpc_ok("getblock", vec![serde_json::json!(hash), serde_json::json!(1)]);
+    let block = node.rpc_ok(
+        "getblock",
+        vec![serde_json::json!(hash), serde_json::json!(1)],
+    );
     assert!(
-        block["tx"].as_array().unwrap().iter().any(|t| t.as_str() == Some(txid.as_str())),
+        block["tx"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t.as_str() == Some(txid.as_str())),
         "premise: the OP_RETURN transaction is in the block"
     );
     mine(node, 10, &addr);
@@ -62,7 +82,10 @@ fn block_with_a_big_op_return(node: &TestNode) -> String {
 
 fn strip(node: &TestNode, hash: &str) -> Result<serde_json::Value, serde_json::Value> {
     let resp = node
-        .rpc_call_with_params("stripopreturns", vec![serde_json::json!(hash), serde_json::json!(THRESHOLD)])
+        .rpc_call_with_params(
+            "stripopreturns",
+            vec![serde_json::json!(hash), serde_json::json!(THRESHOLD)],
+        )
         .expect("rpc transport");
     if resp["error"].is_null() {
         Ok(resp["result"].clone())
@@ -99,7 +122,9 @@ fn block_files(dir: &Path) -> Vec<u8> {
 /// Whether a run of `len` payload bytes is still in the block files.
 fn payload_run_on_disk(node: &TestNode, len: usize) -> bool {
     let needle = vec![PAYLOAD_BYTE; len];
-    block_files(&blocks_dir(node)).windows(len).any(|w| w == needle.as_slice())
+    block_files(&blocks_dir(node))
+        .windows(len)
+        .any(|w| w == needle.as_slice())
 }
 
 /// Whether the whole payload is still in the block files.
@@ -125,9 +150,15 @@ fn has_corrupt_warning(node: &TestNode) -> bool {
 /// The raw block is unavailable once stripped: never the zeroed bytes.
 fn assert_raw_block_unavailable(node: &TestNode, hash: &str) {
     let resp = node
-        .rpc_call_with_params("getblock", vec![serde_json::json!(hash), serde_json::json!(0)])
+        .rpc_call_with_params(
+            "getblock",
+            vec![serde_json::json!(hash), serde_json::json!(0)],
+        )
         .unwrap();
-    assert!(!resp["error"].is_null(), "a stripped block is not served raw: {resp}");
+    assert!(
+        !resp["error"].is_null(),
+        "a stripped block is not served raw: {resp}"
+    );
     let header = node.rpc_ok("getblockheader", vec![serde_json::json!(hash)]);
     assert_eq!(header["hash"], *hash, "its header is still served");
 }
@@ -139,7 +170,10 @@ fn stripopreturns_needs_allowteststrip() {
     let err = strip(&node, hash.as_str().unwrap()).unwrap_err();
     assert_eq!(err["code"], -32601, "not registered: {err}");
     let help = node.rpc_ok("help", vec![]);
-    assert!(!help.as_str().unwrap().contains("stripopreturns"), "never advertised");
+    assert!(
+        !help.as_str().unwrap().contains("stripopreturns"),
+        "never advertised"
+    );
     node.stop();
 
     // Paired with a node where it is registered: the same call answers.
@@ -148,7 +182,10 @@ fn stripopreturns_needs_allowteststrip() {
     let err = strip(&node, hash.as_str().unwrap()).unwrap_err();
     assert_ne!(err["code"], -32601, "registered: {err}");
     let help = node.rpc_ok("help", vec![]);
-    assert!(!help.as_str().unwrap().contains("stripopreturns"), "never advertised");
+    assert!(
+        !help.as_str().unwrap().contains("stripopreturns"),
+        "never advertised"
+    );
     node.stop();
 }
 
@@ -181,7 +218,11 @@ fn allowteststrip_is_refused_off_regtest() {
         std::thread::sleep(Duration::from_millis(50));
     };
     let text = std::fs::read_to_string(&stderr).unwrap_or_default();
-    assert_eq!(status.and_then(|s| s.code()), Some(1), "refused at startup: {text}");
+    assert_eq!(
+        status.and_then(|s| s.code()),
+        Some(1),
+        "refused at startup: {text}"
+    );
     assert!(text.contains("-allowteststrip"), "{text}");
     let _ = std::fs::remove_dir_all(&datadir);
 }
@@ -206,7 +247,10 @@ fn a_stripped_block_stays_stripped_across_a_restart() {
     assert!(out["freed_bytes"].as_u64().unwrap() >= 4096, "{out}");
     assert!(!payload_on_disk(&node), "the payload is gone");
     let after = allocated(&node);
-    assert!(after < before, "the punch gave space back: {before} -> {after}");
+    assert!(
+        after < before,
+        "the punch gave space back: {before} -> {after}"
+    );
     assert_raw_block_unavailable(&node, &hash);
     assert!(!has_corrupt_warning(&node));
     node.stop();
@@ -234,18 +278,27 @@ fn a_kill_between_the_record_and_the_punch_is_finished_by_the_next_strip() {
         &[("SATD_TEST_FAILPOINT", "strip-after-record")],
     );
     let hash = block_with_a_big_op_return(&node);
-    let _ = node.rpc_call_with_params("stripopreturns", vec![serde_json::json!(hash), serde_json::json!(THRESHOLD)]);
+    let _ = node.rpc_call_with_params(
+        "stripopreturns",
+        vec![serde_json::json!(hash), serde_json::json!(THRESHOLD)],
+    );
     let deadline = Instant::now() + test_timeout(60);
     let status = loop {
         if let Some(status) = node.process.try_wait().unwrap() {
             break status;
         }
-        assert!(Instant::now() < deadline, "the failpoint did not abort the node");
+        assert!(
+            Instant::now() < deadline,
+            "the failpoint did not abort the node"
+        );
         std::thread::sleep(Duration::from_millis(50));
     };
     assert!(!status.success(), "aborted: {status}");
     let log = std::fs::read_to_string(&node.stderr_log).unwrap_or_default();
-    assert!(log.contains("aborting with a durable strip record"), "{log}");
+    assert!(
+        log.contains("aborting with a durable strip record"),
+        "{log}"
+    );
     assert!(payload_on_disk(&node), "nothing was punched");
 
     let mut node = TestNode::start_with_datadir(&datadir, rpcport, &["--allowteststrip"]);
@@ -284,7 +337,10 @@ fn a_corrupt_stored_copy_is_refused_with_a_warning() {
         for (i, b) in data.iter_mut().enumerate() {
             *b ^= key[i % 8];
         }
-        if let Some(at) = data.windows(needle.len()).position(|w| w == needle.as_slice()) {
+        if let Some(at) = data
+            .windows(needle.len())
+            .position(|w| w == needle.as_slice())
+        {
             data[at + 10] ^= 0x01;
             for (i, b) in data.iter_mut().enumerate() {
                 *b ^= key[i % 8];
@@ -297,10 +353,19 @@ fn a_corrupt_stored_copy_is_refused_with_a_warning() {
 
     let mut node = TestNode::start_with_datadir(&datadir, rpcport, &["--allowteststrip"]);
     let err = strip(&node, &hash).unwrap_err();
-    assert!(err["message"].as_str().unwrap().contains("check_block"), "{err}");
+    assert!(
+        err["message"].as_str().unwrap().contains("check_block"),
+        "{err}"
+    );
     let warnings = node.rpc_call("getwarnings").unwrap().to_string();
-    assert!(warnings.contains(&format!("blockdata.corrupt.{hash}")), "{warnings}");
-    assert!(payload_run_on_disk(&node, PAYLOAD - 20), "nothing was punched");
+    assert!(
+        warnings.contains(&format!("blockdata.corrupt.{hash}")),
+        "{warnings}"
+    );
+    assert!(
+        payload_run_on_disk(&node, PAYLOAD - 20),
+        "nothing was punched"
+    );
     node.stop();
 }
 
@@ -339,7 +404,11 @@ fn block_with_a_stripped_and_an_intact_tx(node: &TestNode) -> MixedBlock {
 
 /// [`block_with_a_stripped_and_an_intact_tx`], with the stripped
 /// transaction's first output paying `first_output`.
-fn mixed_block(node: &TestNode, wallet: &DeterministicWallet, first_output: bitcoin::ScriptBuf) -> MixedBlock {
+fn mixed_block(
+    node: &TestNode,
+    wallet: &DeterministicWallet,
+    first_output: bitcoin::ScriptBuf,
+) -> MixedBlock {
     use bitcoin::blockdata::opcodes::all::OP_RETURN;
     use bitcoin::script::{Builder, PushBytesBuf};
 
@@ -363,12 +432,23 @@ fn mixed_block(node: &TestNode, wallet: &DeterministicWallet, first_output: bitc
     );
     node.rpc_ok(
         "sendrawtransaction",
-        vec![serde_json::json!(stripped_raw), serde_json::json!(0.1), serde_json::json!(50)],
+        vec![
+            serde_json::json!(stripped_raw),
+            serde_json::json!(0.1),
+            serde_json::json!(50),
+        ],
     );
     node.rpc_ok("sendrawtransaction", vec![serde_json::json!(intact_raw)]);
     let hash = mine(node, 1, &addr).remove(0);
-    let block = node.rpc_ok("getblock", vec![serde_json::json!(hash), serde_json::json!(1)]);
-    assert_eq!(block["tx"].as_array().unwrap().len(), 3, "premise: both are in the block: {block}");
+    let block = node.rpc_ok(
+        "getblock",
+        vec![serde_json::json!(hash), serde_json::json!(1)],
+    );
+    assert_eq!(
+        block["tx"].as_array().unwrap().len(),
+        3,
+        "premise: both are in the block: {block}"
+    );
     mine(node, 10, &addr);
     MixedBlock {
         hash,
@@ -393,7 +473,9 @@ fn as_stripped(mut tx: serde_json::Value, vout: usize, script_len: usize) -> ser
 }
 
 fn rpc_err(node: &TestNode, method: &str, params: Vec<serde_json::Value>) -> serde_json::Value {
-    let resp = node.rpc_call_with_params(method, params).expect("rpc transport");
+    let resp = node
+        .rpc_call_with_params(method, params)
+        .expect("rpc transport");
     assert!(!resp["error"].is_null(), "{method} must refuse: {resp}");
     resp["error"].clone()
 }
@@ -412,7 +494,12 @@ fn rpc_surfaces_read_a_stripped_block_through_its_record() {
     let (stripped, _) = &b.stripped;
     let (intact, intact_raw) = &b.intact;
     let i = |v: &serde_json::Value, txid: &str| {
-        v["tx"].as_array().unwrap().iter().position(|t| t["txid"] == txid).unwrap()
+        v["tx"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .position(|t| t["txid"] == txid)
+            .unwrap()
     };
     let getblock = |v: u32| node.rpc_ok("getblock", vec![json!(b.hash), json!(v)]);
     let rawtx = |txid: &str, verbosity: u32, block: bool| {
@@ -420,14 +507,18 @@ fn rpc_surfaces_read_a_stripped_block_through_its_record() {
         if block {
             params.push(json!(b.hash));
         }
-        node.rpc_call_with_params("getrawtransaction", params).expect("rpc transport")
+        node.rpc_call_with_params("getrawtransaction", params)
+            .expect("rpc transport")
     };
     let proof = |txid: &str| node.rpc_ok("gettxoutproof", vec![json!([txid])]);
     let spender = |height: u64| {
         let coinbase = common::coinbase_txid_at(&node, height);
         node.rpc_call_with_params(
             "gettxspendingprevout",
-            vec![json!([{"txid": coinbase, "vout": 0}]), json!({"return_spending_tx": true})],
+            vec![
+                json!([{"txid": coinbase, "vout": 0}]),
+                json!({"return_spending_tx": true}),
+            ],
         )
         .expect("rpc transport")
     };
@@ -476,7 +567,8 @@ fn rpc_surfaces_read_a_stripped_block_through_its_record() {
         let mut expected = before.clone();
         let at = i(before, stripped);
         expected["tx"][at] = as_stripped(before["tx"][at].clone(), vout, PAYLOAD);
-        expected["opreturn_stripped"] = json!({"transactions": 1, "outputs": 1, "bytes": PAYLOAD - 1});
+        expected["opreturn_stripped"] =
+            json!({"transactions": 1, "outputs": 1, "bytes": PAYLOAD - 1});
         assert_eq!(getblock(v), expected, "getblock {v}");
     }
 
@@ -485,31 +577,55 @@ fn rpc_surfaces_read_a_stripped_block_through_its_record() {
     for block in [false, true] {
         let resp = rawtx(stripped, 0, block);
         assert_eq!(resp["error"]["code"], -1, "{resp}");
-        assert_eq!(resp["error"]["message"], "Transaction data not available (OP_RETURN data stripped)");
+        assert_eq!(
+            resp["error"]["message"],
+            "Transaction data not available (OP_RETURN data stripped)"
+        );
         assert_eq!(rawtx(intact, 0, block)["result"], json!(intact_raw));
     }
     // Verbose reads like getblock 2's entry, through either path.
-    assert_eq!(rawtx(stripped, 2, false)["result"], as_stripped(before_tx, vout, PAYLOAD));
-    assert_eq!(rawtx(stripped, 2, true)["result"], as_stripped(before_tx_in_block, vout, PAYLOAD));
+    assert_eq!(
+        rawtx(stripped, 2, false)["result"],
+        as_stripped(before_tx, vout, PAYLOAD)
+    );
+    assert_eq!(
+        rawtx(stripped, 2, true)["result"],
+        as_stripped(before_tx_in_block, vout, PAYLOAD)
+    );
     assert_eq!(rawtx(intact, 2, false)["result"], before_intact);
 
     // gettxoutproof needs only the txids: the same proof, and it verifies.
     assert_eq!(proof(stripped), before_proof);
-    assert_eq!(node.rpc_ok("verifytxoutproof", vec![before_proof]), json!([stripped]));
+    assert_eq!(
+        node.rpc_ok("verifytxoutproof", vec![before_proof]),
+        json!([stripped])
+    );
     let intact_proof = proof(intact);
-    assert_eq!(node.rpc_ok("verifytxoutproof", vec![intact_proof]), json!([intact]));
+    assert_eq!(
+        node.rpc_ok("verifytxoutproof", vec![intact_proof]),
+        json!([intact])
+    );
 
     // getblockstats: identical.
-    assert_eq!(node.rpc_ok("getblockstats", vec![json!(b.hash)]), before_stats);
+    assert_eq!(
+        node.rpc_ok("getblockstats", vec![json!(b.hash)]),
+        before_stats
+    );
 
     // verifychain reads the stripped block and finds it sound.
-    assert_eq!(node.rpc_ok("verifychain", vec![json!(4), json!(20)]), json!(true));
+    assert_eq!(
+        node.rpc_ok("verifychain", vec![json!(4), json!(20)]),
+        json!(true)
+    );
 
     // gettxspendingprevout: the stripped spender's bytes are refused; the
     // intact one's are served as before.
     let resp = spender(1);
     assert_eq!(resp["error"]["code"], -1, "{resp}");
-    assert_eq!(resp["error"]["message"], "Transaction data not available (OP_RETURN data stripped)");
+    assert_eq!(
+        resp["error"]["message"],
+        "Transaction data not available (OP_RETURN data stripped)"
+    );
     assert_eq!(spender(2)["result"], before_spender);
 
     // Nothing above was reported as corruption or an index mismatch.
@@ -549,13 +665,19 @@ impl Electrum {
         let stream = std::net::TcpStream::connect(("127.0.0.1", port)).expect("electrum connect");
         stream.set_read_timeout(Some(test_timeout(20))).unwrap();
         let reader = std::io::BufReader::new(stream.try_clone().unwrap());
-        Self { reader, writer: stream }
+        Self {
+            reader,
+            writer: stream,
+        }
     }
 
     fn line(&mut self) -> serde_json::Value {
         use std::io::BufRead as _;
         let mut line = String::new();
-        assert!(self.reader.read_line(&mut line).unwrap() > 0, "electrum closed the connection");
+        assert!(
+            self.reader.read_line(&mut line).unwrap() > 0,
+            "electrum closed the connection"
+        );
         serde_json::from_str(&line).unwrap_or_else(|e| panic!("not JSON: {line:?} ({e})"))
     }
 
@@ -574,7 +696,10 @@ impl Electrum {
     /// The response to `blockchain.tweaks.subscribe` and every notification
     /// through the one that ends the chunk.
     fn tweaks(&mut self, height: u64) -> Vec<serde_json::Value> {
-        let mut out = vec![self.call("blockchain.tweaks.subscribe", serde_json::json!([height, 1, true]))];
+        let mut out = vec![self.call(
+            "blockchain.tweaks.subscribe",
+            serde_json::json!([height, 1, true]),
+        )];
         loop {
             let n = self.line();
             let done = n["params"][0]["message"] == "done";
@@ -588,10 +713,17 @@ impl Electrum {
 
 /// `tx`, an Esplora transaction from before the strip, as it must read after:
 /// the flag, and output `vout` described as its bare `OP_RETURN`.
-fn as_stripped_esplora(mut tx: serde_json::Value, vout: usize, script_len: usize) -> serde_json::Value {
+fn as_stripped_esplora(
+    mut tx: serde_json::Value,
+    vout: usize,
+    script_len: usize,
+) -> serde_json::Value {
     tx["opreturn_stripped"] = serde_json::json!(true);
     // `sigops` is unchanged by the strip: a payload of pushes counted nothing.
-    assert!(tx["sigops"].is_u64(), "premise: the transaction has sigops: {tx}");
+    assert!(
+        tx["sigops"].is_u64(),
+        "premise: the transaction has sigops: {tx}"
+    );
     let out = &mut tx["vout"][vout];
     out["scriptpubkey"] = serde_json::json!("6a");
     out["scriptpubkey_asm"] = serde_json::json!("OP_RETURN");
@@ -629,11 +761,14 @@ fn esplora_and_electrum_read_a_stripped_block_through_its_record() {
     let b = mixed_block(&node, &wallet, p2tr);
     let (stripped, _) = &b.stripped;
     let (intact, intact_raw) = &b.intact;
-    let height = node.rpc_ok("getblockheader", vec![json!(b.hash)])["height"].as_u64().unwrap();
+    let height = node.rpc_ok("getblockheader", vec![json!(b.hash)])["height"]
+        .as_u64()
+        .unwrap();
     common::poll_until(
         || {
             let info = node.rpc_ok("getindexinfo", vec![]);
-            info.as_object().is_some_and(|m| !m.is_empty() && m.values().all(|i| i["synced"] == true))
+            info.as_object()
+                .is_some_and(|m| !m.is_empty() && m.values().all(|i| i["synced"] == true))
         },
         test_timeout(60),
         "indexes never synced",
@@ -653,7 +788,8 @@ fn esplora_and_electrum_read_a_stripped_block_through_its_record() {
         format!("/tx/{intact}/merkle-proof"),
     ];
     let before: Vec<_> = paths.iter().map(|p| get(p)).collect();
-    let (_, before_merkleblock) = esplora_get(esplora, &format!("/tx/{stripped}/merkleblock-proof"));
+    let (_, before_merkleblock) =
+        esplora_get(esplora, &format!("/tx/{stripped}/merkleblock-proof"));
     let before_tx = get(&format!("/tx/{stripped}"));
     let before_txs = get(&format!("/block/{}/txs", b.hash));
     let before_history = get(&format!("/address/{addr}/txs"));
@@ -665,15 +801,26 @@ fn esplora_and_electrum_read_a_stripped_block_through_its_record() {
         .unwrap();
 
     let mut el = Electrum::connect(electrum);
-    let before_el_verbose = el.call("blockchain.transaction.get", json!([stripped, true]))["result"].clone();
-    let before_el_merkle = el.call("blockchain.transaction.get_merkle", json!([stripped, height]));
+    let before_el_verbose =
+        el.call("blockchain.transaction.get", json!([stripped, true]))["result"].clone();
+    let before_el_merkle = el.call(
+        "blockchain.transaction.get_merkle",
+        json!([stripped, height]),
+    );
     let id_from_pos = |el: &mut Electrum| {
-        [1, 2].map(|pos| el.call("blockchain.transaction.id_from_pos", json!([height, pos, true])))
+        [1, 2].map(|pos| {
+            el.call(
+                "blockchain.transaction.id_from_pos",
+                json!([height, pos, true]),
+            )
+        })
     };
     let before_el_pos = id_from_pos(&mut el);
     let before_el_tweaks = el.tweaks(height);
     assert!(
-        before_el_tweaks.iter().any(|l| l.to_string().contains(stripped.as_str())),
+        before_el_tweaks
+            .iter()
+            .any(|l| l.to_string().contains(stripped.as_str())),
         "premise: the stripped tx has a tweak row: {before_el_tweaks:?}"
     );
 
@@ -698,7 +845,10 @@ fn esplora_and_electrum_read_a_stripped_block_through_its_record() {
             *t = want_tx.clone();
         }
     }
-    assert_ne!(want_txs, before_txs, "premise: the page lists the stripped tx");
+    assert_ne!(
+        want_txs, before_txs,
+        "premise: the page lists the stripped tx"
+    );
     assert_eq!(get(&format!("/block/{}/txs", b.hash)), want_txs);
     let mut want_history = before_history.clone();
     for t in want_history.as_array_mut().unwrap() {
@@ -706,18 +856,40 @@ fn esplora_and_electrum_read_a_stripped_block_through_its_record() {
             *t = want_tx.clone();
         }
     }
-    assert_ne!(want_history, before_history, "premise: the history lists the stripped tx");
+    assert_ne!(
+        want_history, before_history,
+        "premise: the history lists the stripped tx"
+    );
     assert_eq!(get(&format!("/address/{addr}/txs")), want_history);
     // Raw bytes are refused, paired with the intact tx and the next block.
     let gone = |path: String, body: &str| {
-        assert_eq!(esplora_get(esplora, &path), (404, body.to_string()), "{path}");
+        assert_eq!(
+            esplora_get(esplora, &path),
+            (404, body.to_string()),
+            "{path}"
+        );
     };
-    gone(format!("/block/{}/raw", b.hash), "block data not available (OP_RETURN data stripped)");
-    gone(format!("/tx/{stripped}/hex"), "transaction data not available (OP_RETURN data stripped)");
-    gone(format!("/tx/{stripped}/raw"), "transaction data not available (OP_RETURN data stripped)");
+    gone(
+        format!("/block/{}/raw", b.hash),
+        "block data not available (OP_RETURN data stripped)",
+    );
+    gone(
+        format!("/tx/{stripped}/hex"),
+        "transaction data not available (OP_RETURN data stripped)",
+    );
+    gone(
+        format!("/tx/{stripped}/raw"),
+        "transaction data not available (OP_RETURN data stripped)",
+    );
     let next = node.rpc_ok("getblockhash", vec![json!(height + 1)]);
-    assert_eq!(esplora_get(esplora, &format!("/block/{}/raw", next.as_str().unwrap())).0, 200);
-    assert_eq!(esplora_get(esplora, &format!("/tx/{intact}/hex")), (200, intact_raw.clone()));
+    assert_eq!(
+        esplora_get(esplora, &format!("/block/{}/raw", next.as_str().unwrap())).0,
+        200
+    );
+    assert_eq!(
+        esplora_get(esplora, &format!("/tx/{intact}/hex")),
+        (200, intact_raw.clone())
+    );
     assert_eq!(esplora_get(esplora, &format!("/tx/{intact}/raw")).0, 200);
 
     // Electrum: the hex is refused and the intact tx's served; verbose reads as
@@ -727,12 +899,21 @@ fn esplora_and_electrum_read_a_stripped_block_through_its_record() {
         resp["error"]["message"], "transaction data not available (OP_RETURN data stripped)",
         "{resp}"
     );
-    assert_eq!(el.call("blockchain.transaction.get", json!([intact]))["result"], json!(intact_raw));
+    assert_eq!(
+        el.call("blockchain.transaction.get", json!([intact]))["result"],
+        json!(intact_raw)
+    );
     assert_eq!(
         el.call("blockchain.transaction.get", json!([stripped, true]))["result"],
         as_stripped(before_el_verbose, vout, PAYLOAD)
     );
-    assert_eq!(el.call("blockchain.transaction.get_merkle", json!([stripped, height])), before_el_merkle);
+    assert_eq!(
+        el.call(
+            "blockchain.transaction.get_merkle",
+            json!([stripped, height])
+        ),
+        before_el_merkle
+    );
     assert_eq!(id_from_pos(&mut el), before_el_pos);
     assert_eq!(el.tweaks(height), before_el_tweaks);
 
@@ -749,7 +930,10 @@ fn dump_chainstate(datadir: &Path) -> Dump {
     use rocksdb::{DB, IteratorMode, Options};
 
     let net_dir = datadir.join("regtest");
-    assert!(net_dir.join(".clean_shutdown").exists(), "dump needs a clean stop");
+    assert!(
+        net_dir.join(".clean_shutdown").exists(),
+        "dump needs a clean stop"
+    );
     let path = net_dir.join("chainstate");
     let opts = Options::default();
     let cfs = DB::list_cf(&opts, &path).expect("list column families");
@@ -770,17 +954,17 @@ fn dump_chainstate(datadir: &Path) -> Dump {
 }
 
 /// The first difference between two dumps, for a readable failure.
-fn first_difference(
-    a: &Dump,
-    b: &Dump,
-) -> Option<String> {
+fn first_difference(a: &Dump, b: &Dump) -> Option<String> {
     let names: std::collections::BTreeSet<_> = a.keys().chain(b.keys()).collect();
     for name in names {
         let (ra, rb) = (a.get(name), b.get(name));
         if ra == rb {
             continue;
         }
-        let (ra, rb) = (ra.cloned().unwrap_or_default(), rb.cloned().unwrap_or_default());
+        let (ra, rb) = (
+            ra.cloned().unwrap_or_default(),
+            rb.cloned().unwrap_or_default(),
+        );
         for i in 0..ra.len().max(rb.len()) {
             if ra.get(i) != rb.get(i) {
                 let show = |r: Option<&(Vec<u8>, Vec<u8>)>| {
@@ -799,7 +983,12 @@ fn first_difference(
     None
 }
 
-const INDEXES: &[&str] = &["--txindex", "--addressindex", "--blockfilterindex", "--silentpaymentindex=1"];
+const INDEXES: &[&str] = &[
+    "--txindex",
+    "--addressindex",
+    "--blockfilterindex",
+    "--silentpaymentindex=1",
+];
 
 fn start_indexed(datadir: &Path, rpcport: u16, extra: &[&str]) -> TestNode {
     let mut args: Vec<&str> = vec!["--allowteststrip"];
@@ -809,7 +998,8 @@ fn start_indexed(datadir: &Path, rpcport: u16, extra: &[&str]) -> TestNode {
     common::poll_until(
         || {
             let info = node.rpc_ok("getindexinfo", vec![]);
-            info.as_object().is_some_and(|m| !m.is_empty() && m.values().all(|i| i["synced"] == true))
+            info.as_object()
+                .is_some_and(|m| !m.is_empty() && m.values().all(|i| i["synced"] == true))
         },
         test_timeout(60),
         "indexes never synced",
@@ -818,17 +1008,19 @@ fn start_indexed(datadir: &Path, rpcport: u16, extra: &[&str]) -> TestNode {
 }
 
 /// Replay the chain with `flag`, stop, and dump it.
-fn replay_and_dump(
-    datadir: &Path,
-    rpcport: u16,
-    flag: &str,
-    tip: &str,
-) -> Dump {
+fn replay_and_dump(datadir: &Path, rpcport: u16, flag: &str, tip: &str) -> Dump {
     let mut node = start_indexed(datadir, rpcport, &[flag]);
-    assert_eq!(node.rpc_ok("getbestblockhash", vec![]), serde_json::json!(tip), "{flag} reached the tip");
+    assert_eq!(
+        node.rpc_ok("getbestblockhash", vec![]),
+        serde_json::json!(tip),
+        "{flag} reached the tip"
+    );
     assert!(!has_corrupt_warning(&node));
     let warnings = node.rpc_call("getwarnings").unwrap().to_string();
-    assert!(!warnings.contains("reindex.halted"), "{flag} halted: {warnings}");
+    assert!(
+        !warnings.contains("reindex.halted"),
+        "{flag} halted: {warnings}"
+    );
     node.stop();
     // Dropping a node removes its datadir; this one is reused.
     node.datadir = PathBuf::new();
@@ -864,7 +1056,10 @@ fn a_stripped_chain_replays_to_the_same_chainstate() {
             .into_script()
     };
     let send = |raw: &str| {
-        node.rpc_ok("sendrawtransaction", vec![json!(raw), json!(0.1), json!(50)]);
+        node.rpc_ok(
+            "sendrawtransaction",
+            vec![json!(raw), json!(0.1), json!(50)],
+        );
     };
     const FEE: u64 = 100_000;
 
@@ -892,7 +1087,10 @@ fn a_stripped_chain_replays_to_the_same_chainstate() {
     let (spend_raw, spend) = common::build_signed_p2tr_keypath_spend(
         &secp,
         &kp,
-        bitcoin::OutPoint { txid: sp.parse().unwrap(), vout: 0 },
+        bitcoin::OutPoint {
+            txid: sp.parse().unwrap(),
+            vout: 0,
+        },
         p2tr.clone(),
         sp_value,
         wallet.address.script_pubkey(),
@@ -909,7 +1107,13 @@ fn a_stripped_chain_replays_to_the_same_chainstate() {
     let y = mine(&node, 1, &addr).remove(0);
     let tip = mine(&node, 10, &addr).pop().unwrap();
     let sp_rows = node.rpc_ok("getblock", vec![json!(x), json!(1)]);
-    assert!(sp_rows["tx"].as_array().unwrap().iter().any(|t| t == &json!(sp)));
+    assert!(
+        sp_rows["tx"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t == &json!(sp))
+    );
     assert!(
         node.rpc_ok("getblock", vec![json!(y), json!(1)])["tx"]
             .as_array()
@@ -979,14 +1183,20 @@ fn backfill_and_dump(datadir: &Path, rpcport: u16, tip: &str) -> Dump {
             "a backfill never completed",
         );
     }
-    assert_eq!(node.rpc_ok("getbestblockhash", vec![]), serde_json::json!(tip));
+    assert_eq!(
+        node.rpc_ok("getbestblockhash", vec![]),
+        serde_json::json!(tip)
+    );
     assert!(!has_corrupt_warning(&node));
     node.stop();
     node.datadir = PathBuf::new();
     let mut dump = dump_chainstate(datadir);
     dump.retain(|name, _| INDEX_CFS.contains(&name.as_str()));
     for cf in INDEX_CFS {
-        assert!(dump.get(*cf).is_some_and(|rows| !rows.is_empty()), "premise: {cf} has rows");
+        assert!(
+            dump.get(*cf).is_some_and(|rows| !rows.is_empty()),
+            "premise: {cf} has rows"
+        );
     }
     dump
 }
@@ -1021,7 +1231,10 @@ fn index_backfills_over_stripped_blocks_match_backfills_over_intact_ones() {
             .into_script()
     };
     let send = |raw: &str| {
-        node.rpc_ok("sendrawtransaction", vec![json!(raw), json!(0.1), json!(50)]);
+        node.rpc_ok(
+            "sendrawtransaction",
+            vec![json!(raw), json!(0.1), json!(50)],
+        );
     };
     const FEE: u64 = 100_000;
     let (sp_raw, sp) = common::build_signed_p2wpkh_spend_of_coinbases(
@@ -1043,7 +1256,10 @@ fn index_backfills_over_stripped_blocks_match_backfills_over_intact_ones() {
     let (spend_raw, _) = common::build_signed_p2tr_keypath_spend(
         &secp,
         &kp,
-        bitcoin::OutPoint { txid: sp.parse().unwrap(), vout: 0 },
+        bitcoin::OutPoint {
+            txid: sp.parse().unwrap(),
+            vout: 0,
+        },
         p2tr,
         sp_value,
         wallet.address.script_pubkey(),
@@ -1052,7 +1268,13 @@ fn index_backfills_over_stripped_blocks_match_backfills_over_intact_ones() {
     send(&spend_raw);
     mine(&node, 1, &addr);
     let tip = mine(&node, 10, &addr).pop().unwrap();
-    assert_eq!(node.rpc_ok("getblock", vec![json!(x), json!(1)])["tx"].as_array().unwrap().len(), 3);
+    assert_eq!(
+        node.rpc_ok("getblock", vec![json!(x), json!(1)])["tx"]
+            .as_array()
+            .unwrap()
+            .len(),
+        3
+    );
     node.stop();
     node.datadir = PathBuf::new();
 
@@ -1087,7 +1309,8 @@ fn index_backfills_over_stripped_blocks_match_backfills_over_intact_ones() {
 fn the_offline_audit_reads_a_stripped_block_through_its_record() {
     let rpcport = find_available_port();
     let datadir = fresh_test_datadir("satd-strip-audit");
-    let mut node = TestNode::start_with_datadir(&datadir, rpcport, &["--allowteststrip", "--txindex"]);
+    let mut node =
+        TestNode::start_with_datadir(&datadir, rpcport, &["--allowteststrip", "--txindex"]);
     let hash = block_with_a_big_op_return(&node);
     let out = strip(&node, &hash).expect("strip");
     assert_eq!(out["outcome"], "stripped", "{out}");
@@ -1100,8 +1323,15 @@ fn the_offline_audit_reads_a_stripped_block_through_its_record() {
         .output()
         .expect("run the audit");
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(out.status.success(), "{stdout}\n{}", String::from_utf8_lossy(&out.stderr));
-    assert!(stdout.contains("checked 50 blocks"), "premise: the stripped block is in the window: {stdout}");
+    assert!(
+        out.status.success(),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        stdout.contains("checked 50 blocks"),
+        "premise: the stripped block is in the window: {stdout}"
+    );
     assert!(stdout.trim_end().ends_with("consistent"), "{stdout}");
     let _ = std::fs::remove_dir_all(&datadir);
 }
@@ -1127,9 +1357,19 @@ fn invalidateblock_below_a_stripped_block_is_refused_and_changes_nothing() {
     let hash = block_with_a_big_op_return(&node);
     let out = strip(&node, &hash).expect("strip");
     assert_eq!(out["outcome"], "stripped", "{out}");
-    let height = node.rpc_ok("getblockheader", vec![json!(hash)])["height"].as_u64().unwrap();
-    let below = node.rpc_ok("getblockhash", vec![json!(height - 1)]).as_str().unwrap().to_string();
-    let above = node.rpc_ok("getblockhash", vec![json!(height + 5)]).as_str().unwrap().to_string();
+    let height = node.rpc_ok("getblockheader", vec![json!(hash)])["height"]
+        .as_u64()
+        .unwrap();
+    let below = node
+        .rpc_ok("getblockhash", vec![json!(height - 1)])
+        .as_str()
+        .unwrap()
+        .to_string();
+    let above = node
+        .rpc_ok("getblockhash", vec![json!(height + 5)])
+        .as_str()
+        .unwrap()
+        .to_string();
     let watched = [below.clone(), hash.clone(), above.clone()];
     let before = chain_state(&node, &watched);
     let tips = node.rpc_ok("getchaintips", vec![]);
@@ -1138,17 +1378,25 @@ fn invalidateblock_below_a_stripped_block_is_refused_and_changes_nothing() {
         let err = rpc_err(&node, "invalidateblock", vec![json!(target)]);
         let msg = err["message"].as_str().unwrap();
         assert!(
-            msg.contains(&format!("block {hash} at height {height} has stripped OP_RETURN data"))
-                && msg.contains("getblockfrompeer"),
+            msg.contains(&format!(
+                "block {hash} at height {height} has stripped OP_RETURN data"
+            )) && msg.contains("getblockfrompeer"),
             "{err}"
         );
         assert_eq!(chain_state(&node, &watched), before, "nothing moved");
-        assert_eq!(node.rpc_ok("getchaintips", vec![]), tips, "nothing was marked");
+        assert_eq!(
+            node.rpc_ok("getchaintips", vec![]),
+            tips,
+            "nothing was marked"
+        );
     }
 
     // Above the stripped block, the same call goes through.
     node.rpc_ok("invalidateblock", vec![json!(above)]);
-    let tip = node.rpc_ok("getblockheader", vec![node.rpc_ok("getbestblockhash", vec![])]);
+    let tip = node.rpc_ok(
+        "getblockheader",
+        vec![node.rpc_ok("getbestblockhash", vec![])],
+    );
     assert_eq!(tip["height"].as_u64(), Some(height + 4));
     node.rpc_ok("reconsiderblock", vec![json!(above)]);
     assert_eq!(chain_state(&node, &watched), before);
@@ -1167,15 +1415,23 @@ fn a_reorg_past_a_stripped_block_fails_closed_with_the_stripped_message() {
     let hash = block_with_a_big_op_return(&node);
     let out = strip(&node, &hash).expect("strip");
     assert_eq!(out["outcome"], "stripped", "{out}");
-    let height = node.rpc_ok("getblockheader", vec![json!(hash)])["height"].as_u64().unwrap();
+    let height = node.rpc_ok("getblockheader", vec![json!(hash)])["height"]
+        .as_u64()
+        .unwrap();
     let tip_height = node.rpc_ok("getblockcount", vec![]).as_u64().unwrap();
-    let below = node.rpc_ok("getblockhash", vec![json!(height - 1)]).as_str().unwrap().to_string();
+    let below = node
+        .rpc_ok("getblockhash", vec![json!(height - 1)])
+        .as_str()
+        .unwrap()
+        .to_string();
     let watched = [below.clone(), hash.clone()];
     let before = chain_state(&node, &watched);
 
     // A competing chain from genesis, longer than the stripped node's.
     let mut other = TestNode::start(&[]);
-    let addr = DeterministicWallet::from_secret([0x63; 32]).address.to_string();
+    let addr = DeterministicWallet::from_secret([0x63; 32])
+        .address
+        .to_string();
     let fork = mine(&other, tip_height + 5, &addr);
     for h in &fork {
         let raw = other.rpc_ok("getblock", vec![json!(h), json!(0)]);
@@ -1183,12 +1439,21 @@ fn a_reorg_past_a_stripped_block_fails_closed_with_the_stripped_message() {
     }
     other.stop();
 
-    assert_eq!(chain_state(&node, &watched), before, "the reorg did not go through");
+    assert_eq!(
+        chain_state(&node, &watched),
+        before,
+        "the reorg did not go through"
+    );
     let log = std::fs::read_to_string(&node.stderr_log).unwrap_or_default();
     assert!(
-        log.contains(&format!("block {hash} at height {height} has stripped OP_RETURN data")),
+        log.contains(&format!(
+            "block {hash} at height {height} has stripped OP_RETURN data"
+        )),
         "the reorg failure names the stripped block: {}",
-        log.lines().filter(|l| l.contains("reorg")).collect::<Vec<_>>().join("\n")
+        log.lines()
+            .filter(|l| l.contains("reorg"))
+            .collect::<Vec<_>>()
+            .join("\n")
     );
     assert!(!has_corrupt_warning(&node));
     node.stop();
@@ -1209,7 +1474,13 @@ fn getblockfrompeer_restores_a_stripped_block_in_place() {
     let raw = a.rpc_ok("getblock", vec![json!(hash), json!(0)]);
 
     let mut b = TestNode::start(&[]);
-    b.rpc_ok("addnode", vec![json!(format!("127.0.0.1:{}", a.p2p_port.unwrap())), json!("onetry")]);
+    b.rpc_ok(
+        "addnode",
+        vec![
+            json!(format!("127.0.0.1:{}", a.p2p_port.unwrap())),
+            json!("onetry"),
+        ],
+    );
     common::poll_until(
         || b.rpc_ok("getbestblockhash", vec![]) == tip,
         test_timeout(60),
@@ -1227,14 +1498,24 @@ fn getblockfrompeer_restores_a_stripped_block_in_place() {
     let peer = a.rpc_ok("getpeerinfo", vec![])[0]["id"].clone();
     a.rpc_ok("getblockfrompeer", vec![json!(hash), peer]);
     common::poll_until(
-        || a.rpc_call_with_params("getblock", vec![json!(hash), json!(0)]).unwrap()["result"] == raw,
+        || {
+            a.rpc_call_with_params("getblock", vec![json!(hash), json!(0)])
+                .unwrap()["result"]
+                == raw
+        },
         test_timeout(30),
         "the block was never restored",
     );
     let block = a.rpc_ok("getblock", vec![json!(hash), json!(1)]);
-    assert!(block.get("opreturn_stripped").is_none(), "the record is gone: {block}");
+    assert!(
+        block.get("opreturn_stripped").is_none(),
+        "the record is gone: {block}"
+    );
     assert!(payload_on_disk(&a), "the payload is back on disk");
-    assert!(allocated(&a) > stripped, "the punched space is allocated again");
+    assert!(
+        allocated(&a) > stripped,
+        "the punched space is allocated again"
+    );
     assert!(!has_corrupt_warning(&a));
 
     // In place: a restart reads it intact, and a strip finds no record to redo.
@@ -1242,7 +1523,8 @@ fn getblockfrompeer_restores_a_stripped_block_in_place() {
     let rpcport = a.rpcport;
     a.stop();
     a.datadir = PathBuf::new();
-    let mut a = TestNode::start_with_datadir(&datadir, rpcport, &["--allowteststrip", "--blocksxor=1"]);
+    let mut a =
+        TestNode::start_with_datadir(&datadir, rpcport, &["--allowteststrip", "--blocksxor=1"]);
     assert_eq!(a.rpc_ok("getblock", vec![json!(hash), json!(0)]), raw);
     a.stop();
     b.stop();
@@ -1259,15 +1541,28 @@ fn restoring_the_last_stripped_block_makes_a_full_node_again() {
     use serde_json::json;
 
     let network = |node: &TestNode| {
-        node.rpc_ok("getnetworkinfo", vec![])["localservicesnames"].as_array().unwrap().contains(&json!("NETWORK"))
+        node.rpc_ok("getnetworkinfo", vec![])["localservicesnames"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("NETWORK"))
     };
     let mut a = TestNode::start(&["--allowteststrip"]);
     let hash = block_with_a_big_op_return(&a);
     let raw = a.rpc_ok("getblock", vec![json!(hash), json!(0)]);
     let tip = a.rpc_ok("getbestblockhash", vec![]);
     let mut b = TestNode::start(&[]);
-    b.rpc_ok("addnode", vec![json!(format!("127.0.0.1:{}", a.p2p_port.unwrap())), json!("onetry")]);
-    common::poll_until(|| b.rpc_ok("getbestblockhash", vec![]) == tip, test_timeout(60), "B never synced from A");
+    b.rpc_ok(
+        "addnode",
+        vec![
+            json!(format!("127.0.0.1:{}", a.p2p_port.unwrap())),
+            json!("onetry"),
+        ],
+    );
+    common::poll_until(
+        || b.rpc_ok("getbestblockhash", vec![]) == tip,
+        test_timeout(60),
+        "B never synced from A",
+    );
     assert_eq!(strip(&a, &hash).expect("strip")["outcome"], "stripped");
 
     // A restart with the option off: the stripped block keeps A limited, and
@@ -1279,38 +1574,67 @@ fn restoring_the_last_stripped_block_makes_a_full_node_again() {
     let port_arg = format!("--port={a_port}");
     let mut a = TestNode::start_with_datadir(&datadir, rpcport, &[&port_arg]);
     assert!(!network(&a), "premise: limited while a block is stripped");
-    a.rpc_ok("addnode", vec![json!(format!("127.0.0.1:{}", b.p2p_port.unwrap())), json!("onetry")]);
+    a.rpc_ok(
+        "addnode",
+        vec![
+            json!(format!("127.0.0.1:{}", b.p2p_port.unwrap())),
+            json!("onetry"),
+        ],
+    );
     // Until a peer has finished its handshake, `getblockfrompeer` refuses it.
     common::poll_until(
         || {
-            a.rpc_ok("getpeerinfo", vec![]).as_array().unwrap().iter().any(|p| {
-                a.rpc_call_with_params("getblockfrompeer", vec![json!(hash), p["id"].clone()]).unwrap()["error"]
-                    .is_null()
-            })
+            a.rpc_ok("getpeerinfo", vec![])
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|p| {
+                    a.rpc_call_with_params("getblockfrompeer", vec![json!(hash), p["id"].clone()])
+                        .unwrap()["error"]
+                        .is_null()
+                })
         },
         test_timeout(30),
         "A never asked B for the block",
     );
     common::poll_until(
-        || a.rpc_call_with_params("getblock", vec![json!(hash), json!(0)]).unwrap()["result"] == raw,
+        || {
+            a.rpc_call_with_params("getblock", vec![json!(hash), json!(0)])
+                .unwrap()["result"]
+                == raw
+        },
         test_timeout(30),
         "the block was never restored",
     );
     // A new tip wakes the worker from its idle wait.
-    let addr = DeterministicWallet::from_secret([0x5b; 32]).address.to_string();
+    let addr = DeterministicWallet::from_secret([0x5b; 32])
+        .address
+        .to_string();
     mine(&a, 1, &addr);
-    common::poll_until(|| network(&a), test_timeout(60), "A never advertised NODE_NETWORK again");
+    common::poll_until(
+        || network(&a),
+        test_timeout(60),
+        "A never advertised NODE_NETWORK again",
+    );
     assert_eq!(a.rpc_ok("getopreturnpruneinfo", vec![])["blocks"], 0);
 
     let mut c = TestNode::start(&[]);
-    c.rpc_ok("addnode", vec![json!(format!("127.0.0.1:{a_port}")), json!("onetry")]);
+    c.rpc_ok(
+        "addnode",
+        vec![json!(format!("127.0.0.1:{a_port}")), json!("onetry")],
+    );
     common::poll_until(
         || {
             c.rpc_ok("getpeerinfo", vec![])
                 .as_array()
                 .unwrap()
                 .iter()
-                .any(|p| p["servicesnames"].as_array().unwrap().contains(&json!("NETWORK")))
+                .any(|p| {
+                    p["servicesnames"]
+                        .as_array()
+                        .unwrap()
+                        .contains(&json!("NETWORK"))
+                })
         },
         test_timeout(30),
         "a new peer never saw NODE_NETWORK in A's version",
@@ -1320,8 +1644,15 @@ fn restoring_the_last_stripped_block_makes_a_full_node_again() {
 
     a.stop();
     a.datadir = PathBuf::new();
-    let cfs = rocksdb::DB::list_cf(&rocksdb::Options::default(), datadir.join("regtest").join("chainstate")).unwrap();
-    assert!(!cfs.iter().any(|n| n == "opreturn_strip"), "the strip family is gone: {cfs:?}");
+    let cfs = rocksdb::DB::list_cf(
+        &rocksdb::Options::default(),
+        datadir.join("regtest").join("chainstate"),
+    )
+    .unwrap();
+    assert!(
+        !cfs.iter().any(|n| n == "opreturn_strip"),
+        "the strip family is gone: {cfs:?}"
+    );
     let mut a = TestNode::start_with_datadir(&datadir, rpcport, &[]);
     assert!(network(&a), "a full node after a restart");
     assert_eq!(a.rpc_ok("getblock", vec![json!(hash), json!(0)]), raw);
@@ -1331,7 +1662,13 @@ fn restoring_the_last_stripped_block_makes_a_full_node_again() {
 
 /// A transaction paying `wallet` back with one OP_RETURN of `len` bytes (the
 /// whole scriptPubKey), spending coinbase `coinbase`. Returns its txid.
-fn send_op_return(node: &TestNode, wallet: &DeterministicWallet, coinbase: u64, len: usize, byte: u8) -> String {
+fn send_op_return(
+    node: &TestNode,
+    wallet: &DeterministicWallet,
+    coinbase: u64,
+    len: usize,
+    byte: u8,
+) -> String {
     use bitcoin::blockdata::opcodes::all::OP_RETURN;
     use bitcoin::script::{Builder, PushBytesBuf};
 
@@ -1355,14 +1692,23 @@ fn send_op_return(node: &TestNode, wallet: &DeterministicWallet, coinbase: u64, 
     );
     node.rpc_ok(
         "sendrawtransaction",
-        vec![serde_json::json!(raw), serde_json::json!(0.1), serde_json::json!(50)],
+        vec![
+            serde_json::json!(raw),
+            serde_json::json!(0.1),
+            serde_json::json!(50),
+        ],
     );
     txid
 }
 
 fn wait_for_the_worker(node: &TestNode, below: u64) -> serde_json::Value {
     common::poll_until(
-        || node.rpc_ok("getopreturnpruneinfo", vec![])["examined_below_height"].as_u64().unwrap_or(0) >= below,
+        || {
+            node.rpc_ok("getopreturnpruneinfo", vec![])["examined_below_height"]
+                .as_u64()
+                .unwrap_or(0)
+                >= below
+        },
         test_timeout(120),
         "the strip worker never examined the chain",
     );
@@ -1371,7 +1717,8 @@ fn wait_for_the_worker(node: &TestNode, below: u64) -> serde_json::Value {
 
 /// `getrawtransaction <txid>`'s whole response.
 fn raw_tx(node: &TestNode, txid: &str) -> serde_json::Value {
-    node.rpc_call_with_params("getrawtransaction", vec![serde_json::json!(txid)]).unwrap()
+    node.rpc_call_with_params("getrawtransaction", vec![serde_json::json!(txid)])
+        .unwrap()
 }
 
 /// `-pruneopreturn` end to end (plan PR 8): the worker strips what is deep and
@@ -1385,7 +1732,11 @@ fn pruneopreturn_strips_deep_large_payloads_end_to_end() {
 
     let rpcport = find_available_port();
     let datadir = fresh_test_datadir("satd-pruneopreturn-e2e");
-    let on: &[&str] = &["--pruneopreturn=288", "--pruneopreturnsize=1000", "--txindex"];
+    let on: &[&str] = &[
+        "--pruneopreturn=288",
+        "--pruneopreturnsize=1000",
+        "--txindex",
+    ];
     // The chain is built with the option off, so the block files' allocated
     // size can be taken before anything is stripped; then it is turned on.
     let mut node = TestNode::start_with_datadir(&datadir, rpcport, &["--txindex"]);
@@ -1402,17 +1753,25 @@ fn pruneopreturn_strips_deep_large_payloads_end_to_end() {
     let medium = send_op_return(&node, &wallet, 4, 500, 0x54);
     let small = send_op_return(&node, &wallet, 5, 80, 0x55);
     let block = mine(&node, 1, &addr).remove(0);
-    let height = node.rpc_ok("getblockheader", vec![json!(block)])["height"].as_u64().unwrap();
+    let height = node.rpc_ok("getblockheader", vec![json!(block)])["height"]
+        .as_u64()
+        .unwrap();
     let raw_before = node.rpc_ok("getblock", vec![json!(block), json!(0)]);
     assert_eq!(
-        node.rpc_ok("getblock", vec![json!(block), json!(1)])["tx"].as_array().unwrap().len(),
+        node.rpc_ok("getblock", vec![json!(block), json!(1)])["tx"]
+            .as_array()
+            .unwrap()
+            .len(),
         6,
         "premise: all five are in one block"
     );
     // Deep enough: more than 288 + 2 below the tip.
     mine(&node, 300, &addr);
     assert!(
-        node.rpc_ok("getnetworkinfo", vec![])["localservicesnames"].as_array().unwrap().contains(&json!("NETWORK")),
+        node.rpc_ok("getnetworkinfo", vec![])["localservicesnames"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("NETWORK")),
         "premise: a full node before the option"
     );
     let allocated_before = allocated(&node);
@@ -1441,17 +1800,32 @@ fn pruneopreturn_strips_deep_large_payloads_end_to_end() {
 
     // The surfaces: the large ones are stripped, the small ones intact.
     for txid in &big {
-        assert_eq!(raw_tx(&node, txid)["error"]["message"], "Transaction data not available (OP_RETURN data stripped)");
+        assert_eq!(
+            raw_tx(&node, txid)["error"]["message"],
+            "Transaction data not available (OP_RETURN data stripped)"
+        );
         let verbose = node.rpc_ok("getrawtransaction", vec![json!(txid), json!(1)]);
         assert_eq!(verbose["opreturn_stripped"], true, "{verbose}");
     }
     for txid in [&medium, &small] {
-        assert!(raw_tx(&node, txid)["result"].is_string(), "{txid} is intact");
+        assert!(
+            raw_tx(&node, txid)["result"].is_string(),
+            "{txid} is intact"
+        );
     }
     assert_raw_block_unavailable(&node, &block);
     let services = node.rpc_ok("getnetworkinfo", vec![])["localservicesnames"].clone();
-    assert!(!services.as_array().unwrap().contains(&json!("NETWORK")), "{services}");
-    assert!(services.as_array().unwrap().contains(&json!("NETWORK_LIMITED")), "{services}");
+    assert!(
+        !services.as_array().unwrap().contains(&json!("NETWORK")),
+        "{services}"
+    );
+    assert!(
+        services
+            .as_array()
+            .unwrap()
+            .contains(&json!("NETWORK_LIMITED")),
+        "{services}"
+    );
     assert!(!has_corrupt_warning(&node));
     node.stop();
     node.datadir = PathBuf::new();
@@ -1459,7 +1833,10 @@ fn pruneopreturn_strips_deep_large_payloads_end_to_end() {
     // A restart keeps it all.
     let mut node = TestNode::start_with_datadir(&datadir, rpcport, on);
     let again = node.rpc_ok("getopreturnpruneinfo", vec![]);
-    assert_eq!((again["blocks"].clone(), again["bytes_zeroed"].clone()), (json!(1), json!(101_000 - 3)));
+    assert_eq!(
+        (again["blocks"].clone(), again["bytes_zeroed"].clone()),
+        (json!(1), json!(101_000 - 3))
+    );
     assert_raw_block_unavailable(&node, &block);
     node.stop();
     node.datadir = PathBuf::new();
@@ -1470,14 +1847,21 @@ fn pruneopreturn_strips_deep_large_payloads_end_to_end() {
     assert_eq!(chain["opreturn_prune"]["enabled"], false, "{chain}");
     assert_eq!(chain["opreturn_prune"]["blocks"], 1, "{chain}");
     let services = node.rpc_ok("getnetworkinfo", vec![])["localservicesnames"].clone();
-    assert!(!services.as_array().unwrap().contains(&json!("NETWORK")), "still limited: {services}");
+    assert!(
+        !services.as_array().unwrap().contains(&json!("NETWORK")),
+        "still limited: {services}"
+    );
     assert_raw_block_unavailable(&node, &block);
     node.stop();
     node.datadir = PathBuf::new();
 
     // A lower threshold: the 500-byte output is stripped on the rescan; the
     // 80-byte one never is.
-    let lower: &[&str] = &["--pruneopreturn=288", "--pruneopreturnsize=400", "--txindex"];
+    let lower: &[&str] = &[
+        "--pruneopreturn=288",
+        "--pruneopreturnsize=400",
+        "--txindex",
+    ];
     let mut node = TestNode::start_with_datadir(&datadir, rpcport, lower);
     common::poll_until(
         || node.rpc_ok("getopreturnpruneinfo", vec![])["transactions"] == json!(4),
@@ -1488,8 +1872,15 @@ fn pruneopreturn_strips_deep_large_payloads_end_to_end() {
         raw_tx(&node, &medium)["error"]["message"],
         "Transaction data not available (OP_RETURN data stripped)"
     );
-    assert!(raw_tx(&node, &small)["result"].is_string(), "the 80-byte one is never stripped");
-    assert_ne!(node.rpc_call_with_params("getblock", vec![json!(block), json!(0)]).unwrap()["result"], raw_before);
+    assert!(
+        raw_tx(&node, &small)["result"].is_string(),
+        "the 80-byte one is never stripped"
+    );
+    assert_ne!(
+        node.rpc_call_with_params("getblock", vec![json!(block), json!(0)])
+            .unwrap()["result"],
+        raw_before
+    );
     assert!(!has_corrupt_warning(&node));
     node.stop();
     let _ = std::fs::remove_dir_all(&datadir);
@@ -1502,7 +1893,10 @@ struct RawPeer {
 
 impl RawPeer {
     fn connect(port: u16) -> Self {
-        Self::connect_as(port, bitcoin::p2p::ServiceFlags::NETWORK | bitcoin::p2p::ServiceFlags::WITNESS)
+        Self::connect_as(
+            port,
+            bitcoin::p2p::ServiceFlags::NETWORK | bitcoin::p2p::ServiceFlags::WITNESS,
+        )
     }
 
     /// Connect advertising `services`.
@@ -1512,17 +1906,19 @@ impl RawPeer {
         stream.set_nodelay(true).unwrap();
         let mut peer = Self { stream };
         let zero: std::net::SocketAddr = "0.0.0.0:0".parse().unwrap();
-        peer.send(NetworkMessage::Version(bitcoin::p2p::message_network::VersionMessage {
-            version: 70016,
-            services,
-            timestamp: 1_760_000_000,
-            receiver: bitcoin::p2p::Address::new(&zero, bitcoin::p2p::ServiceFlags::NONE),
-            sender: bitcoin::p2p::Address::new(&zero, services),
-            nonce: 0x5a5a_0001,
-            user_agent: "/opreturn-strip-test/".into(),
-            start_height: 0,
-            relay: false,
-        }));
+        peer.send(NetworkMessage::Version(
+            bitcoin::p2p::message_network::VersionMessage {
+                version: 70016,
+                services,
+                timestamp: 1_760_000_000,
+                receiver: bitcoin::p2p::Address::new(&zero, bitcoin::p2p::ServiceFlags::NONE),
+                sender: bitcoin::p2p::Address::new(&zero, services),
+                nonce: 0x5a5a_0001,
+                user_agent: "/opreturn-strip-test/".into(),
+                start_height: 0,
+                relay: false,
+            },
+        ));
         let mut got_version = false;
         loop {
             match peer.recv(Duration::from_secs(30)) {
@@ -1542,7 +1938,10 @@ impl RawPeer {
         let _ = self.stream.write_all(&bitcoin::consensus::serialize(&raw));
     }
 
-    fn recv(&mut self, timeout: Duration) -> std::io::Result<bitcoin::p2p::message::NetworkMessage> {
+    fn recv(
+        &mut self,
+        timeout: Duration,
+    ) -> std::io::Result<bitcoin::p2p::message::NetworkMessage> {
         use std::io::Read;
         self.stream.set_read_timeout(Some(timeout)).unwrap();
         let mut header = [0u8; 24];
@@ -1551,8 +1950,9 @@ impl RawPeer {
         let mut buf = header.to_vec();
         buf.resize(24 + len, 0);
         self.stream.read_exact(&mut buf[24..])?;
-        let raw: bitcoin::p2p::message::RawNetworkMessage = bitcoin::consensus::deserialize(&buf)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+        let raw: bitcoin::p2p::message::RawNetworkMessage =
+            bitcoin::consensus::deserialize(&buf)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
         Ok(raw.into_payload())
     }
 
@@ -1565,12 +1965,23 @@ impl RawPeer {
         use bitcoin::p2p::message_blockdata::{GetBlocksMessage, GetHeadersMessage, Inventory};
         let genesis = bitcoin::constants::genesis_block(bitcoin::Network::Regtest).block_hash();
         let zero = bitcoin::BlockHash::all_zeros();
-        self.send(NetworkMessage::GetBlocks(GetBlocksMessage::new(vec![genesis], zero)));
-        self.send(NetworkMessage::GetHeaders(GetHeadersMessage::new(vec![genesis], zero)));
+        self.send(NetworkMessage::GetBlocks(GetBlocksMessage::new(
+            vec![genesis],
+            zero,
+        )));
+        self.send(NetworkMessage::GetHeaders(GetHeadersMessage::new(
+            vec![genesis],
+            zero,
+        )));
         let mut blocks = 0;
         loop {
             match self.recv(Duration::from_secs(30)).expect("an answer") {
-                NetworkMessage::Inv(inv) => blocks += inv.iter().filter(|i| matches!(i, Inventory::Block(_))).count(),
+                NetworkMessage::Inv(inv) => {
+                    blocks += inv
+                        .iter()
+                        .filter(|i| matches!(i, Inventory::Block(_)))
+                        .count()
+                }
                 NetworkMessage::Headers(_) => return blocks,
                 NetworkMessage::Ping(n) => self.send(NetworkMessage::Pong(n)),
                 _ => {}
@@ -1589,12 +2000,19 @@ impl RawPeer {
             let left = deadline.saturating_duration_since(std::time::Instant::now());
             match self.recv(left) {
                 Ok(NetworkMessage::Block(b)) if b.block_hash() == hash => return Some(Ok(b)),
-                Ok(NetworkMessage::NotFound(inv)) if inv.iter().any(|i| i == &Inventory::WitnessBlock(hash)) => {
+                Ok(NetworkMessage::NotFound(inv))
+                    if inv.iter().any(|i| i == &Inventory::WitnessBlock(hash)) =>
+                {
                     return Some(Err(()));
                 }
                 Ok(NetworkMessage::Ping(n)) => self.send(NetworkMessage::Pong(n)),
                 Ok(_) => {}
-                Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
                     panic!("no answer for {hash}")
                 }
                 Err(_) => return None,
@@ -1620,25 +2038,39 @@ fn pruneopreturnpeers_intact_serves_deep_intact_blocks_and_notfound_for_stripped
         }
         let mut node = TestNode::start(&args);
         let stripped = block_with_a_big_op_return(&node);
-        let height = node.rpc_ok("getblockheader", vec![json!(stripped)])["height"].as_u64().unwrap();
-        let addr = DeterministicWallet::from_secret([0x65; 32]).address.to_string();
+        let height = node.rpc_ok("getblockheader", vec![json!(stripped)])["height"]
+            .as_u64()
+            .unwrap();
+        let addr = DeterministicWallet::from_secret([0x65; 32])
+            .address
+            .to_string();
         mine(&node, 500, &addr);
         common::poll_until(
             || node.rpc_ok("getopreturnpruneinfo", vec![])["blocks"] == json!(1),
             test_timeout(120),
             "the worker never stripped the block",
         );
-        let deep: bitcoin::BlockHash =
-            node.rpc_ok("getblockhash", vec![json!(height + 1)]).as_str().unwrap().parse().unwrap();
+        let deep: bitcoin::BlockHash = node
+            .rpc_ok("getblockhash", vec![json!(height + 1)])
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap();
 
         let services = u64::from_str_radix(
-            node.rpc_ok("getnetworkinfo", vec![])["localservices"].as_str().unwrap(),
+            node.rpc_ok("getnetworkinfo", vec![])["localservices"]
+                .as_str()
+                .unwrap(),
             16,
         )
         .unwrap();
         assert_eq!(services & 1, 0, "never NODE_NETWORK");
         assert_ne!(services & (1 << 10), 0, "NODE_NETWORK_LIMITED");
-        assert_eq!(services & (1 << 28) != 0, intact, "NODE_INTACT_BLOCKS only under intact");
+        assert_eq!(
+            services & (1 << 28) != 0,
+            intact,
+            "NODE_INTACT_BLOCKS only under intact"
+        );
 
         let mut peer = RawPeer::connect(node.p2p_port.unwrap());
         // `getblocks` invs only what the node would serve.
@@ -1647,10 +2079,21 @@ fn pruneopreturnpeers_intact_serves_deep_intact_blocks_and_notfound_for_stripped
             let got = peer.get_block(deep).expect("still connected");
             assert_eq!(got.expect("the intact block").block_hash(), deep);
             let stripped: bitcoin::BlockHash = stripped.parse().unwrap();
-            assert_eq!(peer.get_block(stripped), Some(Err(())), "notfound, and the peer stays");
-            assert!(peer.get_block(deep).is_some_and(|b| b.is_ok()), "still served after the notfound");
+            assert_eq!(
+                peer.get_block(stripped),
+                Some(Err(())),
+                "notfound, and the peer stays"
+            );
+            assert!(
+                peer.get_block(deep).is_some_and(|b| b.is_ok()),
+                "still served after the notfound"
+            );
         } else {
-            assert_eq!(peer.get_block(deep), None, "a limited node disconnects a deep request");
+            assert_eq!(
+                peer.get_block(deep),
+                None,
+                "a limited node disconnects a deep request"
+            );
         }
         node.stop();
     }
@@ -1684,18 +2127,26 @@ fn withhold_blocks(
             match peer.recv(Duration::from_millis(200)) {
                 Ok(NetworkMessage::Ping(n)) => peer.send(NetworkMessage::Pong(n)),
                 Ok(NetworkMessage::GetData(inv)) => {
-                    let blocks: Vec<Inventory> =
-                        inv.into_iter().filter(|i| matches!(i, Inventory::Block(_) | Inventory::WitnessBlock(_))).collect();
-                    seen.lock().unwrap().extend(blocks.iter().filter_map(|i| match i {
-                        Inventory::Block(h) | Inventory::WitnessBlock(h) => Some(*h),
-                        _ => None,
-                    }));
+                    let blocks: Vec<Inventory> = inv
+                        .into_iter()
+                        .filter(|i| matches!(i, Inventory::Block(_) | Inventory::WitnessBlock(_)))
+                        .collect();
+                    seen.lock()
+                        .unwrap()
+                        .extend(blocks.iter().filter_map(|i| match i {
+                            Inventory::Block(h) | Inventory::WitnessBlock(h) => Some(*h),
+                            _ => None,
+                        }));
                     if mode == Withhold::NotFound && !blocks.is_empty() {
                         peer.send(NetworkMessage::NotFound(blocks));
                     }
                 }
                 Ok(_) => {}
-                Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {}
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) => {}
                 Err(_) => break,
             }
         }
@@ -1707,18 +2158,33 @@ fn withhold_blocks(
 /// node B that synced the chain from it first. A is stopped when this
 /// returns. Returns A's datadir and RPC port, each stripped block's hash and
 /// raw bytes, and B.
-fn stripped_node_and_archive(n: usize, extra: &[&str]) -> (PathBuf, u16, Vec<(String, serde_json::Value)>, TestNode) {
+fn stripped_node_and_archive(
+    n: usize,
+    extra: &[&str],
+) -> (PathBuf, u16, Vec<(String, serde_json::Value)>, TestNode) {
     use serde_json::json;
     let mut args = vec!["--allowteststrip"];
     args.extend_from_slice(extra);
     let mut a = TestNode::start(&args);
     let hashes: Vec<String> = (0..n).map(|_| block_with_a_big_op_return(&a)).collect();
-    let blocks: Vec<(String, serde_json::Value)> =
-        hashes.iter().map(|h| (h.clone(), a.rpc_ok("getblock", vec![json!(h), json!(0)]))).collect();
+    let blocks: Vec<(String, serde_json::Value)> = hashes
+        .iter()
+        .map(|h| (h.clone(), a.rpc_ok("getblock", vec![json!(h), json!(0)])))
+        .collect();
     let tip = a.rpc_ok("getbestblockhash", vec![]);
     let b = TestNode::start(&[]);
-    b.rpc_ok("addnode", vec![json!(format!("127.0.0.1:{}", a.p2p_port.unwrap())), json!("onetry")]);
-    common::poll_until(|| b.rpc_ok("getbestblockhash", vec![]) == tip, test_timeout(120), "B never synced from A");
+    b.rpc_ok(
+        "addnode",
+        vec![
+            json!(format!("127.0.0.1:{}", a.p2p_port.unwrap())),
+            json!("onetry"),
+        ],
+    );
+    common::poll_until(
+        || b.rpc_ok("getbestblockhash", vec![]) == tip,
+        test_timeout(120),
+        "B never synced from A",
+    );
     for (hash, _) in &blocks {
         assert_eq!(strip(&a, hash).expect("strip")["outcome"], "stripped");
     }
@@ -1746,11 +2212,19 @@ fn prune_info(node: &TestNode) -> serde_json::Value {
 fn wait_for_the_restore(node: &TestNode, blocks: &[(String, serde_json::Value)], secs: u64) {
     use serde_json::json;
     common::poll_until(
-        || blocks.iter().all(|(h, raw)| node.rpc_call_with_params("getblock", vec![json!(h), json!(0)]).unwrap()["result"] == *raw),
+        || {
+            blocks.iter().all(|(h, raw)| {
+                node.rpc_call_with_params("getblock", vec![json!(h), json!(0)])
+                    .unwrap()["result"]
+                    == *raw
+            })
+        },
         test_timeout(secs),
         "the stripped blocks were never all restored",
     );
-    let addr = DeterministicWallet::from_secret([0x5b; 32]).address.to_string();
+    let addr = DeterministicWallet::from_secret([0x5b; 32])
+        .address
+        .to_string();
     mine(node, 1, &addr);
     common::poll_until(
         || prune_info(node)["worker"] == "restored" && advertises_network(node),
@@ -1774,25 +2248,43 @@ fn restoreopreturns_downloads_every_stripped_block_again() {
     let a_port = find_available_port();
     let port_arg = format!("--port={a_port}");
     let mut a = TestNode::start_with_datadir(&datadir, rpcport, &["--restoreopreturns", &port_arg]);
-    assert!(!advertises_network(&a), "premise: limited while blocks are stripped");
+    assert!(
+        !advertises_network(&a),
+        "premise: limited while blocks are stripped"
+    );
     let info = prune_info(&a);
     assert_eq!(info["enabled"], false, "{info}");
     assert_eq!(info["worker"], "waiting_for_peers", "no peer yet: {info}");
     // `getblockchaininfo`, which sat-tui polls, carries the same state.
     let summary = a.rpc_ok("getblockchaininfo", vec![])["opreturn_prune"].clone();
     assert_eq!(summary["worker"], "waiting_for_peers", "{summary}");
-    assert!(summary["restore"]["progress_ratio"].is_number(), "{summary}");
+    assert!(
+        summary["restore"]["progress_ratio"].is_number(),
+        "{summary}"
+    );
     let stripped_allocation = allocated(&a);
 
-    a.rpc_ok("addnode", vec![json!(format!("127.0.0.1:{}", b.p2p_port.unwrap())), json!("onetry")]);
+    a.rpc_ok(
+        "addnode",
+        vec![
+            json!(format!("127.0.0.1:{}", b.p2p_port.unwrap())),
+            json!("onetry"),
+        ],
+    );
     wait_for_the_restore(&a, &blocks, 120);
     // The restore logs its progress, not a line per block.
     let log = std::fs::read_to_string(&a.stderr_log).unwrap_or_default();
-    assert!(log.contains("OP_RETURN restore complete"), "the finish is logged: {log}");
+    assert!(
+        log.contains("OP_RETURN restore complete"),
+        "the finish is logged: {log}"
+    );
     assert!(
         !log.contains("Restored an OP_RETURN-stripped block in place"),
         "no INFO line per restored block: {}",
-        log.lines().filter(|l| l.contains("Restored")).collect::<Vec<_>>().join("\n")
+        log.lines()
+            .filter(|l| l.contains("Restored"))
+            .collect::<Vec<_>>()
+            .join("\n")
     );
     let info = prune_info(&a);
     assert_eq!(info["blocks"], 0, "{info}");
@@ -1801,39 +2293,86 @@ fn restoreopreturns_downloads_every_stripped_block_again() {
     assert_eq!(info["restore"]["remaining_blocks"], 0, "{info}");
     assert_eq!(info["restore"]["progress_ratio"], 1.0, "{info}");
     assert_eq!(info["restore"]["estimated_remaining_seconds"], 0, "{info}");
-    assert!(a.rpc_ok("getblockchaininfo", vec![]).get("opreturn_prune").is_none(), "nothing stripped: no object");
-    assert!(info["restore"]["bytes_downloaded"].as_u64().unwrap() > 2 * PAYLOAD as u64, "{info}");
+    assert!(
+        a.rpc_ok("getblockchaininfo", vec![])
+            .get("opreturn_prune")
+            .is_none(),
+        "nothing stripped: no object"
+    );
+    assert!(
+        info["restore"]["bytes_downloaded"].as_u64().unwrap() > 2 * PAYLOAD as u64,
+        "{info}"
+    );
     assert!(payload_on_disk(&a), "the payloads are back on disk");
-    assert!(allocated(&a) > stripped_allocation, "the punched space is allocated again");
+    assert!(
+        allocated(&a) > stripped_allocation,
+        "the punched space is allocated again"
+    );
     assert!(!has_corrupt_warning(&a));
     for (hash, _) in &blocks {
         let block = a.rpc_ok("getblock", vec![json!(hash), json!(2)]);
         let ours = a.rpc_ok("getblock", vec![json!(hash), json!(0)]);
-        assert_eq!(ours, b.rpc_ok("getblock", vec![json!(hash), json!(0)]), "the archive's bytes");
+        assert_eq!(
+            ours,
+            b.rpc_ok("getblock", vec![json!(hash), json!(0)]),
+            "the archive's bytes"
+        );
         assert!(block.get("opreturn_stripped").is_none(), "{hash}");
         let txid = block["tx"][1]["txid"].as_str().unwrap();
-        assert!(a.rpc_call_with_params("getrawtransaction", vec![json!(txid), json!(0), json!(hash)]).unwrap()["result"].is_string());
+        assert!(
+            a.rpc_call_with_params(
+                "getrawtransaction",
+                vec![json!(txid), json!(0), json!(hash)]
+            )
+            .unwrap()["result"]
+                .is_string()
+        );
     }
     b.stop();
 
     // A new peer sees NODE_NETWORK and syncs the whole chain from A alone,
     // blocks far deeper than 288 included.
-    let addr = DeterministicWallet::from_secret([0x5b; 32]).address.to_string();
+    let addr = DeterministicWallet::from_secret([0x5b; 32])
+        .address
+        .to_string();
     mine(&a, 100, &addr);
-    assert!(a.rpc_ok("getblockcount", vec![]).as_u64().unwrap() > 300, "premise: a chain deeper than 288");
+    assert!(
+        a.rpc_ok("getblockcount", vec![]).as_u64().unwrap() > 300,
+        "premise: a chain deeper than 288"
+    );
     let tip = a.rpc_ok("getbestblockhash", vec![]);
     let c = TestNode::start(&[]);
-    c.rpc_ok("addnode", vec![json!(format!("127.0.0.1:{a_port}")), json!("onetry")]);
-    common::poll_until(|| c.rpc_ok("getbestblockhash", vec![]) == tip, test_timeout(120), "C never synced from A");
+    c.rpc_ok(
+        "addnode",
+        vec![json!(format!("127.0.0.1:{a_port}")), json!("onetry")],
+    );
+    common::poll_until(
+        || c.rpc_ok("getbestblockhash", vec![]) == tip,
+        test_timeout(120),
+        "C never synced from A",
+    );
     let a_seen = c.rpc_ok("getpeerinfo", vec![]);
-    assert!(a_seen[0]["servicesnames"].as_array().unwrap().contains(&json!("NETWORK")), "{a_seen}");
+    assert!(
+        a_seen[0]["servicesnames"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("NETWORK")),
+        "{a_seen}"
+    );
     let mut c = c;
     c.stop();
 
     a.stop();
     a.datadir = PathBuf::new();
-    let cfs = rocksdb::DB::list_cf(&rocksdb::Options::default(), datadir.join("regtest").join("chainstate")).unwrap();
-    assert!(!cfs.iter().any(|n| n == "opreturn_strip"), "the strip family is gone: {cfs:?}");
+    let cfs = rocksdb::DB::list_cf(
+        &rocksdb::Options::default(),
+        datadir.join("regtest").join("chainstate"),
+    )
+    .unwrap();
+    assert!(
+        !cfs.iter().any(|n| n == "opreturn_strip"),
+        "the strip family is gone: {cfs:?}"
+    );
     // Without the flag: an ordinary unpruned node.
     let mut a = TestNode::start_with_datadir(&datadir, rpcport, &[]);
     assert!(advertises_network(&a), "a full node after a restart");
@@ -1849,7 +2388,9 @@ fn restoreopreturns_on_a_node_that_never_stripped_does_nothing() {
     let rpcport = find_available_port();
     let datadir = fresh_test_datadir("satd-restore-never-stripped");
     let mut node = TestNode::start_with_datadir(&datadir, rpcport, &["--restoreopreturns"]);
-    let addr = DeterministicWallet::from_secret([0x5b; 32]).address.to_string();
+    let addr = DeterministicWallet::from_secret([0x5b; 32])
+        .address
+        .to_string();
     mine(&node, 5, &addr);
     assert!(advertises_network(&node));
     let info = prune_info(&node);
@@ -1857,7 +2398,11 @@ fn restoreopreturns_on_a_node_that_never_stripped_does_nothing() {
     assert_eq!(info["restore"]["remaining_blocks"], 0, "{info}");
     node.stop();
     node.datadir = PathBuf::new();
-    let cfs = rocksdb::DB::list_cf(&rocksdb::Options::default(), datadir.join("regtest").join("chainstate")).unwrap();
+    let cfs = rocksdb::DB::list_cf(
+        &rocksdb::Options::default(),
+        datadir.join("regtest").join("chainstate"),
+    )
+    .unwrap();
     assert!(!cfs.iter().any(|n| n == "opreturn_strip"), "{cfs:?}");
     let _ = std::fs::remove_dir_all(&datadir);
 }
@@ -1882,7 +2427,10 @@ fn restoreopreturns_with_a_pruning_option_is_refused_at_startup() {
         .expect("run satd");
     let text = std::fs::read_to_string(&stderr).unwrap_or_default();
     assert!(!status.success(), "refused at startup: {text}");
-    assert!(text.contains("-restoreopreturns") && text.contains("-pruneopreturn"), "{text}");
+    assert!(
+        text.contains("-restoreopreturns") && text.contains("-pruneopreturn"),
+        "{text}"
+    );
     let _ = std::fs::remove_dir_all(&datadir);
 }
 
@@ -1898,9 +2446,14 @@ fn restoreopreturns_never_asks_a_limited_peer() {
     let port_arg = format!("--port={a_port}");
     let mut a = TestNode::start_with_datadir(&datadir, rpcport, &["--restoreopreturns", &port_arg]);
 
-    let intact = ServiceFlags::NETWORK_LIMITED | ServiceFlags::WITNESS | ServiceFlags::from(1u64 << 28);
+    let intact =
+        ServiceFlags::NETWORK_LIMITED | ServiceFlags::WITNESS | ServiceFlags::from(1u64 << 28);
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let (limited, asked) = withhold_blocks(RawPeer::connect_as(a_port, intact), Withhold::NotFound, stop.clone());
+    let (limited, asked) = withhold_blocks(
+        RawPeer::connect_as(a_port, intact),
+        Withhold::NotFound,
+        stop.clone(),
+    );
     common::poll_until(
         || a.rpc_ok("getpeerinfo", vec![]).as_array().unwrap().len() == 1,
         test_timeout(30),
@@ -1912,11 +2465,21 @@ fn restoreopreturns_never_asks_a_limited_peer() {
     assert_eq!(info["worker"], "waiting_for_peers", "{info}");
     assert_eq!(info["restore"]["peers"], 0, "{info}");
 
-    a.rpc_ok("addnode", vec![json!(format!("127.0.0.1:{}", b.p2p_port.unwrap())), json!("onetry")]);
+    a.rpc_ok(
+        "addnode",
+        vec![
+            json!(format!("127.0.0.1:{}", b.p2p_port.unwrap())),
+            json!("onetry"),
+        ],
+    );
     wait_for_the_restore(&a, &blocks, 120);
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
     limited.join().unwrap();
-    assert_eq!(*asked.lock().unwrap(), Vec::<bitcoin::BlockHash>::new(), "the limited peer was never asked");
+    assert_eq!(
+        *asked.lock().unwrap(),
+        Vec::<bitcoin::BlockHash>::new(),
+        "the limited peer was never asked"
+    );
     a.stop();
     b.stop();
     let _ = std::fs::remove_dir_all(&datadir);
@@ -1932,16 +2495,33 @@ fn restoreopreturns_moves_on_from_a_peer_that_withholds_blocks() {
         let (datadir, rpcport, blocks, mut b) = stripped_node_and_archive(2, &[]);
         let a_port = find_available_port();
         let port_arg = format!("--port={a_port}");
-        let mut a = TestNode::start_with_datadir(&datadir, rpcport, &["--restoreopreturns", &port_arg]);
+        let mut a =
+            TestNode::start_with_datadir(&datadir, rpcport, &["--restoreopreturns", &port_arg]);
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (withholding, asked) = withhold_blocks(RawPeer::connect(a_port), mode, stop.clone());
-        common::poll_until(|| asked.lock().unwrap().len() >= blocks.len(), test_timeout(30), "the withholding peer was never asked");
-        a.rpc_ok("addnode", vec![json!(format!("127.0.0.1:{}", b.p2p_port.unwrap())), json!("onetry")]);
+        common::poll_until(
+            || asked.lock().unwrap().len() >= blocks.len(),
+            test_timeout(30),
+            "the withholding peer was never asked",
+        );
+        a.rpc_ok(
+            "addnode",
+            vec![
+                json!(format!("127.0.0.1:{}", b.p2p_port.unwrap())),
+                json!("onetry"),
+            ],
+        );
         if mode == Withhold::NotFound {
             // At once: a `notfound` does not wait out the 15-second stall
             // timeout.
             common::poll_until(
-                || blocks.iter().all(|(h, raw)| a.rpc_call_with_params("getblock", vec![json!(h), json!(0)]).unwrap()["result"] == *raw),
+                || {
+                    blocks.iter().all(|(h, raw)| {
+                        a.rpc_call_with_params("getblock", vec![json!(h), json!(0)])
+                            .unwrap()["result"]
+                            == *raw
+                    })
+                },
                 test_timeout(10),
                 "a notfound did not move the blocks on at once",
             );
@@ -1952,7 +2532,10 @@ fn restoreopreturns_moves_on_from_a_peer_that_withholds_blocks() {
         withholding.join().unwrap();
         let asked = asked.lock().unwrap();
         for (hash, _) in &blocks {
-            assert!(asked.contains(&hash.parse().unwrap()), "the withholding peer was asked for {hash}");
+            assert!(
+                asked.contains(&hash.parse().unwrap()),
+                "the withholding peer was asked for {hash}"
+            );
         }
         a.stop();
         b.stop();
@@ -1974,11 +2557,25 @@ fn restoreopreturns_waits_for_free_space() {
         &["--restoreopreturns"],
         &[("SATD_TEST_FREE_SPACE_FILE", free.to_str().unwrap())],
     );
-    a.rpc_ok("addnode", vec![json!(format!("127.0.0.1:{}", b.p2p_port.unwrap())), json!("onetry")]);
-    common::poll_until(|| prune_info(&a)["worker"] == "waiting_for_disk", test_timeout(30), "never waited for disk");
+    a.rpc_ok(
+        "addnode",
+        vec![
+            json!(format!("127.0.0.1:{}", b.p2p_port.unwrap())),
+            json!("onetry"),
+        ],
+    );
+    common::poll_until(
+        || prune_info(&a)["worker"] == "waiting_for_disk",
+        test_timeout(30),
+        "never waited for disk",
+    );
     std::thread::sleep(Duration::from_secs(5));
     assert_eq!(prune_info(&a)["worker"], "waiting_for_disk");
-    assert_eq!(prune_info(&a)["blocks"], 1, "nothing restored while waiting");
+    assert_eq!(
+        prune_info(&a)["blocks"],
+        1,
+        "nothing restored while waiting"
+    );
     std::fs::write(&free, (1u64 << 40).to_string()).unwrap();
     wait_for_the_restore(&a, &blocks, 120);
     a.stop();
@@ -1992,8 +2589,15 @@ fn restoreopreturns_waits_for_free_space() {
 fn restoreopreturns_on_a_pruning_node() {
     use serde_json::json;
     let (datadir, rpcport, blocks, mut b) = stripped_node_and_archive(2, &[]);
-    let mut a = TestNode::start_with_datadir(&datadir, rpcport, &["--restoreopreturns", "--prune=1"]);
-    a.rpc_ok("addnode", vec![json!(format!("127.0.0.1:{}", b.p2p_port.unwrap())), json!("onetry")]);
+    let mut a =
+        TestNode::start_with_datadir(&datadir, rpcport, &["--restoreopreturns", "--prune=1"]);
+    a.rpc_ok(
+        "addnode",
+        vec![
+            json!(format!("127.0.0.1:{}", b.p2p_port.unwrap())),
+            json!("onetry"),
+        ],
+    );
     common::poll_until(
         || prune_info(&a)["blocks"] == 0,
         test_timeout(120),
@@ -2002,10 +2606,20 @@ fn restoreopreturns_on_a_pruning_node() {
     for (hash, raw) in &blocks {
         assert_eq!(a.rpc_ok("getblock", vec![json!(hash), json!(0)]), *raw);
     }
-    let addr = DeterministicWallet::from_secret([0x5b; 32]).address.to_string();
+    let addr = DeterministicWallet::from_secret([0x5b; 32])
+        .address
+        .to_string();
     mine(&a, 1, &addr);
-    common::poll_until(|| prune_info(&a)["worker"] == "restored", test_timeout(90), "never finished");
-    assert_eq!(a.rpc_ok("getblockchaininfo", vec![])["pruned"], true, "still pruning");
+    common::poll_until(
+        || prune_info(&a)["worker"] == "restored",
+        test_timeout(90),
+        "never finished",
+    );
+    assert_eq!(
+        a.rpc_ok("getblockchaininfo", vec![])["pruned"],
+        true,
+        "still pruning"
+    );
     assert!(!advertises_network(&a), "a pruning node stays limited");
     a.stop();
     b.stop();

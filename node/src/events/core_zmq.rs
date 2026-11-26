@@ -124,7 +124,10 @@ pub struct CoreZmqStatus {
 }
 
 impl CoreZmqStatus {
-    pub fn new(notifiers: Vec<CoreZmqNotifier>, sockets: Vec<Weak<dyn CoreZmqSocketStats>>) -> Self {
+    pub fn new(
+        notifiers: Vec<CoreZmqNotifier>,
+        sockets: Vec<Weak<dyn CoreZmqSocketStats>>,
+    ) -> Self {
         Self {
             notifiers,
             sockets,
@@ -207,7 +210,11 @@ impl CoreZmqStatus {
 
     /// Messages dropped for full subscriber queues, across every socket.
     pub fn subscriber_drops_total(&self) -> u64 {
-        self.sockets.iter().filter_map(Weak::upgrade).map(|s| s.dropped_total()).sum()
+        self.sockets
+            .iter()
+            .filter_map(Weak::upgrade)
+            .map(|s| s.dropped_total())
+            .sum()
     }
 }
 
@@ -226,11 +233,26 @@ mod tests {
         assert_eq!(
             names,
             [
-                ("hashblock", "zmqpubhashblock", "zmqpubhashblockhwm", "pubhashblock"),
+                (
+                    "hashblock",
+                    "zmqpubhashblock",
+                    "zmqpubhashblockhwm",
+                    "pubhashblock"
+                ),
                 ("hashtx", "zmqpubhashtx", "zmqpubhashtxhwm", "pubhashtx"),
-                ("rawblock", "zmqpubrawblock", "zmqpubrawblockhwm", "pubrawblock"),
+                (
+                    "rawblock",
+                    "zmqpubrawblock",
+                    "zmqpubrawblockhwm",
+                    "pubrawblock"
+                ),
                 ("rawtx", "zmqpubrawtx", "zmqpubrawtxhwm", "pubrawtx"),
-                ("sequence", "zmqpubsequence", "zmqpubsequencehwm", "pubsequence"),
+                (
+                    "sequence",
+                    "zmqpubsequence",
+                    "zmqpubsequencehwm",
+                    "pubsequence"
+                ),
             ]
         );
         for (i, t) in CoreZmqTopic::ALL.iter().enumerate() {

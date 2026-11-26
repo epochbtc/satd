@@ -13,58 +13,102 @@ fn mempool_help() -> Vec<Line<'static>> {
         heading("Summary Strip"),
         label("Txs", "Unconfirmed transactions currently in the mempool."),
         label("Bytes", "Total mempool size in bytes."),
-        label("Min / Max", "Cheapest / most expensive fee rate admitted (sat/vB)."),
-        label("Δ last Ns", "Net change in tx count and bytes since the previous 10-second snapshot."),
+        label(
+            "Min / Max",
+            "Cheapest / most expensive fee rate admitted (sat/vB).",
+        ),
+        label(
+            "Δ last Ns",
+            "Net change in tx count and bytes since the previous 10-second snapshot.",
+        ),
         blank(),
         heading("Quarantine (only while a transaction-filtering policy is loaded)"),
-        Line::from(vec![
-            Span::styled("  Transactions the policy holds without relaying or mining them.", Style::default().fg(Color::White)),
-        ]),
-        Line::from(vec![
-            Span::styled("  They are not in the Txs / Bytes counts above, which cover relayed txs only.", Style::default().fg(Color::Gray)),
-        ]),
-        label("Held", "Quarantined txs and bytes, against the quarantinemempool budget."),
-        label("Confirmed anyway", "Quarantined txs later seen in a block (since satd started)."),
-        label("Foregone fees", "Fees above the template floor of txs withheld from block templates."),
-        label("rule", "Rule holding the txs; rules holding none are dimmed."),
+        Line::from(vec![Span::styled(
+            "  Transactions the policy holds without relaying or mining them.",
+            Style::default().fg(Color::White),
+        )]),
+        Line::from(vec![Span::styled(
+            "  They are not in the Txs / Bytes counts above, which cover relayed txs only.",
+            Style::default().fg(Color::Gray),
+        )]),
+        label(
+            "Held",
+            "Quarantined txs and bytes, against the quarantinemempool budget.",
+        ),
+        label(
+            "Confirmed anyway",
+            "Quarantined txs later seen in a block (since satd started).",
+        ),
+        label(
+            "Foregone fees",
+            "Fees above the template floor of txs withheld from block templates.",
+        ),
+        label(
+            "rule",
+            "Rule holding the txs; rules holding none are dimmed.",
+        ),
         label("sat/vB", "Fee-rate range of the txs that rule holds."),
-        label("matched", "Times the rule matched since the ruleset loaded."),
+        label(
+            "matched",
+            "Times the rule matched since the ruleset loaded.",
+        ),
         blank(),
         heading("Feerate Histogram"),
-        Line::from(vec![
-            Span::styled("  Distribution of mempool weight across fee-rate bands.", Style::default().fg(Color::White)),
-        ]),
-        Line::from(vec![
-            Span::styled("  Bar color tracks fee-tier thresholds (High/Medium/Low/None).", Style::default().fg(Color::Gray)),
-        ]),
-        Line::from(vec![
-            Span::styled("  Trailing number = vbyte total in the bucket.", Style::default().fg(Color::Gray)),
-        ]),
+        Line::from(vec![Span::styled(
+            "  Distribution of mempool weight across fee-rate bands.",
+            Style::default().fg(Color::White),
+        )]),
+        Line::from(vec![Span::styled(
+            "  Bar color tracks fee-tier thresholds (High/Medium/Low/None).",
+            Style::default().fg(Color::Gray),
+        )]),
+        Line::from(vec![Span::styled(
+            "  Trailing number = vbyte total in the bucket.",
+            Style::default().fg(Color::Gray),
+        )]),
         blank(),
         heading("Fee Tiers (mempool.space convention)"),
         label("High", "Next-block target (1 block)."),
         label("Medium", "~30-minute target (3 blocks)."),
         label("Low", "~1-hour target (6 blocks)."),
-        label("None", "Economy: cheap but reasonable, clamped to min-relay floor."),
-        label("mode / confidence", "Estimator data source + headline quality."),
+        label(
+            "None",
+            "Economy: cheap but reasonable, clamped to min-relay floor.",
+        ),
+        label(
+            "mode / confidence",
+            "Estimator data source + headline quality.",
+        ),
         blank(),
         heading("Trend Sparklines (~40 min)"),
-        label("Bytes", "Total mempool bytes over time (from getmempoolhistory)."),
+        label(
+            "Bytes",
+            "Total mempool bytes over time (from getmempoolhistory).",
+        ),
         label("Txs", "Mempool entry count over time."),
         label("MinFee", "Minimum-accepted fee rate over time (sat/kvB)."),
         blank(),
         heading("Top by Ancestor Feerate"),
         label("#", "Ranking from highest to lowest effective feerate."),
         label("vsize", "Transaction virtual size (vbytes)."),
-        label("anc sat/vB", "Ancestor-adjusted effective feerate (CPFP-aware)."),
-        label("A/D", "Ancestor count / Descendant count — chain depth in either direction."),
+        label(
+            "anc sat/vB",
+            "Ancestor-adjusted effective feerate (CPFP-aware).",
+        ),
+        label(
+            "A/D",
+            "Ancestor count / Descendant count — chain depth in either direction.",
+        ),
         label("age", "Time since the tx entered the mempool."),
         blank(),
         heading("Keyboard"),
         label("q", "Quit (or close help / reorgs)"),
         label("h / ?", "Toggle this help screen"),
         label("r", "Toggle reorg history (last 7 days)"),
-        label("1 / 2 / 3 / 4", "Force IBD / Steady / Mempool / Chain view (press again for auto)"),
+        label(
+            "1 / 2 / 3 / 4",
+            "Force IBD / Steady / Mempool / Chain view (press again for auto)",
+        ),
         label("Up / Down", "Scroll the top-N table"),
     ]
 }
@@ -77,7 +121,9 @@ pub fn draw(f: &mut Frame, state: &AppState) {
         .border_style(Style::default().fg(Color::DarkGray))
         .title(Span::styled(
             " Help ",
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
         ));
 
     let chunks = Layout::default()
@@ -115,7 +161,9 @@ pub fn draw(f: &mut Frame, state: &AppState) {
 fn heading(text: &str) -> Line<'static> {
     Line::from(Span::styled(
         text.to_string(),
-        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
     ))
 }
 
@@ -131,8 +179,13 @@ fn label(key: &str, desc: &str) -> Line<'static> {
 /// the node serves peer behaviour data.
 fn extra_keys(state: &AppState) -> Vec<Line<'static>> {
     let mut out = Vec::new();
-    if state.peer_behavior.is_some() && matches!(state.active_mode(), ViewMode::Ibd | ViewMode::Steady) {
-        out.push(label("Enter", "Peer detail: fingerprint, flags with evidence, counters (Esc closes)"));
+    if state.peer_behavior.is_some()
+        && matches!(state.active_mode(), ViewMode::Ibd | ViewMode::Steady)
+    {
+        out.push(label(
+            "Enter",
+            "Peer detail: fingerprint, flags with evidence, counters (Esc closes)",
+        ));
         out.push(label("f", "Show only flagged peers / all peers"));
     }
     if state.nap_available() {
@@ -145,7 +198,10 @@ fn extra_keys(state: &AppState) -> Vec<Line<'static>> {
 /// peers views list them.
 fn peer_behaviour_lines() -> Line<'static> {
     Line::from(vec![
-        Span::styled(format!("  {:<14}", "Flags"), Style::default().fg(Color::Cyan)),
+        Span::styled(
+            format!("  {:<14}", "Flags"),
+            Style::default().fg(Color::Cyan),
+        ),
         Span::styled(
             "Behaviour flags (C crawler, S spy, F fingerprint mismatch, A addr abuse, H height lie, \
              N notfound, T stalling): yellow one, red S or two or more. '≠' after the agent: \
@@ -164,44 +220,83 @@ fn nap_help() -> Vec<Line<'static>> {
         heading("NAP View  --  Node Attestation Protocol"),
         blank(),
         heading("NAP Panel"),
-        label("Publisher", "nap=1: attestations this node serves to peers, and how many are valid."),
-        label("Aggregator", "napaggregator=1: the report on attestations collected from peers."),
-        label("Held", "Attestations the aggregator holds; counting = the ones that count at the tip."),
-        label("invalid", "Attestations whose signatures failed (0 for the node's own set)."),
-        label("UTXO total", "Value of every coin at the tip: the denominator of coverage."),
-        label("digest", "SHA256 of the held set; a replayed snapshot with it gives the same report."),
+        label(
+            "Publisher",
+            "nap=1: attestations this node serves to peers, and how many are valid.",
+        ),
+        label(
+            "Aggregator",
+            "napaggregator=1: the report on attestations collected from peers.",
+        ),
+        label(
+            "Held",
+            "Attestations the aggregator holds; counting = the ones that count at the tip.",
+        ),
+        label(
+            "invalid",
+            "Attestations whose signatures failed (0 for the node's own set).",
+        ),
+        label(
+            "UTXO total",
+            "Value of every coin at the tip: the denominator of coverage.",
+        ),
+        label(
+            "digest",
+            "SHA256 of the held set; a replayed snapshot with it gives the same report.",
+        ),
         blank(),
         heading("Report Table"),
-        Line::from(vec![
-            Span::styled("  Each key in bold, then its values, heaviest first. Weight is coin value.", Style::default().fg(Color::White)),
-        ]),
+        Line::from(vec![Span::styled(
+            "  Each key in bold, then its values, heaviest first. Weight is coin value.",
+            Style::default().fg(Color::White),
+        )]),
         label("Share", "A value's part of its key's participating weight."),
         label("Weight", "Value of the coins attesting, in BTC."),
         label("Coverage", "Weight as a part of the UTXO total."),
         label("Coins", "Outpoints attesting."),
-        label("Withdrawn", "Weight of coins that withdrew from the key; not in any share."),
-        Line::from(vec![
-            Span::styled("  Percentages are rounded down from the node's parts per million.", Style::default().fg(Color::Gray)),
-        ]),
+        label(
+            "Withdrawn",
+            "Weight of coins that withdrew from the key; not in any share.",
+        ),
+        Line::from(vec![Span::styled(
+            "  Percentages are rounded down from the node's parts per million.",
+            Style::default().fg(Color::Gray),
+        )]),
         blank(),
         heading("Breakdown (selected value)"),
-        label("Value", "Weight by coin size: <0.01, 0.01-1, 1-100, >=100 BTC."),
-        label("Anchor age", "Weight by how old the attestation's anchor block is."),
+        label(
+            "Value",
+            "Weight by coin size: <0.01, 0.01-1, 1-100, >=100 BTC.",
+        ),
+        label(
+            "Anchor age",
+            "Weight by how old the attestation's anchor block is.",
+        ),
         label("Coin age", "Weight by how long ago the coin was created."),
         label("Script", "Weight by output type."),
-        label("top N", "Share of the value's weight held by its N heaviest coins."),
+        label(
+            "top N",
+            "Share of the value's weight held by its N heaviest coins.",
+        ),
         blank(),
         heading("Published Table"),
-        label("Status", "`valid`, or the rule the attestation fails at the tip."),
-        Line::from(vec![
-            Span::styled("  Keys and values are holder-chosen; anything but printable ASCII shows as ?.", Style::default().fg(Color::Gray)),
-        ]),
+        label(
+            "Status",
+            "`valid`, or the rule the attestation fails at the tip.",
+        ),
+        Line::from(vec![Span::styled(
+            "  Keys and values are holder-chosen; anything but printable ASCII shows as ?.",
+            Style::default().fg(Color::Gray),
+        )]),
         blank(),
         heading("Keyboard"),
         label("q", "Quit (or close help / reorgs)"),
         label("h / ?", "Toggle this help screen"),
         label("r", "Toggle reorg history (last 7 days)"),
-        label("1 / 2 / 3 / 4", "Force IBD / Steady / Mempool / Chain view (press again for auto)"),
+        label(
+            "1 / 2 / 3 / 4",
+            "Force IBD / Steady / Mempool / Chain view (press again for auto)",
+        ),
         label("Up / Down", "Select a value for the breakdown"),
     ]
 }
@@ -211,18 +306,32 @@ fn ibd_help() -> Vec<Line<'static>> {
         heading("IBD View  --  Initial Block Download"),
         blank(),
         heading("Progress Bar"),
-        label("Blocks / Target", "Connected blocks vs network chain tip (from peers)."),
-        label("blk/s", "Rate at which blocks are connected to the chain (EMA smoothed)."),
-        label("hdr/s", "Rate at which block headers are being received from peers."),
-        label("ETA", "Estimated time to sync, based on current blk/s rate."),
+        label(
+            "Blocks / Target",
+            "Connected blocks vs network chain tip (from peers).",
+        ),
+        label(
+            "blk/s",
+            "Rate at which blocks are connected to the chain (EMA smoothed).",
+        ),
+        label(
+            "hdr/s",
+            "Rate at which block headers are being received from peers.",
+        ),
+        label(
+            "ETA",
+            "Estimated time to sync, based on current blk/s rate.",
+        ),
         blank(),
         heading("Block Map"),
-        Line::from(vec![
-            Span::styled("  Visualizes the state of every block in the download range.", Style::default().fg(Color::White)),
-        ]),
-        Line::from(vec![
-            Span::styled("  Each character represents a group of blocks. Colors:", Style::default().fg(Color::White)),
-        ]),
+        Line::from(vec![Span::styled(
+            "  Visualizes the state of every block in the download range.",
+            Style::default().fg(Color::White),
+        )]),
+        Line::from(vec![Span::styled(
+            "  Each character represents a group of blocks. Colors:",
+            Style::default().fg(Color::White),
+        )]),
         Line::from(vec![
             Span::styled("  \u{2588}", Style::default().fg(Color::Green)),
             Span::styled(" Connected   ", Style::default().fg(Color::White)),
@@ -233,30 +342,54 @@ fn ibd_help() -> Vec<Line<'static>> {
             Span::styled("\u{00B7}", Style::default().fg(Color::DarkGray)),
             Span::styled(" Pending", Style::default().fg(Color::White)),
         ]),
-        Line::from(vec![
-            Span::styled("  Connected = validated and added to chain. Downloaded = stored on disk,", Style::default().fg(Color::Gray)),
-        ]),
-        Line::from(vec![
-            Span::styled("  awaiting sequential connection. In-flight = requested from a peer,", Style::default().fg(Color::Gray)),
-        ]),
-        Line::from(vec![
-            Span::styled("  awaiting response. Pending = queued for download.", Style::default().fg(Color::Gray)),
-        ]),
+        Line::from(vec![Span::styled(
+            "  Connected = validated and added to chain. Downloaded = stored on disk,",
+            Style::default().fg(Color::Gray),
+        )]),
+        Line::from(vec![Span::styled(
+            "  awaiting sequential connection. In-flight = requested from a peer,",
+            Style::default().fg(Color::Gray),
+        )]),
+        Line::from(vec![Span::styled(
+            "  awaiting response. Pending = queued for download.",
+            Style::default().fg(Color::Gray),
+        )]),
         blank(),
         heading("Sync Rate Sparklines"),
-        label("Top (yellow)", "Blocks connected per second over the last ~90 seconds."),
-        label("Bottom (cyan)", "Blocks downloaded per second (across all peers)."),
+        label(
+            "Top (yellow)",
+            "Blocks connected per second over the last ~90 seconds.",
+        ),
+        label(
+            "Bottom (cyan)",
+            "Blocks downloaded per second (across all peers).",
+        ),
         blank(),
         heading("Stats Panel"),
-        label("Headers", "Total block headers received (chain structure, no block data)."),
-        label("Connected", "Blocks fully validated and added to the chain tip."),
-        label("Stored", "Blocks downloaded and stored but not yet connected."),
-        label("In-Flight", "Block requests sent to peers, awaiting response."),
+        label(
+            "Headers",
+            "Total block headers received (chain structure, no block data).",
+        ),
+        label(
+            "Connected",
+            "Blocks fully validated and added to the chain tip.",
+        ),
+        label(
+            "Stored",
+            "Blocks downloaded and stored but not yet connected.",
+        ),
+        label(
+            "In-Flight",
+            "Block requests sent to peers, awaiting response.",
+        ),
         label("Remaining", "Blocks still queued for download."),
         blank(),
         heading("Peer Table"),
         label("Recv", "Total blocks received from this peer during IBD."),
-        label("Assigned", "Blocks currently assigned to this peer for download."),
+        label(
+            "Assigned",
+            "Blocks currently assigned to this peer for download.",
+        ),
         label("Rate", "Per-peer download rate in blocks/second."),
         peer_behaviour_lines(),
         blank(),
@@ -264,7 +397,10 @@ fn ibd_help() -> Vec<Line<'static>> {
         label("q", "Quit (or close help / reorgs)"),
         label("h / ?", "Toggle this help screen"),
         label("r", "Toggle reorg history (last 7 days)"),
-        label("1 / 2 / 3 / 4", "Force IBD / Steady / Mempool / Chain view (press again for auto)"),
+        label(
+            "1 / 2 / 3 / 4",
+            "Force IBD / Steady / Mempool / Chain view (press again for auto)",
+        ),
         label("Up / Down", "Scroll the peer table"),
     ]
 }
@@ -274,64 +410,116 @@ fn chain_help() -> Vec<Line<'static>> {
         heading("Chain & Issuance View  --  Long-horizon chain stats"),
         blank(),
         heading("Halvings Panel"),
-        label("Subsidy Epoch", "Halving epoch index (0 = pre-first-halving)."),
+        label(
+            "Subsidy Epoch",
+            "Halving epoch index (0 = pre-first-halving).",
+        ),
         label("Subsidy", "Block reward at the current tip, in BTC."),
         label("Halving In", "Blocks remaining until the next halving."),
         label("Halving ETA", "Wall-clock estimate at 10 min/block."),
         blank(),
         heading("Difficulty Retarget Panel"),
-        label("Blocks to Retarget", "Distance to the next 2016-block boundary."),
+        label(
+            "Blocks to Retarget",
+            "Distance to the next 2016-block boundary.",
+        ),
         label("Retarget ETA", "Wall-clock estimate at 10 min/block."),
-        label("Block Time (epoch)", "Average seconds/block within the current epoch."),
-        label("Δ Est", "Predicted % change at next retarget (clamped to ±300%)."),
+        label(
+            "Block Time (epoch)",
+            "Average seconds/block within the current epoch.",
+        ),
+        label(
+            "Δ Est",
+            "Predicted % change at next retarget (clamped to ±300%).",
+        ),
         blank(),
         heading("Supply / Issuance Panel"),
         label("Issued", "Total BTC currently in the UTXO set."),
         label("% Issued", "Fraction of the 21M cap that has been mined."),
         label("Remaining", "BTC still to be issued before the supply cap."),
         label("Realized", "Annual inflation rate at the current subsidy."),
-        label("Forward", "Annual inflation projected for the next halving epoch."),
+        label(
+            "Forward",
+            "Annual inflation projected for the next halving epoch.",
+        ),
         blank(),
         heading("Chain Security Panel"),
-        label("Chain Work", "Cumulative work as bits (≈ log2 of chainwork)."),
-        label("Rewrite", "Seconds an attacker at network hashrate would need to redo all work."),
+        label(
+            "Chain Work",
+            "Cumulative work as bits (≈ log2 of chainwork).",
+        ),
+        label(
+            "Rewrite",
+            "Seconds an attacker at network hashrate would need to redo all work.",
+        ),
         label("Hashrate", "Network hashrate from getmininginfo."),
         blank(),
         heading("Peer Clients Panel"),
-        Line::from(vec![
-            Span::styled("  Top user-agent strings among connected peers, with %.", Style::default().fg(Color::White)),
-        ]),
-        Line::from(vec![
-            Span::styled("  Long tail collapses into 'other'.", Style::default().fg(Color::Gray)),
-        ]),
-        Line::from(vec![
-            Span::styled("  With peer behaviour data: by observed family instead, a mismatch as", Style::default().fg(Color::Gray)),
-        ]),
-        Line::from(vec![
-            Span::styled("  'observed [claimed]', then the number of fingerprint mismatches.", Style::default().fg(Color::Gray)),
-        ]),
+        Line::from(vec![Span::styled(
+            "  Top user-agent strings among connected peers, with %.",
+            Style::default().fg(Color::White),
+        )]),
+        Line::from(vec![Span::styled(
+            "  Long tail collapses into 'other'.",
+            Style::default().fg(Color::Gray),
+        )]),
+        Line::from(vec![Span::styled(
+            "  With peer behaviour data: by observed family instead, a mismatch as",
+            Style::default().fg(Color::Gray),
+        )]),
+        Line::from(vec![Span::styled(
+            "  'observed [claimed]', then the number of fingerprint mismatches.",
+            Style::default().fg(Color::Gray),
+        )]),
         blank(),
         heading("Trivia Panel"),
         label("Era index", "Halving epoch (alias for Subsidy Epoch)."),
         label("Next halving", "Approximate calendar date at 10 min/block."),
-        label("Block at retarget", "Height of the upcoming retarget block."),
+        label(
+            "Block at retarget",
+            "Height of the upcoming retarget block.",
+        ),
         blank(),
         heading("Network Survey Row (satd with -peersurvey=1)"),
-        label("Network Survey", "Addresses surveyed in the last 30 days; share by observed family (top 8, then 'other'); non-Core share."),
-        label("Survey Detail", "v2 and mismatch shares; top 5 AS (with -asmap); last survey connection; connection counts; addresses probed."),
-        label("Short terminal", "The row collapses to one 'survey:' line above the footer."),
+        label(
+            "Network Survey",
+            "Addresses surveyed in the last 30 days; share by observed family (top 8, then 'other'); non-Core share.",
+        ),
+        label(
+            "Survey Detail",
+            "v2 and mismatch shares; top 5 AS (with -asmap); last survey connection; connection counts; addresses probed.",
+        ),
+        label(
+            "Short terminal",
+            "The row collapses to one 'survey:' line above the footer.",
+        ),
         blank(),
         heading("Network Crawl Row (satd with -crawl=1)"),
-        label("Network Crawl", "State (running, held and why, stopped); addresses reachable now; share by observed family (top 8, then 'other'); non-Core share."),
-        label("Crawl Detail", "Reachable by network; v2 + v1, v1 only (v2 failed), v1 no v2 ad (v2 not advertised, never tried), v2 only, v2 unchecked; mismatches; sessions reached and unreached; sessions open against the limits; book size."),
-        label("Survey row", "With the crawl on, one 'survey: superseded by the crawl' line, if -peersurvey was asked for too."),
-        label("Short terminal", "The row collapses to one 'crawl:' line above the footer."),
+        label(
+            "Network Crawl",
+            "State (running, held and why, stopped); addresses reachable now; share by observed family (top 8, then 'other'); non-Core share.",
+        ),
+        label(
+            "Crawl Detail",
+            "Reachable by network; v2 + v1, v1 only (v2 failed), v1 no v2 ad (v2 not advertised, never tried), v2 only, v2 unchecked; mismatches; sessions reached and unreached; sessions open against the limits; book size.",
+        ),
+        label(
+            "Survey row",
+            "With the crawl on, one 'survey: superseded by the crawl' line, if -peersurvey was asked for too.",
+        ),
+        label(
+            "Short terminal",
+            "The row collapses to one 'crawl:' line above the footer.",
+        ),
         blank(),
         heading("Keyboard"),
         label("q", "Quit (or close help / reorgs)"),
         label("h / ?", "Toggle this help screen"),
         label("r", "Toggle reorg history (last 7 days)"),
-        label("1 / 2 / 3 / 4", "Force IBD / Steady / Mempool / Chain view (press again for auto)"),
+        label(
+            "1 / 2 / 3 / 4",
+            "Force IBD / Steady / Mempool / Chain view (press again for auto)",
+        ),
     ]
 }
 
@@ -342,32 +530,54 @@ fn steady_help() -> Vec<Line<'static>> {
         heading("Chain Panel"),
         label("Height", "Current block height (chain tip)."),
         label("Difficulty", "Current mining difficulty target."),
-        label("Hash Rate", "Estimated network hash rate (from getmininginfo)."),
+        label(
+            "Hash Rate",
+            "Estimated network hash rate (from getmininginfo).",
+        ),
         label("Last Block", "Time since the most recent block was mined."),
         blank(),
         heading("Latest Block Panel"),
         label("Txs", "Number of transactions in the tip block."),
-        label("Size / Weight", "Size in bytes and weight units of the block's transactions, coinbase excluded (getblockstats total_size, total_weight)."),
+        label(
+            "Size / Weight",
+            "Size in bytes and weight units of the block's transactions, coinbase excluded (getblockstats total_size, total_weight).",
+        ),
         label("Fees", "Total transaction fees collected in the block."),
-        label("Avg Rate", "Total fees over the transactions' weight, coinbase excluded (sat/vB)."),
+        label(
+            "Avg Rate",
+            "Total fees over the transactions' weight, coinbase excluded (sat/vB).",
+        ),
         blank(),
         heading("Mempool Panel"),
         label("Txs", "Unconfirmed transactions waiting for inclusion."),
         label("Size", "Total size of mempool transactions."),
         label("Min Rate", "Minimum fee rate to enter the mempool."),
         label("Tx Rate", "Transactions entering the mempool per second."),
-        label("Distribution", "Sparkline showing transaction count by vByte size bucket."),
+        label(
+            "Distribution",
+            "Sparkline showing transaction count by vByte size bucket.",
+        ),
         blank(),
         heading("Fees Panel"),
-        Line::from(vec![
-            Span::styled("  Fee rate tiers derived from `estimatefees` (mempool-based).", Style::default().fg(Color::White)),
-        ]),
+        Line::from(vec![Span::styled(
+            "  Fee rate tiers derived from `estimatefees` (mempool-based).",
+            Style::default().fg(Color::White),
+        )]),
         label("High", "Next-block inclusion target (1 block)."),
         label("Medium", "Within ~30 minutes (3 blocks)."),
         label("Low", "Within ~1 hour (6 blocks)."),
-        label("None", "Economy tier — cheap but reasonable, derived from min-relay floor."),
-        label("mode", "`historical` | `mempool` | `blend` — data source used by the estimator."),
-        label("confidence", "`high` | `medium` | `low` — quality indicator for the top-tier estimate."),
+        label(
+            "None",
+            "Economy tier — cheap but reasonable, derived from min-relay floor.",
+        ),
+        label(
+            "mode",
+            "`historical` | `mempool` | `blend` — data source used by the estimator.",
+        ),
+        label(
+            "confidence",
+            "`high` | `medium` | `low` — quality indicator for the top-tier estimate.",
+        ),
         blank(),
         heading("UTXO Set Panel"),
         label("UTXOs", "Total unspent transaction outputs in the chain."),
@@ -381,14 +591,20 @@ fn steady_help() -> Vec<Line<'static>> {
         peer_behaviour_lines(),
         blank(),
         heading("Network Panel"),
-        label("Peers", "Connected peers (inbound accepting / outbound initiated)."),
+        label(
+            "Peers",
+            "Connected peers (inbound accepting / outbound initiated).",
+        ),
         label("Recv / Sent", "Total bytes transferred with all peers."),
         blank(),
         heading("Keyboard"),
         label("q", "Quit (or close help / reorgs)"),
         label("h / ?", "Toggle this help screen"),
         label("r", "Toggle reorg history (last 7 days)"),
-        label("1 / 2 / 3 / 4", "Force IBD / Steady / Mempool / Chain view (press again for auto)"),
+        label(
+            "1 / 2 / 3 / 4",
+            "Force IBD / Steady / Mempool / Chain view (press again for auto)",
+        ),
         label("Up / Down", "Scroll the peer table"),
     ]
 }
@@ -411,7 +627,9 @@ mod tests {
         let mut st = AppState::new();
         st.force_mode = Some(ViewMode::Steady);
         assert!(keys(&st).is_empty(), "no behaviour data");
-        st.update_peer_behavior(crate::behavior::classify(Ok(crate::behavior::tests::reply())));
+        st.update_peer_behavior(crate::behavior::classify(Ok(
+            crate::behavior::tests::reply(),
+        )));
         assert_eq!(keys(&st), ["Enter", "f"]);
         st.force_mode = Some(ViewMode::Ibd);
         assert_eq!(keys(&st), ["Enter", "f"]);

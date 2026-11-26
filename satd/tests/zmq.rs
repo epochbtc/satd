@@ -57,7 +57,10 @@ struct Sub {
 
 impl Sub {
     fn connect(endpoint: &str, topics: &[&str]) -> Self {
-        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
         let mut socket = zeromq::SubSocket::new();
         rt.block_on(async {
             socket.connect(endpoint).await.expect("connect");
@@ -70,10 +73,17 @@ impl Sub {
 
     fn recv(&mut self, timeout: Duration) -> Option<Msg> {
         let socket = &mut self.socket;
-        let msg = self.rt.block_on(async { tokio::time::timeout(timeout, socket.recv()).await }).ok()?;
+        let msg = self
+            .rt
+            .block_on(async { tokio::time::timeout(timeout, socket.recv()).await })
+            .ok()?;
         let msg = msg.expect("recv");
         let frames: Vec<Vec<u8>> = msg.into_vec().into_iter().map(|b| b.to_vec()).collect();
-        assert_eq!(frames.len(), 3, "a Core ZMQ message has three frames: {frames:?}");
+        assert_eq!(
+            frames.len(),
+            3,
+            "a Core ZMQ message has three frames: {frames:?}"
+        );
         Some(Msg {
             topic: String::from_utf8(frames[0].clone()).expect("ascii topic"),
             body: frames[1].clone(),
@@ -143,7 +153,10 @@ fn sync_up(node: &TestNode, subs: &mut [&mut Sub], addr: &str) -> Vec<String> {
     let deadline = Instant::now() + test_timeout(60);
     let mut ready = vec![false; subs.len()];
     while !ready.iter().all(|r| *r) {
-        assert!(Instant::now() < deadline, "subscribers never received a message");
+        assert!(
+            Instant::now() < deadline,
+            "subscribers never received a message"
+        );
         mined.extend(mine(node, 1, addr));
         for (i, sub) in subs.iter_mut().enumerate() {
             if !ready[i] && sub.recv(Duration::from_secs(1)).is_some() {
@@ -162,7 +175,10 @@ fn sync_up(node: &TestNode, subs: &mut [&mut Sub], addr: &str) -> Vec<String> {
 #[test]
 fn zmq_basic_topics_shared_socket() {
     let port = find_available_port();
-    let args: Vec<String> = TOPICS.iter().map(|t| format!("--zmqpub{t}={}", tcp(port))).collect();
+    let args: Vec<String> = TOPICS
+        .iter()
+        .map(|t| format!("--zmqpub{t}={}", tcp(port)))
+        .collect();
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     let mut node = TestNode::start(&args);
     let addr = wallet().address.to_string();
@@ -177,11 +193,19 @@ fn zmq_basic_topics_shared_socket() {
         let coinbase = &block.txdata[0];
         let m = &msgs[i * 5..i * 5 + 5];
         let topics: Vec<&str> = m.iter().map(|m| m.topic.as_str()).collect();
-        assert_eq!(topics, ["hashtx", "rawtx", "sequence", "hashblock", "rawblock"], "block {i}");
+        assert_eq!(
+            topics,
+            ["hashtx", "rawtx", "sequence", "hashblock", "rawblock"],
+            "block {i}"
+        );
         assert_eq!(m[0].hash_hex(), coinbase.compute_txid().to_string());
         let rawtx: Transaction = deserialize(&m[1].body).expect("rawtx deserializes");
         assert_eq!(rawtx.compute_txid(), coinbase.compute_txid());
-        assert_eq!(m[1].body, serialize(coinbase), "rawtx is the witness serialization");
+        assert_eq!(
+            m[1].body,
+            serialize(coinbase),
+            "rawtx is the witness serialization"
+        );
         assert_eq!(m[2].sequence(), (hash.clone(), 'C', None));
         assert_eq!(m[3].hash_hex(), *hash);
         let rawblock: Block = deserialize(&m[4].body).expect("rawblock deserializes");
@@ -201,13 +225,19 @@ fn zmq_basic_topics_shared_socket() {
 #[test]
 fn zmq_per_topic_sockets() {
     let ports: Vec<u16> = TOPICS.iter().map(|_| find_available_port()).collect();
-    let args: Vec<String> =
-        TOPICS.iter().zip(&ports).map(|(t, p)| format!("--zmqpub{t}={}", tcp(*p))).collect();
+    let args: Vec<String> = TOPICS
+        .iter()
+        .zip(&ports)
+        .map(|(t, p)| format!("--zmqpub{t}={}", tcp(*p)))
+        .collect();
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     let mut node = TestNode::start(&args);
     let addr = wallet().address.to_string();
 
-    let mut subs: Vec<Sub> = ports.iter().map(|p| Sub::connect(&tcp(*p), &[""])).collect();
+    let mut subs: Vec<Sub> = ports
+        .iter()
+        .map(|p| Sub::connect(&tcp(*p), &[""]))
+        .collect();
     {
         let mut refs: Vec<&mut Sub> = subs.iter_mut().collect();
         sync_up(&node, &mut refs, &addr);
@@ -217,7 +247,10 @@ fn zmq_per_topic_sockets() {
         let m = sub.take(2);
         assert!(m.iter().all(|m| m.topic == *topic), "{topic} socket: {m:?}");
         assert_eq!(m[1].seq, m[0].seq + 1, "{topic} counter");
-        assert!(sub.drain(Duration::from_millis(300)).is_empty(), "{topic}: one per block");
+        assert!(
+            sub.drain(Duration::from_millis(300)).is_empty(),
+            "{topic}: one per block"
+        );
     }
     node.stop();
 }
@@ -226,7 +259,10 @@ fn zmq_per_topic_sockets() {
 /// mature (spendable by [`wallet`]) and a subscriber synced to it.
 fn mempool_fixture() -> (TestNode, Sub, DeterministicWallet) {
     let port = find_available_port();
-    let args: Vec<String> = TOPICS.iter().map(|t| format!("--zmqpub{t}={}", tcp(port))).collect();
+    let args: Vec<String> = TOPICS
+        .iter()
+        .map(|t| format!("--zmqpub{t}={}", tcp(port)))
+        .collect();
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     let node = TestNode::start(&args);
     let w = wallet();
@@ -238,7 +274,10 @@ fn mempool_fixture() -> (TestNode, Sub, DeterministicWallet) {
 }
 
 fn send(node: &TestNode, raw_hex: &str) -> String {
-    node.rpc_ok("sendrawtransaction", vec![json!(raw_hex)]).as_str().unwrap().to_string()
+    node.rpc_ok("sendrawtransaction", vec![json!(raw_hex)])
+        .as_str()
+        .unwrap()
+        .to_string()
 }
 
 /// A mempool admission: `hashtx`, `rawtx` (the witness serialization, so it
@@ -284,7 +323,10 @@ fn zmq_rawtx_for_replaced_tx() {
     send(&node, &raw2);
 
     let m = sub.take(7);
-    let got: Vec<(&str, Vec<u8>)> = m.iter().map(|m| (m.topic.as_str(), m.body.clone())).collect();
+    let got: Vec<(&str, Vec<u8>)> = m
+        .iter()
+        .map(|m| (m.topic.as_str(), m.body.clone()))
+        .collect();
     assert_eq!(got[1], ("rawtx", hex::decode(&raw1).unwrap()));
     assert_eq!(m[2].sequence(), (txid1.clone(), 'A', Some(before)));
     assert_eq!(m[3].sequence(), (txid1, 'R', Some(before + 1)));
@@ -307,14 +349,32 @@ fn zmq_block_republishes_mempool_txs() {
 
     let hash = mine(&node, 1, &w.address.to_string()).remove(0);
     let block = block_at(&node, &hash);
-    assert_eq!(block.txdata.len(), 2, "fixture: the block mines the transaction");
+    assert_eq!(
+        block.txdata.len(),
+        2,
+        "fixture: the block mines the transaction"
+    );
     let m = sub.take(7);
     let topics: Vec<&str> = m.iter().map(|m| m.topic.as_str()).collect();
-    assert_eq!(topics, ["hashtx", "rawtx", "hashtx", "rawtx", "sequence", "hashblock", "rawblock"]);
+    assert_eq!(
+        topics,
+        [
+            "hashtx",
+            "rawtx",
+            "hashtx",
+            "rawtx",
+            "sequence",
+            "hashblock",
+            "rawblock"
+        ]
+    );
     assert_eq!(m[2].hash_hex(), txid);
     assert_eq!(m[3].body, hex::decode(&raw).unwrap());
     assert_eq!(m[4].sequence(), (hash.clone(), 'C', None));
-    assert!(sub.drain(Duration::from_millis(500)).is_empty(), "no R for a mined transaction");
+    assert!(
+        sub.drain(Duration::from_millis(500)).is_empty(),
+        "no R for a mined transaction"
+    );
     node.stop();
 }
 
@@ -327,7 +387,12 @@ fn sign_p2wpkh_inputs(tx: &mut Transaction, w: &DeterministicWallet, amounts: &[
     let mut cache = SighashCache::new(tx.clone());
     for (i, amount) in amounts.iter().enumerate() {
         let sighash = cache
-            .p2wpkh_signature_hash(i, &spk, bitcoin::Amount::from_sat(*amount), EcdsaSighashType::All)
+            .p2wpkh_signature_hash(
+                i,
+                &spk,
+                bitcoin::Amount::from_sat(*amount),
+                EcdsaSighashType::All,
+            )
             .expect("sighash");
         let mut sig = secp
             .sign_ecdsa(&Message::from_digest(sighash.to_byte_array()), &w.sk)
@@ -353,8 +418,14 @@ fn zmq_package_parent_before_child() {
         &node,
         &w,
         vec![
-            bitcoin::TxOut { value: bitcoin::Amount::ZERO, script_pubkey: spk.clone() },
-            bitcoin::TxOut { value: bitcoin::Amount::from_sat(coin), script_pubkey: spk.clone() },
+            bitcoin::TxOut {
+                value: bitcoin::Amount::ZERO,
+                script_pubkey: spk.clone(),
+            },
+            bitcoin::TxOut {
+                value: bitcoin::Amount::from_sat(coin),
+                script_pubkey: spk.clone(),
+            },
         ],
     );
     let parent: Transaction = deserialize(&hex::decode(&parent_raw).unwrap()).unwrap();
@@ -363,7 +434,10 @@ fn zmq_package_parent_before_child() {
         lock_time: bitcoin::absolute::LockTime::ZERO,
         input: (0..2)
             .map(|vout| bitcoin::TxIn {
-                previous_output: bitcoin::OutPoint { txid: parent.compute_txid(), vout },
+                previous_output: bitcoin::OutPoint {
+                    txid: parent.compute_txid(),
+                    vout,
+                },
                 script_sig: bitcoin::ScriptBuf::new(),
                 sequence: bitcoin::Sequence::MAX,
                 witness: bitcoin::Witness::new(),
@@ -385,7 +459,10 @@ fn zmq_package_parent_before_child() {
 
     let m = sub.take(6);
     let topics: Vec<&str> = m.iter().map(|m| m.topic.as_str()).collect();
-    assert_eq!(topics, ["hashtx", "rawtx", "sequence", "hashtx", "rawtx", "sequence"]);
+    assert_eq!(
+        topics,
+        ["hashtx", "rawtx", "sequence", "hashtx", "rawtx", "sequence"]
+    );
     assert_eq!(m[0].hash_hex(), parent_txid);
     assert_eq!(m[1].body, hex::decode(&parent_raw).unwrap());
     assert_eq!(m[2].sequence(), (parent_txid, 'A', Some(before)));
@@ -440,12 +517,16 @@ fn build_block(prev: BlockHash, height: u32, time: u32, extra: Vec<Transaction>)
 }
 
 fn submit(node: &TestNode, method: &str, bytes: Vec<u8>) {
-    let r = node.rpc_call_with_params(method, vec![json!(hex::encode(bytes))]).expect("rpc");
+    let r = node
+        .rpc_call_with_params(method, vec![json!(hex::encode(bytes))])
+        .expect("rpc");
     assert!(r["error"].is_null(), "{method}: {r}");
 }
 
 fn template_time(node: &TestNode) -> u32 {
-    node.rpc_ok("getblocktemplate", vec![])["curtime"].as_u64().unwrap() as u32
+    node.rpc_ok("getblocktemplate", vec![])["curtime"]
+        .as_u64()
+        .unwrap() as u32
 }
 
 /// A reorg publishes `D` for each disconnected block newest first, `C` for
@@ -455,7 +536,10 @@ fn template_time(node: &TestNode) -> u32 {
 #[test]
 fn zmq_reorg_single_tip_update() {
     let port = find_available_port();
-    let args: Vec<String> = TOPICS.iter().map(|t| format!("--zmqpub{t}={}", tcp(port))).collect();
+    let args: Vec<String> = TOPICS
+        .iter()
+        .map(|t| format!("--zmqpub{t}={}", tcp(port)))
+        .collect();
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     let mut node = TestNode::start(&args);
     let addr = wallet().address.to_string();
@@ -464,7 +548,13 @@ fn zmq_reorg_single_tip_update() {
 
     let old = mine(&node, 2, &addr);
     sub.take(10);
-    let fork: BlockHash = node.rpc_ok("getblockhash", vec![json!(node.rpc_ok("getblockcount", vec![]).as_u64().unwrap() - 2)])
+    let fork: BlockHash = node
+        .rpc_ok(
+            "getblockhash",
+            vec![json!(
+                node.rpc_ok("getblockcount", vec![]).as_u64().unwrap() - 2
+            )],
+        )
         .as_str()
         .unwrap()
         .parse()
@@ -477,9 +567,16 @@ fn zmq_reorg_single_tip_update() {
     for b in [&b1, &b2] {
         submit(&node, "submitblock", serialize(b));
     }
-    assert_eq!(node.rpc_ok("getbestblockhash", vec![]).as_str().unwrap(), old[1], "fixture: no reorg yet");
+    assert_eq!(
+        node.rpc_ok("getbestblockhash", vec![]).as_str().unwrap(),
+        old[1],
+        "fixture: no reorg yet"
+    );
     submit(&node, "submitblock", serialize(&b3));
-    assert_eq!(node.rpc_ok("getbestblockhash", vec![]).as_str().unwrap(), b3.block_hash().to_string());
+    assert_eq!(
+        node.rpc_ok("getbestblockhash", vec![]).as_str().unwrap(),
+        b3.block_hash().to_string()
+    );
 
     let m = sub.take(17);
     let seq: Vec<(String, char)> = m
@@ -500,8 +597,16 @@ fn zmq_reorg_single_tip_update() {
             (b3.block_hash().to_string(), 'C'),
         ]
     );
-    let tips: Vec<String> = m.iter().filter(|m| m.topic == "hashblock").map(Msg::hash_hex).collect();
-    assert_eq!(tips, vec![b3.block_hash().to_string()], "one tip update, for the new tip");
+    let tips: Vec<String> = m
+        .iter()
+        .filter(|m| m.topic == "hashblock")
+        .map(Msg::hash_hex)
+        .collect();
+    assert_eq!(
+        tips,
+        vec![b3.block_hash().to_string()],
+        "one tip update, for the new tip"
+    );
     let raw: Vec<&Msg> = m.iter().filter(|m| m.topic == "rawblock").collect();
     assert_eq!(raw.len(), 1);
     assert_eq!(raw[0].body, serialize(&b3));
@@ -524,7 +629,9 @@ fn zmq_reorg_announces_each_block_past_the_old_tip() {
         &format!("--zmqpubsequence={}", tcp(port)),
     ]);
     let addr = wallet().address.to_string();
-    let other = DeterministicWallet::from_secret([0x5b; 32]).address.to_string();
+    let other = DeterministicWallet::from_secret([0x5b; 32])
+        .address
+        .to_string();
     let mut sub = Sub::connect(&tcp(port), &[""]);
     sync_up(&node, &mut [&mut sub], &addr);
 
@@ -533,11 +640,18 @@ fn zmq_reorg_announces_each_block_past_the_old_tip() {
     let b = mine(&node, 5, &other);
     node.rpc_ok("reconsiderblock", vec![json!(a1)]);
     node.rpc_ok("invalidateblock", vec![json!(b[0])]);
-    assert_eq!(node.rpc_ok("getbestblockhash", vec![]).as_str().unwrap(), a1, "fixture: A active, B stored");
+    assert_eq!(
+        node.rpc_ok("getbestblockhash", vec![]).as_str().unwrap(),
+        a1,
+        "fixture: A active, B stored"
+    );
     sub.drain(Duration::from_millis(500));
 
     node.rpc_ok("reconsiderblock", vec![json!(b[0])]);
-    assert_eq!(node.rpc_ok("getbestblockhash", vec![]).as_str().unwrap(), b[4]);
+    assert_eq!(
+        node.rpc_ok("getbestblockhash", vec![]).as_str().unwrap(),
+        b[4]
+    );
     let got: Vec<String> = sub
         .take(10)
         .iter()
@@ -548,14 +662,26 @@ fn zmq_reorg_announces_each_block_past_the_old_tip() {
             } else {
                 (m.hash_hex(), m.topic.clone())
             };
-            let name = if hash == a1 { "A1".to_string() } else { format!("B{}", b.iter().position(|h| *h == hash).unwrap() + 1) };
+            let name = if hash == a1 {
+                "A1".to_string()
+            } else {
+                format!("B{}", b.iter().position(|h| *h == hash).unwrap() + 1)
+            };
             format!("{label} {name}")
         })
         .collect();
     assert_eq!(
         got,
         [
-            "D A1", "C B1", "C B2", "hashblock B2", "C B3", "hashblock B3", "C B4", "hashblock B4", "C B5",
+            "D A1",
+            "C B1",
+            "C B2",
+            "hashblock B2",
+            "C B3",
+            "hashblock B3",
+            "C B4",
+            "hashblock B4",
+            "C B5",
             "hashblock B5",
         ],
     );
@@ -583,20 +709,42 @@ fn zmq_invalidate_no_hashblock() {
     // Block-derived: the block's two transactions, then D. Mempool-derived:
     // the re-admitted transaction. No order is promised between the groups.
     let m = sub.take(8);
-    assert!(m.iter().all(|m| m.topic != "hashblock" && m.topic != "rawblock"), "{m:#?}");
-    let seq: Vec<(String, char, Option<u64>)> =
-        m.iter().filter(|m| m.topic == "sequence").map(Msg::sequence).collect();
+    assert!(
+        m.iter()
+            .all(|m| m.topic != "hashblock" && m.topic != "rawblock"),
+        "{m:#?}"
+    );
+    let seq: Vec<(String, char, Option<u64>)> = m
+        .iter()
+        .filter(|m| m.topic == "sequence")
+        .map(Msg::sequence)
+        .collect();
     assert_eq!(seq.len(), 2);
     assert!(seq.contains(&(hash.clone(), 'D', None)), "{seq:?}");
     assert!(seq.contains(&(txid.clone(), 'A', Some(before))), "{seq:?}");
-    assert_eq!(m.iter().filter(|m| m.topic == "hashtx" && m.hash_hex() == txid).count(), 2);
+    assert_eq!(
+        m.iter()
+            .filter(|m| m.topic == "hashtx" && m.hash_hex() == txid)
+            .count(),
+        2
+    );
 
     // Another address, or the template rebuilds the invalidated block.
-    let other = DeterministicWallet::from_secret([0x5b; 32]).address.to_string();
+    let other = DeterministicWallet::from_secret([0x5b; 32])
+        .address
+        .to_string();
     let next = mine(&node, 1, &other).remove(0);
     let m = sub.take(7);
-    let tips: Vec<String> = m.iter().filter(|m| m.topic == "hashblock").map(Msg::hash_hex).collect();
-    assert_eq!(tips, vec![next], "the block after an invalidation is announced");
+    let tips: Vec<String> = m
+        .iter()
+        .filter(|m| m.topic == "hashblock")
+        .map(Msg::hash_hex)
+        .collect();
+    assert_eq!(
+        tips,
+        vec![next],
+        "the block after an invalidation is announced"
+    );
     node.stop();
 }
 
@@ -618,7 +766,10 @@ fn zmq_ibd_suppresses_tip_update() {
     // Sync up on old blocks: each gives exactly one `sequence C`.
     let deadline = Instant::now() + test_timeout(60);
     loop {
-        assert!(Instant::now() < deadline, "subscriber never received a message");
+        assert!(
+            Instant::now() < deadline,
+            "subscriber never received a message"
+        );
         height += 1;
         let b = build_block(prev, height, genesis.header.time + height, vec![]);
         prev = b.block_hash();
@@ -633,7 +784,10 @@ fn zmq_ibd_suppresses_tip_update() {
     submit(&node, "submitblock", serialize(&old));
     let m = sub.take(1);
     assert_eq!(m[0].sequence(), (old.block_hash().to_string(), 'C', None));
-    assert!(sub.drain(Duration::from_millis(500)).is_empty(), "no tip update in IBD");
+    assert!(
+        sub.drain(Duration::from_millis(500)).is_empty(),
+        "no tip update in IBD"
+    );
 
     let now = mine(&node, 1, &wallet().address.to_string()).remove(0);
     let m = sub.take(2);
@@ -667,7 +821,12 @@ fn zmq_getzmqnotifications_shape() {
         ])
     );
     let help = node.rpc_ok("help", vec![]);
-    assert!(help.as_str().unwrap().contains("== Zmq ==\ngetzmqnotifications"), "{help}");
+    assert!(
+        help.as_str()
+            .unwrap()
+            .contains("== Zmq ==\ngetzmqnotifications"),
+        "{help}"
+    );
     node.stop();
 }
 
@@ -677,7 +836,10 @@ fn zmq_getzmqnotifications_shape() {
 fn zmq_bad_endpoint_is_non_fatal() {
     let mut node = TestNode::start(&["--zmqpubrawtx=foo", "--zmqpubhashtx=bar"]);
     assert_eq!(node.rpc_ok("getzmqnotifications", vec![]), json!([]));
-    assert!(node.rpc_ok("getblockcount", vec![]).is_u64(), "the node is up");
+    assert!(
+        node.rpc_ok("getblockcount", vec![]).is_u64(),
+        "the node is up"
+    );
     node.stop();
 }
 
@@ -686,8 +848,11 @@ fn zmq_bad_endpoint_is_non_fatal() {
 #[test]
 fn zmq_port_validation_error_text() {
     let dir = common::fresh_test_datadir("satd-zmq-port");
-    let (status, stderr) =
-        common::run_satd_until_exit(&dir, &["--zmqpubrawtx=127.0.0.1:notaport"], test_timeout(60));
+    let (status, stderr) = common::run_satd_until_exit(
+        &dir,
+        &["--zmqpubrawtx=127.0.0.1:notaport"],
+        test_timeout(60),
+    );
     assert!(!status.success());
     assert!(
         stderr.contains("Invalid port specified in -zmqpubrawtx: '127.0.0.1:notaport'"),
@@ -728,22 +893,40 @@ fn zmq_large_block_rawblock_prompt() {
         version: bitcoin::transaction::Version(2),
         lock_time: bitcoin::absolute::LockTime::ZERO,
         input: vec![bitcoin::TxIn {
-            previous_output: bitcoin::OutPoint { txid: funding.compute_txid(), vout: 0 },
+            previous_output: bitcoin::OutPoint {
+                txid: funding.compute_txid(),
+                vout: 0,
+            },
             script_sig: bitcoin::ScriptBuf::new(),
             sequence: bitcoin::Sequence::MAX,
             witness: bitcoin::Witness::new(),
         }],
         output: (0..95)
-            .map(|_| bitcoin::TxOut { value: bitcoin::Amount::ZERO, script_pubkey: big_script.clone() })
+            .map(|_| bitcoin::TxOut {
+                value: bitcoin::Amount::ZERO,
+                script_pubkey: big_script.clone(),
+            })
             .collect(),
     };
-    let tip: BlockHash = node.rpc_ok("getbestblockhash", vec![]).as_str().unwrap().parse().unwrap();
+    let tip: BlockHash = node
+        .rpc_ok("getbestblockhash", vec![])
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
     let height = node.rpc_ok("getblockcount", vec![]).as_u64().unwrap() as u32;
     let big = build_block(tip, height + 1, template_time(&node), vec![spend]);
     let bytes = serialize(&big);
-    assert!(big.weight().to_wu() > 3_700_000, "fixture: {} WU", big.weight().to_wu());
+    assert!(
+        big.weight().to_wu() > 3_700_000,
+        "fixture: {} WU",
+        big.weight().to_wu()
+    );
     submit(&node, "submitblock", bytes.clone());
-    assert_eq!(node.rpc_ok("getbestblockhash", vec![]).as_str().unwrap(), big.block_hash().to_string());
+    assert_eq!(
+        node.rpc_ok("getbestblockhash", vec![]).as_str().unwrap(),
+        big.block_hash().to_string()
+    );
 
     let m = sub.take(1);
     assert_eq!(m[0].body.len(), bytes.len());
@@ -761,7 +944,10 @@ fn zmq_unconfigured_is_inert() {
         .unwrap()
         .text()
         .unwrap();
-    assert!(!page.contains("satd_zmq_"), "no ZMQ metrics without a publisher");
+    assert!(
+        !page.contains("satd_zmq_"),
+        "no ZMQ metrics without a publisher"
+    );
     node.stop();
 }
 
@@ -780,7 +966,10 @@ fn zmq_metrics_count_messages_and_subscribers() {
         .text()
         .unwrap();
     assert!(
-        page.contains(&format!("satd_zmq_messages_total{{topic=\"hashblock\"}} {}", mined.len())),
+        page.contains(&format!(
+            "satd_zmq_messages_total{{topic=\"hashblock\"}} {}",
+            mined.len()
+        )),
         "{page}"
     );
     assert!(page.contains("satd_zmq_subscribers 1"), "{page}");
@@ -797,7 +986,12 @@ fn zmq_stored_tail_block_published() {
     let mut sub = Sub::connect(&tcp(port), &["hashblock"]);
     sync_up(&node, &mut [&mut sub], &wallet().address.to_string());
 
-    let tip: BlockHash = node.rpc_ok("getbestblockhash", vec![]).as_str().unwrap().parse().unwrap();
+    let tip: BlockHash = node
+        .rpc_ok("getbestblockhash", vec![])
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
     let height = node.rpc_ok("getblockcount", vec![]).as_u64().unwrap() as u32;
     let time = template_time(&node);
     let parent = build_block(tip, height + 1, time, vec![]);
@@ -805,11 +999,21 @@ fn zmq_stored_tail_block_published() {
     submit(&node, "submitheader", serialize(&parent.header));
     submit(&node, "submitheader", serialize(&child.header));
     submit(&node, "submitblock", serialize(&child));
-    assert_eq!(node.rpc_ok("getblockcount", vec![]).as_u64().unwrap() as u32, height, "fixture: the child waits");
+    assert_eq!(
+        node.rpc_ok("getblockcount", vec![]).as_u64().unwrap() as u32,
+        height,
+        "fixture: the child waits"
+    );
     submit(&node, "submitblock", serialize(&parent));
 
     let m = sub.take(2);
     let tips: Vec<String> = m.iter().map(Msg::hash_hex).collect();
-    assert_eq!(tips, vec![parent.block_hash().to_string(), child.block_hash().to_string()]);
+    assert_eq!(
+        tips,
+        vec![
+            parent.block_hash().to_string(),
+            child.block_hash().to_string()
+        ]
+    );
     node.stop();
 }

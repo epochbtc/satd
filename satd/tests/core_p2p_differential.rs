@@ -26,7 +26,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-use p2p_diff::{compare, satd_decode, seed_cases, CoreOracle, CoreVerdict, Outcome};
+use p2p_diff::{CoreOracle, CoreVerdict, Outcome, compare, satd_decode, seed_cases};
 
 fn seed_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../fuzz/seeds/p2p_differential")
@@ -38,12 +38,15 @@ fn seed_dir() -> PathBuf {
 /// saw a field, would pass the agreement check without testing anything.
 #[test]
 fn seed_cases_agree_with_core() {
-    let mut core = CoreOracle::start().unwrap_or_else(|e| panic!("could not start the Bitcoin Core oracle: {e}"));
+    let mut core = CoreOracle::start()
+        .unwrap_or_else(|e| panic!("could not start the Bitcoin Core oracle: {e}"));
     let mut failures = Vec::new();
     let mut seen: BTreeMap<&str, usize> = BTreeMap::new();
     for (name, case) in seed_cases() {
         let satd = satd_decode(&case);
-        let verdict = core.verdict(&case).unwrap_or_else(|e| panic!("{name}: the Core oracle failed: {e}"));
+        let verdict = core
+            .verdict(&case)
+            .unwrap_or_else(|e| panic!("{name}: the Core oracle failed: {e}"));
         let outcome = compare(&case, &satd, &verdict);
         eprintln!("{name}: {outcome:?}");
         match &verdict {
@@ -66,17 +69,36 @@ fn seed_cases_agree_with_core() {
         }
         match outcome {
             Outcome::Agree | Outcome::Allowed(_) => {}
-            Outcome::Skipped(why) => failures.push(format!("{name}: Core gave no verdict ({why}); a seed must be observable")),
-            Outcome::Diverge(d) => failures.push(format!("{name}: DIVERGENCE: {d}\n    case: {case}")),
+            Outcome::Skipped(why) => failures.push(format!(
+                "{name}: Core gave no verdict ({why}); a seed must be observable"
+            )),
+            Outcome::Diverge(d) => {
+                failures.push(format!("{name}: DIVERGENCE: {d}\n    case: {case}"))
+            }
         }
     }
     eprintln!("seen: {seen:?}");
-    for kind in ["accept", "reject", "ignore", "version fields", "entry count", "tx ids", "block hash"] {
+    for kind in [
+        "accept",
+        "reject",
+        "ignore",
+        "version fields",
+        "entry count",
+        "tx ids",
+        "block hash",
+    ] {
         if !seen.contains_key(kind) {
-            failures.push(format!("no seed produced a Core '{kind}': the oracle is not observing what it claims to"));
+            failures.push(format!(
+                "no seed produced a Core '{kind}': the oracle is not observing what it claims to"
+            ));
         }
     }
-    assert!(failures.is_empty(), "{} problem(s):\n{}", failures.len(), failures.join("\n"));
+    assert!(
+        failures.is_empty(),
+        "{} problem(s):\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
 }
 
 /// The committed seed corpus is the generator's output, so the nightly
@@ -84,8 +106,10 @@ fn seed_cases_agree_with_core() {
 #[test]
 fn committed_seeds_match_the_generator() {
     let dir = seed_dir();
-    let want: BTreeMap<String, Vec<u8>> =
-        seed_cases().into_iter().map(|(name, case)| (format!("{name}.bin"), case.to_bytes())).collect();
+    let want: BTreeMap<String, Vec<u8>> = seed_cases()
+        .into_iter()
+        .map(|(name, case)| (format!("{name}.bin"), case.to_bytes()))
+        .collect();
     for (name, case) in seed_cases() {
         assert_eq!(
             p2p_diff::Case::from_bytes(&case.to_bytes()).as_ref(),
@@ -107,7 +131,10 @@ fn committed_seeds_match_the_generator() {
         .unwrap_or_else(|e| panic!("{}: {e}", dir.display()))
         .map(|e| {
             let e = e.expect("dir entry");
-            (e.file_name().to_string_lossy().into_owned(), std::fs::read(e.path()).expect("read a seed"))
+            (
+                e.file_name().to_string_lossy().into_owned(),
+                std::fs::read(e.path()).expect("read a seed"),
+            )
         })
         .collect();
     assert!(
@@ -124,7 +151,8 @@ const CHILD: &str = "P2P_DIFF_TEST_CHILD";
 /// Run one test of this binary in a child process, with `CHILD` set.
 fn run_child(test: &str, mode: &str, envs: &[(&str, &std::ffi::OsStr)]) -> std::process::Output {
     let mut cmd = Command::new(std::env::current_exe().expect("test binary"));
-    cmd.args(["--exact", test, "--nocapture", "--test-threads=1"]).env(CHILD, mode);
+    cmd.args(["--exact", test, "--nocapture", "--test-threads=1"])
+        .env(CHILD, mode);
     for (k, v) in envs {
         cmd.env(k, v);
     }
@@ -137,14 +165,19 @@ fn run_child(test: &str, mode: &str, envs: &[(&str, &std::ffi::OsStr)]) -> std::
 #[test]
 fn bitcoind_does_not_outlive_its_process() {
     if std::env::var_os(CHILD).is_some_and(|m| m == "leak") {
-        let core = CoreOracle::start().unwrap_or_else(|e| panic!("could not start the Bitcoin Core oracle: {e}"));
+        let core = CoreOracle::start()
+            .unwrap_or_else(|e| panic!("could not start the Bitcoin Core oracle: {e}"));
         println!("WORK={}", core.work_dir().display());
         std::mem::forget(core);
         std::process::exit(0);
     }
     let out = run_child("bitcoind_does_not_outlive_its_process", "leak", &[]);
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(out.status.success(), "child failed: {stdout}\n{}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "child failed: {stdout}\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let work = stdout
         .lines()
         .find_map(|l| l.split_once("WORK=").map(|(_, w)| w.trim()))
@@ -155,7 +188,11 @@ fn bitcoind_does_not_outlive_its_process() {
     while work.exists() && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(100));
     }
-    assert!(!work.exists(), "{} outlived the process that started it: bitcoind is still running", work.display());
+    assert!(
+        !work.exists(),
+        "{} outlived the process that started it: bitcoind is still running",
+        work.display()
+    );
 }
 
 /// A start that fails before bitcoind runs leaves no work dir behind.
@@ -172,10 +209,20 @@ fn a_failed_start_leaves_no_work_dir() {
     let out = run_child(
         "a_failed_start_leaves_no_work_dir",
         "bad-bitcoind",
-        &[("BITCOIND", "/bin/true".as_ref()), ("P2P_DIFF_TMPDIR", scratch.path().as_os_str())],
+        &[
+            ("BITCOIND", "/bin/true".as_ref()),
+            ("P2P_DIFF_TMPDIR", scratch.path().as_os_str()),
+        ],
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(out.status.success() && stdout.contains("refused: "), "child: {stdout}\n{}", String::from_utf8_lossy(&out.stderr));
-    let left: Vec<_> = std::fs::read_dir(scratch.path()).expect("read scratch").map(|e| e.expect("entry").path()).collect();
+    assert!(
+        out.status.success() && stdout.contains("refused: "),
+        "child: {stdout}\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let left: Vec<_> = std::fs::read_dir(scratch.path())
+        .expect("read scratch")
+        .map(|e| e.expect("entry").path())
+        .collect();
     assert!(left.is_empty(), "a failed start left {left:?}");
 }

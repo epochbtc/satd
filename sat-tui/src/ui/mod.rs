@@ -10,15 +10,19 @@ pub mod startup;
 pub mod steady;
 pub mod warnings;
 
+use ratatui::layout::Constraint;
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Row, Table, Cell};
-use ratatui::layout::Constraint;
+use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table};
 
 /// The view keys for the footers: `5` is listed only while the node has NAP
 /// on, as it does nothing otherwise.
 pub fn view_keys(state: &crate::state::AppState) -> &'static str {
-    if state.nap_available() { "1/2/3/4/5" } else { "1/2/3/4" }
+    if state.nap_available() {
+        "1/2/3/4/5"
+    } else {
+        "1/2/3/4"
+    }
 }
 
 /// Format bytes as human-readable (e.g., "1.23 MB").
@@ -37,7 +41,7 @@ pub fn format_bytes(n: u64) -> String {
 /// Format a block hash for display (first 8 + ... + last 4 chars).
 pub fn format_hash(h: &str) -> String {
     if h.len() > 16 {
-        format!("{}...{}", &h[..8], &h[h.len()-4..])
+        format!("{}...{}", &h[..8], &h[h.len() - 4..])
     } else {
         h.to_string()
     }
@@ -167,10 +171,22 @@ impl PeerCol {
     fn min_width(self, ibd: bool) -> u16 {
         match self {
             PeerCol::Addr => 22,
-            PeerCol::Agent => if ibd { 20 } else { 22 },
+            PeerCol::Agent => {
+                if ibd {
+                    20
+                } else {
+                    22
+                }
+            }
             PeerCol::Flags => crate::behavior::FLAGS_WIDTH,
             PeerCol::Height => 12,
-            PeerCol::Recv => if ibd { 10 } else { 12 },
+            PeerCol::Recv => {
+                if ibd {
+                    10
+                } else {
+                    12
+                }
+            }
             PeerCol::Assigned => 8,
             PeerCol::Rate => 10,
         }
@@ -190,14 +206,26 @@ impl PeerCol {
 /// Recv's place.
 pub fn peer_columns(ibd: bool, flags: bool, width: u16) -> Vec<PeerCol> {
     let mut cols = if ibd {
-        vec![PeerCol::Addr, PeerCol::Agent, PeerCol::Recv, PeerCol::Assigned, PeerCol::Rate]
+        vec![
+            PeerCol::Addr,
+            PeerCol::Agent,
+            PeerCol::Recv,
+            PeerCol::Assigned,
+            PeerCol::Rate,
+        ]
     } else {
-        vec![PeerCol::Addr, PeerCol::Agent, PeerCol::Height, PeerCol::Recv]
+        vec![
+            PeerCol::Addr,
+            PeerCol::Agent,
+            PeerCol::Height,
+            PeerCol::Recv,
+        ]
     };
     if flags {
         cols.insert(2, PeerCol::Flags);
         // Each column at its minimum, one cell between columns, two borders.
-        let needed: u16 = cols.iter().map(|c| c.min_width(ibd)).sum::<u16>() + cols.len() as u16 - 1 + 2;
+        let needed: u16 =
+            cols.iter().map(|c| c.min_width(ibd)).sum::<u16>() + cols.len() as u16 - 1 + 2;
         if width < needed {
             cols.retain(|c| *c != PeerCol::Recv);
         }
@@ -217,7 +245,11 @@ pub fn flags_color(tone: crate::behavior::FlagsTone) -> Color {
 /// The peers table title: the count, and the filter when it is on.
 pub fn peer_title(state: &crate::state::AppState) -> String {
     if state.flag_filter_active() {
-        format!("Peers ({} connected, {} flagged)", state.connections, state.visible_peers().len())
+        format!(
+            "Peers ({} connected, {} flagged)",
+            state.connections,
+            state.visible_peers().len()
+        )
     } else {
         format!("Peers ({} connected)", state.connections)
     }
@@ -233,7 +265,11 @@ pub fn peer_keys(state: &crate::state::AppState) -> Vec<Span<'static>> {
         Span::styled(": detail  ", Style::default().fg(Color::DarkGray)),
         Span::styled("f", Style::default().fg(Color::White)),
         Span::styled(
-            if state.flagged_only { ": all peers" } else { ": flagged" },
+            if state.flagged_only {
+                ": all peers"
+            } else {
+                ": flagged"
+            },
             Style::default().fg(Color::DarkGray),
         ),
     ]
@@ -267,7 +303,12 @@ pub fn peer_table<'a>(
             let cells: Vec<Cell> = cols
                 .iter()
                 .map(|col| match col {
-                    PeerCol::Addr => Cell::from(p.get("addr").and_then(|a| a.as_str()).unwrap_or("-").to_string()),
+                    PeerCol::Addr => Cell::from(
+                        p.get("addr")
+                            .and_then(|a| a.as_str())
+                            .unwrap_or("-")
+                            .to_string(),
+                    ),
                     PeerCol::Agent => {
                         let subver = p.get("subver").and_then(|a| a.as_str()).unwrap_or("-");
                         Cell::from(crate::behavior::agent_cell(subver, behavior))
@@ -279,23 +320,35 @@ pub fn peer_table<'a>(
                         None => Cell::from(""),
                     },
                     PeerCol::Height => {
-                        let height = p.get("synced_headers").and_then(|h| h.as_u64())
+                        let height = p
+                            .get("synced_headers")
+                            .and_then(|h| h.as_u64())
                             .or_else(|| p.get("startingheight").and_then(|h| h.as_u64()))
                             .unwrap_or(0);
                         Cell::from(format_num(height))
                     }
                     PeerCol::Recv if ibd => Cell::from(
-                        ibd_map.get(&peer_id).map(|s| format_num(s.blocks_received)).unwrap_or("-".into()),
+                        ibd_map
+                            .get(&peer_id)
+                            .map(|s| format_num(s.blocks_received))
+                            .unwrap_or("-".into()),
                     ),
-                    PeerCol::Recv => {
-                        Cell::from(format_bytes(p.get("bytesrecv").and_then(|b| b.as_u64()).unwrap_or(0)))
-                    }
+                    PeerCol::Recv => Cell::from(format_bytes(
+                        p.get("bytesrecv").and_then(|b| b.as_u64()).unwrap_or(0),
+                    )),
                     PeerCol::Assigned => Cell::from(
-                        ibd_map.get(&peer_id).map(|s| s.assigned.to_string()).unwrap_or("-".into()),
+                        ibd_map
+                            .get(&peer_id)
+                            .map(|s| s.assigned.to_string())
+                            .unwrap_or("-".into()),
                     ),
                     PeerCol::Rate => {
                         let rate = state.peer_dl_rates.get(&peer_id).copied().unwrap_or(0.0);
-                        Cell::from(if rate > 0.1 { format!("{:.1} blk/s", rate) } else { "-".into() })
+                        Cell::from(if rate > 0.1 {
+                            format!("{:.1} blk/s", rate)
+                        } else {
+                            "-".into()
+                        })
                     }
                 })
                 .collect();
@@ -309,17 +362,17 @@ pub fn peer_table<'a>(
         })
         .collect();
 
-    Table::new(rows, widths)
-        .header(header)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::DarkGray))
-                .title(Span::styled(
-                    format!(" {} ", title),
-                    Style::default().fg(Color::Cyan).add_modifier(ratatui::style::Modifier::BOLD),
-                )),
-        )
+    Table::new(rows, widths).header(header).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::DarkGray))
+            .title(Span::styled(
+                format!(" {} ", title),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(ratatui::style::Modifier::BOLD),
+            )),
+    )
 }
 
 /// Render the block map grid for IBD view.
@@ -360,10 +413,10 @@ pub fn render_block_map(
             } else if mid >= bitmap.bitmap_start {
                 let idx = (mid - bitmap.bitmap_start) as usize;
                 match bitmap.bitmap.get(idx).copied().unwrap_or(0) {
-                    3 => ("\u{2591}", Color::Cyan),    // light shade - downloaded
-                    2 => ("\u{2593}", Color::Yellow),  // dark shade - in-flight
-                    1 => ("\u{00B7}", Color::DarkGray),// middle dot - pending
-                    _ => ("\u{00B7}", Color::DarkGray),// middle dot - not requested
+                    3 => ("\u{2591}", Color::Cyan),     // light shade - downloaded
+                    2 => ("\u{2593}", Color::Yellow),   // dark shade - in-flight
+                    1 => ("\u{00B7}", Color::DarkGray), // middle dot - pending
+                    _ => ("\u{00B7}", Color::DarkGray), // middle dot - not requested
                 }
             } else {
                 ("\u{2588}", Color::Green)
@@ -387,16 +440,19 @@ pub fn connecting_paragraph<'a>(stale: bool) -> Paragraph<'a> {
     } else {
         "Connecting to satd...".to_string()
     };
-    Paragraph::new(Line::from(vec![
-        Span::styled(msg, Style::default().fg(Color::Yellow)),
-    ]))
+    Paragraph::new(Line::from(vec![Span::styled(
+        msg,
+        Style::default().fg(Color::Yellow),
+    )]))
     .block(
         Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::DarkGray))
             .title(Span::styled(
                 " sat-tui ",
-                Style::default().fg(Color::Cyan).add_modifier(ratatui::style::Modifier::BOLD),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(ratatui::style::Modifier::BOLD),
             )),
     )
 }
@@ -408,7 +464,9 @@ pub fn render_loading_panel(f: &mut ratatui::Frame, area: ratatui::layout::Rect,
         .border_style(Style::default().fg(Color::DarkGray))
         .title(Span::styled(
             title.to_string(),
-            Style::default().fg(Color::Cyan).add_modifier(ratatui::style::Modifier::BOLD),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(ratatui::style::Modifier::BOLD),
         ));
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -431,14 +489,26 @@ mod tests {
         use PeerCol::*;
         // No behaviour data: the tables are as they were.
         assert_eq!(peer_columns(false, false, 200), [Addr, Agent, Height, Recv]);
-        assert_eq!(peer_columns(true, false, 200), [Addr, Agent, Recv, Assigned, Rate]);
+        assert_eq!(
+            peer_columns(true, false, 200),
+            [Addr, Agent, Recv, Assigned, Rate]
+        );
         assert_eq!(peer_columns(false, false, 60), [Addr, Agent, Height, Recv]);
         // With it, Flags right of Agent.
-        assert_eq!(peer_columns(false, true, 81), [Addr, Agent, Flags, Height, Recv]);
-        assert_eq!(peer_columns(true, true, 84), [Addr, Agent, Flags, Recv, Assigned, Rate]);
+        assert_eq!(
+            peer_columns(false, true, 81),
+            [Addr, Agent, Flags, Height, Recv]
+        );
+        assert_eq!(
+            peer_columns(true, true, 84),
+            [Addr, Agent, Flags, Recv, Assigned, Rate]
+        );
         // One cell narrower, and Flags takes Recv's place.
         assert_eq!(peer_columns(false, true, 80), [Addr, Agent, Flags, Height]);
-        assert_eq!(peer_columns(true, true, 83), [Addr, Agent, Flags, Assigned, Rate]);
+        assert_eq!(
+            peer_columns(true, true, 83),
+            [Addr, Agent, Flags, Assigned, Rate]
+        );
     }
 
     #[test]

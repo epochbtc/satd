@@ -3,15 +3,15 @@
 #![allow(clippy::nonminimal_bool)]
 
 use bitcoin::consensus::Encodable;
-use bitcoin::hashes::{sha256, sha256d, Hash, HashEngine};
-use bitcoin::sighash::{EcdsaSighashType, SighashCache};
+use bitcoin::hashes::{Hash, HashEngine, sha256, sha256d};
 use bitcoin::secp256k1::{self, Message, Secp256k1, VerifyOnly};
+use bitcoin::sighash::{EcdsaSighashType, SighashCache};
 use bitcoin::{Amount, Script, ScriptBuf, Sequence, Transaction, TxOut};
 use std::cell::{OnceCell, RefCell};
 use std::rc::Rc;
 use std::sync::OnceLock;
 
-use crate::checker::{ExecData, SignatureChecker, SigVersion};
+use crate::checker::{ExecData, SigVersion, SignatureChecker};
 use crate::error::ScriptError;
 use crate::scriptnum::ScriptNum;
 
@@ -50,7 +50,10 @@ pub struct TxSighashCache<'a> {
 
 impl<'a> TxSighashCache<'a> {
     pub fn new(tx: &'a Transaction) -> Self {
-        Self { legacy: SighashCache::new(tx), taproot: None }
+        Self {
+            legacy: SighashCache::new(tx),
+            taproot: None,
+        }
     }
 }
 
@@ -75,18 +78,29 @@ impl TaprootTxHashes {
         let mut prevouts = sha256::Hash::engine();
         let mut sequences = sha256::Hash::engine();
         for input in &tx.input {
-            input.previous_output.consensus_encode(&mut prevouts).expect("engines do not fail");
-            input.sequence.consensus_encode(&mut sequences).expect("engines do not fail");
+            input
+                .previous_output
+                .consensus_encode(&mut prevouts)
+                .expect("engines do not fail");
+            input
+                .sequence
+                .consensus_encode(&mut sequences)
+                .expect("engines do not fail");
         }
         let mut amounts = sha256::Hash::engine();
         let mut script_pubkeys = sha256::Hash::engine();
         for out in spent {
-            out.value.consensus_encode(&mut amounts).expect("engines do not fail");
-            out.script_pubkey.consensus_encode(&mut script_pubkeys).expect("engines do not fail");
+            out.value
+                .consensus_encode(&mut amounts)
+                .expect("engines do not fail");
+            out.script_pubkey
+                .consensus_encode(&mut script_pubkeys)
+                .expect("engines do not fail");
         }
         let mut outputs = sha256::Hash::engine();
         for out in &tx.output {
-            out.consensus_encode(&mut outputs).expect("engines do not fail");
+            out.consensus_encode(&mut outputs)
+                .expect("engines do not fail");
         }
         let done = |e: sha256::HashEngine| sha256::Hash::from_engine(e).to_byte_array();
         Self {
@@ -156,18 +170,29 @@ impl<'a> TxSignatureChecker<'a> {
     /// `exec_data`, and the SIGHASH_SINGLE output here), never per check.
     /// `None` where Core returns false: an undefined hash type, spent outputs
     /// missing, or SIGHASH_SINGLE with no output at this input's index.
-    fn taproot_sighash(&self, hash_type: u8, sig_version: SigVersion, exec_data: &ExecData) -> Option<[u8; 32]> {
+    fn taproot_sighash(
+        &self,
+        hash_type: u8,
+        sig_version: SigVersion,
+        exec_data: &ExecData,
+    ) -> Option<[u8; 32]> {
         if !(hash_type <= 0x03 || (0x81..=0x83).contains(&hash_type)) {
             return None;
         }
         if self.prev_outputs.len() != self.tx.input.len() {
             return None;
         }
-        let output_type = if hash_type == 0x00 { 0x01 } else { hash_type & 0x03 };
+        let output_type = if hash_type == 0x00 {
+            0x01
+        } else {
+            hash_type & 0x03
+        };
         let anyone_can_pay = hash_type & 0x80 != 0;
         let tx_hashes = {
             let mut cache = self.cache.borrow_mut();
-            *cache.taproot.get_or_insert_with(|| TaprootTxHashes::compute(self.tx, self.prev_outputs))
+            *cache
+                .taproot
+                .get_or_insert_with(|| TaprootTxHashes::compute(self.tx, self.prev_outputs))
         };
 
         let mut e = bitcoin::TapSighash::engine();
@@ -184,15 +209,23 @@ impl<'a> TxSignatureChecker<'a> {
         if output_type == 0x01 {
             e.input(&tx_hashes.outputs);
         }
-        let ext_flag: u8 = if sig_version == SigVersion::Tapscript { 1 } else { 0 };
+        let ext_flag: u8 = if sig_version == SigVersion::Tapscript {
+            1
+        } else {
+            0
+        };
         e.input(&[(ext_flag << 1) | u8::from(exec_data.annex_present)]);
         if anyone_can_pay {
             let input = &self.tx.input[self.input_index];
             input.previous_output.consensus_encode(&mut e).expect(ok);
-            self.prev_outputs[self.input_index].consensus_encode(&mut e).expect(ok);
+            self.prev_outputs[self.input_index]
+                .consensus_encode(&mut e)
+                .expect(ok);
             input.sequence.consensus_encode(&mut e).expect(ok);
         } else {
-            (self.input_index as u32).consensus_encode(&mut e).expect(ok);
+            (self.input_index as u32)
+                .consensus_encode(&mut e)
+                .expect(ok);
         }
         if exec_data.annex_present {
             e.input(&exec_data.annex_hash);
@@ -210,7 +243,10 @@ impl<'a> TxSignatureChecker<'a> {
         if sig_version == SigVersion::Tapscript {
             e.input(&exec_data.tapleaf_hash);
             e.input(&[0x00]); // key_version
-            exec_data.codeseparator_pos.consensus_encode(&mut e).expect(ok);
+            exec_data
+                .codeseparator_pos
+                .consensus_encode(&mut e)
+                .expect(ok);
         }
         Some(bitcoin::TapSighash::from_engine(e).to_byte_array())
     }
@@ -288,7 +324,12 @@ impl SignatureChecker for TxSignatureChecker<'_> {
             }
             SigVersion::Base => {
                 let cache = self.cache.borrow();
-                match legacy_sighash_with(&cache.legacy, self.input_index, script_code, hash_type_byte as u32) {
+                match legacy_sighash_with(
+                    &cache.legacy,
+                    self.input_index,
+                    script_code,
+                    hash_type_byte as u32,
+                ) {
                     Some(h) => h,
                     None => return false,
                 }
@@ -298,9 +339,7 @@ impl SignatureChecker for TxSignatureChecker<'_> {
 
         let msg = Message::from_digest(sighash);
 
-        secp_ctx()
-            .verify_ecdsa(&msg, &ecdsa_sig, &pubkey)
-            .is_ok()
+        secp_ctx().verify_ecdsa(&msg, &ecdsa_sig, &pubkey).is_ok()
     }
 
     fn check_schnorr_signature(
@@ -317,8 +356,8 @@ impl SignatureChecker for TxSignatureChecker<'_> {
             return Err(ScriptError::SchnorrSigSize);
         }
 
-        let xonly =
-            secp256k1::XOnlyPublicKey::from_slice(pubkey_bytes).map_err(|_| ScriptError::SchnorrSig)?;
+        let xonly = secp256k1::XOnlyPublicKey::from_slice(pubkey_bytes)
+            .map_err(|_| ScriptError::SchnorrSig)?;
 
         let mut hash_type_byte: u8 = 0x00; // SIGHASH_DEFAULT
         let sig_data = if sig.len() == 65 {
@@ -407,7 +446,12 @@ impl SignatureChecker for TxSignatureChecker<'_> {
 /// Core's legacy `SignatureHash` (src/script/interpreter.cpp) for any 32-bit
 /// hash type, OP_CODESEPARATOR removal included. `None` when `input_index`
 /// is past the last input.
-pub fn legacy_sighash(tx: &Transaction, input_index: usize, script_code: &[u8], hash_type: u32) -> Option<[u8; 32]> {
+pub fn legacy_sighash(
+    tx: &Transaction,
+    input_index: usize,
+    script_code: &[u8],
+    hash_type: u32,
+) -> Option<[u8; 32]> {
     legacy_sighash_with(&SighashCache::new(tx), input_index, script_code, hash_type)
 }
 
@@ -445,7 +489,12 @@ pub fn taproot_sighash(
     if input_index >= tx.input.len() || spent_outputs.len() != tx.input.len() {
         return None;
     }
-    let checker = TxSignatureChecker::new(tx, input_index, spent_outputs[input_index].value, spent_outputs);
+    let checker = TxSignatureChecker::new(
+        tx,
+        input_index,
+        spent_outputs[input_index].value,
+        spent_outputs,
+    );
     let mut exec_data = ExecData::new();
     if let Some(annex) = annex {
         exec_data.annex_present = true;
@@ -516,7 +565,11 @@ mod tests {
             let mut script = push.to_vec();
             script.extend([0xab; 4]);
             let got = remove_codeseparators(&script);
-            assert_eq!(got.as_bytes(), &script[..script.len() - 1], "push {push:02x?}");
+            assert_eq!(
+                got.as_bytes(),
+                &script[..script.len() - 1],
+                "push {push:02x?}"
+            );
         }
     }
 
@@ -528,7 +581,10 @@ mod tests {
         let mut script = vec![0x4c, 0x50];
         script.extend([0xab; 80]);
         script.push(0xab);
-        assert_eq!(remove_codeseparators(&script).as_bytes(), &script[..script.len() - 1]);
+        assert_eq!(
+            remove_codeseparators(&script).as_bytes(),
+            &script[..script.len() - 1]
+        );
     }
 
     #[test]

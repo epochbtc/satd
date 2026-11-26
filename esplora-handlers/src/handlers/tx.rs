@@ -10,8 +10,8 @@
 
 use axum::body::Body;
 use axum::extract::{Path, Query, State};
-use axum::{Extension, Json};
 use axum::http::{HeaderValue, Response};
+use axum::{Extension, Json};
 use bitcoin::consensus::encode::{deserialize, serialize};
 use bitcoin::{Address, Block, BlockHash, Network, Script, Transaction, Txid};
 use node::storage::Store;
@@ -127,15 +127,19 @@ pub async fn tx_broadcast(
     body: String,
 ) -> EsploraResult<String> {
     require_submit(&state, principal.as_deref())?;
-    let bytes = hex::decode(body.trim())
-        .map_err(|e| EsploraError::BadRequest(format!("bad hex: {e}")))?;
-    let tx: Transaction = deserialize(&bytes)
-        .map_err(|e| EsploraError::BadRequest(format!("decode: {e}")))?;
+    let bytes =
+        hex::decode(body.trim()).map_err(|e| EsploraError::BadRequest(format!("bad hex: {e}")))?;
+    let tx: Transaction =
+        deserialize(&bytes).map_err(|e| EsploraError::BadRequest(format!("decode: {e}")))?;
     // Accept + announce in one step so the tx actually propagates — a bare
     // mempool accept leaves it sitting on this node, unannounced.
     let txid = state
         .tx_broadcaster
-        .submit_and_announce(tx, node::mempool::pool::TxSource::Esplora, q.allowquarantined)
+        .submit_and_announce(
+            tx,
+            node::mempool::pool::TxSource::Esplora,
+            q.allowquarantined,
+        )
         .map_err(|e| EsploraError::BadRequest(format!("mempool reject: {e}")))?;
     Ok(txid.to_string())
 }
@@ -156,9 +160,8 @@ fn require_submit(state: &EsploraState, principal: Option<&Principal>) -> Esplor
         }
         return Ok(());
     };
-    p.require(Capability::RpcSubmit).map_err(|d| {
-        EsploraError::Forbidden(format!("token lacks the {} capability", d.0))
-    })
+    p.require(Capability::RpcSubmit)
+        .map_err(|d| EsploraError::Forbidden(format!("token lacks the {} capability", d.0)))
 }
 
 // ── JSON shapes ──
@@ -258,7 +261,8 @@ pub struct TxJson {
 }
 
 /// The body of a 404 for a stripped transaction's bytes.
-pub(crate) const TX_DATA_STRIPPED: &str = "transaction data not available (OP_RETURN data stripped)";
+pub(crate) const TX_DATA_STRIPPED: &str =
+    "transaction data not available (OP_RETURN data stripped)";
 
 /// A transaction as stored. For one in an OP_RETURN-stripped block, `tx` is
 /// the filled form: its size, weight, inputs and output values are the
@@ -276,11 +280,19 @@ impl StoredTx {
     pub(crate) fn take(mut stored: StoredBlock, i: usize) -> Self {
         let txid = stored.txid(i);
         let stripped = stored.tx_is_stripped(i).then(|| stored.stripped_outputs(i));
-        Self { tx: stored.block.txdata.swap_remove(i), txid, stripped }
+        Self {
+            tx: stored.block.txdata.swap_remove(i),
+            txid,
+            stripped,
+        }
     }
 
     fn as_view(&self) -> TxView<'_> {
-        TxView { tx: &self.tx, txid: self.txid, stripped: self.stripped.as_deref() }
+        TxView {
+            tx: &self.tx,
+            txid: self.txid,
+            stripped: self.stripped.as_deref(),
+        }
     }
 
     /// The transaction, if its bytes are its own; a 404 naming the strip
@@ -303,7 +315,11 @@ pub(crate) struct TxView<'a> {
 
 impl<'a> TxView<'a> {
     fn intact(tx: &'a Transaction) -> Self {
-        Self { tx, txid: tx.compute_txid(), stripped: None }
+        Self {
+            tx,
+            txid: tx.compute_txid(),
+            stripped: None,
+        }
     }
 }
 
@@ -334,12 +350,11 @@ fn lookup_confirmed(
         Some(h) => h,
         None => return Ok(None),
     };
-    let block = state
-        .chain
-        .get_stored_block(&block_hash)
-        .ok_or_else(|| EsploraError::Internal(format!(
+    let block = state.chain.get_stored_block(&block_hash).ok_or_else(|| {
+        EsploraError::Internal(format!(
             "txindex points at {block_hash} but block data is missing"
-        )))?;
+        ))
+    })?;
     let entry = state.chain.get_block_index(&block_hash).ok_or_else(|| {
         EsploraError::Internal(format!(
             "txindex points at {block_hash} but block index entry is missing"
@@ -410,7 +425,11 @@ fn lookup_any(state: &EsploraState, txid: &Txid) -> EsploraResult<StoredTx> {
         return Ok(tx);
     }
     if let Some(tx) = lookup_mempool(state, txid) {
-        return Ok(StoredTx { tx, txid: *txid, stripped: None });
+        return Ok(StoredTx {
+            tx,
+            txid: *txid,
+            stripped: None,
+        });
     }
     Err(EsploraError::NotFound)
 }
@@ -423,10 +442,7 @@ fn lookup_any(state: &EsploraState, txid: &Txid) -> EsploraResult<StoredTx> {
 ///    the prev tx, and return its `output[vout]`. Required for
 ///    confirmed inputs.
 /// 3. The mempool — for child-of-mempool inputs.
-fn resolve_prev_output(
-    state: &EsploraState,
-    prev: &bitcoin::OutPoint,
-) -> Option<bitcoin::TxOut> {
+fn resolve_prev_output(state: &EsploraState, prev: &bitcoin::OutPoint) -> Option<bitcoin::TxOut> {
     if let Some(coin) = state.chain.get_coin(prev) {
         return Some(bitcoin::TxOut {
             value: bitcoin::Amount::from_sat(coin.amount),
@@ -517,8 +533,15 @@ fn build_tx_json(
         .iter()
         .enumerate()
         .map(|(n, out)| {
-            let stripped_size = stripped.iter().find(|(v, _)| *v as usize == n).map(|(_, len)| *len);
-            let spk = if stripped_size.is_some() { bare.as_script() } else { out.script_pubkey.as_script() };
+            let stripped_size = stripped
+                .iter()
+                .find(|(v, _)| *v as usize == n)
+                .map(|(_, len)| *len);
+            let spk = if stripped_size.is_some() {
+                bare.as_script()
+            } else {
+                out.script_pubkey.as_script()
+            };
             VoutJson {
                 scriptpubkey: hex::encode(spk.as_bytes()),
                 scriptpubkey_asm: spk.to_asm_string(),
@@ -637,7 +660,9 @@ fn script_type_str(spk: &Script) -> &'static str {
 }
 
 fn derive_address(spk: &Script, network: Network) -> Option<String> {
-    Address::from_script(spk, network).ok().map(|a| a.to_string())
+    Address::from_script(spk, network)
+        .ok()
+        .map(|a| a.to_string())
 }
 
 /// Used by `block::block_txs[_page]` so the page handler doesn't
@@ -691,37 +716,35 @@ pub fn build_confirmed_tx_json(
         .store_ref()
         .get_tx_location(txid)
         .ok_or(EsploraError::NotFound)?;
-    let block = state
-        .chain
-        .get_stored_block(&block_hash)
-        .ok_or_else(|| {
-            EsploraError::Internal(format!(
-                "txindex points at {block_hash} but block data is missing"
-            ))
-        })?;
-    let entry = state
-        .chain
-        .get_block_index(&block_hash)
-        .ok_or_else(|| {
-            EsploraError::Internal(format!(
-                "txindex points at {block_hash} but block index entry is missing"
-            ))
-        })?;
+    let block = state.chain.get_stored_block(&block_hash).ok_or_else(|| {
+        EsploraError::Internal(format!(
+            "txindex points at {block_hash} but block data is missing"
+        ))
+    })?;
+    let entry = state.chain.get_block_index(&block_hash).ok_or_else(|| {
+        EsploraError::Internal(format!(
+            "txindex points at {block_hash} but block index entry is missing"
+        ))
+    })?;
     let i = position_in(&block, txid).ok_or_else(|| {
         EsploraError::Internal(format!(
             "txindex points at {block_hash} but tx {txid} not present in block"
         ))
     })?;
-    build_block_tx_json(state, &block, i, block_hash, entry.height, entry.header.time)
+    build_block_tx_json(
+        state,
+        &block,
+        i,
+        block_hash,
+        entry.height,
+        entry.header.time,
+    )
 }
 
 /// Build a JSON for an unconfirmed mempool tx. `status.confirmed` is
 /// `false` and the block fields are absent. Used by the address-history
 /// mempool-tx page.
-pub fn build_mempool_tx_json(
-    state: &EsploraState,
-    tx: &Transaction,
-) -> EsploraResult<TxJson> {
+pub fn build_mempool_tx_json(state: &EsploraState, tx: &Transaction) -> EsploraResult<TxJson> {
     build_tx_json(state, &TxView::intact(tx), None)
 }
 

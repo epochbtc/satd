@@ -47,15 +47,15 @@
 //!
 //! `addrv2` is read by [`crate::net::addrv2`] before a payload gets here.
 
+use bitcoin::BlockHash;
 use bitcoin::bip152::BlockTransactionsRequest;
 use bitcoin::consensus::encode::{self, Decodable};
-use bitcoin::hashes::{sha256d, Hash};
-use bitcoin::p2p::message::{CommandString, NetworkMessage};
+use bitcoin::hashes::{Hash, sha256d};
+use bitcoin::p2p::ServiceFlags;
 use bitcoin::p2p::address::Address;
+use bitcoin::p2p::message::{CommandString, NetworkMessage};
 use bitcoin::p2p::message_compact_blocks::{BlockTxn, CmpctBlock, GetBlockTxn, SendCmpct};
 use bitcoin::p2p::message_network::VersionMessage;
-use bitcoin::p2p::ServiceFlags;
-use bitcoin::BlockHash;
 
 use crate::validation::decode;
 
@@ -83,7 +83,11 @@ fn read_version(payload: &[u8]) -> Result<VersionMessage, encode::Error> {
         services,
         timestamp,
         receiver,
-        sender: Address { services: ServiceFlags::NONE, address: [0; 8], port: 0 },
+        sender: Address {
+            services: ServiceFlags::NONE,
+            address: [0; 8],
+            port: 0,
+        },
         nonce: 1,
         user_agent: String::new(),
         start_height: -1,
@@ -98,7 +102,9 @@ fn read_version(payload: &[u8]) -> Result<VersionMessage, encode::Error> {
     if !r.is_empty() {
         let len = encode::VarInt::consensus_decode(&mut r)?.0;
         if len > MAX_SUBVERSION_LENGTH {
-            return Err(encode::Error::ParseFailed("version user agent over 256 bytes"));
+            return Err(encode::Error::ParseFailed(
+                "version user agent over 256 bytes",
+            ));
         }
         let len = len as usize;
         if r.len() < len {
@@ -126,7 +132,9 @@ const MAX_SIZE: u64 = 0x0200_0000;
 fn read_compact_size(r: &mut &[u8]) -> Result<u64, encode::Error> {
     let n = encode::VarInt::consensus_decode(r)?.0;
     if n > MAX_SIZE {
-        return Err(encode::Error::ParseFailed("ReadCompactSize(): size too large"));
+        return Err(encode::Error::ParseFailed(
+            "ReadCompactSize(): size too large",
+        ));
     }
     Ok(n)
 }
@@ -167,12 +175,20 @@ fn read_getblocktxn(payload: &[u8]) -> Result<GetBlockTxn, encode::Error> {
         indexes.push(shift);
         shift += 1;
     }
-    Ok(GetBlockTxn { txs_request: BlockTransactionsRequest { block_hash, indexes } })
+    Ok(GetBlockTxn {
+        txs_request: BlockTransactionsRequest {
+            block_hash,
+            indexes,
+        },
+    })
 }
 
 /// Decode the payload of a message of type `command`, as Core reads it.
 /// A type no handler knows comes back as [`NetworkMessage::Unknown`].
-pub fn decode_payload(command: CommandString, payload: &[u8]) -> Result<NetworkMessage, encode::Error> {
+pub fn decode_payload(
+    command: CommandString,
+    payload: &[u8],
+) -> Result<NetworkMessage, encode::Error> {
     use NetworkMessage as M;
     Ok(match command.as_ref() {
         "version" => M::Version(read_version(payload)?),
@@ -208,15 +224,25 @@ pub fn decode_payload(command: CommandString, payload: &[u8]) -> Result<NetworkM
             let mut r = payload;
             let high_bandwidth = u8::consensus_decode(&mut r)?;
             let version = u64::consensus_decode(&mut r)?;
-            M::SendCmpct(SendCmpct { send_compact: high_bandwidth != 0, version })
+            M::SendCmpct(SendCmpct {
+                send_compact: high_bandwidth != 0,
+                version,
+            })
         }
-        "cmpctblock" => M::CmpctBlock(CmpctBlock { compact_block: decode::read_header_and_short_ids(&mut &payload[..])? }),
+        "cmpctblock" => M::CmpctBlock(CmpctBlock {
+            compact_block: decode::read_header_and_short_ids(&mut &payload[..])?,
+        }),
         "getblocktxn" => M::GetBlockTxn(read_getblocktxn(payload)?),
-        "blocktxn" => M::BlockTxn(BlockTxn { transactions: decode::read_block_transactions(&mut &payload[..])? }),
+        "blocktxn" => M::BlockTxn(BlockTxn {
+            transactions: decode::read_block_transactions(&mut &payload[..])?,
+        }),
         "wtxidrelay" => M::WtxidRelay,
         "addrv2" => M::AddrV2(read(payload)?),
         "sendaddrv2" => M::SendAddrV2,
-        _ => M::Unknown { command, payload: payload.to_vec() },
+        _ => M::Unknown {
+            command,
+            payload: payload.to_vec(),
+        },
     })
 }
 
@@ -226,12 +252,16 @@ pub fn decode_payload(command: CommandString, payload: &[u8]) -> Result<NetworkM
 /// header.
 pub fn decode_v1_frame(frame: &[u8]) -> Result<NetworkMessage, encode::Error> {
     if frame.len() < V1_HEADER_SIZE {
-        return Err(encode::Error::ParseFailed("v1 frame shorter than its header"));
+        return Err(encode::Error::ParseFailed(
+            "v1 frame shorter than its header",
+        ));
     }
     let (header, payload) = frame.split_at(V1_HEADER_SIZE);
     let len = u32::from_le_bytes([header[16], header[17], header[18], header[19]]) as usize;
     if payload.len() != len {
-        return Err(encode::Error::ParseFailed("v1 payload length does not match its header"));
+        return Err(encode::Error::ParseFailed(
+            "v1 payload length does not match its header",
+        ));
     }
     let hash = sha256d::Hash::hash(payload);
     if hash[..4] != header[20..24] {

@@ -13,7 +13,11 @@ fn is_getheaders(m: &NetworkMessage) -> bool {
 /// A pong for `nonce` within `within`.
 fn pong_within(peer: &mut RawPeer, nonce: u64, within: Duration) -> bool {
     peer.send(NetworkMessage::Ping(nonce));
-    peer.recv_until(|m| matches!(m, NetworkMessage::Pong(n) if *n == nonce), within).is_some()
+    peer.recv_until(
+        |m| matches!(m, NetworkMessage::Pong(n) if *n == nonce),
+        within,
+    )
+    .is_some()
 }
 
 /// A block the node did not ask for, on a parent it does not know, is
@@ -26,14 +30,19 @@ fn pong_within(peer: &mut RawPeer, nonce: u64, within: Duration) -> bool {
 fn an_unrequested_block_on_an_unknown_parent_is_dropped_and_headers_are_asked_for() {
     let (node, _) = started_node(1);
     let mut peer = RawPeer::connect(node.p2p_port.unwrap());
-    poll_until(|| peer_count(&node) == 1, test_timeout(20), "peer must connect");
+    poll_until(
+        || peer_count(&node) == 1,
+        test_timeout(20),
+        "peer must connect",
+    );
     let tip = block_at(&node, &best_hash(&node));
     let parent = build_block(&tip, height(&node) + 1, vec![], true, 81);
     let child = build_block(&parent, height(&node) + 2, vec![], true, 82);
 
     // No `getheaders` goes out on a timer (#1122), so the opening one is the
     // only one before the block under test.
-    peer.recv_until(is_getheaders, test_timeout(30)).expect("the opening getheaders");
+    peer.recv_until(is_getheaders, test_timeout(30))
+        .expect("the opening getheaders");
     // Answer it, as a peer with nothing new does. An unanswered getheaders
     // is outstanding for two minutes, and holds back the one under test
     // (Core's `MaybeSendGetHeaders`, #1262).
@@ -41,16 +50,28 @@ fn an_unrequested_block_on_an_unknown_parent_is_dropped_and_headers_are_asked_fo
 
     peer.send(NetworkMessage::Block(child.clone()));
     assert!(
-        peer.recv_until(is_getheaders, Duration::from_secs(4)).is_some(),
+        peer.recv_until(is_getheaders, Duration::from_secs(4))
+            .is_some(),
         "a block on an unknown parent must be answered with getheaders"
     );
 
     peer.send(NetworkMessage::Block(parent.clone()));
-    assert!(pong_within(&mut peer, 0x0b0b_0001, test_timeout(20)), "pong after the parent");
-    poll_until(|| best_hash(&node) == parent.block_hash(), test_timeout(20), "the parent must connect");
+    assert!(
+        pong_within(&mut peer, 0x0b0b_0001, test_timeout(20)),
+        "pong after the parent"
+    );
+    poll_until(
+        || best_hash(&node) == parent.block_hash(),
+        test_timeout(20),
+        "the parent must connect",
+    );
     // The pong came after the parent's processing, which is where a waiting
     // child would have been connected.
-    assert_eq!(best_hash(&node), parent.block_hash(), "the unrequested child must not have been kept");
+    assert_eq!(
+        best_hash(&node),
+        parent.block_hash(),
+        "the unrequested child must not have been kept"
+    );
     assert!(!peer.is_closed());
     assert_eq!(banned_count(&node), 0);
 }
@@ -64,13 +85,24 @@ fn an_unrequested_block_on_an_unknown_parent_is_dropped_and_headers_are_asked_fo
 fn a_requested_block_waits_for_its_parent_without_holding_the_pong() {
     let (node, _) = started_node(1);
     let mut peer = RawPeer::connect(node.p2p_port.unwrap());
-    poll_until(|| peer_count(&node) == 1, test_timeout(20), "peer must connect");
+    poll_until(
+        || peer_count(&node) == 1,
+        test_timeout(20),
+        "peer must connect",
+    );
     let tip = block_at(&node, &best_hash(&node));
     let parent = build_block(&tip, height(&node) + 1, vec![], true, 83);
     let child = build_block(&parent, height(&node) + 2, vec![], true, 84);
 
-    peer.send(NetworkMessage::Inv(vec![Inventory::Block(child.block_hash())]));
-    collect_until(&mut peer, is_getdata_for(child.block_hash()), test_timeout(20), "a getdata for the child");
+    peer.send(NetworkMessage::Inv(vec![Inventory::Block(
+        child.block_hash(),
+    )]));
+    collect_until(
+        &mut peer,
+        is_getdata_for(child.block_hash()),
+        test_timeout(20),
+        "a getdata for the child",
+    );
     peer.send(NetworkMessage::Block(child.clone()));
     assert!(
         pong_within(&mut peer, 0x0b0b_0002, Duration::from_secs(10)),
@@ -79,5 +111,9 @@ fn a_requested_block_waits_for_its_parent_without_holding_the_pong() {
     assert_eq!(height(&node), 1, "fixture: the child cannot connect yet");
 
     peer.send(NetworkMessage::Block(parent.clone()));
-    poll_until(|| best_hash(&node) == child.block_hash(), test_timeout(20), "the child must follow its parent");
+    poll_until(
+        || best_hash(&node) == child.block_hash(),
+        test_timeout(20),
+        "the child must follow its parent",
+    );
 }

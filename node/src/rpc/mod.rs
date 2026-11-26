@@ -38,12 +38,12 @@ pub(crate) const RPC_MAX_BODY_SIZE: usize = 20 * 1024 * 1024;
 /// follow-up, not this constant's job.
 pub(crate) const RPC_MAX_RESPONSE_SIZE: usize = 256 * 1024 * 1024;
 
-pub mod active_commands;
 pub mod access;
+pub mod active_commands;
 pub mod address;
+pub mod address_decode;
 pub mod admission;
 pub mod allowip;
-pub mod address_decode;
 pub mod amounts;
 pub mod auth;
 pub mod blockchain;
@@ -64,18 +64,18 @@ pub mod psbt;
 pub(crate) mod psbt_fields;
 pub mod psbt_v2;
 pub mod rawtx;
+pub mod readonly;
 pub mod script_asm;
+pub mod server;
 pub mod signmessage;
 pub mod txospender;
-pub mod readonly;
+pub mod util;
 pub mod warmup;
 pub mod whitelist;
-pub mod server;
-pub mod util;
 
 #[cfg(test)]
 mod rpcparity_tests;
 #[cfg(test)]
-mod txparity_tests;
-#[cfg(test)]
 mod txoutsetinfo_tests;
+#[cfg(test)]
+mod txparity_tests;

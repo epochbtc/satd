@@ -149,9 +149,8 @@ where
         // each member as it runs rather than one entry for the whole body.
         let inner = self.inner.clone();
         async move {
-            let mut builder = BatchResponseBuilder::new_with_limit(
-                crate::rpc::readonly::RESPONSE_BODY_LIMIT,
-            );
+            let mut builder =
+                BatchResponseBuilder::new_with_limit(crate::rpc::readonly::RESPONSE_BODY_LIMIT);
             let mut got_notification = false;
             for entry in batch.into_iter() {
                 match entry {

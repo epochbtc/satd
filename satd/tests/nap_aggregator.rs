@@ -34,8 +34,8 @@ use bitcoin::{Amount, BlockHash, OutPoint, ScriptBuf, Witness};
 use serde_json::{Value, json};
 
 use common::{
-    DeterministicWallet, TestNode, build_signed_p2wpkh_spend_of_coinbase, coinbase_txid_at, poll_until,
-    test_timeout,
+    DeterministicWallet, TestNode, build_signed_p2wpkh_spend_of_coinbase, coinbase_txid_at,
+    poll_until, test_timeout,
 };
 
 const BURN: &str = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
@@ -44,7 +44,10 @@ const ATTESTABLE_AFTER: u64 = 100 + 6;
 const NODE_NAP: u64 = 1 << 30;
 
 fn burn() -> ScriptBuf {
-    BURN.parse::<bitcoin::Address<_>>().unwrap().assume_checked().script_pubkey()
+    BURN.parse::<bitcoin::Address<_>>()
+        .unwrap()
+        .assume_checked()
+        .script_pubkey()
 }
 
 fn wallet() -> DeterministicWallet {
@@ -58,12 +61,19 @@ fn sign(message: &str) -> String {
     let pk = bitcoin::CompressedPublicKey::from_slice(&w.pk.to_bytes()).unwrap();
     let spend = node::bip322::to_spend(&spk, message.as_bytes());
     let tx = node::bip322::to_sign(spend.compute_txid(), Witness::new());
-    let sighash =
-        SighashCache::new(&tx).p2wpkh_signature_hash(0, &spk, Amount::ZERO, EcdsaSighashType::All).unwrap();
+    let sighash = SighashCache::new(&tx)
+        .p2wpkh_signature_hash(0, &spk, Amount::ZERO, EcdsaSighashType::All)
+        .unwrap();
     let sig = Secp256k1::new().sign_ecdsa(&Message::from_digest(sighash.to_byte_array()), &w.sk);
-    let sig = bitcoin::ecdsa::Signature { signature: sig, sighash_type: EcdsaSighashType::All };
+    let sig = bitcoin::ecdsa::Signature {
+        signature: sig,
+        sighash_type: EcdsaSighashType::All,
+    };
     let wit = Witness::p2wpkh(&sig, &pk.0);
-    format!("smp{}", base64::engine::general_purpose::STANDARD.encode(bitcoin::consensus::serialize(&wit)))
+    format!(
+        "smp{}",
+        base64::engine::general_purpose::STANDARD.encode(bitcoin::consensus::serialize(&wit))
+    )
 }
 
 /// The coinbase output of the block at `height`, as `"<txid>:0"`.
@@ -73,9 +83,15 @@ fn coin(node: &TestNode, height: u64) -> String {
 
 /// Attest `key` = `value` for `outpoint` on publisher `node`.
 fn attest(node: &TestNode, outpoint: &str, key: &str, value: &str) {
-    let draft = node.rpc_ok("createnapattestation", vec![json!(outpoint), json!(key), json!(value)]);
+    let draft = node.rpc_ok(
+        "createnapattestation",
+        vec![json!(outpoint), json!(key), json!(value)],
+    );
     let message = draft["message"].as_str().unwrap();
-    node.rpc_ok("submitnapattestation", vec![json!(message), json!(sign(message))]);
+    node.rpc_ok(
+        "submitnapattestation",
+        vec![json!(message), json!(sign(message))],
+    );
 }
 
 fn height(node: &TestNode) -> u64 {
@@ -89,7 +105,10 @@ fn p2p(node: &TestNode) -> String {
 fn synced(nodes: &[&TestNode]) {
     poll_until(
         || {
-            let tips: Vec<Value> = nodes.iter().map(|n| n.rpc_ok("getbestblockhash", vec![])).collect();
+            let tips: Vec<Value> = nodes
+                .iter()
+                .map(|n| n.rpc_ok("getbestblockhash", vec![]))
+                .collect();
             tips.windows(2).all(|w| w[0] == w[1])
         },
         test_timeout(60),
@@ -104,10 +123,18 @@ fn aggregate(node: &TestNode) -> Value {
 /// What counts for `outpoint` and `key` at the aggregator: the value and the
 /// peer it came from.
 fn counted(node: &TestNode, outpoint: &str, key: &str) -> Option<(String, String)> {
-    aggregate(node)["attestations"].as_array().unwrap().iter().find_map(|a| {
-        (a["outpoint"] == outpoint && a["key"] == key)
-            .then(|| (a["value"].as_str().unwrap().to_owned(), a["source"].as_str().unwrap().to_owned()))
-    })
+    aggregate(node)["attestations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find_map(|a| {
+            (a["outpoint"] == outpoint && a["key"] == key).then(|| {
+                (
+                    a["value"].as_str().unwrap().to_owned(),
+                    a["source"].as_str().unwrap().to_owned(),
+                )
+            })
+        })
 }
 
 fn wait_counted(node: &TestNode, outpoint: &str, key: &str, value: &str, what: &str) {
@@ -125,7 +152,11 @@ fn reconnect(c: &TestNode, peer: &TestNode) {
     poll_until(
         || {
             let peers = c.rpc_ok("getpeerinfo", vec![]);
-            !peers.as_array().unwrap().iter().any(|p| p["addr"] == p2p(peer).as_str())
+            !peers
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|p| p["addr"] == p2p(peer).as_str())
         },
         test_timeout(30),
         "the connection to close",
@@ -181,35 +212,87 @@ fn nap_aggregator_collects_supersedes_withdraws_reorgs_spends_and_punishes() {
 
     // An anchor reorg at the aggregator: without the block the newer
     // attestations anchor to, the older ones count again.
-    let anchor: BlockHash = c.rpc_ok("getblockhash", vec![json!(newer_anchor)]).as_str().unwrap().parse().unwrap();
+    let anchor: BlockHash = c
+        .rpc_ok("getblockhash", vec![json!(newer_anchor)])
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
     c.rpc_ok("invalidateblock", vec![json!(anchor.to_string())]);
-    wait_counted(&c, &coin1, "k", "yes", "coin 1's older attestation, after the reorg");
-    wait_counted(&c, &coin2, "k", "yes", "coin 2's older value, after the reorg");
+    wait_counted(
+        &c,
+        &coin1,
+        "k",
+        "yes",
+        "coin 1's older attestation, after the reorg",
+    );
+    wait_counted(
+        &c,
+        &coin2,
+        "k",
+        "yes",
+        "coin 2's older value, after the reorg",
+    );
     c.rpc_ok("reconsiderblock", vec![json!(anchor.to_string())]);
     synced(&[&a, &b, &c]);
-    wait_counted(&c, &coin1, "k", "no", "coin 1's newer attestation, back with its anchor");
-    wait_counted(&c, &coin2, "k", "", "coin 2's withdrawal, back with its anchor");
+    wait_counted(
+        &c,
+        &coin1,
+        "k",
+        "no",
+        "coin 1's newer attestation, back with its anchor",
+    );
+    wait_counted(
+        &c,
+        &coin2,
+        "k",
+        "",
+        "coin 2's withdrawal, back with its anchor",
+    );
 
     // A spent coin drops out at the next block.
     let (raw, _) = build_signed_p2wpkh_spend_of_coinbase(&a, &w, 3, burn(), 1_000);
     a.rpc_ok("sendrawtransaction", vec![json!(raw)]);
     a.mine_blocks(1, BURN);
     synced(&[&a, &b, &c]);
-    poll_until(|| counted(&c, &coin3, "k").is_none(), test_timeout(60), "coin 3 to drop out once spent");
+    poll_until(
+        || counted(&c, &coin3, "k").is_none(),
+        test_timeout(60),
+        "coin 3 to drop out once spent",
+    );
 
     // A misbehaving publisher, reached only through a pull connection.
     let anchor_height = height(&c) as u32 - 6;
-    let anchor: BlockHash =
-        c.rpc_ok("getblockhash", vec![json!(anchor_height)]).as_str().unwrap().parse().unwrap();
+    let anchor: BlockHash = c
+        .rpc_ok("getblockhash", vec![json!(anchor_height)])
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
     let coin4: OutPoint = coin(&a, 4).parse().unwrap();
     let forged = forged_page(coin4, anchor_height, anchor);
     let fake = FakePublisher::start(forged);
     fake.announce_to(c.p2p_port.unwrap());
-    poll_until(|| fake.closed(), test_timeout(180), "the aggregator to pull the fake publisher and drop it");
+    poll_until(
+        || fake.closed(),
+        test_timeout(180),
+        "the aggregator to pull the fake publisher and drop it",
+    );
     // The handshake, keep-alive and the pull: nothing else.
     let seen = fake.pull_connection().unwrap();
-    let allowed = ["version", "verack", "wtxidrelay", "sendaddrv2", "ping", "pong", "getnapatt"];
-    assert!(seen.iter().all(|m| allowed.contains(&m.as_str())), "a pull connection carried more: {seen:?}");
+    let allowed = [
+        "version",
+        "verack",
+        "wtxidrelay",
+        "sendaddrv2",
+        "ping",
+        "pong",
+        "getnapatt",
+    ];
+    assert!(
+        seen.iter().all(|m| allowed.contains(&m.as_str())),
+        "a pull connection carried more: {seen:?}"
+    );
     let agg = aggregate(&c);
     assert_eq!(agg["misbehaving"], 1, "{agg}");
     assert!(counted(&c, &coin4.to_string(), "forged").is_none());
@@ -222,7 +305,9 @@ fn nap_aggregator_collects_supersedes_withdraws_reorgs_spends_and_punishes() {
 /// An error's code from an RPC that must fail.
 fn refused(node: &TestNode, method: &str, params: Vec<Value>) -> i64 {
     let resp = node.rpc_call_with_params(method, params).unwrap();
-    resp["error"]["code"].as_i64().unwrap_or_else(|| panic!("{method} succeeded: {resp}"))
+    resp["error"]["code"]
+        .as_i64()
+        .unwrap_or_else(|| panic!("{method} succeeded: {resp}"))
 }
 
 #[test]
@@ -250,15 +335,25 @@ fn nap_report_replays_byte_for_byte_from_an_exported_snapshot() {
     assert_eq!(k["key"], "k");
     // Regtest's early coinbases hold 50 BTC each.
     assert_eq!(k["weight_sat"], 10_000_000_000u64);
-    assert_eq!(k["withdrawn"], json!({ "weight_sat": 5_000_000_000u64, "outpoints": 1 }));
+    assert_eq!(
+        k["withdrawn"],
+        json!({ "weight_sat": 5_000_000_000u64, "outpoints": 1 })
+    );
     assert_eq!(k["values"][0]["share_ppm"], 500_000);
 
     let export = c.rpc_ok("exportnapsnapshot", vec![json!("nap-snapshot.dat")]);
     assert_eq!(export["digest"], live["digest"]);
     assert_eq!(export["attestations"], 3);
     let path = export["path"].as_str().unwrap().to_owned();
-    assert!(path.ends_with("nap-snapshot.dat") && std::path::Path::new(&path).is_absolute(), "{path}");
-    assert_eq!(refused(&c, "exportnapsnapshot", vec![json!(path)]), -8, "an existing file is not overwritten");
+    assert!(
+        path.ends_with("nap-snapshot.dat") && std::path::Path::new(&path).is_absolute(),
+        "{path}"
+    );
+    assert_eq!(
+        refused(&c, "exportnapsnapshot", vec![json!(path)]),
+        -8,
+        "an existing file is not overwritten"
+    );
 
     // The replay, at the same tip, on the aggregator and on a node that
     // aggregates nothing: the same bytes.
@@ -271,7 +366,10 @@ fn nap_report_replays_byte_for_byte_from_an_exported_snapshot() {
     // Without the aggregator, only a snapshot can be reported on.
     assert_eq!(refused(&a, "getnapreport", vec![]), -1);
     assert_eq!(refused(&a, "exportnapsnapshot", vec![json!("x.dat")]), -1);
-    assert_eq!(refused(&a, "replaynapsnapshot", vec![json!("no-such-file.dat")]), -8);
+    assert_eq!(
+        refused(&a, "replaynapsnapshot", vec![json!("no-such-file.dat")]),
+        -8
+    );
 
     // The live report, asked again, is the one computed; a new block makes
     // a new one.
@@ -291,7 +389,9 @@ fn forged_page(outpoint: OutPoint, anchor_height: u32, anchor: BlockHash) -> Vec
     let other = node::nap::message::render(&outpoint, "forged", "no", anchor_height, &anchor);
     let sig = sign(&other);
     let witness: Witness = encode::deserialize(
-        &base64::engine::general_purpose::STANDARD.decode(sig.trim_start_matches("smp")).unwrap(),
+        &base64::engine::general_purpose::STANDARD
+            .decode(sig.trim_start_matches("smp"))
+            .unwrap(),
     )
     .unwrap();
     let att = node::nap::Attestation::new(
@@ -303,7 +403,11 @@ fn forged_page(outpoint: OutPoint, anchor_height: u32, anchor: BlockHash) -> Vec
         node::nap::NapSignature::Simple(witness),
     )
     .unwrap();
-    node::nap::p2p::NapAtt { attestations: vec![att], next_cursor: None }.to_bytes()
+    node::nap::p2p::NapAtt {
+        attestations: vec![att],
+        next_cursor: None,
+    }
+    .to_bytes()
 }
 
 /// A P2P peer in the test process that announces itself as a NAP publisher
@@ -379,7 +483,9 @@ impl FakePublisher {
                 let Ok(mut stream) = stream else { continue };
                 let (log, done, page) = (log.clone(), done.clone(), page.clone());
                 std::thread::spawn(move || {
-                    stream.set_read_timeout(Some(Duration::from_secs(300))).unwrap();
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(300)))
+                        .unwrap();
                     let n = {
                         let mut l = log.lock().unwrap();
                         l.push(Vec::new());
@@ -396,7 +502,9 @@ impl FakePublisher {
                                 send(&mut stream, NetworkMessage::Verack);
                             }
                             NetworkMessage::Ping(x) => send(&mut stream, NetworkMessage::Pong(x)),
-                            NetworkMessage::Unknown { command, .. } if command.as_ref() == "getnapatt" => {
+                            NetworkMessage::Unknown { command, .. }
+                                if command.as_ref() == "getnapatt" =>
+                            {
                                 pulled = true;
                                 send(
                                     &mut stream,
@@ -415,15 +523,24 @@ impl FakePublisher {
                 });
             }
         });
-        FakePublisher { listener_port, connections, closed }
+        FakePublisher {
+            listener_port,
+            connections,
+            closed,
+        }
     }
 
     /// Connect to the node at `port` as an ordinary peer that does not
     /// publish, and announce the listening port as a NAP publisher's address.
     fn announce_to(&self, port: u16) {
         let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
-        stream.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
-        send(&mut stream, version(ServiceFlags::NETWORK | ServiceFlags::WITNESS));
+        stream
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .unwrap();
+        send(
+            &mut stream,
+            version(ServiceFlags::NETWORK | ServiceFlags::WITNESS),
+        );
         let (mut version_in, mut verack_in) = (false, false);
         while !(version_in && verack_in) {
             match recv(&mut stream).expect("handshake") {
@@ -436,8 +553,14 @@ impl FakePublisher {
             }
         }
         let me: SocketAddr = format!("127.0.0.1:{}", self.listener_port).parse().unwrap();
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as u32;
-        send(&mut stream, NetworkMessage::Addr(vec![(now, P2pAddress::new(&me, services()))]));
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as u32;
+        send(
+            &mut stream,
+            NetworkMessage::Addr(vec![(now, P2pAddress::new(&me, services()))]),
+        );
         // Stay up, answering pings, so the address is taken in.
         std::thread::spawn(move || {
             while let Some(msg) = recv(&mut stream) {
@@ -450,7 +573,12 @@ impl FakePublisher {
 
     /// The commands the connection asked for the pull received.
     fn pull_connection(&self) -> Option<Vec<String>> {
-        self.connections.lock().unwrap().iter().find(|c| c.iter().any(|m| m == "getnapatt")).cloned()
+        self.connections
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|c| c.iter().any(|m| m == "getnapatt"))
+            .cloned()
     }
 
     fn closed(&self) -> bool {
@@ -478,17 +606,31 @@ fn fan_out(node: &TestNode, height: u64, count: usize) -> String {
             witness: Witness::new(),
         }],
         output: (0..count)
-            .map(|_| TxOut { value: Amount::from_sat(each), script_pubkey: w.address.script_pubkey() })
+            .map(|_| TxOut {
+                value: Amount::from_sat(each),
+                script_pubkey: w.address.script_pubkey(),
+            })
             .collect(),
     };
     let sighash = SighashCache::new(&tx)
-        .p2wpkh_signature_hash(0, &w.address.script_pubkey(), Amount::from_sat(50 * 100_000_000), EcdsaSighashType::All)
+        .p2wpkh_signature_hash(
+            0,
+            &w.address.script_pubkey(),
+            Amount::from_sat(50 * 100_000_000),
+            EcdsaSighashType::All,
+        )
         .unwrap();
     let sig = Secp256k1::new().sign_ecdsa(&Message::from_digest(sighash.to_byte_array()), &w.sk);
-    let sig = bitcoin::ecdsa::Signature { signature: sig, sighash_type: EcdsaSighashType::All };
+    let sig = bitcoin::ecdsa::Signature {
+        signature: sig,
+        sighash_type: EcdsaSighashType::All,
+    };
     let pk = bitcoin::CompressedPublicKey::from_slice(&w.pk.to_bytes()).unwrap();
     tx.input[0].witness = Witness::p2wpkh(&sig, &pk.0);
-    node.rpc_ok("sendrawtransaction", vec![json!(hex::encode(encode::serialize(&tx)))]);
+    node.rpc_ok(
+        "sendrawtransaction",
+        vec![json!(hex::encode(encode::serialize(&tx)))],
+    );
     tx.compute_txid().to_string()
 }
 
@@ -504,9 +646,15 @@ fn fan_out(node: &TestNode, height: u64, count: usize) -> String {
 #[ignore = "a measurement; run by hand"]
 fn nap_budget_measurement() {
     const PER_TX: usize = 2_500;
-    let n: usize = std::env::var("NAP_BUDGET_COINS").ok().and_then(|v| v.parse().ok()).unwrap_or(12_000);
+    let n: usize = std::env::var("NAP_BUDGET_COINS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(12_000);
     let txs = n.div_ceil(PER_TX);
-    assert!(txs < 40, "the fan-out spends coinbases from below the first halving");
+    assert!(
+        txs < 40,
+        "the fan-out spends coinbases from below the first halving"
+    );
     let mut a = TestNode::start(&["--nap=1", "--v2transport=0"]);
     let w = wallet();
     a.mine_blocks(txs as u64, &w.address.to_string());
@@ -526,14 +674,20 @@ fn nap_budget_measurement() {
         attest(&a, op, "budget", if i % 3 == 0 { "no" } else { "yes" });
     }
     let submit = start.elapsed();
-    println!("publisher: {n} attestations created and submitted in {submit:.1?} ({:.0}/s)", n as f64 / submit.as_secs_f64());
+    println!(
+        "publisher: {n} attestations created and submitted in {submit:.1?} ({:.0}/s)",
+        n as f64 / submit.as_secs_f64()
+    );
 
     let c = TestNode::start(&["--napaggregator=1", "--v2transport=0"]);
     c.rpc_ok("addnode", vec![json!(p2p(&a)), json!("onetry")]);
     synced(&[&a, &c]);
     let start = std::time::Instant::now();
     let mut last = None;
-    println!("{:>8} {:>8} {:>9} {:>6} {:>6}", "secs", "held", "deferred", "pulls", "pages");
+    println!(
+        "{:>8} {:>8} {:>9} {:>6} {:>6}",
+        "secs", "held", "deferred", "pulls", "pages"
+    );
     loop {
         let agg = aggregate(&c);
         let row = (
@@ -543,7 +697,14 @@ fn nap_budget_measurement() {
             agg["pulls"]["pages"].as_u64().unwrap(),
         );
         if last != Some(row) {
-            println!("{:>8.1} {:>8} {:>9} {:>6} {:>6}", start.elapsed().as_secs_f64(), row.0, row.1, row.2, row.3);
+            println!(
+                "{:>8.1} {:>8} {:>9} {:>6} {:>6}",
+                start.elapsed().as_secs_f64(),
+                row.0,
+                row.1,
+                row.2,
+                row.3
+            );
             last = Some(row);
         }
         if row.0 as usize >= n || start.elapsed() > Duration::from_secs(3 * 60 * 60) {
@@ -552,7 +713,10 @@ fn nap_budget_measurement() {
         std::thread::sleep(Duration::from_millis(500));
     }
     let fill = start.elapsed();
-    println!("aggregator: {} of {n} held after {fill:.1?}", last.unwrap().0);
+    println!(
+        "aggregator: {} of {n} held after {fill:.1?}",
+        last.unwrap().0
+    );
     let peer = |node: &TestNode, other: &TestNode| -> Value {
         let peers = node.rpc_ok("getpeerinfo", vec![]);
         let port = other.p2p_port.unwrap().to_string();
@@ -560,14 +724,23 @@ fn nap_budget_measurement() {
             .as_array()
             .unwrap()
             .iter()
-            .find(|p| p["addr"].as_str().unwrap().ends_with(&port) || p["addrbind"].as_str().is_some_and(|b| b.ends_with(&port)))
+            .find(|p| {
+                p["addr"].as_str().unwrap().ends_with(&port)
+                    || p["addrbind"].as_str().is_some_and(|b| b.ends_with(&port))
+            })
             .cloned()
             .unwrap_or(Value::Null)
     };
-    println!("aggregator received per message: {}", peer(&c, &a)["bytesrecv_per_msg"]);
+    println!(
+        "aggregator received per message: {}",
+        peer(&c, &a)["bytesrecv_per_msg"]
+    );
     let served = a.rpc_ok("getpeerinfo", vec![]);
     for p in served.as_array().unwrap() {
-        println!("publisher sent to {} per message: {}", p["addr"], p["bytessent_per_msg"]);
+        println!(
+            "publisher sent to {} per message: {}",
+            p["addr"], p["bytessent_per_msg"]
+        );
     }
 
     let start = std::time::Instant::now();
@@ -586,9 +759,16 @@ fn nap_budget_measurement() {
     let exported = start.elapsed();
     let path = export["path"].as_str().unwrap().to_owned();
     let size = std::fs::metadata(&path).unwrap().len();
-    println!("export: {size} bytes ({:.0} per attestation) in {exported:.1?}", size as f64 / n as f64);
+    println!(
+        "export: {size} bytes ({:.0} per attestation) in {exported:.1?}",
+        size as f64 / n as f64
+    );
     let start = std::time::Instant::now();
     let replayed = a.rpc_ok("replaynapsnapshot", vec![json!(path)]);
-    println!("replay on the publisher: {:.1?}, same report: {}", start.elapsed(), replayed == report);
+    println!(
+        "replay on the publisher: {:.1?}, same report: {}",
+        start.elapsed(),
+        replayed == report
+    );
     a.stop();
 }

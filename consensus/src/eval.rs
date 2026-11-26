@@ -1,4 +1,4 @@
-use crate::checker::{ExecData, SignatureChecker, SigVersion};
+use crate::checker::{ExecData, SigVersion, SignatureChecker};
 use crate::condition::ConditionStack;
 use crate::encoding;
 use crate::error::ScriptError;
@@ -6,9 +6,9 @@ use crate::flags;
 use crate::scriptnum::ScriptNum;
 use crate::stack::{self, StackItem};
 
+use ripemd::Ripemd160;
 use sha1::Sha1;
 use sha2::{Digest as _, Sha256};
-use ripemd::Ripemd160;
 
 /// Maximum number of bytes pushable to the stack.
 const MAX_SCRIPT_ELEMENT_SIZE: usize = 520;
@@ -267,8 +267,8 @@ pub fn eval_script(
             let f_exec = vf_exec.all_true();
 
             // Read instruction
-            let (opcode, push_data) = read_instruction(script, &mut pc)
-                .ok_or(ScriptError::BadOpcode)?;
+            let (opcode, push_data) =
+                read_instruction(script, &mut pc).ok_or(ScriptError::BadOpcode)?;
 
             if push_data.len() > MAX_SCRIPT_ELEMENT_SIZE {
                 return Err(ScriptError::PushSize);
@@ -319,12 +319,9 @@ pub fn eval_script(
                             if stack.is_empty() {
                                 return Err(ScriptError::InvalidStackOperation);
                             }
-                            let n_lock_time = ScriptNum::from_bytes(
-                                stack.last().unwrap(),
-                                require_minimal,
-                                5,
-                            )
-                            .map_err(|_| ScriptError::ScriptNum)?;
+                            let n_lock_time =
+                                ScriptNum::from_bytes(stack.last().unwrap(), require_minimal, 5)
+                                    .map_err(|_| ScriptError::ScriptNum)?;
                             if n_lock_time < 0 {
                                 return Err(ScriptError::NegativeLocktime);
                             }
@@ -342,12 +339,9 @@ pub fn eval_script(
                             if stack.is_empty() {
                                 return Err(ScriptError::InvalidStackOperation);
                             }
-                            let n_sequence = ScriptNum::from_bytes(
-                                stack.last().unwrap(),
-                                require_minimal,
-                                5,
-                            )
-                            .map_err(|_| ScriptError::ScriptNum)?;
+                            let n_sequence =
+                                ScriptNum::from_bytes(stack.last().unwrap(), require_minimal, 5)
+                                    .map_err(|_| ScriptError::ScriptNum)?;
                             if n_sequence < 0 {
                                 return Err(ScriptError::NegativeLocktime);
                             }
@@ -564,9 +558,10 @@ pub fn eval_script(
                         if stack.len() < 2 {
                             return Err(ScriptError::InvalidStackOperation);
                         }
-                        let n = ScriptNum::from_bytes_default(stack.last().unwrap(), require_minimal)
-                            .map_err(|_| ScriptError::ScriptNum)?
-                            .getint();
+                        let n =
+                            ScriptNum::from_bytes_default(stack.last().unwrap(), require_minimal)
+                                .map_err(|_| ScriptError::ScriptNum)?
+                                .getint();
                         stack.pop();
                         if n < 0 || n as usize >= stack.len() {
                             return Err(ScriptError::InvalidStackOperation);
@@ -636,13 +631,18 @@ pub fn eval_script(
                     }
 
                     // Unary numeric operations
-                    op::OP_1ADD | op::OP_1SUB | op::OP_NEGATE | op::OP_ABS | op::OP_NOT
+                    op::OP_1ADD
+                    | op::OP_1SUB
+                    | op::OP_NEGATE
+                    | op::OP_ABS
+                    | op::OP_NOT
                     | op::OP_0NOTEQUAL => {
                         if stack.is_empty() {
                             return Err(ScriptError::InvalidStackOperation);
                         }
-                        let bn = ScriptNum::from_bytes_default(stack.last().unwrap(), require_minimal)
-                            .map_err(|_| ScriptError::ScriptNum)?;
+                        let bn =
+                            ScriptNum::from_bytes_default(stack.last().unwrap(), require_minimal)
+                                .map_err(|_| ScriptError::ScriptNum)?;
                         let result = match opcode {
                             op::OP_1ADD => bn + ScriptNum::new(1),
                             op::OP_1SUB => bn - ScriptNum::new(1),
@@ -690,9 +690,7 @@ pub fn eval_script(
                             op::OP_SUB => bn1 - bn2,
                             op::OP_BOOLAND => ScriptNum::from(bn1 != 0 && bn2 != 0),
                             op::OP_BOOLOR => ScriptNum::from(bn1 != 0 || bn2 != 0),
-                            op::OP_NUMEQUAL | op::OP_NUMEQUALVERIFY => {
-                                ScriptNum::from(bn1 == bn2)
-                            }
+                            op::OP_NUMEQUAL | op::OP_NUMEQUALVERIFY => ScriptNum::from(bn1 == bn2),
                             op::OP_NUMNOTEQUAL => ScriptNum::from(bn1 != bn2),
                             op::OP_LESSTHAN => ScriptNum::from(bn1 < bn2),
                             op::OP_GREATERTHAN => ScriptNum::from(bn1 > bn2),
@@ -848,19 +846,16 @@ pub fn eval_script(
 
                     op::OP_CHECKSIGADD => {
                         // Only available in tapscript
-                        if sig_version == SigVersion::Base || sig_version == SigVersion::WitnessV0
-                        {
+                        if sig_version == SigVersion::Base || sig_version == SigVersion::WitnessV0 {
                             return Err(ScriptError::BadOpcode);
                         }
                         if stack.len() < 3 {
                             return Err(ScriptError::InvalidStackOperation);
                         }
                         let pubkey = stack.pop().unwrap();
-                        let num = ScriptNum::from_bytes_default(
-                            stack.last().unwrap(),
-                            require_minimal,
-                        )
-                        .map_err(|_| ScriptError::ScriptNum)?;
+                        let num =
+                            ScriptNum::from_bytes_default(stack.last().unwrap(), require_minimal)
+                                .map_err(|_| ScriptError::ScriptNum)?;
                         stack.pop();
                         let sig = stack.pop().unwrap();
 
@@ -890,12 +885,10 @@ pub fn eval_script(
                             return Err(ScriptError::InvalidStackOperation);
                         }
 
-                        let n_keys_count = ScriptNum::from_bytes_default(
-                            &stack[stack.len() - i],
-                            require_minimal,
-                        )
-                        .map_err(|_| ScriptError::ScriptNum)?
-                        .getint();
+                        let n_keys_count =
+                            ScriptNum::from_bytes_default(&stack[stack.len() - i], require_minimal)
+                                .map_err(|_| ScriptError::ScriptNum)?
+                                .getint();
 
                         if n_keys_count < 0 || n_keys_count as usize > MAX_PUBKEYS_PER_MULTISIG {
                             return Err(ScriptError::PubkeyCount);
@@ -916,12 +909,10 @@ pub fn eval_script(
                             return Err(ScriptError::InvalidStackOperation);
                         }
 
-                        let mut n_sigs_count = ScriptNum::from_bytes_default(
-                            &stack[stack.len() - i],
-                            require_minimal,
-                        )
-                        .map_err(|_| ScriptError::ScriptNum)?
-                        .getint();
+                        let mut n_sigs_count =
+                            ScriptNum::from_bytes_default(&stack[stack.len() - i], require_minimal)
+                                .map_err(|_| ScriptError::ScriptNum)?
+                                .getint();
 
                         if n_sigs_count < 0 || n_sigs_count > n_keys_count {
                             return Err(ScriptError::SigCount);
@@ -962,10 +953,7 @@ pub fn eval_script(
                                 let (new_code, found) =
                                     encoding::find_and_delete(&script_code, &pattern);
                                 if found > 0
-                                    && flags::has_flag(
-                                        script_flags,
-                                        flags::VERIFY_CONST_SCRIPTCODE,
-                                    )
+                                    && flags::has_flag(script_flags, flags::VERIFY_CONST_SCRIPTCODE)
                                 {
                                     return Err(ScriptError::SigFindAndDelete);
                                 }
@@ -1086,17 +1074,15 @@ fn eval_checksig(
     success: &mut bool,
 ) -> Result<(), ScriptError> {
     match sig_version {
-        SigVersion::Base | SigVersion::WitnessV0 => {
-            eval_checksig_pre_tapscript(
-                sig,
-                pubkey,
-                script_code,
-                script_flags,
-                checker,
-                sig_version,
-                success,
-            )
-        }
+        SigVersion::Base | SigVersion::WitnessV0 => eval_checksig_pre_tapscript(
+            sig,
+            pubkey,
+            script_code,
+            script_flags,
+            checker,
+            sig_version,
+            success,
+        ),
         SigVersion::Tapscript => {
             eval_checksig_tapscript(sig, pubkey, exec_data, script_flags, checker, success)
         }
@@ -1176,8 +1162,8 @@ fn eval_checksig_tapscript(
         return Err(ScriptError::TapscriptEmptyPubkey);
     } else if pubkey.len() == 32 {
         if *success {
-            let ok = checker
-                .check_schnorr_signature(sig, pubkey, SigVersion::Tapscript, exec_data)?;
+            let ok =
+                checker.check_schnorr_signature(sig, pubkey, SigVersion::Tapscript, exec_data)?;
             if !ok {
                 return Err(ScriptError::SchnorrSig);
             }
@@ -1201,5 +1187,12 @@ pub fn eval_script_simple(
     sig_version: SigVersion,
 ) -> Result<(), ScriptError> {
     let mut exec_data = ExecData::new();
-    eval_script(stack, script, script_flags, checker, sig_version, &mut exec_data)
+    eval_script(
+        stack,
+        script,
+        script_flags,
+        checker,
+        sig_version,
+        &mut exec_data,
+    )
 }

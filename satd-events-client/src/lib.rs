@@ -146,16 +146,16 @@ pub use client::{
     SilentPaymentTarget, StreamClient, StreamClientBuilder, SubscribeOptions, WatchHandle,
 };
 pub use error::StreamError;
-pub use event::{
-    display_hex, Cursor, CursorRejectReason, DescriptorMatch, Event, EvictReason, Outpoint,
-    PrefixMatch, RejectedDescriptor, RescanRejectReason, ScriptPrefix, SpentPrevout, StatusKind,
-    StatusSeverity, StatusState, TaprootOutput, TweakEntry, WatchAddKind, WatchAddRejectReason,
-    WatchAddRejected, WatchSetRejectReason,
-};
 /// Parse a raw wire txid into a typed [`bitcoin::Txid`]. Requires the `bitcoin`
 /// feature.
 #[cfg(feature = "bitcoin")]
 pub use event::parse_txid;
+pub use event::{
+    Cursor, CursorRejectReason, DescriptorMatch, Event, EvictReason, Outpoint, PrefixMatch,
+    RejectedDescriptor, RescanRejectReason, ScriptPrefix, SpentPrevout, StatusKind, StatusSeverity,
+    StatusState, TaprootOutput, TweakEntry, WatchAddKind, WatchAddRejectReason, WatchAddRejected,
+    WatchSetRejectReason, display_hex,
+};
 pub use resilience::{
     Backoff, CursorStore, FileCursorStore, LagPolicy, NoopCursorStore, ResilientConfig,
     ResilientSubscription,
@@ -166,9 +166,7 @@ pub use resilient_watch::{
 
 #[cfg(feature = "bitcoin")]
 #[cfg_attr(docsrs, doc(cfg(feature = "bitcoin")))]
-pub use prefix::{
-    prefix_of, scripthash_of, FundingHit, PrefixHits, PrefixWatcher, SpendingHit,
-};
+pub use prefix::{FundingHit, PrefixHits, PrefixWatcher, SpendingHit, prefix_of, scripthash_of};
 
 /// The generated `satd.events.v1` wire types, for low-level control-message
 /// construction until typed helpers cover every case.

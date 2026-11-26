@@ -69,26 +69,39 @@ fn the_ibd_connector_leaves_ibd_when_a_stored_block_is_invalid() {
         let b = build_test_block(parent, h, BASE + 600 * h);
         parent = cs.accept_block(&b).expect("fixture block").hash();
     }
-    let missing = OutPoint { txid: bitcoin::Txid::from_byte_array([0xd7; 32]), vout: 0 };
+    let missing = OutPoint {
+        txid: bitcoin::Txid::from_byte_array([0xd7; 32]),
+        vout: 0,
+    };
     let bad = build_test_block_spending(parent, 4, BASE + 600 * 4, missing);
     let child = build_test_block(bad.block_hash(), 5, BASE + 600 * 5);
     for b in [&bad, &child] {
         cs.accept_header(&b.header).expect("fixture header");
         cs.store_block(b).expect("fixture body");
     }
-    let ibd = Arc::new(parking_lot::RwLock::new(Some(crate::net::ibd::IbdScheduler::new(
-        5, 3, &cs, 64,
-    ))));
+    let ibd = Arc::new(parking_lot::RwLock::new(Some(
+        crate::net::ibd::IbdScheduler::new(5, 3, &cs, 64),
+    )));
 
     let returned = run_connector(&cs, &ibd, Duration::from_secs(20));
-    assert!(returned, "the connector must not keep waiting on a block it judged");
-    assert!(ibd.read().is_none(), "IBD handed off to the steady-state path");
+    assert!(
+        returned,
+        "the connector must not keep waiting on a block it judged"
+    );
+    assert!(
+        ibd.read().is_none(),
+        "IBD handed off to the steady-state path"
+    );
     assert_eq!(
         cs.get_block_index(&bad.block_hash()).map(|e| e.status),
         Some(BlockStatus::Invalid)
     );
     assert_eq!(cs.tip_height(), 3);
-    assert_eq!(cs.best_header_hash(), parent, "the header tip left the invalid branch");
+    assert_eq!(
+        cs.best_header_hash(),
+        parent,
+        "the header tip left the invalid branch"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -109,11 +122,14 @@ fn the_ibd_connector_connects_valid_stored_blocks() {
         cs.accept_header(&b.header).expect("fixture header");
         cs.store_block(b).expect("fixture body");
     }
-    let ibd = Arc::new(parking_lot::RwLock::new(Some(crate::net::ibd::IbdScheduler::new(
-        5, 3, &cs, 64,
-    ))));
+    let ibd = Arc::new(parking_lot::RwLock::new(Some(
+        crate::net::ibd::IbdScheduler::new(5, 3, &cs, 64),
+    )));
 
-    assert!(run_connector(&cs, &ibd, Duration::from_secs(20)), "IBD completes");
+    assert!(
+        run_connector(&cs, &ibd, Duration::from_secs(20)),
+        "IBD completes"
+    );
     assert!(ibd.read().is_none());
     assert_eq!(cs.tip_hash(), b5.block_hash());
 

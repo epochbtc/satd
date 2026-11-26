@@ -33,12 +33,12 @@ use axum::routing::get;
 use futures_util::{SinkExt, StreamExt};
 use node::chain::events::ChainEvent;
 use node::events::{
-    build_cursor_replay, BlockCursorSource, Cursor, EventPublisher, NodeEventBody, WatchMatch,
-    WatchRegistry, MAX_REPLAY_BLOCKS, WATCH_CHANNEL_CAPACITY,
+    BlockCursorSource, Cursor, EventPublisher, MAX_REPLAY_BLOCKS, NodeEventBody,
+    WATCH_CHANNEL_CAPACITY, WatchMatch, WatchRegistry, build_cursor_replay,
 };
 use serde::Deserialize;
 
-use crate::watchset::{bounded_txid_depth_pairs, WatchSet};
+use crate::watchset::{WatchSet, bounded_txid_depth_pairs};
 use serde_json::json;
 use tokio::net::TcpListener;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, broadcast, watch};
@@ -264,7 +264,10 @@ impl WsStreamServer {
 // The `Err` variant is an axum `Response` (large), but it's the natural
 // return for an auth gate and is only built on the rejection path.
 #[allow(clippy::result_large_err)]
-fn authorize(state: &WsState, headers: &HeaderMap) -> Result<Option<satd_auth::Principal>, Response> {
+fn authorize(
+    state: &WsState,
+    headers: &HeaderMap,
+) -> Result<Option<satd_auth::Principal>, Response> {
     let Some(store) = state.auth.as_ref() else {
         return Ok(None); // auth disabled (loopback trust)
     };
@@ -540,7 +543,9 @@ async fn sse_firehose(
                         last_s.load(Ordering::Relaxed),
                     );
                     let ev = node::events::lagged_event(&publisher, n, resume);
-                    Some(Ok(Event::default().data(serde_json::to_string(&ev).unwrap_or_default())))
+                    Some(Ok(
+                        Event::default().data(serde_json::to_string(&ev).unwrap_or_default())
+                    ))
                 }
                 _ => None,
             }
@@ -614,8 +619,9 @@ async fn ws_conn(
     // while its watch-set stays live. Held behind an `Arc` shared with the
     // inbound task; quota is released per-remove, and the remainder when
     // `ws_conn` returns (alongside the `WatchHandle` deregister).
-    let watch_set: Arc<std::sync::Mutex<WatchSet>> =
-        Arc::new(std::sync::Mutex::new(WatchSet::with_entry_cap(state.max_subscriptions)));
+    let watch_set: Arc<std::sync::Mutex<WatchSet>> = Arc::new(std::sync::Mutex::new(
+        WatchSet::with_entry_cap(state.max_subscriptions),
+    ));
     // Liveness: every frame from the client (including Pong) refreshes this;
     // the outbound loop reaps the connection if it goes silent past the idle
     // timeout, so a dead/half-open peer cannot pin a connection slot.
@@ -1190,7 +1196,9 @@ fn apply_ws_control(
             );
             None
         }
-        WsControl::SetWatchOptions { include_raw_tx: want } => {
+        WsControl::SetWatchOptions {
+            include_raw_tx: want,
+        } => {
             // Store the encoder-side flag AND toggle the registry gate counter so
             // the matcher serializes only when opted in; both must agree.
             include_raw_tx.store(want, Ordering::Relaxed);
@@ -1198,17 +1206,18 @@ fn apply_ws_control(
             None
         }
         WsControl::AddOutpoints { outpoints } => watch_set
-            .add_outpoints(principal, outpoints.iter().filter_map(parse_ws_outpoint), |ops| {
-                handle.add_outpoints(ops);
-            })
-            .err(),
-        WsControl::RemoveOutpoints { outpoints } => {
-            watch_set.remove_outpoints(
+            .add_outpoints(
+                principal,
                 outpoints.iter().filter_map(parse_ws_outpoint),
                 |ops| {
-                    handle.remove_outpoints(ops);
+                    handle.add_outpoints(ops);
                 },
-            );
+            )
+            .err(),
+        WsControl::RemoveOutpoints { outpoints } => {
+            watch_set.remove_outpoints(outpoints.iter().filter_map(parse_ws_outpoint), |ops| {
+                handle.remove_outpoints(ops);
+            });
             None
         }
         WsControl::AddScripts {
@@ -1228,7 +1237,10 @@ fn apply_ws_control(
                 Some(AddRejected {
                     reason: AddRejectReason::Malformed,
                     items: RejectedItems::Scripts(
-                        scripthashes.iter().filter_map(|s| parse_ws_scripthash(s)).collect(),
+                        scripthashes
+                            .iter()
+                            .filter_map(|s| parse_ws_scripthash(s))
+                            .collect(),
                     ),
                 })
             } else {
@@ -1276,7 +1288,8 @@ fn apply_ws_control(
             min_depths,
             auto_close_depth,
         } => {
-            let parsed: Vec<bitcoin::Txid> = txids.iter().filter_map(|s| parse_ws_txid(s)).collect();
+            let parsed: Vec<bitcoin::Txid> =
+                txids.iter().filter_map(|s| parse_ws_txid(s)).collect();
             let depths: Vec<u32> = min_depths.iter().copied().filter(|d| *d >= 1).collect();
             if depths.is_empty() {
                 watch_set
@@ -1304,7 +1317,8 @@ fn apply_ws_control(
             }
         }
         WsControl::RemoveTransactions { txids, min_depths } => {
-            let parsed: Vec<bitcoin::Txid> = txids.iter().filter_map(|s| parse_ws_txid(s)).collect();
+            let parsed: Vec<bitcoin::Txid> =
+                txids.iter().filter_map(|s| parse_ws_txid(s)).collect();
             let depths: Vec<u32> = min_depths.iter().copied().filter(|d| *d >= 1).collect();
             if depths.is_empty() {
                 watch_set.remove_transactions(parsed, |txids| {
@@ -1379,7 +1393,9 @@ fn apply_ws_control(
         WsControl::RemoveScriptPrefixes { prefixes } => {
             let keys: Vec<(u8, u32)> = prefixes
                 .iter()
-                .filter_map(|p| parse_ws_prefix(p, prefix_min_bits, prefix_max_bits).map(|(k, _)| k))
+                .filter_map(|p| {
+                    parse_ws_prefix(p, prefix_min_bits, prefix_max_bits).map(|(k, _)| k)
+                })
                 .collect();
             watch_set.remove_prefixes(keys, |keys| {
                 handle.remove_prefixes(keys);
@@ -1436,13 +1452,17 @@ fn watch_add_rejected_json(rejected: &crate::watchset::AddRejected) -> serde_jso
     let mut body = serde_json::Map::new();
     body.insert("category".into(), json!("watch_add_rejected"));
     let (reason, required, held, quota, retry_after_secs) = match rejected.reason {
-        AddRejectReason::QuotaExceeded { required, held, quota } => {
-            ("quota_exceeded", required, held, quota, 0)
-        }
+        AddRejectReason::QuotaExceeded {
+            required,
+            held,
+            quota,
+        } => ("quota_exceeded", required, held, quota, 0),
         AddRejectReason::RateLimited { retry_after_secs } => {
             ("rate_limited", 0, 0, 0, retry_after_secs)
         }
-        AddRejectReason::CapExceeded { requested, limit } => ("cap_exceeded", requested, 0, limit, 0),
+        AddRejectReason::CapExceeded { requested, limit } => {
+            ("cap_exceeded", requested, 0, limit, 0)
+        }
         AddRejectReason::PermissionDenied => ("permission_denied", 0, 0, 0, 0),
         AddRejectReason::Malformed => ("malformed", 0, 0, 0, 0),
     };
@@ -1452,16 +1472,19 @@ fn watch_add_rejected_json(rejected: &crate::watchset::AddRejected) -> serde_jso
     body.insert("quota".into(), json!(quota));
     body.insert("retry_after_secs".into(), json!(retry_after_secs));
     let (kind, field, items) = match &rejected.items {
-        RejectedItems::Scripts(shs) => {
-            ("scripts", "scripthashes", json!(shs.iter().map(hex::encode).collect::<Vec<_>>()))
-        }
+        RejectedItems::Scripts(shs) => (
+            "scripts",
+            "scripthashes",
+            json!(shs.iter().map(hex::encode).collect::<Vec<_>>()),
+        ),
         RejectedItems::Outpoints(ops) => (
             "outpoints",
             "outpoints",
-            json!(ops
-                .iter()
-                .map(|op| json!({ "txid": op.txid.to_string(), "vout": op.vout }))
-                .collect::<Vec<_>>()),
+            json!(
+                ops.iter()
+                    .map(|op| json!({ "txid": op.txid.to_string(), "vout": op.vout }))
+                    .collect::<Vec<_>>()
+            ),
         ),
         RejectedItems::Transactions(txids) => (
             "transactions",
@@ -1471,12 +1494,19 @@ fn watch_add_rejected_json(rejected: &crate::watchset::AddRejected) -> serde_jso
         RejectedItems::DepthAlarms(pairs) => (
             "depth_alarms",
             "depth_alarms",
-            json!(pairs
-                .iter()
-                .map(|(t, depth)| json!({ "txid": t.to_string(), "depth": depth }))
-                .collect::<Vec<_>>()),
+            json!(
+                pairs
+                    .iter()
+                    .map(|(t, depth)| json!({ "txid": t.to_string(), "depth": depth }))
+                    .collect::<Vec<_>>()
+            ),
         ),
-        RejectedItems::Descriptor { descriptor, gap_limit, start, kept } => {
+        RejectedItems::Descriptor {
+            descriptor,
+            gap_limit,
+            start,
+            kept,
+        } => {
             body.insert("gap_limit".into(), json!(gap_limit));
             body.insert("start".into(), json!(start));
             body.insert("descriptor_kept".into(), json!(kept));
@@ -1509,7 +1539,11 @@ fn watch_add_rejected_json(rejected: &crate::watchset::AddRejected) -> serde_jso
 fn watch_set_result_json(outcome: &crate::watchset::ReplaceOutcome) -> serde_json::Value {
     use crate::watchset::ReplaceOutcome;
     let body = match outcome {
-        ReplaceOutcome::Accepted { added, removed, unchanged } => json!({
+        ReplaceOutcome::Accepted {
+            added,
+            removed,
+            unchanged,
+        } => json!({
             "category": "watch_set_result",
             "outcome": "accepted",
             "added": added,
@@ -1785,7 +1819,10 @@ mod tests {
     /// Bind a streamws server on a free loopback port and serve it until the
     /// returned sender flips.
     async fn serve_ws() -> (SocketAddr, watch::Sender<bool>, tokio::task::JoinHandle<()>) {
-        let publisher = EventPublisher::new(node::events::EdgeIdentity::new([0xab; 16], None).unwrap(), 64);
+        let publisher = EventPublisher::new(
+            node::events::EdgeIdentity::new([0xab; 16], None).unwrap(),
+            64,
+        );
         let server = WsStreamServer::bind(
             "127.0.0.1:0",
             false,
@@ -1838,7 +1875,10 @@ mod tests {
                 }
             }
         };
-        tokio::time::timeout(Duration::from_secs(5), read).await.ok().flatten()
+        tokio::time::timeout(Duration::from_secs(5), read)
+            .await
+            .ok()
+            .flatten()
     }
 
     /// An upgraded `/ws` socket is closed at shutdown with `1001 Going
@@ -1863,13 +1903,26 @@ mod tests {
             c.read_exact(&mut b).await.unwrap();
             head.push(b[0]);
         }
-        assert!(head.starts_with(b"HTTP/1.1 101"), "{}", String::from_utf8_lossy(&head));
+        assert!(
+            head.starts_with(b"HTTP/1.1 101"),
+            "{}",
+            String::from_utf8_lossy(&head)
+        );
         // The first keep-alive ping: the socket's loop is running.
-        assert!(read_until_opcode(&mut c, 0x9).await.is_some(), "a ping first");
+        assert!(
+            read_until_opcode(&mut c, 0x9).await.is_some(),
+            "a ping first"
+        );
 
         let _ = sd_tx.send(true);
-        let close = read_until_opcode(&mut c, 0x8).await.expect("a close frame at shutdown");
-        assert_eq!(close.get(..2), Some(&1001u16.to_be_bytes()[..]), "{close:?}");
+        let close = read_until_opcode(&mut c, 0x8)
+            .await
+            .expect("a close frame at shutdown");
+        assert_eq!(
+            close.get(..2),
+            Some(&1001u16.to_be_bytes()[..]),
+            "{close:?}"
+        );
         let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
     }
 
@@ -1973,26 +2026,59 @@ mod tests {
         let mut ws = WatchSet::with_entry_cap(2);
         let txid = "00".repeat(32);
         let add = |vout: u32| {
-            format!(
-                r#"{{"type":"add_outpoints","outpoints":[{{"txid":"{txid}","vout":{vout}}}]}}"#
-            )
+            format!(r#"{{"type":"add_outpoints","outpoints":[{{"txid":"{txid}","vout":{vout}}}]}}"#)
         };
         // cap = 2, no principal (loopback/unlimited quota).
-        apply_ws_control(&add(0), &handle, None, &mask, &AtomicBool::new(false), &mut ws, (8, 32));
-        apply_ws_control(&add(1), &handle, None, &mask, &AtomicBool::new(false), &mut ws, (8, 32));
+        apply_ws_control(
+            &add(0),
+            &handle,
+            None,
+            &mask,
+            &AtomicBool::new(false),
+            &mut ws,
+            (8, 32),
+        );
+        apply_ws_control(
+            &add(1),
+            &handle,
+            None,
+            &mask,
+            &AtomicBool::new(false),
+            &mut ws,
+            (8, 32),
+        );
         assert_eq!(ws.len(), 2, "two distinct outpoints registered");
         // At the cap → the next add is refused and reported (connection stays up).
-        let reply =
-            apply_ws_control(&add(2), &handle, None, &mask, &AtomicBool::new(false), &mut ws, (8, 32));
+        let reply = apply_ws_control(
+            &add(2),
+            &handle,
+            None,
+            &mask,
+            &AtomicBool::new(false),
+            &mut ws,
+            (8, 32),
+        );
         let Some(WsReply::AddRejected(rejected)) = reply else {
             panic!("an add at the cap must be reported, got {reply:?}");
         };
-        assert_eq!(rejected.reason, crate::watchset::AddRejectReason::CapExceeded { requested: 3, limit: 2 });
+        assert_eq!(
+            rejected.reason,
+            crate::watchset::AddRejectReason::CapExceeded {
+                requested: 3,
+                limit: 2
+            }
+        );
         let json = watch_add_rejected_json(&rejected);
         assert_eq!(json["body"]["category"], "watch_add_rejected");
         assert_eq!(json["body"]["kind"], "outpoints");
         assert_eq!(json["body"]["reason"], "cap_exceeded");
-        assert_eq!((json["body"]["required"].as_u64(), json["body"]["quota"].as_u64()), (Some(3), Some(2)));
+        assert_eq!(
+            (
+                json["body"]["required"].as_u64(),
+                json["body"]["quota"].as_u64()
+            ),
+            (Some(3), Some(2))
+        );
         assert_eq!(
             json["body"]["outpoints"],
             serde_json::json!([{ "txid": txid, "vout": 2 }]),
@@ -2000,19 +2086,45 @@ mod tests {
         );
         assert_eq!(ws.len(), 2, "add at the per-connection cap is shed");
         // A remove frees a slot; a subsequent add then succeeds.
-        let rm = format!(
-            r#"{{"type":"remove_outpoints","outpoints":[{{"txid":"{txid}","vout":0}}]}}"#
+        let rm =
+            format!(r#"{{"type":"remove_outpoints","outpoints":[{{"txid":"{txid}","vout":0}}]}}"#);
+        apply_ws_control(
+            &rm,
+            &handle,
+            None,
+            &mask,
+            &AtomicBool::new(false),
+            &mut ws,
+            (8, 32),
         );
-        apply_ws_control(&rm, &handle, None, &mask, &AtomicBool::new(false), &mut ws, (8, 32));
         assert_eq!(ws.len(), 1);
-        let reply =
-            apply_ws_control(&add(2), &handle, None, &mask, &AtomicBool::new(false), &mut ws, (8, 32));
+        let reply = apply_ws_control(
+            &add(2),
+            &handle,
+            None,
+            &mask,
+            &AtomicBool::new(false),
+            &mut ws,
+            (8, 32),
+        );
         assert!(reply.is_none(), "an add that lands sends nothing back");
-        assert_eq!(ws.len(), 2, "add succeeds again after a remove frees a slot");
+        assert_eq!(
+            ws.len(),
+            2,
+            "add succeeds again after a remove frees a slot"
+        );
         // cap = 0 ⇒ unlimited: adds are never shed.
         let mut uncapped = WatchSet::with_entry_cap(0);
         for vout in 0..3 {
-            apply_ws_control(&add(vout), &handle, None, &mask, &AtomicBool::new(false), &mut uncapped, (8, 32));
+            apply_ws_control(
+                &add(vout),
+                &handle,
+                None,
+                &mask,
+                &AtomicBool::new(false),
+                &mut uncapped,
+                (8, 32),
+            );
         }
         assert_eq!(uncapped.len(), 3, "cap 0 disables the per-connection limit");
     }
@@ -2024,7 +2136,8 @@ mod tests {
     #[test]
     fn the_status_category_needs_rpc_read_at_the_handshake() {
         use satd_auth::{Capability, CapabilitySet, Principal};
-        let stream_only = Principal::loopback(CapabilitySet::EMPTY.with(Capability::StreamSubscribe));
+        let stream_only =
+            Principal::loopback(CapabilitySet::EMPTY.with(Capability::StreamSubscribe));
         let with_read = Principal::loopback(
             CapabilitySet::EMPTY
                 .with(Capability::StreamSubscribe)
@@ -2041,7 +2154,9 @@ mod tests {
                 .is_err(),
         );
         // Everything else is untouched for the same token.
-        assert!(require_status_capability(node::events::CATEGORY_CHAIN, Some(&stream_only)).is_ok());
+        assert!(
+            require_status_capability(node::events::CATEGORY_CHAIN, Some(&stream_only)).is_ok()
+        );
         // The default mask does not contain status, so an ordinary subscriber
         // is unaffected — this gate must not break `categories=0`.
         assert!(
@@ -2066,10 +2181,26 @@ mod tests {
             r#"{{"type":"set_categories","categories":{}}}"#,
             node::events::CATEGORY_STATUS | node::events::CATEGORY_CHAIN,
         );
-        apply_ws_control(&ctrl, &handle, Some(&p), &mask, &AtomicBool::new(false), &mut ws, (8, 32));
+        apply_ws_control(
+            &ctrl,
+            &handle,
+            Some(&p),
+            &mask,
+            &AtomicBool::new(false),
+            &mut ws,
+            (8, 32),
+        );
         let got = mask.load(Ordering::Relaxed);
-        assert_eq!(got & node::events::CATEGORY_STATUS, 0, "status must not be added");
-        assert_ne!(got & node::events::CATEGORY_CHAIN, 0, "the rest of the update applies");
+        assert_eq!(
+            got & node::events::CATEGORY_STATUS,
+            0,
+            "status must not be added"
+        );
+        assert_ne!(
+            got & node::events::CATEGORY_CHAIN,
+            0,
+            "the rest of the update applies"
+        );
 
         // With rpc:read the same message is honored, so the gate is the
         // capability and not the code path.
@@ -2078,7 +2209,15 @@ mod tests {
                 .with(Capability::StreamSubscribe)
                 .with(Capability::RpcRead),
         );
-        apply_ws_control(&ctrl, &handle, Some(&p2), &mask, &AtomicBool::new(false), &mut ws, (8, 32));
+        apply_ws_control(
+            &ctrl,
+            &handle,
+            Some(&p2),
+            &mask,
+            &AtomicBool::new(false),
+            &mut ws,
+            (8, 32),
+        );
         assert_ne!(
             mask.load(Ordering::Relaxed) & node::events::CATEGORY_STATUS,
             0,
@@ -2110,12 +2249,29 @@ mod tests {
             "11".repeat(32),
             "22".repeat(32),
         );
-        let outcome = apply_ws_control(&ctrl, &handle, Some(&p), &mask, &AtomicBool::new(false), &mut ws, (8, 32));
+        let outcome = apply_ws_control(
+            &ctrl,
+            &handle,
+            Some(&p),
+            &mask,
+            &AtomicBool::new(false),
+            &mut ws,
+            (8, 32),
+        );
         assert!(
-            matches!(outcome, Some(WsReply::WatchSet(crate::watchset::ReplaceOutcome::Rejected { .. }))),
+            matches!(
+                outcome,
+                Some(WsReply::WatchSet(
+                    crate::watchset::ReplaceOutcome::Rejected { .. }
+                ))
+            ),
             "over-quota target must be rejected",
         );
-        assert_eq!(mask.load(Ordering::Relaxed), 0xF, "rejected replace must not touch categories");
+        assert_eq!(
+            mask.load(Ordering::Relaxed),
+            0xF,
+            "rejected replace must not touch categories"
+        );
         assert_eq!(ws.len(), 0, "rejected replace registers nothing");
 
         // A single script fits quota → accepted, and the category filter applies.
@@ -2123,9 +2279,26 @@ mod tests {
             r#"{{"type":"set_watch_set","categories":2,"scripthashes":["{}"]}}"#,
             "11".repeat(32),
         );
-        let outcome = apply_ws_control(&ok, &handle, Some(&p), &mask, &AtomicBool::new(false), &mut ws, (8, 32));
-        assert!(matches!(outcome, Some(WsReply::WatchSet(crate::watchset::ReplaceOutcome::Accepted { .. }))));
-        assert_eq!(mask.load(Ordering::Relaxed), 2, "accepted replace applies its category filter");
+        let outcome = apply_ws_control(
+            &ok,
+            &handle,
+            Some(&p),
+            &mask,
+            &AtomicBool::new(false),
+            &mut ws,
+            (8, 32),
+        );
+        assert!(matches!(
+            outcome,
+            Some(WsReply::WatchSet(
+                crate::watchset::ReplaceOutcome::Accepted { .. }
+            ))
+        ));
+        assert_eq!(
+            mask.load(Ordering::Relaxed),
+            2,
+            "accepted replace applies its category filter"
+        );
     }
 
     #[test]
@@ -2144,8 +2317,21 @@ mod tests {
             "aa".repeat(32),
             "bb".repeat(32),
         );
-        let outcome = apply_ws_control(&seed, &handle, None, &mask, &AtomicBool::new(false), &mut ws, (8, 32));
-        assert!(matches!(outcome, Some(WsReply::WatchSet(crate::watchset::ReplaceOutcome::Accepted { .. }))));
+        let outcome = apply_ws_control(
+            &seed,
+            &handle,
+            None,
+            &mask,
+            &AtomicBool::new(false),
+            &mut ws,
+            (8, 32),
+        );
+        assert!(matches!(
+            outcome,
+            Some(WsReply::WatchSet(
+                crate::watchset::ReplaceOutcome::Accepted { .. }
+            ))
+        ));
         assert_eq!(ws.len(), 2);
         assert_eq!(mask.load(Ordering::Relaxed), 2);
 
@@ -2155,14 +2341,38 @@ mod tests {
             r#"{{"type":"set_watch_set","categories":8,"scripthashes":["{}","zz"]}}"#,
             "cc".repeat(32),
         );
-        let outcome = apply_ws_control(&bad, &handle, None, &mask, &AtomicBool::new(false), &mut ws, (8, 32));
+        let outcome = apply_ws_control(
+            &bad,
+            &handle,
+            None,
+            &mask,
+            &AtomicBool::new(false),
+            &mut ws,
+            (8, 32),
+        );
         assert!(
-            matches!(outcome, Some(WsReply::WatchSet(crate::watchset::ReplaceOutcome::Malformed))),
+            matches!(
+                outcome,
+                Some(WsReply::WatchSet(
+                    crate::watchset::ReplaceOutcome::Malformed
+                ))
+            ),
             "a malformed element refuses the whole snapshot",
         );
-        assert_eq!(ws.len(), 2, "the live set is untouched by a rejected replace");
-        assert_eq!(mask.load(Ordering::Relaxed), 2, "categories are not changed by a rejected replace");
-        assert_eq!(watch_set_result_json(&crate::watchset::ReplaceOutcome::Malformed)["body"]["reason"], "malformed");
+        assert_eq!(
+            ws.len(),
+            2,
+            "the live set is untouched by a rejected replace"
+        );
+        assert_eq!(
+            mask.load(Ordering::Relaxed),
+            2,
+            "categories are not changed by a rejected replace"
+        );
+        assert_eq!(
+            watch_set_result_json(&crate::watchset::ReplaceOutcome::Malformed)["body"]["reason"],
+            "malformed"
+        );
     }
 
     #[test]
@@ -2182,14 +2392,33 @@ mod tests {
             "22".repeat(32),
             "33".repeat(32),
         );
-        let outcome = apply_ws_control(&over, &handle, None, &mask, &AtomicBool::new(false), &mut ws, (8, 32));
+        let outcome = apply_ws_control(
+            &over,
+            &handle,
+            None,
+            &mask,
+            &AtomicBool::new(false),
+            &mut ws,
+            (8, 32),
+        );
         assert!(
-            matches!(outcome, Some(WsReply::WatchSet(crate::watchset::ReplaceOutcome::CapExceeded { limit: 2, requested: 3 }))),
+            matches!(
+                outcome,
+                Some(WsReply::WatchSet(
+                    crate::watchset::ReplaceOutcome::CapExceeded {
+                        limit: 2,
+                        requested: 3
+                    }
+                ))
+            ),
             "over-cap SetWatchSet must be rejected, got {outcome:?}",
         );
         assert_eq!(ws.len(), 0, "a cap-rejected replace installs nothing");
         assert_eq!(
-            watch_set_result_json(&crate::watchset::ReplaceOutcome::CapExceeded { limit: 2, requested: 3 })["body"]["reason"],
+            watch_set_result_json(&crate::watchset::ReplaceOutcome::CapExceeded {
+                limit: 2,
+                requested: 3
+            })["body"]["reason"],
             "cap_exceeded",
         );
 
@@ -2199,8 +2428,21 @@ mod tests {
             "11".repeat(32),
             "22".repeat(32),
         );
-        let outcome = apply_ws_control(&ok, &handle, None, &mask, &AtomicBool::new(false), &mut ws, (8, 32));
-        assert!(matches!(outcome, Some(WsReply::WatchSet(crate::watchset::ReplaceOutcome::Accepted { .. }))));
+        let outcome = apply_ws_control(
+            &ok,
+            &handle,
+            None,
+            &mask,
+            &AtomicBool::new(false),
+            &mut ws,
+            (8, 32),
+        );
+        assert!(matches!(
+            outcome,
+            Some(WsReply::WatchSet(
+                crate::watchset::ReplaceOutcome::Accepted { .. }
+            ))
+        ));
         assert_eq!(ws.len(), 2);
     }
 
@@ -2212,7 +2454,9 @@ mod tests {
         let txid = bitcoin::Txid::from_str(&txid_hex).unwrap();
 
         let json = watch_add_rejected_json(&AddRejected {
-            reason: AddRejectReason::RateLimited { retry_after_secs: 4 },
+            reason: AddRejectReason::RateLimited {
+                retry_after_secs: 4,
+            },
             items: RejectedItems::DepthAlarms(vec![(txid, 6)]),
         });
         assert_eq!(json["body"]["kind"], "depth_alarms");
@@ -2224,7 +2468,11 @@ mod tests {
         );
 
         let json = watch_add_rejected_json(&AddRejected {
-            reason: AddRejectReason::QuotaExceeded { required: 20, held: 90, quota: 100 },
+            reason: AddRejectReason::QuotaExceeded {
+                required: 20,
+                held: 90,
+                quota: 100,
+            },
             items: RejectedItems::Descriptor {
                 descriptor: "wpkh(x)".into(),
                 gap_limit: 20,
@@ -2233,9 +2481,26 @@ mod tests {
             },
         });
         let b = &json["body"];
-        assert_eq!((b["kind"].as_str(), b["reason"].as_str()), (Some("descriptor"), Some("quota_exceeded")));
-        assert_eq!((b["required"].as_u64(), b["held"].as_u64(), b["quota"].as_u64()), (Some(20), Some(90), Some(100)));
-        assert_eq!((b["descriptor"].as_str(), b["gap_limit"].as_u64(), b["start"].as_u64()), (Some("wpkh(x)"), Some(20), Some(40)));
+        assert_eq!(
+            (b["kind"].as_str(), b["reason"].as_str()),
+            (Some("descriptor"), Some("quota_exceeded"))
+        );
+        assert_eq!(
+            (
+                b["required"].as_u64(),
+                b["held"].as_u64(),
+                b["quota"].as_u64()
+            ),
+            (Some(20), Some(90), Some(100))
+        );
+        assert_eq!(
+            (
+                b["descriptor"].as_str(),
+                b["gap_limit"].as_u64(),
+                b["start"].as_u64()
+            ),
+            (Some("wpkh(x)"), Some(20), Some(40))
+        );
         assert_eq!(b["descriptor_kept"], true);
 
         let (key, _) = crate::watchset::parse_prefix(&[0xab, 0xcd], 12, 8, 32).unwrap();
@@ -2244,13 +2509,22 @@ mod tests {
             items: RejectedItems::Prefixes(vec![key]),
         });
         assert_eq!(json["body"]["kind"], "script_prefixes");
-        assert_eq!(json["body"]["prefixes"], serde_json::json!([{ "prefix": "abc0", "bits": 12 }]));
+        assert_eq!(
+            json["body"]["prefixes"],
+            serde_json::json!([{ "prefix": "abc0", "bits": 12 }])
+        );
 
         let json = watch_add_rejected_json(&AddRejected {
-            reason: AddRejectReason::CapExceeded { requested: 17, limit: 16 },
+            reason: AddRejectReason::CapExceeded {
+                requested: 17,
+                limit: 16,
+            },
             items: RejectedItems::SilentPayments(vec![[0x02; 33]]),
         });
-        assert_eq!(json["body"]["scan_pubkeys"], serde_json::json!(["02".repeat(33)]));
+        assert_eq!(
+            json["body"]["scan_pubkeys"],
+            serde_json::json!(["02".repeat(33)])
+        );
 
         // A min_values list that is not parallel to its scripthashes refuses the
         // whole add as malformed and echoes the scripthashes that parsed.
@@ -2258,8 +2532,19 @@ mod tests {
         let (handle, _rx) = reg.register(WATCH_CHANNEL_CAPACITY);
         let mask = AtomicU32::new(0);
         let mut ws = WatchSet::default();
-        let bad = format!(r#"{{"type":"add_scripts","scripthashes":["{}"],"min_values":[1,2]}}"#, "11".repeat(32));
-        let reply = apply_ws_control(&bad, &handle, None, &mask, &AtomicBool::new(false), &mut ws, (8, 32));
+        let bad = format!(
+            r#"{{"type":"add_scripts","scripthashes":["{}"],"min_values":[1,2]}}"#,
+            "11".repeat(32)
+        );
+        let reply = apply_ws_control(
+            &bad,
+            &handle,
+            None,
+            &mask,
+            &AtomicBool::new(false),
+            &mut ws,
+            (8, 32),
+        );
         let Some(WsReply::AddRejected(rejected)) = reply else {
             panic!("a malformed add must be reported, got {reply:?}");
         };
@@ -2271,8 +2556,9 @@ mod tests {
     #[test]
     fn script_match_json_amount_and_raw_tx_gate() {
         use bitcoin::hashes::Hash;
-        let txid =
-            bitcoin::Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array([0x11; 32]));
+        let txid = bitcoin::Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array(
+            [0x11; 32],
+        ));
         let m = WatchMatch::ScriptMatched {
             scripthash: [0xaa; 32],
             txid,
@@ -2302,8 +2588,9 @@ mod tests {
     #[test]
     fn stripped_match_json_has_no_hex_and_the_flag() {
         use bitcoin::hashes::Hash;
-        let txid =
-            bitcoin::Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array([0x11; 32]));
+        let txid = bitcoin::Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array(
+            [0x11; 32],
+        ));
         let m = WatchMatch::ScriptMatched {
             scripthash: [0xaa; 32],
             txid,
@@ -2320,7 +2607,10 @@ mod tests {
         assert_eq!(on["body"]["raw_tx_stripped"], true);
         let off = watch_match_json(&m, &[], false);
         assert!(off["body"]["raw_tx"].is_null());
-        assert!(off["body"].get("raw_tx_stripped").is_none(), "not opted in: no flag");
+        assert!(
+            off["body"].get("raw_tx_stripped").is_none(),
+            "not opted in: no flag"
+        );
 
         let pm = WatchMatch::PrefixMatched(Box::new(node::events::PrefixMatch {
             prefix: (0xabcd_0000, 16),
@@ -2334,7 +2624,10 @@ mod tests {
         let v = watch_match_json(&pm, &[], false);
         assert!(v["body"]["raw_tx"].is_null(), "never empty hex: {v}");
         assert_eq!(v["body"]["raw_tx_stripped"], true);
-        assert_eq!(v["body"]["txid"], hex::encode(txid.as_raw_hash().to_byte_array()));
+        assert_eq!(
+            v["body"]["txid"],
+            hex::encode(txid.as_raw_hash().to_byte_array())
+        );
     }
 
     #[test]
@@ -2357,47 +2650,69 @@ mod tests {
     #[test]
     fn lifecycle_and_depth_json_shapes() {
         use bitcoin::hashes::Hash;
-        let txid =
-            bitcoin::Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array([0x11; 32]));
-        let rep =
-            bitcoin::Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array([0x22; 32]));
+        let txid = bitcoin::Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array(
+            [0x11; 32],
+        ));
+        let rep = bitcoin::Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array(
+            [0x22; 32],
+        ));
 
-        let v = watch_match_json(&WatchMatch::TxidReplaced {
-            txid,
-            replacing_txid: rep,
-        }, &[], false);
+        let v = watch_match_json(
+            &WatchMatch::TxidReplaced {
+                txid,
+                replacing_txid: rep,
+            },
+            &[],
+            false,
+        );
         assert_eq!(v["body"]["category"], "txid_replaced");
         assert_eq!(v["body"]["replacing_txid"], "22".repeat(32));
         assert!(v["cursor"].is_null(), "replaced carries no cursor");
 
-        let v = watch_match_json(&WatchMatch::TxidEvicted {
-            txid,
-            reason: node::mempool::events::EvictReason::BlockConflict,
-        }, &[], false);
+        let v = watch_match_json(
+            &WatchMatch::TxidEvicted {
+                txid,
+                reason: node::mempool::events::EvictReason::BlockConflict,
+            },
+            &[],
+            false,
+        );
         assert_eq!(v["body"]["category"], "txid_evicted");
         assert_eq!(v["body"]["reason"], "block_conflict");
 
-        let v = watch_match_json(&WatchMatch::TxidUnconfirmed {
-            txid,
-            prev_height: 814_000,
-        }, &[], false);
+        let v = watch_match_json(
+            &WatchMatch::TxidUnconfirmed {
+                txid,
+                prev_height: 814_000,
+            },
+            &[],
+            false,
+        );
         assert_eq!(v["body"]["category"], "txid_unconfirmed");
         assert_eq!(v["body"]["prev_height"], 814_000);
 
-        let v = watch_match_json(&WatchMatch::TxidDepthReached {
-            txid,
-            depth: 3,
-            height: 100,
-        }, &[], false);
+        let v = watch_match_json(
+            &WatchMatch::TxidDepthReached {
+                txid,
+                depth: 3,
+                height: 100,
+            },
+            &[],
+            false,
+        );
         assert_eq!(v["body"]["category"], "txid_depth_reached");
         assert_eq!(v["body"]["depth"], 3);
         assert_eq!(v["cursor"]["height"], 100);
 
-        let v = watch_match_json(&WatchMatch::TxidFinalized {
-            txid,
-            depth: 6,
-            height: 100,
-        }, &[], false);
+        let v = watch_match_json(
+            &WatchMatch::TxidFinalized {
+                txid,
+                depth: 6,
+                height: 100,
+            },
+            &[],
+            false,
+        );
         assert_eq!(v["body"]["category"], "txid_finalized");
         assert_eq!(v["body"]["depth"], 6);
         assert_eq!(v["cursor"]["height"], 100);
@@ -2411,14 +2726,29 @@ mod tests {
         let mut ws = WatchSet::default();
         let txid = "11".repeat(32);
         // min_depths [1,3] on one txid → two distinct alarm items.
-        let ctrl = format!(
-            r#"{{"type":"add_transactions","txids":["{txid}"],"min_depths":[1,3]}}"#
+        let ctrl =
+            format!(r#"{{"type":"add_transactions","txids":["{txid}"],"min_depths":[1,3]}}"#);
+        apply_ws_control(
+            &ctrl,
+            &handle,
+            None,
+            &mask,
+            &AtomicBool::new(false),
+            &mut ws,
+            (8, 32),
         );
-        apply_ws_control(&ctrl, &handle, None, &mask, &AtomicBool::new(false), &mut ws, (8, 32));
         assert_eq!(ws.len(), 2, "(X,1) and (X,3) are two items");
         // Lifecycle add (no depths) is one item.
         let ctrl = format!(r#"{{"type":"add_transactions","txids":["{txid}"]}}"#);
-        apply_ws_control(&ctrl, &handle, None, &mask, &AtomicBool::new(false), &mut ws, (8, 32));
+        apply_ws_control(
+            &ctrl,
+            &handle,
+            None,
+            &mask,
+            &AtomicBool::new(false),
+            &mut ws,
+            (8, 32),
+        );
         assert_eq!(ws.len(), 3, "lifecycle watch adds one more item");
     }
 
@@ -2430,18 +2760,42 @@ mod tests {
         let mut ws = WatchSet::default();
         // A 16-bit prefix (2 bytes hex). No principal ⇒ loopback/unlimited.
         let ctrl = r#"{"type":"add_script_prefixes","prefixes":[{"prefix":"abcd","bits":16}]}"#;
-        apply_ws_control(ctrl, &handle, None, &mask, &AtomicBool::new(false), &mut ws, (8, 32));
+        apply_ws_control(
+            ctrl,
+            &handle,
+            None,
+            &mask,
+            &AtomicBool::new(false),
+            &mut ws,
+            (8, 32),
+        );
         assert_eq!(ws.len(), 1, "one prefix bucket registered");
         assert!(reg.has_prefix_watchers());
 
         // Below-min bits is dropped (filter_map) → nothing registered.
         let bad = r#"{"type":"add_script_prefixes","prefixes":[{"prefix":"ab","bits":4}]}"#;
-        apply_ws_control(bad, &handle, None, &mask, &AtomicBool::new(false), &mut ws, (8, 32));
+        apply_ws_control(
+            bad,
+            &handle,
+            None,
+            &mask,
+            &AtomicBool::new(false),
+            &mut ws,
+            (8, 32),
+        );
         assert_eq!(ws.len(), 1, "out-of-range bits rejected, set unchanged");
 
         // Remove releases it.
         let rm = r#"{"type":"remove_script_prefixes","prefixes":[{"prefix":"abcd","bits":16}]}"#;
-        apply_ws_control(rm, &handle, None, &mask, &AtomicBool::new(false), &mut ws, (8, 32));
+        apply_ws_control(
+            rm,
+            &handle,
+            None,
+            &mask,
+            &AtomicBool::new(false),
+            &mut ws,
+            (8, 32),
+        );
         assert_eq!(ws.len(), 0);
         assert!(!reg.has_prefix_watchers());
     }
@@ -2450,16 +2804,18 @@ mod tests {
     fn prefix_matched_json_shape() {
         use bitcoin::hashes::Hash;
         let op = |b: u8, vout: u32| bitcoin::OutPoint {
-            txid: bitcoin::Txid::from_raw_hash(
-                bitcoin::hashes::sha256d::Hash::from_byte_array([b; 32]),
-            ),
+            txid: bitcoin::Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array(
+                [b; 32],
+            )),
             vout,
         };
         let m = WatchMatch::PrefixMatched(Box::new(node::events::PrefixMatch {
             prefix: (0xabcd_0000, 16),
             raw_tx: vec![0x01, 0x02].into(),
             raw_tx_stripped: false,
-            txid: bitcoin::Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array([0x42; 32])),
+            txid: bitcoin::Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array(
+                [0x42; 32],
+            )),
             confirmed: true,
             height: Some(5),
             matched_prevouts: vec![
@@ -2630,9 +2986,9 @@ mod tests {
         let output = sp_test_pubkey(7).x_only_public_key().0;
         let tweak = sp_test_pubkey(8);
         let scan_pubkey = sp_test_pubkey(9).serialize();
-        let txid = bitcoin::Txid::from_raw_hash(
-            bitcoin::hashes::sha256d::Hash::from_byte_array([5u8; 32]),
-        );
+        let txid = bitcoin::Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array(
+            [5u8; 32],
+        ));
         let m = WatchMatch::SilentPaymentMatched {
             scan_pubkey,
             txid,
@@ -2651,7 +3007,10 @@ mod tests {
         let v = watch_match_json(&m, &[], false);
         assert_eq!(v["body"]["category"], "silent_payment_matched");
         assert_eq!(v["body"]["scan_pubkey"], hex::encode(scan_pubkey));
-        assert_eq!(v["body"]["txid"], hex::encode(txid.as_raw_hash().to_byte_array()));
+        assert_eq!(
+            v["body"]["txid"],
+            hex::encode(txid.as_raw_hash().to_byte_array())
+        );
         assert_eq!(v["body"]["vout"], 2);
         assert_eq!(v["body"]["output_pubkey"], hex::encode(output.serialize()));
         assert_eq!(v["body"]["amount"], 7_777);

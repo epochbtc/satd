@@ -169,8 +169,12 @@ fn the_check_waits_while_the_index_is_disabled() {
     let dir = tempfile::tempdir().unwrap();
     let cs = chain(dir.path());
     set_cursor(&cs, BackfillState::Completed);
-    let out = check_filter_header_chain(&cs, &FilterIndexConfig::default(), &not_shut_down()).unwrap();
-    assert_eq!(out, HeaderChainCheck::Skipped("block filter index disabled"));
+    let out =
+        check_filter_header_chain(&cs, &FilterIndexConfig::default(), &not_shut_down()).unwrap();
+    assert_eq!(
+        out,
+        HeaderChainCheck::Skipped("block filter index disabled")
+    );
     assert!(!cs.store_ref().filter_header_chain_checked());
 }
 
@@ -199,7 +203,11 @@ fn the_check_stops_at_a_gap() {
             first_rewritten: Some(2),
         }
     );
-    assert_eq!(headers(&cs)[5..].to_vec(), above, "rows above the gap untouched");
+    assert_eq!(
+        headers(&cs)[5..].to_vec(),
+        above,
+        "rows above the gap untouched"
+    );
 }
 
 /// A shutdown before the walk finishes leaves the marker unset.

@@ -439,9 +439,7 @@ pub fn dispatch_session(
                 session.set(negotiated);
                 Response::success(id, answer)
             }
-            None => {
-                Response::error(id, handlers::server_methods::no_common_version()).closing()
-            }
+            None => Response::error(id, handlers::server_methods::no_common_version()).closing(),
         };
     }
     let version = session.version();
@@ -555,7 +553,9 @@ fn handle_tweaks_subscribe(
     // A start above the tip is not an error: the client gets an empty map for
     // that height and an immediate `done`, which is how a caught-up wallet
     // polls. `last < from` makes the stream task a no-op plus `done`.
-    let last = treq.last_height(state.chain.tip_height()).unwrap_or(treq.start);
+    let last = treq
+        .last_height(state.chain.tip_height())
+        .unwrap_or(treq.start);
     // `height_map` is the heaviest read on this surface: one index read, a full
     // block read out of the flat files, and -- under cut-through, which is what
     // Cake sends by default -- one UTXO lookup per taproot output of every
@@ -577,9 +577,7 @@ fn handle_tweaks_subscribe(
     let _slot = tweaks::try_claim_scan_slot().ok_or_else(tweaks::scan_slots_busy)?;
     let read_first = || tweaks::height_map(&src, treq.start, treq.cut_through());
     let first = match tokio::runtime::Handle::try_current().map(|h| h.runtime_flavor()) {
-        Ok(tokio::runtime::RuntimeFlavor::MultiThread) => {
-            tokio::task::block_in_place(read_first)
-        }
+        Ok(tokio::runtime::RuntimeFlavor::MultiThread) => tokio::task::block_in_place(read_first),
         _ => read_first(),
     }?;
     subs.add_tweaks(
@@ -742,7 +740,8 @@ mod tests {
     fn parse_batch_with_mixed_jsonrpc_fields() {
         // Batch with one item having jsonrpc and one without — both
         // must parse and dispatch.
-        let s = r#"[{"id":1,"method":"server.ping"},{"jsonrpc":"2.0","id":2,"method":"server.ping"}]"#;
+        let s =
+            r#"[{"id":1,"method":"server.ping"},{"jsonrpc":"2.0","id":2,"method":"server.ping"}]"#;
         let parsed = Requests::parse(s).unwrap();
         match parsed {
             Requests::Batch(reqs) => {

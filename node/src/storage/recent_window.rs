@@ -287,7 +287,10 @@ mod tests {
         w.apply(&deltas(&[(3, 2), (10, 1)]));
         assert_eq!(w.count_at(3), Some(2));
         // A put+remove pair nets to zero and must not move the window.
-        w.apply(&deltas(&[(RECENT_WINDOW_LEN + 50, 1), (RECENT_WINDOW_LEN + 50, -1)]));
+        w.apply(&deltas(&[
+            (RECENT_WINDOW_LEN + 50, 1),
+            (RECENT_WINDOW_LEN + 50, -1),
+        ]));
         assert_eq!(w.base, 0);
         // A real coin above the top slides the window so it is the top.
         w.apply(&deltas(&[(RECENT_WINDOW_LEN + 5, 1)]));
@@ -326,7 +329,9 @@ mod tests {
             scanned.add_one(h);
         }
         let mut applied = RecentHeightWindow::empty([0; 32]);
-        applied.apply(&deltas(&heights.iter().map(|h| (*h, 1)).collect::<Vec<_>>()));
+        applied.apply(&deltas(
+            &heights.iter().map(|h| (*h, 1)).collect::<Vec<_>>(),
+        ));
         assert_eq!(scanned, applied);
         assert_eq!(scanned.top(), 9000);
         assert_eq!(scanned.count_at(9000), Some(2));

@@ -6,7 +6,7 @@ use ratatui::widgets::{Bar, BarChart, Block, Borders, Paragraph, Sparkline};
 
 use crate::state::AppState;
 use crate::ui::{
-    format_bytes, format_btc, format_count3, format_duration, format_hash, format_hashrate,
+    format_btc, format_bytes, format_count3, format_duration, format_hash, format_hashrate,
     format_num, format_vsize_edge, log_bar, peer_table, render_loading_panel,
 };
 
@@ -29,7 +29,8 @@ pub fn draw(f: &mut Frame, state: &AppState) {
         .split(size);
 
     // Title bar with health dot.
-    let uptime_str = state.uptime_secs
+    let uptime_str = state
+        .uptime_secs
         .map(|s| format!(" up {} ", format_duration(s)))
         .unwrap_or_default();
     let (dot_glyph, dot_color, health_label) = if state.is_healthy() {
@@ -40,12 +41,20 @@ pub fn draw(f: &mut Frame, state: &AppState) {
         ("○ ", Color::Yellow, "syncing")
     };
     let title = Line::from(vec![
-        Span::styled(" satd ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            " satd ",
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::styled(
             format!(" {} ", state.chain_name),
             Style::default().fg(Color::White),
         ),
-        Span::styled(dot_glyph, Style::default().fg(dot_color).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            dot_glyph,
+            Style::default().fg(dot_color).add_modifier(Modifier::BOLD),
+        ),
         Span::styled(format!("{} ", health_label), Style::default().fg(dot_color)),
         Span::styled(state.version_line(), Style::default().fg(Color::DarkGray)),
         Span::styled(uptime_str, Style::default().fg(Color::DarkGray)),
@@ -90,7 +99,10 @@ pub fn draw(f: &mut Frame, state: &AppState) {
         Span::styled(": help  ", Style::default().fg(Color::DarkGray)),
         Span::styled("r", Style::default().fg(Color::White)),
         Span::styled(": reorgs  ", Style::default().fg(Color::DarkGray)),
-        Span::styled(crate::ui::view_keys(state), Style::default().fg(Color::White)),
+        Span::styled(
+            crate::ui::view_keys(state),
+            Style::default().fg(Color::White),
+        ),
         Span::styled(": view  ", Style::default().fg(Color::DarkGray)),
         Span::raw("\u{2191}\u{2193}"),
         Span::styled(": peers", Style::default().fg(Color::DarkGray)),
@@ -305,10 +317,7 @@ fn addr_index_spans(spans: &mut Vec<Span<'static>>, state: &AppState) {
             // before Electrum / Esplora can bind.
             spans.push(dot(Color::Yellow));
             spans.push(Span::styled(label, Style::default().fg(Color::White)));
-            spans.push(Span::styled(
-                " syncing",
-                Style::default().fg(Color::Yellow),
-            ));
+            spans.push(Span::styled(" syncing", Style::default().fg(Color::Yellow)));
         }
     }
 }
@@ -364,16 +373,31 @@ fn opreturn_spans(spans: &mut Vec<Span<'static>>, op: &crate::state::OpReturnPro
         let done = format_num(r.total_blocks.saturating_sub(r.remaining_blocks));
         let total = format_num(r.total_blocks);
         let (color, text) = match op.worker.as_str() {
-            "waiting_for_peers" => (Color::Yellow, format!(" waiting for a full peer ({done}/{total})")),
-            "waiting_for_disk" => (Color::Yellow, format!(" waiting for disk space ({done}/{total})")),
-            "waiting_for_tip" => (Color::Yellow, format!(" waiting for the tip ({done}/{total})")),
+            "waiting_for_peers" => (
+                Color::Yellow,
+                format!(" waiting for a full peer ({done}/{total})"),
+            ),
+            "waiting_for_disk" => (
+                Color::Yellow,
+                format!(" waiting for disk space ({done}/{total})"),
+            ),
+            "waiting_for_tip" => (
+                Color::Yellow,
+                format!(" waiting for the tip ({done}/{total})"),
+            ),
             _ => {
-                let pct = r.progress_ratio.map(|x| format!("{:.1}% ", x * 100.0)).unwrap_or_default();
+                let pct = r
+                    .progress_ratio
+                    .map(|x| format!("{:.1}% ", x * 100.0))
+                    .unwrap_or_default();
                 let eta = match r.estimated_remaining_seconds {
                     Some(s) if s > 0 => format!("  ETA {}", format_duration(s)),
                     _ => String::new(),
                 };
-                (Color::Yellow, format!(" {pct}({done}/{total}) {} peers{eta}", r.peers))
+                (
+                    Color::Yellow,
+                    format!(" {pct}({done}/{total}) {} peers{eta}", r.peers),
+                )
             }
         };
         spans.push(dot(color));
@@ -400,7 +424,9 @@ fn opreturn_spans(spans: &mut Vec<Span<'static>>, op: &crate::state::OpReturnPro
             }
             _ => (Color::Green, blocks),
         },
-        "ibd" | "reindex" | "background_validation" => (Color::Yellow, format!("{blocks}, paused ({})", op.worker)),
+        "ibd" | "reindex" | "background_validation" => {
+            (Color::Yellow, format!("{blocks}, paused ({})", op.worker))
+        }
         // The option is off; stripped blocks remain until restored.
         "off" => (Color::DarkGray, format!("{blocks}, off")),
         // A daemon that does not say (older than the field), or a state
@@ -410,7 +436,14 @@ fn opreturn_spans(spans: &mut Vec<Span<'static>>, op: &crate::state::OpReturnPro
     };
     spans.push(dot(color));
     spans.push(Span::styled(label, Style::default().fg(Color::White)));
-    spans.push(Span::styled(text, Style::default().fg(if color == Color::Green { Color::Gray } else { color })));
+    spans.push(Span::styled(
+        text,
+        Style::default().fg(if color == Color::Green {
+            Color::Gray
+        } else {
+            color
+        }),
+    ));
 }
 
 fn dot(color: Color) -> Span<'static> {
@@ -424,12 +457,14 @@ fn draw_top_row(f: &mut Frame, area: Rect, state: &AppState) {
     let cols = left_right_columns(area);
 
     // Chain info
-    let last_block_str = state.last_block_secs_ago
+    let last_block_str = state
+        .last_block_secs_ago
         .map(|s| format!("{} ago", format_duration(s)))
         .unwrap_or_else(|| "-".into());
 
     let hash_rate_str = if state.loaded.mining {
-        state.network_hash_ps
+        state
+            .network_hash_ps
             .map(format_hashrate)
             .unwrap_or_else(|| "-".into())
     } else {
@@ -452,12 +487,20 @@ fn draw_top_row(f: &mut Frame, area: Rect, state: &AppState) {
         render_loading_panel(f, cols[1], &block_title);
     } else {
         let txs_str = state.block_stats_txs.map(format_num).unwrap_or("-".into());
-        let size_str = state.block_stats_size.map(format_bytes).unwrap_or("-".into());
-        let weight_str = state.block_stats_weight
+        let size_str = state
+            .block_stats_size
+            .map(format_bytes)
+            .unwrap_or("-".into());
+        let weight_str = state
+            .block_stats_weight
             .map(|w| format!("{} WU", format_num(w)))
             .unwrap_or("-".into());
-        let fees_str = state.block_stats_total_fee.map(format_btc).unwrap_or("-".into());
-        let avg_rate_str = state.block_stats_avg_fee_rate
+        let fees_str = state
+            .block_stats_total_fee
+            .map(format_btc)
+            .unwrap_or("-".into());
+        let avg_rate_str = state
+            .block_stats_avg_fee_rate
             .map(|r| format!("{:.1} sat/vB", r))
             .unwrap_or("-".into());
 
@@ -484,7 +527,10 @@ fn draw_middle_row(f: &mut Frame, area: Rect, state: &AppState) {
         "1.0 sat/vB".into()
     };
     let tx_rate_str = if state.loaded.tx_stats {
-        state.tx_rate.map(|r| format!("{:.1} tx/sec", r)).unwrap_or("-".into())
+        state
+            .tx_rate
+            .map(|r| format!("{:.1} tx/sec", r))
+            .unwrap_or("-".into())
     } else {
         "loading...".into()
     };
@@ -493,7 +539,11 @@ fn draw_middle_row(f: &mut Frame, area: Rect, state: &AppState) {
     // loaded, the held transactions go on the same line so the row count of
     // the panel (and the size chart's position under it) does not change.
     let txs_str = match &state.quarantine {
-        Some(q) => format!("{}  +{} quarantined", format_num(state.mempool_size), format_num(q.count)),
+        Some(q) => format!(
+            "{}  +{} quarantined",
+            format_num(state.mempool_size),
+            format_num(q.count)
+        ),
         None => format_num(state.mempool_size),
     };
     let mut mempool_lines = vec![
@@ -505,7 +555,10 @@ fn draw_middle_row(f: &mut Frame, area: Rect, state: &AppState) {
 
     // Add size distribution sparkline
     if let Some(_dist) = &state.mempool_size_dist {
-        mempool_lines.push(Line::from(Span::styled("Size Distribution:", Style::default().fg(Color::Gray))));
+        mempool_lines.push(Line::from(Span::styled(
+            "Size Distribution:",
+            Style::default().fg(Color::Gray),
+        )));
         // We'll render the sparkline separately
     }
 
@@ -514,7 +567,9 @@ fn draw_middle_row(f: &mut Frame, area: Rect, state: &AppState) {
         .border_style(Style::default().fg(Color::DarkGray))
         .title(Span::styled(
             " Mempool ",
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
         ));
     let mempool_inner = mempool_block.inner(cols[0]);
     f.render_widget(mempool_block, cols[0]);
@@ -571,7 +626,9 @@ fn draw_middle_row(f: &mut Frame, area: Rect, state: &AppState) {
             .border_style(Style::default().fg(Color::DarkGray))
             .title(Span::styled(
                 " Fees (sat/vB) ",
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
             ));
         let fee_inner = fee_block.inner(cols[1]);
         f.render_widget(fee_block, cols[1]);
@@ -659,16 +716,20 @@ fn draw_bottom_row(f: &mut Frame, area: Rect, state: &AppState) {
             .border_style(Style::default().fg(Color::DarkGray))
             .title(Span::styled(
                 " UTXO Set ",
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
             ));
         let utxo_inner = utxo_block.inner(cols[0]);
         f.render_widget(utxo_block, cols[0]);
 
         let utxo_count_str = state.utxo_count.map(format_num).unwrap_or("-".into());
-        let total_str = state.utxo_total_amount
+        let total_str = state
+            .utxo_total_amount
             .map(|a| format!("{:.0} BTC", a))
             .unwrap_or("-".into());
-        let supply_pct = state.utxo_total_amount
+        let supply_pct = state
+            .utxo_total_amount
             .map(|a| format!("{:.2}%", a / 21_000_000.0 * 100.0))
             .unwrap_or("-".into());
 
@@ -735,26 +796,37 @@ fn draw_bottom_row(f: &mut Frame, area: Rect, state: &AppState) {
     }
 
     // Network
-    let inbound: usize = state.peers.iter()
+    let inbound: usize = state
+        .peers
+        .iter()
         .filter(|p| p.get("inbound").and_then(|b| b.as_bool()).unwrap_or(false))
         .count();
     let outbound = state.connections.saturating_sub(inbound);
-    let total_recv: u64 = state.peers.iter()
+    let total_recv: u64 = state
+        .peers
+        .iter()
         .filter_map(|p| p.get("bytesrecv").and_then(|b| b.as_u64()))
         .sum();
-    let total_sent: u64 = state.peers.iter()
+    let total_sent: u64 = state
+        .peers
+        .iter()
         .filter_map(|p| p.get("bytessent").and_then(|b| b.as_u64()))
         .sum();
 
-    let rss_str = state.rss_bytes
+    let rss_str = state
+        .rss_bytes
         .map(format_bytes)
         .unwrap_or_else(|| "-".into());
-    let threads_str = state.thread_count
+    let threads_str = state
+        .thread_count
         .map(|t| t.to_string())
         .unwrap_or_else(|| "-".into());
 
     let net_lines = vec![
-        info_line("Peers:", &format!("{} ({} in / {} out)", state.connections, inbound, outbound)),
+        info_line(
+            "Peers:",
+            &format!("{} ({} in / {} out)", state.connections, inbound, outbound),
+        ),
         info_line("Recv:", &format_bytes(total_recv)),
         info_line("Sent:", &format_bytes(total_sent)),
         info_line("RSS:", &rss_str),
@@ -769,7 +841,9 @@ fn draw_bottom_row(f: &mut Frame, area: Rect, state: &AppState) {
 /// separating the bars, which runs their counts and labels together. The
 /// three rows share the split so the panel borders line up.
 fn left_right_columns(area: Rect) -> std::rc::Rc<[Rect]> {
-    let left = (area.width * 2 / 5).max(LEFT_COLUMN_MIN_WIDTH).min(area.width);
+    let left = (area.width * 2 / 5)
+        .max(LEFT_COLUMN_MIN_WIDTH)
+        .min(area.width);
     Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Length(left), Constraint::Min(0)])
@@ -864,7 +938,11 @@ fn render_histogram(f: &mut Frame, area: Rect, buckets: &[HistBucket], color: Co
             ..area
         },
     );
-    let axis = histogram_axis(buckets.iter().map(|b| b.label.as_str()), HIST_BAR_WIDTH, gap);
+    let axis = histogram_axis(
+        buckets.iter().map(|b| b.label.as_str()),
+        HIST_BAR_WIDTH,
+        gap,
+    );
     let axis_area = Rect {
         y: area.y + bar_rows,
         height: 1,
@@ -912,7 +990,9 @@ fn render_panel(f: &mut Frame, area: Rect, title: &str, lines: &[Line<'_>]) {
         .border_style(Style::default().fg(Color::DarkGray))
         .title(Span::styled(
             title.to_string(),
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
         ));
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -976,7 +1056,11 @@ mod tests {
         terminal.draw(|f| draw(f, state)).unwrap();
         let buffer = terminal.backend().buffer();
         (0..height)
-            .map(|y| (0..width).map(|x| buffer[(x, y)].symbol()).collect::<String>())
+            .map(|y| {
+                (0..width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
             .collect()
     }
 
@@ -991,7 +1075,11 @@ mod tests {
             "loaded": true, "quarantine": {"count": 87, "bytes": 1, "budget_bytes": 1},
         }));
         let rows = render_steady(120, 40, &st);
-        assert!(txs(&rows).contains("12,345  +87 quarantined"), "{}", txs(&rows));
+        assert!(
+            txs(&rows).contains("12,345  +87 quarantined"),
+            "{}",
+            txs(&rows)
+        );
         // Same line, so the size chart keeps its place in the panel.
         let screen = rows.join("\n");
         assert!(screen.contains("Size Distribution:"), "{screen}");
@@ -1046,34 +1134,62 @@ mod tests {
             .map(|(id, ua)| serde_json::json!({"id": id, "addr": format!("10.0.0.{id}:8333"), "subver": ua}))
             .collect();
         st.connections = 3;
-        let peer_row = |rows: &[String], addr: &str| rows.iter().find(|r| r.contains(addr)).cloned();
+        let peer_row =
+            |rows: &[String], addr: &str| rows.iter().find(|r| r.contains(addr)).cloned();
 
         let plain = render_steady(120, 50, &st);
-        assert!(!plain.iter().any(|r| r.contains("Flags")), "no data, no column");
+        assert!(
+            !plain.iter().any(|r| r.contains("Flags")),
+            "no data, no column"
+        );
         assert!(!plain.iter().any(|r| r.contains('≠')));
 
-        st.update_peer_behavior(crate::behavior::classify(Ok(crate::behavior::tests::reply())));
+        st.update_peer_behavior(crate::behavior::classify(Ok(
+            crate::behavior::tests::reply(),
+        )));
         let rows = render_steady(120, 50, &st);
         let header = rows.iter().find(|r| r.contains("Agent")).unwrap();
-        let (agent_at, flags_at) = (header.find("Agent").unwrap(), header.find("Flags").expect("Flags column"));
-        assert!(agent_at < flags_at && flags_at < header.find("Height").unwrap(), "{header}");
-        assert!(header.contains("Recv"), "wide enough to keep Recv: {header}");
+        let (agent_at, flags_at) = (
+            header.find("Agent").unwrap(),
+            header.find("Flags").expect("Flags column"),
+        );
+        assert!(
+            agent_at < flags_at && flags_at < header.find("Height").unwrap(),
+            "{header}"
+        );
+        assert!(
+            header.contains("Recv"),
+            "wide enough to keep Recv: {header}"
+        );
         let mismatched = peer_row(&rows, "10.0.0.3:").unwrap();
         assert!(mismatched.contains("/Satoshi:27.0.0/ ≠"), "{mismatched}");
-        assert!(peer_row(&rows, "10.0.0.7:").unwrap().contains(" C "), "crawler flag shown");
+        assert!(
+            peer_row(&rows, "10.0.0.7:").unwrap().contains(" C "),
+            "crawler flag shown"
+        );
         assert!(!peer_row(&rows, "10.0.0.11:").unwrap().contains('≠'));
 
         // Narrow: Flags takes Recv's place.
         let narrow = render_steady(80, 50, &st);
         let header = narrow.iter().find(|r| r.contains("Agent")).unwrap();
-        assert!(header.contains("Flags") && !header.contains("Recv"), "{header}");
+        assert!(
+            header.contains("Flags") && !header.contains("Recv"),
+            "{header}"
+        );
 
         // `f`: only the flagged peers.
         st.toggle_flag_filter();
         let filtered = render_steady(120, 50, &st);
         assert!(peer_row(&filtered, "10.0.0.3:").is_some());
-        assert!(peer_row(&filtered, "10.0.0.11:").is_none(), "unflagged peer hidden");
-        assert!(filtered.iter().any(|r| r.contains("Peers (3 connected, 2 flagged)")));
+        assert!(
+            peer_row(&filtered, "10.0.0.11:").is_none(),
+            "unflagged peer hidden"
+        );
+        assert!(
+            filtered
+                .iter()
+                .any(|r| r.contains("Peers (3 connected, 2 flagged)"))
+        );
     }
 
     #[test]
@@ -1105,7 +1221,11 @@ mod tests {
             .unwrap();
         let buffer = terminal.backend().buffer();
         (0..height)
-            .map(|y| (0..width).map(|x| buffer[(x, y)].symbol()).collect::<String>())
+            .map(|y| {
+                (0..width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
             .collect()
     }
 
@@ -1117,7 +1237,10 @@ mod tests {
         let rows = render_histogram_rows(40, 2);
         assert!(!rows[0].chars().any(|c| c.is_ascii_digit()), "{rows:#?}");
         let glyphs = |r: &str| r.chars().filter(|c| "▁▂▃▄▅▆▇█".contains(*c)).count();
-        assert!(glyphs(&rows[0]) >= 7, "one glyph per non-empty bucket: {rows:#?}");
+        assert!(
+            glyphs(&rows[0]) >= 7,
+            "one glyph per non-empty bucket: {rows:#?}"
+        );
         assert!(rows[1].starts_with("<1h <1d"), "{rows:#?}");
         // Too narrow for eight three-column bars: the same fallback.
         let rows = render_histogram_rows(20, 6);
@@ -1193,14 +1316,20 @@ mod tests {
         let mut st = AppState::new();
         st.sp_index = Some(sp(false, false, "idle"));
         let r = row(&st);
-        assert!(!r.contains("sp-idx"), "disabled index must not take a column: {r}");
+        assert!(
+            !r.contains("sp-idx"),
+            "disabled index must not take a column: {r}"
+        );
         // The other three columns are untouched.
         assert!(r.contains("addr-idx"));
         assert!(r.contains("esplora"));
         assert!(r.contains("electrum"));
     }
 
-    fn opreturn(worker: &str, restore: Option<crate::state::RestoreView>) -> crate::state::OpReturnProgress {
+    fn opreturn(
+        worker: &str,
+        restore: Option<crate::state::RestoreView>,
+    ) -> crate::state::OpReturnProgress {
         crate::state::OpReturnProgress {
             worker: worker.to_string(),
             blocks: 1_234,
@@ -1233,7 +1362,10 @@ mod tests {
         let r = row(&st);
         // The daemon's ratio verbatim, not done/total (830/1230 = 67.5% here
         // too, so check the ETA and peers to tell the layout apart).
-        assert!(r.contains("op-restore 67.5% (830/1,230) 3 peers  ETA"), "{r}");
+        assert!(
+            r.contains("op-restore 67.5% (830/1,230) 3 peers  ETA"),
+            "{r}"
+        );
         assert!(!r.contains("op-prune"), "{r}");
     }
 
@@ -1247,7 +1379,10 @@ mod tests {
             let mut st = AppState::new();
             st.opreturn = Some(opreturn(worker, Some(restore_view())));
             let r = row(&st);
-            assert!(r.contains(&format!("op-restore {words} (830/1,230)")), "{worker}: {r}");
+            assert!(
+                r.contains(&format!("op-restore {words} (830/1,230)")),
+                "{worker}: {r}"
+            );
         }
     }
 
@@ -1275,13 +1410,19 @@ mod tests {
         op.scan = Some((262_640, 973_303));
         st.opreturn = Some(op.clone());
         let r = row(&st);
-        assert!(r.contains("op-prune scanning 27.0% (262,640/973,303), 1,234 stripped"), "{r}");
+        assert!(
+            r.contains("op-prune scanning 27.0% (262,640/973,303), 1,234 stripped"),
+            "{r}"
+        );
         assert_eq!(opreturn_dot(&op), Color::Yellow);
         for behind in [0, SCAN_CAUGHT_UP_WITHIN] {
             op.scan = Some((973_303 - behind, 973_303));
             st.opreturn = Some(op.clone());
             let r = row(&st);
-            assert!(r.contains("op-prune 1,234 blocks stripped") && !r.contains("scanning"), "{behind}: {r}");
+            assert!(
+                r.contains("op-prune 1,234 blocks stripped") && !r.contains("scanning"),
+                "{behind}: {r}"
+            );
             assert_eq!(opreturn_dot(&op), Color::Green, "{behind}");
         }
     }
@@ -1292,7 +1433,10 @@ mod tests {
     fn services_row_dots_are_yellow_while_work_is_pending() {
         let dot_before = |st: &AppState, label: &str| -> Color {
             let spans = services_line(st).spans;
-            let at = spans.iter().position(|s| s.content == label).unwrap_or_else(|| panic!("no {label}"));
+            let at = spans
+                .iter()
+                .position(|s| s.content == label)
+                .unwrap_or_else(|| panic!("no {label}"));
             spans[at - 1].style.fg.expect("a coloured dot")
         };
         let mut st = AppState::new();
@@ -1310,11 +1454,19 @@ mod tests {
             estimated_remaining_seconds: 60,
             last_error: None,
         });
-        assert_eq!(dot_before(&st, "addr-idx"), Color::Yellow, "addr-idx backfill");
+        assert_eq!(
+            dot_before(&st, "addr-idx"),
+            Color::Yellow,
+            "addr-idx backfill"
+        );
 
         let mut st = AppState::new();
         st.opreturn = Some(opreturn("restoring", Some(restore_view())));
-        assert_eq!(dot_before(&st, "op-restore"), Color::Yellow, "op-restore downloading");
+        assert_eq!(
+            dot_before(&st, "op-restore"),
+            Color::Yellow,
+            "op-restore downloading"
+        );
     }
 
     /// The colour of the dot `opreturn_spans` draws.
@@ -1333,7 +1485,12 @@ mod tests {
             let mut st = AppState::new();
             st.opreturn = Some(opreturn(worker, None));
             let r = row(&st);
-            assert!(r.contains("op-prune 1,234 blocks stripped") && !r.contains("off") && !r.contains("paused"), "{worker:?}: {r}");
+            assert!(
+                r.contains("op-prune 1,234 blocks stripped")
+                    && !r.contains("off")
+                    && !r.contains("paused"),
+                "{worker:?}: {r}"
+            );
         }
         for restore in [None, Some(restore_view())] {
             let mut st = AppState::new();
@@ -1374,7 +1531,10 @@ mod tests {
         );
         assert!(!r.contains("43.4%"), "two-pass reconstruction: {r}");
         assert!(r.contains("(835,200/962,151)"), "{r}");
-        assert!(!r.contains("pass"), "single-pass backfill must not show a pass counter: {r}");
+        assert!(
+            !r.contains("pass"),
+            "single-pass backfill must not show a pass counter: {r}"
+        );
     }
 
     #[test]
@@ -1390,7 +1550,10 @@ mod tests {
         st.sp_index = Some(p);
         let r = row(&st);
         assert!(r.contains("sp-idx backfill (835,200/962,151)"), "{r}");
-        assert!(!r.contains('%'), "no ratio from the daemon, no percentage: {r}");
+        assert!(
+            !r.contains('%'),
+            "no ratio from the daemon, no percentage: {r}"
+        );
         assert!(r.contains("ETA"), "{r}");
     }
 
@@ -1402,7 +1565,10 @@ mod tests {
         let mut st = AppState::new();
         st.sp_index = Some(sp(false, false, "running"));
         let r = row(&st);
-        assert!(!r.contains("sp-idx"), "disabled index must not take a column: {r}");
+        assert!(
+            !r.contains("sp-idx"),
+            "disabled index must not take a column: {r}"
+        );
     }
 
     #[test]

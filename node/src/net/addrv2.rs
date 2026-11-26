@@ -23,9 +23,9 @@
 //! an address longer than 512 bytes, a founding network (other than TORv2)
 //! with the wrong address length, and a truncated payload.
 
-use bitcoin::hashes::{sha256d, Hash};
-use bitcoin::p2p::address::{AddrV2, AddrV2Message};
+use bitcoin::hashes::{Hash, sha256d};
 use bitcoin::p2p::ServiceFlags;
+use bitcoin::p2p::address::{AddrV2, AddrV2Message};
 use std::net::Ipv6Addr;
 
 /// The `addrv2` command as it sits in a v1 header and in a v2 long-form
@@ -93,9 +93,18 @@ impl<'a> Reader<'a> {
         let first = self.u8()?;
         let (value, min) = match first {
             0..=0xfc => (u64::from(first), 0),
-            0xfd => (u64::from(u16::from_le_bytes(self.take(2)?.try_into().unwrap())), 0xfd),
-            0xfe => (u64::from(u32::from_le_bytes(self.take(4)?.try_into().unwrap())), 0x1_0000),
-            0xff => (u64::from_le_bytes(self.take(8)?.try_into().unwrap()), 0x1_0000_0000),
+            0xfd => (
+                u64::from(u16::from_le_bytes(self.take(2)?.try_into().unwrap())),
+                0xfd,
+            ),
+            0xfe => (
+                u64::from(u32::from_le_bytes(self.take(4)?.try_into().unwrap())),
+                0x1_0000,
+            ),
+            0xff => (
+                u64::from_le_bytes(self.take(8)?.try_into().unwrap()),
+                0x1_0000_0000,
+            ),
         };
         if value < min {
             return Err(AddrV2DecodeError::NonCanonicalCompactSize);
@@ -172,7 +181,7 @@ pub fn decode_disk_vector(buf: &[u8]) -> Result<(Vec<AddrV2Message>, usize), Add
 /// Encode `entries` as [`decode_disk_vector`] reads them, as Core writes
 /// them.
 pub fn encode_disk_vector(entries: &[AddrV2Message]) -> Vec<u8> {
-    use bitcoin::consensus::encode::{serialize, VarInt};
+    use bitcoin::consensus::encode::{VarInt, serialize};
     let mut out = serialize(&VarInt(entries.len() as u64));
     for e in entries {
         out.extend_from_slice(&(DISK_VERSION_INIT | DISK_VERSION_ADDRV2).to_le_bytes());
@@ -223,11 +232,18 @@ fn decode_entry(r: &mut Reader<'_>) -> Result<AddrV2Message, AddrV2DecodeError> 
         5 => AddrV2::I2p(bytes.try_into().unwrap()),
         // Core reads any 16 bytes here and calls the address invalid
         // without the `fc` prefix (`CNetAddr::IsValid`).
-        6 if bytes[0] == 0xfc => AddrV2::Cjdns(Ipv6Addr::from(<[u8; 16]>::try_from(bytes).unwrap())),
+        6 if bytes[0] == 0xfc => {
+            AddrV2::Cjdns(Ipv6Addr::from(<[u8; 16]>::try_from(bytes).unwrap()))
+        }
         _ => AddrV2::Unknown(network, bytes.to_vec()),
     };
     let port = u16::from_be_bytes(r.take(2)?.try_into().unwrap());
-    Ok(AddrV2Message { time, services, addr, port })
+    Ok(AddrV2Message {
+        time,
+        services,
+        addr,
+        port,
+    })
 }
 
 /// An `addrv2` payload of three IPv4 entries (1.2.3.4, 5.6.7.8, 9.9.9.9,
@@ -236,9 +252,15 @@ fn decode_entry(r: &mut Reader<'_>) -> Result<AddrV2Message, AddrV2DecodeError> 
 #[cfg(test)]
 pub(crate) fn payload_with_service_bit_26() -> Vec<u8> {
     let mut v = vec![3u8];
-    for (ip, services) in [([1, 2, 3, 4], 0x409u64), ([5, 6, 7, 8], 1 << 26 | 0x409), ([9, 9, 9, 9], 0x409)] {
+    for (ip, services) in [
+        ([1, 2, 3, 4], 0x409u64),
+        ([5, 6, 7, 8], 1 << 26 | 0x409),
+        ([9, 9, 9, 9], 0x409),
+    ] {
         v.extend_from_slice(&1_700_000_000u32.to_le_bytes());
-        v.extend(bitcoin::consensus::encode::serialize(&bitcoin::consensus::encode::VarInt(services)));
+        v.extend(bitcoin::consensus::encode::serialize(
+            &bitcoin::consensus::encode::VarInt(services),
+        ));
         v.extend_from_slice(&[1, 4]);
         v.extend_from_slice(&ip);
         v.extend_from_slice(&8333u16.to_be_bytes());
@@ -249,7 +271,7 @@ pub(crate) fn payload_with_service_bit_26() -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bitcoin::consensus::encode::{serialize, VarInt};
+    use bitcoin::consensus::encode::{VarInt, serialize};
 
     fn entry(time: u32, services: u64, network: u8, addr: &[u8], port: u16) -> Vec<u8> {
         let mut v = time.to_le_bytes().to_vec();
@@ -295,12 +317,42 @@ mod tests {
     #[test]
     fn agrees_with_rust_bitcoin_on_ordinary_entries() {
         let msgs = vec![
-            AddrV2Message { time: 7, services: ServiceFlags::NETWORK, addr: AddrV2::Ipv4([8, 8, 4, 4].into()), port: 8333 },
-            AddrV2Message { time: 8, services: ServiceFlags::WITNESS, addr: AddrV2::Ipv6("2001:4860::8888".parse().unwrap()), port: 1 },
-            AddrV2Message { time: 9, services: ServiceFlags::NONE, addr: AddrV2::TorV3([0x11; 32]), port: 0 },
-            AddrV2Message { time: 10, services: ServiceFlags::NONE, addr: AddrV2::I2p([0x22; 32]), port: 0 },
-            AddrV2Message { time: 11, services: ServiceFlags::NONE, addr: AddrV2::Cjdns("fc00::1".parse().unwrap()), port: 8333 },
-            AddrV2Message { time: 12, services: ServiceFlags::NONE, addr: AddrV2::Unknown(42, vec![1, 2, 3]), port: 9 },
+            AddrV2Message {
+                time: 7,
+                services: ServiceFlags::NETWORK,
+                addr: AddrV2::Ipv4([8, 8, 4, 4].into()),
+                port: 8333,
+            },
+            AddrV2Message {
+                time: 8,
+                services: ServiceFlags::WITNESS,
+                addr: AddrV2::Ipv6("2001:4860::8888".parse().unwrap()),
+                port: 1,
+            },
+            AddrV2Message {
+                time: 9,
+                services: ServiceFlags::NONE,
+                addr: AddrV2::TorV3([0x11; 32]),
+                port: 0,
+            },
+            AddrV2Message {
+                time: 10,
+                services: ServiceFlags::NONE,
+                addr: AddrV2::I2p([0x22; 32]),
+                port: 0,
+            },
+            AddrV2Message {
+                time: 11,
+                services: ServiceFlags::NONE,
+                addr: AddrV2::Cjdns("fc00::1".parse().unwrap()),
+                port: 8333,
+            },
+            AddrV2Message {
+                time: 12,
+                services: ServiceFlags::NONE,
+                addr: AddrV2::Unknown(42, vec![1, 2, 3]),
+                port: 9,
+            },
         ];
         let p = serialize(&msgs);
         assert_eq!(decode_payload(&p).unwrap(), msgs);
@@ -327,7 +379,11 @@ mod tests {
         ]);
         let got = decode_payload(&p).unwrap();
         assert_eq!(got.len(), 5);
-        assert!(got[..4].iter().all(|m| matches!(m.addr, AddrV2::Unknown(..))));
+        assert!(
+            got[..4]
+                .iter()
+                .all(|m| matches!(m.addr, AddrV2::Unknown(..)))
+        );
         assert!(got[..4].iter().all(|m| m.socket_addr().is_err()));
         assert_eq!(got[4].addr, AddrV2::Ipv4([1, 1, 1, 1].into()));
     }
@@ -340,7 +396,10 @@ mod tests {
         let mut e = 1u32.to_le_bytes().to_vec();
         e.extend_from_slice(&[0xfd, 0x01, 0x00]);
         e.extend_from_slice(&[1, 4, 1, 2, 3, 4, 0, 1]);
-        assert_eq!(decode_payload(&payload(&[e])), Err(AddrV2DecodeError::NonCanonicalCompactSize));
+        assert_eq!(
+            decode_payload(&payload(&[e])),
+            Err(AddrV2DecodeError::NonCanonicalCompactSize)
+        );
         // Wrong length for a founding network.
         assert_eq!(
             decode_payload(&payload(&[entry(1, 1, 1, &[1, 2, 3], 1)])),
@@ -369,6 +428,9 @@ mod tests {
         header[20..24].copy_from_slice(&sha256d::Hash::hash(&p)[..4]);
         assert_eq!(decode_v1_payload(&header, &p).unwrap().len(), 1);
         header[20] ^= 1;
-        assert_eq!(decode_v1_payload(&header, &p), Err(AddrV2DecodeError::BadChecksum));
+        assert_eq!(
+            decode_v1_payload(&header, &p),
+            Err(AddrV2DecodeError::BadChecksum)
+        );
     }
 }

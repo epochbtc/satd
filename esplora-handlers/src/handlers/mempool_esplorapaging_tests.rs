@@ -69,7 +69,10 @@ fn fee_estimates_map_keeps_mempool_targets_and_leaves_out_floored_ones() {
     );
     for tf in &sf.targets {
         if let Some(v) = map.get(&tf.target.to_string()) {
-            assert_eq!(*v, serde_json::json!(tf.feerate_sat_per_kvb as f64 / 1000.0));
+            assert_eq!(
+                *v,
+                serde_json::json!(tf.feerate_sat_per_kvb as f64 / 1000.0)
+            );
         }
     }
 }

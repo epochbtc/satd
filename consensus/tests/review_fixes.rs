@@ -7,9 +7,9 @@ mod helpers;
 
 use bitcoin::absolute::LockTime;
 use bitcoin::consensus::Encodable;
-use bitcoin::hashes::{sha256, Hash, HashEngine};
+use bitcoin::hashes::{Hash, HashEngine, sha256};
 use bitcoin::secp256k1::{
-    self, Keypair, Message, Scalar, Secp256k1, SecretKey, XOnlyPublicKey, Parity,
+    self, Keypair, Message, Parity, Scalar, Secp256k1, SecretKey, XOnlyPublicKey,
 };
 use bitcoin::sighash::{Prevouts, SighashCache, TapSighashType};
 use bitcoin::transaction::Version;
@@ -55,9 +55,7 @@ fn credit_tx(spk: &[u8], value: u64) -> Transaction {
 fn spend_tx_with_witness(credit: &Transaction, witness: &[Vec<u8>]) -> Transaction {
     let mut buf = Vec::new();
     credit.consensus_encode(&mut buf).unwrap();
-    let txid = Txid::from_byte_array(
-        bitcoin::hashes::sha256d::Hash::hash(&buf).to_byte_array(),
-    );
+    let txid = Txid::from_byte_array(bitcoin::hashes::sha256d::Hash::hash(&buf).to_byte_array());
     let mut w = Witness::new();
     for item in witness {
         w.push(item);
@@ -373,8 +371,11 @@ fn test_tapscript_invalid_nonempty_sig_hard_fails() {
 
     let result = verify_script(&[], &spk, &wit, TR_FLAGS, &checker);
     // Must be SchnorrSig error (hard fail), not EvalFalse (soft fail)
-    assert_eq!(result, Err(ScriptError::SchnorrSig),
-        "Invalid non-empty Schnorr sig in tapscript must hard-fail per BIP342");
+    assert_eq!(
+        result,
+        Err(ScriptError::SchnorrSig),
+        "Invalid non-empty Schnorr sig in tapscript must hard-fail per BIP342"
+    );
 }
 
 /// But an EMPTY signature in tapscript CHECKSIG should push false (not hard fail).
@@ -400,6 +401,9 @@ fn test_tapscript_empty_sig_pushes_false() {
 
     let result = verify_script(&[], &spk, &wit, TR_FLAGS, &checker);
     // Empty sig → success=false → CHECKSIG pushes false → script fails with EvalFalse
-    assert_eq!(result, Err(ScriptError::EvalFalse),
-        "Empty sig in tapscript CHECKSIG should soft-fail with EvalFalse");
+    assert_eq!(
+        result,
+        Err(ScriptError::EvalFalse),
+        "Empty sig in tapscript CHECKSIG should soft-fail with EvalFalse"
+    );
 }

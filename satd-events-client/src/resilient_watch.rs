@@ -64,7 +64,7 @@ use satd_events_proto::v1 as pb;
 use satd_events_proto::v1::subscribe_control::Msg;
 
 use crate::client::{
-    validate_prefix, AutoClose, EventStream, SilentPaymentTarget, StreamClient, WatchHandle,
+    AutoClose, EventStream, SilentPaymentTarget, StreamClient, WatchHandle, validate_prefix,
 };
 use crate::error::StreamError;
 use crate::event::{Cursor, CursorRejectReason, Event, WatchAddRejectReason, WatchAddRejected};
@@ -77,10 +77,9 @@ type BoxError = Box<dyn std::error::Error + Send + Sync>;
 /// populates it (typically from a durable source-of-truth), and resolves to
 /// `Ok(())` once the canonical set is declared. Boxed so the loader can be any
 /// async closure the integrator supplies.
-type WatchSetLoaderFn =
-    dyn Fn(WatchSetBuilder) -> Pin<Box<dyn Future<Output = Result<(), BoxError>> + Send>>
-        + Send
-        + Sync;
+type WatchSetLoaderFn = dyn Fn(WatchSetBuilder) -> Pin<Box<dyn Future<Output = Result<(), BoxError>> + Send>>
+    + Send
+    + Sync;
 
 /// A scripthash (`sha256(scriptPubKey)`).
 type Scripthash = [u8; 32];
@@ -207,7 +206,10 @@ impl WatchSetMirror {
             }
         }
         for (t, v) in &r.outpoints {
-            if let Some(op) = fixed(t).map(|t| (t, *v)).filter(|op| self.outpoints.contains(op)) {
+            if let Some(op) = fixed(t)
+                .map(|t| (t, *v))
+                .filter(|op| self.outpoints.contains(op))
+            {
                 out.outpoints.insert(op);
             }
         }
@@ -217,7 +219,10 @@ impl WatchSetMirror {
             }
         }
         for (t, d) in &r.depth_alarms {
-            if let Some(alarm) = fixed(t).map(|t| (t, *d)).filter(|a| self.depth_alarms.contains(a)) {
+            if let Some(alarm) = fixed(t)
+                .map(|t| (t, *d))
+                .filter(|a| self.depth_alarms.contains(a))
+            {
                 out.depth_alarms.insert(alarm);
             }
         }
@@ -228,7 +233,11 @@ impl WatchSetMirror {
                 }
             }
         }
-        for id in r.scan_pubkeys.iter().filter_map(|b| <[u8; 33]>::try_from(b.as_slice()).ok()) {
+        for id in r
+            .scan_pubkeys
+            .iter()
+            .filter_map(|b| <[u8; 33]>::try_from(b.as_slice()).ok())
+        {
             if let Some(t) = self.silent_payments.get(&id) {
                 out.silent_payments.insert(id, t.clone());
             }
@@ -236,7 +245,8 @@ impl WatchSetMirror {
         if let Some(d) = &r.descriptor
             && self.descriptors.get(&d.descriptor) == Some(&(d.gap_limit, d.start))
         {
-            out.descriptors.insert(d.descriptor.clone(), (d.gap_limit, d.start));
+            out.descriptors
+                .insert(d.descriptor.clone(), (d.gap_limit, d.start));
         }
         out
     }
@@ -247,21 +257,31 @@ impl WatchSetMirror {
         let fixed = |b: &Vec<u8>| <[u8; 32]>::try_from(b.as_slice()).ok();
         let scripts: Vec<Scripthash> = r.scripthashes.iter().filter_map(fixed).collect();
         self.remove_scripts(&scripts);
-        let outpoints: Vec<(Txid, u32)> =
-            r.outpoints.iter().filter_map(|(t, v)| Some((fixed(t)?, *v))).collect();
+        let outpoints: Vec<(Txid, u32)> = r
+            .outpoints
+            .iter()
+            .filter_map(|(t, v)| Some((fixed(t)?, *v)))
+            .collect();
         self.remove_outpoints(&outpoints);
         let txids: Vec<Txid> = r.txids.iter().filter_map(fixed).collect();
         self.remove_tx_lifecycle(&txids);
-        let alarms: Vec<(Txid, u32)> =
-            r.depth_alarms.iter().filter_map(|(t, d)| Some((fixed(t)?, *d))).collect();
+        let alarms: Vec<(Txid, u32)> = r
+            .depth_alarms
+            .iter()
+            .filter_map(|(t, d)| Some((fixed(t)?, *d)))
+            .collect();
         self.remove_depth_alarms(&alarms);
         // The server echoes a prefix masked to its bits; the mirror holds it as
         // the caller wrote it.
         for (prefix, bits) in &r.prefixes {
-            self.prefixes.retain(|(b, p)| !(b == bits && mask_prefix(p, *b) == *prefix));
+            self.prefixes
+                .retain(|(b, p)| !(b == bits && mask_prefix(p, *b) == *prefix));
         }
-        let ids: Vec<[u8; 33]> =
-            r.scan_pubkeys.iter().filter_map(|b| <[u8; 33]>::try_from(b.as_slice()).ok()).collect();
+        let ids: Vec<[u8; 33]> = r
+            .scan_pubkeys
+            .iter()
+            .filter_map(|b| <[u8; 33]>::try_from(b.as_slice()).ok())
+            .collect();
         self.remove_silent_payments(&ids);
         if let Some(d) = &r.descriptor {
             let refused = (d.gap_limit, d.start);
@@ -269,7 +289,10 @@ impl WatchSetMirror {
                 // The node refused the latest window. It handles slides in
                 // order, so what it keeps is the latest earlier window that was
                 // not itself refused.
-                let prev = self.descriptor_history.get_mut(&d.descriptor).and_then(Vec::pop);
+                let prev = self
+                    .descriptor_history
+                    .get_mut(&d.descriptor)
+                    .and_then(Vec::pop);
                 match prev {
                     Some(prev) if d.kept => {
                         self.descriptors.insert(d.descriptor.clone(), prev);
@@ -287,7 +310,11 @@ impl WatchSetMirror {
                 // window cannot be the one the node keeps.
                 history.retain(|w| *w != refused);
             }
-            if self.descriptor_history.get(&d.descriptor).is_some_and(Vec::is_empty) {
+            if self
+                .descriptor_history
+                .get(&d.descriptor)
+                .is_some_and(Vec::is_empty)
+            {
                 self.descriptor_history.remove(&d.descriptor);
             }
         }
@@ -361,14 +388,20 @@ impl WatchSetMirror {
             } else {
                 Vec::new()
             };
-            out.push(Msg::AddScripts(pb::AddScripts { scripthashes, min_values }));
+            out.push(Msg::AddScripts(pb::AddScripts {
+                scripthashes,
+                min_values,
+            }));
         }
 
         if !self.outpoints.is_empty() {
             let outpoints = self
                 .outpoints
                 .iter()
-                .map(|(t, v)| pb::Outpoint { txid: t.to_vec(), vout: *v })
+                .map(|(t, v)| pb::Outpoint {
+                    txid: t.to_vec(),
+                    vout: *v,
+                })
                 .collect();
             out.push(Msg::AddOutpoints(pb::AddOutpoints { outpoints }));
         }
@@ -417,13 +450,20 @@ impl WatchSetMirror {
             let prefixes = self
                 .prefixes
                 .iter()
-                .map(|(bits, prefix)| pb::ScriptPrefix { prefix: prefix.clone(), bits: *bits })
+                .map(|(bits, prefix)| pb::ScriptPrefix {
+                    prefix: prefix.clone(),
+                    bits: *bits,
+                })
                 .collect();
             out.push(Msg::AddScriptPrefixes(pb::AddScriptPrefixes { prefixes }));
         }
 
         if !self.silent_payments.is_empty() {
-            let targets = self.silent_payments.values().map(|t| t.to_proto()).collect();
+            let targets = self
+                .silent_payments
+                .values()
+                .map(|t| t.to_proto())
+                .collect();
             out.push(Msg::AddSilentPayments(pb::AddSilentPayments { targets }));
         }
 
@@ -454,7 +494,10 @@ impl WatchSetMirror {
             outpoints: self
                 .outpoints
                 .iter()
-                .map(|(t, v)| pb::Outpoint { txid: t.to_vec(), vout: *v })
+                .map(|(t, v)| pb::Outpoint {
+                    txid: t.to_vec(),
+                    vout: *v,
+                })
                 .collect(),
             descriptors: self
                 .descriptors
@@ -468,7 +511,10 @@ impl WatchSetMirror {
             prefixes: self
                 .prefixes
                 .iter()
-                .map(|(bits, prefix)| pb::ScriptPrefix { prefix: prefix.clone(), bits: *bits })
+                .map(|(bits, prefix)| pb::ScriptPrefix {
+                    prefix: prefix.clone(),
+                    bits: *bits,
+                })
                 .collect(),
             lifecycles: self
                 .tx_lifecycles
@@ -484,9 +530,16 @@ impl WatchSetMirror {
             depth_alarms: self
                 .depth_alarms
                 .iter()
-                .map(|(t, d)| pb::WatchDepthAlarm { txid: t.to_vec(), depth: *d })
+                .map(|(t, d)| pb::WatchDepthAlarm {
+                    txid: t.to_vec(),
+                    depth: *d,
+                })
                 .collect(),
-            silent_payments: self.silent_payments.values().map(|t| t.to_proto()).collect(),
+            silent_payments: self
+                .silent_payments
+                .values()
+                .map(|t| t.to_proto())
+                .collect(),
             // `..Default::default()` for the same reason as SubscribeRequest in
             // client.rs: this published crate must compile against both the pinned
             // released proto and the newer in-workspace schema — any field a
@@ -528,7 +581,9 @@ impl WatchSetMirror {
         let target_mask = target.categories.unwrap_or(0);
         let live_mask = self.categories.unwrap_or(0);
         if target_mask != live_mask {
-            lead.push(Msg::SetCategories(pb::SetCategories { categories: target_mask }));
+            lead.push(Msg::SetCategories(pb::SetCategories {
+                categories: target_mask,
+            }));
         }
 
         // Scripts: new or changed-floor → AddScripts; vanished → RemoveScripts.
@@ -540,8 +595,12 @@ impl WatchSetMirror {
                     _ => changed.push((*h, *floor)),
                 }
             }
-            let gone: Vec<Scripthash> =
-                self.scripts.keys().filter(|h| !target.scripts.contains_key(*h)).copied().collect();
+            let gone: Vec<Scripthash> = self
+                .scripts
+                .keys()
+                .filter(|h| !target.scripts.contains_key(*h))
+                .copied()
+                .collect();
             if !changed.is_empty() {
                 c.added += changed.len();
                 let scripthashes = changed.iter().map(|(h, _)| h.to_vec()).collect();
@@ -550,7 +609,10 @@ impl WatchSetMirror {
                 } else {
                     Vec::new()
                 };
-                adds.push(Msg::AddScripts(pb::AddScripts { scripthashes, min_values }));
+                adds.push(Msg::AddScripts(pb::AddScripts {
+                    scripthashes,
+                    min_values,
+                }));
             }
             if !gone.is_empty() {
                 c.removed += gone.len();
@@ -562,19 +624,39 @@ impl WatchSetMirror {
 
         // Outpoints.
         {
-            let add: Vec<_> = target.outpoints.difference(&self.outpoints).copied().collect();
-            let gone: Vec<_> = self.outpoints.difference(&target.outpoints).copied().collect();
+            let add: Vec<_> = target
+                .outpoints
+                .difference(&self.outpoints)
+                .copied()
+                .collect();
+            let gone: Vec<_> = self
+                .outpoints
+                .difference(&target.outpoints)
+                .copied()
+                .collect();
             c.unchanged += target.outpoints.intersection(&self.outpoints).count();
             if !add.is_empty() {
                 c.added += add.len();
                 adds.push(Msg::AddOutpoints(pb::AddOutpoints {
-                    outpoints: add.iter().map(|(t, v)| pb::Outpoint { txid: t.to_vec(), vout: *v }).collect(),
+                    outpoints: add
+                        .iter()
+                        .map(|(t, v)| pb::Outpoint {
+                            txid: t.to_vec(),
+                            vout: *v,
+                        })
+                        .collect(),
                 }));
             }
             if !gone.is_empty() {
                 c.removed += gone.len();
                 removes.push(Msg::RemoveOutpoints(pb::RemoveOutpoints {
-                    outpoints: gone.iter().map(|(t, v)| pb::Outpoint { txid: t.to_vec(), vout: *v }).collect(),
+                    outpoints: gone
+                        .iter()
+                        .map(|(t, v)| pb::Outpoint {
+                            txid: t.to_vec(),
+                            vout: *v,
+                        })
+                        .collect(),
                 }));
             }
         }
@@ -620,8 +702,16 @@ impl WatchSetMirror {
 
         // Depth alarms, grouped per txid (non-empty min_depths marks the kind).
         {
-            let add: Vec<_> = target.depth_alarms.difference(&self.depth_alarms).copied().collect();
-            let gone: Vec<_> = self.depth_alarms.difference(&target.depth_alarms).copied().collect();
+            let add: Vec<_> = target
+                .depth_alarms
+                .difference(&self.depth_alarms)
+                .copied()
+                .collect();
+            let gone: Vec<_> = self
+                .depth_alarms
+                .difference(&target.depth_alarms)
+                .copied()
+                .collect();
             c.unchanged += target.depth_alarms.intersection(&self.depth_alarms).count();
             if !add.is_empty() {
                 c.added += add.len();
@@ -671,26 +761,48 @@ impl WatchSetMirror {
             for d in self.descriptors.keys() {
                 if !target.descriptors.contains_key(d) {
                     c.removed += 1;
-                    removes.push(Msg::RemoveDescriptor(pb::RemoveDescriptor { descriptor: d.clone() }));
+                    removes.push(Msg::RemoveDescriptor(pb::RemoveDescriptor {
+                        descriptor: d.clone(),
+                    }));
                 }
             }
         }
 
         // Prefix buckets.
         {
-            let add: Vec<_> = target.prefixes.difference(&self.prefixes).cloned().collect();
-            let gone: Vec<_> = self.prefixes.difference(&target.prefixes).cloned().collect();
+            let add: Vec<_> = target
+                .prefixes
+                .difference(&self.prefixes)
+                .cloned()
+                .collect();
+            let gone: Vec<_> = self
+                .prefixes
+                .difference(&target.prefixes)
+                .cloned()
+                .collect();
             c.unchanged += target.prefixes.intersection(&self.prefixes).count();
             if !add.is_empty() {
                 c.added += add.len();
                 adds.push(Msg::AddScriptPrefixes(pb::AddScriptPrefixes {
-                    prefixes: add.iter().map(|(bits, p)| pb::ScriptPrefix { prefix: p.clone(), bits: *bits }).collect(),
+                    prefixes: add
+                        .iter()
+                        .map(|(bits, p)| pb::ScriptPrefix {
+                            prefix: p.clone(),
+                            bits: *bits,
+                        })
+                        .collect(),
                 }));
             }
             if !gone.is_empty() {
                 c.removed += gone.len();
                 removes.push(Msg::RemoveScriptPrefixes(pb::RemoveScriptPrefixes {
-                    prefixes: gone.iter().map(|(bits, p)| pb::ScriptPrefix { prefix: p.clone(), bits: *bits }).collect(),
+                    prefixes: gone
+                        .iter()
+                        .map(|(bits, p)| pb::ScriptPrefix {
+                            prefix: p.clone(),
+                            bits: *bits,
+                        })
+                        .collect(),
                 }));
             }
         }
@@ -702,9 +814,7 @@ impl WatchSetMirror {
             let mut changed: Vec<pb::SilentPaymentTarget> = Vec::new();
             for (id, t) in &target.silent_payments {
                 match self.silent_payments.get(id) {
-                    Some(cur)
-                        if cur.labels == t.labels && cur.spend_pubkey == t.spend_pubkey =>
-                    {
+                    Some(cur) if cur.labels == t.labels && cur.spend_pubkey == t.spend_pubkey => {
                         c.unchanged += 1;
                     }
                     _ => changed.push(t.to_proto()),
@@ -718,7 +828,9 @@ impl WatchSetMirror {
                 .collect();
             if !changed.is_empty() {
                 c.added += changed.len();
-                adds.push(Msg::AddSilentPayments(pb::AddSilentPayments { targets: changed }));
+                adds.push(Msg::AddSilentPayments(pb::AddSilentPayments {
+                    targets: changed,
+                }));
             }
             if !gone.is_empty() {
                 c.removed += gone.len();
@@ -913,7 +1025,10 @@ impl std::fmt::Debug for ResilientWatchConfig {
             .field("backoff", &self.backoff)
             .field("cursor_store", &"<dyn CursorStore>")
             .field("from_cursor", &self.from_cursor)
-            .field("watch_set_loader", &self.watch_set_loader.as_ref().map(|_| "<loader>"))
+            .field(
+                "watch_set_loader",
+                &self.watch_set_loader.as_ref().map(|_| "<loader>"),
+            )
             .finish()
     }
 }
@@ -1081,11 +1196,27 @@ fn retry_keys(r: &WatchAddRejected) -> Vec<Vec<u8>> {
     };
     let mut keys = Vec::new();
     keys.extend(r.scripthashes.iter().map(|b| tagged(1, b)));
-    keys.extend(r.outpoints.iter().map(|(t, v)| tagged(2, &[t.as_slice(), &v.to_be_bytes()].concat())));
+    keys.extend(
+        r.outpoints
+            .iter()
+            .map(|(t, v)| tagged(2, &[t.as_slice(), &v.to_be_bytes()].concat())),
+    );
     keys.extend(r.txids.iter().map(|b| tagged(3, b)));
-    keys.extend(r.depth_alarms.iter().map(|(t, d)| tagged(4, &[t.as_slice(), &d.to_be_bytes()].concat())));
-    keys.extend(r.descriptor.iter().map(|d| tagged(5, d.descriptor.as_bytes())));
-    keys.extend(r.prefixes.iter().map(|(p, bits)| tagged(6, &[p.as_slice(), &bits.to_be_bytes()].concat())));
+    keys.extend(
+        r.depth_alarms
+            .iter()
+            .map(|(t, d)| tagged(4, &[t.as_slice(), &d.to_be_bytes()].concat())),
+    );
+    keys.extend(
+        r.descriptor
+            .iter()
+            .map(|d| tagged(5, d.descriptor.as_bytes())),
+    );
+    keys.extend(
+        r.prefixes
+            .iter()
+            .map(|(p, bits)| tagged(6, &[p.as_slice(), &bits.to_be_bytes()].concat())),
+    );
     keys.extend(r.scan_pubkeys.iter().map(|b| tagged(7, b)));
     keys
 }
@@ -1324,7 +1455,8 @@ impl ResilientWatch {
         start: u32,
     ) -> Result<(), StreamError> {
         let descriptor = descriptor.into();
-        self.mirror.add_descriptor(descriptor.clone(), gap_limit, start);
+        self.mirror
+            .add_descriptor(descriptor.clone(), gap_limit, start);
         let res = match &self.handle {
             Some(h) => Some(h.add_descriptor(descriptor, gap_limit, start).await),
             None => None,
@@ -1572,12 +1704,18 @@ impl ResilientWatch {
     /// [`ReloadError::Loader`] if the loader itself fails (surfaced, not retried —
     /// an explicit `reload` lets the caller decide).
     pub async fn reload(&mut self) -> Result<ReloadSummary, ReloadError> {
-        let loader = self.config.watch_set_loader.clone().ok_or(ReloadError::NoLoader)?;
+        let loader = self
+            .config
+            .watch_set_loader
+            .clone()
+            .ok_or(ReloadError::NoLoader)?;
         // Build the canonical set from the integrator's truth into a fresh mirror.
         let shared = Arc::new(Mutex::new(WatchSetMirror::default()));
-        loader(WatchSetBuilder { mirror: shared.clone() })
-            .await
-            .map_err(ReloadError::Loader)?;
+        loader(WatchSetBuilder {
+            mirror: shared.clone(),
+        })
+        .await
+        .map_err(ReloadError::Loader)?;
         let loaded = std::mem::take(&mut *shared.lock().unwrap_or_else(|p| p.into_inner()));
 
         // Counts (added/removed/unchanged) for the summary — advisory; the
@@ -1595,7 +1733,9 @@ impl ResilientWatch {
         let mut applied = false;
         if let Some(h) = &self.handle {
             let msg = Msg::SetWatchSet(loaded.to_set_watch_set());
-            let set_res = h.send_control(pb::SubscribeControl { msg: Some(msg) }).await;
+            let set_res = h
+                .send_control(pb::SubscribeControl { msg: Some(msg) })
+                .await;
             // SetWatchSet carries the category filter but NOT the raw-tx opt-in,
             // so reconcile it separately — and in BOTH directions. The reconnect
             // path renders it via `control_messages` on a fresh (default-off)
@@ -1713,7 +1853,11 @@ impl ResilientWatch {
 
             // A rate-limited add whose retry is due goes out before the next read.
             let now = tokio::time::Instant::now();
-            if let Some(i) = self.pending_add_retries.iter().position(|p| p.deadline <= now) {
+            if let Some(i) = self
+                .pending_add_retries
+                .iter()
+                .position(|p| p.deadline <= now)
+            {
                 self.send_add_retry(i).await?;
                 continue;
             }
@@ -1777,9 +1921,17 @@ impl ResilientWatch {
             && r.reason == WatchAddRejectReason::RateLimited
         {
             let keys = retry_keys(r);
-            let attempt =
-                keys.iter().filter_map(|k| self.add_retry_attempts.get(k)).copied().max().unwrap_or(0);
-            let exhausted = self.config.backoff.max_retries.is_some_and(|max| attempt >= max);
+            let attempt = keys
+                .iter()
+                .filter_map(|k| self.add_retry_attempts.get(k))
+                .copied()
+                .max()
+                .unwrap_or(0);
+            let exhausted = self
+                .config
+                .backoff
+                .max_retries
+                .is_some_and(|max| attempt >= max);
             if !exhausted {
                 for k in keys {
                     self.add_retry_attempts.insert(k, attempt.saturating_add(1));
@@ -1855,8 +2007,9 @@ impl ResilientWatch {
             // is captured — the drive re-sends the live `desired_cursor`.
             let delay = self.config.backoff.delay_for(self.reanchor_attempts);
             self.reanchor_attempts = self.reanchor_attempts.saturating_add(1);
-            self.pending_reanchor =
-                Some(PendingReanchor { deadline: tokio::time::Instant::now() + delay });
+            self.pending_reanchor = Some(PendingReanchor {
+                deadline: tokio::time::Instant::now() + delay,
+            });
             return Ok(None);
         }
 
@@ -1925,15 +2078,19 @@ impl ResilientWatch {
         // not use is dropped here and the next attempt retries the load.
         if let Some(loader) = self.config.watch_set_loader.clone() {
             let shared = Arc::new(Mutex::new(WatchSetMirror::default()));
-            loader(WatchSetBuilder { mirror: shared.clone() })
-                .await
-                .map_err(StreamError::WatchSetLoader)?;
+            loader(WatchSetBuilder {
+                mirror: shared.clone(),
+            })
+            .await
+            .map_err(StreamError::WatchSetLoader)?;
             // Take the loaded set regardless of whether the loader stashed a
             // builder clone; the builder only records, so nothing races here.
             self.mirror = std::mem::take(&mut *shared.lock().unwrap_or_else(|p| p.into_inner()));
         }
         for msg in self.mirror.control_messages() {
-            handle.send_control(pb::SubscribeControl { msg: Some(msg) }).await?;
+            handle
+                .send_control(pb::SubscribeControl { msg: Some(msg) })
+                .await?;
         }
         self.desired_cursor = self.resume;
         self.reanchor_attempts = 0;
@@ -1991,12 +2148,17 @@ impl ResilientWatch {
     /// still holds. The entry is removed only after the sends resolve, so a
     /// cancelled `next` re-sends it; a duplicate add is an idempotent re-assert.
     async fn send_add_retry(&mut self, i: usize) -> Result<(), StreamError> {
-        let msgs = self.mirror.subset_for(&self.pending_add_retries[i].rejected).control_messages();
+        let msgs = self
+            .mirror
+            .subset_for(&self.pending_add_retries[i].rejected)
+            .control_messages();
         let res = match &self.handle {
             Some(h) => {
                 let mut res = Ok(());
                 for msg in msgs {
-                    res = h.send_control(pb::SubscribeControl { msg: Some(msg) }).await;
+                    res = h
+                        .send_control(pb::SubscribeControl { msg: Some(msg) })
+                        .await;
                     if res.is_err() {
                         break;
                     }
@@ -2032,7 +2194,9 @@ impl ResilientWatch {
     /// Commit-on-poll flush: persist the armed high-water if it differs from the
     /// store's current value.
     fn commit_due(&mut self) -> Result<(), StreamError> {
-        let Some(c) = self.commit_next else { return Ok(()) };
+        let Some(c) = self.commit_next else {
+            return Ok(());
+        };
         if self.committed == Some(c) {
             self.commit_next = None;
             return Ok(());
@@ -2122,7 +2286,11 @@ fn sp_mirror_entries(
 /// source-of-truth should be retried on the next connect rather than crashing
 /// the consumer — neither is a caller-facing error.
 fn is_reconnectable(e: &StreamError) -> bool {
-    e.is_retryable() || matches!(e, StreamError::ControlClosed | StreamError::WatchSetLoader(_))
+    e.is_retryable()
+        || matches!(
+            e,
+            StreamError::ControlClosed | StreamError::WatchSetLoader(_)
+        )
 }
 
 #[cfg(test)]
@@ -2204,7 +2372,10 @@ mod tests {
         m.add_outpoints(&[([1u8; 32], 0)]);
         m.set_categories(crate::Categories::CHAIN);
         let msgs = m.control_messages();
-        assert!(matches!(msgs[0], Msg::SetCategories(_)), "categories lead the replay");
+        assert!(
+            matches!(msgs[0], Msg::SetCategories(_)),
+            "categories lead the replay"
+        );
     }
 
     #[test]
@@ -2227,7 +2398,11 @@ mod tests {
             Msg::SetWatchOptions(o) => Some(o.include_raw_tx),
             _ => None,
         });
-        assert_eq!(opt, Some(true), "opt-in replayed as SetWatchOptions{{true}}");
+        assert_eq!(
+            opt,
+            Some(true),
+            "opt-in replayed as SetWatchOptions{{true}}"
+        );
         // It leads the watch-set adds (like categories), so raw_tx is on from
         // the first replayed match.
         let opt_pos = msgs
@@ -2295,9 +2470,16 @@ mod tests {
         // Two targets with the SAME scan identity (same b_scan) but different
         // spend key/labels: dedup collapses to one, last-wins — so the mirror,
         // the wire message, and every reconnect replay all agree.
-        let t1 = SilentPaymentTarget { scan_secret: b_scan, spend_pubkey: spend_a, labels: vec![0] };
-        let t2 =
-            SilentPaymentTarget { scan_secret: b_scan, spend_pubkey: spend_b, labels: vec![1, 2] };
+        let t1 = SilentPaymentTarget {
+            scan_secret: b_scan,
+            spend_pubkey: spend_a,
+            labels: vec![0],
+        };
+        let t2 = SilentPaymentTarget {
+            scan_secret: b_scan,
+            spend_pubkey: spend_b,
+            labels: vec![1, 2],
+        };
         let entries = sp_mirror_entries([t1, t2]).expect("valid targets");
         assert_eq!(entries.len(), 1, "same identity collapses to one entry");
         assert_eq!(entries[0].1.spend_pubkey, spend_b, "last write wins");
@@ -2307,14 +2489,26 @@ mod tests {
         // silently accepted and skipped by the server.
         let mut bad_spend = spend_a;
         bad_spend[0] = 0x01; // invalid compressed-point prefix
-        let bad =
-            SilentPaymentTarget { scan_secret: b_scan, spend_pubkey: bad_spend, labels: vec![] };
-        assert!(matches!(sp_mirror_entries([bad]), Err(StreamError::InvalidArgument(_))));
+        let bad = SilentPaymentTarget {
+            scan_secret: b_scan,
+            spend_pubkey: bad_spend,
+            labels: vec![],
+        };
+        assert!(matches!(
+            sp_mirror_entries([bad]),
+            Err(StreamError::InvalidArgument(_))
+        ));
 
         // A malformed scan_secret (zero scalar) is likewise rejected.
-        let bad2 =
-            SilentPaymentTarget { scan_secret: [0u8; 32], spend_pubkey: spend_a, labels: vec![] };
-        assert!(matches!(sp_mirror_entries([bad2]), Err(StreamError::InvalidArgument(_))));
+        let bad2 = SilentPaymentTarget {
+            scan_secret: [0u8; 32],
+            spend_pubkey: spend_a,
+            labels: vec![],
+        };
+        assert!(matches!(
+            sp_mirror_entries([bad2]),
+            Err(StreamError::InvalidArgument(_))
+        ));
     }
 
     #[cfg(feature = "bitcoin")]
@@ -2330,17 +2524,26 @@ mod tests {
         let store = Arc::new(MemStore::default());
         let mut w = watch_with(&store);
         // Exactly the cap of distinct targets is accepted.
-        let full: Vec<_> = (1..=MAX_SP_TARGETS_PER_CONNECTION as u8).map(target).collect();
-        w.add_silent_payments(full).await.expect("cap-exact add accepted");
+        let full: Vec<_> = (1..=MAX_SP_TARGETS_PER_CONNECTION as u8)
+            .map(target)
+            .collect();
+        w.add_silent_payments(full)
+            .await
+            .expect("cap-exact add accepted");
         // Re-asserting a held identity at the cap is free (net-new = 0).
-        w.add_silent_payments([target(1)]).await.expect("re-assert at cap is free");
+        w.add_silent_payments([target(1)])
+            .await
+            .expect("re-assert at cap is free");
         // A further DISTINCT target is rejected deterministically rather than
         // silently shed by the server and replayed forever by the mirror.
         let err = w
             .add_silent_payments([target(MAX_SP_TARGETS_PER_CONNECTION as u8 + 1)])
             .await
             .expect_err("over-cap add must be rejected");
-        assert!(matches!(err, StreamError::InvalidArgument(_)), "got {err:?}");
+        assert!(
+            matches!(err, StreamError::InvalidArgument(_)),
+            "got {err:?}"
+        );
     }
 
     #[cfg(feature = "bitcoin")]
@@ -2356,15 +2559,23 @@ mod tests {
             spend_pubkey: spend,
             labels: (0..=MAX_SP_LABELS_PER_TARGET as u32).collect(),
         };
-        let err = w.add_silent_payments([over]).await.expect_err("over-label rejected");
-        assert!(matches!(err, StreamError::InvalidArgument(_)), "got {err:?}");
+        let err = w
+            .add_silent_payments([over])
+            .await
+            .expect_err("over-label rejected");
+        assert!(
+            matches!(err, StreamError::InvalidArgument(_)),
+            "got {err:?}"
+        );
         // Exactly the cap is accepted.
         let ok = SilentPaymentTarget {
             scan_secret: [1u8; 32],
             spend_pubkey: spend,
             labels: (0..MAX_SP_LABELS_PER_TARGET as u32).collect(),
         };
-        w.add_silent_payments([ok]).await.expect("cap-exact labels accepted");
+        w.add_silent_payments([ok])
+            .await
+            .expect("cap-exact labels accepted");
     }
 
     /// A valid compressed spend point for SP target test fixtures.
@@ -2372,7 +2583,8 @@ mod tests {
     fn valid_spend_pubkey() -> [u8; 33] {
         use bitcoin::secp256k1::{PublicKey, Secp256k1, SecretKey};
         let secp = Secp256k1::new();
-        PublicKey::from_secret_key(&secp, &SecretKey::from_slice(&[0x22u8; 32]).unwrap()).serialize()
+        PublicKey::from_secret_key(&secp, &SecretKey::from_slice(&[0x22u8; 32]).unwrap())
+            .serialize()
     }
 
     // --- a CursorStore we can assert against ----------------------------------
@@ -2397,7 +2609,12 @@ mod tests {
     }
 
     fn cur(height: u32) -> Cursor {
-        Cursor { height, tx_index: 0, mempool_seq: 0, instance_id: 1 }
+        Cursor {
+            height,
+            tx_index: 0,
+            mempool_seq: 0,
+            instance_id: 1,
+        }
     }
 
     // --- offline edits land in the mirror -------------------------------------
@@ -2428,10 +2645,20 @@ mod tests {
         let store = Arc::new(MemStore::default());
         let mut w = watch_with(&store);
         w.reanchor_attempts = 3;
-        let ev = Event::CursorAccepted { from: Some(cur(100)), clamped: false, earliest_replayed: 100 };
+        let ev = Event::CursorAccepted {
+            from: Some(cur(100)),
+            clamped: false,
+            earliest_replayed: 100,
+        };
         let out = w.handle_event(ev, None).await.unwrap();
-        assert!(matches!(out, Some(Event::CursorAccepted { .. })), "accept surfaces to caller");
-        assert_eq!(w.reanchor_attempts, 0, "a landed re-anchor resets the retry counter");
+        assert!(
+            matches!(out, Some(Event::CursorAccepted { .. })),
+            "accept surfaces to caller"
+        );
+        assert_eq!(
+            w.reanchor_attempts, 0,
+            "a landed re-anchor resets the retry counter"
+        );
     }
 
     #[tokio::test]
@@ -2444,12 +2671,20 @@ mod tests {
         w.desired_cursor = Some(cur(200));
         // Server admits the re-anchor. No replayed confirmed event has arrived yet
         // (this control frame carries no cursor).
-        let ev = Event::CursorAccepted { from: Some(cur(200)), clamped: false, earliest_replayed: 200 };
+        let ev = Event::CursorAccepted {
+            from: Some(cur(200)),
+            clamped: false,
+            earliest_replayed: 200,
+        };
         let out = w.handle_event(ev, None).await.unwrap();
         assert!(matches!(out, Some(Event::CursorAccepted { .. })));
         // The accepted anchor is adopted immediately, so a reconnect *before* the
         // first replayed event re-anchors from 200, not the stale high-water 1000.
-        assert_eq!(w.resume, Some(cur(200)), "accepted anchor becomes the resume point at once");
+        assert_eq!(
+            w.resume,
+            Some(cur(200)),
+            "accepted anchor becomes the resume point at once"
+        );
         assert_eq!(w.desired_cursor, Some(cur(200)));
     }
 
@@ -2463,7 +2698,13 @@ mod tests {
         };
         let out = w.handle_event(ev, None).await.unwrap();
         assert!(
-            matches!(out, Some(Event::CursorRejected { reason: CursorRejectReason::NoSource, .. })),
+            matches!(
+                out,
+                Some(Event::CursorRejected {
+                    reason: CursorRejectReason::NoSource,
+                    ..
+                })
+            ),
             "NoSource is terminal — surfaced so the caller can resnapshot"
         );
     }
@@ -2492,9 +2733,18 @@ mod tests {
         // (the backoff + re-send is driven by `next`); we assert the budget
         // accounting and that the reject is consumed (Ok(None)) until exhausted,
         // then surfaced.
-        assert!(w.handle_event(reject(), None).await.unwrap().is_none(), "retry 1 consumed");
-        assert!(w.pending_reanchor.is_some(), "retry 1 deferred to a pending slot");
-        assert!(w.handle_event(reject(), None).await.unwrap().is_none(), "retry 2 consumed");
+        assert!(
+            w.handle_event(reject(), None).await.unwrap().is_none(),
+            "retry 1 consumed"
+        );
+        assert!(
+            w.pending_reanchor.is_some(),
+            "retry 1 deferred to a pending slot"
+        );
+        assert!(
+            w.handle_event(reject(), None).await.unwrap().is_none(),
+            "retry 2 consumed"
+        );
         let out = w.handle_event(reject(), None).await.unwrap();
         assert!(
             matches!(out, Some(Event::CursorRejected { .. })),
@@ -2513,14 +2763,16 @@ mod tests {
         let store = Arc::new(MemStore::default());
         let mut w = ResilientWatch::new(
             StreamClient::for_test(),
-            ResilientWatchConfig::new().cursor_store(store.clone()).backoff(Backoff {
-                // A long backoff so the drive is guaranteed to park in the sleep
-                // (never reaching the re-send) before we cancel it.
-                initial: std::time::Duration::from_secs(30),
-                max: std::time::Duration::from_secs(30),
-                multiplier: 1.0,
-                max_retries: Some(3),
-            }),
+            ResilientWatchConfig::new()
+                .cursor_store(store.clone())
+                .backoff(Backoff {
+                    // A long backoff so the drive is guaranteed to park in the sleep
+                    // (never reaching the re-send) before we cancel it.
+                    initial: std::time::Duration::from_secs(30),
+                    max: std::time::Duration::from_secs(30),
+                    multiplier: 1.0,
+                    max_retries: Some(3),
+                }),
         );
         w.desired_cursor = Some(cur(100));
 
@@ -2528,14 +2780,20 @@ mod tests {
         // inline await in `handle_event` any more.
         let out = w
             .handle_event(
-                Event::CursorRejected { reason: CursorRejectReason::RateLimited, current_head: None },
+                Event::CursorRejected {
+                    reason: CursorRejectReason::RateLimited,
+                    current_head: None,
+                },
                 None,
             )
             .await
             .unwrap();
         assert!(out.is_none(), "transient reject consumed");
         assert_eq!(w.reanchor_attempts, 1, "one retry charged");
-        assert!(w.pending_reanchor.is_some(), "retry deferred to a resumable slot");
+        assert!(
+            w.pending_reanchor.is_some(),
+            "retry deferred to a resumable slot"
+        );
 
         // Cancel the drive while it is parked in the 30s backoff: `biased` polls
         // the drive first (it parks), then the 1ms timer fires and preempts it,
@@ -2545,15 +2803,27 @@ mod tests {
             _ = w.drive_pending_reanchor() => unreachable!("30s backoff cannot have elapsed"),
             _ = tokio::time::sleep(std::time::Duration::from_millis(1)) => {}
         }
-        assert!(w.pending_reanchor.is_some(), "a cancelled drive leaves the retry resumable");
-        assert_eq!(w.reanchor_attempts, 1, "the cancelled drive did not re-charge the budget");
+        assert!(
+            w.pending_reanchor.is_some(),
+            "a cancelled drive leaves the retry resumable"
+        );
+        assert_eq!(
+            w.reanchor_attempts, 1,
+            "the cancelled drive did not re-charge the budget"
+        );
 
         // Resume to completion. Collapse the remaining backoff so the test stays
         // fast; disconnected, so the re-send is a no-op and the slot just clears.
         w.pending_reanchor.as_mut().unwrap().deadline = tokio::time::Instant::now();
         w.drive_pending_reanchor().await.unwrap();
-        assert!(w.pending_reanchor.is_none(), "the resumed drive completes the retry");
-        assert_eq!(w.reanchor_attempts, 1, "resuming does not re-charge the budget");
+        assert!(
+            w.pending_reanchor.is_none(),
+            "the resumed drive completes the retry"
+        );
+        assert_eq!(
+            w.reanchor_attempts, 1,
+            "resuming does not re-charge the budget"
+        );
     }
 
     // Drain the cursor of every `SetCursor` control message queued on a test
@@ -2584,7 +2854,10 @@ mod tests {
 
         // A transient reject defers a retry that would re-send the anchor at 100.
         w.handle_event(
-            Event::CursorRejected { reason: CursorRejectReason::RateLimited, current_head: None },
+            Event::CursorRejected {
+                reason: CursorRejectReason::RateLimited,
+                current_head: None,
+            },
             None,
         )
         .await
@@ -2594,13 +2867,23 @@ mod tests {
         // The caller now re-anchors to 200: sends set_cursor(200) live, and must
         // supersede the deferred retry for 100.
         w.set_cursor(cur(200)).await.unwrap();
-        assert!(w.pending_reanchor.is_none(), "explicit re-anchor drops the stale deferred retry");
-        assert_eq!(drained_set_cursors(&mut rx), vec![cur(200)], "only the fresh anchor is sent");
+        assert!(
+            w.pending_reanchor.is_none(),
+            "explicit re-anchor drops the stale deferred retry"
+        );
+        assert_eq!(
+            drained_set_cursors(&mut rx),
+            vec![cur(200)],
+            "only the fresh anchor is sent"
+        );
 
         // Driving the (now-cleared) retry re-sends nothing — in particular not the
         // stale 100 that would clobber the caller's 200.
         w.drive_pending_reanchor().await.unwrap();
-        assert!(drained_set_cursors(&mut rx).is_empty(), "a superseded retry re-sends nothing");
+        assert!(
+            drained_set_cursors(&mut rx).is_empty(),
+            "a superseded retry re-sends nothing"
+        );
     }
 
     #[tokio::test]
@@ -2612,12 +2895,14 @@ mod tests {
         let (handle, mut rx) = crate::client::WatchHandle::for_test();
         let mut w = ResilientWatch::new(
             StreamClient::for_test(),
-            ResilientWatchConfig::new().cursor_store(store.clone()).backoff(Backoff {
-                initial: std::time::Duration::ZERO,
-                max: std::time::Duration::ZERO,
-                multiplier: 1.0,
-                max_retries: Some(3),
-            }),
+            ResilientWatchConfig::new()
+                .cursor_store(store.clone())
+                .backoff(Backoff {
+                    initial: std::time::Duration::ZERO,
+                    max: std::time::Duration::ZERO,
+                    multiplier: 1.0,
+                    max_retries: Some(3),
+                }),
         );
         w.handle = Some(handle);
         w.desired_cursor = Some(cur(100));
@@ -2637,7 +2922,11 @@ mod tests {
 
         // The drive re-sends the live 200, never the stale 100.
         w.drive_pending_reanchor().await.unwrap();
-        assert_eq!(drained_set_cursors(&mut rx), vec![cur(200)], "the live anchor is re-sent");
+        assert_eq!(
+            drained_set_cursors(&mut rx),
+            vec![cur(200)],
+            "the live anchor is re-sent"
+        );
         assert!(w.pending_reanchor.is_none(), "the retry completed");
     }
 
@@ -2650,23 +2939,45 @@ mod tests {
         // Arm two alarms on one txid; the server fires and self-evicts the
         // depth-3 one (reporting the requested threshold 3, not actual confs).
         w.add_depth_alarms([[7u8; 32]], [3, 6]).await.unwrap();
-        let ev = Event::TxidDepthReached { txid: [7u8; 32].to_vec(), depth: 3, height: 100 };
+        let ev = Event::TxidDepthReached {
+            txid: [7u8; 32].to_vec(),
+            depth: 3,
+            height: 100,
+        };
         let out = w.handle_event(ev, None).await.unwrap();
-        assert!(matches!(out, Some(Event::TxidDepthReached { .. })), "still surfaced to caller");
+        assert!(
+            matches!(out, Some(Event::TxidDepthReached { .. })),
+            "still surfaced to caller"
+        );
         // Fired (txid,3) pruned so a reconnect won't re-register it; (txid,6)
         // stays for replay.
-        assert!(!w.mirror.depth_alarms.contains(&([7u8; 32], 3)), "fired alarm pruned");
-        assert!(w.mirror.depth_alarms.contains(&([7u8; 32], 6)), "unfired alarm retained");
+        assert!(
+            !w.mirror.depth_alarms.contains(&([7u8; 32], 3)),
+            "fired alarm pruned"
+        );
+        assert!(
+            w.mirror.depth_alarms.contains(&([7u8; 32], 6)),
+            "unfired alarm retained"
+        );
     }
 
     #[tokio::test]
     async fn finalized_lifecycle_watch_is_pruned_from_the_mirror() {
         let store = Arc::new(MemStore::default());
         let mut w = watch_with(&store);
-        w.add_tx_lifecycle([[8u8; 32]], AutoClose::AtDepth(6)).await.unwrap();
-        let ev = Event::TxidFinalized { txid: [8u8; 32].to_vec(), depth: 6, height: 200 };
+        w.add_tx_lifecycle([[8u8; 32]], AutoClose::AtDepth(6))
+            .await
+            .unwrap();
+        let ev = Event::TxidFinalized {
+            txid: [8u8; 32].to_vec(),
+            depth: 6,
+            height: 200,
+        };
         let out = w.handle_event(ev, None).await.unwrap();
-        assert!(matches!(out, Some(Event::TxidFinalized { .. })), "still surfaced to caller");
+        assert!(
+            matches!(out, Some(Event::TxidFinalized { .. })),
+            "still surfaced to caller"
+        );
         assert!(
             !w.mirror.tx_lifecycles.contains_key(&[8u8; 32]),
             "auto-close finalize prunes the lifecycle watch the server evicted"
@@ -2684,11 +2995,17 @@ mod tests {
         use pb::watch_add_rejected::{Kind, Reason};
         let store = Arc::new(MemStore::default());
         let mut w = watch_with(&store);
-        w.add_scripts([([1u8; 32], None), ([2u8; 32], None)]).await.unwrap();
-        w.add_outpoints([([3u8; 32], 0), ([3u8; 32], 1)]).await.unwrap();
+        w.add_scripts([([1u8; 32], None), ([2u8; 32], None)])
+            .await
+            .unwrap();
+        w.add_outpoints([([3u8; 32], 0), ([3u8; 32], 1)])
+            .await
+            .unwrap();
         // 12 bits: the caller's low nibble survives in the mirror, the server
         // echoes it masked.
-        w.add_script_prefixes([(vec![0xab, 0xcd], 12)]).await.unwrap();
+        w.add_script_prefixes([(vec![0xab, 0xcd], 12)])
+            .await
+            .unwrap();
 
         let out = w
             .handle_event(
@@ -2702,15 +3019,27 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(matches!(out, Some(Event::WatchAddRejected(_))), "still surfaced to the caller");
-        assert!(w.mirror.scripts.contains_key(&[1u8; 32]), "an item the server holds stays");
-        assert!(!w.mirror.scripts.contains_key(&[2u8; 32]), "a refused script is dropped");
+        assert!(
+            matches!(out, Some(Event::WatchAddRejected(_))),
+            "still surfaced to the caller"
+        );
+        assert!(
+            w.mirror.scripts.contains_key(&[1u8; 32]),
+            "an item the server holds stays"
+        );
+        assert!(
+            !w.mirror.scripts.contains_key(&[2u8; 32]),
+            "a refused script is dropped"
+        );
 
         w.handle_event(
             refused(pb::WatchAddRejected {
                 kind: Kind::Outpoints as i32,
                 reason: Reason::PermissionDenied as i32,
-                outpoints: vec![pb::Outpoint { txid: vec![3u8; 32], vout: 1 }],
+                outpoints: vec![pb::Outpoint {
+                    txid: vec![3u8; 32],
+                    vout: 1,
+                }],
                 ..Default::default()
             }),
             None,
@@ -2724,14 +3053,20 @@ mod tests {
             refused(pb::WatchAddRejected {
                 kind: Kind::ScriptPrefixes as i32,
                 reason: Reason::CapExceeded as i32,
-                prefixes: vec![pb::ScriptPrefix { prefix: vec![0xab, 0xc0], bits: 12 }],
+                prefixes: vec![pb::ScriptPrefix {
+                    prefix: vec![0xab, 0xc0],
+                    bits: 12,
+                }],
                 ..Default::default()
             }),
             None,
         )
         .await
         .unwrap();
-        assert!(w.mirror.prefixes.is_empty(), "the masked echo matches the caller's prefix");
+        assert!(
+            w.mirror.prefixes.is_empty(),
+            "the masked echo matches the caller's prefix"
+        );
     }
 
     #[tokio::test]
@@ -2758,7 +3093,11 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(w.mirror.descriptors.get("wpkh(a)"), Some(&(20, 0)), "replays the held window");
+        assert_eq!(
+            w.mirror.descriptors.get("wpkh(a)"),
+            Some(&(20, 0)),
+            "replays the held window"
+        );
 
         // A brand-new descriptor that is refused is not watched at all.
         w.handle_event(
@@ -2798,7 +3137,11 @@ mod tests {
             .await
             .unwrap();
         }
-        assert_eq!(w.mirror.descriptors.get("wpkh(c)"), Some(&(20, 0)), "falls back past both refusals");
+        assert_eq!(
+            w.mirror.descriptors.get("wpkh(c)"),
+            Some(&(20, 0)),
+            "falls back past both refusals"
+        );
 
         // A refusal for a window the caller already slid past changes nothing.
         w.add_descriptor("wpkh(a)", 20, 40).await.unwrap();
@@ -2839,7 +3182,9 @@ mod tests {
         })
     }
 
-    fn sent_scripts(rx: &mut tokio::sync::mpsc::Receiver<pb::SubscribeControl>) -> Vec<pb::AddScripts> {
+    fn sent_scripts(
+        rx: &mut tokio::sync::mpsc::Receiver<pb::SubscribeControl>,
+    ) -> Vec<pb::AddScripts> {
         let mut out = Vec::new();
         while let Ok(ctrl) = rx.try_recv() {
             if let Some(Msg::AddScripts(a)) = ctrl.msg {
@@ -2855,17 +3200,26 @@ mod tests {
         let (handle, mut rx) = crate::client::WatchHandle::for_test();
         let mut w = ResilientWatch::new(
             StreamClient::for_test(),
-            ResilientWatchConfig::new().cursor_store(store.clone()).backoff(zero_backoff(Some(3))),
+            ResilientWatchConfig::new()
+                .cursor_store(store.clone())
+                .backoff(zero_backoff(Some(3))),
         );
         w.handle = Some(handle);
-        w.add_scripts([([1u8; 32], None), ([2u8; 32], Some(500)), ([3u8; 32], None)]).await.unwrap();
+        w.add_scripts([([1u8; 32], None), ([2u8; 32], Some(500)), ([3u8; 32], None)])
+            .await
+            .unwrap();
         let _ = sent_scripts(&mut rx);
 
         // The node throttled the add of 2 and 3: the event is absorbed, and both
         // stay in the mirror for the retry.
-        let out = w.handle_event(rate_limited_scripts(&[2, 3]), None).await.unwrap();
+        let out = w
+            .handle_event(rate_limited_scripts(&[2, 3]), None)
+            .await
+            .unwrap();
         assert!(out.is_none(), "a rate-limited add is retried, not surfaced");
-        assert!(w.mirror.scripts.contains_key(&[2u8; 32]) && w.mirror.scripts.contains_key(&[3u8; 32]));
+        assert!(
+            w.mirror.scripts.contains_key(&[2u8; 32]) && w.mirror.scripts.contains_key(&[3u8; 32])
+        );
         assert_eq!(w.pending_add_retries.len(), 1);
 
         // The caller removes 3 before the retry is due: the removal wins.
@@ -2874,7 +3228,11 @@ mod tests {
         w.send_add_retry(0).await.unwrap();
         let sent = sent_scripts(&mut rx);
         assert_eq!(sent.len(), 1, "one re-send: {sent:?}");
-        assert_eq!(sent[0].scripthashes, vec![vec![2u8; 32]], "only what the caller still holds");
+        assert_eq!(
+            sent[0].scripthashes,
+            vec![vec![2u8; 32]],
+            "only what the caller still holds"
+        );
         assert_eq!(sent[0].min_values, vec![500], "with its current floor");
         assert!(w.pending_add_retries.is_empty());
     }
@@ -2884,14 +3242,31 @@ mod tests {
         let store = Arc::new(MemStore::default());
         let mut w = ResilientWatch::new(
             StreamClient::for_test(),
-            ResilientWatchConfig::new().cursor_store(store.clone()).backoff(zero_backoff(Some(1))),
+            ResilientWatchConfig::new()
+                .cursor_store(store.clone())
+                .backoff(zero_backoff(Some(1))),
         );
         w.add_scripts([([2u8; 32], None)]).await.unwrap();
-        assert!(w.handle_event(rate_limited_scripts(&[2]), None).await.unwrap().is_none(), "retry 1");
+        assert!(
+            w.handle_event(rate_limited_scripts(&[2]), None)
+                .await
+                .unwrap()
+                .is_none(),
+            "retry 1"
+        );
         // The retried add is throttled again: the budget of 1 is spent.
-        let out = w.handle_event(rate_limited_scripts(&[2]), None).await.unwrap();
-        assert!(matches!(out, Some(Event::WatchAddRejected(_))), "surfaced once the budget is spent");
-        assert!(!w.mirror.scripts.contains_key(&[2u8; 32]), "and dropped from the mirror");
+        let out = w
+            .handle_event(rate_limited_scripts(&[2]), None)
+            .await
+            .unwrap();
+        assert!(
+            matches!(out, Some(Event::WatchAddRejected(_))),
+            "surfaced once the budget is spent"
+        );
+        assert!(
+            !w.mirror.scripts.contains_key(&[2u8; 32]),
+            "and dropped from the mirror"
+        );
         assert!(w.add_retry_attempts.is_empty(), "its budget is released");
     }
 
@@ -2900,13 +3275,20 @@ mod tests {
         let store = Arc::new(MemStore::default());
         let mut w = ResilientWatch::new(
             StreamClient::for_test(),
-            ResilientWatchConfig::new().cursor_store(store.clone()).backoff(zero_backoff(Some(3))),
+            ResilientWatchConfig::new()
+                .cursor_store(store.clone())
+                .backoff(zero_backoff(Some(3))),
         );
         w.add_scripts([([2u8; 32], None)]).await.unwrap();
-        w.handle_event(rate_limited_scripts(&[2]), None).await.unwrap();
+        w.handle_event(rate_limited_scripts(&[2]), None)
+            .await
+            .unwrap();
         w.teardown();
         assert!(w.pending_add_retries.is_empty() && w.add_retry_attempts.is_empty());
-        assert!(w.mirror.scripts.contains_key(&[2u8; 32]), "the reconnect re-sends it with the mirror");
+        assert!(
+            w.mirror.scripts.contains_key(&[2u8; 32]),
+            "the reconnect re-sends it with the mirror"
+        );
     }
 
     // --- cursor persistence (commit-on-poll) ----------------------------------
@@ -2920,7 +3302,13 @@ mod tests {
         // Deliver a confirmed event carrying cursor c.
         w.commit_due().unwrap();
         let out = w
-            .handle_event(Event::BlockConnected { hash: vec![0xaa], height: 900 }, Some(c))
+            .handle_event(
+                Event::BlockConnected {
+                    hash: vec![0xaa],
+                    height: 900,
+                },
+                Some(c),
+            )
             .await
             .unwrap();
         assert!(out.is_some());
@@ -2964,20 +3352,35 @@ mod tests {
     /// exits believing a cursor is durable that was never written.
     #[tokio::test]
     async fn commit_retry_after_a_store_failure_actually_writes() {
-        let store = Arc::new(FlakyStore { fail_next: Mutex::new(1), ..Default::default() });
+        let store = Arc::new(FlakyStore {
+            fail_next: Mutex::new(1),
+            ..Default::default()
+        });
         let mut w = ResilientWatch::new(
             StreamClient::for_test(),
-            ResilientWatchConfig { cursor_store: store.clone(), ..Default::default() },
+            ResilientWatchConfig {
+                cursor_store: store.clone(),
+                ..Default::default()
+            },
         );
         let c = cur(900);
 
-        w.handle_event(Event::BlockConnected { hash: vec![0xaa], height: 900 }, Some(c))
-            .await
-            .unwrap();
+        w.handle_event(
+            Event::BlockConnected {
+                hash: vec![0xaa],
+                height: 900,
+            },
+            Some(c),
+        )
+        .await
+        .unwrap();
         w.arm_commit();
 
         let err = w.commit_due().unwrap_err();
-        assert!(matches!(err, StreamError::Decode(_)), "the transient failure surfaces");
+        assert!(
+            matches!(err, StreamError::Decode(_)),
+            "the transient failure surfaces"
+        );
         assert_eq!(store.load().unwrap(), None, "nothing was written");
 
         w.commit_due().expect("retry after a transient failure");
@@ -2995,10 +3398,16 @@ mod tests {
         store.save(cur(800)).unwrap();
         let mut w = ResilientWatch::new(
             StreamClient::for_test(),
-            ResilientWatchConfig::new().cursor_store(store.clone()).from_cursor(cur(1)),
+            ResilientWatchConfig::new()
+                .cursor_store(store.clone())
+                .from_cursor(cur(1)),
         );
         w.seed_resume().unwrap();
-        assert_eq!(w.resume, Some(cur(800)), "persisted cursor wins over from_cursor");
+        assert_eq!(
+            w.resume,
+            Some(cur(800)),
+            "persisted cursor wins over from_cursor"
+        );
         assert_eq!(w.committed, Some(cur(800)), "loaded cursor seeds committed");
     }
 
@@ -3009,9 +3418,11 @@ mod tests {
     async fn run_loader(config: &ResilientWatchConfig) -> Result<WatchSetMirror, StreamError> {
         let loader = config.watch_set_loader.clone().expect("loader configured");
         let shared = Arc::new(Mutex::new(WatchSetMirror::default()));
-        loader(WatchSetBuilder { mirror: shared.clone() })
-            .await
-            .map_err(StreamError::WatchSetLoader)?;
+        loader(WatchSetBuilder {
+            mirror: shared.clone(),
+        })
+        .await
+        .map_err(StreamError::WatchSetLoader)?;
         Ok(std::mem::take(&mut *shared.lock().unwrap()))
     }
 
@@ -3035,7 +3446,11 @@ mod tests {
             .collect();
         // Categories + scripts + outpoints + lifecycle + depth-alarm + descriptor
         // + prefixes = 7 messages, the same shapes a manual replay emits.
-        assert_eq!(kinds.len(), 7, "every declared kind renders to a control message");
+        assert_eq!(
+            kinds.len(),
+            7,
+            "every declared kind renders to a control message"
+        );
         assert!(
             matches!(mirror.control_messages()[0], Msg::SetCategories(_)),
             "categories still lead the replay"
@@ -3052,7 +3467,11 @@ mod tests {
         let mirror = std::mem::take(&mut *m.lock().unwrap());
         assert!(mirror.depth_alarms.contains(&([1u8; 32], 5)));
         assert!(mirror.depth_alarms.contains(&([2u8; 32], 5)));
-        assert_eq!(mirror.depth_alarms.len(), 2, "depth 0 dropped, depth 5 kept");
+        assert_eq!(
+            mirror.depth_alarms.len(),
+            2,
+            "depth 0 dropped, depth 5 kept"
+        );
     }
 
     #[test]
@@ -3068,12 +3487,13 @@ mod tests {
 
     #[tokio::test]
     async fn loader_rebuilds_the_canonical_watch_set() {
-        let config = ResilientWatchConfig::new().watch_set_loader(|b: WatchSetBuilder| async move {
-            // Stand-in for "query the durable truth, then declare the set."
-            b.add_scripts([([7u8; 32], None), ([8u8; 32], Some(1_000))]);
-            b.add_outpoints([([9u8; 32], 1)]);
-            Ok(())
-        });
+        let config =
+            ResilientWatchConfig::new().watch_set_loader(|b: WatchSetBuilder| async move {
+                // Stand-in for "query the durable truth, then declare the set."
+                b.add_scripts([([7u8; 32], None), ([8u8; 32], Some(1_000))]);
+                b.add_outpoints([([9u8; 32], 1)]);
+                Ok(())
+            });
         let mirror = run_loader(&config).await.expect("loader succeeds");
         assert!(mirror.scripts.contains_key(&[7u8; 32]));
         assert_eq!(mirror.scripts.get(&[8u8; 32]), Some(&Some(1_000)));
@@ -3096,16 +3516,25 @@ mod tests {
         assert!(w.mirror.scripts.contains_key(&[1u8; 32]));
         // Adopt the loaded set the way `connect` does.
         w.mirror = run_loader(&w.config).await.unwrap();
-        assert!(!w.mirror.scripts.contains_key(&[1u8; 32]), "stale in-process edit dropped");
-        assert!(w.mirror.scripts.contains_key(&[2u8; 32]), "canonical loaded script present");
+        assert!(
+            !w.mirror.scripts.contains_key(&[1u8; 32]),
+            "stale in-process edit dropped"
+        );
+        assert!(
+            w.mirror.scripts.contains_key(&[2u8; 32]),
+            "canonical loaded script present"
+        );
     }
 
     #[tokio::test]
     async fn loader_error_maps_to_watch_set_loader_and_is_reconnectable() {
-        let config = ResilientWatchConfig::new().watch_set_loader(|_b: WatchSetBuilder| async move {
-            Err("source-of-truth unreachable".into())
-        });
-        let err = run_loader(&config).await.expect_err("loader failure surfaces");
+        let config =
+            ResilientWatchConfig::new().watch_set_loader(|_b: WatchSetBuilder| async move {
+                Err("source-of-truth unreachable".into())
+            });
+        let err = run_loader(&config)
+            .await
+            .expect_err("loader failure surfaces");
         assert!(matches!(err, StreamError::WatchSetLoader(_)));
         assert!(
             is_reconnectable(&err),
@@ -3173,10 +3602,16 @@ mod tests {
             )
         });
         if let (Some(lr), Some(fa)) = (last_remove, first_add) {
-            assert!(lr < fa, "every Remove must precede every quota-consuming Add");
+            assert!(
+                lr < fa,
+                "every Remove must precede every quota-consuming Add"
+            );
         }
         // A vanished descriptor is dropped with RemoveDescriptor, not by scripthash.
-        assert!(msgs.iter().any(|m| matches!(m, Msg::RemoveDescriptor(d) if d.descriptor == "desc-drop")));
+        assert!(
+            msgs.iter()
+                .any(|m| matches!(m, Msg::RemoveDescriptor(d) if d.descriptor == "desc-drop"))
+        );
     }
 
     #[test]
@@ -3246,7 +3681,11 @@ mod tests {
         let mut all = WatchSetMirror::default();
         all.set_categories(0);
         assert!(
-            !none.reconcile_to(&all).0.iter().any(|m| matches!(m, Msg::SetCategories(_))),
+            !none
+                .reconcile_to(&all)
+                .0
+                .iter()
+                .any(|m| matches!(m, Msg::SetCategories(_))),
             "None and Some(0) are the same effective filter — no reset emitted",
         );
     }
@@ -3283,7 +3722,10 @@ mod tests {
         w.add_scripts([([1u8; 32], None)]).await.unwrap();
 
         let summary = w.reload().await.expect("reload ok");
-        assert!(!summary.applied, "no live stream → deferred to reconnect loader");
+        assert!(
+            !summary.applied,
+            "no live stream → deferred to reconnect loader"
+        );
         assert_eq!(summary.added, 1, "sh5 added");
         assert_eq!(summary.removed, 1, "stale sh1 removed");
         // The mirror now reflects truth, so a reconnect re-registers the right set.
@@ -3301,7 +3743,9 @@ mod tests {
                 Ok(())
             }),
         );
-        w.add_scripts([([1u8; 32], None), ([2u8; 32], None)]).await.unwrap();
+        w.add_scripts([([1u8; 32], None), ([2u8; 32], None)])
+            .await
+            .unwrap();
 
         // Inject a live handle whose receiver we can inspect.
         let (handle, mut rx) = crate::client::WatchHandle::for_test();
@@ -3310,7 +3754,10 @@ mod tests {
         let summary = w.reload().await.expect("reload ok");
         assert!(summary.applied, "connected → applied live");
         // Advisory client counts (server's WatchSetResult is authoritative).
-        assert_eq!((summary.added, summary.removed, summary.unchanged), (1, 1, 1));
+        assert_eq!(
+            (summary.added, summary.removed, summary.unchanged),
+            (1, 1, 1)
+        );
 
         // Exactly ONE SetWatchSet carrying the whole desired set (sh1 + sh3)
         // reached the wire — no client-computed Add*/Remove* delta.
@@ -3364,7 +3811,11 @@ mod tests {
             Msg::SetWatchOptions(o) => Some(o.include_raw_tx),
             _ => None,
         });
-        assert_eq!(opt, Some(false), "reload turns the opt-in OFF to match truth");
+        assert_eq!(
+            opt,
+            Some(false),
+            "reload turns the opt-in OFF to match truth"
+        );
         // The mirror now reflects truth (no opt-in), so a reconnect stays off.
         assert_eq!(w.mirror.include_raw_tx, None);
     }

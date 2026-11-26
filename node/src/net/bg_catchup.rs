@@ -170,7 +170,11 @@ impl BgDownloader {
         let mut next = self.next_start % peers.len();
         self.next_start = self.next_start.wrapping_add(1);
         for &(height, hash) in needed {
-            let avoid = if peers.len() > 1 { self.released_from.get(&height).copied() } else { None };
+            let avoid = if peers.len() > 1 {
+                self.released_from.get(&height).copied()
+            } else {
+                None
+            };
             let Some(i) = (0..peers.len())
                 .map(|k| (next + k) % peers.len())
                 .find(|&i| room[i] > 0 && Some(peers[i]) != avoid)

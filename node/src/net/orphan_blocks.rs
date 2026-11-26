@@ -99,7 +99,11 @@ impl OrphanBlocks {
     }
 
     pub fn with_limits(limits: Limits) -> Self {
-        Self { waiting: VecDeque::new(), bytes: 0, limits }
+        Self {
+            waiting: VecDeque::new(),
+            bytes: 0,
+            limits,
+        }
     }
 
     /// Blocks waiting.
@@ -151,20 +155,30 @@ impl OrphanBlocks {
             self.remove_at(0);
         }
         self.bytes += size;
-        self.waiting.push_back(Orphan { hash, block, from, size, since: now });
+        self.waiting.push_back(Orphan {
+            hash,
+            block,
+            from,
+            size,
+            since: now,
+        });
         true
     }
 
     /// Remove and return the oldest waiting block whose parent is `parent`.
     pub fn take_child_of(&mut self, parent: &BlockHash) -> Option<Block> {
-        let at = self.waiting.iter().position(|o| o.block.header.prev_blockhash == *parent)?;
+        let at = self
+            .waiting
+            .iter()
+            .position(|o| o.block.header.prev_blockhash == *parent)?;
         Some(self.remove_at(at).block)
     }
 
     /// Drop every block that has waited [`Limits::expiry`] or longer.
     pub fn expire(&mut self, now: Instant) {
         let expiry = self.limits.expiry;
-        self.waiting.retain(|o| now.saturating_duration_since(o.since) < expiry);
+        self.waiting
+            .retain(|o| now.saturating_duration_since(o.since) < expiry);
         self.bytes = self.waiting.iter().map(|o| o.size).sum();
     }
 
@@ -242,8 +256,14 @@ mod tests {
         let now = Instant::now();
         assert!(buf.insert(7, b.clone(), Network::Regtest, now));
         assert_eq!((buf.len(), buf.bytes()), (1, b.total_size()));
-        assert!(buf.take_child_of(&prev(2)).is_none(), "only to its own parent");
-        assert_eq!(buf.take_child_of(&prev(1)).map(|b| b.block_hash()), Some(b.block_hash()));
+        assert!(
+            buf.take_child_of(&prev(2)).is_none(),
+            "only to its own parent"
+        );
+        assert_eq!(
+            buf.take_child_of(&prev(1)).map(|b| b.block_hash()),
+            Some(b.block_hash())
+        );
         assert_eq!((buf.len(), buf.bytes()), (0, 0), "its bytes are released");
     }
 
@@ -254,20 +274,32 @@ mod tests {
         let mut buf = OrphanBlocks::new();
         let now = Instant::now();
         let misses = block_on(prev(1), 2, 0, false);
-        assert!(!buf.insert(7, misses, Network::Regtest, now), "the hash misses its target");
+        assert!(
+            !buf.insert(7, misses, Network::Regtest, now),
+            "the hash misses its target"
+        );
 
         // A target above regtest's powLimit (0x207fffff), which almost every
         // hash meets.
         let mut easy = block_on(prev(1), 3, 0, true);
         easy.header.bits = bitcoin::CompactTarget::from_consensus(0x2100_ffff);
-        assert!(easy.header.validate_pow(easy.header.target()).is_ok(), "fixture: meets its own target");
-        assert!(!buf.insert(7, easy, Network::Regtest, now), "the target is above powLimit");
+        assert!(
+            easy.header.validate_pow(easy.header.target()).is_ok(),
+            "fixture: meets its own target"
+        );
+        assert!(
+            !buf.insert(7, easy, Network::Regtest, now),
+            "the target is above powLimit"
+        );
 
         // The same rule on mainnet, where regtest's work is far too little.
         let regtest_work = block_on(prev(1), 4, 0, true);
         assert!(!buf.insert(7, regtest_work.clone(), Network::Bitcoin, now));
         assert!(buf.is_empty());
-        assert!(buf.insert(7, regtest_work, Network::Regtest, now), "but it is enough on regtest");
+        assert!(
+            buf.insert(7, regtest_work, Network::Regtest, now),
+            "but it is enough on regtest"
+        );
     }
 
     #[test]
@@ -275,39 +307,61 @@ mod tests {
         let mut buf = OrphanBlocks::new();
         let now = Instant::now();
         let over = block_on(prev(1), 5, MAX_BLOCK_SERIALIZED_SIZE, true);
-        assert!(over.total_size() > MAX_BLOCK_SERIALIZED_SIZE, "fixture: over the limit");
+        assert!(
+            over.total_size() > MAX_BLOCK_SERIALIZED_SIZE,
+            "fixture: over the limit"
+        );
         assert!(!buf.insert(7, over, Network::Regtest, now));
         assert!(buf.is_empty());
 
         let at = block_on(prev(1), 6, MAX_BLOCK_SERIALIZED_SIZE - 200, true);
-        assert!(at.total_size() <= MAX_BLOCK_SERIALIZED_SIZE, "fixture: within the limit");
-        assert!(buf.insert(7, at, Network::Regtest, now), "a block within the limit is kept");
+        assert!(
+            at.total_size() <= MAX_BLOCK_SERIALIZED_SIZE,
+            "fixture: within the limit"
+        );
+        assert!(
+            buf.insert(7, at, Network::Regtest, now),
+            "a block within the limit is kept"
+        );
     }
 
     /// One peer cannot take more than its share: past it, its own oldest
     /// block goes, and blocks from other peers stay.
     #[test]
     fn one_peer_keeps_at_most_its_share_and_loses_its_oldest_first() {
-        let mut buf = small(Limits { per_peer: 2, ..ROOMY });
+        let mut buf = small(Limits {
+            per_peer: 2,
+            ..ROOMY
+        });
         let now = Instant::now();
         let other = block_on(prev(9), 9, 0, true);
         assert!(buf.insert(8, other.clone(), Network::Regtest, now));
-        let mine: Vec<Block> = (1..=3).map(|i| block_on(prev(i), 10 + u32::from(i), 0, true)).collect();
+        let mine: Vec<Block> = (1..=3)
+            .map(|i| block_on(prev(i), 10 + u32::from(i), 0, true))
+            .collect();
         for b in &mine {
             assert!(buf.insert(7, b.clone(), Network::Regtest, now));
         }
         assert_eq!(buf.len(), 3, "two from peer 7, one from peer 8");
         assert!(!buf.contains(&mine[0].block_hash()), "peer 7's oldest went");
         assert!(buf.contains(&mine[1].block_hash()) && buf.contains(&mine[2].block_hash()));
-        assert!(buf.contains(&other.block_hash()), "the other peer's block stays");
+        assert!(
+            buf.contains(&other.block_hash()),
+            "the other peer's block stays"
+        );
     }
 
     #[test]
     fn the_byte_cap_drops_the_oldest_blocks_first() {
         let probe = block_on(prev(1), 20, 1_000, true).total_size();
-        let mut buf = small(Limits { bytes: 3 * probe, ..ROOMY });
+        let mut buf = small(Limits {
+            bytes: 3 * probe,
+            ..ROOMY
+        });
         let now = Instant::now();
-        let blocks: Vec<Block> = (1..=4).map(|i| block_on(prev(i), 20 + u32::from(i), 1_000, true)).collect();
+        let blocks: Vec<Block> = (1..=4)
+            .map(|i| block_on(prev(i), 20 + u32::from(i), 1_000, true))
+            .collect();
         for (peer, b) in blocks.iter().enumerate() {
             assert_eq!(b.total_size(), probe, "fixture: equal sizes");
             assert!(buf.insert(peer as PeerId, b.clone(), Network::Regtest, now));
@@ -322,7 +376,9 @@ mod tests {
     fn the_block_cap_drops_the_oldest_blocks_first() {
         let mut buf = small(Limits { blocks: 2, ..ROOMY });
         let now = Instant::now();
-        let blocks: Vec<Block> = (1..=3).map(|i| block_on(prev(i), 30 + u32::from(i), 0, true)).collect();
+        let blocks: Vec<Block> = (1..=3)
+            .map(|i| block_on(prev(i), 30 + u32::from(i), 0, true))
+            .collect();
         for (peer, b) in blocks.iter().enumerate() {
             assert!(buf.insert(peer as PeerId, b.clone(), Network::Regtest, now));
         }
@@ -332,12 +388,20 @@ mod tests {
 
     #[test]
     fn a_block_is_dropped_once_it_has_waited_the_expiry() {
-        let mut buf = small(Limits { expiry: Duration::from_secs(60), ..ROOMY });
+        let mut buf = small(Limits {
+            expiry: Duration::from_secs(60),
+            ..ROOMY
+        });
         let start = Instant::now();
         let old = block_on(prev(1), 40, 0, true);
         let young = block_on(prev(2), 41, 0, true);
         assert!(buf.insert(7, old.clone(), Network::Regtest, start));
-        assert!(buf.insert(8, young.clone(), Network::Regtest, start + Duration::from_secs(30)));
+        assert!(buf.insert(
+            8,
+            young.clone(),
+            Network::Regtest,
+            start + Duration::from_secs(30)
+        ));
 
         buf.expire(start + Duration::from_secs(59));
         assert_eq!(buf.len(), 2, "nothing has waited a minute yet");
@@ -357,10 +421,23 @@ mod tests {
         let b = block_on(prev(1), 51, 0, true);
         assert!(buf.insert(7, a.clone(), Network::Regtest, now));
         assert!(buf.insert(8, b.clone(), Network::Regtest, now));
-        assert!(buf.insert(9, a.clone(), Network::Regtest, now), "already waiting");
-        assert_eq!((buf.len(), buf.bytes()), (2, a.total_size() + b.total_size()));
-        assert_eq!(buf.take_child_of(&prev(1)).map(|x| x.block_hash()), Some(a.block_hash()), "oldest first");
-        assert_eq!(buf.take_child_of(&prev(1)).map(|x| x.block_hash()), Some(b.block_hash()));
+        assert!(
+            buf.insert(9, a.clone(), Network::Regtest, now),
+            "already waiting"
+        );
+        assert_eq!(
+            (buf.len(), buf.bytes()),
+            (2, a.total_size() + b.total_size())
+        );
+        assert_eq!(
+            buf.take_child_of(&prev(1)).map(|x| x.block_hash()),
+            Some(a.block_hash()),
+            "oldest first"
+        );
+        assert_eq!(
+            buf.take_child_of(&prev(1)).map(|x| x.block_hash()),
+            Some(b.block_hash())
+        );
         assert!(buf.is_empty());
     }
 

@@ -472,7 +472,10 @@ fn push_synthetic(synthetic: &mut Vec<SynthChunk>, injection: &[(u64, u64)]) {
 
 /// The histogram band lower bounds, sat/kvB: the bands arrivals are counted in.
 pub fn histogram_bands_sat_per_kvb() -> Vec<u64> {
-    HISTOGRAM_BOUNDARIES_SAT_PER_VB.iter().map(|v| v * 1000).collect()
+    HISTOGRAM_BOUNDARIES_SAT_PER_VB
+        .iter()
+        .map(|v| v * 1000)
+        .collect()
 }
 
 /// Fraction of admitted block weight (cheapest-first) trimmed before reading
@@ -523,8 +526,10 @@ pub fn build_histogram(entries: &HashMap<Txid, MempoolEntry>) -> Vec<HistogramBu
         .collect();
     let mut weights: Vec<u64> = vec![0; bounds_kvb.len()];
     for entry in entries.values() {
-        let rate =
-            crate::mempool::policy::fee_rate_sat_per_kvb(effective_fee(entry), entry.adjusted_weight());
+        let rate = crate::mempool::policy::fee_rate_sat_per_kvb(
+            effective_fee(entry),
+            entry.adjusted_weight(),
+        );
         // Drop into the highest bucket whose boundary is ≤ rate.
         let mut idx: Option<usize> = None;
         for (i, b) in bounds_kvb.iter().enumerate() {
@@ -784,7 +789,13 @@ pub fn near_rate(
     if mempool_policy_refusal(mempool).is_some() {
         return None;
     }
-    Some(template_percentile(&fee_estimator.cached_mempool_estimate(mempool), conservative).unwrap_or(0))
+    Some(
+        template_percentile(
+            &fee_estimator.cached_mempool_estimate(mempool),
+            conservative,
+        )
+        .unwrap_or(0),
+    )
 }
 
 /// The deepest target the mempool side answers: Core 32.1's
@@ -1020,7 +1031,9 @@ pub fn near_candidates(
     }
     let floor = mempool.fee_estimate_floor();
     let plain = fee_estimator.cached_mempool_estimate(mempool);
-    let percentile = template_percentile(&plain, conservative).unwrap_or(0).max(floor);
+    let percentile = template_percentile(&plain, conservative)
+        .unwrap_or(0)
+        .max(floor);
     let injection = arrival_injection(&mempool.arrival_rates());
     let simulated = if injection.is_empty() {
         plain
@@ -1126,7 +1139,10 @@ pub fn estimate_smart_fee(
         }
         (_, EstimateMode::Mempool) => {
             let est = fee_estimator.cached_mempool_estimate(mempool);
-            (target_estimate(&est, target, 0).0, EstimateSource::MempoolPolicy)
+            (
+                target_estimate(&est, target, 0).0,
+                EstimateSource::MempoolPolicy,
+            )
         }
         (_, EstimateMode::Blend) => default_rate(
             near_rate(mempool, fee_estimator, conservative),
@@ -1175,7 +1191,15 @@ pub fn smart_fees(
     let max_target = targets.iter().copied().max().unwrap_or(24).max(1);
     let sim_depth = (max_target as usize).min(MAX_SIM_DEPTH);
     let mempool_est = estimate_from_mempool(snapshot, sim_depth);
-    smart_fees_from_estimate(&mempool_est, fee_estimator, near, targets, mode, conservative, floor_sat_per_kvb)
+    smart_fees_from_estimate(
+        &mempool_est,
+        fee_estimator,
+        near,
+        targets,
+        mode,
+        conservative,
+        floor_sat_per_kvb,
+    )
 }
 
 /// `smart_fees` against a *prebuilt* mempool simulation, so callers on hot
@@ -1200,8 +1224,15 @@ pub fn smart_fees_from_estimate(
     let mut fallback = false;
     let mut rows: Vec<(u32, u64, Confidence)> = Vec::with_capacity(targets.len());
     for &t in targets {
-        let (rate, conf, fb) =
-            resolve_target(mempool_est, fee_estimator, near, t, mode, conservative, floor_sat_per_kvb);
+        let (rate, conf, fb) = resolve_target(
+            mempool_est,
+            fee_estimator,
+            near,
+            t,
+            mode,
+            conservative,
+            floor_sat_per_kvb,
+        );
         fallback |= fb;
         rows.push((t, rate, conf));
     }
@@ -1540,7 +1571,11 @@ mod tests {
         let est = estimate_from_mempool(snap, 1);
         assert_eq!(est.sim_blocks[0].tx_count, 48);
         assert_eq!(est.sim_blocks[0].weight, 18 * 536 + 30 * 100_000);
-        assert_eq!(est.mempool_weight, 18 * 536 + 30 * 100_000, "the weight queued, not the adjusted");
+        assert_eq!(
+            est.mempool_weight,
+            18 * 536 + 30 * 100_000,
+            "the weight queued, not the adjusted"
+        );
     }
 
     #[test]
@@ -1714,7 +1749,15 @@ mod tests {
         // (and economy) collapses to the floor, monotone, with `fallback`.
         let est = FeeEstimator::new();
         let floor = 1_000;
-        let sf = smart_fees(Vec::new(), &est, None, &[1, 3, 6, 12, 24], EstimateMode::Blend, false, floor);
+        let sf = smart_fees(
+            Vec::new(),
+            &est,
+            None,
+            &[1, 3, 6, 12, 24],
+            EstimateMode::Blend,
+            false,
+            floor,
+        );
         assert_eq!(sf.targets.len(), 5);
         assert!(sf.thin_block);
         assert!(sf.fallback);
@@ -1733,10 +1776,21 @@ mod tests {
         let rates: Vec<u64> = (1..=100).collect();
         est.record_block(&rates);
         let floor = 1; // keep the floor out of the way of the percentile values
-        let sf = smart_fees(Vec::new(), &est, None, &[1, 3, 6, 12, 24], EstimateMode::Historical, false, floor);
+        let sf = smart_fees(
+            Vec::new(),
+            &est,
+            None,
+            &[1, 3, 6, 12, 24],
+            EstimateMode::Historical,
+            false,
+            floor,
+        );
         let vals: Vec<u64> = sf.targets.iter().map(|t| t.feerate_sat_per_kvb).collect();
         for w in vals.windows(2) {
-            assert!(w[0] >= w[1], "historical ladder must be non-increasing: {vals:?}");
+            assert!(
+                w[0] >= w[1],
+                "historical ladder must be non-increasing: {vals:?}"
+            );
         }
         let lowest = *vals.iter().min().unwrap();
         assert!(sf.economy_feerate_sat_per_kvb.unwrap() <= lowest);
@@ -1753,10 +1807,21 @@ mod tests {
         // Empty mempool → every target is thin/Low → blend falls to historical
         // (5_000) for all. That is flat (monotone) and a useful regression that
         // sources agree; assert non-increasing + economy cap.
-        let sf = smart_fees(Vec::new(), &est, None, &[1, 3, 6], EstimateMode::Blend, false, floor);
+        let sf = smart_fees(
+            Vec::new(),
+            &est,
+            None,
+            &[1, 3, 6],
+            EstimateMode::Blend,
+            false,
+            floor,
+        );
         let vals: Vec<u64> = sf.targets.iter().map(|t| t.feerate_sat_per_kvb).collect();
         for w in vals.windows(2) {
-            assert!(w[0] >= w[1], "blend ladder must be non-increasing: {vals:?}");
+            assert!(
+                w[0] >= w[1],
+                "blend ladder must be non-increasing: {vals:?}"
+            );
         }
         assert!(sf.economy_feerate_sat_per_kvb.unwrap() <= *vals.iter().min().unwrap());
     }
@@ -1830,12 +1895,18 @@ mod tests {
         let cid = cheap.compute_txid();
         let cfee = crate::mempool::policy::weight_to_vsize(400); // tiny, 1 sat/vB
         let est = estimate_from_mempool(
-            vec![(bid, mk_entry(big, bfee, weight)), (cid, mk_entry(cheap, cfee, 400))],
+            vec![
+                (bid, mk_entry(big, bfee, weight)),
+                (cid, mk_entry(cheap, cfee, 400)),
+            ],
             1,
         );
         let b0 = &est.sim_blocks[0];
         assert!(!b0.filled, "block 0 should be partial (whole mempool fits)");
-        assert_eq!(b0.min_feerate_sat_per_kvb, 1_000, "partial block keeps cheapest");
+        assert_eq!(
+            b0.min_feerate_sat_per_kvb, 1_000,
+            "partial block keeps cheapest"
+        );
     }
 
     #[test]
@@ -1843,7 +1914,15 @@ mod tests {
         // A very deep target must not blow up the sim; depth is capped and
         // deeper targets resolve through the (monotone) fallback path.
         let est = FeeEstimator::new();
-        let sf = smart_fees(Vec::new(), &est, None, &[1, 1008], EstimateMode::Blend, false, 1_000);
+        let sf = smart_fees(
+            Vec::new(),
+            &est,
+            None,
+            &[1, 1008],
+            EstimateMode::Blend,
+            false,
+            1_000,
+        );
         assert_eq!(sf.targets.len(), 2);
         assert!(sf.targets[0].feerate_sat_per_kvb >= sf.targets[1].feerate_sat_per_kvb);
     }
@@ -1871,8 +1950,14 @@ mod tests {
             assert_eq!(FeeRateEstimator::parse(v), FeeRateEstimator::Auto, "{v:?}");
         }
         // Case-insensitive, as Core's `FeeRateEstimatorTypeFromString`.
-        assert_eq!(FeeRateEstimator::parse(Some("Block_Policy")), FeeRateEstimator::BlockPolicy);
-        assert_eq!(FeeRateEstimator::parse(Some("MEMPOOL_POLICY")), FeeRateEstimator::MempoolPolicy);
+        assert_eq!(
+            FeeRateEstimator::parse(Some("Block_Policy")),
+            FeeRateEstimator::BlockPolicy
+        );
+        assert_eq!(
+            FeeRateEstimator::parse(Some("MEMPOOL_POLICY")),
+            FeeRateEstimator::MempoolPolicy
+        );
     }
 
     #[test]
@@ -1886,14 +1971,28 @@ mod tests {
     fn estimate_smart_fee_serves_target_one_as_two() {
         let pool = empty_pool();
         let est = spread_history();
-        let one = estimate_smart_fee(&pool, &est, 1, EstimateMode::Historical, FeeRateEstimator::Auto, false)
-            .expect("history answers");
+        let one = estimate_smart_fee(
+            &pool,
+            &est,
+            1,
+            EstimateMode::Historical,
+            FeeRateEstimator::Auto,
+            false,
+        )
+        .expect("history answers");
         assert_eq!(one.blocks, 2);
         assert_eq!(Some(one.feerate_sat_per_kvb), est.estimate_fee(2));
         assert_eq!(one.estimator, EstimateSource::BlockPolicy);
         // Every other target is answered where it was asked.
-        let six = estimate_smart_fee(&pool, &est, 6, EstimateMode::Historical, FeeRateEstimator::Auto, false)
-            .unwrap();
+        let six = estimate_smart_fee(
+            &pool,
+            &est,
+            6,
+            EstimateMode::Historical,
+            FeeRateEstimator::Auto,
+            false,
+        )
+        .unwrap();
         assert_eq!(six.blocks, 6);
         assert_eq!(Some(six.feerate_sat_per_kvb), est.estimate_fee(6));
     }
@@ -1907,13 +2006,24 @@ mod tests {
                 .expect_err("no history, no answer");
             assert_eq!(
                 err,
-                SmartFeeError { blocks: 0, reason: SmartFeeReason::Static(INSUFFICIENT_DATA) }
+                SmartFeeError {
+                    blocks: 0,
+                    reason: SmartFeeReason::Static(INSUFFICIENT_DATA)
+                }
             );
         }
     }
 
-    fn health_stats(height: u64, block_weight: u64, removed: u64) -> crate::mempool::health::MinedBlockStats {
-        crate::mempool::health::MinedBlockStats { height, block_weight, mempool_txs_weight: removed }
+    fn health_stats(
+        height: u64,
+        block_weight: u64,
+        removed: u64,
+    ) -> crate::mempool::health::MinedBlockStats {
+        crate::mempool::health::MinedBlockStats {
+            height,
+            block_weight,
+            mempool_txs_weight: removed,
+        }
     }
 
     fn block_hash(n: u64) -> bitcoin::BlockHash {
@@ -1930,7 +2040,11 @@ mod tests {
         }
     }
 
-    fn mempool_policy(pool: &crate::mempool::pool::Mempool, target: u32, conservative: bool) -> Result<SmartFeeAnswer, SmartFeeError> {
+    fn mempool_policy(
+        pool: &crate::mempool::pool::Mempool,
+        target: u32,
+        conservative: bool,
+    ) -> Result<SmartFeeAnswer, SmartFeeError> {
         estimate_smart_fee(
             pool,
             &FeeEstimator::new(),
@@ -1961,7 +2075,10 @@ mod tests {
         // Six full blocks of which this pool held none: unreliable.
         fill_health(&pool, 1_000_000, 0);
         let err = mempool_policy(&pool, 6, false).unwrap_err();
-        assert_eq!(err.reason.as_str(), "mempool_policy: Mempool is unreliable for fee rate estimation");
+        assert_eq!(
+            err.reason.as_str(),
+            "mempool_policy: Mempool is unreliable for fee rate estimation"
+        );
         assert!(near_candidates(&pool, &FeeEstimator::new(), 1, false).is_none());
     }
 
@@ -1987,8 +2104,15 @@ mod tests {
         pool.set_load_tried(true);
         let est = spread_history();
         assert!(mempool_policy(&pool, 2, false).is_err());
-        let a = estimate_smart_fee(&pool, &est, 2, EstimateMode::Historical, FeeRateEstimator::Auto, false)
-            .unwrap();
+        let a = estimate_smart_fee(
+            &pool,
+            &est,
+            2,
+            EstimateMode::Historical,
+            FeeRateEstimator::Auto,
+            false,
+        )
+        .unwrap();
         assert_eq!(a.estimator, EstimateSource::BlockPolicy);
         assert_eq!(Some(a.feerate_sat_per_kvb), est.estimate_fee(2));
     }
@@ -1997,7 +2121,10 @@ mod tests {
     /// `calculate_max_weight_percentiles`, in satd's units.
     #[test]
     fn template_percentiles_match_cores_calculation() {
-        assert_eq!(calculate_max_weight_percentiles(&[]), TemplatePercentiles::default());
+        assert_eq!(
+            calculate_max_weight_percentiles(&[]),
+            TemplatePercentiles::default()
+        );
         let chunks = 10u64;
         let weight = PERCENTILE_BLOCK_WEIGHT / chunks;
         let (super_high, high, medium, low) = (500_000, 100_000, 50_000, 10_000);
@@ -2017,7 +2144,13 @@ mod tests {
             }
         }
         let p = calculate_max_weight_percentiles(&packages);
-        assert_eq!(p, TemplatePercentiles { p50: Some(high), p75: Some(medium) });
+        assert_eq!(
+            p,
+            TemplatePercentiles {
+                p50: Some(high),
+                p75: Some(medium)
+            }
+        );
     }
 
     fn u32_txid(n: u32) -> Txid {
@@ -2030,13 +2163,29 @@ mod tests {
 
     /// Fill `pool` with independent 10,000 vB transactions at `sat_per_vb`
     /// until its weight passes `percent` of a block. Returns the next index.
-    fn fill_to(pool: &crate::mempool::pool::Mempool, next: &mut u32, sat_per_vb: u64, percent: u64) {
+    fn fill_to(
+        pool: &crate::mempool::pool::Mempool,
+        next: &mut u32,
+        sat_per_vb: u64,
+        percent: u64,
+    ) {
         const W: usize = 40_000;
         let target = PERCENTILE_BLOCK_WEIGHT * percent / 100;
-        while pool.get_template_entries().iter().map(|(_, e)| e.weight as u64).sum::<u64>() <= target {
+        while pool
+            .get_template_entries()
+            .iter()
+            .map(|(_, e)| e.weight as u64)
+            .sum::<u64>()
+            <= target
+        {
             let tx = mk_tx(&[(u32_txid(*next), 0)], 1);
             *next += 1;
-            pool.insert_tx_weighted_for_test(tx, sat_per_vb * 10_000, W, crate::mempool::pool::QuarantineScope::acting());
+            pool.insert_tx_weighted_for_test(
+                tx,
+                sat_per_vb * 10_000,
+                W,
+                crate::mempool::pool::QuarantineScope::acting(),
+            );
         }
     }
 
@@ -2055,10 +2204,18 @@ mod tests {
         let mut next = 0;
 
         fill_to(&pool, &mut next, high, 25);
-        assert_eq!((rate(true), rate(false)), (floor, floor), "under 50%: both floored");
+        assert_eq!(
+            (rate(true), rate(false)),
+            (floor, floor),
+            "under 50%: both floored"
+        );
 
         fill_to(&pool, &mut next, med, 50);
-        assert_eq!((rate(true), rate(false)), (med * 1000, floor), "50-75%: conservative only");
+        assert_eq!(
+            (rate(true), rate(false)),
+            (med * 1000, floor),
+            "50-75%: conservative only"
+        );
 
         fill_to(&pool, &mut next, low, 75);
         assert_eq!((rate(true), rate(false)), (med * 1000, low * 1000));
@@ -2102,7 +2259,10 @@ mod tests {
         let (before, _) = target_estimate(&plain, 1, floor);
         let (after, _) = target_estimate(&with, 1, floor);
         assert_eq!(before, 20_000);
-        assert!(after > before, "inflow must raise near(1): {before} -> {after}");
+        assert!(
+            after > before,
+            "inflow must raise near(1): {before} -> {after}"
+        );
     }
 
     #[test]
@@ -2114,7 +2274,10 @@ mod tests {
         assert!(injection.is_empty());
         let plain = estimate_from_mempool(snap.clone(), 3);
         let with = estimate_from_mempool_with_arrivals(snap, 3, &injection);
-        assert_eq!(format!("{:?}", plain.sim_blocks), format!("{:?}", with.sim_blocks));
+        assert_eq!(
+            format!("{:?}", plain.sim_blocks),
+            format!("{:?}", with.sim_blocks)
+        );
         assert_eq!(plain.template_percentiles, with.template_percentiles);
     }
 
@@ -2162,11 +2325,25 @@ mod tests {
         // only followed under `auto`.
         let pool = empty_pool();
         let est = spread_history();
-        let a = estimate_smart_fee(&pool, &est, 6, EstimateMode::Mempool, FeeRateEstimator::BlockPolicy, false)
-            .unwrap();
+        let a = estimate_smart_fee(
+            &pool,
+            &est,
+            6,
+            EstimateMode::Mempool,
+            FeeRateEstimator::BlockPolicy,
+            false,
+        )
+        .unwrap();
         assert_eq!(a.estimator, EstimateSource::BlockPolicy);
-        let b = estimate_smart_fee(&pool, &est, 6, EstimateMode::Mempool, FeeRateEstimator::Auto, false)
-            .unwrap();
+        let b = estimate_smart_fee(
+            &pool,
+            &est,
+            6,
+            EstimateMode::Mempool,
+            FeeRateEstimator::Auto,
+            false,
+        )
+        .unwrap();
         assert_eq!(b.estimator, EstimateSource::Floor);
         assert_eq!(b.blocks, 6);
     }
@@ -2176,8 +2353,15 @@ mod tests {
         let pool = empty_pool();
         let est = FeeEstimator::new();
         est.record_block(&[100; 50]); // 0.1 sat/vB, below this pool's 1 sat/vB relay floor
-        let a = estimate_smart_fee(&pool, &est, 6, EstimateMode::Historical, FeeRateEstimator::Auto, false)
-            .unwrap();
+        let a = estimate_smart_fee(
+            &pool,
+            &est,
+            6,
+            EstimateMode::Historical,
+            FeeRateEstimator::Auto,
+            false,
+        )
+        .unwrap();
         assert_eq!(a.feerate_sat_per_kvb, 1_000);
         assert_eq!(a.estimator, EstimateSource::Floor);
     }
@@ -2203,7 +2387,11 @@ mod tests {
             assert!(e.is_err(), "{mode:?} {fre:?}: {e:?}");
         }
         let snap = est.cached_mempool_estimate(&pool);
-        for mode in [EstimateMode::Historical, EstimateMode::Blend, EstimateMode::Mempool] {
+        for mode in [
+            EstimateMode::Historical,
+            EstimateMode::Blend,
+            EstimateMode::Mempool,
+        ] {
             let (r, c, _) = resolve_target(&snap, &est, Some(0), 6, mode, false, 0);
             assert_eq!((r, c), (0, Confidence::Low), "{mode:?}");
             let sf = smart_fees_from_estimate(&snap, &est, Some(0), &[1, 6, 24], mode, false, 0);
@@ -2214,14 +2402,37 @@ mod tests {
         for _ in 0..6 {
             est.record_block(&[120; 50]);
         }
-        let a = estimate_smart_fee(&pool, &est, 6, EstimateMode::Historical, FeeRateEstimator::Auto, false)
-            .unwrap();
+        let a = estimate_smart_fee(
+            &pool,
+            &est,
+            6,
+            EstimateMode::Historical,
+            FeeRateEstimator::Auto,
+            false,
+        )
+        .unwrap();
         assert_eq!(a.feerate_sat_per_kvb, 120);
         // Economy is capped at twice the floor, so a zero floor has none; at
         // the default relay floor it is the history rate.
-        let sf = smart_fees(Vec::new(), &est, None, &[1, 6, 24], EstimateMode::Historical, false, 0);
+        let sf = smart_fees(
+            Vec::new(),
+            &est,
+            None,
+            &[1, 6, 24],
+            EstimateMode::Historical,
+            false,
+            0,
+        );
         assert_eq!(sf.economy_feerate_sat_per_kvb, None);
-        let sf = smart_fees(Vec::new(), &est, None, &[1, 6, 24], EstimateMode::Historical, false, 100);
+        let sf = smart_fees(
+            Vec::new(),
+            &est,
+            None,
+            &[1, 6, 24],
+            EstimateMode::Historical,
+            false,
+            100,
+        );
         assert_eq!(sf.economy_feerate_sat_per_kvb, Some(120));
     }
 
@@ -2229,13 +2440,17 @@ mod tests {
     /// blocks answers itself: no 1 sat/vB floor sits on top, as in Core.
     #[test]
     fn a_sub_one_sat_per_vb_history_is_quoted_at_the_default_relay_floor() {
-        let pool = crate::mempool::pool::Mempool::new(300_000_000, crate::mempool::policy::DEFAULT_MIN_RELAY_FEE_RATE);
+        let pool = crate::mempool::pool::Mempool::new(
+            300_000_000,
+            crate::mempool::policy::DEFAULT_MIN_RELAY_FEE_RATE,
+        );
         let est = FeeEstimator::new();
         for _ in 0..6 {
             est.record_block(&[120; 50]); // 0.12 sat/vB
         }
         for mode in [EstimateMode::Historical, EstimateMode::Blend] {
-            let a = estimate_smart_fee(&pool, &est, 6, mode, FeeRateEstimator::Auto, false).unwrap();
+            let a =
+                estimate_smart_fee(&pool, &est, 6, mode, FeeRateEstimator::Auto, false).unwrap();
             assert_eq!(a.feerate_sat_per_kvb, 120, "{mode:?}");
             assert_eq!(a.estimator, EstimateSource::BlockPolicy, "{mode:?}");
         }
@@ -2255,9 +2470,21 @@ mod tests {
         pool
     }
 
-    fn auto(pool: &crate::mempool::pool::Mempool, est: &FeeEstimator, target: u32, conservative: bool) -> SmartFeeAnswer {
-        estimate_smart_fee(pool, est, target, EstimateMode::Blend, FeeRateEstimator::Auto, conservative)
-            .expect("the default answers")
+    fn auto(
+        pool: &crate::mempool::pool::Mempool,
+        est: &FeeEstimator,
+        target: u32,
+        conservative: bool,
+    ) -> SmartFeeAnswer {
+        estimate_smart_fee(
+            pool,
+            est,
+            target,
+            EstimateMode::Blend,
+            FeeRateEstimator::Auto,
+            conservative,
+        )
+        .expect("the default answers")
     }
 
     const LADDER: [u32; 9] = [1, 2, 3, 6, 12, 24, 144, 504, 1008];
@@ -2271,15 +2498,27 @@ mod tests {
         let pool = healthy_pool_at(10);
         let est = spread_history();
         let econ2 = auto(&pool, &est, 2, false);
-        assert_eq!((econ2.feerate_sat_per_kvb, econ2.estimator), (10_000, EstimateSource::MempoolPolicy));
+        assert_eq!(
+            (econ2.feerate_sat_per_kvb, econ2.estimator),
+            (10_000, EstimateSource::MempoolPolicy)
+        );
         let econ6 = auto(&pool, &est, 6, false);
         assert_eq!(est.estimate_fee(6), Some(51_000));
-        assert_eq!((econ6.feerate_sat_per_kvb, econ6.estimator), (10_000, EstimateSource::MempoolPolicy));
+        assert_eq!(
+            (econ6.feerate_sat_per_kvb, econ6.estimator),
+            (10_000, EstimateSource::MempoolPolicy)
+        );
         assert_eq!(econ6.blocks, 6, "blocks is the target asked, as in F1");
         let cons2 = auto(&pool, &est, 2, true);
-        assert_eq!((cons2.feerate_sat_per_kvb, cons2.estimator), (76_000, EstimateSource::BlockPolicy));
+        assert_eq!(
+            (cons2.feerate_sat_per_kvb, cons2.estimator),
+            (76_000, EstimateSource::BlockPolicy)
+        );
         let cons6 = auto(&pool, &est, 6, true);
-        assert_eq!((cons6.feerate_sat_per_kvb, cons6.estimator), (51_000, EstimateSource::BlockPolicy));
+        assert_eq!(
+            (cons6.feerate_sat_per_kvb, cons6.estimator),
+            (51_000, EstimateSource::BlockPolicy)
+        );
     }
 
     /// A healthy mempool dearer than history: 1-2 blocks answer the mempool
@@ -2292,11 +2531,21 @@ mod tests {
         est.record_block(&[2_000; 50]);
         for conservative in [false, true] {
             let near = auto(&pool, &est, 2, conservative);
-            assert_eq!((near.feerate_sat_per_kvb, near.estimator), (100_000, EstimateSource::MempoolPolicy));
+            assert_eq!(
+                (near.feerate_sat_per_kvb, near.estimator),
+                (100_000, EstimateSource::MempoolPolicy)
+            );
             let one = auto(&pool, &est, 1, conservative);
-            assert_eq!((one.feerate_sat_per_kvb, one.blocks), (100_000, 2), "target 1 served as 2");
+            assert_eq!(
+                (one.feerate_sat_per_kvb, one.blocks),
+                (100_000, 2),
+                "target 1 served as 2"
+            );
             let deep = auto(&pool, &est, 6, conservative);
-            assert_eq!((deep.feerate_sat_per_kvb, deep.estimator), (2_000, EstimateSource::BlockPolicy));
+            assert_eq!(
+                (deep.feerate_sat_per_kvb, deep.estimator),
+                (2_000, EstimateSource::BlockPolicy)
+            );
         }
     }
 
@@ -2306,9 +2555,15 @@ mod tests {
     fn the_default_without_history_floors_deep_targets() {
         let pool = healthy_pool_at(10);
         let est = FeeEstimator::new();
-        assert_eq!(auto(&pool, &est, 2, false).estimator, EstimateSource::MempoolPolicy);
+        assert_eq!(
+            auto(&pool, &est, 2, false).estimator,
+            EstimateSource::MempoolPolicy
+        );
         let deep = auto(&pool, &est, 24, false);
-        assert_eq!((deep.feerate_sat_per_kvb, deep.estimator), (pool.fee_estimate_floor(), EstimateSource::Floor));
+        assert_eq!(
+            (deep.feerate_sat_per_kvb, deep.estimator),
+            (pool.fee_estimate_floor(), EstimateSource::Floor)
+        );
     }
 
     /// Conservative is never below economical, and both are non-increasing
@@ -2329,7 +2584,10 @@ mod tests {
                     let e = auto(&pool, &est, t, false).feerate_sat_per_kvb;
                     let c = auto(&pool, &est, t, true).feerate_sat_per_kvb;
                     assert!(c >= e, "target {t}: conservative {c} < economical {e}");
-                    assert!(e <= prev.0 && c <= prev.1, "target {t}: ladder rose ({e}, {c}) after {prev:?}");
+                    assert!(
+                        e <= prev.0 && c <= prev.1,
+                        "target {t}: ladder rose ({e}, {c}) after {prev:?}"
+                    );
                     prev = (e, c);
                 }
             }
@@ -2350,7 +2608,10 @@ mod tests {
         est.record_block(&[2_000; 50]);
         assert!(near_rate(&pool, &est, false).is_none());
         let a = auto(&pool, &est, 2, false);
-        assert_eq!((a.feerate_sat_per_kvb, a.estimator), (2_000, EstimateSource::BlockPolicy));
+        assert_eq!(
+            (a.feerate_sat_per_kvb, a.estimator),
+            (2_000, EstimateSource::BlockPolicy)
+        );
     }
 
     /// A healthy mempool too thin to reach 75% of a block (here 60%, at 10
@@ -2370,24 +2631,49 @@ mod tests {
         let floor = pool.fee_estimate_floor();
         for t in LADDER {
             let a = auto(&pool, &est, t, false);
-            assert_eq!((a.feerate_sat_per_kvb, a.estimator), (floor, EstimateSource::Floor), "target {t}");
+            assert_eq!(
+                (a.feerate_sat_per_kvb, a.estimator),
+                (floor, EstimateSource::Floor),
+                "target {t}"
+            );
         }
         let c = auto(&pool, &est, 2, true);
-        assert_eq!((c.feerate_sat_per_kvb, c.estimator), (10_000, EstimateSource::MempoolPolicy));
+        assert_eq!(
+            (c.feerate_sat_per_kvb, c.estimator),
+            (10_000, EstimateSource::MempoolPolicy)
+        );
     }
 
     /// satd's `historical` mode is the history answer alone, healthy
     /// mempool or not; Core's modes are the default.
     #[test]
     fn historical_mode_is_history_alone_and_core_modes_are_the_default() {
-        assert_eq!(EstimateMode::parse(Some("historical")), Some(EstimateMode::Historical));
+        assert_eq!(
+            EstimateMode::parse(Some("historical")),
+            Some(EstimateMode::Historical)
+        );
         for m in ["unset", "economical", "conservative", "blend", "ECONOMICAL"] {
-            assert_eq!(EstimateMode::parse(Some(m)), Some(EstimateMode::Blend), "{m}");
+            assert_eq!(
+                EstimateMode::parse(Some(m)),
+                Some(EstimateMode::Blend),
+                "{m}"
+            );
         }
         let pool = healthy_pool_at(10);
         let est = spread_history();
-        let h = estimate_smart_fee(&pool, &est, 6, EstimateMode::Historical, FeeRateEstimator::Auto, false).unwrap();
-        assert_eq!((h.feerate_sat_per_kvb, h.estimator), (51_000, EstimateSource::BlockPolicy));
+        let h = estimate_smart_fee(
+            &pool,
+            &est,
+            6,
+            EstimateMode::Historical,
+            FeeRateEstimator::Auto,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            (h.feerate_sat_per_kvb, h.estimator),
+            (51_000, EstimateSource::BlockPolicy)
+        );
         assert_eq!(auto(&pool, &est, 6, false).feerate_sat_per_kvb, 10_000);
     }
 

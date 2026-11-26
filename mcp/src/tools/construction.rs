@@ -88,18 +88,12 @@ pub fn psbt_workflow(ctx: &McpContext, action: &str, params: &Value) -> String {
             .map_err(|(code, msg)| format!("Error {}: {}", code, msg))
         }
         "decode" => {
-            let psbt_b64 = params
-                .get("psbt")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+            let psbt_b64 = params.get("psbt").and_then(|v| v.as_str()).unwrap_or("");
             psbt::decode_psbt(psbt_b64, Some(&ctx.chain_state))
                 .map_err(|(code, msg)| format!("Error {}: {}", code, msg))
         }
         "analyze" => {
-            let psbt_b64 = params
-                .get("psbt")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+            let psbt_b64 = params.get("psbt").and_then(|v| v.as_str()).unwrap_or("");
             psbt::analyze_psbt(psbt_b64, Some(&ctx.chain_state))
                 .map_err(|(code, msg)| format!("Error {}: {}", code, msg))
         }
@@ -107,16 +101,16 @@ pub fn psbt_workflow(ctx: &McpContext, action: &str, params: &Value) -> String {
             let psbts: Vec<String> = params
                 .get("psbts")
                 .and_then(|v| v.as_array())
-                .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
                 .unwrap_or_default();
-            psbt::combine_psbt(&psbts)
-                .map_err(|(code, msg)| format!("Error {}: {}", code, msg))
+            psbt::combine_psbt(&psbts).map_err(|(code, msg)| format!("Error {}: {}", code, msg))
         }
         "finalize" => {
-            let psbt_b64 = params
-                .get("psbt")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+            let psbt_b64 = params.get("psbt").and_then(|v| v.as_str()).unwrap_or("");
             let extract = params
                 .get("extract")
                 .and_then(|v| v.as_bool())
@@ -125,18 +119,12 @@ pub fn psbt_workflow(ctx: &McpContext, action: &str, params: &Value) -> String {
                 .map_err(|(code, msg)| format!("Error {}: {}", code, msg))
         }
         "update" => {
-            let psbt_b64 = params
-                .get("psbt")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+            let psbt_b64 = params.get("psbt").and_then(|v| v.as_str()).unwrap_or("");
             psbt::utxo_update_psbt(&ctx.chain_state, psbt_b64)
                 .map_err(|(code, msg)| format!("Error {}: {}", code, msg))
         }
         "convert" => {
-            let hex_tx = params
-                .get("hex_tx")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+            let hex_tx = params.get("hex_tx").and_then(|v| v.as_str()).unwrap_or("");
             // Core's `permitsigdata` default: refuse rather than silently
             // discard a transaction's signatures during the conversion.
             let permit_sigdata = params
@@ -150,10 +138,13 @@ pub fn psbt_workflow(ctx: &McpContext, action: &str, params: &Value) -> String {
             let psbts: Vec<String> = params
                 .get("psbts")
                 .and_then(|v| v.as_array())
-                .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
                 .unwrap_or_default();
-            psbt::join_psbts(&psbts)
-                .map_err(|(code, msg)| format!("Error {}: {}", code, msg))
+            psbt::join_psbts(&psbts).map_err(|(code, msg)| format!("Error {}: {}", code, msg))
         }
         _ => Err(format!(
             "Unknown PSBT action: {}. Use: create, decode, analyze, combine, finalize, update, convert, join",

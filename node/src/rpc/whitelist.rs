@@ -134,7 +134,10 @@ mod tests {
     #[test]
     fn a_trailing_comma_allows_the_listed_method() {
         // user1 `getbestblockhash,getblockcount,` and strangedude3 `:getblockcount,`
-        let w = wl(&["user1:getbestblockhash,getblockcount,", "s3:getblockcount,"], None);
+        let w = wl(
+            &["user1:getbestblockhash,getblockcount,", "s3:getblockcount,"],
+            None,
+        );
         assert!(allowed(&w, "user1", "getbestblockhash"));
         assert!(allowed(&w, "user1", "getblockcount"));
         assert!(!allowed(&w, "user1", "getnetworkinfo"));
@@ -146,16 +149,25 @@ mod tests {
     fn a_bare_user_or_an_empty_list_allows_nothing() {
         // strangedude `strangedude:` and strangedude2 `strangedude2`
         let w = wl(&["s1:", "s2"], Some(false));
-        assert_eq!(w.scope_for("s1"), Some(MethodScope::Only(Arc::new(BTreeSet::from([String::new()])))));
+        assert_eq!(
+            w.scope_for("s1"),
+            Some(MethodScope::Only(Arc::new(BTreeSet::from([String::new()]))))
+        );
         assert!(!allowed(&w, "s1", "getnetworkinfo"));
         assert!(!allowed(&w, "s2", "getnetworkinfo"));
-        assert_eq!(w.scope_for("s2"), Some(MethodScope::Only(Arc::new(BTreeSet::new()))));
+        assert_eq!(
+            w.scope_for("s2"),
+            Some(MethodScope::Only(Arc::new(BTreeSet::new())))
+        );
     }
 
     #[test]
     fn the_same_user_twice_keeps_the_intersection() {
         // strangedude4 `:getblockcount, getbestblockhash` then `:getblockcount`
-        let w = wl(&["s4:getblockcount, getbestblockhash", "s4:getblockcount"], None);
+        let w = wl(
+            &["s4:getblockcount, getbestblockhash", "s4:getblockcount"],
+            None,
+        );
         assert!(allowed(&w, "s4", "getblockcount"));
         assert!(!allowed(&w, "s4", "getbestblockhash"));
     }
@@ -191,17 +203,31 @@ mod tests {
     #[test]
     fn the_username_is_not_trimmed() {
         let w = wl(&[" u:getblockcount"], Some(false));
-        assert!(allowed(&w, "u", "getnetworkinfo"), "`u` has no entry; ` u` does");
+        assert!(
+            allowed(&w, "u", "getnetworkinfo"),
+            "`u` has no entry; ` u` does"
+        );
         assert!(!allowed(&w, " u", "getnetworkinfo"));
     }
 
     #[test]
     fn the_default_flips_on_when_any_whitelist_is_set() {
         // strangedude6 has no entry.
-        assert!(!allowed(&wl(&["u:getblockcount"], None), "s6", "getbestblockhash"));
-        assert!(allowed(&wl(&["u:getblockcount"], Some(false)), "s6", "getbestblockhash"));
+        assert!(!allowed(
+            &wl(&["u:getblockcount"], None),
+            "s6",
+            "getbestblockhash"
+        ));
+        assert!(allowed(
+            &wl(&["u:getblockcount"], Some(false)),
+            "s6",
+            "getbestblockhash"
+        ));
         assert!(allowed(&wl(&[], None), "s6", "getbestblockhash"));
-        assert_eq!(wl(&[], Some(true)).scope_for("s6"), Some(MethodScope::DenyAll));
+        assert_eq!(
+            wl(&[], Some(true)).scope_for("s6"),
+            Some(MethodScope::DenyAll)
+        );
     }
 
     #[test]

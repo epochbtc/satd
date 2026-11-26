@@ -8,7 +8,7 @@
 //!
 //! Run: `cargo bench --bench real_block`
 
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, criterion_group, criterion_main};
 
 mod common;
 use common::{load_real_block, make_criterion, run_suite};

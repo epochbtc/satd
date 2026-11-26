@@ -39,7 +39,9 @@ fn store_with_a_coin_on_disk() -> (RocksDbStore, tempfile::TempDir, PathBuf) {
     let dir = tempfile::tempdir().unwrap();
     let store = RocksDbStore::open(dir.path(), false, 16, false, -1).unwrap();
     let mut batch = StoreBatch::default();
-    batch.coin_puts.push((spendable_outpoint(), spendable_coin()));
+    batch
+        .coin_puts
+        .push((spendable_outpoint(), spendable_coin()));
     store.write_batch(batch).unwrap();
 
     let cf = store.cf(CF_COINS);
@@ -65,7 +67,11 @@ fn store_with_a_coin_on_disk() -> (RocksDbStore, tempfile::TempDir, PathBuf) {
 /// written in place, as a failing disk would leave it.
 fn damage(sst: &std::path::Path) {
     use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
-    let mut file = std::fs::OpenOptions::new().read(true).write(true).open(sst).unwrap();
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(sst)
+        .unwrap();
     let mut head = [0u8; 16];
     file.read_exact(&mut head).unwrap();
     for b in &mut head {
@@ -95,7 +101,9 @@ fn assert_stops(what: &str, outcome: Result<String, String>) {
             message.contains("Error reading from database"),
             "{what}: stopped with an unexpected message: {message}"
         ),
-        Err(returned) => panic!("{what}: a coin that cannot be read must stop the node, but the read returned {returned}"),
+        Err(returned) => panic!(
+            "{what}: a coin that cannot be read must stop the node, but the read returned {returned}"
+        ),
     }
 }
 
@@ -117,7 +125,10 @@ fn a_coin_read_error_stops_the_node_and_is_never_read_as_missing() {
     let (store, _dir, sst) = store_with_a_coin_on_disk();
     damage(&sst);
     assert_stops("get_coin", stopped_with(|| store.get_coin(&op)));
-    assert_stops("get_coins_batch", stopped_with(|| store.get_coins_batch(&[op])));
+    assert_stops(
+        "get_coins_batch",
+        stopped_with(|| store.get_coins_batch(&[op])),
+    );
     assert_stops("has_coin", stopped_with(|| store.has_coin(&op)));
 }
 
@@ -130,16 +141,28 @@ fn a_coin_read_error_stops_the_node_and_is_never_read_as_missing() {
 #[test]
 fn an_undecodable_coin_row_stops_the_node_and_is_never_read_as_missing() {
     let (store, _dir, _) = store_with_a_coin_on_disk();
-    let op = OutPoint { vout: 1, ..spendable_outpoint() };
+    let op = OutPoint {
+        vout: 1,
+        ..spendable_outpoint()
+    };
     let cf = store.cf(CF_COINS);
     store.db.put_cf(&cf, outpoint_to_key(&op), b"").unwrap();
     drop(cf);
-    assert!(Coin::deserialize_compact(b"").is_none(), "fixture: the row does not decode");
+    assert!(
+        Coin::deserialize_compact(b"").is_none(),
+        "fixture: the row does not decode"
+    );
 
     assert_stops("get_coin", stopped_with(|| store.get_coin(&op)));
-    assert_stops("get_coins_batch", stopped_with(|| store.get_coins_batch(&[spendable_outpoint(), op])));
+    assert_stops(
+        "get_coins_batch",
+        stopped_with(|| store.get_coins_batch(&[spendable_outpoint(), op])),
+    );
     // The coin beside it still reads.
-    assert_eq!(store.get_coin(&spendable_outpoint()), Some(spendable_coin()));
+    assert_eq!(
+        store.get_coin(&spendable_outpoint()),
+        Some(spendable_coin())
+    );
 }
 
 /// A block that spends a coin the database cannot read is not refused and
@@ -161,7 +184,8 @@ fn a_block_spending_a_coin_that_cannot_be_read_is_not_marked_invalid() {
 
     let (intact, _intact_db, _) = store_with_a_coin_on_disk();
     let (cs, dir) = make_chain_state_with_store(Box::new(CoinCache::new(Box::new(intact), 16)));
-    cs.accept_block(&block).expect("over an undamaged database the block connects");
+    cs.accept_block(&block)
+        .expect("over an undamaged database the block connects");
     assert_eq!(cs.tip_hash(), hash);
     drop(cs);
     let _ = std::fs::remove_dir_all(&dir);

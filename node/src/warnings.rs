@@ -324,7 +324,13 @@ impl NodeWarnings {
                     continue;
                 }
                 if let Some((worst, others, secs)) = state.close_window(now, window_age) {
-                    outgoing.push(format_event(worst.severity, id, &worst.message, others, secs));
+                    outgoing.push(format_event(
+                        worst.severity,
+                        id,
+                        &worst.message,
+                        others,
+                        secs,
+                    ));
                 }
             }
         }
@@ -388,7 +394,9 @@ impl NodeWarnings {
                     });
                 // Read the sink before the active lock goes: see
                 // `set_alert_notifier`.
-                let sink = overflow_is_new.then(|| self.alert_tx.lock().clone()).flatten();
+                let sink = overflow_is_new
+                    .then(|| self.alert_tx.lock().clone())
+                    .flatten();
                 drop(active);
                 if let Some(tx) = sink {
                     let _ = tx.send(format!(
@@ -421,7 +429,11 @@ impl NodeWarnings {
             // Read the sink while the active lock is held, so this and
             // `set_alert_notifier`'s catch-up cannot both send this id (or
             // both miss it).
-            sink = if is_new { self.alert_tx.lock().clone() } else { None };
+            sink = if is_new {
+                self.alert_tx.lock().clone()
+            } else {
+                None
+            };
         }
         // Fire the `-alertnotify` hook once per new warning id (Core fires on
         // each `DoWarning`; deduping by id avoids flooding the hook with
@@ -463,7 +475,6 @@ impl NodeWarnings {
     pub fn has_errors(&self) -> bool {
         self.active
             .lock()
-            
             .values()
             .any(|w| w.severity == Severity::Error)
     }
@@ -473,7 +484,15 @@ impl NodeWarnings {
     pub fn as_strings(&self) -> Vec<String> {
         self.list()
             .into_iter()
-            .map(|w| format!("[{}] {}: {} (×{})", w.severity.as_str(), w.id, w.message, w.count))
+            .map(|w| {
+                format!(
+                    "[{}] {}: {} (×{})",
+                    w.severity.as_str(),
+                    w.id,
+                    w.message,
+                    w.count
+                )
+            })
             .collect()
     }
 
@@ -502,7 +521,11 @@ impl EventRate {
     /// more useful thing to hand an operator.
     fn withhold(&mut self, severity: Severity, message: &str, magnitude: u64) {
         self.withheld += 1;
-        if self.worst_withheld.as_ref().is_none_or(|w| magnitude >= w.magnitude) {
+        if self
+            .worst_withheld
+            .as_ref()
+            .is_none_or(|w| magnitude >= w.magnitude)
+        {
             self.worst_withheld = Some(Withheld {
                 severity,
                 message: message.to_string(),
@@ -568,7 +591,10 @@ fn format_event(
         // drained by the flush timer or by an occurrence minutes later did not
         // happen "in the previous 60s", and a page that misdates itself is
         // worse than one that says nothing about timing.
-        let _ = write!(msg, " [{withheld_others} more in the previous {window_secs}s]");
+        let _ = write!(
+            msg,
+            " [{withheld_others} more in the previous {window_secs}s]"
+        );
     }
     msg
 }
@@ -637,7 +663,12 @@ mod tests {
     #[test]
     fn as_strings_is_core_compatible() {
         let w = NodeWarnings::new();
-        w.record("connect.missing", Severity::Error, "block 945989 won't connect", json!({"h": 945989}));
+        w.record(
+            "connect.missing",
+            Severity::Error,
+            "block 945989 won't connect",
+            json!({"h": 945989}),
+        );
         let strings = w.as_strings();
         assert_eq!(strings.len(), 1);
         assert!(strings[0].contains("error"));
@@ -668,26 +699,58 @@ mod tests {
     fn alert_notifier_catches_up_on_warnings_recorded_before_install() {
         let w = NodeWarnings::new();
         w.record("early.warn", Severity::Warn, "raised first", json!(null));
-        w.record("reindex.halted", Severity::Error, "block 7 cannot be replayed", json!(null));
-        w.record("gone.again", Severity::Warn, "resolved before install", json!(null));
+        w.record(
+            "reindex.halted",
+            Severity::Error,
+            "block 7 cannot be replayed",
+            json!(null),
+        );
+        w.record(
+            "gone.again",
+            Severity::Warn,
+            "resolved before install",
+            json!(null),
+        );
         w.clear("gone.again");
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
         w.set_alert_notifier(tx);
 
         // Error first, then Warn: the order `getwarnings` lists them in.
-        let first = rx.try_recv().expect("an already-active error must fire on install");
-        assert!(first.contains("reindex.halted") && first.contains("block 7"), "{first}");
-        let second = rx.try_recv().expect("an already-active warning must fire on install");
+        let first = rx
+            .try_recv()
+            .expect("an already-active error must fire on install");
+        assert!(
+            first.contains("reindex.halted") && first.contains("block 7"),
+            "{first}"
+        );
+        let second = rx
+            .try_recv()
+            .expect("an already-active warning must fire on install");
         assert!(second.contains("early.warn"), "{second}");
-        assert!(rx.try_recv().is_err(), "a cleared warning is not active and must not fire");
+        assert!(
+            rx.try_recv().is_err(),
+            "a cleared warning is not active and must not fire"
+        );
 
         // Repeats after install still only bump the count.
-        w.record("reindex.halted", Severity::Error, "still halted", json!(null));
-        assert!(rx.try_recv().is_err(), "a caught-up id must not fire again on repeat");
+        w.record(
+            "reindex.halted",
+            Severity::Error,
+            "still halted",
+            json!(null),
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "a caught-up id must not fire again on repeat"
+        );
         // A new id after install fires as before.
         w.record("later.warn", Severity::Warn, "after install", json!(null));
-        assert!(rx.try_recv().expect("new id after install").contains("later.warn"));
+        assert!(
+            rx.try_recv()
+                .expect("new id after install")
+                .contains("later.warn")
+        );
     }
 
     #[test]
@@ -705,7 +768,12 @@ mod tests {
 
         // Repeats of the same id only bump the count — they do NOT re-fire,
         // so the hook isn't flooded by an N-times-recorded condition.
-        w.record("disk.full", Severity::Error, "still out of space", json!(null));
+        w.record(
+            "disk.full",
+            Severity::Error,
+            "still out of space",
+            json!(null),
+        );
         assert!(rx.try_recv().is_err(), "repeat of same id must not re-fire");
 
         // A new id fires again.
@@ -726,7 +794,12 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
         w.set_alert_notifier(tx);
 
-        w.notify_event("alert.deep_reorg", Severity::Error, "reorg rolled back 4 blocks", 4);
+        w.notify_event(
+            "alert.deep_reorg",
+            Severity::Error,
+            "reorg rolled back 4 blocks",
+            4,
+        );
 
         let msg = rx.try_recv().expect("a one-shot event must still page");
         assert!(msg.contains("alert.deep_reorg"), "{msg}");
@@ -781,12 +854,22 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
         w.set_alert_notifier(tx);
 
-        w.notify_event("alert.deep_reorg", Severity::Error, "rolled back 3 blocks", 3);
+        w.notify_event(
+            "alert.deep_reorg",
+            Severity::Error,
+            "rolled back 3 blocks",
+            3,
+        );
         let benign = rx.try_recv().expect("the first occurrence pages");
         assert!(benign.contains("3 blocks"), "{benign}");
 
         // Well inside the window, and far worse.
-        w.notify_event("alert.deep_reorg", Severity::Error, "rolled back 200 blocks", 200);
+        w.notify_event(
+            "alert.deep_reorg",
+            Severity::Error,
+            "rolled back 200 blocks",
+            200,
+        );
         let serious = rx
             .try_recv()
             .expect("a strictly worse occurrence must not wait out the window");
@@ -803,7 +886,12 @@ mod tests {
         w.set_alert_notifier(tx);
 
         for depth in 1..=20 {
-            w.notify_event("alert.deep_reorg", Severity::Error, format!("depth {depth}"), depth);
+            w.notify_event(
+                "alert.deep_reorg",
+                Severity::Error,
+                format!("depth {depth}"),
+                depth,
+            );
         }
 
         let first = rx.try_recv().expect("first pages");
@@ -820,7 +908,10 @@ mod tests {
         w.rewind_event_window_for_test("alert.deep_reorg");
         w.flush_due_events();
         let held = rx.try_recv().expect("the held remainder must be reported");
-        assert!(held.contains("depth 20"), "the worst held one, not the first: {held}");
+        assert!(
+            held.contains("depth 20"),
+            "the worst held one, not the first: {held}"
+        );
     }
 
     /// Nothing is *lost*: once the window closes, the next occurrence pages,
@@ -838,7 +929,12 @@ mod tests {
         // All below the paged magnitude, so none of them escalate; the middle
         // one is the worst of the held set.
         for (i, depth) in [(1, 4), (2, 8), (3, 5)] {
-            w.notify_event("alert.deep_reorg", Severity::Error, format!("reorg {i}"), depth);
+            w.notify_event(
+                "alert.deep_reorg",
+                Severity::Error,
+                format!("reorg {i}"),
+                depth,
+            );
         }
         assert!(rx.try_recv().is_err(), "held inside the window");
 
@@ -860,7 +956,10 @@ mod tests {
         w.rewind_event_window_for_test("alert.deep_reorg");
         w.notify_event("alert.deep_reorg", Severity::Error, "reorg 5", 1);
         let msg = rx.try_recv().expect("pages");
-        assert!(!msg.contains("more in the previous"), "counter must reset: {msg}");
+        assert!(
+            !msg.contains("more in the previous"),
+            "counter must reset: {msg}"
+        );
     }
 
     /// A burst that simply *stops* must still be reported. Draining only on the
@@ -879,11 +978,16 @@ mod tests {
 
         // Nothing further ever arrives for this id.
         w.flush_due_events();
-        assert!(rx.try_recv().is_err(), "not due yet — the window is still open");
+        assert!(
+            rx.try_recv().is_err(),
+            "not due yet — the window is still open"
+        );
 
         w.rewind_event_window_for_test("alert.deep_reorg");
         w.flush_due_events();
-        let msg = rx.try_recv().expect("the held burst must page once the window closes");
+        let msg = rx
+            .try_recv()
+            .expect("the held burst must page once the window closes");
         assert!(msg.contains("reorg"), "{msg}");
         assert!(msg.contains("1 more in the previous"), "{msg}");
 
@@ -892,7 +996,10 @@ mod tests {
         w.flush_due_events();
         w.rewind_event_window_for_test("alert.deep_reorg");
         w.flush_due_events();
-        assert!(rx.try_recv().is_err(), "an idle id must not page on every tick");
+        assert!(
+            rx.try_recv().is_err(),
+            "an idle id must not page on every tick"
+        );
     }
 
     /// The window is reported as measured, not as configured. A page that
@@ -957,7 +1064,9 @@ mod tests {
 
         let a = rx.try_recv().expect("first id pages");
         assert!(a.contains("alert.deep_reorg"), "{a}");
-        let b = rx.try_recv().expect("a different id must page independently");
+        let b = rx
+            .try_recv()
+            .expect("a different id must page independently");
         assert!(b.contains("alert.other_thing"), "{b}");
         assert!(rx.try_recv().is_err());
     }
@@ -976,7 +1085,10 @@ mod tests {
         }
         let first = rx.try_recv().expect("first pages");
         assert!(first.contains("thing 0"), "{first}");
-        assert!(rx.try_recv().is_err(), "no magnitude means no escalation path");
+        assert!(
+            rx.try_recv().is_err(),
+            "no magnitude means no escalation path"
+        );
     }
 
     /// Ids that embed an identifier — `blockdata.corrupt.<hash>` is one per
@@ -991,13 +1103,23 @@ mod tests {
         w.set_alert_notifier(tx);
 
         for i in 0..MAX_ACTIVE_WARNINGS {
-            w.record(&format!("blockdata.corrupt.{i}"), Severity::Error, "bad", json!(null));
+            w.record(
+                &format!("blockdata.corrupt.{i}"),
+                Severity::Error,
+                "bad",
+                json!(null),
+            );
         }
         assert_eq!(w.count(), MAX_ACTIVE_WARNINGS);
         while rx.try_recv().is_ok() {}
 
         for i in MAX_ACTIVE_WARNINGS..MAX_ACTIVE_WARNINGS + 50 {
-            w.record(&format!("blockdata.corrupt.{i}"), Severity::Error, "bad", json!(null));
+            w.record(
+                &format!("blockdata.corrupt.{i}"),
+                Severity::Error,
+                "bad",
+                json!(null),
+            );
         }
         assert_eq!(
             w.count(),
@@ -1027,11 +1149,26 @@ mod tests {
     #[test]
     fn an_already_active_id_still_updates_past_the_cap() {
         let w = NodeWarnings::new();
-        w.record("storage.flush_failed", Severity::Error, "first", json!(null));
+        w.record(
+            "storage.flush_failed",
+            Severity::Error,
+            "first",
+            json!(null),
+        );
         for i in 0..MAX_ACTIVE_WARNINGS + 20 {
-            w.record(&format!("blockdata.corrupt.{i}"), Severity::Error, "bad", json!(null));
+            w.record(
+                &format!("blockdata.corrupt.{i}"),
+                Severity::Error,
+                "bad",
+                json!(null),
+            );
         }
-        w.record("storage.flush_failed", Severity::Error, "still failing", json!(null));
+        w.record(
+            "storage.flush_failed",
+            Severity::Error,
+            "still failing",
+            json!(null),
+        );
 
         let tracked = w
             .list()

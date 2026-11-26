@@ -96,9 +96,7 @@ pub enum PsbtError {
     #[error("{map} has no {field}")]
     MissingField { map: MapId, field: &'static str },
 
-    #[error(
-        "the declared count of {kind} ({declared}) exceeds the {remaining} bytes remaining"
-    )]
+    #[error("the declared count of {kind} ({declared}) exceeds the {remaining} bytes remaining")]
     ImplausibleCount {
         kind: &'static str,
         declared: u64,

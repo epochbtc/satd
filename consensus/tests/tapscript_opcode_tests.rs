@@ -19,9 +19,13 @@ use consensus::verify::verify_script;
 /// Core's `IsOpSuccess` (src/script/script.cpp:364-370), transcribed.
 fn core_is_op_success(opcode: u8) -> bool {
     let opcode = opcode as u32;
-    opcode == 80 || opcode == 98 || (126..=129).contains(&opcode)
-        || (131..=134).contains(&opcode) || (137..=138).contains(&opcode)
-        || (141..=142).contains(&opcode) || (149..=153).contains(&opcode)
+    opcode == 80
+        || opcode == 98
+        || (126..=129).contains(&opcode)
+        || (131..=134).contains(&opcode)
+        || (137..=138).contains(&opcode)
+        || (141..=142).contains(&opcode)
+        || (149..=153).contains(&opcode)
         || (187..=254).contains(&opcode)
 }
 
@@ -46,7 +50,10 @@ fn leaf_spend(leaf: &[u8]) -> LeafSpend {
         .unwrap()
         .finalize(&secp, internal)
         .unwrap();
-    let control = info.control_block(&(script, LeafVersion::TapScript)).unwrap().serialize();
+    let control = info
+        .control_block(&(script, LeafVersion::TapScript))
+        .unwrap()
+        .serialize();
     let mut spk = vec![0x51, 0x20];
     spk.extend_from_slice(&info.output_key().to_x_only_public_key().serialize());
 
@@ -59,14 +66,25 @@ fn leaf_spend(leaf: &[u8]) -> LeafSpend {
         version: Version(2),
         lock_time: LockTime::ZERO,
         input: vec![TxIn {
-            previous_output: OutPoint { txid: Txid::all_zeros(), vout: 0 },
+            previous_output: OutPoint {
+                txid: Txid::all_zeros(),
+                vout: 0,
+            },
             script_sig: ScriptBuf::new(),
             sequence: Sequence::MAX,
             witness: Witness::from_slice(&witness),
         }],
-        output: vec![TxOut { value: Amount::from_sat(90_000), script_pubkey: ScriptBuf::new() }],
+        output: vec![TxOut {
+            value: Amount::from_sat(90_000),
+            script_pubkey: ScriptBuf::new(),
+        }],
     };
-    LeafSpend { spk, tx, prevouts: vec![prevout], witness }
+    LeafSpend {
+        spk,
+        tx,
+        prevouts: vec![prevout],
+        witness,
+    }
 }
 
 fn rust_verify(s: &LeafSpend, script_flags: u32) -> Result<(), ScriptError> {
@@ -107,11 +125,18 @@ fn every_opcode_in_a_tapscript_leaf_matches_libbitcoinconsensus() {
             let rust = rust_verify(&s, CONSENSUS_FLAGS);
             let cpp = cpp_verify(&s, CONSENSUS_FLAGS);
             if rust.is_ok() != cpp {
-                diffs.push(format!("leaf {leaf:02x?}: rust={rust:?} libbitcoinconsensus ok={cpp}"));
+                diffs.push(format!(
+                    "leaf {leaf:02x?}: rust={rust:?} libbitcoinconsensus ok={cpp}"
+                ));
             }
         }
     }
-    assert!(diffs.is_empty(), "{} verdicts differ:\n{}", diffs.len(), diffs.join("\n"));
+    assert!(
+        diffs.is_empty(),
+        "{} verdicts differ:\n{}",
+        diffs.len(),
+        diffs.join("\n")
+    );
 }
 
 #[test]
@@ -134,9 +159,15 @@ fn op_success_leaf_is_valid_and_discouraged_by_policy_flag() {
     // success: `0 IF SIZE ENDIF 1` leaves [1] and passes under both flag sets,
     // while `0 IF SIZE ENDIF` leaves an empty stack and fails.
     let s = leaf_spend(&[0x00, 0x63, 0x82, 0x68, 0x51]);
-    assert_eq!(rust_verify(&s, CONSENSUS_FLAGS | flags::VERIFY_DISCOURAGE_OP_SUCCESS), Ok(()));
+    assert_eq!(
+        rust_verify(&s, CONSENSUS_FLAGS | flags::VERIFY_DISCOURAGE_OP_SUCCESS),
+        Ok(())
+    );
     let s = leaf_spend(&[0x00, 0x63, 0x82, 0x68]);
-    assert_eq!(rust_verify(&s, CONSENSUS_FLAGS), Err(ScriptError::CleanStack));
+    assert_eq!(
+        rust_verify(&s, CONSENSUS_FLAGS),
+        Err(ScriptError::CleanStack)
+    );
 }
 
 /// `OP_1 <0x4e73>`, the pay-to-anchor output.
@@ -154,7 +185,10 @@ fn pay_to_anchor_spend_passes_discourage_upgradable_witness_program() {
 
     // Bare P2A: Core returns true before the discourage branch
     // (src/script/interpreter.cpp:1990).
-    assert_eq!(verify_script(&[], &P2A_SPK, &[], policy, &NoopChecker), Ok(()));
+    assert_eq!(
+        verify_script(&[], &P2A_SPK, &[], policy, &NoopChecker),
+        Ok(())
+    );
 
     // P2SH-wrapped P2A: is_p2sh, so Core discourages it.
     let mut wrapped_spk = vec![0xa9, 0x14];
@@ -167,9 +201,18 @@ fn pay_to_anchor_spend_passes_discourage_upgradable_witness_program() {
         Err(ScriptError::DiscourageUpgradableWitnessProgram)
     );
     // Both pass under consensus flags alone.
-    assert_eq!(verify_script(&[], &P2A_SPK, &[], CONSENSUS_FLAGS, &NoopChecker), Ok(()));
     assert_eq!(
-        verify_script(&script_sig, &wrapped_spk, &[], CONSENSUS_FLAGS, &NoopChecker),
+        verify_script(&[], &P2A_SPK, &[], CONSENSUS_FLAGS, &NoopChecker),
+        Ok(())
+    );
+    assert_eq!(
+        verify_script(
+            &script_sig,
+            &wrapped_spk,
+            &[],
+            CONSENSUS_FLAGS,
+            &NoopChecker
+        ),
         Ok(())
     );
 }

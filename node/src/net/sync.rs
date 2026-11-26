@@ -1,7 +1,7 @@
-use bitcoin::hashes::Hash;
-use bitcoin::p2p::message_blockdata::{GetHeadersMessage, Inventory};
-use bitcoin::p2p::message::NetworkMessage;
 use bitcoin::BlockHash;
+use bitcoin::hashes::Hash;
+use bitcoin::p2p::message::NetworkMessage;
+use bitcoin::p2p::message_blockdata::{GetHeadersMessage, Inventory};
 
 use crate::chain::state::ChainState;
 
@@ -14,7 +14,9 @@ pub fn build_locator(chain_state: &ChainState) -> Vec<BlockHash> {
 
 /// The height of the most-work header we know, or of the tip if that is higher.
 fn best_known_height(chain_state: &ChainState) -> u32 {
-    chain_state.headers_tip_height().max(chain_state.tip_height())
+    chain_state
+        .headers_tip_height()
+        .max(chain_state.tip_height())
 }
 
 /// A block locator starting at `tip_height`.
@@ -45,9 +47,10 @@ fn extend_locator_from_rows(
 
     // Always include genesis
     if let Some(hash) = chain_state.get_block_hash_by_height(0)
-        && locator.last() != Some(&hash) {
-            locator.push(hash);
-        }
+        && locator.last() != Some(&hash)
+    {
+        locator.push(hash);
+    }
 }
 
 /// How many parent links [`build_locator_for_branch`] follows before it
@@ -62,7 +65,10 @@ const BRANCH_LOCATOR_MAX_WALK: u32 = 4096;
 /// Once the branch reaches a block the height rows also hold, the rest of the
 /// locator comes from the rows, which below that point are the same chain.
 /// `None` if `start` is not in the block index.
-pub fn build_locator_for_branch(chain_state: &ChainState, start: BlockHash) -> Option<Vec<BlockHash>> {
+pub fn build_locator_for_branch(
+    chain_state: &ChainState,
+    start: BlockHash,
+) -> Option<Vec<BlockHash>> {
     let mut entry = chain_state.get_block_index(&start)?;
     let mut hash = start;
     let mut locator = Vec::new();
@@ -120,7 +126,11 @@ pub fn make_getheaders_after(chain_state: &ChainState, last: BlockHash) -> Netwo
 /// `HeadersSyncState::NextHeadersRequestLocator`, `first` (the last header
 /// the sync took) and then the locator of the block the peer's chain builds
 /// on, `chain_start`, which is in the index.
-pub fn make_headers_sync_getheaders(chain_state: &ChainState, first: BlockHash, chain_start: BlockHash) -> NetworkMessage {
+pub fn make_headers_sync_getheaders(
+    chain_state: &ChainState,
+    first: BlockHash,
+    chain_start: BlockHash,
+) -> NetworkMessage {
     let mut locator = vec![first];
     match build_locator_for_branch(chain_state, chain_start) {
         Some(rest) => locator.extend(rest),
@@ -149,7 +159,10 @@ pub fn make_getheaders(chain_state: &ChainState) -> NetworkMessage {
 /// it, a peer on our tip is known to have nothing until it next announces a
 /// block, and `sendheaders` waits on exactly that knowledge.
 pub fn make_initial_getheaders(chain_state: &ChainState) -> NetworkMessage {
-    let locator = build_locator_from(chain_state, best_known_height(chain_state).saturating_sub(1));
+    let locator = build_locator_from(
+        chain_state,
+        best_known_height(chain_state).saturating_sub(1),
+    );
     NetworkMessage::GetHeaders(GetHeadersMessage::new(
         locator,
         BlockHash::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array([0u8; 32])),
@@ -163,10 +176,7 @@ pub fn make_block_inv(hash: BlockHash) -> NetworkMessage {
 
 /// Create a GetData message for block hashes.
 pub fn make_getdata_blocks(hashes: &[BlockHash]) -> NetworkMessage {
-    let inv: Vec<Inventory> = hashes
-        .iter()
-        .map(|h| Inventory::WitnessBlock(*h))
-        .collect();
+    let inv: Vec<Inventory> = hashes.iter().map(|h| Inventory::WitnessBlock(*h)).collect();
     NetworkMessage::GetData(inv)
 }
 
@@ -199,7 +209,19 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("satd-sync-test-{}", std::process::id()));
         let store = Box::new(InMemoryStore::new());
         let flat_files = FlatFileManager::new(&dir.join("blocks")).unwrap();
-        let cs = ChainState::new(store, flat_files, Network::Regtest, Box::new(NoopVerifier), AssumeValid::Disabled, 450, 4, Default::default(), Default::default(), Default::default()).unwrap();
+        let cs = ChainState::new(
+            store,
+            flat_files,
+            Network::Regtest,
+            Box::new(NoopVerifier),
+            AssumeValid::Disabled,
+            450,
+            4,
+            Default::default(),
+            Default::default(),
+            Default::default(),
+        )
+        .unwrap();
 
         let locator = build_locator(&cs);
         assert!(!locator.is_empty());
@@ -230,10 +252,11 @@ mod tests {
             Box::new(NoopVerifier),
             AssumeValid::Disabled,
             450,
-        4,
-        Default::default(),
-        Default::default(),
-            Default::default(),)
+            4,
+            Default::default(),
+            Default::default(),
+            Default::default(),
+        )
         .unwrap();
 
         let genesis = bitcoin::constants::genesis_block(Network::Regtest);
@@ -264,15 +287,12 @@ mod tests {
     fn test_make_getdata_blocks() {
         use bitcoin::hashes::Hash;
 
-        let h1 = BlockHash::from_raw_hash(
-            bitcoin::hashes::sha256d::Hash::from_byte_array([0x01; 32]),
-        );
-        let h2 = BlockHash::from_raw_hash(
-            bitcoin::hashes::sha256d::Hash::from_byte_array([0x02; 32]),
-        );
-        let h3 = BlockHash::from_raw_hash(
-            bitcoin::hashes::sha256d::Hash::from_byte_array([0x03; 32]),
-        );
+        let h1 =
+            BlockHash::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array([0x01; 32]));
+        let h2 =
+            BlockHash::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array([0x02; 32]));
+        let h3 =
+            BlockHash::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array([0x03; 32]));
 
         let msg = make_getdata_blocks(&[h1, h2, h3]);
         match msg {
@@ -290,12 +310,12 @@ mod tests {
     fn test_make_getdata_txs() {
         use bitcoin::hashes::Hash;
 
-        let t1 = bitcoin::Txid::from_raw_hash(
-            bitcoin::hashes::sha256d::Hash::from_byte_array([0xaa; 32]),
-        );
-        let t2 = bitcoin::Txid::from_raw_hash(
-            bitcoin::hashes::sha256d::Hash::from_byte_array([0xbb; 32]),
-        );
+        let t1 = bitcoin::Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array(
+            [0xaa; 32],
+        ));
+        let t2 = bitcoin::Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array(
+            [0xbb; 32],
+        ));
 
         let msg = make_getdata_txs(&[t1, t2]);
         match msg {
@@ -327,10 +347,11 @@ mod tests {
             Box::new(NoopVerifier),
             AssumeValid::Disabled,
             450,
-        4,
-        Default::default(),
-        Default::default(),
-            Default::default(),)
+            4,
+            Default::default(),
+            Default::default(),
+            Default::default(),
+        )
         .unwrap();
 
         let msg = make_getheaders(&cs);
@@ -368,6 +389,10 @@ mod tests {
             hashes.push(parent);
         }
         assert_eq!(first_locator_hash(make_initial_getheaders(&cs)), hashes[2]);
-        assert_eq!(first_locator_hash(make_getheaders(&cs)), hashes[3], "the steady-state locator is unchanged");
+        assert_eq!(
+            first_locator_hash(make_getheaders(&cs)),
+            hashes[3],
+            "the steady-state locator is unchanged"
+        );
     }
 }

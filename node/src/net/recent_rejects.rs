@@ -30,7 +30,11 @@ struct Filter {
 
 impl Filter {
     fn new(capacity: usize) -> Self {
-        Self { keys: HashSet::new(), order: VecDeque::new(), capacity }
+        Self {
+            keys: HashSet::new(),
+            order: VecDeque::new(),
+            capacity,
+        }
     }
 
     fn insert(&mut self, key: u64) {
@@ -118,7 +122,13 @@ impl RecentRejects {
     /// tip that is current: `judged_at` is the tip the transaction was
     /// validated against, `tip` the tip now. A verdict about a tip that has
     /// since moved is dropped rather than recorded under the new one.
-    pub fn insert_if_tip(&mut self, judged_at: BlockHash, tip: BlockHash, hashes: &[[u8; 32]], kind: Rejection) {
+    pub fn insert_if_tip(
+        &mut self,
+        judged_at: BlockHash,
+        tip: BlockHash,
+        hashes: &[[u8; 32]],
+        kind: Rejection,
+    ) {
         if judged_at != tip {
             return;
         }
@@ -130,7 +140,12 @@ impl RecentRejects {
     /// Whether `hash` was refused under `tip`: by the main filter, or with
     /// `include_reconsiderable` also by the fee filter (Core's
     /// `AlreadyHaveTx(gtxid, include_reconsiderable)`).
-    pub fn contains(&mut self, tip: BlockHash, hash: &[u8; 32], include_reconsiderable: bool) -> bool {
+    pub fn contains(
+        &mut self,
+        tip: BlockHash,
+        hash: &[u8; 32],
+        include_reconsiderable: bool,
+    ) -> bool {
         self.sync_tip(tip);
         let key = self.key(hash);
         self.rejected.contains(key) || (include_reconsiderable && self.reconsiderable.contains(key))
@@ -181,14 +196,17 @@ mod tests {
     /// array, where these two would sort the other way round.
     #[test]
     fn the_package_hash_sorts_the_wtxids_as_numbers() {
-        use bitcoin::hashes::{sha256, HashEngine};
+        use bitcoin::hashes::{HashEngine, sha256};
         // As numbers, `low` < `high`, though `low`'s first byte is larger.
         let mut low = [0u8; 32];
         low[0] = 0xff;
         low[31] = 0x01;
         let mut high = [0u8; 32];
         high[31] = 0x02;
-        let (lw, hw) = (bitcoin::Wtxid::from_byte_array(low), bitcoin::Wtxid::from_byte_array(high));
+        let (lw, hw) = (
+            bitcoin::Wtxid::from_byte_array(low),
+            bitcoin::Wtxid::from_byte_array(high),
+        );
         let mut engine = sha256::Hash::engine();
         engine.input(&low);
         engine.input(&high);
@@ -213,7 +231,10 @@ mod tests {
         assert!(r.contains(tip(1), &[7; 32], false));
         assert!(!r.contains(tip(1), &[8; 32], true));
         assert!(!r.contains(tip(2), &[7; 32], true), "a new tip forgets it");
-        assert!(!r.contains(tip(1), &[7; 32], true), "and going back does not restore it");
+        assert!(
+            !r.contains(tip(1), &[7; 32], true),
+            "and going back does not restore it"
+        );
     }
 
     #[test]

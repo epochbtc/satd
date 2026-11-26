@@ -1,28 +1,27 @@
 use crate::chain::state::ChainState;
+use crate::http_serve::serve_http_connection;
 use crate::index::address::{AddressIndex, BackfillCommand, BackfillHandle};
 use crate::mempool::fee::FeeEstimator;
 use crate::mempool::history::MempoolHistory;
 use crate::mempool::pool::Mempool;
 use crate::net::manager::PeerManager;
+use crate::rpc::admission::{AdmissionLayer, AdmissionState};
 use crate::rpc::amounts::{
     annotate_units, default_unit, format_amount, format_feerate_sat_per_kvb,
 };
-use crate::rpc::admission::{AdmissionLayer, AdmissionState};
 use crate::rpc::auth::{AuthLayer, RpcAuth};
-use crate::rpc::compat::{CoreHttpPreludeLayer, JsonRpcCompatLayer};
 use crate::rpc::capability::{BatchRateLayer, CapabilityLayer, TokenRecheckLayer};
-use crate::http_serve::serve_http_connection;
-use crate::warn_budget::WarnBudget;
+use crate::rpc::compat::{CoreHttpPreludeLayer, JsonRpcCompatLayer};
 use crate::rpc::named_params::NamedParamsLayer;
+use crate::warn_budget::WarnBudget;
 
-use crate::rpc::params::{core_int, Args};
+use crate::rpc::params::{Args, core_int};
 use crate::rpc::readonly::ReadOnlyLayer;
 use crate::rpc::{access, address, blockchain, indexes, mining, network, psbt, rawtx, util};
 use crate::storage::Store;
 use jsonrpsee::server::middleware::rpc::RpcServiceBuilder;
 use jsonrpsee::server::{
-    Methods, RpcModule, ServerBuilder, ServerConfig, ServerHandle,
-    stop_channel,
+    Methods, RpcModule, ServerBuilder, ServerConfig, ServerHandle, stop_channel,
 };
 use jsonrpsee::types::ErrorObjectOwned;
 use parking_lot::RwLock;
@@ -34,8 +33,15 @@ use tokio::sync::watch;
 
 /// The categories `help` prints, in order. `rpc_help.py::test_categories`
 /// asserts exactly this list and this order.
-const HELP_CATEGORIES: [&str; 7] =
-    ["Blockchain", "Control", "Mining", "Network", "Rawtransactions", "Util", "Zmq"];
+const HELP_CATEGORIES: [&str; 7] = [
+    "Blockchain",
+    "Control",
+    "Mining",
+    "Network",
+    "Rawtransactions",
+    "Util",
+    "Zmq",
+];
 
 /// The `help` listing: every registered method, in exactly one category.
 ///
@@ -513,8 +519,7 @@ fn raw_outputs_sequence(raw_params: &str, index: usize) -> Option<Vec<serde_json
 
     // Use serde_json's streaming deserializer to walk the array without
     // collapsing duplicate keys: parse each element as a RawValue.
-    let elements: Vec<&serde_json::value::RawValue> =
-        serde_json::from_str(trimmed).ok()?;
+    let elements: Vec<&serde_json::value::RawValue> = serde_json::from_str(trimmed).ok()?;
     let outputs_raw = elements.get(index)?;
     let outputs_str = outputs_raw.get();
 
@@ -583,7 +588,11 @@ fn parse_btc_amount_arg(
     };
     let sat = (btc * 100_000_000.0).round();
     if !(0.0..=MAX_MONEY_SAT).contains(&sat) {
-        return Err(ErrorObjectOwned::owned(-3, "Amount out of range", None::<()>));
+        return Err(ErrorObjectOwned::owned(
+            -3,
+            "Amount out of range",
+            None::<()>,
+        ));
     }
     Ok(sat as u64)
 }
@@ -626,7 +635,10 @@ fn net_datadir_from(ctx: &RpcContext) -> Option<std::path::PathBuf> {
 
 /// `path` as `dumptxoutset` resolves it: an absolute path as given, a
 /// relative one against the network datadir.
-fn resolve_datadir_path(ctx: &RpcContext, path: &str) -> Result<std::path::PathBuf, ErrorObjectOwned> {
+fn resolve_datadir_path(
+    ctx: &RpcContext,
+    path: &str,
+) -> Result<std::path::PathBuf, ErrorObjectOwned> {
     let p = std::path::Path::new(path);
     if p.is_absolute() {
         return Ok(p.to_path_buf());
@@ -1073,21 +1085,20 @@ pub async fn start(
         // `getblock`).
         let verbosity = args.verbosity("verbosity", 1)?.max(0) as u32;
         args.check()?;
-        blockchain::get_block(&ctx.chain_state, &hash, verbosity)
-            .map_err(|e| {
-                // "Block not available (...)" errors use RPC_MISC_ERROR (-1),
-                // matching Bitcoin Core; all others (e.g. "Block not found",
-                // "Invalid block hash") use RPC_INVALID_ADDRESS_OR_KEY (-5).
-                // Unusable undo data is RPC_INTERNAL_ERROR, as in Core.
-                let code = if e.starts_with("Block not available") {
-                    -1
-                } else if e == crate::rpc::rawtx::UNDO_UNREADABLE {
-                    -32603
-                } else {
-                    -5
-                };
-                ErrorObjectOwned::owned(code, e, None::<()>)
-            })
+        blockchain::get_block(&ctx.chain_state, &hash, verbosity).map_err(|e| {
+            // "Block not available (...)" errors use RPC_MISC_ERROR (-1),
+            // matching Bitcoin Core; all others (e.g. "Block not found",
+            // "Invalid block hash") use RPC_INVALID_ADDRESS_OR_KEY (-5).
+            // Unusable undo data is RPC_INTERNAL_ERROR, as in Core.
+            let code = if e.starts_with("Block not available") {
+                -1
+            } else if e == crate::rpc::rawtx::UNDO_UNREADABLE {
+                -32603
+            } else {
+                -5
+            };
+            ErrorObjectOwned::owned(code, e, None::<()>)
+        })
     })?;
 
     module.register_method("getblockheader", |params, ctx, _extensions| {
@@ -1220,7 +1231,11 @@ pub async fn start(
             None => None,
         };
         blockchain::get_chain_tx_stats(&ctx.chain_state, nblocks, final_blockhash).map_err(|e| {
-            let code = if e == blockchain::INVALID_BLOCK_COUNT { -8 } else { -1 };
+            let code = if e == blockchain::INVALID_BLOCK_COUNT {
+                -8
+            } else {
+                -1
+            };
             ErrorObjectOwned::owned(code, e, None::<()>)
         })
     })?;
@@ -1261,9 +1276,9 @@ pub async fn start(
         // of txids (bulk). On bulk, returns a map of txid → entry | null.
         let mut args = Args::new(&params);
         // Either shape is legitimate here, so the slot is read raw.
-        let first: serde_json::Value = args
-            .raw("txid")?
-            .ok_or_else(|| ErrorObjectOwned::owned(-1, "Missing required argument txid", None::<()>))?;
+        let first: serde_json::Value = args.raw("txid")?.ok_or_else(|| {
+            ErrorObjectOwned::owned(-1, "Missing required argument txid", None::<()>)
+        })?;
         args.check()?;
         match first {
             serde_json::Value::Array(arr) => {
@@ -1701,8 +1716,15 @@ pub async fn start(
         // A call still mining when the node shuts down stops at the next
         // block, so main's wait for the RPC server to drain ends.
         let stopping = || *ctx.shutdown_tx.borrow();
-        mining::generate_to_address(&ctx.chain_state, &ctx.mempool, nblocks, &address, max_tries, &stopping)
-            .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
+        mining::generate_to_address(
+            &ctx.chain_state,
+            &ctx.mempool,
+            nblocks,
+            &address,
+            max_tries,
+            &stopping,
+        )
+        .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
     })?;
 
     module.register_method("generatetodescriptor", |params, ctx, _extensions| {
@@ -1724,7 +1746,7 @@ pub async fn start(
             max_tries,
             &stopping,
         )
-            .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
+        .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
     })?;
 
     module.register_method("generateblock", |params, ctx, _extensions| {
@@ -1746,15 +1768,11 @@ pub async fn start(
         // address parser; otherwise a descriptor failure was reported as a
         // base58 error for something that was never an address.
         let coinbase_script = if output.contains('(') {
-            crate::rpc::descriptor::descriptor_to_coinbase_script(
-                &output,
-                ctx.chain_state.network,
-            )
-            .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))?
+            crate::rpc::descriptor::descriptor_to_coinbase_script(&output, ctx.chain_state.network)
+                .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))?
         } else {
-            let addr: bitcoin::Address<bitcoin::address::NetworkUnchecked> = output
-                .parse()
-                .map_err(|e| {
+            let addr: bitcoin::Address<bitcoin::address::NetworkUnchecked> =
+                output.parse().map_err(|e| {
                     ErrorObjectOwned::owned(
                         -5,
                         format!("Invalid address or descriptor: {e}"),
@@ -1779,10 +1797,20 @@ pub async fn start(
                     ErrorObjectOwned::owned(-1, "transaction must be a string", None::<()>)
                 })?;
                 if hex.len() == 64 {
-                    let txid: bitcoin::Txid = hex.parse()
-                        .map_err(|_| ErrorObjectOwned::owned(-5, format!("Transaction {hex} not in mempool."), None::<()>))?;
-                    let entry = ctx.mempool.get(&txid)
-                        .ok_or_else(|| ErrorObjectOwned::owned(-5, format!("Transaction {txid} not in mempool."), None::<()>))?;
+                    let txid: bitcoin::Txid = hex.parse().map_err(|_| {
+                        ErrorObjectOwned::owned(
+                            -5,
+                            format!("Transaction {hex} not in mempool."),
+                            None::<()>,
+                        )
+                    })?;
+                    let entry = ctx.mempool.get(&txid).ok_or_else(|| {
+                        ErrorObjectOwned::owned(
+                            -5,
+                            format!("Transaction {txid} not in mempool."),
+                            None::<()>,
+                        )
+                    })?;
                     txs.push(entry.tx.clone());
                 } else {
                     // Core's `DecodeHexTx` with its defaults, the extended
@@ -1791,7 +1819,10 @@ pub async fn start(
                     let decode_failed = || {
                         ErrorObjectOwned::owned(
                             -22,
-                            format!("Transaction decode failed for {hex}. {}", rawtx::AT_LEAST_ONE_INPUT),
+                            format!(
+                                "Transaction decode failed for {hex}. {}",
+                                rawtx::AT_LEAST_ONE_INPUT
+                            ),
                             None::<()>,
                         )
                     };
@@ -1819,17 +1850,26 @@ pub async fn start(
         // a failure with RPC_VERIFY_ERROR (-25, `rpc/mining.cpp`); the check
         // now runs while the block is built, so keep that code for it.
         let block = crate::mining::miner::build_block_to_script(
-            &ctx.chain_state, &ctx.mempool, coinbase_script, explicit_txs,
-        ).map_err(|e| {
-            let code = if matches!(e, crate::mining::miner::MineError::TemplateInvalid(_)) { -25 } else { -1 };
+            &ctx.chain_state,
+            &ctx.mempool,
+            coinbase_script,
+            explicit_txs,
+        )
+        .map_err(|e| {
+            let code = if matches!(e, crate::mining::miner::MineError::TemplateInvalid(_)) {
+                -25
+            } else {
+                -1
+            };
             ErrorObjectOwned::owned(code, e.to_string(), None::<()>)
         })?;
 
         let hash = block.block_hash().to_string();
 
         if submit {
-            let acceptance = ctx.chain_state.accept_block(&block)
-                .map_err(|e| ErrorObjectOwned::owned(-25, format!("TestBlockValidity failed: {e}"), None::<()>))?;
+            let acceptance = ctx.chain_state.accept_block(&block).map_err(|e| {
+                ErrorObjectOwned::owned(-25, format!("TestBlockValidity failed: {e}"), None::<()>)
+            })?;
             if let Some(height) = ctx.chain_state.connected_height(&acceptance) {
                 ctx.mempool.remove_for_block(&block, height);
             }
@@ -1845,9 +1885,9 @@ pub async fn start(
         // object. When it contains `"mode": "proposal"` and `"data"`, run
         // proposal-mode validation instead of returning a new template.
         let mut args = Args::new(&params);
-        let request: Option<serde_json::Value> =
-            args.optional::<serde_json::Map<String, serde_json::Value>>("template_request")?
-                .map(serde_json::Value::Object);
+        let request: Option<serde_json::Value> = args
+            .optional::<serde_json::Map<String, serde_json::Value>>("template_request")?
+            .map(serde_json::Value::Object);
         args.check()?;
         // Core (`rpc/mining.cpp`): `mode` absent or JSON null means "template";
         // a present-but-non-string `mode`, or any string other than
@@ -1869,11 +1909,7 @@ pub async fn start(
                 .and_then(|r| r.get("data"))
                 .and_then(|d| d.as_str())
                 .ok_or_else(|| {
-                    ErrorObjectOwned::owned(
-                        -3,
-                        "Missing data String key for proposal",
-                        None::<()>,
-                    )
+                    ErrorObjectOwned::owned(-3, "Missing data String key for proposal", None::<()>)
                 })?;
             return mining::get_block_template_proposal(&ctx.chain_state, data)
                 .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>));
@@ -1997,7 +2033,11 @@ pub async fn start(
         // Actually submit and broadcast.
         let result = ctx
             .peer_manager
-            .broadcast_transaction(&hex_tx, crate::mempool::pool::TxSource::Rpc, allow_quarantined)
+            .broadcast_transaction(
+                &hex_tx,
+                crate::mempool::pool::TxSource::Rpc,
+                allow_quarantined,
+            )
             .map_err(|(code, msg)| {
                 // Classify the mempool error by its code (Core taxonomy):
                 // -22 = decode failed; -25 (RPC_TRANSACTION_ERROR, in
@@ -2006,14 +2046,8 @@ pub async fn start(
                 // verdict) are both mempool acceptance failures and want the
                 // same operator advice.
                 let (category, suggestion) = match code {
-                    -22 => (
-                        "rpc.input.parse",
-                        "Transaction hex failed to decode.",
-                    ),
-                    -25 | -26 => (
-                        "mempool.rejected",
-                        "Mempool rejected the tx.",
-                    ),
+                    -22 => ("rpc.input.parse", "Transaction hex failed to decode."),
+                    -25 | -26 => ("mempool.rejected", "Mempool rejected the tx."),
                     _ => ("rpc.unknown", ""),
                 };
                 let mut err = crate::rpc::error::RpcError::new(code, category, msg);
@@ -2405,7 +2439,8 @@ pub async fn start(
         // of *this* transaction's outputs is still an unspent coin. satd
         // looked at output 0 alone, and also at the txindex, which finds a
         // confirmed transaction forever.
-        let already_known = |tx: &bitcoin::Transaction| rawtx::has_output_in_utxo_set(&ctx.chain_state, tx);
+        let already_known =
+            |tx: &bitcoin::Transaction| rawtx::has_output_in_utxo_set(&ctx.chain_state, tx);
 
         let mut results = Vec::new();
         if decoded.len() == 1 {
@@ -2540,9 +2575,9 @@ pub async fn start(
         let inputs: Vec<serde_json::Value> = args.required("inputs")?;
         // See `createrawtransaction`: an explicit `null` is the handler's to
         // refuse, by name, not an omission.
-        let outputs: serde_json::Value = args
-            .raw_or_null("outputs")?
-            .ok_or_else(|| ErrorObjectOwned::owned(-1, "Missing required argument outputs", None::<()>))?;
+        let outputs: serde_json::Value = args.raw_or_null("outputs")?.ok_or_else(|| {
+            ErrorObjectOwned::owned(-1, "Missing required argument outputs", None::<()>)
+        })?;
         // `ConstructTransaction` reads the locktime with `getInt<int64_t>`
         // and refuses one outside `uint32_t` by name, -8.
         let locktime: Option<i64> = args.optional("locktime")?;
@@ -2694,7 +2729,9 @@ pub async fn start(
         // Core's `include_mempool`, default true.
         let include_mempool: Option<bool> = args.optional("include_mempool")?;
         args.check()?;
-        let mempool = include_mempool.unwrap_or(true).then_some(ctx.mempool.as_ref());
+        let mempool = include_mempool
+            .unwrap_or(true)
+            .then_some(ctx.mempool.as_ref());
         blockchain::get_tx_out_view(&ctx.chain_state, mempool, &txid, vout)
             .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
     })?;
@@ -2702,14 +2739,18 @@ pub async fn start(
     module.register_method("gettxspendingprevout", |params, ctx, _extensions| {
         let mut args = Args::new(&params);
         let outputs: Vec<serde_json::Value> = args.required("outputs")?;
-        let options: Option<serde_json::Map<String, serde_json::Value>> = args.optional("options")?;
+        let options: Option<serde_json::Map<String, serde_json::Value>> =
+            args.optional("options")?;
         args.check()?;
         // `-txospenderindex` is served by the address index's spend rows;
         // config refuses the flag without that index.
         let index = (ctx.txospenderindex_enabled && ctx.address_index_enabled).then(|| {
             crate::index::outpoint_spend::lookups::RocksSpendIndex::new(
                 ctx.chain_state.store_ref().clone(),
-                Arc::new(crate::index::address::AddressIndexConfig { enabled: true, ..Default::default() }),
+                Arc::new(crate::index::address::AddressIndexConfig {
+                    enabled: true,
+                    ..Default::default()
+                }),
             )
         });
         crate::rpc::txospender::get_tx_spending_prevout(
@@ -2728,7 +2769,11 @@ pub async fn start(
         let hash_or_height = args.raw("hash_or_height")?;
         let use_index: Option<bool> = args.optional("use_index")?;
         args.check()?;
-        let args = blockchain::TxOutSetInfoArgs { hash_type, hash_or_height, use_index };
+        let args = blockchain::TxOutSetInfoArgs {
+            hash_type,
+            hash_or_height,
+            use_index,
+        };
         blockchain::get_tx_out_set_info_with(&ctx.chain_state, &args)
             .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
     })?;
@@ -2738,12 +2783,8 @@ pub async fn start(
         let txids: Vec<String> = args.required("txids")?;
         let blockhash: Option<String> = args.optional("blockhash")?;
         args.check()?;
-        rawtx::get_tx_out_proof(
-            &ctx.chain_state,
-            &txids,
-            blockhash.as_deref(),
-        )
-        .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
+        rawtx::get_tx_out_proof(&ctx.chain_state, &txids, blockhash.as_deref())
+            .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
     })?;
 
     module.register_method("verifytxoutproof", |params, ctx, _extensions| {
@@ -2804,7 +2845,10 @@ pub async fn start(
     /// fraction or a value past `int` is -1 "JSON integer out of range", then
     /// one range error, -8, for anything below 1 or above the highest target
     /// the estimator tracks -- negative targets included.
-    fn parse_confirm_target(n: &serde_json::Number, max_target: u32) -> Result<u32, ErrorObjectOwned> {
+    fn parse_confirm_target(
+        n: &serde_json::Number,
+        max_target: u32,
+    ) -> Result<u32, ErrorObjectOwned> {
         let target = core_int::<i32>(n)?;
         match u32::try_from(target) {
             Ok(t) if (1..=max_target).contains(&t) => Ok(t),
@@ -3063,8 +3107,9 @@ pub async fn start(
         fee_args.check()?;
         let mode = EstimateMode::parse(mode_str.as_deref()).unwrap_or(EstimateMode::Blend);
         // Core's `conservative` asks the default for its conservative side.
-        let conservative =
-            mode_str.as_deref().is_some_and(|m| m.trim().eq_ignore_ascii_case("conservative"));
+        let conservative = mode_str
+            .as_deref()
+            .is_some_and(|m| m.trim().eq_ignore_ascii_case("conservative"));
 
         let unit = default_unit();
         let floor_sat_per_kvb = ctx.mempool.fee_estimate_floor();
@@ -3078,7 +3123,13 @@ pub async fn start(
             &ctx.fee_estimator,
             // The mempool side is read only by `blend`.
             (mode == EstimateMode::Blend)
-                .then(|| crate::mempool::estimate::near_rate(&ctx.mempool, &ctx.fee_estimator, conservative))
+                .then(|| {
+                    crate::mempool::estimate::near_rate(
+                        &ctx.mempool,
+                        &ctx.fee_estimator,
+                        conservative,
+                    )
+                })
                 .flatten(),
             &targets,
             mode,
@@ -3136,9 +3187,16 @@ pub async fn start(
         let mut args = Args::new(&params);
         let peer_id: Option<u64> = args.optional("peer_id")?;
         args.check()?;
-        ctx.peer_manager.get_peer_behavior(peer_id).map(serde_json::Value::from).ok_or_else(|| {
-            ErrorObjectOwned::owned(-8, format!("peer_id {} not found", peer_id.unwrap_or_default()), None::<()>)
-        })
+        ctx.peer_manager
+            .get_peer_behavior(peer_id)
+            .map(serde_json::Value::from)
+            .ok_or_else(|| {
+                ErrorObjectOwned::owned(
+                    -8,
+                    format!("peer_id {} not found", peer_id.unwrap_or_default()),
+                    None::<()>,
+                )
+            })
     })?;
 
     // satd: the network survey (`-peersurvey`): the aggregate, and with
@@ -3317,9 +3375,12 @@ pub async fn start(
         args.check()?;
         let all_info = ctx.peer_manager.get_added_node_info();
         if let Some(ref node) = filter_node {
-            let filtered: Vec<_> = all_info.into_iter().filter(|entry| {
-                entry.get("addednode").and_then(|v| v.as_str()) == Some(node.as_str())
-            }).collect();
+            let filtered: Vec<_> = all_info
+                .into_iter()
+                .filter(|entry| {
+                    entry.get("addednode").and_then(|v| v.as_str()) == Some(node.as_str())
+                })
+                .collect();
             if filtered.is_empty() {
                 // -24 = RPC_CLIENT_NODE_NOT_ADDED. Core's exact message.
                 return Err(ErrorObjectOwned::owned(
@@ -3495,14 +3556,23 @@ pub async fn start(
             let threshold: u64 = args.required("threshold")?;
             args.check()?;
             let hash = hash.parse::<bitcoin::BlockHash>().map_err(|e| {
-                ErrorObjectOwned::owned(-8, format!("blockhash must be a block hash: {e}"), None::<()>)
+                ErrorObjectOwned::owned(
+                    -8,
+                    format!("blockhash must be a block hash: {e}"),
+                    None::<()>,
+                )
             })?;
             let chain_state = ctx.chain_state.clone();
-            let outcome = tokio::task::spawn_blocking(move || chain_state.strip_block(&hash, threshold))
-                .await
-                .map_err(|e| {
-                    ErrorObjectOwned::owned(-32603, format!("strip task join error: {e}"), None::<()>)
-                })?;
+            let outcome =
+                tokio::task::spawn_blocking(move || chain_state.strip_block(&hash, threshold))
+                    .await
+                    .map_err(|e| {
+                        ErrorObjectOwned::owned(
+                            -32603,
+                            format!("strip task join error: {e}"),
+                            None::<()>,
+                        )
+                    })?;
             use crate::chain::state::{StripError, StripOutcome};
             let (name, stats) = match outcome {
                 Ok(StripOutcome::NothingEligible) => ("nothing_eligible", Default::default()),
@@ -3587,7 +3657,11 @@ pub async fn start(
                 v2transport,
             )
             .map_err(|e| {
-                let code = if e.starts_with("Error: Already at capacity") { -34 } else { -1 };
+                let code = if e.starts_with("Error: Already at capacity") {
+                    -34
+                } else {
+                    -1
+                };
                 ErrorObjectOwned::owned(code, e, None::<()>)
             })?;
 
@@ -3615,11 +3689,13 @@ pub async fn start(
                 None::<()>,
             ));
         }
-        let payload = hex::decode(&msg).map_err(|_| {
-            ErrorObjectOwned::owned(-8, "Error parsing input for msg", None::<()>)
-        })?;
+        let payload = hex::decode(&msg)
+            .map_err(|_| ErrorObjectOwned::owned(-8, "Error parsing input for msg", None::<()>))?;
         let peer_id = u64::try_from(peer_id).unwrap_or(u64::MAX);
-        if !ctx.peer_manager.send_raw_message(peer_id, &msg_type, payload) {
+        if !ctx
+            .peer_manager
+            .send_raw_message(peer_id, &msg_type, payload)
+        {
             return Err(ErrorObjectOwned::owned(
                 -1,
                 "Error: Could not send message to peer",
@@ -3642,7 +3718,11 @@ pub async fn start(
         args.check()?;
         let count = count.unwrap_or(1);
         if count < 0 {
-            return Err(ErrorObjectOwned::owned(-8, "Address count out of range", None::<()>));
+            return Err(ErrorObjectOwned::owned(
+                -8,
+                "Address count out of range",
+                None::<()>,
+            ));
         }
         let network = match network {
             None => None,
@@ -3727,9 +3807,16 @@ pub async fn start(
         } else if address.to_ascii_lowercase().ends_with(".onion")
             && crate::net::peer::onion_host_to_torv3_pubkey(&address.to_ascii_lowercase()).is_some()
         {
-            crate::net::peer::PeerAddr::Onion { host: address.to_ascii_lowercase(), port }
+            crate::net::peer::PeerAddr::Onion {
+                host: address.to_ascii_lowercase(),
+                port,
+            }
         } else {
-            return Err(ErrorObjectOwned::owned(-30, "Invalid IP address", None::<()>));
+            return Err(ErrorObjectOwned::owned(
+                -30,
+                "Invalid IP address",
+                None::<()>,
+            ));
         };
         let mut out = serde_json::Map::new();
         let success = match ctx.peer_manager.addrman_add_manual(addr, tried) {
@@ -3826,7 +3913,8 @@ pub async fn start(
             && let Some(serde_json::Value::String(s)) = args.last()
             && s == "trigger_internal_bug"
         {
-            let msg = "Internal bug detected: request.params[9].get_str() != \"trigger_internal_bug\"";
+            let msg =
+                "Internal bug detected: request.params[9].get_str() != \"trigger_internal_bug\"";
             return Err(ErrorObjectOwned::owned(-1, msg, None::<()>));
         }
         Ok::<_, ErrorObjectOwned>(serde_json::json!(args))
@@ -4036,7 +4124,8 @@ pub async fn start(
         // Core's `SendMessages` sees the new time on its next pass, within
         // milliseconds; the P2P manager's timers (header-download, chain-sync)
         // would otherwise wait for its next tick.
-        ctx.peer_manager.clock_moved(crate::time::now_secs().saturating_sub(before));
+        ctx.peer_manager
+            .clock_moved(crate::time::now_secs().saturating_sub(before));
         Ok::<_, ErrorObjectOwned>(serde_json::Value::Null)
     })?;
 
@@ -4160,13 +4249,20 @@ pub async fn start(
 
     // `getopreturnpruneinfo` (satd extension, plan §2.13): OP_RETURN pruning
     // in full. Off the async workers: it stats the block files.
-    module.register_async_method("getopreturnpruneinfo", |params, ctx, _extensions| async move {
-        Args::new(&params).check()?;
-        let chain_state = ctx.chain_state.clone();
-        tokio::task::spawn_blocking(move || crate::rpc::blockchain::opreturn_prune_json(&chain_state, true))
+    module.register_async_method(
+        "getopreturnpruneinfo",
+        |params, ctx, _extensions| async move {
+            Args::new(&params).check()?;
+            let chain_state = ctx.chain_state.clone();
+            tokio::task::spawn_blocking(move || {
+                crate::rpc::blockchain::opreturn_prune_json(&chain_state, true)
+            })
             .await
-            .map_err(|e| ErrorObjectOwned::owned(-32603, format!("task join error: {e}"), None::<()>))
-    })?;
+            .map_err(|e| {
+                ErrorObjectOwned::owned(-32603, format!("task join error: {e}"), None::<()>)
+            })
+        },
+    )?;
 
     module.register_async_method(
         "getblockfileaudit",
@@ -4184,13 +4280,9 @@ pub async fn start(
             //      invocations from multiplying disk pressure. A second
             //      caller sees a deterministic BUSY error rather than
             //      queueing behind another minute-scale scan.
-            let guard = try_acquire_blockfile_audit(&ctx.blockfile_audit_running)
-                .ok_or_else(|| {
-                    ErrorObjectOwned::owned(
-                        -32000,
-                        "blockfile audit already running",
-                        None::<()>,
-                    )
+            let guard =
+                try_acquire_blockfile_audit(&ctx.blockfile_audit_running).ok_or_else(|| {
+                    ErrorObjectOwned::owned(-32000, "blockfile audit already running", None::<()>)
                 })?;
             let chain_state = ctx.chain_state.clone();
             let report = tokio::task::spawn_blocking(move || {
@@ -4413,20 +4505,16 @@ pub async fn start(
                     }
                 }))
             }
-            "mallocinfo" => {
-                Err(ErrorObjectOwned::owned(
-                    -8,
-                    "mallocinfo mode not available",
-                    None::<()>,
-                ))
-            }
-            other => {
-                Err(ErrorObjectOwned::owned(
-                    -8,
-                    format!("unknown mode {other}"),
-                    None::<()>,
-                ))
-            }
+            "mallocinfo" => Err(ErrorObjectOwned::owned(
+                -8,
+                "mallocinfo mode not available",
+                None::<()>,
+            )),
+            other => Err(ErrorObjectOwned::owned(
+                -8,
+                format!("unknown mode {other}"),
+                None::<()>,
+            )),
         }
     })?;
 
@@ -4596,8 +4684,13 @@ pub async fn start(
         let signature: String = args.required("signature")?;
         let message: String = args.required("message")?;
         args.check()?;
-        crate::rpc::signmessage::verify_bip322(&address, &signature, &message, ctx.chain_state.network)
-            .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
+        crate::rpc::signmessage::verify_bip322(
+            &address,
+            &signature,
+            &message,
+            ctx.chain_state.network,
+        )
+        .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
     })?;
 
     // --- NAP publisher (satd's own; `-nap=1`) ---
@@ -4610,7 +4703,14 @@ pub async fn start(
         let descriptor: Option<String> = args.optional("descriptor")?;
         args.check()?;
         let nap = crate::rpc::nap::enabled(ctx.nap.as_deref())?;
-        crate::rpc::nap::create(nap, &ctx.chain_state, &outpoint, &key, &value, descriptor.as_deref())
+        crate::rpc::nap::create(
+            nap,
+            &ctx.chain_state,
+            &outpoint,
+            &key,
+            &value,
+            descriptor.as_deref(),
+        )
     })?;
 
     module.register_method("submitnapattestation", |params, ctx, _extensions| {
@@ -4631,7 +4731,10 @@ pub async fn start(
     module.register_method("listnapaggregate", |params, ctx, _extensions| {
         Args::new(&params).check()?;
         let aggregator = crate::rpc::nap::aggregator_enabled(ctx.nap_aggregator.as_deref())?;
-        Ok::<_, ErrorObjectOwned>(crate::rpc::nap::list_aggregate(aggregator, &ctx.chain_state))
+        Ok::<_, ErrorObjectOwned>(crate::rpc::nap::list_aggregate(
+            aggregator,
+            &ctx.chain_state,
+        ))
     })?;
 
     // A report judges every attestation held at the tip, once per tip and
@@ -4646,7 +4749,9 @@ pub async fn start(
             crate::rpc::nap::report(aggregator.as_deref().expect("checked above"), &chain)
         })
         .await
-        .map_err(|e| ErrorObjectOwned::owned(-32603, format!("report task failed: {e}"), None::<()>))?
+        .map_err(|e| {
+            ErrorObjectOwned::owned(-32603, format!("report task failed: {e}"), None::<()>)
+        })?
     })?;
 
     module.register_async_method("replaynapsnapshot", |params, ctx, _extensions| async move {
@@ -4657,12 +4762,17 @@ pub async fn start(
         let chain = std::sync::Arc::clone(&ctx.chain_state);
         // A replay takes as many attestations as this node's own set may
         // hold, or the default if it aggregates nothing.
-        let max = ctx.nap_aggregator.as_deref().map_or(crate::nap::aggregate::DEFAULT_MAX_ATTESTATIONS, |p| {
-            p.collector().aggregate().max_attestations()
-        });
+        let max = ctx
+            .nap_aggregator
+            .as_deref()
+            .map_or(crate::nap::aggregate::DEFAULT_MAX_ATTESTATIONS, |p| {
+                p.collector().aggregate().max_attestations()
+            });
         tokio::task::spawn_blocking(move || crate::rpc::nap::report_snapshot(&chain, &path, max))
             .await
-            .map_err(|e| ErrorObjectOwned::owned(-32603, format!("replay task failed: {e}"), None::<()>))?
+            .map_err(|e| {
+                ErrorObjectOwned::owned(-32603, format!("replay task failed: {e}"), None::<()>)
+            })?
     })?;
 
     module.register_async_method("exportnapsnapshot", |params, ctx, _extensions| async move {
@@ -4674,10 +4784,16 @@ pub async fn start(
         let path = resolve_datadir_path(&ctx, &path)?;
         let chain = std::sync::Arc::clone(&ctx.chain_state);
         tokio::task::spawn_blocking(move || {
-            crate::rpc::nap::export_snapshot(aggregator.as_deref().expect("checked above"), &chain, &path)
+            crate::rpc::nap::export_snapshot(
+                aggregator.as_deref().expect("checked above"),
+                &chain,
+                &path,
+            )
         })
         .await
-        .map_err(|e| ErrorObjectOwned::owned(-32603, format!("export task failed: {e}"), None::<()>))?
+        .map_err(|e| {
+            ErrorObjectOwned::owned(-32603, format!("export task failed: {e}"), None::<()>)
+        })?
     })?;
 
     module.register_method("removenapattestation", |params, ctx, _extensions| {
@@ -4711,7 +4827,11 @@ pub async fn start(
         let message: String = args.required("message").map_err(help)?;
         args.check()?;
         let Some(key) = decode_secret(&privkey, ctx.chain_state.network) else {
-            return Err(ErrorObjectOwned::owned(-5, "Invalid private key", None::<()>));
+            return Err(ErrorObjectOwned::owned(
+                -5,
+                "Invalid private key",
+                None::<()>,
+            ));
         };
         Ok::<_, ErrorObjectOwned>(message_sign(&key, &message))
     })?;
@@ -4966,7 +5086,15 @@ pub async fn start(
     // runtime, behind the read-only method filter, with their own admission
     // budget and source-address allowlist.
     let readonly_handles = if let Some(ro) = readonly {
-        spawn_readonly_listeners(ro, &server_cfg, &auth, &methods, &shutdown_tx_outer, header_read_timeout).await?
+        spawn_readonly_listeners(
+            ro,
+            &server_cfg,
+            &auth,
+            &methods,
+            &shutdown_tx_outer,
+            header_read_timeout,
+        )
+        .await?
     } else {
         Vec::new()
     };
@@ -5263,9 +5391,7 @@ async fn spawn_tls_surface(
     // accept time. The permit is handed to a task that lives as long as
     // the connection (see the spawn below), so the cap covers the
     // handshake and steady-state serving, idle keepalive included.
-    let conn_cap = std::sync::Arc::new(tokio::sync::Semaphore::new(
-        cfg.max_connections.max(1),
-    ));
+    let conn_cap = std::sync::Arc::new(tokio::sync::Semaphore::new(cfg.max_connections.max(1)));
     let max_connections = cfg.max_connections;
     // One warning budget per listener, not per function: this function
     // serves several binds, and a `static` here would let a flood on one
@@ -5410,7 +5536,8 @@ async fn spawn_tls_surface(
                 let svc = tower::service_fn(
                     move |mut req: jsonrpsee::server::HttpRequest<hyper::body::Incoming>| {
                         // See the plain accept loop: the peer, for the auth log.
-                        req.extensions_mut().insert(crate::rpc::auth::RpcPeerAddr(peer));
+                        req.extensions_mut()
+                            .insert(crate::rpc::auth::RpcPeerAddr(peer));
                         let mut rpc_svc = rpc_svc.clone();
                         Box::pin(async move {
                             tower::Service::<
@@ -5563,11 +5690,11 @@ pub async fn spawn_plain_surface(
 ) -> Result<ServerHandle, Box<dyn std::error::Error + Send + Sync>> {
     // Bind synchronously so a port conflict is a startup-fatal error
     // rather than a silently-dropped task that never accepts.
-    let tcp = tokio::net::TcpListener::bind(bind_addr)
-        .await
-        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+    let tcp = tokio::net::TcpListener::bind(bind_addr).await.map_err(
+        |e| -> Box<dyn std::error::Error + Send + Sync> {
             format!("failed to bind RPC server on {bind_addr}: {e}").into()
-        })?;
+        },
+    )?;
 
     let (stop_handle, server_handle) = stop_channel();
 
@@ -5716,7 +5843,8 @@ pub async fn spawn_plain_surface(
                 move |mut req: jsonrpsee::server::HttpRequest<hyper::body::Incoming>| {
                     // The auth layer names the peer when it logs a failed
                     // credential, as Core does.
-                    req.extensions_mut().insert(crate::rpc::auth::RpcPeerAddr(peer));
+                    req.extensions_mut()
+                        .insert(crate::rpc::auth::RpcPeerAddr(peer));
                     let mut rpc_svc = rpc_svc.clone();
                     Box::pin(async move {
                         tower::Service::<
@@ -5766,18 +5894,27 @@ pub async fn spawn_plain_surface(
 /// seconds, until the mempool has changed since it. A `longpollid` that is not
 /// a `<tip hash><counter>` string watches the current tip and counter, as
 /// Core's does for testing.
-async fn wait_for_longpoll(ctx: &RpcContext, lpval: &serde_json::Value) -> Result<(), ErrorObjectOwned> {
+async fn wait_for_longpoll(
+    ctx: &RpcContext,
+    lpval: &serde_json::Value,
+) -> Result<(), ErrorObjectOwned> {
     let (watched, seq) = match lpval.as_str() {
         Some(s) => {
             let hash = s.get(..64).unwrap_or(s);
             let watched: bitcoin::BlockHash = hash.parse().map_err(|_| {
                 ErrorObjectOwned::owned(
                     -8,
-                    format!("longpollid must be of length 64 (not {}, for '{hash}')", hash.len()),
+                    format!(
+                        "longpollid must be of length 64 (not {}, for '{hash}')",
+                        hash.len()
+                    ),
                     None::<()>,
                 )
             })?;
-            (watched, s.get(64..).and_then(|n| n.parse::<u64>().ok()).unwrap_or(0))
+            (
+                watched,
+                s.get(64..).and_then(|n| n.parse::<u64>().ok()).unwrap_or(0),
+            )
         }
         None => (ctx.chain_state.tip_hash(), ctx.mempool.mempool_sequence()),
     };
@@ -5805,7 +5942,11 @@ async fn wait_for_longpoll(ctx: &RpcContext, lpval: &serde_json::Value) -> Resul
 /// Core's `OrphanToJSON` (src/rpc/mempool.cpp), at `getorphantxs`'s
 /// verbosity: the txid alone at 0, the object at 1, and its hex beside it
 /// at 2.
-fn orphan_to_json<F: serde::Serialize>(tx: &bitcoin::Transaction, from: &F, verbosity: i32) -> serde_json::Value {
+fn orphan_to_json<F: serde::Serialize>(
+    tx: &bitcoin::Transaction,
+    from: &F,
+    verbosity: i32,
+) -> serde_json::Value {
     if verbosity == 0 {
         return serde_json::json!(tx.compute_txid().to_string());
     }
@@ -5848,7 +5989,15 @@ mod orphan_json_tests {
         let tx: bitcoin::Transaction = bitcoin::consensus::encode::deserialize_hex(&hex).unwrap();
         let o = orphan_to_json(&tx, &[7u64], 1);
         let sizes = (&o["vsize"], &o["vsize_bip141"], &o["weight"]);
-        assert_eq!(sizes, (&serde_json::json!(146), &serde_json::json!(146), &serde_json::json!(583)), "{o}");
+        assert_eq!(
+            sizes,
+            (
+                &serde_json::json!(146),
+                &serde_json::json!(146),
+                &serde_json::json!(583)
+            ),
+            "{o}"
+        );
         assert!(o.get("vsize_adjusted").is_none(), "{o}");
         assert!(o.get("hex").is_none());
         assert!(orphan_to_json(&tx, &[7u64], 2)["hex"].is_string());
@@ -5879,8 +6028,14 @@ mod raw_outputs_tests {
     /// Anything that is not an object keeps its ordinarily-parsed value.
     #[test]
     fn non_objects_are_left_alone() {
-        assert!(raw_outputs_sequence(r#"[[],[{"a":1}]]"#, 1).is_none(), "array");
-        assert!(raw_outputs_sequence(r#"[[],"hello"]"#, 1).is_none(), "string");
+        assert!(
+            raw_outputs_sequence(r#"[[],[{"a":1}]]"#, 1).is_none(),
+            "array"
+        );
+        assert!(
+            raw_outputs_sequence(r#"[[],"hello"]"#, 1).is_none(),
+            "string"
+        );
         assert!(raw_outputs_sequence(r#"[[]]"#, 1).is_none(), "absent");
         assert!(raw_outputs_sequence("not json", 1).is_none(), "garbage");
         assert!(raw_outputs_sequence("", 1).is_none(), "empty");
@@ -5901,7 +6056,10 @@ mod help_listing_tests {
     fn every_registered_method_has_a_help_category() {
         let listed: Vec<&str> = HELP_METHODS.iter().map(|(n, _)| *n).collect();
         let missing: Vec<&&str> = ALL_METHODS.iter().filter(|m| !listed.contains(m)).collect();
-        assert!(missing.is_empty(), "registered but absent from the help table: {missing:?}");
+        assert!(
+            missing.is_empty(),
+            "registered but absent from the help table: {missing:?}"
+        );
     }
 
     /// The other direction: the table must not name a method that is not
@@ -5914,7 +6072,10 @@ mod help_listing_tests {
             .map(|(n, _)| *n)
             .filter(|n| !ALL_METHODS.contains(n))
             .collect();
-        assert!(stray.is_empty(), "in the help table but not registered: {stray:?}");
+        assert!(
+            stray.is_empty(),
+            "in the help table but not registered: {stray:?}"
+        );
     }
 
     /// A category that is neither printed nor `hidden` silently drops its
@@ -6006,7 +6167,10 @@ mod tls_surface_tests {
                 continue;
             };
             let head = String::from_utf8_lossy(&buf[..head_end]).to_ascii_lowercase();
-            assert!(head.starts_with("http/1.1 401"), "unexpected reply head: {head}");
+            assert!(
+                head.starts_with("http/1.1 401"),
+                "unexpected reply head: {head}"
+            );
             let body_len: usize = head
                 .lines()
                 .find_map(|l| l.strip_prefix("content-length:"))
@@ -6073,9 +6237,13 @@ mod tls_surface_tests {
         // is provably running before the third connection is attempted;
         // without this the refusal could depend on which of the two
         // server-side handshakes the scheduler finished first.
-        let mut c1 = tls_connect(bind_addr, &cert_der).await.expect("first connection");
+        let mut c1 = tls_connect(bind_addr, &cert_der)
+            .await
+            .expect("first connection");
         probe_http(&mut c1).await;
-        let mut c2 = tls_connect(bind_addr, &cert_der).await.expect("second connection");
+        let mut c2 = tls_connect(bind_addr, &cert_der)
+            .await
+            .expect("second connection");
         probe_http(&mut c2).await;
 
         // A third is dropped pre-handshake: the client sees the socket
@@ -6100,7 +6268,10 @@ mod tls_surface_tests {
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        assert!(admitted, "permit must be released when the connection closes");
+        assert!(
+            admitted,
+            "permit must be released when the connection closes"
+        );
 
         let _ = shutdown_tx.send(true);
         let _ = handle.stop();
@@ -6152,10 +6323,13 @@ mod tls_surface_tests {
         let bind_addr: SocketAddr = listener_status.rpc_tls().unwrap().parse().unwrap();
 
         // "u:p" in Basic auth; a fixed RFC 6455 sample key.
-        const UPGRADE: &[u8] = b"GET / HTTP/1.1\r\nHost: localhost\r\nAuthorization: Basic dTpw\r\n\
+        const UPGRADE: &[u8] =
+            b"GET / HTTP/1.1\r\nHost: localhost\r\nAuthorization: Basic dTpw\r\n\
             Connection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\n\
             Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n";
-        let mut ws = tls_connect(bind_addr, &cert_der).await.expect("first connection");
+        let mut ws = tls_connect(bind_addr, &cert_der)
+            .await
+            .expect("first connection");
         ws.write_all(UPGRADE).await.unwrap();
         let mut buf = [0u8; 512];
         let n = tokio::time::timeout(Duration::from_secs(5), ws.read(&mut buf))
@@ -6163,7 +6337,10 @@ mod tls_surface_tests {
             .expect("upgrade reply within 5s")
             .unwrap();
         let head = String::from_utf8_lossy(&buf[..n]);
-        assert!(head.starts_with("HTTP/1.1 101"), "the RPC listener upgrades: {head}");
+        assert!(
+            head.starts_with("HTTP/1.1 101"),
+            "the RPC listener upgrades: {head}"
+        );
         // Give hyper the moment it takes to hand the socket over and finish
         // the connection future -- the point at which a permit tied to that
         // future used to be released.
@@ -6224,7 +6401,11 @@ mod tls_surface_tests {
             admit_plain(outside, &allow, &conn_cap, &denied_cap),
             PlainAdmit::Drop { denied: true }
         ));
-        assert_eq!(conn_cap.available_permits(), 1, "no denied peer took the slot");
+        assert_eq!(
+            conn_cap.available_permits(),
+            1,
+            "no denied peer took the slot"
+        );
         let served = match admit_plain(inside, &allow, &conn_cap, &denied_cap) {
             PlainAdmit::Serve(p) => p,
             _ => panic!("the allowlisted client gets the slot"),
@@ -6249,7 +6430,11 @@ mod tls_surface_tests {
         let mut reply = Vec::new();
         client.read_to_end(&mut reply).await.unwrap();
         task.await.unwrap();
-        assert!(reply.is_empty(), "no reply is written: {:?}", String::from_utf8_lossy(&reply));
+        assert!(
+            reply.is_empty(),
+            "no reply is written: {:?}",
+            String::from_utf8_lossy(&reply)
+        );
     }
 
     #[tokio::test]
@@ -6278,8 +6463,9 @@ mod tls_surface_tests {
         // An allowlist that does not name loopback, which is the ordinary
         // case: the operator lists the remote clients and relies on the
         // loopback exemption for their own CLI.
-        let allowip =
-            Arc::new(vec![crate::rpc::allowip::IpAllowEntry::parse("10.0.0.0/8").unwrap()]);
+        let allowip = Arc::new(vec![
+            crate::rpc::allowip::IpAllowEntry::parse("10.0.0.0/8").unwrap(),
+        ]);
         let handle = spawn_tls_surface(
             cfg,
             ServerConfig::default(),

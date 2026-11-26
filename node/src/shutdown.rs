@@ -109,8 +109,9 @@ pub fn join_within(threads: Vec<NamedThread>, timeout: Duration) -> Vec<NamedThr
     let deadline = std::time::Instant::now() + timeout;
     let mut running = threads;
     loop {
-        let (finished, still): (Vec<_>, Vec<_>) =
-            running.into_iter().partition(|(_, handle)| handle.is_finished());
+        let (finished, still): (Vec<_>, Vec<_>) = running
+            .into_iter()
+            .partition(|(_, handle)| handle.is_finished());
         for (name, handle) in finished {
             if handle.join().is_err() {
                 tracing::error!(thread = name, "thread panicked before shutdown joined it");
@@ -416,15 +417,26 @@ mod tests {
         assert!(!stop.end_replay(), "no request, nothing to report");
         stop.begin_replay();
         assert_eq!(stop.request(), StopRequest::ReplayStops);
-        assert_eq!(stop.request(), StopRequest::ReplayStops, "a second request changes nothing");
+        assert_eq!(
+            stop.request(),
+            StopRequest::ReplayStops,
+            "a second request changes nothing"
+        );
         assert!(stop.is_requested(), "the replay sees it");
         assert!(stop.end_replay(), "and so does its caller");
-        assert_eq!(stop.request(), StopRequest::ExitNow, "after the replay, startup exits");
+        assert_eq!(
+            stop.request(),
+            StopRequest::ExitNow,
+            "after the replay, startup exits"
+        );
 
         let stop = StartupStop::default();
         stop.finish();
         assert_eq!(stop.request(), StopRequest::StartupFinished);
-        assert!(!stop.is_requested(), "the running node's stop is not recorded here");
+        assert!(
+            !stop.is_requested(),
+            "the running node's stop is not recorded here"
+        );
     }
 
     /// The clones a replay and the signal watcher hold are one stop.
@@ -654,7 +666,11 @@ mod tests {
     /// whether its exit handlers ran.
     fn run_exit_probe(how: &str) -> (Option<i32>, bool) {
         let out = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["shutdown::tests::exit_probe_child", "--exact", "--nocapture"])
+            .args([
+                "shutdown::tests::exit_probe_child",
+                "--exact",
+                "--nocapture",
+            ])
             .env(EXIT_PROBE, how)
             .output()
             .unwrap();

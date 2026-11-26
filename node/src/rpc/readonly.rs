@@ -191,19 +191,13 @@ mod tests {
         type BatchResponse = MethodResponse;
         type NotificationResponse = MethodResponse;
 
-        fn call<'a>(
-            &self,
-            req: Request<'a>,
-        ) -> impl Future<Output = MethodResponse> + Send + 'a {
+        fn call<'a>(&self, req: Request<'a>) -> impl Future<Output = MethodResponse> + Send + 'a {
             self.dispatched.fetch_add(1, Ordering::SeqCst);
             let id = req.id.clone();
             async move { MethodResponse::response(id, ResponsePayload::success(true), 1024) }
         }
 
-        fn batch<'a>(
-            &self,
-            _batch: Batch<'a>,
-        ) -> impl Future<Output = MethodResponse> + Send + 'a {
+        fn batch<'a>(&self, _batch: Batch<'a>) -> impl Future<Output = MethodResponse> + Send + 'a {
             async move { MethodResponse::notification() }
         }
 

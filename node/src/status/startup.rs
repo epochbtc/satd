@@ -39,7 +39,8 @@ pub fn label(phase: &str) -> &'static str {
 /// The cards the running node's view fills. The startup view hides each
 /// one explicitly, so a tab that was showing the running node and polls
 /// through a restart does not keep its last chain figures on screen.
-pub(super) const NODE_CARDS: [&str; 6] = ["warnings", "chain", "wallets", "connect", "peers", "crawl"];
+pub(super) const NODE_CARDS: [&str; 6] =
+    ["warnings", "chain", "wallets", "connect", "peers", "crawl"];
 
 /// Every key the startup card marks. The running node's view carries each
 /// one blank and hidden ([`blank`]), so every marker on the page names a
@@ -83,7 +84,8 @@ pub fn view(s: &StartupSnapshot, version: &str, network: &str) -> View {
     v.text.insert("phase.label", label(&s.phase).to_string());
     v.text.insert("network", network.to_string());
     v.text.insert("version", format!("v{version}"));
-    v.text.insert("uptime", format!("up {}", duration(s.total_elapsed_secs)));
+    v.text
+        .insert("uptime", format!("up {}", duration(s.total_elapsed_secs)));
     v.state.insert("phase", WAIT);
 
     v.text.insert("startup.message", s.message.clone());
@@ -108,8 +110,16 @@ pub fn view(s: &StartupSnapshot, version: &str, network: &str) -> View {
     let target = s.target();
     let progress = if target > 0 {
         let share = s.current as f64 / target as f64;
-        let of = if in_bytes { bytes(target as usize) } else { thousands(target) };
-        let done = if in_bytes { bytes(s.current as usize) } else { thousands(s.current) };
+        let of = if in_bytes {
+            bytes(target as usize)
+        } else {
+            thousands(target)
+        };
+        let done = if in_bytes {
+            bytes(s.current as usize)
+        } else {
+            thousands(s.current)
+        };
         let unit = if in_bytes { "" } else { " blocks" };
         v.width.insert("startup.bar", percent(share));
         format!("{done} of {of}{unit} ({})", percent(share))
@@ -133,7 +143,8 @@ pub fn view(s: &StartupSnapshot, version: &str, network: &str) -> View {
     }
     v.text.insert("startup.elapsed", duration(s.elapsed_secs));
     if let Some(eta) = s.eta_secs {
-        v.text.insert("startup.eta", format!("about {} left", duration(eta)));
+        v.text
+            .insert("startup.eta", format!("about {} left", duration(eta)));
         v.show.insert("startup.eta", true);
     }
 
@@ -180,7 +191,10 @@ mod tests {
         assert_eq!(v.text["phase.label"], "rebuilding chainstate");
         assert_eq!(v.state["phase"], WAIT);
         assert_eq!(v.text["startup.message"], "Replaying UTXO set");
-        assert_eq!(v.text["startup.progress"], "412,930 of 967,870 blocks (42.7%)");
+        assert_eq!(
+            v.text["startup.progress"],
+            "412,930 of 967,870 blocks (42.7%)"
+        );
         assert_eq!(v.width["startup.bar"], "42.7%");
         assert_eq!(v.text["startup.rate"], "115.0 blocks/s");
         assert_eq!(v.text["startup.elapsed"], "1h 02m");
@@ -188,22 +202,42 @@ mod tests {
         assert_eq!(v.text["uptime"], "up 1h 03m");
         assert_eq!(v.text["version"], "v0.6.0-pre");
         assert_eq!(v.text["network"], "mainnet");
-        for key in ["startup", "startup.progress", "startup.bar", "startup.rate", "startup.eta"] {
+        for key in [
+            "startup",
+            "startup.progress",
+            "startup.bar",
+            "startup.rate",
+            "startup.eta",
+        ] {
             assert!(v.show[key], "{key} is hidden");
         }
         for card in NODE_CARDS {
             assert!(!v.show[card], "the {card} card shows during startup");
         }
         let page = render::html(&v);
-        assert!(page.contains(">rebuilding chainstate<"), "the server render says it too");
+        assert!(
+            page.contains(">rebuilding chainstate<"),
+            "the server render says it too"
+        );
         assert!(page.contains("412,930 of 967,870 blocks (42.7%)"));
-        assert!(page.contains("data-s=\"chain\" hidden"), "the chain card is hidden in the first paint");
-        assert!(!page.contains("data-s=\"startup\" hidden"), "the startup card is shown in the first paint");
+        assert!(
+            page.contains("data-s=\"chain\" hidden"),
+            "the chain card is hidden in the first paint"
+        );
+        assert!(
+            !page.contains("data-s=\"startup\" hidden"),
+            "the startup card is shown in the first paint"
+        );
     }
 
     #[test]
     fn other_startup_phases_say_starting_with_the_message() {
-        for phase in ["opening_db", "chain_init", "checkblockindex", "fast_start_download"] {
+        for phase in [
+            "opening_db",
+            "chain_init",
+            "checkblockindex",
+            "fast_start_download",
+        ] {
             let s = StartupSnapshot {
                 phase: phase.to_string(),
                 message: "Initializing chain state...".to_string(),
@@ -211,14 +245,30 @@ mod tests {
             };
             let v = view(&s, "0.6.0-pre", "signet");
             assert_eq!(v.text["phase.label"], "starting", "{phase}");
-            assert_eq!(v.text["startup.message"], "Initializing chain state...", "{phase}");
+            assert_eq!(
+                v.text["startup.message"], "Initializing chain state...",
+                "{phase}"
+            );
             // Nothing counted yet: no progress row, no bar, no rate, no ETA.
-            for key in ["startup.progress", "startup.bar", "startup.rate", "startup.eta"] {
+            for key in [
+                "startup.progress",
+                "startup.bar",
+                "startup.rate",
+                "startup.eta",
+            ] {
                 assert!(!v.show[key], "{phase}: {key} shows with nothing to show");
             }
-            assert_eq!(not_ready_reason(&s), "starting: Initializing chain state...");
+            assert_eq!(
+                not_ready_reason(&s),
+                "starting: Initializing chain state..."
+            );
         }
-        for phase in ["clearing_db", "reindex_scan", "reindex_connect", "reindex_chainstate"] {
+        for phase in [
+            "clearing_db",
+            "reindex_scan",
+            "reindex_connect",
+            "reindex_chainstate",
+        ] {
             assert_eq!(label(phase), "rebuilding chainstate", "{phase}");
         }
     }
@@ -233,7 +283,10 @@ mod tests {
             ..rebuilding()
         };
         let v = view(&s, "0.6.0-pre", "mainnet");
-        assert_eq!(v.text["startup.progress"], "250,000 of 500,000 blocks (50.0%)");
+        assert_eq!(
+            v.text["startup.progress"],
+            "250,000 of 500,000 blocks (50.0%)"
+        );
         assert_eq!(v.width["startup.bar"], "50.0%");
         assert_eq!(s.startup_info()["percent"], 50.0);
     }
@@ -277,7 +330,10 @@ mod tests {
         let v = view(&s, "0.6.0-pre", "mainnet");
         let body: serde_json::Value = serde_json::from_str(&json(&s, &v)).unwrap();
         assert_eq!(body["view"], serde_json::to_value(&v).unwrap());
-        assert!(body.get("snapshot").is_none(), "no snapshot while starting: {body}");
+        assert!(
+            body.get("snapshot").is_none(),
+            "no snapshot while starting: {body}"
+        );
         assert_eq!(body["startup"], s.startup_info());
         assert_eq!(body["startup"]["started"], false);
         assert_eq!(body["startup"]["phase"], "reindex_chainstate");
@@ -296,7 +352,10 @@ mod tests {
         };
         let v = view(&s, "0.6.0-pre", "mainnet");
         let page = render::html(&v);
-        assert!(!page.contains("<script>alert"), "raw script tag in the page");
+        assert!(
+            !page.contains("<script>alert"),
+            "raw script tag in the page"
+        );
         assert!(page.contains("&lt;script&gt;alert(1)&lt;/script&gt;&amp;"));
         let body = json(&s, &v);
         assert!(!body.contains('<') && !body.contains('>'), "{body}");

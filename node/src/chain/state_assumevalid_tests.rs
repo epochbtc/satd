@@ -87,14 +87,25 @@ fn only_buried_ancestors_of_the_assumevalid_block_skip_scripts() {
     }
     assert_eq!(cs.tip_height(), N);
 
-    assert_eq!(reason(&cs, &blocks[12], 13), None, "2017 blocks on top: skipped");
-    assert_eq!(reason(&cs, &blocks[13], 14), Some(av::TOO_RECENT), "exactly two weeks on top");
+    assert_eq!(
+        reason(&cs, &blocks[12], 13),
+        None,
+        "2017 blocks on top: skipped"
+    );
+    assert_eq!(
+        reason(&cs, &blocks[13], 14),
+        Some(av::TOO_RECENT),
+        "exactly two weeks on top"
+    );
     assert_eq!(reason(&cs, av_block, 20), Some(av::TOO_RECENT));
     assert_eq!(reason(&cs, &blocks[20], 21), Some(av::ABOVE_AV_HEIGHT));
 
     // A competitor at height 10, below the assumevalid block, on another branch.
     let side = build_test_block(blocks[8].block_hash(), 10, BASE + 600 * 10 + 1);
-    assert!(matches!(cs.accept_block(&side), Ok(BlockAcceptance::Stored(_))));
+    assert!(matches!(
+        cs.accept_block(&side),
+        Ok(BlockAcceptance::Stored(_))
+    ));
     assert_eq!(reason(&cs, &side, 10), Some(av::NOT_IN_AV_CHAIN));
     // Its height-10 sibling on the assumevalid chain still skips.
     assert_eq!(reason(&cs, &blocks[9], 10), None);
@@ -119,7 +130,10 @@ fn a_best_header_off_the_assumevalid_chain_verifies() {
     assert_eq!(accepted, 40);
     assert_eq!(cs.best_header_hash(), fork.last().unwrap().block_hash());
 
-    assert_eq!(reason(&cs, &blocks[2], 3), Some(av::NOT_IN_BEST_HEADER_CHAIN));
+    assert_eq!(
+        reason(&cs, &blocks[2], 3),
+        Some(av::NOT_IN_BEST_HEADER_CHAIN)
+    );
 }
 
 /// `-assumevalid=all` (satd's) skips by the block's age, read from its own
@@ -127,15 +141,29 @@ fn a_best_header_off_the_assumevalid_chain_verifies() {
 #[test]
 fn assumevalid_all_compares_the_blocks_age_with_the_node_clock() {
     const MAX_AGE: u64 = 86_400;
-    let (cs, _dir) = chain_state(AssumeValid::All { max_age_secs: MAX_AGE });
+    let (cs, _dir) = chain_state(AssumeValid::All {
+        max_age_secs: MAX_AGE,
+    });
     let b = build_test_block(genesis(), 1, 1_300_000_001);
     cs.accept_block(&b).unwrap();
     let t = 1_300_000_001u64;
     let at = |now| cs.script_check_reason_at(1, &b.block_hash(), now);
-    assert_eq!(at(t), Some(av::NEWER_THAN_AGE), "a block mined now is not old");
-    assert_eq!(at(t + MAX_AGE), Some(av::NEWER_THAN_AGE), "the cutoff is exclusive");
+    assert_eq!(
+        at(t),
+        Some(av::NEWER_THAN_AGE),
+        "a block mined now is not old"
+    );
+    assert_eq!(
+        at(t + MAX_AGE),
+        Some(av::NEWER_THAN_AGE),
+        "the cutoff is exclusive"
+    );
     assert_eq!(at(t + MAX_AGE + 1), None);
-    assert_eq!(at(t - 1), Some(av::NEWER_THAN_AGE), "a clock behind the block saturates to age 0");
+    assert_eq!(
+        at(t - 1),
+        Some(av::NEWER_THAN_AGE),
+        "a clock behind the block saturates to age 0"
+    );
 }
 
 /// `should_skip_scripts`, which the connect paths call, answers from the
@@ -168,5 +196,9 @@ fn a_best_header_below_the_minimum_chain_work_verifies() {
     }
     assert_eq!(reason(&cs, &blocks[4], 5), Some(av::BELOW_MIN_CHAINWORK));
     cs.set_minimum_chain_work(None);
-    assert_eq!(reason(&cs, &blocks[4], 5), None, "the same block skips without the floor");
+    assert_eq!(
+        reason(&cs, &blocks[4], 5),
+        None,
+        "the same block skips without the floor"
+    );
 }

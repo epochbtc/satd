@@ -149,9 +149,15 @@ mod tests {
             read_line_bounded(&mut reader, &mut buf, MAX_LINE_BYTES),
         )
         .await;
-        assert!(cancelled.is_err(), "no newline yet, so the read is still pending");
+        assert!(
+            cancelled.is_err(),
+            "no newline yet, so the read is still pending"
+        );
 
-        client.write_all(b"\"method\":\"server.ping\"}\n").await.unwrap();
+        client
+            .write_all(b"\"method\":\"server.ping\"}\n")
+            .await
+            .unwrap();
         client.flush().await.unwrap();
 
         let line = read_line_bounded(&mut reader, &mut buf, MAX_LINE_BYTES)

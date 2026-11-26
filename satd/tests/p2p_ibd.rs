@@ -27,12 +27,16 @@ impl Peer {
         let stream = loop {
             match TcpStream::connect_timeout(&addr, Duration::from_secs(2)) {
                 Ok(s) => break s,
-                Err(_) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(100)),
+                Err(_) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(100))
+                }
                 Err(e) => panic!("connect to {addr}: {e}"),
             }
         };
         stream.set_nodelay(true).unwrap();
-        stream.set_write_timeout(Some(Duration::from_secs(30))).unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(30)))
+            .unwrap();
         let mut peer = Peer { stream };
         peer.send(NetworkMessage::Version(version()));
         let mut got_version = false;
@@ -50,7 +54,9 @@ impl Peer {
 
     fn send(&mut self, msg: NetworkMessage) {
         // The node may close the socket part way through.
-        let _ = self.stream.write_all(&serialize(&RawNetworkMessage::new(Magic::REGTEST, msg)));
+        let _ = self
+            .stream
+            .write_all(&serialize(&RawNetworkMessage::new(Magic::REGTEST, msg)));
     }
 
     fn recv(&mut self, timeout: Duration) -> io::Result<NetworkMessage> {
@@ -61,8 +67,8 @@ impl Peer {
         let mut buf = header.to_vec();
         buf.resize(24 + len, 0);
         self.stream.read_exact(&mut buf[24..])?;
-        let raw: RawNetworkMessage =
-            deserialize(&buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+        let raw: RawNetworkMessage = deserialize(&buf)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
         Ok(raw.into_payload())
     }
 
@@ -79,7 +85,14 @@ impl Peer {
             match self.recv(left) {
                 Ok(NetworkMessage::Ping(n)) => self.send(NetworkMessage::Pong(n)),
                 Ok(_) => {}
-                Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => return None,
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    return None;
+                }
                 Err(_) => return Some(start.elapsed()),
             }
         }
@@ -95,7 +108,10 @@ fn version() -> VersionMessage {
         timestamp: 1_760_000_000,
         receiver: Address::new(&zero, ServiceFlags::NONE),
         sender: Address::new(&zero, services),
-        nonce: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos() as u64,
+        nonce: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as u64,
         user_agent: "/p2p-ibd-test/".into(),
         start_height: 60,
         relay: true,
@@ -126,7 +142,8 @@ fn a_peer_stalling_block_download_is_disconnected() {
     for h in 1..=BLOCKS {
         let hash = source.rpc_ok("getblockhash", vec![serde_json::json!(h)]);
         let hex = source.rpc_ok("getblock", vec![hash, serde_json::json!(0)]);
-        let block: bitcoin::Block = deserialize(&hex::decode(hex.as_str().unwrap()).unwrap()).unwrap();
+        let block: bitcoin::Block =
+            deserialize(&hex::decode(hex.as_str().unwrap()).unwrap()).unwrap();
         headers.push(block.header);
         blocks.insert(block.block_hash(), block);
     }
@@ -139,10 +156,14 @@ fn a_peer_stalling_block_download_is_disconnected() {
     // The node asks the staller for blocks, which it never sends.
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
-        let left = deadline.saturating_duration_since(Instant::now()).max(Duration::from_millis(1));
+        let left = deadline
+            .saturating_duration_since(Instant::now())
+            .max(Duration::from_millis(1));
         match staller.recv(left) {
             Ok(NetworkMessage::GetData(inv))
-                if inv.iter().any(|i| matches!(i, Inventory::WitnessBlock(_) | Inventory::Block(_))) =>
+                if inv
+                    .iter()
+                    .any(|i| matches!(i, Inventory::WitnessBlock(_) | Inventory::Block(_))) =>
             {
                 break;
             }
@@ -174,7 +195,11 @@ fn a_peer_stalling_block_download_is_disconnected() {
                     }
                     Ok(NetworkMessage::Ping(n)) => peer.send(NetworkMessage::Pong(n)),
                     Ok(_) => {}
-                    Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {}
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                        ) => {}
                     Err(_) => break,
                 }
             }
@@ -187,7 +212,10 @@ fn a_peer_stalling_block_download_is_disconnected() {
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
     server.join().unwrap();
     let log = std::fs::read_to_string(&node.stderr_log).unwrap_or_default();
-    assert!(closed.is_some(), "the stalling peer is still connected 35s after its getdata; log:\n{log}");
+    assert!(
+        closed.is_some(),
+        "the stalling peer is still connected 35s after its getdata; log:\n{log}"
+    );
     assert!(
         log.contains("IBD: peer is stalling block download, disconnecting"),
         "the peer was disconnected, but not for stalling; log:\n{log}"

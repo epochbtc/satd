@@ -310,10 +310,7 @@ pub fn locate_errors(s: &str) -> (String, Vec<usize>) {
                 }
                 let l_s1_s0p2 = i32::from(t.log[s1_s0p2]);
 
-                let inv_p1_p2 = 1023
-                    - i32::from(
-                        t.log[(t.exp[p1] ^ t.exp[p2]) as usize],
-                    );
+                let inv_p1_p2 = 1023 - i32::from(t.log[(t.exp[p1] ^ t.exp[p2]) as usize]);
                 let l_e2 = l_s1_s0p1 + inv_p1_p2 + (1023 - 997) * p2 as i32;
                 if l_e2 % 33 != 0 {
                     continue;
@@ -362,7 +359,10 @@ pub enum Decoded {
     /// Not a destination here. Core's `error_str`, plus the character
     /// positions it could attribute (empty for everything but a Bech32
     /// checksum failure).
-    Invalid { error: String, locations: Vec<usize> },
+    Invalid {
+        error: String,
+        locations: Vec<usize>,
+    },
 }
 
 fn bech32_hrp(network: Network) -> &'static str {
@@ -496,18 +496,23 @@ pub fn decode_destination(s: &str, network: Network) -> Decoded {
         // long address. `rust-bitcoin` has no such cap, so apply it here --
         // without it a 50-character string whose first byte happens to match a
         // version prefix gets the wrong message.
-        match bitcoin::base58::decode_check(s).map_err(|_| ()).and_then(|d| {
-            if d.len() <= 21 { Ok(d) } else { Err(()) }
-        }) {
+        match bitcoin::base58::decode_check(s)
+            .map_err(|_| ())
+            .and_then(|d| if d.len() <= 21 { Ok(d) } else { Err(()) })
+        {
             Ok(data) if data.len() == 21 => {
                 let mut hash = [0u8; 20];
                 hash.copy_from_slice(&data[1..]);
                 if data[0] == pubkey_prefix {
-                    let h = bitcoin::PubkeyHash::from(bitcoin::hashes::hash160::Hash::from_byte_array(hash));
+                    let h = bitcoin::PubkeyHash::from(
+                        bitcoin::hashes::hash160::Hash::from_byte_array(hash),
+                    );
                     return Decoded::Valid(bitcoin::Address::p2pkh(h, network));
                 }
                 if data[0] == script_prefix {
-                    let h = bitcoin::ScriptHash::from(bitcoin::hashes::hash160::Hash::from_byte_array(hash));
+                    let h = bitcoin::ScriptHash::from(
+                        bitcoin::hashes::hash160::Hash::from_byte_array(hash),
+                    );
                     return Decoded::Valid(bitcoin::Address::p2sh_from_hash(h, network));
                 }
                 return Decoded::Invalid {
@@ -525,7 +530,10 @@ pub fn decode_destination(s: &str, network: Network) -> Decoded {
                 } else {
                     "Invalid or unsupported Base58-encoded address."
                 };
-                return Decoded::Invalid { error: error.to_string(), locations: Vec::new() };
+                return Decoded::Invalid {
+                    error: error.to_string(),
+                    locations: Vec::new(),
+                };
             }
             Err(_) => {
                 // Core retries the decode without the checksum and with a
@@ -538,7 +546,10 @@ pub fn decode_destination(s: &str, network: Network) -> Decoded {
                     }
                     _ => "Invalid or unsupported Segwit (Bech32) or Base58 encoding.",
                 };
-                return Decoded::Invalid { error: error.to_string(), locations: Vec::new() };
+                return Decoded::Invalid {
+                    error: error.to_string(),
+                    locations: Vec::new(),
+                };
             }
         }
     }
@@ -609,7 +620,10 @@ pub fn decode_destination(s: &str, network: Network) -> Decoded {
     let taproot = version == 1 && program.len() == 32;
     if !taproot && !is_p2a && !(2..=40).contains(&program.len()) {
         return Decoded::Invalid {
-            error: format!("Invalid Bech32 address program size ({} {byte_str})", program.len()),
+            error: format!(
+                "Invalid Bech32 address program size ({} {byte_str})",
+                program.len()
+            ),
             locations: Vec::new(),
         };
     }
@@ -623,7 +637,10 @@ pub fn decode_destination(s: &str, network: Network) -> Decoded {
     match bitcoin::WitnessProgram::new(wv, &program) {
         Ok(wp) => Decoded::Valid(bitcoin::Address::from_witness_program(wp, network)),
         Err(_) => Decoded::Invalid {
-            error: format!("Invalid Bech32 address program size ({} {byte_str})", program.len()),
+            error: format!(
+                "Invalid Bech32 address program size ({} {byte_str})",
+                program.len()
+            ),
             locations: Vec::new(),
         },
     }
@@ -643,17 +660,41 @@ mod tests {
                 "Bech32 string too long",
                 &[90],
             ),
-            ("bcrt1q049edschfnwystcqnsvyfpj23mpsg3jcedq9xv", "Invalid Bech32 checksum", &[9]),
-            ("bcrt1qax9suht3qv95sw33xavx8crpxduefdrsvgsklu", "Invalid Bech32 checksum", &[22, 43]),
-            ("BCRT1QPLMTZKC2XHARPPZDLNPAQL78RSHJ68U32RAH7R", "Invalid Bech32 checksum", &[38]),
-            ("bcrtq049ldschfnwystcqnsvyfpj23mpsg3jcedq9xv", "Missing separator", &[]),
-            ("bcrt1q04oldschfnwystcqnsvyfpj23mpsg3jcedq9xv", "Invalid Base 32 character", &[8]),
+            (
+                "bcrt1q049edschfnwystcqnsvyfpj23mpsg3jcedq9xv",
+                "Invalid Bech32 checksum",
+                &[9],
+            ),
+            (
+                "bcrt1qax9suht3qv95sw33xavx8crpxduefdrsvgsklu",
+                "Invalid Bech32 checksum",
+                &[22, 43],
+            ),
+            (
+                "BCRT1QPLMTZKC2XHARPPZDLNPAQL78RSHJ68U32RAH7R",
+                "Invalid Bech32 checksum",
+                &[38],
+            ),
+            (
+                "bcrtq049ldschfnwystcqnsvyfpj23mpsg3jcedq9xv",
+                "Missing separator",
+                &[],
+            ),
+            (
+                "bcrt1q04oldschfnwystcqnsvyfpj23mpsg3jcedq9xv",
+                "Invalid Base 32 character",
+                &[8],
+            ),
             (
                 "bcrt1qdg3myrgvzw7ml8q0ejxhlkyxn7vl9r56yzkfgvzclrf4hkpx9yfqhpsuks",
                 "Invalid Bech32 checksum",
                 &[19, 30],
             ),
-            ("bcrt1ptmp74ayg7p24uslctssvjm06q5phz4yrxucgnv", "Invalid Bech32 checksum", &[5]),
+            (
+                "bcrt1ptmp74ayg7p24uslctssvjm06q5phz4yrxucgnv",
+                "Invalid Bech32 checksum",
+                &[5],
+            ),
         ];
         for (addr, want_msg, want_pos) in cases {
             let (msg, pos) = locate_errors(addr);
@@ -715,10 +756,16 @@ mod tests {
     fn an_address_for_another_network_is_not_valid_here() {
         // A mainnet P2SH address (`wallet_disable.py` uses this exact one).
         let m = decode_destination("3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy", Network::Regtest);
-        assert!(matches!(m, Decoded::Invalid { .. }), "mainnet P2SH must not validate on regtest");
+        assert!(
+            matches!(m, Decoded::Invalid { .. }),
+            "mainnet P2SH must not validate on regtest"
+        );
         // ... and the regtest one it pairs with must still validate.
         let r = decode_destination("mneYUmWYsuk7kySiURxCi3AGxrAqZxLgPZ", Network::Regtest);
-        assert!(matches!(r, Decoded::Valid(_)), "regtest P2PKH must validate on regtest");
+        assert!(
+            matches!(r, Decoded::Valid(_)),
+            "regtest P2PKH must validate on regtest"
+        );
         // A mainnet bech32 string on regtest: the HRP does not match, so Core
         // routes it to the Base58 path and reports an encoding error.
         let b = decode_destination(
@@ -811,7 +858,10 @@ mod tests {
             "mipcBbFg9gMiCh81Kj8tqqdgoZub1ZJRfn",
         ] {
             assert!(
-                matches!(decode_destination(addr, Network::Regtest), Decoded::Valid(_)),
+                matches!(
+                    decode_destination(addr, Network::Regtest),
+                    Decoded::Valid(_)
+                ),
                 "{addr} must validate on regtest"
             );
         }
@@ -824,8 +874,19 @@ mod tests {
     /// cannot throw.
     #[test]
     fn a_multibyte_first_character_does_not_panic() {
-        for network in [Network::Bitcoin, Network::Regtest, Network::Testnet, Network::Signet] {
-            for s in ["\u{20ac}", "bcr\u{20ac}xxxx", "\u{20ac}\u{20ac}", "b\u{20ac}", "\u{1f600}1qqqq"] {
+        for network in [
+            Network::Bitcoin,
+            Network::Regtest,
+            Network::Testnet,
+            Network::Signet,
+        ] {
+            for s in [
+                "\u{20ac}",
+                "bcr\u{20ac}xxxx",
+                "\u{20ac}\u{20ac}",
+                "b\u{20ac}",
+                "\u{1f600}1qqqq",
+            ] {
                 // The value does not matter; not panicking does.
                 let _ = decode_destination(s, network);
             }
@@ -847,8 +908,7 @@ mod tests {
         let elapsed = started.elapsed();
         match decoded {
             Decoded::Invalid { error, .. } => assert_eq!(
-                error,
-                "Invalid or unsupported Segwit (Bech32) or Base58 encoding.",
+                error, "Invalid or unsupported Segwit (Bech32) or Base58 encoding.",
                 "must be Core's message for an undecodable string"
             ),
             Decoded::Valid(_) => panic!("400k ones is not an address"),

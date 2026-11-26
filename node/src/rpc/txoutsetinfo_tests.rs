@@ -7,11 +7,11 @@
 //! `ParseHashOrHeight`).
 
 use bitcoin::Network;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
-use crate::chain::state::tests::{build_test_block, make_chain_state};
 use crate::chain::state::ChainState;
-use crate::rpc::blockchain::{get_tx_out_set_info_with, TxOutSetInfoArgs};
+use crate::chain::state::tests::{build_test_block, make_chain_state};
+use crate::rpc::blockchain::{TxOutSetInfoArgs, get_tx_out_set_info_with};
 
 fn chain(n: u32) -> (ChainState, std::path::PathBuf) {
     let (cs, dir) = make_chain_state();
@@ -30,7 +30,11 @@ fn call(
     hash_or_height: Option<Value>,
     use_index: Option<bool>,
 ) -> Result<Value, (i32, String)> {
-    let args = TxOutSetInfoArgs { hash_type: hash_type.map(str::to_string), hash_or_height, use_index };
+    let args = TxOutSetInfoArgs {
+        hash_type: hash_type.map(str::to_string),
+        hash_or_height,
+        use_index,
+    };
     get_tx_out_set_info_with(cs, &args)
 }
 
@@ -71,7 +75,11 @@ fn a_block_other_than_the_tip_is_refused() {
             Err((-8, NEEDS_INDEX.to_string())),
             "{hoh}"
         );
-        assert_eq!(call(&cs, None, Some(hoh.clone()), None), Err((-8, NEEDS_INDEX.to_string())), "{hoh}");
+        assert_eq!(
+            call(&cs, None, Some(hoh.clone()), None),
+            Err((-8, NEEDS_INDEX.to_string())),
+            "{hoh}"
+        );
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -95,32 +103,68 @@ fn cores_argument_errors_are_cores() {
     let tip = cs.tip_hash().to_string();
     let err = |t: Option<&str>, h: Option<Value>, u: Option<bool>| call(&cs, t, h, u).unwrap_err();
 
-    assert_eq!(err(Some("sha256"), None, None), (-8, "'sha256' is not a valid hash_type".into()));
+    assert_eq!(
+        err(Some("sha256"), None, None),
+        (-8, "'sha256' is not a valid hash_type".into())
+    );
     // `ParseHashType` runs before anything looks at the height.
-    assert_eq!(err(Some("sha256"), Some(json!(3)), None), (-8, "'sha256' is not a valid hash_type".into()));
-    assert_eq!(err(None, Some(json!(-1)), None), (-8, "Target block height -1 is negative".into()));
-    assert_eq!(err(None, Some(json!(6)), None), (-8, "Target block height 6 after current tip 5".into()));
-    assert_eq!(err(None, Some(json!(1.5)), None), (-1, "JSON integer out of range".into()));
+    assert_eq!(
+        err(Some("sha256"), Some(json!(3)), None),
+        (-8, "'sha256' is not a valid hash_type".into())
+    );
+    assert_eq!(
+        err(None, Some(json!(-1)), None),
+        (-8, "Target block height -1 is negative".into())
+    );
+    assert_eq!(
+        err(None, Some(json!(6)), None),
+        (-8, "Target block height 6 after current tip 5".into())
+    );
+    assert_eq!(
+        err(None, Some(json!(1.5)), None),
+        (-1, "JSON integer out of range".into())
+    );
     assert_eq!(
         err(None, Some(json!("abc")), None),
-        (-8, "hash_or_height must be of length 64 (not 3, for 'abc')".into())
+        (
+            -8,
+            "hash_or_height must be of length 64 (not 3, for 'abc')".into()
+        )
     );
-    assert_eq!(err(None, Some(json!("00".repeat(32))), None), (-5, "Block not found".into()));
+    assert_eq!(
+        err(None, Some(json!("00".repeat(32))), None),
+        (-5, "Block not found".into())
+    );
     assert_eq!(
         err(None, Some(json!(true)), None),
-        (-1, "JSON value of type bool is not of expected type string".into())
+        (
+            -1,
+            "JSON value of type bool is not of expected type string".into()
+        )
     );
     // The two checks Core makes for a named block apply to the tip too.
     assert_eq!(
         err(Some("hash_serialized_3"), Some(json!(tip.clone())), None),
-        (-8, "hash_serialized_3 hash type cannot be queried for a specific block".into())
+        (
+            -8,
+            "hash_serialized_3 hash type cannot be queried for a specific block".into()
+        )
     );
     assert_eq!(
         err(Some("none"), Some(json!(5)), Some(false)),
-        (-8, "Cannot set use_index to false when querying for a specific block".into())
+        (
+            -8,
+            "Cannot set use_index to false when querying for a specific block".into()
+        )
     );
     // Without coinstatsindex Core refuses a named block before either.
-    assert_eq!(err(Some("hash_serialized_3"), Some(json!(3)), None), (-8, NEEDS_INDEX.into()));
-    assert_eq!(err(None, Some(json!(3)), Some(false)), (-8, NEEDS_INDEX.into()));
+    assert_eq!(
+        err(Some("hash_serialized_3"), Some(json!(3)), None),
+        (-8, NEEDS_INDEX.into())
+    );
+    assert_eq!(
+        err(None, Some(json!(3)), Some(false)),
+        (-8, NEEDS_INDEX.into())
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }

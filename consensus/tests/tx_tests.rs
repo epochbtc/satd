@@ -14,8 +14,8 @@
 mod helpers;
 
 use bitcoin::consensus::Decodable;
-use bitcoin::{Amount, OutPoint, ScriptBuf, Transaction, Txid, TxOut};
 use bitcoin::hashes::Hash;
+use bitcoin::{Amount, OutPoint, ScriptBuf, Transaction, TxOut, Txid};
 use consensus::flags;
 use consensus::sighash::TxSignatureChecker;
 use consensus::verify::verify_script;
@@ -90,10 +90,7 @@ fn check_tx_scripts(
         .iter()
         .map(|input| {
             let key = (input.previous_output.txid, input.previous_output.vout);
-            let script_pubkey = script_map
-                .get(&key)
-                .cloned()
-                .unwrap_or_default();
+            let script_pubkey = script_map.get(&key).cloned().unwrap_or_default();
             let amount = value_map.get(&key).copied().unwrap_or(0);
             TxOut {
                 value: Amount::from_sat(amount as u64),
@@ -157,25 +154,40 @@ fn test_tx_valid() {
         let inputs = arr[0].as_array().unwrap();
         let tx_hex = match arr[1].as_str() {
             Some(s) => s,
-            None => { skipped += 1; continue; }
+            None => {
+                skipped += 1;
+                continue;
+            }
         };
         let flags_str = match arr[2].as_str() {
             Some(s) => s,
-            None => { skipped += 1; continue; }
+            None => {
+                skipped += 1;
+                continue;
+            }
         };
 
         let (script_map, value_map) = match parse_prevouts(inputs) {
             Some(maps) => maps,
-            None => { skipped += 1; continue; }
+            None => {
+                skipped += 1;
+                continue;
+            }
         };
 
         let tx_bytes = match hex::decode(tx_hex) {
             Ok(b) => b,
-            Err(_) => { skipped += 1; continue; }
+            Err(_) => {
+                skipped += 1;
+                continue;
+            }
         };
         let tx: Transaction = match Transaction::consensus_decode(&mut tx_bytes.as_slice()) {
             Ok(tx) => tx,
-            Err(_) => { skipped += 1; continue; }
+            Err(_) => {
+                skipped += 1;
+                continue;
+            }
         };
 
         // tx_valid: flags specify what to EXCLUDE. Run with ~flags.
@@ -194,10 +206,7 @@ fn test_tx_valid() {
             };
             eprintln!(
                 "FAIL tx_valid: flags='{}' verify_flags=0x{:x} comment='{}' tx={:.60}...",
-                flags_str,
-                verify_flags,
-                comment,
-                tx_hex,
+                flags_str, verify_flags, comment, tx_hex,
             );
         }
     }
@@ -227,11 +236,17 @@ fn test_tx_invalid() {
         let inputs = arr[0].as_array().unwrap();
         let tx_hex = match arr[1].as_str() {
             Some(s) => s,
-            None => { skipped += 1; continue; }
+            None => {
+                skipped += 1;
+                continue;
+            }
         };
         let flags_str = match arr[2].as_str() {
             Some(s) => s,
-            None => { skipped += 1; continue; }
+            None => {
+                skipped += 1;
+                continue;
+            }
         };
 
         // BADTX: malformed transaction that fails CheckTransaction or deserialization.
@@ -241,7 +256,10 @@ fn test_tx_invalid() {
         if flags_str == "BADTX" {
             let tx_bytes = match hex::decode(tx_hex) {
                 Ok(b) => b,
-                Err(_) => { passed += 1; continue; }
+                Err(_) => {
+                    passed += 1;
+                    continue;
+                }
             };
             match Transaction::consensus_decode(&mut tx_bytes.as_slice()) {
                 Ok(tx) => {
@@ -260,7 +278,11 @@ fn test_tx_invalid() {
                         }
                         || {
                             // null prevout in non-coinbase (coinbase has exactly 1 input with null prevout)
-                            tx.input.len() > 1 && tx.input.iter().any(|i| i.previous_output == OutPoint::null())
+                            tx.input.len() > 1
+                                && tx
+                                    .input
+                                    .iter()
+                                    .any(|i| i.previous_output == OutPoint::null())
                         }
                         || {
                             // negative value (sign bit set in i64 interpretation)
@@ -297,12 +319,18 @@ fn test_tx_invalid() {
 
         let (script_map, value_map) = match parse_prevouts(inputs) {
             Some(maps) => maps,
-            None => { skipped += 1; continue; }
+            None => {
+                skipped += 1;
+                continue;
+            }
         };
 
         let tx_bytes = match hex::decode(tx_hex) {
             Ok(b) => b,
-            Err(_) => { skipped += 1; continue; }
+            Err(_) => {
+                skipped += 1;
+                continue;
+            }
         };
         let tx: Transaction = match Transaction::consensus_decode(&mut tx_bytes.as_slice()) {
             Ok(tx) => tx,

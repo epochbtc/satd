@@ -117,7 +117,9 @@ pub async fn address_info(
     Path(addr): Path<String>,
 ) -> EsploraResult<Json<AddressInfoJson>> {
     let sh = parse_address(&addr, state.network)?;
-    Ok(Json(off_worker(&state, move |st| build_address_info(st, &pin, &addr, &sh)).await?))
+    Ok(Json(
+        off_worker(&state, move |st| build_address_info(st, &pin, &addr, &sh)).await?,
+    ))
 }
 
 pub async fn address_txs_combined(
@@ -128,7 +130,12 @@ pub async fn address_txs_combined(
 ) -> EsploraResult<Json<Vec<TxJson>>> {
     let sh = parse_address(&addr, state.network)?;
     let after_txid = parse_after_txid(&query)?;
-    Ok(Json(off_worker(&state, move |st| build_combined_txs(st, &pin, &sh, after_txid)).await?))
+    Ok(Json(
+        off_worker(&state, move |st| {
+            build_combined_txs(st, &pin, &sh, after_txid)
+        })
+        .await?,
+    ))
 }
 
 pub async fn address_txs_chain(
@@ -137,7 +144,9 @@ pub async fn address_txs_chain(
     Path(addr): Path<String>,
 ) -> EsploraResult<Json<Vec<TxJson>>> {
     let sh = parse_address(&addr, state.network)?;
-    Ok(Json(off_worker(&state, move |st| build_chain_txs(st, &pin, &sh, None)).await?))
+    Ok(Json(
+        off_worker(&state, move |st| build_chain_txs(st, &pin, &sh, None)).await?,
+    ))
 }
 
 pub async fn address_txs_chain_paged(
@@ -147,7 +156,12 @@ pub async fn address_txs_chain_paged(
 ) -> EsploraResult<Json<Vec<TxJson>>> {
     let sh = parse_address(&addr, state.network)?;
     let last_seen = parse_txid(&last_seen)?;
-    Ok(Json(off_worker(&state, move |st| build_chain_txs(st, &pin, &sh, Some(last_seen))).await?))
+    Ok(Json(
+        off_worker(&state, move |st| {
+            build_chain_txs(st, &pin, &sh, Some(last_seen))
+        })
+        .await?,
+    ))
 }
 
 pub async fn address_txs_summary(
@@ -158,7 +172,9 @@ pub async fn address_txs_summary(
 ) -> EsploraResult<Json<Vec<TxSummaryJson>>> {
     let sh = parse_address(&addr, state.network)?;
     let after = parse_after_txid(&query)?;
-    Ok(Json(off_worker(&state, move |st| build_summary_txs(st, &pin, &sh, after)).await?))
+    Ok(Json(
+        off_worker(&state, move |st| build_summary_txs(st, &pin, &sh, after)).await?,
+    ))
 }
 
 pub async fn address_txs_summary_paged(
@@ -168,7 +184,12 @@ pub async fn address_txs_summary_paged(
 ) -> EsploraResult<Json<Vec<TxSummaryJson>>> {
     let sh = parse_address(&addr, state.network)?;
     let last_seen = parse_txid(&last_seen)?;
-    Ok(Json(off_worker(&state, move |st| build_summary_txs(st, &pin, &sh, Some(last_seen))).await?))
+    Ok(Json(
+        off_worker(&state, move |st| {
+            build_summary_txs(st, &pin, &sh, Some(last_seen))
+        })
+        .await?,
+    ))
 }
 
 pub async fn address_txs_mempool(
@@ -176,7 +197,9 @@ pub async fn address_txs_mempool(
     Path(addr): Path<String>,
 ) -> EsploraResult<Json<Vec<TxJson>>> {
     let sh = parse_address(&addr, state.network)?;
-    Ok(Json(off_worker(&state, move |st| build_mempool_txs(st, &sh)).await?))
+    Ok(Json(
+        off_worker(&state, move |st| build_mempool_txs(st, &sh)).await?,
+    ))
 }
 
 pub async fn address_utxo(
@@ -185,7 +208,9 @@ pub async fn address_utxo(
     Path(addr): Path<String>,
 ) -> EsploraResult<Json<Vec<UtxoJson>>> {
     let sh = parse_address(&addr, state.network)?;
-    Ok(Json(off_worker(&state, move |st| build_utxos(st, &pin, &sh)).await?))
+    Ok(Json(
+        off_worker(&state, move |st| build_utxos(st, &pin, &sh)).await?,
+    ))
 }
 
 // ── Scripthash handlers (parallel set) ─────────────────────────────
@@ -196,7 +221,9 @@ pub async fn scripthash_info(
     Path(hash): Path<String>,
 ) -> EsploraResult<Json<AddressInfoJson>> {
     let sh = parse_scripthash(&hash)?;
-    Ok(Json(off_worker(&state, move |st| build_address_info(st, &pin, &hash, &sh)).await?))
+    Ok(Json(
+        off_worker(&state, move |st| build_address_info(st, &pin, &hash, &sh)).await?,
+    ))
 }
 
 pub async fn scripthash_txs_combined(
@@ -207,7 +234,12 @@ pub async fn scripthash_txs_combined(
 ) -> EsploraResult<Json<Vec<TxJson>>> {
     let sh = parse_scripthash(&hash)?;
     let after_txid = parse_after_txid(&query)?;
-    Ok(Json(off_worker(&state, move |st| build_combined_txs(st, &pin, &sh, after_txid)).await?))
+    Ok(Json(
+        off_worker(&state, move |st| {
+            build_combined_txs(st, &pin, &sh, after_txid)
+        })
+        .await?,
+    ))
 }
 
 pub async fn scripthash_txs_chain(
@@ -216,7 +248,9 @@ pub async fn scripthash_txs_chain(
     Path(hash): Path<String>,
 ) -> EsploraResult<Json<Vec<TxJson>>> {
     let sh = parse_scripthash(&hash)?;
-    Ok(Json(off_worker(&state, move |st| build_chain_txs(st, &pin, &sh, None)).await?))
+    Ok(Json(
+        off_worker(&state, move |st| build_chain_txs(st, &pin, &sh, None)).await?,
+    ))
 }
 
 pub async fn scripthash_txs_chain_paged(
@@ -226,7 +260,12 @@ pub async fn scripthash_txs_chain_paged(
 ) -> EsploraResult<Json<Vec<TxJson>>> {
     let sh = parse_scripthash(&hash)?;
     let last_seen = parse_txid(&last_seen)?;
-    Ok(Json(off_worker(&state, move |st| build_chain_txs(st, &pin, &sh, Some(last_seen))).await?))
+    Ok(Json(
+        off_worker(&state, move |st| {
+            build_chain_txs(st, &pin, &sh, Some(last_seen))
+        })
+        .await?,
+    ))
 }
 
 pub async fn scripthash_txs_summary(
@@ -237,7 +276,9 @@ pub async fn scripthash_txs_summary(
 ) -> EsploraResult<Json<Vec<TxSummaryJson>>> {
     let sh = parse_scripthash(&hash)?;
     let after = parse_after_txid(&query)?;
-    Ok(Json(off_worker(&state, move |st| build_summary_txs(st, &pin, &sh, after)).await?))
+    Ok(Json(
+        off_worker(&state, move |st| build_summary_txs(st, &pin, &sh, after)).await?,
+    ))
 }
 
 pub async fn scripthash_txs_summary_paged(
@@ -247,7 +288,12 @@ pub async fn scripthash_txs_summary_paged(
 ) -> EsploraResult<Json<Vec<TxSummaryJson>>> {
     let sh = parse_scripthash(&hash)?;
     let last_seen = parse_txid(&last_seen)?;
-    Ok(Json(off_worker(&state, move |st| build_summary_txs(st, &pin, &sh, Some(last_seen))).await?))
+    Ok(Json(
+        off_worker(&state, move |st| {
+            build_summary_txs(st, &pin, &sh, Some(last_seen))
+        })
+        .await?,
+    ))
 }
 
 pub async fn scripthash_txs_mempool(
@@ -255,7 +301,9 @@ pub async fn scripthash_txs_mempool(
     Path(hash): Path<String>,
 ) -> EsploraResult<Json<Vec<TxJson>>> {
     let sh = parse_scripthash(&hash)?;
-    Ok(Json(off_worker(&state, move |st| build_mempool_txs(st, &sh)).await?))
+    Ok(Json(
+        off_worker(&state, move |st| build_mempool_txs(st, &sh)).await?,
+    ))
 }
 
 pub async fn scripthash_utxo(
@@ -264,7 +312,9 @@ pub async fn scripthash_utxo(
     Path(hash): Path<String>,
 ) -> EsploraResult<Json<Vec<UtxoJson>>> {
     let sh = parse_scripthash(&hash)?;
-    Ok(Json(off_worker(&state, move |st| build_utxos(st, &pin, &sh)).await?))
+    Ok(Json(
+        off_worker(&state, move |st| build_utxos(st, &pin, &sh)).await?,
+    ))
 }
 
 #[cfg(test)]
@@ -277,17 +327,15 @@ fn parse_address(s: &str, network: Network) -> EsploraResult<Scripthash> {
     let unchecked: Address<NetworkUnchecked> = s
         .parse()
         .map_err(|e| EsploraError::BadRequest(format!("bad address '{s}': {e}")))?;
-    let address = unchecked
-        .require_network(network)
-        .map_err(|e| {
-            EsploraError::BadRequest(format!("address '{s}' not valid for network: {e}"))
-        })?;
+    let address = unchecked.require_network(network).map_err(|e| {
+        EsploraError::BadRequest(format!("address '{s}' not valid for network: {e}"))
+    })?;
     Ok(scripthash_of(&address.script_pubkey()))
 }
 
 fn parse_scripthash(s: &str) -> EsploraResult<Scripthash> {
-    let bytes = hex::decode(s)
-        .map_err(|e| EsploraError::BadRequest(format!("bad scripthash hex: {e}")))?;
+    let bytes =
+        hex::decode(s).map_err(|e| EsploraError::BadRequest(format!("bad scripthash hex: {e}")))?;
     if bytes.len() != 32 {
         return Err(EsploraError::BadRequest(format!(
             "scripthash must be 32 bytes (64 hex chars); got {}",
@@ -394,9 +442,15 @@ fn split_stats_at_pin(history: &[HistoryEntry], pin: &Pin) -> (AddressStatsJson,
 
 fn add_stats(stats: &mut AddressStatsJson, late: &LateStats) {
     stats.tx_count = stats.tx_count.saturating_add(late.stats.tx_count);
-    stats.funded_txo_count = stats.funded_txo_count.saturating_add(late.stats.funded_txo_count);
-    stats.funded_txo_sum = stats.funded_txo_sum.saturating_add(late.stats.funded_txo_sum);
-    stats.spent_txo_count = stats.spent_txo_count.saturating_add(late.stats.spent_txo_count);
+    stats.funded_txo_count = stats
+        .funded_txo_count
+        .saturating_add(late.stats.funded_txo_count);
+    stats.funded_txo_sum = stats
+        .funded_txo_sum
+        .saturating_add(late.stats.funded_txo_sum);
+    stats.spent_txo_count = stats
+        .spent_txo_count
+        .saturating_add(late.stats.spent_txo_count);
     stats.spent_txo_sum = stats.spent_txo_sum.saturating_add(late.stats.spent_txo_sum);
 }
 
@@ -446,9 +500,7 @@ fn compute_chain_stats_from_history(history: &[HistoryEntry]) -> AddressStatsJso
         } = entry
         {
             spent_txo_count = spent_txo_count.saturating_add(1);
-            if let Some(&amt) =
-                funding_amount.get(&(prev_outpoint.txid, prev_outpoint.vout))
-            {
+            if let Some(&amt) = funding_amount.get(&(prev_outpoint.txid, prev_outpoint.vout)) {
                 spent_txo_sum = spent_txo_sum.saturating_add(amt);
             }
             tx_set.insert(*txid);
@@ -487,9 +539,7 @@ mod tests {
 
     fn fixture_txid(byte: u8) -> Txid {
         use bitcoin::hashes::Hash as _;
-        Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array(
-            [byte; 32],
-        ))
+        Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array([byte; 32]))
     }
 
     /// Review M1: same-block parent funds + child spends. The child's
@@ -572,7 +622,11 @@ mod tests {
 ///
 /// A transaction the late rows already count (it confirmed above the pin
 /// while the mempool index still listed it) is skipped.
-fn build_mempool_stats(state: &EsploraState, sh: &Scripthash, late: &LateStats) -> AddressStatsJson {
+fn build_mempool_stats(
+    state: &EsploraState,
+    sh: &Scripthash,
+    late: &LateStats,
+) -> AddressStatsJson {
     let entries = state.address_index.mempool_history(sh);
 
     let mut tx_count: u64 = 0;
@@ -607,8 +661,7 @@ fn build_mempool_stats(state: &EsploraState, sh: &Scripthash, late: &LateStats) 
                     touched = true;
                 }
             } else if let Some(parent) = state.mempool.get(&input.previous_output.txid)
-                && let Some(parent_out) =
-                    parent.tx.output.get(input.previous_output.vout as usize)
+                && let Some(parent_out) = parent.tx.output.get(input.previous_output.vout as usize)
                 && &scripthash_of(&parent_out.script_pubkey) == sh
             {
                 spent_txo_count = spent_txo_count.saturating_add(1);
@@ -717,11 +770,7 @@ fn confirmed_page(
 /// Whether `txid` is in the script's confirmed history. An empty page after
 /// it exists exactly when it is; for a transaction that is not confirmed the
 /// index answers from one ordinal lookup.
-fn in_confirmed_history(
-    state: &EsploraState,
-    sh: &Scripthash,
-    txid: &Txid,
-) -> EsploraResult<bool> {
+fn in_confirmed_history(state: &EsploraState, sh: &Scripthash, txid: &Txid) -> EsploraResult<bool> {
     Ok(state
         .address_index
         .confirmed_txs_newest_first(sh, Some(*txid), 0)?
@@ -985,14 +1034,26 @@ fn net_values(page: &[(u32, Txid)], history: &[HistoryEntry]) -> HashMap<Txid, i
             HistoryEntry::Funding { amount_sat, .. } => {
                 *value = value.saturating_add(sats(*amount_sat));
             }
-            HistoryEntry::Spending { txid, prev_outpoint, .. } => {
+            HistoryEntry::Spending {
+                txid,
+                prev_outpoint,
+                ..
+            } => {
                 spent_by.insert(*prev_outpoint, *txid);
             }
         }
     }
     for entry in history {
-        if let HistoryEntry::Funding { txid, vout, amount_sat, .. } = entry
-            && let Some(spender) = spent_by.get(&OutPoint { txid: *txid, vout: *vout })
+        if let HistoryEntry::Funding {
+            txid,
+            vout,
+            amount_sat,
+            ..
+        } = entry
+            && let Some(spender) = spent_by.get(&OutPoint {
+                txid: *txid,
+                vout: *vout,
+            })
             && let Some(value) = values.get_mut(spender)
         {
             *value = value.saturating_sub(sats(*amount_sat));
@@ -1011,10 +1072,7 @@ fn confirmed_place(state: &EsploraState, txid: &Txid) -> Option<(u32, u32)> {
 }
 
 /// Render confirmed `(height, txid)` transactions in full Esplora shape.
-fn render_confirmed_txs(
-    state: &EsploraState,
-    page: &[(u32, Txid)],
-) -> EsploraResult<Vec<TxJson>> {
+fn render_confirmed_txs(state: &EsploraState, page: &[(u32, Txid)]) -> EsploraResult<Vec<TxJson>> {
     let mut out = Vec::with_capacity(page.len());
     for (height, txid) in page {
         // Render full Esplora-shape tx JSON. Requires txindex (to find
@@ -1030,10 +1088,7 @@ fn render_confirmed_txs(
 
 /// `/address/:addr/txs/mempool` — up to 50 mempool txs, no paging, in the
 /// order this node admitted them (see `mempool_txids_in_admission_order`).
-fn build_mempool_txs(
-    state: &EsploraState,
-    sh: &Scripthash,
-) -> EsploraResult<Vec<TxJson>> {
+fn build_mempool_txs(state: &EsploraState, sh: &Scripthash) -> EsploraResult<Vec<TxJson>> {
     let mut txids = mempool_txids_in_admission_order(state, sh);
     txids.truncate(MEMPOOL_TXS_LIMIT);
     render_mempool_txs(state, &txids)
@@ -1069,7 +1124,9 @@ fn render_mempool_txs(state: &EsploraState, txids: &[Txid]) -> EsploraResult<Vec
     let mut out = Vec::with_capacity(txids.len());
     for txid in txids {
         if let Some(entry) = state.mempool.get(txid) {
-            out.push(crate::handlers::tx::build_mempool_tx_json(state, &entry.tx)?);
+            out.push(crate::handlers::tx::build_mempool_tx_json(
+                state, &entry.tx,
+            )?);
         }
     }
     Ok(out)
@@ -1092,11 +1149,7 @@ fn render_mempool_txs(state: &EsploraState, txids: &[Txid]) -> EsploraResult<Vec
 ///
 /// A confirmed UTXO created above the pinned tip was an unconfirmed output
 /// as of the pin, and is listed as one.
-fn build_utxos(
-    state: &EsploraState,
-    pin: &Pin,
-    sh: &Scripthash,
-) -> EsploraResult<Vec<UtxoJson>> {
+fn build_utxos(state: &EsploraState, pin: &Pin, sh: &Scripthash) -> EsploraResult<Vec<UtxoJson>> {
     if !pin.mempool {
         return build_utxos_as_of(state, pin, sh);
     }
@@ -1212,7 +1265,12 @@ fn build_utxos_as_of(
         else {
             continue;
         };
-        if !pin.covers(*height) || spent.contains(&OutPoint { txid: *txid, vout: *vout }) {
+        if !pin.covers(*height)
+            || spent.contains(&OutPoint {
+                txid: *txid,
+                vout: *vout,
+            })
+        {
             continue;
         }
         let block_hash = pin.hash_at_height(&state.chain, *height);

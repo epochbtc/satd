@@ -21,7 +21,6 @@
 //!
 //! Nothing here holds a secret or signs anything.
 
-
 use bitcoin::hashes::{Hash, hash160};
 use bitcoin::secp256k1::{PublicKey, Scalar, Secp256k1};
 use bitcoin::{OutPoint, ScriptBuf, TxOut, WitnessVersion};
@@ -298,7 +297,10 @@ pub enum KeyBinding {
 /// set. That is the one check a node can do and a hardware wallet cannot: a
 /// `witness_utxo` is whatever the PSBT's author wrote, and for a taproot input
 /// it *is* the public key the share is supposed to belong to.
-pub fn verify(view: &V2View<'_>, lookup: Option<&PrevoutLookup<'_>>) -> Result<SpReport, PsbtError> {
+pub fn verify(
+    view: &V2View<'_>,
+    lookup: Option<&PrevoutLookup<'_>>,
+) -> Result<SpReport, PsbtError> {
     verify_with_binding(view, lookup, KeyBinding::Required)
 }
 
@@ -440,8 +442,7 @@ pub fn verify_with_binding(
                 None => (
                     OutputStatus::InvalidInputs,
                     Some(
-                        "the eligible inputs' public keys do not sum to a usable value"
-                            .to_string(),
+                        "the eligible inputs' public keys do not sum to a usable value".to_string(),
                     ),
                 ),
             };
@@ -504,8 +505,7 @@ fn assign_k(
         let mut all_match = true;
         for (k, position) in order.iter().enumerate() {
             let report = &reports[*position];
-            let script =
-                derive_script(secp, ecdh, input_hash, &report.spend_key, k as u32);
+            let script = derive_script(secp, ecdh, input_hash, &report.spend_key, k as u32);
             if report.script_present && script.as_ref() != report.declared_script.as_ref() {
                 all_match = false;
             }
@@ -553,7 +553,6 @@ fn assign_k(
         }
     }
 }
-
 
 /// Per-input eligibility, key binding and previous-output cross-check.
 fn input_reports(
@@ -624,9 +623,15 @@ fn blocking_condition(
         return Ok(Some(match unverifiable {
             Some(report) => (
                 OutputStatus::Unverifiable,
-                format!("input {}: {}", report.index, report.ineligible.as_ref()
-                    .map(Ineligible::reason)
-                    .unwrap_or_default()),
+                format!(
+                    "input {}: {}",
+                    report.index,
+                    report
+                        .ineligible
+                        .as_ref()
+                        .map(Ineligible::reason)
+                        .unwrap_or_default()
+                ),
             ),
             None => (
                 OutputStatus::InvalidInputs,
@@ -736,7 +741,10 @@ fn collect_share(
 
     // A global share stands for the whole eligible set at once, so it is
     // proven against the sum of their public keys.
-    let global = view.raw().global.get(keys::global::SP_ECDH_SHARE, &scan_bytes);
+    let global = view
+        .raw()
+        .global
+        .get(keys::global::SP_ECDH_SHARE, &scan_bytes);
     let mut global_point = None;
     if let Some(share) = global {
         let Some(sum) = key_sum else {
@@ -774,9 +782,10 @@ fn collect_share(
             continue;
         };
         let Some(proof) = input.map().get(keys::input::SP_DLEQ, &scan_bytes) else {
-            outcome
-                .invalid_inputs
-                .push((report_input.index, "the ECDH share has no DLEQ proof".to_string()));
+            outcome.invalid_inputs.push((
+                report_input.index,
+                "the ECDH share has no DLEQ proof".to_string(),
+            ));
             continue;
         };
         let Some(key) = report_input.public_key.as_ref() else {
@@ -1065,7 +1074,8 @@ impl ScalarSum {
 pub fn sum_secret_keys(
     keys: impl Iterator<Item = bitcoin::secp256k1::SecretKey>,
 ) -> Option<bitcoin::secp256k1::SecretKey> {
-    keys.fold(ScalarSum::Empty, |acc, key| acc.add(&key)).finish()
+    keys.fold(ScalarSum::Empty, |acc, key| acc.add(&key))
+        .finish()
 }
 
 /// `Σ A_i`, or `None` when there is nothing to sum or the sum is infinity.
@@ -1103,7 +1113,13 @@ pub fn derive_output_script(
     spend_key: &PublicKey,
     k: u32,
 ) -> Option<ScriptBuf> {
-    derive_script(&Secp256k1::verification_only(), ecdh, input_hash, spend_key, k)
+    derive_script(
+        &Secp256k1::verification_only(),
+        ecdh,
+        input_hash,
+        spend_key,
+        k,
+    )
 }
 
 fn derive_script(

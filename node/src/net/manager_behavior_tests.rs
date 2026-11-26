@@ -2,15 +2,19 @@
 //! counter, against a live `PeerManager`: a scripted peer does the thing,
 //! and the counter moves. Each test names the counter it covers.
 
-use super::p1c_tests::{coin_at, pm_with_coins, spend, COIN};
-use super::txrequest_tests::{add_peer_with, MockClock};
+use super::p1c_tests::{COIN, coin_at, pm_with_coins, spend};
+use super::txrequest_tests::{MockClock, add_peer_with};
 use super::*;
 use crate::net::flow::InFlight;
 
 const SECOND: u64 = 1_000_000;
 
 /// A connected, handshaken peer relaying by wtxid.
-fn handshaken(pm: &PeerManager, id: PeerId, direction: Direction) -> mpsc::Receiver<NetworkMessage> {
+fn handshaken(
+    pm: &PeerManager,
+    id: PeerId,
+    direction: Direction,
+) -> mpsc::Receiver<NetworkMessage> {
     let rx = add_peer_with(pm, id, direction, |_| {});
     pm.start_tx_relay(id);
     rx
@@ -20,7 +24,11 @@ fn deliver(pm: &PeerManager, id: PeerId, msg: NetworkMessage) {
     pm.handle_message(id, msg, InFlight::new(None));
 }
 
-fn behavior<T>(pm: &PeerManager, id: PeerId, f: impl FnOnce(&crate::net::behavior::PeerBehavior) -> T) -> T {
+fn behavior<T>(
+    pm: &PeerManager,
+    id: PeerId,
+    f: impl FnOnce(&crate::net::behavior::PeerBehavior) -> T,
+) -> T {
     f(&pm.peers.read()[&id].info.behavior)
 }
 
@@ -63,7 +71,10 @@ async fn handshake_records_the_commands_to_verack_and_the_version_fields() {
     let mut theirs = Connection::with_magic(dialed, Magic::REGTEST);
 
     let remote = async {
-        theirs.send(NetworkMessage::Version(version(500))).await.unwrap();
+        theirs
+            .send(NetworkMessage::Version(version(500)))
+            .await
+            .unwrap();
         loop {
             if matches!(theirs.recv().await.unwrap(), NetworkMessage::Verack) {
                 break;
@@ -73,15 +84,27 @@ async fn handshake_records_the_commands_to_verack_and_the_version_fields() {
         theirs.send(NetworkMessage::SendAddrV2).await.unwrap();
         theirs.send(NetworkMessage::Verack).await.unwrap();
     };
-    let (handshake, ()) = tokio::join!(pm.perform_handshake(7, &mut ours, Direction::Inbound, crate::time::now_secs()), remote);
+    let (handshake, ()) = tokio::join!(
+        pm.perform_handshake(7, &mut ours, Direction::Inbound, crate::time::now_secs()),
+        remote
+    );
     handshake.unwrap();
 
     behavior(&pm, 7, |b| {
-        assert_eq!(b.handshake.commands().collect::<Vec<_>>(), ["version", "wtxidrelay", "sendaddrv2", "verack"]);
-        assert!(b.handshake.is_open(), "the announcements after verack are still to come");
+        assert_eq!(
+            b.handshake.commands().collect::<Vec<_>>(),
+            ["version", "wtxidrelay", "sendaddrv2", "verack"]
+        );
+        assert!(
+            b.handshake.is_open(),
+            "the announcements after verack are still to come"
+        );
         let v = b.version.as_ref().expect("version fields");
         assert_eq!(v.protocol_version, 70016);
-        assert_eq!(v.services, (ServiceFlags::NETWORK | ServiceFlags::WITNESS).to_u64());
+        assert_eq!(
+            v.services,
+            (ServiceFlags::NETWORK | ServiceFlags::WITNESS).to_u64()
+        );
         assert!(v.relay);
         assert_eq!(v.start_height, 500);
         assert_eq!(v.user_agent, "/behavior-test:1/");
@@ -108,10 +131,16 @@ fn handshake_after_verack_skips_replies_and_ends_at_the_first_non_announcement()
     assert!(pm.capture_handshake(7, &NetworkMessage::Headers(Vec::new())));
     assert!(pm.capture_handshake(7, &NetworkMessage::SendHeaders));
     assert!(pm.capture_handshake(7, &NetworkMessage::FeeFilter(1000)));
-    assert!(!pm.capture_handshake(7, &NetworkMessage::GetAddr), "getaddr ends the transcript");
+    assert!(
+        !pm.capture_handshake(7, &NetworkMessage::GetAddr),
+        "getaddr ends the transcript"
+    );
     assert!(!pm.capture_handshake(7, &NetworkMessage::Ping(2)));
     behavior(&pm, 7, |b| {
-        assert_eq!(b.handshake.commands().collect::<Vec<_>>(), ["version", "verack", "sendheaders", "feefilter", "getaddr"]);
+        assert_eq!(
+            b.handshake.commands().collect::<Vec<_>>(),
+            ["version", "verack", "sendheaders", "feefilter", "getaddr"]
+        );
     });
 
     // With no `getheaders` out, a `headers` is the peer's own, and counts.
@@ -123,7 +152,12 @@ fn handshake_after_verack_skips_replies_and_ends_at_the_first_non_announcement()
         b.handshake.observe("verack", false);
     }
     assert!(!pm.capture_handshake(8, &NetworkMessage::Headers(Vec::new())));
-    behavior(&pm, 8, |b| assert_eq!(b.handshake.commands().collect::<Vec<_>>(), ["version", "verack", "headers"]));
+    behavior(&pm, 8, |b| {
+        assert_eq!(
+            b.handshake.commands().collect::<Vec<_>>(),
+            ["version", "verack", "headers"]
+        )
+    });
 }
 
 /// `inv_tx_in`: the transaction entries of the peer's `inv`s.
@@ -146,7 +180,11 @@ fn inv_tx_announced_to_counts_what_a_flush_sends() {
     pm.handle_tx(1, spend(coin_at(20), COIN, 1_000, 20));
     pm.handle_tx(1, spend(coin_at(21), COIN, 1_000, 21));
     pm.send_tx_invs();
-    assert_eq!(behavior(&pm, 10, |b| b.inv_tx_announced_to), 0, "queued, not yet announced");
+    assert_eq!(
+        behavior(&pm, 10, |b| b.inv_tx_announced_to),
+        0,
+        "queued, not yet announced"
+    );
     clock.advance(60 * SECOND);
     pm.send_tx_invs();
     assert_eq!(behavior(&pm, 10, |b| b.inv_tx_announced_to), 2);
@@ -161,7 +199,11 @@ fn getdata_tx_in_counts_requested_transactions() {
     let block = Inventory::WitnessBlock(bitcoin::BlockHash::from_byte_array([3; 32]));
     deliver(&pm, 7, NetworkMessage::GetData(vec![wtx(1), wtx(2), block]));
     assert_eq!(behavior(&pm, 7, |b| b.getdata_tx_in), 2);
-    assert_eq!(behavior(&pm, 7, |b| b.getdata_latency.count()), 0, "nothing was announced to pair with");
+    assert_eq!(
+        behavior(&pm, 7, |b| b.getdata_latency.count()),
+        0,
+        "nothing was announced to pair with"
+    );
 }
 
 /// `getdata_latency`: the delay from our `inv` to the peer's `getdata` for
@@ -181,7 +223,11 @@ fn getdata_latency_pairs_a_getdata_with_our_announcement() {
     behavior(&pm, 10, |b| {
         assert_eq!(b.getdata_latency.count(), 1, "one announcement, one sample");
         // Asked at once: well inside a second, whatever the test machine.
-        assert!(b.getdata_latency.median_ms().is_some_and(|ms| ms <= 1_000), "{:?}", b.getdata_latency);
+        assert!(
+            b.getdata_latency.median_ms().is_some_and(|ms| ms <= 1_000),
+            "{:?}",
+            b.getdata_latency
+        );
         assert_eq!(b.getdata_tx_in, 2);
     });
 }
@@ -210,13 +256,21 @@ fn blocks_req_counts_block_getdata_and_getblocktxn() {
     deliver(
         &pm,
         7,
-        NetworkMessage::GetData(vec![Inventory::Block(h), Inventory::WitnessBlock(h), Inventory::CompactBlock(h), wtx(1)]),
+        NetworkMessage::GetData(vec![
+            Inventory::Block(h),
+            Inventory::WitnessBlock(h),
+            Inventory::CompactBlock(h),
+            wtx(1),
+        ]),
     );
     deliver(
         &pm,
         7,
         NetworkMessage::GetBlockTxn(bitcoin::p2p::message_compact_blocks::GetBlockTxn {
-            txs_request: bitcoin::bip152::BlockTransactionsRequest { block_hash: h, indexes: vec![0] },
+            txs_request: bitcoin::bip152::BlockTransactionsRequest {
+                block_hash: h,
+                indexes: vec![0],
+            },
         }),
     );
     assert_eq!(behavior(&pm, 7, |b| b.blocks_req), 4);
@@ -290,7 +344,8 @@ fn notfound_after_inv_counts_announced_then_refused() {
     let (pm, _dir) = pm_with_coins(&[]);
     let mut rx = handshaken(&pm, 7, Direction::Outbound);
     deliver(&pm, 7, NetworkMessage::Inv(vec![wtx(1)]));
-    let asked = std::iter::from_fn(|| rx.try_recv().ok()).any(|m| matches!(m, NetworkMessage::GetData(_)));
+    let asked =
+        std::iter::from_fn(|| rx.try_recv().ok()).any(|m| matches!(m, NetworkMessage::GetData(_)));
     assert!(asked, "the announcer is asked at once");
     deliver(&pm, 7, NetworkMessage::NotFound(vec![wtx(1), wtx(9)]));
     assert_eq!(behavior(&pm, 7, |b| b.notfound_after_inv), 1);
@@ -316,7 +371,13 @@ fn height_claim_gap_measures_start_height_against_a_short_answer() {
 
     // A `headers` with no `getheaders` out is not an answer.
     let _rx = handshaken(&pm, 8, Direction::Outbound);
-    pm.peers.write().get_mut(&8).unwrap().info.behavior.note_version(&version(tip as i32 + 50), tip);
+    pm.peers
+        .write()
+        .get_mut(&8)
+        .unwrap()
+        .info
+        .behavior
+        .note_version(&version(tip as i32 + 50), tip);
     pm.handle_headers(8, Vec::new());
     assert_eq!(behavior(&pm, 8, |b| b.height_claim_gap), 0);
 }
@@ -334,7 +395,12 @@ fn stalls_count_charged_heights_and_a_stall_disconnect() {
         pm.chain_state.accept_header(&b.header).unwrap();
         prev = b.block_hash();
     }
-    *pm.ibd.write() = Some(crate::net::ibd::IbdScheduler::new(base + 20, base, &pm.chain_state, 1024));
+    *pm.ibd.write() = Some(crate::net::ibd::IbdScheduler::new(
+        base + 20,
+        base,
+        &pm.chain_state,
+        1024,
+    ));
     let _rx7 = handshaken(&pm, 7, Direction::Outbound);
     let _rx8 = handshaken(&pm, 8, Direction::Outbound);
 
@@ -352,7 +418,11 @@ fn stalls_count_charged_heights_and_a_stall_disconnect() {
     let (stalled, released, _) = pm.take_download_stalls();
     assert!(stalled.is_empty());
     assert_eq!(released, held);
-    assert_eq!(behavior(&pm, 7, |b| b.stalls), held as u32, "one per charged height");
+    assert_eq!(
+        behavior(&pm, 7, |b| b.stalls),
+        held as u32,
+        "one per charged height"
+    );
 
     // Now quiet for two minutes with blocks owed: a stall disconnect.
     {
@@ -377,11 +447,18 @@ fn disconnect_reason_is_set_as_the_peer_goes() {
     let _rx = handshaken(&pm, 8, Direction::Inbound);
     assert!(pm.disconnect_on_request(7));
     pm.handle_peer_disconnected(8);
-    assert_eq!(*pm.retired_behavior.lock(), vec![(7, Some("rpc_request")), (8, Some("peer-closed"))]);
+    assert_eq!(
+        *pm.retired_behavior.lock(),
+        vec![(7, Some("rpc_request")), (8, Some("peer-closed"))]
+    );
 
     // Turning networking off closes every record.
     let _rx = handshaken(&pm, 9, Direction::Inbound);
     pm.retired_behavior.lock().clear();
     pm.set_network_active(false);
-    assert!(pm.retired_behavior.lock().contains(&(9, Some("network-inactive"))));
+    assert!(
+        pm.retired_behavior
+            .lock()
+            .contains(&(9, Some("network-inactive")))
+    );
 }

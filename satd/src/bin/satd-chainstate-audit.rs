@@ -164,8 +164,8 @@ fn run(args: &Args) -> Result<node::chain::consistency::ChainstateReport, String
         .blocksdir
         .clone()
         .unwrap_or_else(|| args.datadir.join("blocks"));
-    let mut flat = FlatFileManager::new(&blocksdir)
-        .map_err(|e| format!("cannot open block files: {e}"))?;
+    let mut flat =
+        FlatFileManager::new(&blocksdir).map_err(|e| format!("cannot open block files: {e}"))?;
 
     eprintln!(
         "auditing {} blocks below tip {} (height {})",
@@ -226,7 +226,11 @@ fn print_list<T: std::fmt::Display>(label: &str, items: &[T], verbose: bool) {
         return;
     }
     println!("{label}: {}", items.len());
-    let shown = if verbose { items.len() } else { SHOW.min(items.len()) };
+    let shown = if verbose {
+        items.len()
+    } else {
+        SHOW.min(items.len())
+    };
     for item in &items[..shown] {
         println!("  {item}");
     }
@@ -285,7 +289,11 @@ fn main() -> ExitCode {
     }
 
     print_list("coins missing", &report.missing_coins, args.verbose);
-    print_list("spent coins still present", &report.unspent_spends, args.verbose);
+    print_list(
+        "spent coins still present",
+        &report.unspent_spends,
+        args.verbose,
+    );
     print_list("height rows wrong", &report.height_mismatches, args.verbose);
     print_list("blocks unreadable", &report.unreadable, args.verbose);
 

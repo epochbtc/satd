@@ -200,7 +200,6 @@ impl AddressIndex for RocksAddressIndex {
         }
         self.mempool
             .read()
-            
             .entries_for(sh)
             .into_iter()
             .map(|txid| MempoolHistoryEntry { txid })
@@ -362,10 +361,10 @@ impl AddressIndex for RocksAddressIndex {
             let run = self.store.addr_rows_desc(sh, below, page.saturating_add(1));
             let mut seqs: Vec<u64> = run.rows.iter().map(|r| r.txseq).collect();
             seqs.dedup();
-            for (seq, resolved) in seqs
-                .iter()
-                .zip(crate::index::resolve::resolve_txseqs(self.store.as_ref(), &seqs))
-            {
+            for (seq, resolved) in seqs.iter().zip(crate::index::resolve::resolve_txseqs(
+                self.store.as_ref(),
+                &seqs,
+            )) {
                 match resolved {
                     Some(r) => walked.push((r.height, r.txid)),
                     None => tracing::error!(
@@ -771,7 +770,10 @@ mod tests {
                 funding_vout: i as u32,
             });
             batch.coin_puts.push((
-                OutPoint { txid: txids[i], vout: 0 },
+                OutPoint {
+                    txid: txids[i],
+                    vout: 0,
+                },
                 make_coin(100 + i as u64, 7),
             ));
         }
@@ -874,11 +876,17 @@ mod tests {
             amount_sat: 2500,
         });
         batch.coin_puts.push((
-            OutPoint { txid: txid_a, vout: 0 },
+            OutPoint {
+                txid: txid_a,
+                vout: 0,
+            },
             make_coin(1000, 1),
         ));
         batch.coin_puts.push((
-            OutPoint { txid: txid_b, vout: 1 },
+            OutPoint {
+                txid: txid_b,
+                vout: 1,
+            },
             make_coin(2500, 2),
         ));
         store_inner.write_batch(batch).unwrap();
@@ -911,11 +919,17 @@ mod tests {
             amount_sat: 4000,
         });
         batch.coin_puts.push((
-            OutPoint { txid: txid_a, vout: 0 },
+            OutPoint {
+                txid: txid_a,
+                vout: 0,
+            },
             make_coin(1000, 1),
         ));
         batch.coin_puts.push((
-            OutPoint { txid: txid_b, vout: 0 },
+            OutPoint {
+                txid: txid_b,
+                vout: 0,
+            },
             make_coin(4000, 2),
         ));
         store_inner.write_batch(batch).unwrap();
@@ -923,7 +937,10 @@ mod tests {
         // Spend txid_a:0
         let mut spend_batch = StoreBatch::default();
         spend_batch.coin_removes.push((
-            OutPoint { txid: txid_a, vout: 0 },
+            OutPoint {
+                txid: txid_a,
+                vout: 0,
+            },
             1000,
             1,
         ));
@@ -956,11 +973,17 @@ mod tests {
             amount_sat: 2000,
         });
         batch.coin_puts.push((
-            OutPoint { txid: txid_a, vout: 0 },
+            OutPoint {
+                txid: txid_a,
+                vout: 0,
+            },
             make_coin(1000, 1),
         ));
         batch.coin_puts.push((
-            OutPoint { txid: txid_b, vout: 0 },
+            OutPoint {
+                txid: txid_b,
+                vout: 0,
+            },
             make_coin(2000, 2),
         ));
         store_inner.write_batch(batch).unwrap();
@@ -968,7 +991,10 @@ mod tests {
         // Spend txid_a:0
         let mut spend_batch = StoreBatch::default();
         spend_batch.coin_removes.push((
-            OutPoint { txid: txid_a, vout: 0 },
+            OutPoint {
+                txid: txid_a,
+                vout: 0,
+            },
             1000,
             1,
         ));
@@ -1000,8 +1026,9 @@ mod tests {
         // yields 20 raw funding rows for 4 distinct (height, txid)
         // pairs — duplicate factor 5, above the previous fixed-2
         // assumption.
-        let txs: Vec<(u32, bitcoin::Txid)> =
-            (0..4u32).map(|i| (i, fixture_txid(0x10 + i as u8))).collect();
+        let txs: Vec<(u32, bitcoin::Txid)> = (0..4u32)
+            .map(|i| (i, fixture_txid(0x10 + i as u8)))
+            .collect();
         let seqs = seed_ordinals(&store_inner, &txs);
         let mut batch = StoreBatch::default();
         for (i, seq) in seqs.iter().enumerate() {
@@ -1047,8 +1074,9 @@ mod tests {
         let sh = [0xfe; 32];
 
         // 4 txs × 5 outputs each = 20 raw funding rows.
-        let txs: Vec<(u32, bitcoin::Txid)> =
-            (0..4u32).map(|i| (i, fixture_txid(0x80 + i as u8))).collect();
+        let txs: Vec<(u32, bitcoin::Txid)> = (0..4u32)
+            .map(|i| (i, fixture_txid(0x80 + i as u8)))
+            .collect();
         let seqs = seed_ordinals(&store_inner, &txs);
         let mut batch = StoreBatch::default();
         for (i, seq) in seqs.iter().enumerate() {

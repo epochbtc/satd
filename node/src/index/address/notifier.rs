@@ -152,9 +152,8 @@ pub async fn recompute_all_active_off_thread(
     registry: Arc<SubscriptionRegistry>,
     mempool: Arc<Mempool>,
 ) {
-    let pass = tokio::task::spawn_blocking(move || {
-        recompute_all_active(&index, &registry, &mempool)
-    });
+    let pass =
+        tokio::task::spawn_blocking(move || recompute_all_active(&index, &registry, &mempool));
     if let Err(e) = pass.await {
         tracing::error!(error = %e, "address status recompute failed");
     }
@@ -172,9 +171,8 @@ pub async fn recompute_for_off_thread(
     if touched.is_empty() {
         return;
     }
-    let pass = tokio::task::spawn_blocking(move || {
-        recompute_for(&index, &registry, &mempool, &touched)
-    });
+    let pass =
+        tokio::task::spawn_blocking(move || recompute_for(&index, &registry, &mempool, &touched));
     if let Err(e) = pass.await {
         tracing::error!(error = %e, "address status recompute failed");
     }

@@ -27,7 +27,7 @@ use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, T
 use consensus::flags;
 use consensus::sighash::TxSignatureChecker;
 use consensus::verify::verify_script;
-use helpers::{parse_flags, parse_script, parse_witness_row, TAPROOT_OUTPUT_MARKER};
+use helpers::{TAPROOT_OUTPUT_MARKER, parse_flags, parse_script, parse_witness_row};
 use serde_json::Value;
 
 /// The flags libbitcoinconsensus accepts.
@@ -50,25 +50,42 @@ fn crediting_tx(script_pubkey: &[u8], value: u64) -> Transaction {
             sequence: Sequence::MAX,
             witness: Witness::default(),
         }],
-        output: vec![TxOut { value: Amount::from_sat(value), script_pubkey: ScriptBuf::from_bytes(script_pubkey.to_vec()) }],
+        output: vec![TxOut {
+            value: Amount::from_sat(value),
+            script_pubkey: ScriptBuf::from_bytes(script_pubkey.to_vec()),
+        }],
     }
 }
 
 /// Core's `BuildSpendingTransaction`, then the row's `spend` overrides.
-fn spending_tx(script_sig: &[u8], witness: &[Vec<u8>], credit: &Transaction, spend: Option<&Value>, id: &str) -> Transaction {
+fn spending_tx(
+    script_sig: &[u8],
+    witness: &[Vec<u8>],
+    credit: &Transaction,
+    spend: Option<&Value>,
+    id: &str,
+) -> Transaction {
     let mut tx = Transaction {
         version: Version(1),
         lock_time: LockTime::ZERO,
         input: vec![TxIn {
-            previous_output: OutPoint { txid: Txid::from_byte_array(credit.compute_txid().to_byte_array()), vout: 0 },
+            previous_output: OutPoint {
+                txid: Txid::from_byte_array(credit.compute_txid().to_byte_array()),
+                vout: 0,
+            },
             script_sig: ScriptBuf::from_bytes(script_sig.to_vec()),
             sequence: Sequence::MAX,
             witness: Witness::from_slice(witness),
         }],
-        output: vec![TxOut { value: credit.output[0].value, script_pubkey: ScriptBuf::new() }],
+        output: vec![TxOut {
+            value: credit.output[0].value,
+            script_pubkey: ScriptBuf::new(),
+        }],
     };
     for (key, v) in spend.and_then(Value::as_object).into_iter().flatten() {
-        let v = v.as_u64().unwrap_or_else(|| panic!("{id}: spend.{key} is not a number"));
+        let v = v
+            .as_u64()
+            .unwrap_or_else(|| panic!("{id}: spend.{key} is not a number"));
         match key.as_str() {
             "locktime" => tx.lock_time = LockTime::from_consensus(v as u32),
             "sequence" => tx.input[0].sequence = Sequence(v as u32),
@@ -106,7 +123,9 @@ fn rbitcoin_script_corpus() {
         let field = |i: usize| fields[i].as_str().unwrap();
         let script_sig = parse_script(field(0));
         let script_pubkey = if field(1) == TAPROOT_OUTPUT_MARKER {
-            taproot_output.take().unwrap_or_else(|| panic!("{id}: no tapscript leaf for the output"))
+            taproot_output
+                .take()
+                .unwrap_or_else(|| panic!("{id}: no tapscript leaf for the output"))
         } else {
             parse_script(field(1))
         };
@@ -125,10 +144,21 @@ fn rbitcoin_script_corpus() {
         let spend = spending_tx(&script_sig, &witness, &credit, r.get("spend"), id);
         let prevouts = [credit.output[0].clone()];
         let checker = TxSignatureChecker::new(&spend, 0, credit.output[0].value, &prevouts);
-        let rust_ok = verify_script(&script_sig, &script_pubkey, &witness, script_flags, &checker).is_ok();
+        let rust_ok = verify_script(
+            &script_sig,
+            &script_pubkey,
+            &witness,
+            script_flags,
+            &checker,
+        )
+        .is_ok();
         checked += 1;
         if rust_ok != expect_ok {
-            wrong.push(format!("{id}: expected {}, the engine {}", field(3), if rust_ok { "accepts" } else { "rejects" }));
+            wrong.push(format!(
+                "{id}: expected {}, the engine {}",
+                field(3),
+                if rust_ok { "accepts" } else { "rejects" }
+            ));
         }
 
         if script_flags & !CPP_FLAGS == 0 {
@@ -139,16 +169,32 @@ fn rbitcoin_script_corpus() {
                 script_pubkey_len: script_pubkey.len() as u32,
                 value: amount as i64,
             }];
-            let cpp_ok =
-                kernel_ref::verify_with_flags(&script_pubkey, amount, &bytes, Some(&utxos), 0, script_flags).is_ok();
+            let cpp_ok = kernel_ref::verify_with_flags(
+                &script_pubkey,
+                amount,
+                &bytes,
+                Some(&utxos),
+                0,
+                script_flags,
+            )
+            .is_ok();
             cpp_checked += 1;
             if cpp_ok != expect_ok {
-                wrong.push(format!("{id}: expected {}, libbitcoinconsensus {}", field(3), if cpp_ok { "accepts" } else { "rejects" }));
+                wrong.push(format!(
+                    "{id}: expected {}, libbitcoinconsensus {}",
+                    field(3),
+                    if cpp_ok { "accepts" } else { "rejects" }
+                ));
             }
         }
     }
 
     eprintln!("rbitcoin corpus: {checked} rows, {cpp_checked} also run by libbitcoinconsensus");
-    assert!(wrong.is_empty(), "{} rows disagree:\n{}", wrong.len(), wrong.join("\n"));
+    assert!(
+        wrong.is_empty(),
+        "{} rows disagree:\n{}",
+        wrong.len(),
+        wrong.join("\n")
+    );
     assert_eq!(checked, 448, "every row runs");
 }

@@ -31,8 +31,16 @@ fn expensive_psbt() -> RawPsbt {
     let secp = Secp256k1::new();
 
     let mut global = RawMap::new();
-    global.set(RawPair::new(keys::global::VERSION, Vec::new(), 2u32.to_le_bytes().to_vec()));
-    global.set(RawPair::new(keys::global::TX_VERSION, Vec::new(), 2u32.to_le_bytes().to_vec()));
+    global.set(RawPair::new(
+        keys::global::VERSION,
+        Vec::new(),
+        2u32.to_le_bytes().to_vec(),
+    ));
+    global.set(RawPair::new(
+        keys::global::TX_VERSION,
+        Vec::new(),
+        2u32.to_le_bytes().to_vec(),
+    ));
     let mut count = Vec::new();
     satd_psbt::raw::write_compact_size(&mut count, INPUTS as u64);
     global.set(RawPair::new(keys::global::INPUT_COUNT, Vec::new(), count));
@@ -61,7 +69,11 @@ fn expensive_psbt() -> RawPsbt {
         let mut map = RawMap::new();
         let mut txid = [0u8; 32];
         txid[..8].copy_from_slice(&(i as u64).to_be_bytes());
-        map.set(RawPair::new(keys::input::PREVIOUS_TXID, Vec::new(), txid.to_vec()));
+        map.set(RawPair::new(
+            keys::input::PREVIOUS_TXID,
+            Vec::new(),
+            txid.to_vec(),
+        ));
         map.set(RawPair::new(
             keys::input::OUTPUT_INDEX,
             Vec::new(),
@@ -143,7 +155,12 @@ fn the_expensive_shape_stays_within_its_budget() {
     // Every output is refused, since the proofs are junk — which is also what
     // makes this the worst case: a failing proof costs exactly what a passing
     // one does, so nothing short-circuits.
-    assert!(report.outputs.iter().all(|o| o.status != sp::OutputStatus::Ready));
+    assert!(
+        report
+            .outputs
+            .iter()
+            .all(|o| o.status != sp::OutputStatus::Ready)
+    );
 
     // The work is linear in the number of share-proof pairs the PSBT carries,
     // and a pair costs about a hundred bytes, so the cost is linear in the
@@ -171,11 +188,16 @@ fn past_the_cap_the_work_is_refused_before_it_starts() {
     raw.inputs.extend(extra);
     let mut count = Vec::new();
     satd_psbt::raw::write_compact_size(&mut count, raw.inputs.len() as u64);
-    raw.global.set(RawPair::new(keys::global::INPUT_COUNT, Vec::new(), count));
+    raw.global
+        .set(RawPair::new(keys::global::INPUT_COUNT, Vec::new(), count));
     for (i, map) in raw.inputs.iter_mut().enumerate().skip(INPUTS) {
         let mut txid = [0u8; 32];
         txid[..8].copy_from_slice(&(i as u64 + 1000).to_be_bytes());
-        map.set(RawPair::new(keys::input::PREVIOUS_TXID, Vec::new(), txid.to_vec()));
+        map.set(RawPair::new(
+            keys::input::PREVIOUS_TXID,
+            Vec::new(),
+            txid.to_vec(),
+        ));
     }
 
     let view = V2View::new(&raw).expect("a version 2 PSBT");
@@ -206,7 +228,9 @@ fn the_cost_is_linear_in_the_pairs_the_psbt_carries() {
     small.outputs.truncate(SCAN_KEYS / 2);
     let mut count = Vec::new();
     satd_psbt::raw::write_compact_size(&mut count, small.outputs.len() as u64);
-    small.global.set(RawPair::new(keys::global::OUTPUT_COUNT, Vec::new(), count));
+    small
+        .global
+        .set(RawPair::new(keys::global::OUTPUT_COUNT, Vec::new(), count));
 
     let mut large = small.clone();
     // Twice the inputs, the same scan keys: twice the pairs.
@@ -214,12 +238,18 @@ fn the_cost_is_linear_in_the_pairs_the_psbt_carries() {
     large.inputs.extend(extra);
     let mut count = Vec::new();
     satd_psbt::raw::write_compact_size(&mut count, large.inputs.len() as u64);
-    large.global.set(RawPair::new(keys::global::INPUT_COUNT, Vec::new(), count));
+    large
+        .global
+        .set(RawPair::new(keys::global::INPUT_COUNT, Vec::new(), count));
     // Distinct outpoints, so the doubled inputs are genuinely separate.
     for (i, map) in large.inputs.iter_mut().enumerate().skip(INPUTS) {
         let mut txid = [0u8; 32];
         txid[..8].copy_from_slice(&(i as u64 + 1000).to_be_bytes());
-        map.set(RawPair::new(keys::input::PREVIOUS_TXID, Vec::new(), txid.to_vec()));
+        map.set(RawPair::new(
+            keys::input::PREVIOUS_TXID,
+            Vec::new(),
+            txid.to_vec(),
+        ));
     }
 
     let time = |raw: &RawPsbt| {
@@ -233,7 +263,10 @@ fn the_cost_is_linear_in_the_pairs_the_psbt_carries() {
     let one = time(&small);
     let two = time(&large);
 
-    println!("{INPUTS} inputs: {one:.3}s, {} inputs: {two:.3}s", INPUTS * 2);
+    println!(
+        "{INPUTS} inputs: {one:.3}s, {} inputs: {two:.3}s",
+        INPUTS * 2
+    );
     assert!(
         two < one * 3.0,
         "doubling the inputs took {two:.3}s against {one:.3}s; the cost should roughly \
@@ -260,7 +293,8 @@ fn many_outputs_to_one_scan_key_are_one_group_of_proofs() {
     raw.inputs.truncate(5);
     let mut count = Vec::new();
     satd_psbt::raw::write_compact_size(&mut count, raw.inputs.len() as u64);
-    raw.global.set(RawPair::new(keys::global::INPUT_COUNT, Vec::new(), count));
+    raw.global
+        .set(RawPair::new(keys::global::INPUT_COUNT, Vec::new(), count));
 
     let scan = {
         let info = raw.outputs[0]
@@ -276,8 +310,10 @@ fn many_outputs_to_one_scan_key_are_one_group_of_proofs() {
             // A distinct spend key per output, as a batch payout would have.
             let mut secret = [3u8; 32];
             secret[..8].copy_from_slice(&(i as u64 + 1).to_be_bytes());
-            let spend =
-                PublicKey::from_secret_key(&secp, &SecretKey::from_slice(&secret).expect("a secret"));
+            let spend = PublicKey::from_secret_key(
+                &secp,
+                &SecretKey::from_slice(&secret).expect("a secret"),
+            );
             let mut info = scan.clone();
             info.extend_from_slice(&spend.serialize());
             map.set(RawPair::new(keys::output::SP_V0_INFO, Vec::new(), info));
@@ -286,7 +322,8 @@ fn many_outputs_to_one_scan_key_are_one_group_of_proofs() {
         .collect();
     let mut count = Vec::new();
     satd_psbt::raw::write_compact_size(&mut count, raw.outputs.len() as u64);
-    raw.global.set(RawPair::new(keys::global::OUTPUT_COUNT, Vec::new(), count));
+    raw.global
+        .set(RawPair::new(keys::global::OUTPUT_COUNT, Vec::new(), count));
 
     let view = V2View::new(&raw).expect("a version 2 PSBT");
     let report = match sp::verify(&view, None) {
@@ -304,5 +341,10 @@ fn many_outputs_to_one_scan_key_are_one_group_of_proofs() {
     assert_eq!(report.outputs.len(), sp::K_MAX as usize);
     // The proofs in the fixture are junk, so nothing is ready — what matters
     // here is that the verifier looked at all.
-    assert!(report.outputs.iter().all(|o| o.status != sp::OutputStatus::Ready));
+    assert!(
+        report
+            .outputs
+            .iter()
+            .all(|o| o.status != sp::OutputStatus::Ready)
+    );
 }

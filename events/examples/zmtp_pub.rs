@@ -62,7 +62,9 @@ async fn wait_for(what: &str, cond: impl Fn() -> bool) {
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
     let mut args = std::env::args().skip(1);
-    let endpoint = args.next().unwrap_or_else(|| "tcp://127.0.0.1:0".to_string());
+    let endpoint = args
+        .next()
+        .unwrap_or_else(|| "tcp://127.0.0.1:0".to_string());
     let want: usize = match args.next() {
         Some(n) => n.parse().expect("SUBSCRIBERS must be a number"),
         None => 1,

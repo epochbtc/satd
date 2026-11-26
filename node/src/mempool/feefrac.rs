@@ -332,7 +332,10 @@ fn chunk_sets(txs: &ClusterTxs, order: &[usize], todo: u64) -> Vec<(u64, FeeFrac
 
 /// The chunks of a linearization, in descending feerate.
 pub fn chunk_order(txs: &ClusterTxs, order: &[usize]) -> Vec<FeeFrac> {
-    chunk_sets(txs, order, all_of(txs.len())).into_iter().map(|(_, ff)| ff).collect()
+    chunk_sets(txs, order, all_of(txs.len()))
+        .into_iter()
+        .map(|(_, ff)| ff)
+        .collect()
 }
 
 /// Core's `MergeLinearizations` (v29 `cluster_linearize.h`): a
@@ -423,7 +426,12 @@ mod tests {
     /// poorer child is a chunk of its own.
     #[test]
     fn a_child_that_pays_for_its_parent_shares_its_chunk() {
-        let chunks = cluster_chunks(&[(ff(100, 100), 0), (ff(3_000, 100), 0b1), (ff(200, 100), 0b1)]).unwrap();
+        let chunks = cluster_chunks(&[
+            (ff(100, 100), 0),
+            (ff(3_000, 100), 0b1),
+            (ff(200, 100), 0b1),
+        ])
+        .unwrap();
         assert_eq!(chunks, vec![ff(3_100, 200), ff(200, 100)]);
     }
 
@@ -431,7 +439,12 @@ mod tests {
     /// follow, best first.
     #[test]
     fn a_rich_parent_is_its_own_chunk() {
-        let chunks = cluster_chunks(&[(ff(5_000, 100), 0), (ff(100, 100), 0b1), (ff(300, 100), 0b1)]).unwrap();
+        let chunks = cluster_chunks(&[
+            (ff(5_000, 100), 0),
+            (ff(100, 100), 0b1),
+            (ff(300, 100), 0b1),
+        ])
+        .unwrap();
         assert_eq!(chunks, vec![ff(5_000, 100), ff(300, 100), ff(100, 100)]);
     }
 
@@ -439,7 +452,8 @@ mod tests {
     /// parent and child are pulled up by a rich grandchild.
     #[test]
     fn ancestors_are_taken_transitively() {
-        let chunks = cluster_chunks(&[(ff(0, 100), 0), (ff(0, 100), 0b1), (ff(9_000, 100), 0b10)]).unwrap();
+        let chunks =
+            cluster_chunks(&[(ff(0, 100), 0), (ff(0, 100), 0b1), (ff(9_000, 100), 0b10)]).unwrap();
         assert_eq!(chunks, vec![ff(9_000, 300)]);
     }
 
@@ -450,7 +464,8 @@ mod tests {
         // P pays nothing; C1 pays 300 and C2 200, each over 100. P goes with
         // C1 first ({P, C1} at 1.5 beats {P, C2} at 1.0); then C2 alone pays
         // 2.0, more than that chunk, and joins it.
-        let chunks = cluster_chunks(&[(ff(0, 100), 0), (ff(300, 100), 0b1), (ff(200, 100), 0b1)]).unwrap();
+        let chunks =
+            cluster_chunks(&[(ff(0, 100), 0), (ff(300, 100), 0b1), (ff(200, 100), 0b1)]).unwrap();
         assert_eq!(chunks, vec![ff(500, 300)]);
         for pair in chunks.windows(2) {
             assert_ne!(feerate_compare(pair[0], pair[1]), Ordering::Less);
@@ -464,7 +479,12 @@ mod tests {
     #[test]
     fn a_fee_bump_of_a_diamonds_tail_chunks_no_worse() {
         let diamond = |d_fee| {
-            [(ff(600, 1600), 0), (ff(2600, 1600), 0b1), (ff(1400, 800), 0b1), (ff(d_fee, 2400), 0b110)]
+            [
+                (ff(600, 1600), 0),
+                (ff(2600, 1600), 0b1),
+                (ff(1400, 800), 0b1),
+                (ff(d_fee, 2400), 0b110),
+            ]
         };
         let before = cluster_chunks(&diamond(1400)).unwrap();
         let after = cluster_chunks(&diamond(2400)).unwrap();
@@ -479,24 +499,52 @@ mod tests {
     /// order carrying the bump, it is no worse anywhere.
     #[test]
     fn merging_with_the_old_order_keeps_a_fee_bump_no_worse() {
-        let tree = |d_fee| [(ff(800, 2000), 0), (ff(1800, 800), 0b1), (ff(1300, 400), 0b1), (ff(d_fee, 2000), 0b10)];
+        let tree = |d_fee| {
+            [
+                (ff(800, 2000), 0),
+                (ff(1800, 800), 0b1),
+                (ff(1300, 400), 0b1),
+                (ff(d_fee, 2000), 0b10),
+            ]
+        };
         let before = tree(500);
         let after = tree(2400);
         let old_order = linearize(&before);
-        assert_eq!(chunk_order(&before, &old_order), vec![ff(3900, 3200), ff(500, 2000)]);
+        assert_eq!(
+            chunk_order(&before, &old_order),
+            vec![ff(3900, 3200), ff(500, 2000)]
+        );
         // Fresh, the bump comes out worse than the original.
         let fresh = linearize(&after);
-        assert_ne!(compare_chunks(&chunk_order(&after, &fresh), &chunk_order(&before, &old_order)), DiagramOrdering::Better);
+        assert_ne!(
+            compare_chunks(
+                &chunk_order(&after, &fresh),
+                &chunk_order(&before, &old_order)
+            ),
+            DiagramOrdering::Better
+        );
         // Merged with the original order, it is better.
         let merged = merge_linearizations(&after, &fresh, &old_order);
-        assert_eq!(compare_chunks(&chunk_order(&after, &merged), &chunk_order(&before, &old_order)), DiagramOrdering::Better);
+        assert_eq!(
+            compare_chunks(
+                &chunk_order(&after, &merged),
+                &chunk_order(&before, &old_order)
+            ),
+            DiagramOrdering::Better
+        );
     }
 
     /// A merge is no worse than either input anywhere, and keeps every
     /// parent ahead of its children.
     #[test]
     fn a_merge_is_at_least_as_good_as_both_and_topological() {
-        let txs = [(ff(100, 100), 0), (ff(900, 100), 0b1), (ff(50, 100), 0), (ff(700, 100), 0b100), (ff(300, 100), 0b1010)];
+        let txs = [
+            (ff(100, 100), 0),
+            (ff(900, 100), 0b1),
+            (ff(50, 100), 0),
+            (ff(700, 100), 0b100),
+            (ff(300, 100), 0b1010),
+        ];
         let a = vec![0, 1, 2, 3, 4];
         let b = vec![2, 3, 0, 1, 4];
         let m = merge_linearizations(&txs, &a, &b);
@@ -520,7 +568,11 @@ mod tests {
     fn a_cluster_past_sixty_four_is_not_chunked() {
         let txs: Vec<(FeeFrac, u64)> = (0..65).map(|_| (ff(1, 1), 0)).collect();
         assert!(cluster_chunks(&txs).is_none());
-        assert_eq!(cluster_chunks(&txs[..64]).unwrap().len(), 64, "equal feerates are not merged");
+        assert_eq!(
+            cluster_chunks(&txs[..64]).unwrap().len(),
+            64,
+            "equal feerates are not merged"
+        );
     }
 
     /// Feerates are compared by cross-product, so no division rounds a
@@ -531,7 +583,10 @@ mod tests {
         assert_eq!(feerate_compare(ff(2, 3), ff(1, 3)), Ordering::Greater);
         assert_eq!(feerate_compare(ff(1, 3), ff(1, 2)), Ordering::Less);
         // Rounding a division would call these equal; they are not.
-        assert_eq!(feerate_compare(ff(1_000_001, 1_000), ff(1_000_000, 1_000)), Ordering::Greater);
+        assert_eq!(
+            feerate_compare(ff(1_000_001, 1_000), ff(1_000_000, 1_000)),
+            Ordering::Greater
+        );
     }
 
     /// The cross-product overflows `i64` at realistic values — a
@@ -677,8 +732,16 @@ mod tests {
         let parent = FeeFrac::new(1_000, 110);
         let child = FeeFrac::new(500_000, 110);
         let evicted = [
-            EvictedTx { individual: parent, parent: None, has_descendant: true },
-            EvictedTx { individual: child, parent: Some(parent), has_descendant: false },
+            EvictedTx {
+                individual: parent,
+                parent: None,
+                has_descendant: true,
+            },
+            EvictedTx {
+                individual: child,
+                parent: Some(parent),
+                has_descendant: false,
+            },
         ];
         let chunks = old_diagram(&evicted);
         assert_eq!(
@@ -738,6 +801,9 @@ mod tests {
     /// index, so the order does not depend on which one the walk saw last.
     #[test]
     fn equal_ancestor_sets_go_by_the_lower_index() {
-        assert_eq!(linearize(&[(ff(100, 100), 0), (ff(100, 100), 0)]), vec![0, 1]);
+        assert_eq!(
+            linearize(&[(ff(100, 100), 0), (ff(100, 100), 0)]),
+            vec![0, 1]
+        );
     }
 }

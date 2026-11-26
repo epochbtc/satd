@@ -36,7 +36,10 @@ fn tx(inputs: &[OutPoint], outputs: &[u64]) -> Transaction {
 }
 
 fn outpoint(n: u8, vout: u32) -> OutPoint {
-    OutPoint { txid: Txid::from_byte_array([n; 32]), vout }
+    OutPoint {
+        txid: Txid::from_byte_array([n; 32]),
+        vout,
+    }
 }
 
 fn coin(amount: u64) -> Coin {
@@ -53,9 +56,13 @@ fn coin(amount: u64) -> Coin {
 /// 1,000 and 150, the second of one coin (9,000) paying 8,990.
 fn three_tx_block() -> (Block, UndoData) {
     let mut block = regtest_block(BlockHash::all_zeros(), 1, 0);
-    block.txdata.push(tx(&[outpoint(1, 0), outpoint(2, 3)], &[1_000, 150]));
+    block
+        .txdata
+        .push(tx(&[outpoint(1, 0), outpoint(2, 3)], &[1_000, 150]));
     block.txdata.push(tx(&[outpoint(3, 1)], &[8_990]));
-    let undo = UndoData { spent_coins: vec![coin(700), coin(500), coin(9_000)] };
+    let undo = UndoData {
+        spent_coins: vec![coin(700), coin(500), coin(9_000)],
+    };
     (block, undo)
 }
 
@@ -102,7 +109,9 @@ fn rows_are_txid_fee_weight_value_in_block_order_coinbase_first() {
 fn txids_are_the_ones_given_not_recomputed() {
     // An OP_RETURN-stripped block's txids come from its strip record.
     let (block, undo) = three_tx_block();
-    let recorded: Vec<Txid> = (0..3u8).map(|n| Txid::from_byte_array([0xA0 + n; 32])).collect();
+    let recorded: Vec<Txid> = (0..3u8)
+        .map(|n| Txid::from_byte_array([0xA0 + n; 32]))
+        .collect();
     let rows = block_summary_rows(&block, &recorded, Some(&undo)).unwrap();
     let got: Vec<&str> = rows.iter().map(|row| row.0.as_str()).collect();
     let want: Vec<String> = recorded.iter().map(|t| t.to_string()).collect();
@@ -120,8 +129,13 @@ fn a_coinbase_only_block_needs_no_undo_data() {
         1_000,
     )];
     assert_eq!(block_summary_rows(&block, &txids, None).unwrap(), want);
-    let empty = UndoData { spent_coins: Vec::new() };
-    assert_eq!(block_summary_rows(&block, &txids, Some(&empty)).unwrap(), want);
+    let empty = UndoData {
+        spent_coins: Vec::new(),
+    };
+    assert_eq!(
+        block_summary_rows(&block, &txids, Some(&empty)).unwrap(),
+        want
+    );
 }
 
 #[test]
@@ -138,15 +152,24 @@ fn undo_data_that_does_not_match_the_block_is_500() {
     let (block, mut undo) = three_tx_block();
     // One coin short.
     undo.spent_coins.pop();
-    assert_eq!(refusal(&block, Some(&undo)).0, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(
+        refusal(&block, Some(&undo)).0,
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
     // The right count, but the last transaction pays out more than it spends.
     undo.spent_coins.push(coin(8_989));
-    assert_eq!(refusal(&block, Some(&undo)).0, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(
+        refusal(&block, Some(&undo)).0,
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
     // One txid short.
     let (block, undo) = three_tx_block();
     let txids = &txids_of(&block)[..2];
     let err = block_summary_rows(&block, txids, Some(&undo)).unwrap_err();
-    assert_eq!(err.into_response().status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(
+        err.into_response().status(),
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
 }
 
 async fn get(router: &axum::Router, path: &str) -> (StatusCode, Option<String>, String) {
@@ -160,7 +183,9 @@ async fn get(router: &axum::Router, path: &str) -> (StatusCode, Option<String>, 
         .headers()
         .get("x-bitcoin-chain-tip")
         .map(|v| v.to_str().unwrap().to_string());
-    let body = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+    let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+        .await
+        .unwrap();
     (status, tip, String::from_utf8(body.to_vec()).unwrap())
 }
 
@@ -177,7 +202,10 @@ async fn the_route_serves_best_chain_blocks_only_and_names_the_tip() {
     let side = regtest_block(genesis, 1, 7);
     let _ = state.chain.accept_block(&side);
     let side_hash = side.block_hash();
-    assert!(state.chain.get_stored_block(&side_hash).is_some(), "the side block is stored");
+    assert!(
+        state.chain.get_stored_block(&side_hash).is_some(),
+        "the side block is stored"
+    );
     let stored = state.chain.get_stored_block(&one).unwrap();
     let router = crate::build_router(state).unwrap();
 
@@ -187,20 +215,35 @@ async fn the_route_serves_best_chain_blocks_only_and_names_the_tip() {
     let coinbase = &stored.block.txdata[0];
     assert_eq!(
         body,
-        format!(r#"[["{}",0,{},1000]]"#, coinbase.compute_txid(), coinbase.weight().to_wu())
+        format!(
+            r#"[["{}",0,{},1000]]"#,
+            coinbase.compute_txid(),
+            coinbase.weight().to_wu()
+        )
     );
 
     // Genesis has no undo row and spends nothing.
     let (status, _, body) = get(&router, &format!("/block/{genesis}/txs/summary")).await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(serde_json::from_str::<serde_json::Value>(&body).unwrap().as_array().unwrap().len(), 1);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&body)
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
 
     // The sibling route serves the side block; this one does not.
     let (status, _, _) = get(&router, &format!("/block/{side_hash}/txids")).await;
     assert_eq!(status, StatusCode::OK);
     for hash in [side_hash, BlockHash::all_zeros()] {
         let (status, tip, body) = get(&router, &format!("/block/{hash}/txs/summary")).await;
-        assert_eq!((status, body.as_str()), (StatusCode::NOT_FOUND, "not found"), "{hash}");
+        assert_eq!(
+            (status, body.as_str()),
+            (StatusCode::NOT_FOUND, "not found"),
+            "{hash}"
+        );
         // A handler's 404 names the tip it was decided at, like any answer.
         assert_eq!(tip, Some(two.to_string()), "{hash}");
     }

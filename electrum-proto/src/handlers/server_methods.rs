@@ -196,12 +196,20 @@ mod tests {
     fn the_default_server_name_suits_sparrow_bluewallet_and_cake() {
         let name = format!("{DEFAULT_SERVER_NAME_PREFIX}/{}", env!("CARGO_PKG_VERSION"));
         let lower = name.to_lowercase();
-        assert!(lower.contains("electrumx"), "Sparrow batches only for electrumx: {name}");
         assert!(
-            !["ElectrumPersonalServer", "electrs", "Fulcrum"].iter().any(|p| name.starts_with(p)),
+            lower.contains("electrumx"),
+            "Sparrow batches only for electrumx: {name}"
+        );
+        assert!(
+            !["ElectrumPersonalServer", "electrs", "Fulcrum"]
+                .iter()
+                .any(|p| name.starts_with(p)),
             "BlueWallet turns batching off for this prefix: {name}"
         );
-        assert!(lower.contains("electrs"), "Cake probes tweaks only for electrs: {name}");
+        assert!(
+            lower.contains("electrs"),
+            "Cake probes tweaks only for electrs: {name}"
+        );
         assert!(name.starts_with("satd-"), "identity first: {name}");
     }
 

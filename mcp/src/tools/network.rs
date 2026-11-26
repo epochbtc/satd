@@ -49,7 +49,10 @@ pub fn manage_peer(ctx: &McpContext, action: &str, address: &str) -> String {
             let target = node::net::ban::BanTarget::Net(ipnet::IpNet::from(addr.ip()));
             let now = node::time::now_secs();
             let duration = ctx.peer_manager.default_ban_duration_secs();
-            match ctx.peer_manager.set_ban_subnet(&target, true, now, now + duration) {
+            match ctx
+                .peer_manager
+                .set_ban_subnet(&target, true, now, now + duration)
+            {
                 Ok(()) => json!({"result": "banned"}).to_string(),
                 Err(e) => json!({"error": e}).to_string(),
             }

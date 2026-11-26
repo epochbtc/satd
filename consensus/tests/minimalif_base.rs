@@ -39,7 +39,11 @@ fn non_minimal_if_argument_fails_only_under_the_extension() {
         // OP_2 pushes 0x02, which is true, and a direct push of one 0x00 byte
         // is false. Both pushes are minimal (MINIMALDATA passes), but
         // neither value is a minimal IF argument.
-        let arg: Vec<u8> = if redeem == IF_SCRIPT { vec![0x52] } else { push(&[0x00]) };
+        let arg: Vec<u8> = if redeem == IF_SCRIPT {
+            vec![0x52]
+        } else {
+            push(&[0x00])
+        };
         let arg = arg.as_slice();
 
         let (bare_sig, bare_spk) = (arg.to_vec(), redeem.to_vec());
@@ -54,7 +58,11 @@ fn non_minimal_if_argument_fails_only_under_the_extension() {
         }
 
         // A minimal argument passes either way: OP_1, or OP_0 (empty).
-        let minimal: &[u8] = if redeem == IF_SCRIPT { &[0x51] } else { &[0x00] };
+        let minimal: &[u8] = if redeem == IF_SCRIPT {
+            &[0x51]
+        } else {
+            &[0x00]
+        };
         let (sig, spk) = p2sh(minimal, redeem);
         assert_eq!(run(&sig, &spk, ALL_FLAGS | VERIFY_MINIMALIF_BASE), Ok(()));
     }
@@ -69,9 +77,18 @@ fn extension_leaves_witness_v0_to_minimalif() {
     let witness = vec![vec![0x02], witness_script];
     let base = ALL_FLAGS & !VERIFY_MINIMALIF;
     for ext in [0, VERIFY_MINIMALIF_BASE] {
-        assert_eq!(verify_script(&[], spk.as_bytes(), &witness, base | ext, &NoopChecker), Ok(()));
         assert_eq!(
-            verify_script(&[], spk.as_bytes(), &witness, base | VERIFY_MINIMALIF | ext, &NoopChecker),
+            verify_script(&[], spk.as_bytes(), &witness, base | ext, &NoopChecker),
+            Ok(())
+        );
+        assert_eq!(
+            verify_script(
+                &[],
+                spk.as_bytes(),
+                &witness,
+                base | VERIFY_MINIMALIF | ext,
+                &NoopChecker
+            ),
             Err(ScriptError::MinimalIf)
         );
     }
@@ -86,13 +103,19 @@ fn libconsensus_entry_points_refuse_the_extension() {
         version: Version(1),
         lock_time: LockTime::ZERO,
         input: vec![],
-        output: vec![TxOut { value: Amount::ZERO, script_pubkey: ScriptBuf::from_bytes(IF_SCRIPT.to_vec()) }],
+        output: vec![TxOut {
+            value: Amount::ZERO,
+            script_pubkey: ScriptBuf::from_bytes(IF_SCRIPT.to_vec()),
+        }],
     };
     let spend = Transaction {
         version: Version(1),
         lock_time: LockTime::ZERO,
         input: vec![TxIn {
-            previous_output: OutPoint { txid: credit.compute_txid(), vout: 0 },
+            previous_output: OutPoint {
+                txid: credit.compute_txid(),
+                vout: 0,
+            },
             script_sig: ScriptBuf::from_bytes(vec![0x51]),
             sequence: Sequence::MAX,
             witness: Witness::default(),
@@ -101,7 +124,14 @@ fn libconsensus_entry_points_refuse_the_extension() {
     };
     let precomputed = PrecomputedTransactionData::new(&spend, &credit.output).unwrap();
     assert_eq!(
-        verify(Script::from_bytes(IF_SCRIPT), Amount::ZERO, &spend, 0, VERIFY_MINIMALIF_BASE, &precomputed),
+        verify(
+            Script::from_bytes(IF_SCRIPT),
+            Amount::ZERO,
+            &spend,
+            0,
+            VERIFY_MINIMALIF_BASE,
+            &precomputed
+        ),
         Err(Error::ErrInvalidFlags)
     );
     assert_eq!(
@@ -109,5 +139,8 @@ fn libconsensus_entry_points_refuse_the_extension() {
         Err((0, Error::ErrInvalidFlags))
     );
     // The same spend with Core's flags is fine: the refusal is the flag's.
-    assert_eq!(verify_transaction(&spend, &credit.output, ALL_FLAGS & !flags::VERIFY_TAPROOT), Ok(()));
+    assert_eq!(
+        verify_transaction(&spend, &credit.output, ALL_FLAGS & !flags::VERIFY_TAPROOT),
+        Ok(())
+    );
 }

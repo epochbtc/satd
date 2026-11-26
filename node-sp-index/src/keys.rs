@@ -220,7 +220,10 @@ mod tests {
         assert_eq!(bytes.len(), HEADER_LEN + ENTRY_LEN);
         let decoded = SpBlockRow::decode(&bytes).unwrap();
         assert!(decoded.entries[0].taproot_outputs.is_empty());
-        assert_eq!(decoded.entries[0].max_taproot_value, Amount::from_sat(7_000));
+        assert_eq!(
+            decoded.entries[0].max_taproot_value,
+            Amount::from_sat(7_000)
+        );
     }
 
     fn node_sp_index_taproot_output(

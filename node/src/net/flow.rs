@@ -44,7 +44,9 @@ impl Default for PeerFlow {
 
 impl PeerFlow {
     pub fn new() -> Self {
-        Self { in_flight: watch::Sender::new(0) }
+        Self {
+            in_flight: watch::Sender::new(0),
+        }
     }
 
     /// Count a message as in flight. Called by the socket task as it hands

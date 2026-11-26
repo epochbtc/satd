@@ -105,7 +105,14 @@ pub struct Vardiff {
 impl Vardiff {
     pub fn new(config: VardiffConfig, initial: u64, now: Instant) -> Self {
         let initial = initial.max(1);
-        Self { config, difficulty: initial, floor: 1, since: now, shares: 0.0, ever_accepted: false }
+        Self {
+            config,
+            difficulty: initial,
+            floor: 1,
+            since: now,
+            shares: 0.0,
+            ever_accepted: false,
+        }
     }
 
     pub fn difficulty(&self) -> u64 {
@@ -166,7 +173,11 @@ impl Vardiff {
         let factor = ratio.clamp(1.0 / step, step);
         let current = self.difficulty;
         let proposed = (current as f64 * factor).round();
-        let proposed = if proposed >= u64::MAX as f64 { u64::MAX } else { proposed as u64 };
+        let proposed = if proposed >= u64::MAX as f64 {
+            u64::MAX
+        } else {
+            proposed as u64
+        };
         let next = proposed.max(1).max(self.floor).min(ceiling.max(1));
         // Either way the evidence has been acted on; start counting afresh.
         self.set(next, now);
@@ -192,7 +203,11 @@ fn poisson_at_most(k: u64, lambda: f64) -> f64 {
 
 /// `P(N >= k)` for `N ~ Poisson(lambda)`.
 fn poisson_at_least(k: u64, lambda: f64) -> f64 {
-    if k == 0 { 1.0 } else { (1.0 - poisson_at_most(k - 1, lambda)).max(0.0) }
+    if k == 0 {
+        1.0
+    } else {
+        (1.0 - poisson_at_most(k - 1, lambda)).max(0.0)
+    }
 }
 
 /// The standard normal CDF, from the Abramowitz and Stegun 7.1.26 `erf`
@@ -200,9 +215,16 @@ fn poisson_at_least(k: u64, lambda: f64) -> f64 {
 fn normal_cdf(z: f64) -> f64 {
     let x = z.abs() / std::f64::consts::SQRT_2;
     let t = 1.0 / (1.0 + 0.327_591_1 * x);
-    let poly = t * (0.254_829_592 + t * (-0.284_496_736 + t * (1.421_413_741 + t * (-1.453_152_027 + t * 1.061_405_429))));
+    let poly = t
+        * (0.254_829_592
+            + t * (-0.284_496_736
+                + t * (1.421_413_741 + t * (-1.453_152_027 + t * 1.061_405_429))));
     let erf = 1.0 - poly * (-x * x).exp();
-    if z >= 0.0 { 0.5 * (1.0 + erf) } else { 0.5 * (1.0 - erf) }
+    if z >= 0.0 {
+        0.5 * (1.0 + erf)
+    } else {
+        0.5 * (1.0 - erf)
+    }
 }
 
 #[cfg(test)]
@@ -416,10 +438,24 @@ mod tests {
     /// `hours`, with shares as a Poisson process and a retarget check every
     /// [`TICK`]. Statistics after `settle` seconds describe steady state.
     fn simulate(hashrate: f64, initial: u64, hours: f64, settle: f64, seed: u64) -> Run {
-        simulate_with(VardiffConfig::default(), hashrate, initial, hours, settle, seed)
+        simulate_with(
+            VardiffConfig::default(),
+            hashrate,
+            initial,
+            hours,
+            settle,
+            seed,
+        )
     }
 
-    fn simulate_with(config: VardiffConfig, hashrate: f64, initial: u64, hours: f64, settle: f64, seed: u64) -> Run {
+    fn simulate_with(
+        config: VardiffConfig,
+        hashrate: f64,
+        initial: u64,
+        hours: f64,
+        settle: f64,
+        seed: u64,
+    ) -> Run {
         let t0 = Instant::now();
         let at = |s: f64| t0 + Duration::from_secs_f64(s);
         let optimal = hashrate * 30.0 / 4_294_967_296.0;
@@ -485,13 +521,22 @@ mod tests {
         let mut failures = Vec::new();
         let mut report = Vec::new();
         let (mut bands, mut retargets, mut intervals) = (Vec::new(), Vec::new(), Vec::new());
-        for (label, start, limit) in [("10x too high", 10.0f64, CONVERGE_SLOW_SECS), ("10x too low", 0.1, CONVERGE_FAST_SECS)] {
+        for (label, start, limit) in [
+            ("10x too high", 10.0f64, CONVERGE_SLOW_SECS),
+            ("10x too low", 0.1, CONVERGE_FAST_SECS),
+        ] {
             let mut converge = Vec::new();
             for hashrate in [100e9, 1.2e12, 100e12] {
                 let optimal = hashrate * 30.0 / 4_294_967_296.0;
                 let initial = ((optimal * start).round() as u64).max(1);
                 for seed in 1..=50u64 {
-                    let run = simulate(hashrate, initial, 6.0, 3_600.0, seed * 7_919 + hashrate as u64);
+                    let run = simulate(
+                        hashrate,
+                        initial,
+                        6.0,
+                        3_600.0,
+                        seed * 7_919 + hashrate as u64,
+                    );
                     let converged = run.converged_secs.unwrap_or(f64::INFINITY);
                     converge.push(converged);
                     bands.push(run.band);
@@ -528,7 +573,10 @@ mod tests {
         assert!(failures.is_empty(), "{}", failures.join("\n"));
         assert!(band95 <= 2.0, "95th-percentile band x{band95:.2}");
         assert!(rt95 <= 4.0, "95th-percentile changes {rt95}");
-        assert!(iv95 <= 6.0, "95th-percentile mean-interval error {iv95:.1} s");
+        assert!(
+            iv95 <= 6.0,
+            "95th-percentile mean-interval error {iv95:.1} s"
+        );
     }
 
     struct Connection {
@@ -585,7 +633,11 @@ mod tests {
                 }
             }
         }
-        Connection { first_share_secs: first, drops, accepted }
+        Connection {
+            first_share_secs: first,
+            drops,
+            accepted,
+        }
     }
 
     /// An ESP32-class "lottery" miner at 1 MH/s, connecting at the mainnet
@@ -599,9 +651,16 @@ mod tests {
         for seed in 1..=16u64 {
             let run = simulate_connection(1e6, 10_000, 48.0, seed * 104_729);
             let first = run.first_share_secs.expect("a first share within 48 hours");
-            assert!(first <= 8.0 * 3_600.0, "seed {seed}: first share after {first:.0} s");
+            assert!(
+                first <= 8.0 * 3_600.0,
+                "seed {seed}: first share after {first:.0} s"
+            );
             assert_eq!(run.drops, 0, "seed {seed}: dropped");
-            assert!(run.accepted >= 20, "seed {seed}: only {} shares in 48 hours", run.accepted);
+            assert!(
+                run.accepted >= 20,
+                "seed {seed}: only {} shares in 48 hours",
+                run.accepted
+            );
         }
     }
 
@@ -611,14 +670,25 @@ mod tests {
     /// slowest.
     #[test]
     fn miners_from_mhs_to_ths_at_the_default_difficulty_are_never_dropped() {
-        for (hashrate, first_within) in [(7e6, 3.0 * 3_600.0), (1e9, 1_200.0), (100e9, 600.0), (1.2e12, 300.0)] {
+        for (hashrate, first_within) in [
+            (7e6, 3.0 * 3_600.0),
+            (1e9, 1_200.0),
+            (100e9, 600.0),
+            (1.2e12, 300.0),
+        ] {
             for seed in 1..=16u64 {
                 let run = simulate_connection(hashrate, 10_000, 24.0, seed * 7_919);
                 let first = run.first_share_secs.unwrap_or(f64::INFINITY);
-                assert!(first <= first_within, "{hashrate:e} H/s, seed {seed}: first share after {first:.0} s");
-                assert_eq!(run.drops, 0, "{hashrate:e} H/s, seed {seed}: dropped {} times", run.drops);
+                assert!(
+                    first <= first_within,
+                    "{hashrate:e} H/s, seed {seed}: first share after {first:.0} s"
+                );
+                assert_eq!(
+                    run.drops, 0,
+                    "{hashrate:e} H/s, seed {seed}: dropped {} times",
+                    run.drops
+                );
             }
         }
     }
-
 }

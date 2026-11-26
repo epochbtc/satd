@@ -41,7 +41,10 @@ pub enum BackfillError {
     #[error("backfill already completed for this datadir")]
     AlreadyCompleted,
     #[error("invalid state transition: {from} -> {to}")]
-    InvalidTransition { from: &'static str, to: &'static str },
+    InvalidTransition {
+        from: &'static str,
+        to: &'static str,
+    },
     #[error("pre-flight: insufficient free disk ({have} bytes < {need} bytes required)")]
     InsufficientDisk { have: u64, need: u64 },
     #[error("storage error: {0}")]
@@ -341,10 +344,7 @@ impl BackfillHandle {
     /// Mark Cancelled. Caller drops the temp CF after this returns Ok.
     pub fn mark_cancelled(&self, store: &dyn Store) -> Result<(), BackfillError> {
         let cur = self.cursor();
-        if !matches!(
-            cur.state,
-            BackfillState::Running | BackfillState::Paused
-        ) {
+        if !matches!(cur.state, BackfillState::Running | BackfillState::Paused) {
             return Err(BackfillError::InvalidTransition {
                 from: cur.state.label(),
                 to: "cancelled",
@@ -370,16 +370,9 @@ impl BackfillHandle {
     /// far the failed run got. The persisted last-error is written
     /// AFTER the cursor advance so a crash between the two doesn't
     /// leave a stale error attached to a non-Failed cursor.
-    pub fn mark_failed(
-        &self,
-        store: &dyn Store,
-        err_msg: &str,
-    ) -> Result<(), BackfillError> {
+    pub fn mark_failed(&self, store: &dyn Store, err_msg: &str) -> Result<(), BackfillError> {
         let cur = self.cursor();
-        if !matches!(
-            cur.state,
-            BackfillState::Running | BackfillState::Paused
-        ) {
+        if !matches!(cur.state, BackfillState::Running | BackfillState::Paused) {
             return Err(BackfillError::InvalidTransition {
                 from: cur.state.label(),
                 to: "failed",
@@ -453,11 +446,11 @@ pub const PREFLIGHT_REQUIRED_FREE_BYTES: u64 = 80 * 1_073_741_824;
 /// RPC handler json-renders. Used by both the operator-RPC and (in
 /// future) the Electrum/Esplora `serverinfo` surface.
 pub fn render_status(handle: Option<&BackfillHandle>, address_enabled: bool) -> StatusReport {
-    let cursor = handle.map(|h| h.cursor()).unwrap_or_else(BackfillCursor::idle);
-    let synced = matches!(
-        cursor.state,
-        BackfillState::Idle | BackfillState::Completed
-    ) && address_enabled;
+    let cursor = handle
+        .map(|h| h.cursor())
+        .unwrap_or_else(BackfillCursor::idle);
+    let synced =
+        matches!(cursor.state, BackfillState::Idle | BackfillState::Completed) && address_enabled;
     let progress_ratio = cursor.progress_ratio();
     StatusReport {
         synced,
@@ -556,7 +549,10 @@ mod tests {
             .stint
             .begin_backdated(0.05, std::time::Duration::from_secs(3600));
         let eta = render_status(Some(&h), true).estimated_remaining_seconds;
-        assert!((41_000..=43_000).contains(&eta), "expected ~42000s, got {eta}");
+        assert!(
+            (41_000..=43_000).contains(&eta),
+            "expected ~42000s, got {eta}"
+        );
     }
 
     /// The #532 guard: a backfill that is not running reports no ETA even
@@ -594,7 +590,10 @@ mod tests {
         h.inner
             .stint
             .begin_backdated(0.05, std::time::Duration::from_secs(3600));
-        assert_eq!(render_status(Some(&h), false).estimated_remaining_seconds, 0);
+        assert_eq!(
+            render_status(Some(&h), false).estimated_remaining_seconds,
+            0
+        );
     }
 
     #[test]

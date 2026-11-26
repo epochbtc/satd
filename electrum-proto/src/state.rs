@@ -10,10 +10,10 @@ use std::sync::Arc;
 
 use bitcoin::Network;
 use node::chain::state::ChainState;
+use node::index::silent_payments::SpIndex;
 use node::mempool::fee::FeeEstimator;
 use node::mempool::pool::Mempool;
 use node::net::manager::TxBroadcaster;
-use node::index::silent_payments::SpIndex;
 use node_index::{AddressIndex, SpendIndex};
 
 use crate::config::ElectrumConfig;

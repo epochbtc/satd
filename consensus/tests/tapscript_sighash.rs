@@ -13,7 +13,9 @@ use bitcoin::transaction::Version;
 use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid, Witness};
 use std::time::{Duration, Instant};
 
-const FLAGS: u32 = consensus::flags::VERIFY_P2SH | consensus::flags::VERIFY_WITNESS | consensus::flags::VERIFY_TAPROOT;
+const FLAGS: u32 = consensus::flags::VERIFY_P2SH
+    | consensus::flags::VERIFY_WITNESS
+    | consensus::flags::VERIFY_TAPROOT;
 const VALUE: u64 = 100_000;
 
 fn push(data: &[u8]) -> Vec<u8> {
@@ -25,31 +27,56 @@ fn push(data: &[u8]) -> Vec<u8> {
 /// A one-leaf taproot output for `leaf`, and the leaf's control block.
 fn taproot_output(leaf: &[u8]) -> (ScriptBuf, Vec<u8>) {
     let secp = Secp256k1::new();
-    let internal = Keypair::from_secret_key(&secp, &SecretKey::from_slice(&[9; 32]).unwrap()).x_only_public_key().0;
+    let internal = Keypair::from_secret_key(&secp, &SecretKey::from_slice(&[9; 32]).unwrap())
+        .x_only_public_key()
+        .0;
     let leaf = ScriptBuf::from_bytes(leaf.to_vec());
-    let info = TaprootBuilder::new().add_leaf(0, leaf.clone()).unwrap().finalize(&secp, internal).unwrap();
-    let control = info.control_block(&(leaf, LeafVersion::TapScript)).unwrap().serialize();
+    let info = TaprootBuilder::new()
+        .add_leaf(0, leaf.clone())
+        .unwrap()
+        .finalize(&secp, internal)
+        .unwrap();
+    let control = info
+        .control_block(&(leaf, LeafVersion::TapScript))
+        .unwrap()
+        .serialize();
     (ScriptBuf::new_p2tr_tweaked(info.output_key()), control)
 }
 
 /// A spend of `spks.len()` taproot outputs to two outputs.
 fn spend_of(spks: &[ScriptBuf]) -> (Transaction, Vec<TxOut>) {
-    let prevouts: Vec<TxOut> =
-        spks.iter().map(|spk| TxOut { value: Amount::from_sat(VALUE), script_pubkey: spk.clone() }).collect();
+    let prevouts: Vec<TxOut> = spks
+        .iter()
+        .map(|spk| TxOut {
+            value: Amount::from_sat(VALUE),
+            script_pubkey: spk.clone(),
+        })
+        .collect();
     let tx = Transaction {
         version: Version(2),
         lock_time: LockTime::ZERO,
         input: (0..spks.len())
             .map(|i| TxIn {
-                previous_output: OutPoint { txid: Txid::from_byte_array([i as u8 + 1; 32]), vout: i as u32 },
+                previous_output: OutPoint {
+                    txid: Txid::from_byte_array([i as u8 + 1; 32]),
+                    vout: i as u32,
+                },
                 script_sig: ScriptBuf::new(),
                 sequence: Sequence(0xffff_fffd - i as u32),
                 witness: Witness::default(),
             })
             .collect(),
         output: vec![
-            TxOut { value: Amount::from_sat(1_000), script_pubkey: ScriptBuf::from_bytes(vec![0x51]) },
-            TxOut { value: Amount::from_sat(2_000), script_pubkey: ScriptBuf::from_bytes(vec![0x00, 0x14, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7]) },
+            TxOut {
+                value: Amount::from_sat(1_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            },
+            TxOut {
+                value: Amount::from_sat(2_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![
+                    0x00, 0x14, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
+                ]),
+            },
         ],
     };
     (tx, prevouts)
@@ -57,10 +84,21 @@ fn spend_of(spks: &[ScriptBuf]) -> (Transaction, Vec<TxOut>) {
 
 /// rust-bitcoin's BIP 341 script-path signature over input `index`, an
 /// implementation independent of the engine's own encoder.
-fn sign(tx: &Transaction, prevouts: &[TxOut], index: usize, leaf: &[u8], annex: Option<&[u8]>, codesep: u32, hash_type: TapSighashType) -> Vec<u8> {
+fn sign(
+    tx: &Transaction,
+    prevouts: &[TxOut],
+    index: usize,
+    leaf: &[u8],
+    annex: Option<&[u8]>,
+    codesep: u32,
+    hash_type: TapSighashType,
+) -> Vec<u8> {
     let secp = Secp256k1::new();
     let kp = Keypair::from_secret_key(&secp, &SecretKey::from_slice(&[7; 32]).unwrap());
-    let leaf_hash = bitcoin::TapLeafHash::from_script(bitcoin::Script::from_bytes(leaf), LeafVersion::TapScript);
+    let leaf_hash = bitcoin::TapLeafHash::from_script(
+        bitcoin::Script::from_bytes(leaf),
+        LeafVersion::TapScript,
+    );
     let mut engine = bitcoin::TapSighash::engine();
     SighashCache::new(tx)
         .taproot_encode_signing_data_to(
@@ -83,7 +121,10 @@ fn sign(tx: &Transaction, prevouts: &[TxOut], index: usize, leaf: &[u8], annex: 
 
 fn xonly() -> [u8; 32] {
     let secp = Secp256k1::new();
-    Keypair::from_secret_key(&secp, &SecretKey::from_slice(&[7; 32]).unwrap()).x_only_public_key().0.serialize()
+    Keypair::from_secret_key(&secp, &SecretKey::from_slice(&[7; 32]).unwrap())
+        .x_only_public_key()
+        .0
+        .serialize()
 }
 
 /// (Rust engine, libbitcoinconsensus) verdicts for input `index`.
@@ -93,11 +134,24 @@ fn verify_both(tx: &Transaction, prevouts: &[TxOut], index: usize) -> (bool, boo
     let spk = prevouts[index].script_pubkey.as_bytes();
     let cpp_utxos: Vec<kernel_ref::Utxo> = prevouts
         .iter()
-        .map(|o| kernel_ref::Utxo { script_pubkey: o.script_pubkey.as_bytes().as_ptr(), script_pubkey_len: o.script_pubkey.len() as u32, value: o.value.to_sat() as i64 })
+        .map(|o| kernel_ref::Utxo {
+            script_pubkey: o.script_pubkey.as_bytes().as_ptr(),
+            script_pubkey_len: o.script_pubkey.len() as u32,
+            value: o.value.to_sat() as i64,
+        })
         .collect();
     let precomputed = consensus::PrecomputedTransactionData::new(tx, prevouts).unwrap();
-    let rust = consensus::verify(&prevouts[index].script_pubkey, Amount::from_sat(VALUE), tx, index, FLAGS, &precomputed).is_ok();
-    let cpp = kernel_ref::verify_with_flags(spk, VALUE, &bytes, Some(&cpp_utxos), index, FLAGS).is_ok();
+    let rust = consensus::verify(
+        &prevouts[index].script_pubkey,
+        Amount::from_sat(VALUE),
+        tx,
+        index,
+        FLAGS,
+        &precomputed,
+    )
+    .is_ok();
+    let cpp =
+        kernel_ref::verify_with_flags(spk, VALUE, &bytes, Some(&cpp_utxos), index, FLAGS).is_ok();
     (rust, cpp)
 }
 
@@ -150,7 +204,11 @@ fn script_path_signatures_match_core_for_every_hash_type() {
                     w.push(annex.to_vec());
                 }
                 tx.input[1].witness = Witness::from_slice(&w);
-                assert_eq!(verify_both(&tx, &prevouts, 1), (false, false), "{label}, annex changed");
+                assert_eq!(
+                    verify_both(&tx, &prevouts, 1),
+                    (false, false),
+                    "{label}, annex changed"
+                );
                 cases += 1;
             }
         }
@@ -186,7 +244,15 @@ fn many_checks_spend(checks: usize, annex_len: usize, pad: usize) -> (Transactio
     let (mut tx, prevouts) = spend_of(&[spk]);
     let mut annex = vec![0x50u8];
     annex.resize(annex_len, 0xab);
-    let sig = sign(&tx, &prevouts, 0, &leaf, Some(&annex), 0xffff_ffff, TapSighashType::Default);
+    let sig = sign(
+        &tx,
+        &prevouts,
+        0,
+        &leaf,
+        Some(&annex),
+        0xffff_ffff,
+        TapSighashType::Default,
+    );
     let mut w = Witness::new();
     w.push(&sig);
     w.push(&leaf);
@@ -199,7 +265,17 @@ fn many_checks_spend(checks: usize, annex_len: usize, pad: usize) -> (Transactio
 fn time_rust(tx: &Transaction, prevouts: &[TxOut]) -> Duration {
     let t = Instant::now();
     let precomputed = consensus::PrecomputedTransactionData::new(tx, prevouts).unwrap();
-    assert!(consensus::verify(&prevouts[0].script_pubkey, Amount::from_sat(VALUE), tx, 0, FLAGS, &precomputed).is_ok());
+    assert!(
+        consensus::verify(
+            &prevouts[0].script_pubkey,
+            Amount::from_sat(VALUE),
+            tx,
+            0,
+            FLAGS,
+            &precomputed
+        )
+        .is_ok()
+    );
     t.elapsed()
 }
 
@@ -207,7 +283,11 @@ fn time_core(tx: &Transaction, prevouts: &[TxOut]) -> Duration {
     let mut bytes = Vec::new();
     tx.consensus_encode(&mut bytes).unwrap();
     let spk = prevouts[0].script_pubkey.as_bytes();
-    let utxos = [kernel_ref::Utxo { script_pubkey: spk.as_ptr(), script_pubkey_len: spk.len() as u32, value: VALUE as i64 }];
+    let utxos = [kernel_ref::Utxo {
+        script_pubkey: spk.as_ptr(),
+        script_pubkey_len: spk.len() as u32,
+        value: VALUE as i64,
+    }];
     let t = Instant::now();
     assert!(kernel_ref::verify_with_flags(spk, VALUE, &bytes, Some(&utxos), 0, FLAGS).is_ok());
     t.elapsed()
@@ -236,7 +316,9 @@ fn many_checks_over_a_large_annex_cost_what_they_cost_core() {
     let small = time_rust(&small_tx, &small_prevouts);
     let large = time_rust(&tx, &prevouts);
     let core = time_core(&tx, &prevouts);
-    eprintln!("8000 checks: rust {small:?} (100 B annex), {large:?} (128 kB annex); core {core:?} (128 kB)");
+    eprintln!(
+        "8000 checks: rust {small:?} (100 B annex), {large:?} (128 kB annex); core {core:?} (128 kB)"
+    );
     assert!(
         large < small * 3 / 2 + Duration::from_millis(100),
         "a 128 kB annex took {large:?} where a 100-byte one took {small:?}"

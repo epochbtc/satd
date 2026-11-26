@@ -135,8 +135,14 @@ mod tests {
     fn disabled_emits_nothing() {
         let block = synth_block(vec![coinbase_tx()]);
         let map = HashMap::new();
-        let out =
-            build_sp_row(&SpIndexConfig::default(), &block, block.block_hash(), None, &map).unwrap();
+        let out = build_sp_row(
+            &SpIndexConfig::default(),
+            &block,
+            block.block_hash(),
+            None,
+            &map,
+        )
+        .unwrap();
         assert!(out.is_none());
     }
 

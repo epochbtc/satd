@@ -15,8 +15,8 @@ use crate::mining::template::tests::make_funded_template_env_with;
 use crate::storage::coinview::Coin;
 use crate::validation::script::NoopVerifier;
 use bitcoin::hashes::Hash;
-use bitcoin::opcodes::all::{OP_CHECKMULTISIG, OP_CHECKSIG, OP_ENDIF, OP_IF, OP_PUSHNUM_1};
 use bitcoin::opcodes::OP_0;
+use bitcoin::opcodes::all::{OP_CHECKMULTISIG, OP_CHECKSIG, OP_ENDIF, OP_IF, OP_PUSHNUM_1};
 use bitcoin::{Amount, ScriptBuf, Sequence, TxIn, Witness};
 
 /// Core's count for one input revealing [`heavy_script`].
@@ -36,7 +36,10 @@ fn light_script() -> ScriptBuf {
 }
 
 fn prev(tag: u8) -> OutPoint {
-    OutPoint { txid: Txid::from_byte_array([tag; 32]), vout: 0 }
+    OutPoint {
+        txid: Txid::from_byte_array([tag; 32]),
+        vout: 0,
+    }
 }
 
 /// A confirmed P2WSH coin committing to `witness_script`.
@@ -52,7 +55,12 @@ fn p2wsh_coin(witness_script: &ScriptBuf) -> Coin {
 
 /// Spend each of `prevs` by revealing `witness_script`, paying all but `fee`
 /// to one P2WPKH output.
-fn spend_p2wsh(prevs: &[OutPoint], witness_script: &ScriptBuf, fee: u64, out_tag: u8) -> Transaction {
+fn spend_p2wsh(
+    prevs: &[OutPoint],
+    witness_script: &ScriptBuf,
+    fee: u64,
+    out_tag: u8,
+) -> Transaction {
     let mut spk = vec![0x00, 0x14];
     spk.extend_from_slice(&[out_tag; 20]);
     Transaction {
@@ -84,7 +92,13 @@ fn an_entry_carries_cores_sigop_cost() {
     let (cs, mp, dir) = make_funded_template_env_with(&coins, Box::new(NoopVerifier));
 
     let txid = mp
-        .accept_transaction(spend_p2wsh(&prevs, &ws, 1_000, 0x21), &cs, &NoopVerifier, TxSource::Rpc, false)
+        .accept_transaction(
+            spend_p2wsh(&prevs, &ws, 1_000, 0x21),
+            &cs,
+            &NoopVerifier,
+            TxSource::Rpc,
+            false,
+        )
         .expect("admitted");
     assert_eq!(mp.get(&txid).unwrap().sigop_cost, 4 * HEAVY);
 
@@ -104,13 +118,28 @@ fn the_policy_view_sees_cores_sigop_cost() {
     mp.set_policy(std::sync::Arc::new(rs));
 
     let held = mp
-        .accept_transaction(spend_p2wsh(&[prev(1)], &heavy, 1_000, 0x21), &cs, &NoopVerifier, TxSource::P2p, false)
+        .accept_transaction(
+            spend_p2wsh(&[prev(1)], &heavy, 1_000, 0x21),
+            &cs,
+            &NoopVerifier,
+            TxSource::P2p,
+            false,
+        )
         .expect("admitted into quarantine");
     let free = mp
-        .accept_transaction(spend_p2wsh(&[prev(2)], &light, 1_000, 0x22), &cs, &NoopVerifier, TxSource::P2p, false)
+        .accept_transaction(
+            spend_p2wsh(&[prev(2)], &light, 1_000, 0x22),
+            &cs,
+            &NoopVerifier,
+            TxSource::P2p,
+            false,
+        )
         .expect("admitted");
     let inner = mp.inner.read();
-    assert!(inner.entries.get(&held).unwrap().scope.is_quarantined(), "3,941 is over 3,000");
+    assert!(
+        inner.entries.get(&held).unwrap().scope.is_quarantined(),
+        "3,941 is over 3,000"
+    );
     assert!(inner.entries.get(&free).unwrap().scope.is_acting());
     drop(inner);
 
@@ -127,7 +156,12 @@ fn a_dust_parent_admission_records_its_sigop_cost_and_prevouts() {
     let (cs, mp, dir) = make_funded_template_env_with(&coins, Box::new(NoopVerifier));
 
     let (txid, _) = mp
-        .admit_dust_parent(spend_p2wsh(&[prev(1)], &ws, 0, 0x21), &cs, &NoopVerifier, TxSource::Rpc)
+        .admit_dust_parent(
+            spend_p2wsh(&[prev(1)], &ws, 0, 0x21),
+            &cs,
+            &NoopVerifier,
+            TxSource::Rpc,
+        )
         .expect("admitted");
     let entry = mp.get(&txid).unwrap();
     assert_eq!(entry.sigop_cost, HEAVY);
@@ -155,12 +189,22 @@ fn a_template_keeps_to_the_sigop_limit_by_cores_count() {
     for (i, four) in prevs.chunks(4).enumerate() {
         // Higher fee first, so the one left out is the last.
         let fee = 10_000 - 1_000 * i as u64;
-        mp.accept_transaction(spend_p2wsh(four, &ws, fee, 0x30 + i as u8), &cs, &NoopVerifier, TxSource::Rpc, false)
-            .expect("admitted");
+        mp.accept_transaction(
+            spend_p2wsh(four, &ws, fee, 0x30 + i as u8),
+            &cs,
+            &NoopVerifier,
+            TxSource::Rpc,
+            false,
+        )
+        .expect("admitted");
     }
 
     let template = crate::mining::template::create_template(&cs, &mp);
-    assert_eq!(template.transactions.len(), 5, "five of six fit under 80,000");
+    assert_eq!(
+        template.transactions.len(),
+        5,
+        "five of six fit under 80,000"
+    );
     for t in &template.transactions {
         assert_eq!(t.sigop_cost, 4 * HEAVY);
     }

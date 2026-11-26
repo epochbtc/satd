@@ -77,7 +77,14 @@ pub fn state_connection_factory(state: Arc<ElectrumState>) -> ConnectionFactory 
         let chain = state.chain.clone();
         let extras = state.electrum_extras.clone();
         let dispatch: BoxedDispatch = Box::new(move |req: Request| {
-            dispatch_session(&st, &mut session, &mut subs, chain.as_ref(), extras.clone(), req)
+            dispatch_session(
+                &st,
+                &mut session,
+                &mut subs,
+                chain.as_ref(),
+                extras.clone(),
+                req,
+            )
         });
         (dispatch, notify_rx)
     })
@@ -174,8 +181,9 @@ impl ElectrumServer {
 
         let allow = tls_config::ClientAllowList::new(config.mtls_client_allow.iter().cloned());
 
-        let semaphore =
-            Arc::new(Semaphore::new(node::http_serve::clamp_cap(config.max_conns).max(1)));
+        let semaphore = Arc::new(Semaphore::new(
+            node::http_serve::clamp_cap(config.max_conns).max(1),
+        ));
         Ok(Self {
             listener,
             tls,
@@ -329,7 +337,9 @@ impl ElectrumServer {
                     let tls_stream = match tokio::time::timeout(
                         handshake_timeout,
                         acceptor.accept(stream),
-                    ).await {
+                    )
+                    .await
+                    {
                         Ok(Ok(s)) => s,
                         Ok(Err(e)) => {
                             tracing::debug!(peer = %peer, error = %e, "TLS handshake failed");
@@ -338,7 +348,8 @@ impl ElectrumServer {
                         Err(_elapsed) => {
                             // One line per silent socket is a client's to
                             // drive, so it is budgeted.
-                            static TIMEOUTS: WarnBudget = WarnBudget::new(5, Duration::from_secs(60));
+                            static TIMEOUTS: WarnBudget =
+                                WarnBudget::new(5, Duration::from_secs(60));
                             if let Some(suppressed) = TIMEOUTS.tick() {
                                 tracing::warn!(
                                     target = "electrum::server",
@@ -700,15 +711,28 @@ mod tests {
         let note = json!({"jsonrpc":"2.0","method":"blockchain.headers.subscribe","params":[]});
         let req = json!({"jsonrpc":"2.0","id":7,"method":"server.ping","params":[]});
 
-        assert_eq!(process_request(&mut dispatch, &note.to_string(), 10).reply, None);
-        assert_eq!(calls.load(Ordering::SeqCst), 0, "a lone notification runs nothing");
+        assert_eq!(
+            process_request(&mut dispatch, &note.to_string(), 10).reply,
+            None
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "a lone notification runs nothing"
+        );
 
         let only_notes = json!([note, note]).to_string();
         assert_eq!(process_request(&mut dispatch, &only_notes, 10).reply, None);
-        assert_eq!(calls.load(Ordering::SeqCst), 0, "a batch of notifications runs nothing");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "a batch of notifications runs nothing"
+        );
 
         let mixed = json!([note, req, note]).to_string();
-        let reply = process_request(&mut dispatch, &mixed, 10).reply.expect("the request is answered");
+        let reply = process_request(&mut dispatch, &mixed, 10)
+            .reply
+            .expect("the request is answered");
         let reply: Value = serde_json::from_str(&reply).unwrap();
         assert_eq!(reply.as_array().map(Vec::len), Some(1), "{reply}");
         assert_eq!(reply[0]["id"], 7);

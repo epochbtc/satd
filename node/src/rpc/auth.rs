@@ -397,7 +397,8 @@ where
             // handshake is the gate. Treat the caller as the full-capability
             // operator so the downstream capability filter (if any) is a no-op.
             if auth.is_disabled() {
-                req.extensions_mut().insert(satd_auth::Principal::operator());
+                req.extensions_mut()
+                    .insert(satd_auth::Principal::operator());
                 return inner.call(req).await;
             }
 
@@ -481,7 +482,9 @@ where
                             .map_or_else(|| "an unknown address".to_string(), |p| p.0.to_string());
                         if let Some(suppressed) = failed_auth_log.tick() {
                             if suppressed == 0 {
-                                tracing::warn!("ThreadRPCServer incorrect password attempt from {peer}");
+                                tracing::warn!(
+                                    "ThreadRPCServer incorrect password attempt from {peer}"
+                                );
                             } else {
                                 tracing::warn!(
                                     suppressed,

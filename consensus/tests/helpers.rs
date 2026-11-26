@@ -76,9 +76,9 @@ pub struct WitnessRow {
 /// key0 is the secret key 1 (`vchKey0`, src/test/script_tests.cpp:182).
 #[allow(dead_code)]
 pub fn parse_witness_row(items: &[serde_json::Value]) -> WitnessRow {
+    use bitcoin::ScriptBuf;
     use bitcoin::secp256k1::{Secp256k1, SecretKey};
     use bitcoin::taproot::{LeafVersion, TaprootBuilder};
-    use bitcoin::ScriptBuf;
 
     let mut stack: Vec<Vec<u8>> = Vec::new();
     let mut taproot_output = None;
@@ -93,7 +93,12 @@ pub fn parse_witness_row(items: &[serde_json::Value]) -> WitnessRow {
             let (internal, _) = SecretKey::from_slice(&key0)
                 .unwrap()
                 .x_only_public_key(&secp);
-            let leaf = ScriptBuf::from_bytes(stack.last().expect("#CONTROLBLOCK# follows a script").clone());
+            let leaf = ScriptBuf::from_bytes(
+                stack
+                    .last()
+                    .expect("#CONTROLBLOCK# follows a script")
+                    .clone(),
+            );
             let info = TaprootBuilder::new()
                 .add_leaf(0, leaf.clone())
                 .unwrap()
@@ -110,7 +115,10 @@ pub fn parse_witness_row(items: &[serde_json::Value]) -> WitnessRow {
             stack.push(hex::decode(s).unwrap_or_else(|e| panic!("Bad witness hex '{s}': {e}")));
         }
     }
-    WitnessRow { stack, taproot_output }
+    WitnessRow {
+        stack,
+        taproot_output,
+    }
 }
 
 /// Parse a human-readable script string from Bitcoin Core tests into raw bytes.
@@ -341,9 +349,10 @@ fn opcode_from_name(name: &str) -> Option<u8> {
             // Try SUCCESS opcodes: OP_SUCCESS80..OP_SUCCESS255 etc
             // These are 0x50, 0x62, 0x7e-0x7f, 0x89-0x8a, 0x8d-0x8e, 0x95-0x99, 0xbb-0xfe
             if let Some(rest) = name.strip_prefix("SUCCESS")
-                && let Ok(n) = rest.parse::<u16>() {
-                    return Some(n as u8);
-                }
+                && let Ok(n) = rest.parse::<u16>()
+            {
+                return Some(n as u8);
+            }
             None
         }
     }

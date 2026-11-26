@@ -94,7 +94,10 @@ pub fn decode_txseq(b: &[u8]) -> Option<TxSeq> {
 
 /// Encode a vout/vin index as 3 bytes big-endian.
 pub fn encode_u24(v: u32) -> [u8; VOUT_LEN] {
-    debug_assert!(v <= VOUT_MAX, "output index {v} exceeds the 3-byte encoding");
+    debug_assert!(
+        v <= VOUT_MAX,
+        "output index {v} exceeds the 3-byte encoding"
+    );
     [(v >> 16) as u8, (v >> 8) as u8, v as u8]
 }
 

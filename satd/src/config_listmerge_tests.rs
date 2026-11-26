@@ -33,7 +33,11 @@ fn a_bind_on_the_command_line_adds_to_the_config_files() {
         "[regtest]\nbind=127.0.0.1\n",
         &["-bind=127.0.0.1:28001=onion", "-bind=127.0.0.1:28002=onion"],
     );
-    let binds: Vec<(String, bool)> = cfg.binds.iter().map(|b| (b.addr.to_string(), b.onion)).collect();
+    let binds: Vec<(String, bool)> = cfg
+        .binds
+        .iter()
+        .map(|b| (b.addr.to_string(), b.onion))
+        .collect();
     assert_eq!(
         binds,
         vec![
@@ -69,10 +73,20 @@ fn a_negated_connect_drops_the_config_files_peers_unless_a_peer_follows() {
 
     let cfg = load(file, &["-connect=10.0.0.2", "-noconnect"]);
     assert!(cfg.connect.is_empty(), "{:?}", cfg.connect);
-    assert!(!cfg.automatic_outbound, "a negation still turns automatic outbound off");
+    assert!(
+        !cfg.automatic_outbound,
+        "a negation still turns automatic outbound off"
+    );
 
-    let cfg = load(file, &["-connect=10.0.0.2", "-noconnect", "-connect=10.0.0.3"]);
-    assert_eq!(cfg.connect, ["10.0.0.3", "10.0.0.1"], "values before the negation go; the file's come back");
+    let cfg = load(
+        file,
+        &["-connect=10.0.0.2", "-noconnect", "-connect=10.0.0.3"],
+    );
+    assert_eq!(
+        cfg.connect,
+        ["10.0.0.3", "10.0.0.1"],
+        "values before the negation go; the file's come back"
+    );
 
     let cfg = load("", &["-noconnect"]);
     assert!(cfg.connect.is_empty());
@@ -85,11 +99,19 @@ fn a_negated_rpcauth_drops_the_config_files_entries_unless_one_follows() {
     let a = "a:f7efda5c189b999524f151318c0c86$d5b51b3beffbc02b724e5d095828e0bc8b2456e9ac8757ae3211a5d9b16a22ae";
     let b = "b:f7efda5c189b999524f151318c0c86$d5b51b3beffbc02b724e5d095828e0bc8b2456e9ac8757ae3211a5d9b16a22ae";
     let file = format!("rpcauth={a}\n");
-    let users = |cfg: &Config| cfg.rpcauth.iter().map(|e| e.username.clone()).collect::<Vec<_>>();
+    let users = |cfg: &Config| {
+        cfg.rpcauth
+            .iter()
+            .map(|e| e.username.clone())
+            .collect::<Vec<_>>()
+    };
 
     assert_eq!(users(&load(&file, &[&format!("-rpcauth={b}")])), ["b", "a"]);
     assert!(users(&load(&file, &[&format!("-rpcauth={b}"), "-norpcauth"])).is_empty());
-    assert_eq!(users(&load(&file, &["-norpcauth", &format!("-rpcauth={b}")])), ["b", "a"]);
+    assert_eq!(
+        users(&load(&file, &["-norpcauth", &format!("-rpcauth={b}")])),
+        ["b", "a"]
+    );
 }
 
 #[test]
@@ -99,7 +121,13 @@ fn merge_list_follows_core_settings_list() {
     assert_eq!(merge_list(v(&["a"]), v(&["b"]), None), v(&["a", "b"]));
     assert_eq!(merge_list(v(&[]), v(&["b"]), None), v(&["b"]));
     assert_eq!(merge_list(v(&["a", N]), v(&["b"]), Some(N)), v(&[]));
-    assert_eq!(merge_list(v(&["a", N, "c"]), v(&["b"]), Some(N)), v(&["c", "b"]));
+    assert_eq!(
+        merge_list(v(&["a", N, "c"]), v(&["b"]), Some(N)),
+        v(&["c", "b"])
+    );
     // The config file's own negation trims only the config file's values.
-    assert_eq!(merge_list(v(&["a"]), v(&["b", N, "d"]), Some(N)), v(&["a", "d"]));
+    assert_eq!(
+        merge_list(v(&["a"]), v(&["b", N, "d"]), Some(N)),
+        v(&["a", "d"])
+    );
 }

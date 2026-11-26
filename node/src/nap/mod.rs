@@ -27,8 +27,8 @@ pub mod aggregate;
 pub mod chain;
 pub mod collect;
 pub mod message;
-pub(crate) mod par;
 pub mod p2p;
+pub(crate) mod par;
 pub mod publisher;
 pub mod pull;
 pub mod report;
@@ -39,8 +39,10 @@ pub mod wire;
 use bitcoin::hashes::{Hash as _, sha256};
 use bitcoin::{BlockHash, OutPoint, Transaction, Witness};
 
-pub use publisher::{ChainSource, Publisher, PublishError};
-pub use validity::{ChainView, Coin, Rejection, Timelocks, evaluate, min_coin_age, select, supersedes};
+pub use publisher::{ChainSource, PublishError, Publisher};
+pub use validity::{
+    ChainView, Coin, Rejection, Timelocks, evaluate, min_coin_age, select, supersedes,
+};
 pub use wire::FormatError;
 
 /// The attestation format version, the first byte of the wire form.
@@ -125,7 +127,14 @@ impl Attestation {
     ) -> Result<Self, FormatError> {
         message::check_key(key.as_bytes())?;
         message::check_value(value.as_bytes())?;
-        let att = Attestation { outpoint, key, value, anchor_height, anchor_hash, signature };
+        let att = Attestation {
+            outpoint,
+            key,
+            value,
+            anchor_height,
+            anchor_hash,
+            signature,
+        };
         let size = wire::serialized_size(&att);
         if size > MAX_ATTESTATION_SIZE {
             return Err(FormatError::TooLarge(size));
@@ -164,7 +173,13 @@ impl Attestation {
 
     /// The text the holder signed.
     pub fn message(&self) -> String {
-        message::render(&self.outpoint, &self.key, &self.value, self.anchor_height, &self.anchor_hash)
+        message::render(
+            &self.outpoint,
+            &self.key,
+            &self.value,
+            self.anchor_height,
+            &self.anchor_hash,
+        )
     }
 
     /// SHA256 of the serialized form: the supersession tie-break and the

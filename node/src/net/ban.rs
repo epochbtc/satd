@@ -421,11 +421,7 @@ impl BanList {
     /// lapsed never blocks a fresh one.
     pub fn already_banned(&self, target: &BanTarget, is_subnet: bool, now: u64) -> bool {
         let key = target.normalised();
-        if self
-            .entries
-            .get(&key)
-            .is_some_and(|e| !e.is_expired(now))
-        {
+        if self.entries.get(&key).is_some_and(|e| !e.is_expired(now)) {
             return true;
         }
         if is_subnet {
@@ -442,7 +438,10 @@ impl BanList {
     pub fn remove(&mut self, target: &BanTarget) -> Result<(), String> {
         let key = target.normalised();
         if self.entries.remove(&key).is_none() {
-            return Err("Error: Unban failed. Requested address/subnet was not previously manually banned.".to_string());
+            return Err(
+                "Error: Unban failed. Requested address/subnet was not previously manually banned."
+                    .to_string(),
+            );
         }
         self.dirty = true;
         Ok(())
@@ -519,17 +518,15 @@ mod tests {
 
     #[test]
     fn parse_onion() {
-        let target = parse_ban_target(
-            "pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.onion",
-        )
-        .unwrap();
+        let target =
+            parse_ban_target("pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.onion")
+                .unwrap();
         assert!(matches!(target, BanTarget::Onion(_)));
     }
 
     #[test]
     fn parse_ipv6_cidr() {
-        let target =
-            parse_ban_target("2001:4d48:ac57:400:cacf:e9ff:fe1d:9c63/19").unwrap();
+        let target = parse_ban_target("2001:4d48:ac57:400:cacf:e9ff:fe1d:9c63/19").unwrap();
         assert!(target.normalised().contains("/19"));
     }
 
@@ -603,7 +600,10 @@ mod tests {
 
         // Nothing further to write until something changes.
         assert!(list.take_pending_dump().is_none());
-        assert!(!path.with_extension("json.tmp").exists(), "no temp file left behind");
+        assert!(
+            !path.with_extension("json.tmp").exists(),
+            "no temp file left behind"
+        );
     }
 
     /// Core's format, satd's historical bare array, and a round trip.
@@ -624,7 +624,10 @@ mod tests {
             let path = dir.path().join("banlist.json");
             std::fs::write(&path, raw).unwrap();
             let (list, recreated, why) = BanList::load(&path);
-            assert!(!recreated, "{label}: a readable list is not recreated ({why:?})");
+            assert!(
+                !recreated,
+                "{label}: a readable list is not recreated ({why:?})"
+            );
             assert!(why.is_none(), "{label}: {why:?}");
             assert_eq!(list.list(0).len(), 1, "{label}: the ban survived the load");
             assert!(
@@ -663,7 +666,10 @@ mod tests {
         let reread = std::fs::read_to_string(&path).unwrap();
         let v: serde_json::Value = serde_json::from_str(&reread).unwrap();
         assert!(v.is_object(), "Core's shape is an object: {reread}");
-        assert!(v.get("banned_nets").is_some_and(|n| n.is_array()), "{reread}");
+        assert!(
+            v.get("banned_nets").is_some_and(|n| n.is_array()),
+            "{reread}"
+        );
 
         // And the ban survived the rewrite.
         let (list, _, _) = BanList::load(&path);
@@ -696,7 +702,11 @@ mod tests {
             write_banlist(&dest, &json).unwrap();
 
             let (reloaded, _, _) = BanList::load(&path);
-            assert_eq!(reloaded.list(0).len(), 1, "{junk:?}: the ban must survive a restart");
+            assert_eq!(
+                reloaded.list(0).len(),
+                1,
+                "{junk:?}: the ban must survive a restart"
+            );
         }
     }
 
@@ -719,7 +729,11 @@ mod tests {
         let (list, recreated, _) = BanList::load(&path);
         assert!(!recreated);
         let kept: Vec<&str> = list.list(0).iter().map(|e| e.address.as_str()).collect();
-        assert_eq!(kept, ["192.168.0.0/16"], "unknown version and bad address dropped");
+        assert_eq!(
+            kept,
+            ["192.168.0.0/16"],
+            "unknown version and bad address dropped"
+        );
     }
 
     /// A failed write must leave the previous list intact, not a truncated
@@ -752,7 +766,10 @@ mod tests {
         list.add(&parse_ban_target("192.168.0.0/16").unwrap(), 1, 9999999999)
             .unwrap();
         let (dest, json) = list.take_pending_dump().unwrap();
-        assert!(write_banlist(&dest, &json).is_err(), "the tmp write must fail");
+        assert!(
+            write_banlist(&dest, &json).is_err(),
+            "the tmp write must fail"
+        );
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
             first,
@@ -763,11 +780,16 @@ mod tests {
         // the next flush writes the list that was pending.
         list.mark_dirty();
         std::fs::remove_dir(&tmp).unwrap();
-        let (dest, json) = list.take_pending_dump().expect("still dirty after a failed write");
+        let (dest, json) = list
+            .take_pending_dump()
+            .expect("still dirty after a failed write");
         write_banlist(&dest, &json).unwrap();
         let after = std::fs::read_to_string(&path).unwrap();
         assert!(after.contains("10.0.0.0/8") && after.contains("192.168.0.0/16"));
-        assert!(!tmp.exists(), "no temporary left behind after a successful write");
+        assert!(
+            !tmp.exists(),
+            "no temporary left behind after a successful write"
+        );
     }
 
     /// A ban list written with a non-canonical subnet must still be
@@ -790,7 +812,10 @@ mod tests {
         let (mut list, recreated, _) = BanList::load(&path);
         assert!(!recreated);
         assert_eq!(
-            list.list(0).iter().map(|e| e.address.as_str()).collect::<Vec<_>>(),
+            list.list(0)
+                .iter()
+                .map(|e| e.address.as_str())
+                .collect::<Vec<_>>(),
             ["10.0.0.0/8"],
             "the address is canonicalised on load"
         );
@@ -834,7 +859,10 @@ mod tests {
         settle(&mut list);
 
         list.add(&target, 1, 9999999999).unwrap();
-        assert!(!list.is_dirty(), "a ban that neither inserts nor extends changes nothing");
+        assert!(
+            !list.is_dirty(),
+            "a ban that neither inserts nor extends changes nothing"
+        );
 
         list.add(&target, 1, 99999999999).unwrap();
         assert!(list.is_dirty(), "extending a ban");

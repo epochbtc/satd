@@ -68,7 +68,11 @@ fn a_block_stored_before_its_parent_becomes_the_best_header_and_connects_after_i
         matches!(r, Ok(BlockAcceptance::Connected(h)) if h == parent.block_hash()),
         "the parent extends the tip, got {r:?}"
     );
-    assert_eq!(cs.best_header_hash(), child.block_hash(), "the parent does not lower it");
+    assert_eq!(
+        cs.best_header_hash(),
+        child.block_hash(),
+        "the parent does not lower it"
+    );
 
     let drained = drain_one(&cs);
     assert!(
@@ -184,7 +188,10 @@ fn connecting_a_block_of_equal_work_leaves_the_best_header_alone() {
 fn a_stored_child_that_fails_to_connect_is_marked_and_leaves_the_header_tip() {
     let (cs, dir) = make_chain_state();
     let parent = build_test_block(genesis(), 1, BASE + 600);
-    let missing = OutPoint { txid: bitcoin::Txid::from_byte_array([0xa7; 32]), vout: 0 };
+    let missing = OutPoint {
+        txid: bitcoin::Txid::from_byte_array([0xa7; 32]),
+        vout: 0,
+    };
     let child = build_test_block_spending(parent.block_hash(), 2, BASE + 1200, missing);
 
     cs.accept_header(&parent.header).unwrap();
@@ -193,13 +200,20 @@ fn a_stored_child_that_fails_to_connect_is_marked_and_leaves_the_header_tip() {
     assert!(cs.accept_block(&parent).unwrap().connected());
 
     let drained = drain_one(&cs);
-    assert!(matches!(drained, Some(Err(_))), "the child must fail to connect, got {drained:?}");
+    assert!(
+        matches!(drained, Some(Err(_))),
+        "the child must fail to connect, got {drained:?}"
+    );
     assert_eq!(cs.tip_hash(), parent.block_hash());
     assert_eq!(
         cs.get_block_index(&child.block_hash()).map(|e| e.status),
         Some(BlockStatus::Invalid)
     );
-    assert_eq!(cs.best_header_hash(), parent.block_hash(), "the header tip leaves the failed block");
+    assert_eq!(
+        cs.best_header_hash(),
+        parent.block_hash(),
+        "the header tip leaves the failed block"
+    );
     assert_eq!(cs.headers_tip_height(), 1);
     assert!(drain_one(&cs).is_none(), "the drain does not retry it");
 

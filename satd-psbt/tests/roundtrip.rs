@@ -21,7 +21,12 @@ fn roundtrip_is_byte_exact() {
             "{}: re-serialising changed the bytes",
             v.description
         );
-        assert_eq!(raw.to_base64(), v.base64, "{}: base64 differs", v.description);
+        assert_eq!(
+            raw.to_base64(),
+            v.base64,
+            "{}: base64 differs",
+            v.description
+        );
         checked += 1;
     }
     assert_eq!(checked, 42, "all 42 BIP 375 vectors should round trip");
@@ -51,7 +56,11 @@ fn roundtrip_is_byte_exact_for_v0() {
     for (name, bytes) in v0_fixtures() {
         let raw = RawPsbt::parse(&bytes).unwrap_or_else(|e| panic!("{name}: parse failed: {e}"));
         assert_eq!(raw.version().unwrap(), PsbtVersion::V0, "{name}");
-        assert_eq!(raw.serialize(), bytes, "{name}: re-serialising changed the bytes");
+        assert_eq!(
+            raw.serialize(),
+            bytes,
+            "{name}: re-serialising changed the bytes"
+        );
     }
 }
 
@@ -134,7 +143,10 @@ fn writing_an_empty_script_for_an_absent_one_is_detectable() {
     use satd_psbt::keys;
     let v = common::bip375_valid()
         .into_iter()
-        .find(|v| v.description.starts_with("in progress: one P2TR input / one sp output"))
+        .find(|v| {
+            v.description
+                .starts_with("in progress: one P2TR input / one sp output")
+        })
         .expect("the in-progress vector is in the file");
     let mut raw = RawPsbt::parse(&v.psbt).expect("parses");
     let mut touched = false;
@@ -338,9 +350,16 @@ fn set_replaces_in_place_and_leaves_the_rest_alone() {
 #[test]
 fn insert_refuses_a_duplicate_and_set_does_not() {
     let mut map = RawMap::new();
-    map.insert(RawPair::new(0x01u64, vec![0xaa], vec![1])).unwrap();
-    assert!(map.insert(RawPair::new(0x01u64, vec![0xaa], vec![2])).is_err());
-    assert!(map.insert(RawPair::new(0x01u64, vec![0xbb], vec![2])).is_ok());
+    map.insert(RawPair::new(0x01u64, vec![0xaa], vec![1]))
+        .unwrap();
+    assert!(
+        map.insert(RawPair::new(0x01u64, vec![0xaa], vec![2]))
+            .is_err()
+    );
+    assert!(
+        map.insert(RawPair::new(0x01u64, vec![0xbb], vec![2]))
+            .is_ok()
+    );
     map.set(RawPair::new(0x01u64, vec![0xaa], vec![9]));
     assert_eq!(map.get(0x01, &[0xaa]), Some(&[9u8][..]));
     assert_eq!(map.len(), 2);

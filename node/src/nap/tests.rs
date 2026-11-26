@@ -33,7 +33,12 @@ pub(super) struct Chain {
 
 impl Chain {
     pub(super) fn new() -> Self {
-        Chain { network: Network::Bitcoin, tip: TIP, fork_at: u32::MAX, coins: HashMap::new() }
+        Chain {
+            network: Network::Bitcoin,
+            tip: TIP,
+            fork_at: u32::MAX,
+            coins: HashMap::new(),
+        }
     }
 }
 
@@ -74,7 +79,10 @@ impl ChainView for Chain {
 }
 
 pub(super) fn outpoint(n: u8) -> OutPoint {
-    OutPoint { txid: Txid::from_byte_array([n; 32]), vout: u32::from(n) }
+    OutPoint {
+        txid: Txid::from_byte_array([n; 32]),
+        vout: u32::from(n),
+    }
 }
 
 // --- Signers ----------------------------------------------------------------
@@ -108,8 +116,12 @@ pub(super) fn p2wpkh() -> Signer {
             let sighash = SighashCache::new(&tx)
                 .p2wpkh_signature_hash(0, &challenge, Amount::ZERO, EcdsaSighashType::All)
                 .unwrap();
-            let sig = Secp256k1::new().sign_ecdsa(&SecpMessage::from_digest(sighash.to_byte_array()), &sk);
-            let sig = bitcoin::ecdsa::Signature { signature: sig, sighash_type: EcdsaSighashType::All };
+            let sig = Secp256k1::new()
+                .sign_ecdsa(&SecpMessage::from_digest(sighash.to_byte_array()), &sk);
+            let sig = bitcoin::ecdsa::Signature {
+                signature: sig,
+                sighash_type: EcdsaSighashType::All,
+            };
             NapSignature::Simple(Witness::p2wpkh(&sig, &pk.0))
         }),
     }
@@ -122,7 +134,8 @@ pub(super) fn p2pkh() -> Signer {
     Signer {
         spk,
         sign: Box::new(move |message| {
-            let sig = signmessage::decode_base64(&signmessage::message_sign(&key, message)).unwrap();
+            let sig =
+                signmessage::decode_base64(&signmessage::message_sign(&key, message)).unwrap();
             NapSignature::Legacy(sig.try_into().unwrap())
         }),
     }
@@ -133,7 +146,10 @@ pub(super) fn p2pkh() -> Signer {
 pub(super) fn p2wsh_full(prefix: Builder, version: i32, lock_time: u32, sequence: u32) -> Signer {
     let sk = secret(4);
     let pk = compressed(&sk);
-    let ws = prefix.push_key(&pk.into()).push_opcode(OP_CHECKSIG).into_script();
+    let ws = prefix
+        .push_key(&pk.into())
+        .push_opcode(OP_CHECKSIG)
+        .into_script();
     let spk = ScriptBuf::new_p2wsh(&ws.wscript_hash());
     let challenge = spk.clone();
     Signer {
@@ -147,8 +163,12 @@ pub(super) fn p2wsh_full(prefix: Builder, version: i32, lock_time: u32, sequence
             let sighash = SighashCache::new(&tx)
                 .p2wsh_signature_hash(0, &ws, Amount::ZERO, EcdsaSighashType::All)
                 .unwrap();
-            let sig = Secp256k1::new().sign_ecdsa(&SecpMessage::from_digest(sighash.to_byte_array()), &sk);
-            let sig = bitcoin::ecdsa::Signature { signature: sig, sighash_type: EcdsaSighashType::All };
+            let sig = Secp256k1::new()
+                .sign_ecdsa(&SecpMessage::from_digest(sighash.to_byte_array()), &sk);
+            let sig = bitcoin::ecdsa::Signature {
+                signature: sig,
+                sighash_type: EcdsaSighashType::All,
+            };
             let mut w = Witness::new();
             w.push(sig.to_vec());
             w.push(ws.as_bytes());
@@ -159,10 +179,25 @@ pub(super) fn p2wsh_full(prefix: Builder, version: i32, lock_time: u32, sequence
 }
 
 /// An attestation by `signer` for `op`, anchored at `anchor` on `chain`.
-pub(super) fn attest(chain: &Chain, signer: &Signer, op: OutPoint, key: &str, value: &str, anchor: u32) -> Attestation {
+pub(super) fn attest(
+    chain: &Chain,
+    signer: &Signer,
+    op: OutPoint,
+    key: &str,
+    value: &str,
+    anchor: u32,
+) -> Attestation {
     let hash = chain.block_hash(anchor).unwrap();
     let text = message::render(&op, key, value, anchor, &hash);
-    Attestation::new(op, key.into(), value.into(), anchor, hash, (signer.sign)(&text)).unwrap()
+    Attestation::new(
+        op,
+        key.into(),
+        value.into(),
+        anchor,
+        hash,
+        (signer.sign)(&text),
+    )
+    .unwrap()
 }
 
 /// A chain holding one coin for `signer` at `coin_height`, and an attestation
@@ -172,7 +207,12 @@ pub(super) fn setup(signer: &Signer, coin_height: u32, anchor: u32) -> (Chain, A
     let op = outpoint(7);
     chain.coins.insert(
         op,
-        Coin { value: VALUE, script_pubkey: signer.spk.clone(), height: coin_height, coinbase: false },
+        Coin {
+            value: VALUE,
+            script_pubkey: signer.spk.clone(),
+            height: coin_height,
+            coinbase: false,
+        },
     );
     let att = attest(&chain, signer, op, "bip_xyz.support", "yes", anchor);
     (chain, att)
@@ -182,7 +222,10 @@ pub(super) fn setup(signer: &Signer, coin_height: u32, anchor: u32) -> (Chain, A
 
 #[test]
 fn message_renders_the_designs_text() {
-    let op = OutPoint { txid: Txid::from_byte_array([0x11; 32]), vout: 3 };
+    let op = OutPoint {
+        txid: Txid::from_byte_array([0x11; 32]),
+        vout: 3,
+    };
     let hash = hash_at(39_994, false);
     let text = message::render(&op, "bip_xyz.support", "yes", 39_994, &hash);
     assert_eq!(
@@ -194,7 +237,10 @@ fn message_renders_the_designs_text() {
         )
     );
     let m = message::parse(&text).unwrap();
-    assert_eq!((m.outpoint, m.key.as_str(), m.value.as_str()), (op, "bip_xyz.support", "yes"));
+    assert_eq!(
+        (m.outpoint, m.key.as_str(), m.value.as_str()),
+        (op, "bip_xyz.support", "yes")
+    );
     assert_eq!((m.anchor_height, m.anchor_hash), (39_994, hash));
 
     // An empty value renders as "value: " and parses back.
@@ -205,7 +251,10 @@ fn message_renders_the_designs_text() {
 
 #[test]
 fn message_parse_accepts_only_the_canonical_text() {
-    let op = OutPoint { txid: Txid::from_byte_array([0x11; 32]), vout: 3 };
+    let op = OutPoint {
+        txid: Txid::from_byte_array([0x11; 32]),
+        vout: 3,
+    };
     let hash = hash_at(5, false);
     let good = message::render(&op, "key", "value", 5, &hash);
     let bad = [
@@ -222,7 +271,10 @@ fn message_parse_accepts_only_the_canonical_text() {
         good.replace("key: key", "key: "),
         good.replace("key: key", "key: k\u{7f}"),
         good.replace("value: value", "value: v\talue"),
-        good.replace("value: value", &format!("value: {}", "v".repeat(MAX_VALUE_LEN + 1))),
+        good.replace(
+            "value: value",
+            &format!("value: {}", "v".repeat(MAX_VALUE_LEN + 1)),
+        ),
         good.replace("key: key", &format!("key: {}", "k".repeat(MAX_KEY_LEN + 1))),
         good.replace("value: value\n", ""),
         format!("{good}\nextra: line"),
@@ -232,7 +284,10 @@ fn message_parse_accepts_only_the_canonical_text() {
     }
     let longest = good
         .replace("key: key", &format!("key: {}", "k".repeat(MAX_KEY_LEN)))
-        .replace("value: value", &format!("value: {}", "v".repeat(MAX_VALUE_LEN)));
+        .replace(
+            "value: value",
+            &format!("value: {}", "v".repeat(MAX_VALUE_LEN)),
+        );
     assert!(message::parse(&longest).is_ok());
 }
 
@@ -258,14 +313,20 @@ fn a_list_decodes_one_attestation_at_a_time() {
     assert_eq!(Attestation::decode_from(&mut r).unwrap(), a);
     assert_eq!(Attestation::decode_from(&mut r).unwrap(), b);
     assert!(r.is_empty());
-    assert!(matches!(Attestation::from_bytes(&bytes), Err(FormatError::Decode(_))));
+    assert!(matches!(
+        Attestation::from_bytes(&bytes),
+        Err(FormatError::Decode(_))
+    ));
 }
 
 /// The byte offset of the format byte: after the signature's compact size
 /// and bytes are the last of the encoding.
 fn format_offset(att: &Attestation) -> usize {
     let sig = att.signature().to_bytes();
-    att.to_bytes().len() - sig.len() - bitcoin::consensus::encode::VarInt(sig.len() as u64).size() - 1
+    att.to_bytes().len()
+        - sig.len()
+        - bitcoin::consensus::encode::VarInt(sig.len() as u64).size()
+        - 1
 }
 
 #[test]
@@ -281,20 +342,29 @@ fn decoding_refuses_malformed_bytes() {
 
     let mut b = good.clone();
     b[at] = 3;
-    assert_eq!(Attestation::from_bytes(&b), Err(FormatError::SignatureFormat(3)));
+    assert_eq!(
+        Attestation::from_bytes(&b),
+        Err(FormatError::SignatureFormat(3))
+    );
 
     // Format 0 or 1 over a legacy signature's bytes.
     for f in [0, 1] {
         let mut b = good.clone();
         b[at] = f;
-        assert!(matches!(Attestation::from_bytes(&b), Err(FormatError::Signature(_))), "{f}");
+        assert!(
+            matches!(Attestation::from_bytes(&b), Err(FormatError::Signature(_))),
+            "{f}"
+        );
     }
 
     // A 64-byte legacy signature.
     let mut b = good[..at + 1].to_vec();
     b.push(64);
     b.extend_from_slice(&[1; 64]);
-    assert!(matches!(Attestation::from_bytes(&b), Err(FormatError::Signature(_))));
+    assert!(matches!(
+        Attestation::from_bytes(&b),
+        Err(FormatError::Signature(_))
+    ));
 
     // Truncated anywhere.
     for n in 0..good.len() {
@@ -308,7 +378,10 @@ fn decoding_refuses_malformed_bytes() {
     b.push(0xfd);
     b.extend_from_slice(&(key_len as u16).to_le_bytes());
     b.extend_from_slice(&good[key_at + 1..]);
-    assert!(matches!(Attestation::from_bytes(&b), Err(FormatError::Decode(_))));
+    assert!(matches!(
+        Attestation::from_bytes(&b),
+        Err(FormatError::Decode(_))
+    ));
 
     // A key with a newline in it.
     let mut b = good.clone();
@@ -334,10 +407,16 @@ fn size_limit_holds_on_construction_and_decoding() {
     let att = make(fits).unwrap();
     assert_eq!(att.to_bytes().len(), MAX_ATTESTATION_SIZE);
     assert_eq!(Attestation::from_bytes(&att.to_bytes()).unwrap(), att);
-    assert_eq!(make(fits + 1), Err(FormatError::TooLarge(MAX_ATTESTATION_SIZE + 1)));
+    assert_eq!(
+        make(fits + 1),
+        Err(FormatError::TooLarge(MAX_ATTESTATION_SIZE + 1))
+    );
 
     // The same oversized bytes, as a peer might send them.
-    let big = Attestation { signature: witness_of(fits + 1), ..att };
+    let big = Attestation {
+        signature: witness_of(fits + 1),
+        ..att
+    };
     assert_eq!(
         Attestation::from_bytes(&big.to_bytes()),
         Err(FormatError::TooLarge(MAX_ATTESTATION_SIZE + 1))
@@ -360,9 +439,15 @@ fn construction_checks_key_and_value() {
     let sig = || NapSignature::Legacy([0; LEGACY_SIGNATURE_LEN]);
     let make = |k: &str, v: &str| Attestation::new(op, k.into(), v.into(), 1, hash, sig());
     assert_eq!(make("", "v"), Err(FormatError::KeyLength(0)));
-    assert_eq!(make(&"k".repeat(129), "v"), Err(FormatError::KeyLength(129)));
+    assert_eq!(
+        make(&"k".repeat(129), "v"),
+        Err(FormatError::KeyLength(129))
+    );
     assert_eq!(make("k\n", "v"), Err(FormatError::KeyCharacters));
-    assert_eq!(make("k", &"v".repeat(129)), Err(FormatError::ValueLength(129)));
+    assert_eq!(
+        make("k", &"v".repeat(129)),
+        Err(FormatError::ValueLength(129))
+    );
     assert_eq!(make("k", "v\u{e9}"), Err(FormatError::ValueCharacters));
     assert!(make(&"k".repeat(128), &"v".repeat(128)).is_ok());
     assert!(make("k", "").unwrap().is_withdrawal());
@@ -399,7 +484,12 @@ fn freshness_boundary() {
     let (chain, att) = setup(&signer, COIN_HEIGHT, TIP - (FRESHNESS_WINDOW - 1));
     assert!(evaluate(&att, &chain).is_ok());
     let (chain, att) = setup(&signer, COIN_HEIGHT, TIP - FRESHNESS_WINDOW);
-    assert_eq!(evaluate(&att, &chain), Err(Rejection::Stale { age: FRESHNESS_WINDOW }));
+    assert_eq!(
+        evaluate(&att, &chain),
+        Err(Rejection::Stale {
+            age: FRESHNESS_WINDOW
+        })
+    );
     // An anchor at the tip is fresh.
     let (chain, att) = setup(&signer, COIN_HEIGHT, TIP);
     assert!(evaluate(&att, &chain).is_ok());
@@ -412,8 +502,21 @@ fn a_coin_attests_from_ten_thousand_sats() {
     chain.coins.get_mut(&att.outpoint()).unwrap().value = MIN_COIN_VALUE;
     assert!(evaluate(&att, &chain).is_ok());
     chain.coins.get_mut(&att.outpoint()).unwrap().value = MIN_COIN_VALUE - Amount::ONE_SAT;
-    assert_eq!(evaluate(&att, &chain), Err(Rejection::CoinTooSmall { value: 9_999, min: 10_000 }));
-    assert_eq!(Rejection::CoinTooSmall { value: 9_999, min: 10_000 }.rule(), "coin-too-small");
+    assert_eq!(
+        evaluate(&att, &chain),
+        Err(Rejection::CoinTooSmall {
+            value: 9_999,
+            min: 10_000
+        })
+    );
+    assert_eq!(
+        Rejection::CoinTooSmall {
+            value: 9_999,
+            min: 10_000
+        }
+        .rule(),
+        "coin-too-small"
+    );
 }
 
 #[test]
@@ -434,7 +537,10 @@ fn coin_age_boundary_at_the_anchor() {
     let (chain, att) = setup(&signer, 0, MIN_COIN_AGE - 1);
     let mut chain = chain;
     chain.tip = MIN_COIN_AGE + 10;
-    assert!(matches!(evaluate(&att, &chain), Err(Rejection::CoinTooYoung { .. })));
+    assert!(matches!(
+        evaluate(&att, &chain),
+        Err(Rejection::CoinTooYoung { .. })
+    ));
 }
 
 /// A coinbase output can be attested once MIN_COIN_AGE has passed, which is
@@ -451,7 +557,12 @@ fn coin_age_covers_coinbase_maturity() {
 #[test]
 fn test_networks_take_the_short_coin_age() {
     let signer = p2wpkh();
-    for network in [Network::Testnet, Network::Testnet4, Network::Signet, Network::Regtest] {
+    for network in [
+        Network::Testnet,
+        Network::Testnet4,
+        Network::Signet,
+        Network::Regtest,
+    ] {
         let (mut chain, att) = setup(&signer, ANCHOR - TEST_MIN_COIN_AGE, ANCHOR);
         chain.network = network;
         assert!(evaluate(&att, &chain).is_ok(), "{network}");
@@ -469,7 +580,13 @@ fn test_networks_take_the_short_coin_age() {
     }
     // Mainnet keeps the long age.
     let (chain, att) = setup(&signer, ANCHOR - TEST_MIN_COIN_AGE, ANCHOR);
-    assert!(matches!(evaluate(&att, &chain), Err(Rejection::CoinTooYoung { min_age: MIN_COIN_AGE, .. })));
+    assert!(matches!(
+        evaluate(&att, &chain),
+        Err(Rejection::CoinTooYoung {
+            min_age: MIN_COIN_AGE,
+            ..
+        })
+    ));
 }
 
 /// On a test network a coinbase coin still waits for coinbase maturity: it
@@ -534,47 +651,78 @@ fn signature_rules() {
         att.signature().clone(),
     )
     .unwrap();
-    assert!(matches!(evaluate(&other_value, &chain), Err(Rejection::SignatureInvalid(_))));
+    assert!(matches!(
+        evaluate(&other_value, &chain),
+        Err(Rejection::SignatureInvalid(_))
+    ));
 
     // Legacy is for P2PKH only, and the recovered key must be the coin's.
     let legacy = p2pkh();
     let (mut chain, att) = setup(&legacy, COIN_HEIGHT, ANCHOR);
     chain.coins.get_mut(&att.outpoint()).unwrap().script_pubkey = signer.spk.clone();
-    assert!(matches!(evaluate(&att, &chain), Err(Rejection::WrongFormat(_))));
+    assert!(matches!(
+        evaluate(&att, &chain),
+        Err(Rejection::WrongFormat(_))
+    ));
     let other_key = PrivateKey::new(secret(9), Network::Regtest).public_key(&Secp256k1::new());
-    chain.coins.get_mut(&att.outpoint()).unwrap().script_pubkey = ScriptBuf::new_p2pkh(&other_key.pubkey_hash());
-    assert!(matches!(evaluate(&att, &chain), Err(Rejection::SignatureInvalid(_))));
+    chain.coins.get_mut(&att.outpoint()).unwrap().script_pubkey =
+        ScriptBuf::new_p2pkh(&other_key.pubkey_hash());
+    assert!(matches!(
+        evaluate(&att, &chain),
+        Err(Rejection::SignatureInvalid(_))
+    ));
     let mut zeroed = att.clone();
     zeroed.signature = NapSignature::Legacy([0; LEGACY_SIGNATURE_LEN]);
-    assert!(matches!(evaluate(&zeroed, &chain), Err(Rejection::SignatureInvalid(_))));
+    assert!(matches!(
+        evaluate(&zeroed, &chain),
+        Err(Rejection::SignatureInvalid(_))
+    ));
 
     // Simple is for native segwit only (D13).
     let (mut chain, att) = setup(&signer, COIN_HEIGHT, ANCHOR);
     chain.coins.get_mut(&att.outpoint()).unwrap().script_pubkey = legacy.spk.clone();
-    assert!(matches!(evaluate(&att, &chain), Err(Rejection::WrongFormat(_))));
+    assert!(matches!(
+        evaluate(&att, &chain),
+        Err(Rejection::WrongFormat(_))
+    ));
 
     // An unknown witness version is inconclusive, and that is not valid.
     let future = Signer {
-        spk: Builder::new().push_opcode(OP_PUSHNUM_2).push_slice([7u8; 32]).into_script(),
+        spk: Builder::new()
+            .push_opcode(OP_PUSHNUM_2)
+            .push_slice([7u8; 32])
+            .into_script(),
         sign: Box::new(|_| NapSignature::Simple(Witness::new())),
     };
     let (chain, att) = setup(&future, COIN_HEIGHT, ANCHOR);
     let rejection = evaluate(&att, &chain).unwrap_err();
-    assert!(matches!(rejection, Rejection::SignatureInconclusive(_)), "{rejection:?}");
+    assert!(
+        matches!(rejection, Rejection::SignatureInconclusive(_)),
+        "{rejection:?}"
+    );
 }
 
 #[test]
 fn chain_state_rejections_are_distinguished_from_bad_signatures() {
     let chain_state = [
         Rejection::AnchorNotOnChain,
-        Rejection::Stale { age: FRESHNESS_WINDOW },
+        Rejection::Stale {
+            age: FRESHNESS_WINDOW,
+        },
         Rejection::CoinNotFound,
-        Rejection::CoinTooYoung { coin_height: 2, anchor_height: 1, min_age: 6 },
+        Rejection::CoinTooYoung {
+            coin_height: 2,
+            anchor_height: 1,
+            min_age: 6,
+        },
         Rejection::NotYetValid("x"),
     ];
     assert!(chain_state.iter().all(Rejection::is_chain_state));
     let never = [
-        Rejection::CoinTooSmall { value: 1, min: 10_000 },
+        Rejection::CoinTooSmall {
+            value: 1,
+            min: 10_000,
+        },
         Rejection::WrongFormat("x"),
         Rejection::SignatureInvalid("x".into()),
         Rejection::SignatureInconclusive("x".into()),
@@ -585,12 +733,18 @@ fn chain_state_rejections_are_distinguished_from_bad_signatures() {
 // --- D11 timelocks ------------------------------------------------------------
 
 pub(super) fn cltv(lock: u32) -> Signer {
-    let prefix = Builder::new().push_int(i64::from(lock)).push_opcode(OP_CLTV).push_opcode(OP_DROP);
+    let prefix = Builder::new()
+        .push_int(i64::from(lock))
+        .push_opcode(OP_CLTV)
+        .push_opcode(OP_DROP);
     p2wsh_full(prefix, 0, lock, Sequence::ENABLE_LOCKTIME_NO_RBF.0)
 }
 
 pub(super) fn csv(sequence: u32) -> Signer {
-    let prefix = Builder::new().push_int(i64::from(sequence)).push_opcode(OP_CSV).push_opcode(OP_DROP);
+    let prefix = Builder::new()
+        .push_int(i64::from(sequence))
+        .push_opcode(OP_CSV)
+        .push_opcode(OP_DROP);
     p2wsh_full(prefix, 2, 0, sequence)
 }
 
@@ -599,7 +753,10 @@ fn locktime_height_is_judged_at_the_next_block() {
     let (chain, att) = setup(&cltv(TIP), COIN_HEIGHT, ANCHOR);
     assert!(evaluate(&att, &chain).is_ok());
     let (mut chain, att) = setup(&cltv(TIP + 1), COIN_HEIGHT, ANCHOR);
-    assert!(matches!(evaluate(&att, &chain), Err(Rejection::NotYetValid(_))));
+    assert!(matches!(
+        evaluate(&att, &chain),
+        Err(Rejection::NotYetValid(_))
+    ));
     // Valid once the chain grows a block.
     chain.tip += 1;
     assert!(evaluate(&att, &chain).is_ok());
@@ -611,7 +768,10 @@ fn locktime_time_is_judged_against_the_tips_mtp() {
     let (chain, att) = setup(&cltv(tip_mtp - 1), COIN_HEIGHT, ANCHOR);
     assert!(evaluate(&att, &chain).is_ok());
     let (chain, att) = setup(&cltv(tip_mtp), COIN_HEIGHT, ANCHOR);
-    assert!(matches!(evaluate(&att, &chain), Err(Rejection::NotYetValid(_))));
+    assert!(matches!(
+        evaluate(&att, &chain),
+        Err(Rejection::NotYetValid(_))
+    ));
 }
 
 #[test]
@@ -620,7 +780,10 @@ fn relative_height_lock_counts_from_the_coin() {
     let (chain, att) = setup(&csv(n), TIP + 1 - n, ANCHOR);
     assert!(evaluate(&att, &chain).is_ok());
     let (chain, att) = setup(&csv(n), TIP + 2 - n, ANCHOR);
-    assert!(matches!(evaluate(&att, &chain), Err(Rejection::NotYetValid(_))));
+    assert!(matches!(
+        evaluate(&att, &chain),
+        Err(Rejection::NotYetValid(_))
+    ));
 }
 
 #[test]
@@ -630,7 +793,10 @@ fn relative_time_lock_counts_from_the_coins_mtp() {
     let (chain, att) = setup(&csv(seq), TIP + 1 - 4_267, ANCHOR);
     assert!(evaluate(&att, &chain).is_ok());
     let (chain, att) = setup(&csv(seq), TIP + 1 - 4_266, ANCHOR);
-    assert!(matches!(evaluate(&att, &chain), Err(Rejection::NotYetValid(_))));
+    assert!(matches!(
+        evaluate(&att, &chain),
+        Err(Rejection::NotYetValid(_))
+    ));
 }
 
 #[test]
@@ -638,11 +804,22 @@ fn relative_locks_need_version_2_and_no_disable_flag() {
     // Version 0 and the disable flag both switch BIP 68 off; a script
     // without CSV then needs nothing of the coin's age.
     for (version, sequence) in [(0, 60_000), (2, (1 << 31) | 60_000)] {
-        let (chain, att) = setup(&p2wsh_full(Builder::new(), version, 0, sequence), COIN_HEIGHT, ANCHOR);
+        let (chain, att) = setup(
+            &p2wsh_full(Builder::new(), version, 0, sequence),
+            COIN_HEIGHT,
+            ANCHOR,
+        );
         assert!(evaluate(&att, &chain).is_ok(), "{version} {sequence:#x}");
     }
-    let (chain, att) = setup(&p2wsh_full(Builder::new(), 2, 0, 60_000), COIN_HEIGHT, ANCHOR);
-    assert!(matches!(evaluate(&att, &chain), Err(Rejection::NotYetValid(_))));
+    let (chain, att) = setup(
+        &p2wsh_full(Builder::new(), 2, 0, 60_000),
+        COIN_HEIGHT,
+        ANCHOR,
+    );
+    assert!(matches!(
+        evaluate(&att, &chain),
+        Err(Rejection::NotYetValid(_))
+    ));
 }
 
 #[test]
@@ -672,7 +849,11 @@ fn a_tie_goes_to_the_lower_id() {
     let signer = p2wpkh();
     let (chain, a) = setup(&signer, COIN_HEIGHT, ANCHOR);
     let b = attest(&chain, &signer, a.outpoint(), a.key(), "no", ANCHOR);
-    let (lo, hi) = if a.id().to_byte_array() < b.id().to_byte_array() { (&a, &b) } else { (&b, &a) };
+    let (lo, hi) = if a.id().to_byte_array() < b.id().to_byte_array() {
+        (&a, &b)
+    } else {
+        (&b, &a)
+    };
     assert!(supersedes(lo, hi) && !supersedes(hi, lo));
     assert!(!supersedes(lo, lo));
     for order in [[lo, hi], [hi, lo]] {
@@ -694,8 +875,17 @@ fn an_empty_value_withdraws() {
 fn keys_and_outpoints_are_counted_apart() {
     let signer = p2wpkh();
     let (mut chain, a) = setup(&signer, COIN_HEIGHT, ANCHOR);
-    let other_key = attest(&chain, &signer, a.outpoint(), "mempool.rbf_policy", "full", ANCHOR);
-    chain.coins.insert(outpoint(8), chain.coins[&a.outpoint()].clone());
+    let other_key = attest(
+        &chain,
+        &signer,
+        a.outpoint(),
+        "mempool.rbf_policy",
+        "full",
+        ANCHOR,
+    );
+    chain
+        .coins
+        .insert(outpoint(8), chain.coins[&a.outpoint()].clone());
     let other_coin = attest(&chain, &signer, outpoint(8), a.key(), "no", ANCHOR);
     assert_eq!(select([&a, &other_key, &other_coin]).len(), 3);
 }
@@ -709,12 +899,18 @@ fn a_reorganised_anchor_restores_the_earlier_attestation() {
     let new = attest(&chain, &signer, old.outpoint(), old.key(), "no", ANCHOR);
     chain.fork_at = ANCHOR - 10;
     assert_eq!(evaluate(&new, &chain), Err(Rejection::AnchorNotOnChain));
-    let valid: Vec<&Attestation> = [&old, &new].into_iter().filter(|a| evaluate(a, &chain).is_ok()).collect();
+    let valid: Vec<&Attestation> = [&old, &new]
+        .into_iter()
+        .filter(|a| evaluate(a, &chain).is_ok())
+        .collect();
     assert_eq!(select(valid)[&(old.outpoint(), old.key())], &old);
 }
 
 #[test]
 fn id_is_the_sha256_of_the_wire_form() {
     let (_, att) = setup(&p2pkh(), COIN_HEIGHT, ANCHOR);
-    assert_eq!(att.id(), bitcoin::hashes::sha256::Hash::hash(&att.to_bytes()));
+    assert_eq!(
+        att.id(),
+        bitcoin::hashes::sha256::Hash::hash(&att.to_bytes())
+    );
 }

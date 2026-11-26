@@ -156,19 +156,31 @@ mod tests {
         // Bitcoin Core emits BTC amounts with a FIXED 8 decimal places
         // (`%d.%08d`), e.g. 50_000 sats → `0.00050000` — not the shortest
         // form `0.0005`. The serialized literal must match byte-for-byte.
-        assert_eq!(format_amount(50_000, AmountUnit::Btc).to_string(), "0.00050000");
-        assert_eq!(format_amount(100_000_000, AmountUnit::Btc).to_string(), "1.00000000");
+        assert_eq!(
+            format_amount(50_000, AmountUnit::Btc).to_string(),
+            "0.00050000"
+        );
+        assert_eq!(
+            format_amount(100_000_000, AmountUnit::Btc).to_string(),
+            "1.00000000"
+        );
         assert_eq!(format_amount(0, AmountUnit::Btc).to_string(), "0.00000000");
         // Regression: the exact value (1000 sat/kvB = 0.00001000 BTC) whose
         // shortest form `0.00001` Core Lightning's bcli parser rejected.
-        assert_eq!(format_amount(1000, AmountUnit::Btc).to_string(), "0.00001000");
+        assert_eq!(
+            format_amount(1000, AmountUnit::Btc).to_string(),
+            "0.00001000"
+        );
         // Largest valid amount still formats exactly (integer-based, no f64 drift).
         assert_eq!(
             format_amount(21_000_000 * 100_000_000, AmountUnit::Btc).to_string(),
             "21000000.00000000"
         );
         // Numeric accessor is unaffected.
-        assert_eq!(format_amount(50_000, AmountUnit::Btc).as_f64(), Some(0.0005));
+        assert_eq!(
+            format_amount(50_000, AmountUnit::Btc).as_f64(),
+            Some(0.0005)
+        );
     }
 
     #[test]

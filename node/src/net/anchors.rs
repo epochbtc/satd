@@ -18,12 +18,12 @@ use std::io::Write as _;
 use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 
-use bitcoin::hashes::{sha256d, Hash};
-use bitcoin::p2p::address::{AddrV2, AddrV2Message};
+use bitcoin::hashes::{Hash, sha256d};
 use bitcoin::p2p::ServiceFlags;
+use bitcoin::p2p::address::{AddrV2, AddrV2Message};
 
 use crate::net::addrv2::{decode_disk_vector, encode_disk_vector};
-use crate::net::peer::{onion_host_to_torv3_pubkey, torv3_to_onion_host, PeerAddr};
+use crate::net::peer::{PeerAddr, onion_host_to_torv3_pubkey, torv3_to_onion_host};
 
 /// The file's name in the network data directory (Core's
 /// `ANCHORS_DATABASE_FILENAME`).
@@ -51,9 +51,16 @@ impl Anchor {
                 },
                 sa.port(),
             ),
-            PeerAddr::Onion { host, port } => (AddrV2::TorV3(onion_host_to_torv3_pubkey(host)?), *port),
+            PeerAddr::Onion { host, port } => {
+                (AddrV2::TorV3(onion_host_to_torv3_pubkey(host)?), *port)
+            }
         };
-        Some(AddrV2Message { time, services: self.services, addr, port })
+        Some(AddrV2Message {
+            time,
+            services: self.services,
+            addr,
+            port,
+        })
     }
 
     /// `None` for a network satd cannot dial (I2P, CJDNS): Core would keep
@@ -62,10 +69,16 @@ impl Anchor {
         let addr = match &m.addr {
             AddrV2::Ipv4(ip) => PeerAddr::Socket(SocketAddr::new(IpAddr::V4(*ip), m.port)),
             AddrV2::Ipv6(ip) => PeerAddr::Socket(SocketAddr::new(IpAddr::V6(*ip), m.port)),
-            AddrV2::TorV3(key) => PeerAddr::Onion { host: torv3_to_onion_host(key), port: m.port },
+            AddrV2::TorV3(key) => PeerAddr::Onion {
+                host: torv3_to_onion_host(key),
+                port: m.port,
+            },
             _ => return None,
         };
-        Some(Anchor { addr, services: m.services })
+        Some(Anchor {
+            addr,
+            services: m.services,
+        })
     }
 }
 
@@ -114,8 +127,10 @@ pub fn write(path: &Path, magic: [u8; 4], anchors: &[Anchor]) -> Result<(), Stri
     {
         let mut f =
             std::fs::File::create(&tmp).map_err(|e| format!("creating {}: {e}", tmp.display()))?;
-        f.write_all(&buf).map_err(|e| format!("writing {}: {e}", tmp.display()))?;
-        f.sync_all().map_err(|e| format!("fsync {}: {e}", tmp.display()))?;
+        f.write_all(&buf)
+            .map_err(|e| format!("writing {}: {e}", tmp.display()))?;
+        f.sync_all()
+            .map_err(|e| format!("fsync {}: {e}", tmp.display()))?;
     }
     std::fs::rename(&tmp, path)
         .map_err(|e| format!("renaming {} -> {}: {e}", tmp.display(), path.display()))
@@ -130,9 +145,21 @@ mod tests {
 
     fn anchors() -> Vec<Anchor> {
         vec![
-            Anchor { addr: PeerAddr::Socket("127.0.0.1:18444".parse().unwrap()), services: ServiceFlags::from(9) },
-            Anchor { addr: PeerAddr::Socket("[2001:4860::1]:8333".parse().unwrap()), services: ServiceFlags::from(0x409) },
-            Anchor { addr: PeerAddr::Onion { host: ONION.to_string(), port: 8333 }, services: ServiceFlags::NONE },
+            Anchor {
+                addr: PeerAddr::Socket("127.0.0.1:18444".parse().unwrap()),
+                services: ServiceFlags::from(9),
+            },
+            Anchor {
+                addr: PeerAddr::Socket("[2001:4860::1]:8333".parse().unwrap()),
+                services: ServiceFlags::from(0x409),
+            },
+            Anchor {
+                addr: PeerAddr::Onion {
+                    host: ONION.to_string(),
+                    port: 8333,
+                },
+                services: ServiceFlags::NONE,
+            },
         ]
     }
 
@@ -157,13 +184,19 @@ mod tests {
         let bytes = std::fs::read(&path).unwrap();
         assert_eq!(bytes[..4], MAGIC);
         assert_eq!(bytes[4], 1);
-        assert_eq!(u32::from_le_bytes(bytes[5..9].try_into().unwrap()), 220_000 | 1 << 29);
+        assert_eq!(
+            u32::from_le_bytes(bytes[5..9].try_into().unwrap()),
+            220_000 | 1 << 29
+        );
         // services_index = 4 + 1 + 4 + 4 in the test.
         assert_eq!(bytes[13], 9);
         assert_eq!(bytes[14..20], [1, 4, 0x7f, 0, 0, 1]);
         assert_eq!(bytes[20..22], 18444u16.to_be_bytes());
         assert_eq!(bytes.len(), 22 + 32);
-        assert_eq!(bytes[22..], sha256d::Hash::hash(&bytes[..22]).to_byte_array());
+        assert_eq!(
+            bytes[22..],
+            sha256d::Hash::hash(&bytes[..22]).to_byte_array()
+        );
     }
 
     /// `feature_anchors.py` inserts a byte at offset 20 and expects no
@@ -197,7 +230,11 @@ mod tests {
         let path = dir.path().join(ANCHORS_FILE);
         write(&path, MAGIC, &anchors()).unwrap();
         let bytes = std::fs::read(&path).unwrap();
-        assert!(decode(&bytes[..bytes.len() - 1], MAGIC).unwrap_err().contains("truncated"));
+        assert!(
+            decode(&bytes[..bytes.len() - 1], MAGIC)
+                .unwrap_err()
+                .contains("truncated")
+        );
         let mut altered = bytes.clone();
         *altered.last_mut().unwrap() ^= 1;
         assert!(decode(&altered, MAGIC).unwrap_err().contains("checksum"));
@@ -221,7 +258,12 @@ mod tests {
     #[test]
     fn an_anchor_on_a_network_satd_cannot_dial_is_dropped() {
         let entries = [
-            AddrV2Message { time: 0, services: ServiceFlags::NONE, addr: AddrV2::I2p([7; 32]), port: 0 },
+            AddrV2Message {
+                time: 0,
+                services: ServiceFlags::NONE,
+                addr: AddrV2::I2p([7; 32]),
+                port: 0,
+            },
             anchors()[0].to_addrv2(0).unwrap(),
         ];
         let mut buf = MAGIC.to_vec();

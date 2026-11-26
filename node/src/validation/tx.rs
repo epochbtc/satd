@@ -98,9 +98,9 @@ mod tests {
         assert!(check_transaction(coinbase).is_ok());
     }
 
+    use bitcoin::hashes::Hash as _;
     use bitcoin::transaction::Version;
     use bitcoin::{Amount, OutPoint, Sequence, Transaction, TxIn, TxOut, Txid, Witness};
-    use bitcoin::hashes::Hash as _;
 
     #[test]
     fn test_no_inputs_rejected() {

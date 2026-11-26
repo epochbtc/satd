@@ -115,8 +115,13 @@ pub fn recover_compact(hash: &[u8; 32], sig: &[u8]) -> Option<PublicKey> {
     let compressed = header & 4 != 0;
     let sig = RecoverableSignature::from_compact(&sig[1..], recid).ok()?;
     let secp = Secp256k1::verification_only();
-    let key = secp.recover_ecdsa(&Message::from_digest(*hash), &sig).ok()?;
-    Some(PublicKey { compressed, inner: key })
+    let key = secp
+        .recover_ecdsa(&Message::from_digest(*hash), &sig)
+        .ok()?;
+    Some(PublicKey {
+        compressed,
+        inner: key,
+    })
 }
 
 /// Core's `MessageVerify`.
@@ -208,14 +213,19 @@ pub fn verify_bip322(
         Err(DecodeError::ProofOfFunds) => return Err((-8, DecodeError::ProofOfFunds.to_string())),
         Err(e) => return Ok(invalid(None, e.to_string())),
         Ok(Signature::Legacy(sig)) => {
-            let bitcoin::address::AddressData::P2pkh { pubkey_hash } = address.to_address_data() else {
+            let bitcoin::address::AddressData::P2pkh { pubkey_hash } = address.to_address_data()
+            else {
                 unreachable!("decode returns Legacy only for a P2PKH challenge")
             };
             let outcome = match recover_compact(&message_hash(message), &sig) {
-                Some(key) if key.pubkey_hash() == pubkey_hash => {
-                    Verification::Valid { version: 0, lock_time: 0, sequence: 0 }
+                Some(key) if key.pubkey_hash() == pubkey_hash => Verification::Valid {
+                    version: 0,
+                    lock_time: 0,
+                    sequence: 0,
+                },
+                Some(_) => {
+                    Verification::Invalid("the signature is not by this address's key".into())
                 }
-                Some(_) => Verification::Invalid("the signature is not by this address's key".into()),
                 None => Verification::Invalid("no public key recovers from the signature".into()),
             };
             ("legacy", outcome)
@@ -225,12 +235,21 @@ pub fn verify_bip322(
                 Proof::Simple(_) => "simple",
                 Proof::Full(_) => "full",
             };
-            (format, bip322::verify(&challenge, message.as_bytes(), &proof))
+            (
+                format,
+                bip322::verify(&challenge, message.as_bytes(), &proof),
+            )
         }
     };
     Ok(match outcome {
-        Verification::Valid { .. } if format == "legacy" => json!({ "result": "valid", "format": format }),
-        Verification::Valid { version, lock_time, sequence } => json!({
+        Verification::Valid { .. } if format == "legacy" => {
+            json!({ "result": "valid", "format": format })
+        }
+        Verification::Valid {
+            version,
+            lock_time,
+            sequence,
+        } => json!({
             "result": "valid",
             "format": format,
             "version": version,
@@ -268,7 +287,12 @@ mod tests {
             MessageVerificationResult::Ok
         );
         assert_eq!(
-            message_verify(CORE_ADDRESS, CORE_SIGNATURE, "another message", Network::Regtest),
+            message_verify(
+                CORE_ADDRESS,
+                CORE_SIGNATURE,
+                "another message",
+                Network::Regtest
+            ),
             MessageVerificationResult::NotSigned
         );
     }
@@ -279,7 +303,12 @@ mod tests {
     fn core_util_tests_message_verify() {
         let net = Network::Bitcoin;
         assert_eq!(
-            message_verify("invalid address", "signature should be irrelevant", "message too", net),
+            message_verify(
+                "invalid address",
+                "signature should be irrelevant",
+                "message too",
+                net
+            ),
             MessageVerificationResult::InvalidAddress
         );
         assert_eq!(
@@ -349,8 +378,14 @@ mod tests {
         prefixed.extend_from_slice(magic.as_bytes());
         prefixed.push(msg.len() as u8);
         prefixed.extend_from_slice(msg.as_bytes());
-        assert_eq!(message_hash(msg), sha256d::Hash::hash(&prefixed).to_byte_array());
-        assert_ne!(message_hash(msg), sha256d::Hash::hash(msg.as_bytes()).to_byte_array());
+        assert_eq!(
+            message_hash(msg),
+            sha256d::Hash::hash(&prefixed).to_byte_array()
+        );
+        assert_ne!(
+            message_hash(msg),
+            sha256d::Hash::hash(msg.as_bytes()).to_byte_array()
+        );
     }
 
     #[test]
@@ -396,7 +431,10 @@ mod tests {
         let addr = "bc1q9vza2e8x573nczrlzms0wvx3gsqjx7vavgkx0l";
         let smp = "smpAkcwRAIgZRfIY3p7/DoVTty6YZbWS71bc5Vct9p9Fia83eRmw2QCICK/ENGfwLtptFluMGs2KsqoNSk89pO7F29zJLUx9a/sASECx/EgAxlkQpQ9hYjgGu6EBCPMVPwVIVJqO4XCsMvViHI=";
         let v = verify_bip322(addr, smp, "Hello World", net).unwrap();
-        assert_eq!(v, serde_json::json!({"result": "valid", "format": "simple", "version": 0, "locktime": 0, "sequence": 0}));
+        assert_eq!(
+            v,
+            serde_json::json!({"result": "valid", "format": "simple", "version": 0, "locktime": 0, "sequence": 0})
+        );
         // The same signature without its prefix: the simple fallback.
         let v = verify_bip322(addr, &smp[3..], "Hello World", net).unwrap();
         assert_eq!(v["result"], "valid");
@@ -412,12 +450,23 @@ mod tests {
         let v = verify_bip322("15CRxFdyRpGZLW9w8HnHvVduizdL5jKNbs",
             "IPojfrX2dfPnH26UegfbGQQLrdK844DlHq5157/P6h57WyuS/Qsl+h/WSVGDF4MUi4rWSswW38oimDYfNNUBUOk=",
             "Trust no one", net).unwrap();
-        assert_eq!(v, serde_json::json!({"result": "valid", "format": "legacy"}));
+        assert_eq!(
+            v,
+            serde_json::json!({"result": "valid", "format": "legacy"})
+        );
 
-        assert_eq!(verify_bip322("not an address", smp, "", net).unwrap_err().0, -5);
+        assert_eq!(
+            verify_bip322("not an address", smp, "", net).unwrap_err().0,
+            -5
+        );
         assert_eq!(verify_bip322(addr, "pofAAAA", "", net).unwrap_err().0, -8);
         // A mainnet address on regtest is not an address.
-        assert_eq!(verify_bip322(addr, smp, "Hello World", Network::Regtest).unwrap_err().0, -5);
+        assert_eq!(
+            verify_bip322(addr, smp, "Hello World", Network::Regtest)
+                .unwrap_err()
+                .0,
+            -5
+        );
     }
 
     #[test]

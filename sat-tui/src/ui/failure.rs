@@ -75,11 +75,7 @@ pub fn draw(f: &mut Frame, state: &AppState) {
                 "• If persistent, check `journalctl -u satd.service` for stalls.",
             ],
         ),
-        RpcFailure::Other => (
-            " ✗ RPC ERROR ",
-            "Unexpected RPC failure.",
-            &[],
-        ),
+        RpcFailure::Other => (" ✗ RPC ERROR ", "Unexpected RPC failure.", &[]),
     };
 
     let area = centered_rect(80, 60, f.area());
@@ -100,20 +96,22 @@ pub fn draw(f: &mut Frame, state: &AppState) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(0), Constraint::Length(2)])
-        .split(inner.inner(Margin { horizontal: 2, vertical: 1 }));
+        .split(inner.inner(Margin {
+            horizontal: 2,
+            vertical: 1,
+        }));
 
     let mut lines: Vec<Line<'static>> = vec![
         Line::from(Span::styled(
             headline.to_string(),
-            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
         Line::from(vec![
             Span::styled("details: ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                rec.message.clone(),
-                Style::default().fg(Color::Yellow),
-            ),
+            Span::styled(rec.message.clone(), Style::default().fg(Color::Yellow)),
         ]),
         Line::from(vec![
             Span::styled("failing for ", Style::default().fg(Color::DarkGray)),
@@ -127,7 +125,9 @@ pub fn draw(f: &mut Frame, state: &AppState) {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
             "Things to check:",
-            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
         )));
         for hint in hints {
             lines.push(Line::from(Span::styled(
@@ -145,7 +145,12 @@ pub fn draw(f: &mut Frame, state: &AppState) {
             "modal clears automatically once any RPC succeeds  ·  ",
             Style::default().fg(Color::DarkGray),
         ),
-        Span::styled("q", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            "q",
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::styled(": quit", Style::default().fg(Color::Gray)),
     ])
     .alignment(Alignment::Center);

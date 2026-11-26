@@ -125,7 +125,9 @@ pub fn merkle_branch(txids: &[[u8; 32]]) -> Vec<[u8; 32]> {
 
 /// Fold a coinbase txid up a merkle branch to the merkle root.
 pub fn merkle_root_from_branch(coinbase_txid: [u8; 32], branch: &[[u8; 32]]) -> [u8; 32] {
-    branch.iter().fold(coinbase_txid, |acc, sibling| hash_pair(&acc, sibling))
+    branch
+        .iter()
+        .fold(coinbase_txid, |acc, sibling| hash_pair(&acc, sibling))
 }
 
 fn hash_pair(a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {
@@ -177,7 +179,9 @@ impl ActiveTemplate {
         // as a script. The height push is exactly what `connect_block` expects
         // at the start of the scriptSig (`push_int`, as the built-in miner
         // uses).
-        let height_push = Builder::new().push_int(i64::from(work.height)).into_script();
+        let height_push = Builder::new()
+            .push_int(i64::from(work.height))
+            .into_script();
         let hole = PushBytesBuf::try_from(vec![0u8; extranonce_len]).expect("≤ 32 bytes");
         let tag = PushBytesBuf::try_from(COINBASE_TAG.to_vec()).expect("short tag");
         let script_sig = Builder::from(height_push.to_bytes())
@@ -242,7 +246,14 @@ impl ActiveTemplate {
         coinbase_suffix: Vec<u8>,
         extranonce_len: usize,
     ) -> Self {
-        Self { job_id, work, payout_script, coinbase_prefix, coinbase_suffix, extranonce_len }
+        Self {
+            job_id,
+            work,
+            payout_script,
+            coinbase_prefix,
+            coinbase_suffix,
+            extranonce_len,
+        }
     }
 
     /// The coinbase txid for a given extranonce.
@@ -277,8 +288,9 @@ impl ActiveTemplate {
 
     /// The full coinbase, including the witness reserved value.
     pub fn reassemble_coinbase(&self, extranonce: &[u8]) -> Transaction {
-        let mut bytes =
-            Vec::with_capacity(self.coinbase_prefix.len() + extranonce.len() + self.coinbase_suffix.len());
+        let mut bytes = Vec::with_capacity(
+            self.coinbase_prefix.len() + extranonce.len() + self.coinbase_suffix.len(),
+        );
         bytes.extend_from_slice(&self.coinbase_prefix);
         bytes.extend_from_slice(extranonce);
         bytes.extend_from_slice(&self.coinbase_suffix);
@@ -289,11 +301,20 @@ impl ActiveTemplate {
     }
 
     /// The complete block for a solution.
-    pub fn reconstruct_block(&self, extranonce: &[u8], ntime: u32, nonce: u32, version: i32) -> Block {
+    pub fn reconstruct_block(
+        &self,
+        extranonce: &[u8],
+        ntime: u32,
+        nonce: u32,
+        version: i32,
+    ) -> Block {
         let mut txdata = Vec::with_capacity(self.work.txdata.len() + 1);
         txdata.push(self.reassemble_coinbase(extranonce));
         txdata.extend(self.work.txdata.iter().cloned());
-        Block { header: self.header(extranonce, ntime, nonce, version), txdata }
+        Block {
+            header: self.header(extranonce, ntime, nonce, version),
+            txdata,
+        }
     }
 }
 
@@ -333,7 +354,12 @@ pub(crate) mod tests {
             cur_time: 1_700_000_000,
             min_time: 1_699_999_000,
             transactions: (0..n)
-                .map(|i| TemplateTx { tx: tx(i as u8 + 1), fee: 100, weight: 400, sigop_cost: 0 })
+                .map(|i| TemplateTx {
+                    tx: tx(i as u8 + 1),
+                    fee: 100,
+                    weight: 400,
+                    sigop_cost: 0,
+                })
                 .collect(),
             coinbase_value: 50 * 100_000_000 + 100 * n as u64,
         };
@@ -388,7 +414,8 @@ pub(crate) mod tests {
         template.height = 0x7fff_ffff;
         let work = Arc::new(template);
         for payout in payouts {
-            let job = ActiveTemplate::build(work.clone(), 1, payout.clone(), MAX_EXTRANONCE_LEN).unwrap();
+            let job =
+                ActiveTemplate::build(work.clone(), 1, payout.clone(), MAX_EXTRANONCE_LEN).unwrap();
             let coinbase = job.reassemble_coinbase(&[0xae; MAX_EXTRANONCE_LEN]);
             let weight = coinbase.weight().to_wu() as usize;
             assert!(weight <= COINBASE_WEIGHT_RESERVE, "{payout}: {weight} WU");
@@ -398,11 +425,20 @@ pub(crate) mod tests {
                 &[],
                 crate::validation::sigops::SigOpFlags::P2shWitness,
             );
-            assert!(sigops <= COINBASE_SIGOPS_RESERVE, "{payout}: {sigops} sigop cost");
+            assert!(
+                sigops <= COINBASE_SIGOPS_RESERVE,
+                "{payout}: {sigops} sigop cost"
+            );
             if payout.is_p2pkh() {
-                assert_eq!(sigops, 4, "the P2PKH payout's OP_CHECKSIG counts, and nothing else");
+                assert_eq!(
+                    sigops, 4,
+                    "the P2PKH payout's OP_CHECKSIG counts, and nothing else"
+                );
             } else {
-                assert_eq!(sigops, 0, "{payout}: the extranonce is pushed data, never opcodes");
+                assert_eq!(
+                    sigops, 0,
+                    "{payout}: the extranonce is pushed data, never opcodes"
+                );
             }
         }
     }

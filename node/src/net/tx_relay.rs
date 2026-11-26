@@ -66,7 +66,11 @@ struct KnownInventory {
 
 impl Default for KnownInventory {
     fn default() -> Self {
-        Self { keys: HashSet::new(), order: VecDeque::new(), salt: std::collections::hash_map::RandomState::new() }
+        Self {
+            keys: HashSet::new(),
+            order: VecDeque::new(),
+            salt: std::collections::hash_map::RandomState::new(),
+        }
     }
 }
 
@@ -213,7 +217,11 @@ impl TxRelay {
     /// the mempool sequence, if given, becomes the peer's
     /// `last_inv_sequence`. A flush that could not send everything it chose
     /// gives none.
-    pub fn finish(&mut self, unsent: impl IntoIterator<Item = Wtxid>, mempool_sequence: Option<u64>) {
+    pub fn finish(
+        &mut self,
+        unsent: impl IntoIterator<Item = Wtxid>,
+        mempool_sequence: Option<u64>,
+    ) {
         self.to_send.extend(unsent);
         if let Some(sequence) = mempool_sequence {
             self.last_inv_sequence = sequence;

@@ -563,30 +563,50 @@ mod tests {
     /// Perturbation: drop the inputs counter from `progress` and this fails.
     #[test]
     fn verifying_script_inputs_counts_as_progress() {
-        use bitcoin::hashes::Hash as _;
-        use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, TxIn, TxOut, Witness, absolute::LockTime, transaction};
         use crate::validation::script::{ConsensusVerifier, ScriptVerifier};
+        use bitcoin::hashes::Hash as _;
+        use bitcoin::{
+            Amount, OutPoint, ScriptBuf, Sequence, TxIn, TxOut, Witness, absolute::LockTime,
+            transaction,
+        };
         let (cs, dir) = crate::chain::state::tests::make_chain_state();
         let op_true = ScriptBuf::from_bytes(vec![0x51]);
         let tx = bitcoin::Transaction {
             version: transaction::Version(2),
             lock_time: LockTime::ZERO,
             input: vec![TxIn {
-                previous_output: OutPoint { txid: bitcoin::Txid::from_byte_array([3; 32]), vout: 0 },
+                previous_output: OutPoint {
+                    txid: bitcoin::Txid::from_byte_array([3; 32]),
+                    vout: 0,
+                },
                 script_sig: ScriptBuf::new(),
                 sequence: Sequence::MAX,
                 witness: Witness::new(),
             }],
-            output: vec![TxOut { value: Amount::from_sat(1000), script_pubkey: op_true.clone() }],
+            output: vec![TxOut {
+                value: Amount::from_sat(1000),
+                script_pubkey: op_true.clone(),
+            }],
         };
-        let spent = [TxOut { value: Amount::from_sat(5000), script_pubkey: op_true }];
+        let spent = [TxOut {
+            value: Amount::from_sat(5000),
+            script_pubkey: op_true,
+        }];
         let before = progress(&cs);
         crate::validation::script::counting_progress(|| {
-            ConsensusVerifier::new(bitcoin::Network::Regtest).verify_transaction(&tx, &spent, crate::validation::script::ScriptContext::unmined(200))
+            ConsensusVerifier::new(bitcoin::Network::Regtest).verify_transaction(
+                &tx,
+                &spent,
+                crate::validation::script::ScriptContext::unmined(200),
+            )
         })
         .expect("anyone-can-spend input verifies");
         let after = progress(&cs);
-        assert_eq!(after[..2], before[..2], "no block connected, manager loop idle");
+        assert_eq!(
+            after[..2],
+            before[..2],
+            "no block connected, manager loop idle"
+        );
         assert_ne!(after, before, "the verified input is progress");
         drop(cs);
         let _ = std::fs::remove_dir_all(&dir);
@@ -646,6 +666,9 @@ mod tests {
             );
             found_any = true;
         }
-        assert!(found_any, "no readable /proc/self/task entries — reader is broken");
+        assert!(
+            found_any,
+            "no readable /proc/self/task entries — reader is broken"
+        );
     }
 }

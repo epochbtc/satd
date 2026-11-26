@@ -35,9 +35,7 @@ pub fn parse_scripthash_param(param: &Value, network: Network) -> Result<Scripth
                 Err("expected {\"address\": \"...\"} or {\"scripthash\": \"<hex>\"}".to_string())
             }
         }
-        _ => Err(
-            "expected an address string or {address|scripthash} object".to_string(),
-        ),
+        _ => Err("expected an address string or {address|scripthash} object".to_string()),
     }
 }
 

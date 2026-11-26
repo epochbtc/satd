@@ -16,7 +16,10 @@ fn accept(mp: &Mempool, cs: &ChainState, tx: &Transaction) -> Result<Txid, Mempo
 /// `tx` with an `OP_RETURN` output carrying `bytes` of data.
 fn padded(mut tx: Transaction, bytes: usize) -> Transaction {
     let data = bitcoin::script::PushBytesBuf::try_from(vec![0u8; bytes]).expect("pushable");
-    tx.output.push(TxOut { value: bitcoin::Amount::ZERO, script_pubkey: ScriptBuf::new_op_return(data) });
+    tx.output.push(TxOut {
+        value: bitcoin::Amount::ZERO,
+        script_pubkey: ScriptBuf::new_op_return(data),
+    });
     tx
 }
 
@@ -48,7 +51,8 @@ fn bumping_one_of_two_children_of_a_cheap_parent_is_accepted() {
         replacement.weight().to_wu() + parent.weight().to_wu(),
     );
     assert!(with_parent < rate(&first, 30_000));
-    mp.test_accept(&replacement, &cs, &NoopVerifier).expect("testmempoolaccept agrees");
+    mp.test_accept(&replacement, &cs, &NoopVerifier)
+        .expect("testmempoolaccept agrees");
     let r = accept(&mp, &cs, &replacement).expect("the cluster's diagram improves");
     assert_eq!(pool(&mp), HashSet::from([p, r, s2]));
 
@@ -70,7 +74,12 @@ fn a_replacement_that_drops_a_rich_grandchild_is_refused() {
     let rich = spend(&[out(f, 0)], first.output[0].value.to_sat(), 22_000, 1, 3);
     accept(&mp, &cs, &rich).expect("its rich child");
     // A second child makes the topology one the pair diagrams cannot take.
-    accept(&mp, &cs, &spend(&[out(p, 1)], parent.output[1].value.to_sat(), 1_000, 1, 4)).expect("second child");
+    accept(
+        &mp,
+        &cs,
+        &spend(&[out(p, 1)], parent.output[1].value.to_sat(), 1_000, 1, 4),
+    )
+    .expect("second child");
 
     // Pays every evicted fee and its relay, at a feerate above the cheap
     // child's, over many vbytes.
@@ -105,18 +114,30 @@ fn a_replacement_past_the_cluster_limit_is_too_large_before_its_diagram() {
     // Replaces the child and also spends the unrelated one: three together.
     // Padded, it pays more than the child but at a lower feerate, which
     // leaves the diagram worse at its start.
-    let replacement =
-        padded(spend(&[out(p, 0), out(o, 0)], value + other.output[0].value.to_sat(), 10_000, 1, 4), 5_000);
+    let replacement = padded(
+        spend(
+            &[out(p, 0), out(o, 0)],
+            value + other.output[0].value.to_sat(),
+            10_000,
+            1,
+            4,
+        ),
+        5_000,
+    );
     let err = accept(&mp, &cs, &replacement).expect_err("refused");
     assert_eq!(err.state_string(), "too-large-cluster");
     assert_eq!(
-        mp.test_accept(&replacement, &cs, &NoopVerifier).expect_err("refused").state_string(),
+        mp.test_accept(&replacement, &cs, &NoopVerifier)
+            .expect_err("refused")
+            .state_string(),
         "too-large-cluster"
     );
     // Within the limits, the diagram is what refuses it.
     mp.config.write().max_cluster_count = 64;
     assert_eq!(
-        mp.test_accept(&replacement, &cs, &NoopVerifier).expect_err("refused").state_string(),
+        mp.test_accept(&replacement, &cs, &NoopVerifier)
+            .expect_err("refused")
+            .state_string(),
         "replacement-failed, insufficient feerate: does not improve feerate diagram"
     );
 
@@ -134,12 +155,20 @@ fn a_replacement_is_chunked_with_the_cheap_parent_it_spends() {
     let p = accept(&mp, &cs, &parent).expect("a large zero-fee parent");
     let value = parent.output[0].value.to_sat();
     accept(&mp, &cs, &spend(&[out(p, 0)], value, 10_000, 1, 2)).expect("a child that pays for it");
-    accept(&mp, &cs, &spend(&[out(p, 1)], parent.output[1].value.to_sat(), 100, 1, 3)).expect("a cheap child");
+    accept(
+        &mp,
+        &cs,
+        &spend(&[out(p, 1)], parent.output[1].value.to_sat(), 100, 1, 3),
+    )
+    .expect("a cheap child");
 
     let replacement = padded(spend(&[out(p, 0)], value, 10_300, 1, 4), 900);
     let before = pool(&mp);
     let verdict = accept(&mp, &cs, &replacement);
-    assert!(matches!(verdict, Err(MempoolError::DoesNotImproveFeerateDiagram(_))), "{verdict:?}");
+    assert!(
+        matches!(verdict, Err(MempoolError::DoesNotImproveFeerateDiagram(_))),
+        "{verdict:?}"
+    );
     assert_eq!(pool(&mp), before);
 
     let _ = std::fs::remove_dir_all(&dir);
@@ -169,9 +198,15 @@ fn a_fee_bump_of_a_diamonds_tail_is_accepted() {
     let (cs, mp, dir) = env(&[1]);
     let a = sized(spend(&[prev(1)], COIN_VALUE, 600, 2, 1), 400);
     let a_id = accept(&mp, &cs, &a).expect("a");
-    let b = sized(spend(&[out(a_id, 0)], a.output[0].value.to_sat(), 2_600, 1, 2), 400);
+    let b = sized(
+        spend(&[out(a_id, 0)], a.output[0].value.to_sat(), 2_600, 1, 2),
+        400,
+    );
     let b_id = accept(&mp, &cs, &b).expect("b");
-    let c = sized(spend(&[out(a_id, 1)], a.output[1].value.to_sat(), 1_400, 1, 3), 200);
+    let c = sized(
+        spend(&[out(a_id, 1)], a.output[1].value.to_sat(), 1_400, 1, 3),
+        200,
+    );
     let c_id = accept(&mp, &cs, &c).expect("c");
     let d_in = b.output[0].value.to_sat() + c.output[0].value.to_sat();
     let d = sized(spend(&[out(b_id, 0), out(c_id, 0)], d_in, 1_400, 1, 4), 600);
@@ -193,12 +228,23 @@ fn a_fee_bump_that_reorders_a_cluster_is_accepted() {
     let (cs, mp, dir) = env(&[1]);
     let a = sized(spend(&[prev(1)], COIN_VALUE, 800, 2, 1), 500);
     let a_id = accept(&mp, &cs, &a).expect("a");
-    let b = sized(spend(&[out(a_id, 0)], a.output[0].value.to_sat(), 1_800, 1, 2), 200);
+    let b = sized(
+        spend(&[out(a_id, 0)], a.output[0].value.to_sat(), 1_800, 1, 2),
+        200,
+    );
     let b_id = accept(&mp, &cs, &b).expect("b");
-    let c = sized(spend(&[out(a_id, 1)], a.output[1].value.to_sat(), 1_300, 1, 3), 100);
+    let c = sized(
+        spend(&[out(a_id, 1)], a.output[1].value.to_sat(), 1_300, 1, 3),
+        100,
+    );
     let c_id = accept(&mp, &cs, &c).expect("c");
     let d_in = b.output[0].value.to_sat();
-    accept(&mp, &cs, &sized(spend(&[out(b_id, 0)], d_in, 500, 1, 4), 500)).expect("d");
+    accept(
+        &mp,
+        &cs,
+        &sized(spend(&[out(b_id, 0)], d_in, 500, 1, 4), 500),
+    )
+    .expect("d");
 
     let bump = sized(spend(&[out(b_id, 0)], d_in, 2_400, 1, 5), 500);
     let r = accept(&mp, &cs, &bump).expect("a fee-only bump improves the diagram");
@@ -214,7 +260,8 @@ fn a_replacement_of_101_clusters_is_refused_and_of_100_is_not() {
     let tags: Vec<u8> = (1..=101).collect();
     let (cs, mp, dir) = env(&tags);
     for &t in &tags {
-        accept(&mp, &cs, &spend(&[prev(t)], COIN_VALUE, 1_000, 1, t)).expect("one cluster per coin");
+        accept(&mp, &cs, &spend(&[prev(t)], COIN_VALUE, 1_000, 1, t))
+            .expect("one cluster per coin");
     }
     let coins: Vec<OutPoint> = tags.iter().map(|&t| prev(t)).collect();
     let before = pool(&mp);
@@ -245,7 +292,10 @@ fn a_conflict_whose_parent_has_another_child_is_judged_on_the_cluster() {
     let (cs, mp, dir) = env(&[1, 2]);
     let parent = sized(spend(&[prev(1)], COIN_VALUE, 210, 2, 1), 210);
     let p = accept(&mp, &cs, &parent).expect("a cheap parent");
-    let rich = sized(spend(&[out(p, 0)], parent.output[0].value.to_sat(), 5_000, 1, 2), 100);
+    let rich = sized(
+        spend(&[out(p, 0)], parent.output[0].value.to_sat(), 5_000, 1, 2),
+        100,
+    );
     accept(&mp, &cs, &rich).expect("a rich child");
     let conflict_in = parent.output[1].value.to_sat() + COIN_VALUE;
     let conflict = sized(spend(&[out(p, 1), prev(2)], conflict_in, 2_000, 1, 3), 200);
@@ -254,8 +304,12 @@ fn a_conflict_whose_parent_has_another_child_is_judged_on_the_cluster() {
     // Spends only the confirmed coin, so it leaves the parent behind.
     let replacement = sized(spend(&[prev(2)], COIN_VALUE, 2_250, 1, 4), 300);
     assert!(rate(&replacement, 2_250) < rate(&conflict, 2_000));
-    let with_parent = policy::fee_rate_sat_per_kvb(2_210, parent.weight().to_wu() + conflict.weight().to_wu());
-    assert!(rate(&replacement, 2_250) > with_parent, "fixture: it beats the conflict paired with its parent");
+    let with_parent =
+        policy::fee_rate_sat_per_kvb(2_210, parent.weight().to_wu() + conflict.weight().to_wu());
+    assert!(
+        rate(&replacement, 2_250) > with_parent,
+        "fixture: it beats the conflict paired with its parent"
+    );
     let before = pool(&mp);
     let verdict = accept(&mp, &cs, &replacement);
     assert!(
@@ -277,7 +331,15 @@ fn a_leaf_replacement_in_a_sixty_four_transaction_cluster_uses_the_diagram() {
     let (cs, mp, dir) = env(&[1]);
     let parent = spend(&[prev(1)], COIN_VALUE, 2_000, 63, 1);
     let p = accept(&mp, &cs, &parent).expect("a parent of 63 outputs");
-    let child = |vout: u32, fee: u64, tag: u8| spend(&[out(p, vout)], parent.output[vout as usize].value.to_sat(), fee, 1, tag);
+    let child = |vout: u32, fee: u64, tag: u8| {
+        spend(
+            &[out(p, vout)],
+            parent.output[vout as usize].value.to_sat(),
+            fee,
+            1,
+            tag,
+        )
+    };
     for vout in 0..63 {
         accept(&mp, &cs, &child(vout, 1_000, 2)).expect("a child");
     }
@@ -286,8 +348,14 @@ fn a_leaf_replacement_in_a_sixty_four_transaction_cluster_uses_the_diagram() {
     let conflict = child(5, 1_000, 2);
 
     let replacement = child(5, 1_100, 3);
-    let with_parent = policy::fee_rate_sat_per_kvb(3_100, parent.weight().to_wu() + replacement.weight().to_wu());
-    assert!(with_parent < rate(&conflict, 1_000), "fixture: the per-conflict rule refuses it");
+    let with_parent = policy::fee_rate_sat_per_kvb(
+        3_100,
+        parent.weight().to_wu() + replacement.weight().to_wu(),
+    );
+    assert!(
+        with_parent < rate(&conflict, 1_000),
+        "fixture: the per-conflict rule refuses it"
+    );
     let r = accept(&mp, &cs, &replacement).expect("the cluster's diagram improves");
     let mut after = before;
     after.remove(&conflict.compute_txid());
@@ -307,11 +375,20 @@ fn a_replacement_whose_parent_follows_the_conflict_is_placed_after_it() {
     let (cs, mp, dir) = env(&[1]);
     let root = sized(spend(&[prev(1)], COIN_VALUE, 210, 2, 1), 210);
     let g = accept(&mp, &cs, &root).expect("root");
-    let conflict = sized(spend(&[out(g, 0)], root.output[0].value.to_sat(), 5_000, 1, 2), 100);
+    let conflict = sized(
+        spend(&[out(g, 0)], root.output[0].value.to_sat(), 5_000, 1, 2),
+        100,
+    );
     accept(&mp, &cs, &conflict).expect("a rich child of the root");
-    let middle = sized(spend(&[out(g, 1)], root.output[1].value.to_sat(), 100, 1, 3), 100);
+    let middle = sized(
+        spend(&[out(g, 1)], root.output[1].value.to_sat(), 100, 1, 3),
+        100,
+    );
     let a = accept(&mp, &cs, &middle).expect("a cheap child of the root");
-    let heavy = sized(spend(&[out(a, 0)], middle.output[0].value.to_sat(), 0, 1, 4), 1_000);
+    let heavy = sized(
+        spend(&[out(a, 0)], middle.output[0].value.to_sat(), 0, 1, 4),
+        1_000,
+    );
     let h = accept(&mp, &cs, &heavy).expect("a heavy, free grandchild");
 
     let r_in = root.output[0].value.to_sat() + heavy.output[0].value.to_sat();

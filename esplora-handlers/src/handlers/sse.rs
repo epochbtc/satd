@@ -137,7 +137,10 @@ pub async fn address_sse(
     // Per-tenant watch-set quota (above the node-wide subscription cap). The
     // lease must outlive the stream so a disconnect releases the unit.
     let lease = acquire_watch_lease(&state, principal.as_deref())?;
-    let rx = state.address_index.subscribe(sh).map_err(map_subscribe_err)?;
+    let rx = state
+        .address_index
+        .subscribe(sh)
+        .map_err(map_subscribe_err)?;
     Ok(build_status_sse(rx, addr, permit, lease))
 }
 
@@ -150,7 +153,10 @@ pub async fn scripthash_sse(
     refuse_over_history_cap(&state, sh).await?;
     let permit = acquire_sse_permit(&state)?;
     let lease = acquire_watch_lease(&state, principal.as_deref())?;
-    let rx = state.address_index.subscribe(sh).map_err(map_subscribe_err)?;
+    let rx = state
+        .address_index
+        .subscribe(sh)
+        .map_err(map_subscribe_err)?;
     Ok(build_status_sse(rx, hash, permit, lease))
 }
 
@@ -297,17 +303,15 @@ fn parse_address(s: &str, network: Network) -> EsploraResult<Scripthash> {
     let unchecked: Address<NetworkUnchecked> = s
         .parse()
         .map_err(|e| EsploraError::BadRequest(format!("bad address '{s}': {e}")))?;
-    let address = unchecked
-        .require_network(network)
-        .map_err(|e| {
-            EsploraError::BadRequest(format!("address '{s}' not valid for network: {e}"))
-        })?;
+    let address = unchecked.require_network(network).map_err(|e| {
+        EsploraError::BadRequest(format!("address '{s}' not valid for network: {e}"))
+    })?;
     Ok(scripthash_of(&address.script_pubkey()))
 }
 
 fn parse_scripthash(s: &str) -> EsploraResult<Scripthash> {
-    let bytes = hex::decode(s)
-        .map_err(|e| EsploraError::BadRequest(format!("bad scripthash hex: {e}")))?;
+    let bytes =
+        hex::decode(s).map_err(|e| EsploraError::BadRequest(format!("bad scripthash hex: {e}")))?;
     if bytes.len() != 32 {
         return Err(EsploraError::BadRequest(format!(
             "scripthash must be 32 bytes (64 hex chars); got {}",

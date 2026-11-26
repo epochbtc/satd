@@ -37,8 +37,8 @@
 
 use super::*;
 use crate::net::survey::{
-    self, PASSIVE_WAIT, PROBE_REPLY_WAIT, PassiveEnd, Probe, ProbeContext, ProbeOutcome, ProbeResults,
-    SurveyRecord, SurveyShape, SurveyStore, UNKNOWN_PROBE_WAIT, Verdict,
+    self, PASSIVE_WAIT, PROBE_REPLY_WAIT, PassiveEnd, Probe, ProbeContext, ProbeOutcome,
+    ProbeResults, SurveyRecord, SurveyShape, SurveyStore, UNKNOWN_PROBE_WAIT, Verdict,
 };
 use rand::seq::SliceRandom as _;
 
@@ -85,7 +85,11 @@ impl SurveyRun {
     /// The last one is set first, so a reader that sees the count sees it.
     fn note_connection(&self, completed: bool) {
         *self.last.lock() = Some((crate::time::now_secs(), completed));
-        let counter = if completed { &self.completed } else { &self.failed };
+        let counter = if completed {
+            &self.completed
+        } else {
+            &self.failed
+        };
         counter.fetch_add(1, Ordering::Relaxed);
     }
 }
@@ -253,10 +257,18 @@ pub(super) async fn send_probes(
             break;
         }
         let sent_at = Instant::now();
-        let outcome = if writer.send(survey::probe_message(probe, ctx)).await.is_err() {
+        let outcome = if writer
+            .send(survey::probe_message(probe, ctx))
+            .await
+            .is_err()
+        {
             ProbeOutcome::Disconnected
         } else {
-            let wait = if probe == Probe::Unknown { waits.1 } else { waits.0 };
+            let wait = if probe == Probe::Unknown {
+                waits.1
+            } else {
+                waits.0
+            };
             let probe_deadline = deadline.map_or(now + wait, |d| d.min(now + wait));
             loop {
                 let msg = match next_message(read_rx, probe_deadline, abort).await {
@@ -280,7 +292,9 @@ pub(super) async fn send_probes(
                         break ProbeOutcome::Answered(n);
                     }
                     (Probe::GetData, NetworkMessage::NotFound(inv)) if inv.contains(&wanted) => {
-                        break ProbeOutcome::Answered(inv.iter().filter(|i| **i == wanted).count() as u32);
+                        break ProbeOutcome::Answered(
+                            inv.iter().filter(|i| **i == wanted).count() as u32
+                        );
                     }
                     (_, NetworkMessage::Ping(n)) => {
                         if writer.send(NetworkMessage::Pong(*n)).await.is_err() {
@@ -314,30 +328,32 @@ impl PeerManager {
     pub fn enable_survey(&self, config: SurveyConfig) {
         let now = crate::time::now_secs();
         let store = match &config.path {
-            Some(path) => match SurveyStore::load(path, self.chain_state.p2p_magic().to_bytes(), now) {
-                Ok(store) => {
-                    if store.dropped_old_format() > 0 {
-                        tracing::info!(
-                            dropped = store.dropped_old_format(),
-                            "The network survey file is in an older format (satdsrv1 or satdsrv2); its records are dropped and the survey starts empty"
-                        );
-                    } else {
-                        tracing::info!(records = store.len(), "Loaded the network survey");
+            Some(path) => {
+                match SurveyStore::load(path, self.chain_state.p2p_magic().to_bytes(), now) {
+                    Ok(store) => {
+                        if store.dropped_old_format() > 0 {
+                            tracing::info!(
+                                dropped = store.dropped_old_format(),
+                                "The network survey file is in an older format (satdsrv1 or satdsrv2); its records are dropped and the survey starts empty"
+                            );
+                        } else {
+                            tracing::info!(records = store.len(), "Loaded the network survey");
+                        }
+                        store
                     }
-                    store
+                    Err(e) => {
+                        // Set aside rather than overwritten at the next save.
+                        let aside = path.with_extension(format!("dat.bad-{now}"));
+                        let _ = std::fs::rename(path, &aside);
+                        tracing::warn!(
+                            file = %path.display(),
+                            moved_to = %aside.display(),
+                            "Could not read the network survey, starting empty: {e}"
+                        );
+                        SurveyStore::default()
+                    }
                 }
-                Err(e) => {
-                    // Set aside rather than overwritten at the next save.
-                    let aside = path.with_extension(format!("dat.bad-{now}"));
-                    let _ = std::fs::rename(path, &aside);
-                    tracing::warn!(
-                        file = %path.display(),
-                        moved_to = %aside.display(),
-                        "Could not read the network survey, starting empty: {e}"
-                    );
-                    SurveyStore::default()
-                }
-            },
+            }
             None => SurveyStore::default(),
         };
         let run = SurveyRun {
@@ -438,8 +454,16 @@ impl PeerManager {
 
     /// Whether a survey connection is open or being dialled.
     pub(super) fn survey_open(&self) -> bool {
-        let dialing = self.survey.get().is_some_and(|run| run.dialing.load(Ordering::Relaxed));
-        dialing || self.peers.read().values().any(|h| h.info.conn_type == ConnType::Survey)
+        let dialing = self
+            .survey
+            .get()
+            .is_some_and(|run| run.dialing.load(Ordering::Relaxed));
+        dialing
+            || self
+                .peers
+                .read()
+                .values()
+                .any(|h| h.info.conn_type == ConnType::Survey)
     }
 
     /// One turn of the survey's loop: dial a survey connection unless one
@@ -465,7 +489,13 @@ impl PeerManager {
         tokio::spawn(async move {
             let _guard = guard;
             tracing::debug!(target = %dialled, retry = is_retry, "Making survey connection");
-            if !pm.dial_book_target(&dialled, Some(ConnType::Survey), AUTOMATIC_RECONNECT_MAX_BACKOFF).await
+            if !pm
+                .dial_book_target(
+                    &dialled,
+                    Some(ConnType::Survey),
+                    AUTOMATIC_RECONNECT_MAX_BACKOFF,
+                )
+                .await
                 && let Some(run) = pm.survey.get()
             {
                 run.note_connection(false);
@@ -481,7 +511,8 @@ impl PeerManager {
     pub(super) fn next_survey_retry(&self) -> Option<PeerAddr> {
         let due = self.read_survey_store(|store| store.due_retries(crate::time::now_secs()))?;
         let now = Instant::now();
-        due.into_iter().find(|target| self.survey_may_target(target, now))
+        due.into_iter()
+            .find(|target| self.survey_may_target(target, now))
     }
 
     /// A survey connection to `addr` did not connect: if it was a due
@@ -514,7 +545,9 @@ impl PeerManager {
         addrs.sort_unstable();
         addrs.shuffle(&mut rand::thread_rng());
         let now = Instant::now();
-        addrs.into_iter().find(|target| self.survey_may_target(target, now))
+        addrs
+            .into_iter()
+            .find(|target| self.survey_may_target(target, now))
     }
 
     /// Whether a survey connection may be dialled at `target`: what the
@@ -538,14 +571,21 @@ impl PeerManager {
         mut conn: Connection,
         connected_at: u64,
     ) -> Result<(), String> {
-        let version = match self.perform_handshake(id, &mut conn, Direction::Outbound, connected_at).await {
+        let version = match self
+            .perform_handshake(id, &mut conn, Direction::Outbound, connected_at)
+            .await
+        {
             Ok(v) => v,
             Err(e) => {
                 tracing::debug!("survey handshake failed: {e}, peer={id}");
                 if let Some(run) = self.survey.get() {
                     run.note_connection(false);
                 }
-                let addr = self.peers.read().get(&id).and_then(|h| Self::dialled_book_addr(&h.info));
+                let addr = self
+                    .peers
+                    .read()
+                    .get(&id)
+                    .and_then(|h| Self::dialled_book_addr(&h.info));
                 if let Some(addr) = addr {
                     self.survey_retry_failed(&addr);
                 }
@@ -558,18 +598,34 @@ impl PeerManager {
 
     /// The survey session past the handshake: the passive wait, the
     /// probes, the record, and the close.
-    async fn run_survey_session(self: &Arc<Self>, id: PeerId, conn: Connection, version: VersionMessage) {
+    async fn run_survey_session(
+        self: &Arc<Self>,
+        id: PeerId,
+        conn: Connection,
+        version: VersionMessage,
+    ) {
         let v2 = conn.transport_protocol().is_v2();
-        let book_addr = self.peers.read().get(&id).and_then(|h| Self::dialled_book_addr(&h.info));
+        let book_addr = self
+            .peers
+            .read()
+            .get(&id)
+            .and_then(|h| Self::dialled_book_addr(&h.info));
         // What a feeler teaches the address book: the peer answered. Core
         // marks every outbound peer good on its `version` (`Good`, v32.1
         // `src/net_processing.cpp`), a feeler's included.
         if let Some(addr) = &book_addr {
-            self.addrman.write().mark_good(addr.clone(), now_unix_secs());
+            self.addrman
+                .write()
+                .mark_good(addr.clone(), now_unix_secs());
         }
 
         let (mut reader, mut writer) = conn.split();
-        let Some((stats, abort)) = self.peers.read().get(&id).map(|h| (h.stats.clone(), h.disconnect.clone())) else {
+        let Some((stats, abort)) = self
+            .peers
+            .read()
+            .get(&id)
+            .map(|h| (h.stats.clone(), h.disconnect.clone()))
+        else {
             // Closed by the node already.
             return;
         };
@@ -586,12 +642,16 @@ impl PeerManager {
             }
         });
 
-        let listened = self.survey_listen(id, &mut writer, &mut read_rx, &abort).await;
+        let listened = self
+            .survey_listen(id, &mut writer, &mut read_rx, &abort)
+            .await;
         let passive = listened.passive_end();
         let mut probes = ProbeResults::default();
         let closed = listened.closed()
             || (self.survey.get().is_some_and(|run| run.config.probes)
-                && self.survey_probe(id, &mut writer, &mut read_rx, &abort, &mut probes).await);
+                && self
+                    .survey_probe(id, &mut writer, &mut read_rx, &abort, &mut probes)
+                    .await);
         read_task.abort();
         drop(writer);
 
@@ -601,20 +661,37 @@ impl PeerManager {
         };
         let info = &mut handle.info;
         let user_agent = crate::net::limits::sanitize_string(&version.user_agent);
-        let verdict =
-            survey::session_verdict(passive, &info.behavior.handshake, &user_agent, version.version, PROTOCOL_VERSION);
+        let verdict = survey::session_verdict(
+            passive,
+            &info.behavior.handshake,
+            &user_agent,
+            version.version,
+            PROTOCOL_VERSION,
+        );
         // A peer that closed before its transcript settled showed nothing
         // of its implementation: no fingerprint.
         let fingerprint = if verdict == Verdict::ClosedEarly {
             crate::net::fingerprint::Fingerprint::Unknown
         } else {
-            crate::net::fingerprint::classify(false, &info.behavior.handshake, info.behavior.version.as_ref(), true)
+            crate::net::fingerprint::classify(
+                false,
+                &info.behavior.handshake,
+                info.behavior.version.as_ref(),
+                true,
+            )
         };
-        let reason = if closed { "survey-peer-closed" } else { "survey-done" };
+        let reason = if closed {
+            "survey-peer-closed"
+        } else {
+            "survey-done"
+        };
         // A shape no row matched keeps its raw features, in the record and
         // here, so the next round of unknown shapes can be told apart.
         let relay = info.behavior.version.as_ref().is_some_and(|v| v.relay);
-        let shape = fingerprint.observed().is_none().then(|| SurveyShape::of(&info.behavior.handshake, relay));
+        let shape = fingerprint
+            .observed()
+            .is_none()
+            .then(|| SurveyShape::of(&info.behavior.handshake, relay));
         tracing::debug!(
             "survey connection done ({reason}), fingerprint={fingerprint} verdict={verdict:?} v2={v2} probes={}{}, disconnecting peer={id}",
             Probe::ALL
@@ -640,9 +717,11 @@ impl PeerManager {
         };
         let now = crate::time::now_secs();
         let asn = match &addr {
-            PeerAddr::Socket(sa) if crate::net::is_routable(sa.ip()) => {
-                self.asmap.get().map(|m| m.lookup(sa.ip())).filter(|a| *a != 0)
-            }
+            PeerAddr::Socket(sa) if crate::net::is_routable(sa.ip()) => self
+                .asmap
+                .get()
+                .map(|m| m.lookup(sa.ip()))
+                .filter(|a| *a != 0),
             _ => None,
         };
         let record = SurveyRecord {
@@ -690,12 +769,19 @@ impl PeerManager {
             return Listened::PeerClosed;
         }
         if let Some(rate) = self.fee_filter_for(id)
-            && writer.send(NetworkMessage::FeeFilter(rate as i64)).await.is_err()
+            && writer
+                .send(NetworkMessage::FeeFilter(rate as i64))
+                .await
+                .is_err()
         {
             return Listened::PeerClosed;
         }
         let deadline = tokio::time::Instant::now() + PASSIVE_WAIT;
-        match listen_passive(id, writer, read_rx, abort, deadline, |msg| self.capture_handshake(id, msg)).await {
+        match listen_passive(id, writer, read_rx, abort, deadline, |msg| {
+            self.capture_handshake(id, msg)
+        })
+        .await
+        {
             // A transcript reads as closed, too, once the node has dropped
             // the peer's handle.
             Listened::Settled if !self.peers.read().contains_key(&id) => Listened::Aborted,
@@ -726,16 +812,32 @@ impl PeerManager {
         let locator = self.survey_locator();
         let zero = bitcoin::BlockHash::all_zeros();
         let (locator_top, stop) = locator.unwrap_or((zero, zero));
-        let wtxid_relay = self.peers.read().get(&id).is_some_and(|h| h.info.wtxid_relay);
+        let wtxid_relay = self
+            .peers
+            .read()
+            .get(&id)
+            .is_some_and(|h| h.info.wtxid_relay);
         let ctx = ProbeContext::new(&mut rand::thread_rng(), locator_top, stop, wtxid_relay);
         let waits = (PROBE_REPLY_WAIT, UNKNOWN_PROBE_WAIT);
-        send_probes(id, writer, read_rx, abort, chosen, &ctx, locator.is_some(), waits, None, None, |probe, outcome| {
-            probes.set(probe, outcome);
-            if let Some(run) = self.survey.get() {
-                let i = Probe::ALL.iter().position(|p| *p == probe).expect("in ALL");
-                run.probe_outcomes[i][outcome_slot(outcome)].fetch_add(1, Ordering::Relaxed);
-            }
-        })
+        send_probes(
+            id,
+            writer,
+            read_rx,
+            abort,
+            chosen,
+            &ctx,
+            locator.is_some(),
+            waits,
+            None,
+            None,
+            |probe, outcome| {
+                probes.set(probe, outcome);
+                if let Some(run) = self.survey.get() {
+                    let i = Probe::ALL.iter().position(|p| *p == probe).expect("in ALL");
+                    run.probe_outcomes[i][outcome_slot(outcome)].fetch_add(1, Ordering::Relaxed);
+                }
+            },
+        )
         .await
     }
 
@@ -745,7 +847,12 @@ impl PeerManager {
     /// answer with a full batch of 2,000: the probe is not sent then.
     pub(super) fn survey_locator(&self) -> Option<(bitcoin::BlockHash, bitcoin::BlockHash)> {
         let tip = self.chain_state.tip_hash();
-        let parent = self.chain_state.get_block_index(&tip).filter(|e| e.height > 0)?.header.prev_blockhash;
+        let parent = self
+            .chain_state
+            .get_block_index(&tip)
+            .filter(|e| e.height > 0)?
+            .header
+            .prev_blockhash;
         Some((parent, tip))
     }
 
@@ -821,7 +928,12 @@ impl PeerManager {
 
     /// Put a record in the survey's store, as a survey connection does, and
     /// refresh the aggregate. Returns false with the survey off.
-    pub(super) fn insert_survey_record(&self, addr: PeerAddr, record: SurveyRecord, now: u64) -> bool {
+    pub(super) fn insert_survey_record(
+        &self,
+        addr: PeerAddr,
+        record: SurveyRecord,
+        now: u64,
+    ) -> bool {
         let Some(run) = self.survey.get() else {
             return false;
         };

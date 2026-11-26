@@ -18,11 +18,11 @@
 use bitcoin::blockdata::opcodes::all::OP_RETURN;
 use bitcoin::blockdata::script::Builder;
 use bitcoin::consensus::Decodable;
-use bitcoin::hashes::{sha256d, Hash};
+use bitcoin::hashes::{Hash, sha256d};
 use bitcoin::p2p::Magic;
 use bitcoin::{
-    absolute, transaction, Amount, Block, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut,
-    Witness,
+    Amount, Block, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness, absolute,
+    transaction,
 };
 
 use crate::validation::ValidationError;
@@ -286,8 +286,7 @@ impl SignetTxs {
         // The signed message: version || prev || modified-merkle || time.
         let mut block_data = Vec::with_capacity(72);
         block_data.extend_from_slice(&block.header.version.to_consensus().to_le_bytes());
-        block_data
-            .extend_from_slice(&block.header.prev_blockhash.to_raw_hash().to_byte_array());
+        block_data.extend_from_slice(&block.header.prev_blockhash.to_raw_hash().to_byte_array());
         block_data.extend_from_slice(&signet_merkle);
         block_data.extend_from_slice(&block.header.time.to_le_bytes());
 
@@ -376,9 +375,9 @@ pub fn check_signet_block_solution(
 /// Real default-signet blocks, for tests anywhere in the crate.
 #[cfg(test)]
 pub(crate) mod fixtures {
+    use bitcoin::Block;
     use bitcoin::consensus::deserialize;
     use bitcoin::hashes::hex::FromHex;
-    use bitcoin::Block;
 
     /// Blocks 1 to 10 of the public default signet, one hex block per line,
     /// as Bitcoin Core's `test/functional/feature_signet.py` carries them.
@@ -402,7 +401,12 @@ pub(crate) mod fixtures {
     /// Default-signet block at `height` (1 to 10).
     pub(crate) fn default_signet_block(height: usize) -> Block {
         assert!((1..=10).contains(&height), "fixtures cover heights 1 to 10");
-        parse(BLOCKS_1_TO_10.lines().nth(height - 1).expect("fixture line"))
+        parse(
+            BLOCKS_1_TO_10
+                .lines()
+                .nth(height - 1)
+                .expect("fixture line"),
+        )
     }
 
     /// Default-signet block 2 carrying an invalid solution (see
@@ -425,7 +429,10 @@ mod tests {
         // changes the magic.
         let derived: Vec<u8> = signet_magic(&DEFAULT_SIGNET_CHALLENGE).to_bytes().to_vec();
         let crate_magic: Vec<u8> = Magic::from(Network::Signet).to_bytes().to_vec();
-        assert_eq!(derived, crate_magic, "derived signet magic must match bitcoin crate");
+        assert_eq!(
+            derived, crate_magic,
+            "derived signet magic must match bitcoin crate"
+        );
     }
 
     /// Parity with Core's `GetSignetDataDir`. The expected names were
@@ -451,7 +458,7 @@ mod tests {
     use bitcoin::blockdata::script::Instruction;
     use bitcoin::script::PushBytes;
     use bitcoin::sighash::{EcdsaSighashType, SighashCache};
-    use bitcoin::{block, BlockHash, CompactTarget, TxMerkleNode};
+    use bitcoin::{BlockHash, CompactTarget, TxMerkleNode, block};
 
     fn push(b: Builder, data: &[u8]) -> Builder {
         let pb: &PushBytes = data.try_into().unwrap();
@@ -510,9 +517,7 @@ mod tests {
         // signet section validates trivially (Core's documented allowance).
         let challenge = Builder::new().push_opcode(OP_PUSHNUM_1).into_script();
         let block = block_from_coinbase(coinbase_with_commitment(None));
-        assert!(
-            check_signet_block_solution(&block, challenge.as_bytes(), dummy_genesis()).is_ok()
-        );
+        assert!(check_signet_block_solution(&block, challenge.as_bytes(), dummy_genesis()).is_ok());
     }
 
     #[test]
@@ -588,8 +593,7 @@ mod tests {
         let mut tampered = block.clone();
         tampered.header.time += 1;
         assert!(
-            check_signet_block_solution(&tampered, challenge.as_bytes(), dummy_genesis())
-                .is_err(),
+            check_signet_block_solution(&tampered, challenge.as_bytes(), dummy_genesis()).is_err(),
             "tampering with the signed block data must invalidate the solution"
         );
     }
@@ -632,7 +636,12 @@ mod tests {
         for height in 1..=10 {
             let block = default_signet_block(height);
             check_signet_block_solution(&block, &DEFAULT_SIGNET_CHALLENGE, genesis).unwrap_or_else(
-                |e| panic!("default signet block {height} ({}) rejected: {e:?}", block.block_hash()),
+                |e| {
+                    panic!(
+                        "default signet block {height} ({}) rejected: {e:?}",
+                        block.block_hash()
+                    )
+                },
             );
         }
     }
@@ -680,12 +689,18 @@ mod tests {
         assert_ne!(bad.header.nonce, real.header.nonce);
 
         // Still a valid block: merkle root, witness commitment and signet PoW.
-        assert!(bad.check_merkle_root(), "merkle root must match the altered coinbase");
+        assert!(
+            bad.check_merkle_root(),
+            "merkle root must match the altered coinbase"
+        );
         assert!(bad.check_witness_commitment());
         bad.header
             .validate_pow(bad.header.target())
             .expect("the reground nonce must meet the header's target");
-        assert_eq!(bad.header.bits, real.header.bits, "same (signet) target as the real block");
+        assert_eq!(
+            bad.header.bits, real.header.bits,
+            "same (signet) target as the real block"
+        );
 
         // The coinbase differs in exactly one byte, inside the signet section.
         let (a, b) = (
@@ -695,15 +710,32 @@ mod tests {
         assert_eq!(a.len(), b.len());
         let diffs: Vec<usize> = (0..a.len()).filter(|&i| a[i] != b[i]).collect();
         assert_eq!(diffs.len(), 1, "exactly one coinbase byte differs");
-        let header_at = a.windows(4).position(|w| w == SIGNET_HEADER).expect("signet section");
-        assert!(diffs[0] > header_at + SIGNET_HEADER.len(), "the flipped byte is in the solution");
+        let header_at = a
+            .windows(4)
+            .position(|w| w == SIGNET_HEADER)
+            .expect("signet section");
+        assert!(
+            diffs[0] > header_at + SIGNET_HEADER.len(),
+            "the flipped byte is in the solution"
+        );
 
         // And the stripped message is the real block's, so only the
         // signature is wrong.
-        let real_txs = SignetTxs::create(&real, &ScriptBuf::from_bytes(DEFAULT_SIGNET_CHALLENGE.to_vec())).unwrap();
-        let bad_txs = SignetTxs::create(&bad, &ScriptBuf::from_bytes(DEFAULT_SIGNET_CHALLENGE.to_vec())).unwrap();
+        let real_txs = SignetTxs::create(
+            &real,
+            &ScriptBuf::from_bytes(DEFAULT_SIGNET_CHALLENGE.to_vec()),
+        )
+        .unwrap();
+        let bad_txs = SignetTxs::create(
+            &bad,
+            &ScriptBuf::from_bytes(DEFAULT_SIGNET_CHALLENGE.to_vec()),
+        )
+        .unwrap();
         assert_eq!(real_txs.to_spend, bad_txs.to_spend, "same signed message");
-        assert_ne!(real_txs.to_sign.input[0].script_sig, bad_txs.to_sign.input[0].script_sig);
+        assert_ne!(
+            real_txs.to_sign.input[0].script_sig,
+            bad_txs.to_sign.input[0].script_sig
+        );
     }
 
     /// BIP 325: `to_spend`'s scriptSig is `OP_0 PUSH72[block_data]`

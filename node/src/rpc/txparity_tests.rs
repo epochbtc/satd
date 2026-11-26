@@ -9,9 +9,9 @@ use crate::chain::state::ChainState;
 use crate::chain::state::tests::{
     build_test_block, build_test_block_spending, make_chain_state, make_chain_state_with_store,
 };
-use crate::storage::test_store::ControllableStore;
 use crate::mempool::pool::Mempool;
 use crate::rpc::{blockchain, rawtx};
+use crate::storage::test_store::ControllableStore;
 
 fn time(h: u32) -> u32 {
     1_300_000_000 + h * 600
@@ -30,7 +30,10 @@ fn mine_a_spend(cs: &ChainState) -> Vec<Block> {
     let mut blocks: Vec<Block> = Vec::new();
     for h in 1..=103 {
         let b = if h == 102 {
-            let spend = OutPoint { txid: blocks[0].txdata[0].compute_txid(), vout: 0 };
+            let spend = OutPoint {
+                txid: blocks[0].txdata[0].compute_txid(),
+                vout: 0,
+            };
             build_test_block_spending(parent, h, time(h), spend)
         } else {
             build_test_block(parent, h, time(h))
@@ -57,7 +60,11 @@ fn getblock_has_strippedsize_and_coinbase_tx() {
     let b = &blocks[101];
     let v = getblock(&cs, b.block_hash(), 1);
     // No witness anywhere: the stripped block is the block.
-    assert_eq!(v["strippedsize"], json!(bitcoin::consensus::serialize(b).len()), "{v}");
+    assert_eq!(
+        v["strippedsize"],
+        json!(bitcoin::consensus::serialize(b).len()),
+        "{v}"
+    );
     let cb = &b.txdata[0];
     assert_eq!(
         v["coinbase_tx"],
@@ -88,9 +95,19 @@ fn getblock_takes_fees_and_prevouts_from_undo_data() {
     let txs = v2["tx"].as_array().unwrap();
     assert_eq!(txs[0].get("fee"), None, "a coinbase has no fee: {v2}");
     assert_eq!(sats(&txs[1]["fee"]), fee, "{v2}");
-    assert_eq!(txs[1]["vin"][0].get("prevout"), None, "verbosity 2 has no prevout: {v2}");
+    assert_eq!(
+        txs[1]["vin"][0].get("prevout"),
+        None,
+        "verbosity 2 has no prevout: {v2}"
+    );
     for tx in txs {
-        for f in ["blockhash", "blockheight", "confirmations", "time", "blocktime"] {
+        for f in [
+            "blockhash",
+            "blockheight",
+            "confirmations",
+            "time",
+            "blocktime",
+        ] {
             assert_eq!(tx.get(f), None, "{f} in a getblock tx: {tx}");
         }
         assert!(tx["hex"].is_string(), "{tx}");
@@ -101,7 +118,10 @@ fn getblock_takes_fees_and_prevouts_from_undo_data() {
     assert_eq!(prevout["generated"], json!(true), "{v3}");
     assert_eq!(prevout["height"], json!(1), "{v3}");
     assert_eq!(sats(&prevout["value"]), funding.value.to_sat(), "{v3}");
-    assert_eq!(prevout["scriptPubKey"]["hex"], json!(hex::encode(funding.script_pubkey.as_bytes())));
+    assert_eq!(
+        prevout["scriptPubKey"]["hex"],
+        json!(hex::encode(funding.script_pubkey.as_bytes()))
+    );
     assert_eq!(sats(&v3["tx"][1]["fee"]), fee, "{v3}");
     let _ = std::fs::remove_dir_all(dir);
 }
@@ -142,14 +162,26 @@ fn getrawtransaction_of_a_confirmed_spend_matches_core() {
 #[test]
 fn getrawtransaction_of_a_mempool_tx_has_no_chain_fields() {
     let (cs, dir, blocks) = chain_with_a_spend();
-    let spend = OutPoint { txid: blocks[1].txdata[0].compute_txid(), vout: 0 };
-    let tx = build_test_block_spending(blocks[102].block_hash(), 104, time(104), spend).txdata[1].clone();
+    let spend = OutPoint {
+        txid: blocks[1].txdata[0].compute_txid(),
+        vout: 0,
+    };
+    let tx = build_test_block_spending(blocks[102].block_hash(), 104, time(104), spend).txdata[1]
+        .clone();
     let txid = tx.compute_txid();
     let pool = Mempool::new(1_000_000, 0);
     pool.insert_entry_for_test(txid, tx, 1);
     for verbosity in [1, 2] {
-        let v = rawtx::get_raw_transaction(&cs, &pool, &txid.to_string(), true, verbosity, None).unwrap();
-        for f in ["confirmations", "blockhash", "blockheight", "time", "blocktime", "fee"] {
+        let v = rawtx::get_raw_transaction(&cs, &pool, &txid.to_string(), true, verbosity, None)
+            .unwrap();
+        for f in [
+            "confirmations",
+            "blockhash",
+            "blockheight",
+            "time",
+            "blocktime",
+            "fee",
+        ] {
             assert_eq!(v.get(f), None, "{f} at verbosity {verbosity}: {v}");
         }
         assert_eq!(v["vin"][0].get("prevout"), None, "{v}");
@@ -162,13 +194,21 @@ fn getrawtransaction_of_a_mempool_tx_has_no_chain_fields() {
 /// `decoderawtransaction` echoes no `hex`.
 #[test]
 fn a_coinbase_witness_is_shown_and_decoderawtransaction_has_no_hex() {
-    let mut cb = build_test_block(bitcoin::constants::genesis_block(Network::Regtest).block_hash(), 1, time(1))
-        .txdata[0]
+    let mut cb = build_test_block(
+        bitcoin::constants::genesis_block(Network::Regtest).block_hash(),
+        1,
+        time(1),
+    )
+    .txdata[0]
         .clone();
     cb.input[0].witness = Witness::from_slice(&[[0u8; 32]]);
     let hex_tx = hex::encode(bitcoin::consensus::serialize(&cb));
     let v = rawtx::decode_raw_transaction(&hex_tx, None, Network::Regtest).unwrap();
-    assert_eq!(v["vin"][0]["txinwitness"], json!([hex::encode([0u8; 32])]), "{v}");
+    assert_eq!(
+        v["vin"][0]["txinwitness"],
+        json!([hex::encode([0u8; 32])]),
+        "{v}"
+    );
     assert_eq!(v.get("hex"), None, "{v}");
 }
 
@@ -211,7 +251,8 @@ fn spend_block_stats() -> (bitcoin::Transaction, u64, Value, Value) {
     let funding = blocks[0].txdata[0].output[0].value.to_sat();
     let fee = funding - tx.output.iter().map(|o| o.value.to_sat()).sum::<u64>();
     let stats = blockchain::get_block_stats(&cs, &b.block_hash().to_string()).unwrap();
-    let coinbase_only = blockchain::get_block_stats(&cs, &blocks[0].block_hash().to_string()).unwrap();
+    let coinbase_only =
+        blockchain::get_block_stats(&cs, &blocks[0].block_hash().to_string()).unwrap();
     let _ = std::fs::remove_dir_all(dir);
     (tx, fee, stats, coinbase_only)
 }
@@ -223,7 +264,10 @@ fn spend_block_stats() -> (bitcoin::Transaction, u64, Value, Value) {
 fn getblockstats_feerates_are_sat_per_vbyte() {
     let (tx, fee, stats, _) = spend_block_stats();
     let rate = fee * 4 / tx.weight().to_wu();
-    assert!(rate > 0, "premise: the spend pays a fee rate of at least 1 sat/vB");
+    assert!(
+        rate > 0,
+        "premise: the spend pays a fee rate of at least 1 sat/vB"
+    );
     assert_eq!(stats["minfeerate"], json!(rate), "{stats}");
     assert_eq!(stats["maxfeerate"], json!(rate), "{stats}");
 }
@@ -234,7 +278,11 @@ fn getblockstats_feerates_are_sat_per_vbyte() {
 #[test]
 fn getblockstats_avgfeerate_is_over_the_non_coinbase_weight() {
     let (tx, fee, stats, coinbase_only) = spend_block_stats();
-    assert_eq!(stats["avgfeerate"], json!(fee * 4 / tx.weight().to_wu()), "{stats}");
+    assert_eq!(
+        stats["avgfeerate"],
+        json!(fee * 4 / tx.weight().to_wu()),
+        "{stats}"
+    );
     assert_eq!(coinbase_only["avgfeerate"], json!(0), "{coinbase_only}");
 }
 
@@ -250,7 +298,13 @@ fn getblockstats_sizes_leave_out_the_header_and_coinbase() {
         assert_eq!(stats[key], json!(size), "{key}: {stats}");
     }
     assert_eq!(stats["total_weight"], json!(tx.weight().to_wu()), "{stats}");
-    for key in ["total_size", "total_weight", "avgtxsize", "mintxsize", "maxtxsize"] {
+    for key in [
+        "total_size",
+        "total_weight",
+        "avgtxsize",
+        "mintxsize",
+        "maxtxsize",
+    ] {
         assert_eq!(coinbase_only[key], json!(0), "{key}: {coinbase_only}");
     }
 }
@@ -289,15 +343,26 @@ fn getblockstats_reports_the_actual_utxo_statistics() {
     let (_, _, stats, coinbase_only) = spend_block_stats();
     assert_eq!(stats["utxo_increase_actual"], json!(1), "{stats}");
     assert_eq!(stats["utxo_size_inc_actual"], json!(49), "{stats}");
-    assert_eq!(coinbase_only["utxo_increase_actual"], json!(1), "{coinbase_only}");
-    assert_eq!(coinbase_only["utxo_size_inc_actual"], json!(49), "{coinbase_only}");
+    assert_eq!(
+        coinbase_only["utxo_increase_actual"],
+        json!(1),
+        "{coinbase_only}"
+    );
+    assert_eq!(
+        coinbase_only["utxo_size_inc_actual"],
+        json!(49),
+        "{coinbase_only}"
+    );
 
     let (cs, dir) = make_chain_state();
     let genesis = bitcoin::constants::genesis_block(Network::Regtest);
     let g = blockchain::get_block_stats(&cs, &genesis.block_hash().to_string()).unwrap();
     let _ = std::fs::remove_dir_all(dir);
     let spk_len = genesis.txdata[0].output[0].script_pubkey.len();
-    assert_eq!(spk_len, 67, "premise: the genesis coinbase pays a 67-byte P2PK script");
+    assert_eq!(
+        spk_len, 67,
+        "premise: the genesis coinbase pays a 67-byte P2PK script"
+    );
     assert_eq!(g["utxo_increase"], json!(1), "{g}");
     assert_eq!(g["utxo_size_inc"], json!(8 + 1 + 67 + 40), "{g}");
     assert_eq!(g["utxo_increase_actual"], json!(0), "{g}");
@@ -316,7 +381,10 @@ fn unreadable_undo_data_refuses_getblockstats() {
     let blocks = mine_a_spend(&cs);
     let hash = blocks[101].block_hash().to_string();
     let before = blockchain::get_block_stats(&cs, &hash).unwrap();
-    assert!(before["totalfee"].as_u64().unwrap() > 0, "premise: the block pays a fee: {before}");
+    assert!(
+        before["totalfee"].as_u64().unwrap() > 0,
+        "premise: the block pays a fee: {before}"
+    );
     cs.store_ref().flush().expect("flush");
     cs.store_ref().drop_read_overlays();
     controls.set_undo_unreadable(true);
@@ -324,7 +392,10 @@ fn unreadable_undo_data_refuses_getblockstats() {
     let err = blockchain::get_block_stats(&cs, &hash).unwrap_err();
     assert_eq!(err, blockchain::UNDO_READ_FAILED);
     assert_eq!(blockchain::get_block_stats_error_code(&err), -1);
-    assert_eq!(blockchain::get_block_stats_error_code("Block not found"), -5);
+    assert_eq!(
+        blockchain::get_block_stats_error_code("Block not found"),
+        -5
+    );
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -340,7 +411,15 @@ fn getrawtransaction_needs_no_txindex_for_the_fee() {
     let b = &blocks[101];
     let pool = Mempool::new(1_000_000, 0);
     let txid = b.txdata[1].compute_txid().to_string();
-    let v = rawtx::get_raw_transaction(&cs, &pool, &txid, true, 2, Some(&b.block_hash().to_string())).unwrap();
+    let v = rawtx::get_raw_transaction(
+        &cs,
+        &pool,
+        &txid,
+        true,
+        2,
+        Some(&b.block_hash().to_string()),
+    )
+    .unwrap();
     assert!(v["fee"].is_number(), "{v}");
     assert_eq!(v["vin"][0]["prevout"]["height"], json!(1), "{v}");
     let _ = std::fs::remove_dir_all(dir);
@@ -355,19 +434,35 @@ fn getrawtransaction_not_found_text_follows_the_index() {
     use bitcoin::hashes::Hash;
     let missing = bitcoin::Txid::from_byte_array([0x5a; 32]).to_string();
     let cases = [
-        ((false, false), "No such mempool transaction. Use -txindex or provide a block hash"),
-        ((true, false), "No such mempool transaction. The transaction index does not cover blocks"),
-        ((true, true), "No such mempool or blockchain transaction. Use gettransaction"),
+        (
+            (false, false),
+            "No such mempool transaction. Use -txindex or provide a block hash",
+        ),
+        (
+            (true, false),
+            "No such mempool transaction. The transaction index does not cover blocks",
+        ),
+        (
+            (true, true),
+            "No such mempool or blockchain transaction. Use gettransaction",
+        ),
     ];
     for ((enabled, complete), want) in cases {
         let store = ControllableStore::new();
         store.controls().set_txindex(enabled, complete);
         let (cs, dir) = make_chain_state_with_store(Box::new(store));
         let pool = Mempool::new(1_000_000, 0);
-        let (code, msg) = rawtx::get_raw_transaction(&cs, &pool, &missing, false, 0, None).unwrap_err();
+        let (code, msg) =
+            rawtx::get_raw_transaction(&cs, &pool, &missing, false, 0, None).unwrap_err();
         assert_eq!(code, -5, "txindex={enabled} complete={complete}");
-        assert!(msg.starts_with(want), "txindex={enabled} complete={complete}: {msg}");
-        assert!(msg.ends_with("Use gettransaction for wallet transactions."), "{msg}");
+        assert!(
+            msg.starts_with(want),
+            "txindex={enabled} complete={complete}: {msg}"
+        );
+        assert!(
+            msg.ends_with("Use gettransaction for wallet transactions."),
+            "{msg}"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 }

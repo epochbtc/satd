@@ -49,7 +49,13 @@ pub struct ReachableNets {
 impl Default for ReachableNets {
     /// No `-onlynet`: everything satd can reach.
     fn default() -> Self {
-        Self { ipv4: true, ipv6: true, onion: true, cjdns: false, cjdns_flip: false }
+        Self {
+            ipv4: true,
+            ipv6: true,
+            onion: true,
+            cjdns: false,
+            cjdns_flip: false,
+        }
     }
 }
 
@@ -126,11 +132,24 @@ mod tests {
         assert_eq!(all.network_of(&v4), Network::Ipv4);
         assert_eq!(all.network_of(&mapped), Network::Ipv4);
         assert_eq!(all.network_of(&v6), Network::Ipv6);
-        assert_eq!(all.network_of(&fc), Network::Ipv6, "fc00::/8 is IPv6 without -cjdnsreachable");
-        let flip = ReachableNets { cjdns_flip: true, ..all };
+        assert_eq!(
+            all.network_of(&fc),
+            Network::Ipv6,
+            "fc00::/8 is IPv6 without -cjdnsreachable"
+        );
+        let flip = ReachableNets {
+            cjdns_flip: true,
+            ..all
+        };
         assert_eq!(flip.network_of(&fc), Network::Cjdns);
 
-        let onion_only = ReachableNets { ipv4: false, ipv6: false, onion: true, cjdns: false, cjdns_flip: false };
+        let onion_only = ReachableNets {
+            ipv4: false,
+            ipv6: false,
+            onion: true,
+            cjdns: false,
+            cjdns_flip: false,
+        };
         assert!(!onion_only.contains_socket(&v4));
         assert!(!onion_only.contains_socket(&v6));
         assert!(!onion_only.clearnet());

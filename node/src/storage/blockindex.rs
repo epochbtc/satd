@@ -104,7 +104,9 @@ pub fn sub_u256(a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {
     let mut out = [0u8; 32];
     let mut borrow = 0u16;
     for i in (0..32).rev() {
-        let diff = u16::from(a[i]).wrapping_sub(u16::from(b[i])).wrapping_sub(borrow);
+        let diff = u16::from(a[i])
+            .wrapping_sub(u16::from(b[i]))
+            .wrapping_sub(borrow);
         out[i] = diff as u8;
         borrow = u16::from(diff > 0xff);
     }
@@ -599,8 +601,15 @@ mod tests {
         // Work should be non-zero
         assert_ne!(work, [0u8; 32]);
         // Bytes 0..27 should all be zero (the value fits in ~5 bytes)
-        assert!(work[..27].iter().all(|&b| b == 0), "upper bytes should be zero");
+        assert!(
+            work[..27].iter().all(|&b| b == 0),
+            "upper bytes should be zero"
+        );
         // Byte 27 should be non-zero (it's 0x01 for the leading byte of ~0x100010001)
-        assert!(work[27] > 0, "byte 27 should be nonzero, got 0x{:02x}", work[27]);
+        assert!(
+            work[27] > 0,
+            "byte 27 should be nonzero, got 0x{:02x}",
+            work[27]
+        );
     }
 }

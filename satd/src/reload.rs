@@ -28,8 +28,8 @@
 //! daemon: it is logged and the running config is kept.
 
 use crate::config::{self, Config};
-use node::events::core_zmq::CoreZmqTopic;
 use node::chain::state::ChainState;
+use node::events::core_zmq::CoreZmqTopic;
 use node::index::address::SubscriptionRegistry;
 use node::mempool::pool::{Mempool, MempoolConfig, PolicyReloadKind};
 use node::net::manager::PeerManager;
@@ -110,7 +110,8 @@ fn consumed_from_reloaded_config(_c: &Config, _h: &ReloadHandles) {}
 /// Push `-maxoutboundfullrelay` and the alt-slot settings to the peer
 /// manager.
 fn apply_outbound_slots(c: &Config, h: &ReloadHandles) {
-    h.peer_manager.set_max_outbound_full_relay(c.maxoutboundfullrelay);
+    h.peer_manager
+        .set_max_outbound_full_relay(c.maxoutboundfullrelay);
     h.peer_manager.set_alt_slots(c.alt_slot_config());
 }
 
@@ -531,7 +532,10 @@ enum AlertfilePath {
 /// success, and an operator who has just moved the file has no reason to doubt
 /// it. The `restart!` spec reports the path change; this stops the reload line
 /// contradicting it.
-fn alertfile_disposition(configured: Option<&std::path::Path>, running: &std::path::Path) -> AlertfilePath {
+fn alertfile_disposition(
+    configured: Option<&std::path::Path>,
+    running: &std::path::Path,
+) -> AlertfilePath {
     match configured {
         None => AlertfilePath::Unconfigured,
         Some(p) if p == running => AlertfilePath::InEffect,
@@ -582,7 +586,11 @@ fn field_specs() -> Vec<FieldSpec> {
                 key: $key,
                 diff: |old, new| {
                     let pick = |c: &Config| -> Vec<String> {
-                        c.zmq_pub.iter().filter(|(t, _)| *t == $topic).map(|(_, a)| a.clone()).collect()
+                        c.zmq_pub
+                            .iter()
+                            .filter(|(t, _)| *t == $topic)
+                            .map(|(_, a)| a.clone())
+                            .collect()
                     };
                     let o = format!("{:?}", pick(old));
                     let n = format!("{:?}", pick(new));
@@ -674,9 +682,15 @@ fn field_specs() -> Vec<FieldSpec> {
         restart!("logsourcelocations", log_source_locations),
         // -checkpoints is consumed once at ChainState construction.
         restart!("checkpoints", enforce_checkpoints),
-        live!("maxshutdownsecs", max_shutdown_secs, consumed_from_reloaded_config),
+        live!(
+            "maxshutdownsecs",
+            max_shutdown_secs,
+            consumed_from_reloaded_config
+        ),
         live!("debug", debug, |c, h| h.log_control.reset_to(c)),
-        live!("debugexclude", debugexclude, |c, h| h.log_control.reset_to(c)),
+        live!("debugexclude", debugexclude, |c, h| h
+            .log_control
+            .reset_to(c)),
         live!("loglevel", log_level, |c, h| h.log_control.reset_to(c)),
         // ---- RPC server ----
         restart!("rpcport", rpcport),
@@ -799,7 +813,10 @@ fn field_specs() -> Vec<FieldSpec> {
             key: "connect",
             diff: |old, new| {
                 let render = |c: &Config| {
-                    format!("{:?} (automatic outbound: {})", c.connect, c.automatic_outbound)
+                    format!(
+                        "{:?} (automatic outbound: {})",
+                        c.connect, c.automatic_outbound
+                    )
                 };
                 let (o, n) = (render(old), render(new));
                 if o != n { Some((o, n)) } else { None }
@@ -809,7 +826,8 @@ fn field_specs() -> Vec<FieldSpec> {
                 // gossiped addresses after an operator pinned the node to
                 // specific peers -- and still refusing to after they removed
                 // the pin.
-                h.peer_manager.set_automatic_outbound(new.automatic_outbound);
+                h.peer_manager
+                    .set_automatic_outbound(new.automatic_outbound);
                 register_added_connects(&old.connect, &new.connect, &h.peer_manager);
             })),
             sensitive: false,
@@ -841,7 +859,11 @@ fn field_specs() -> Vec<FieldSpec> {
             }
             apply_outbound_slots(c, h)
         }),
-        live!("enable-dangerously-large-outbound-peer-limit", dangerous_outbound_limit, consumed_from_reloaded_config),
+        live!(
+            "enable-dangerously-large-outbound-peer-limit",
+            dangerous_outbound_limit,
+            consumed_from_reloaded_config
+        ),
         live!("altslots", altslots, |c, h| {
             for w in node::net::altslots::outbound_limit_warnings(0, c.altslots) {
                 tracing::warn!("{w}");
@@ -855,7 +877,8 @@ fn field_specs() -> Vec<FieldSpec> {
             h.peer_manager.set_max_inbound_per_ip(c.maxinboundperip)
         }),
         live!("inboundrelaypercent", inboundrelaypercent, |c, h| {
-            h.peer_manager.set_inbound_relay_percent(c.inboundrelaypercent)
+            h.peer_manager
+                .set_inbound_relay_percent(c.inboundrelaypercent)
         }),
         // Sizes a ring the peer manager allocates once; a resize would have to
         // decide which of the kept transactions to drop.
@@ -975,7 +998,11 @@ fn field_specs() -> Vec<FieldSpec> {
         }),
         // `persistmempool` only governs save-on-shutdown behavior, which reads
         // the (reassigned) running config at exit — report rather than apply.
-        live!("persistmempool", persistmempool, consumed_from_reloaded_config),
+        live!(
+            "persistmempool",
+            persistmempool,
+            consumed_from_reloaded_config
+        ),
         live!("permitbaremultisig", permitbaremultisig, |c, h| {
             h.mempool.reload_policy(mempool_config_from(c))
         }),
@@ -1075,7 +1102,10 @@ fn field_specs() -> Vec<FieldSpec> {
         restart!("electrummaxsubsperconn", electrum_max_subs_per_conn),
         restart!("electrumrequesttimeout", electrum_request_timeout),
         restart!("electrummaxbatchrequests", electrum_max_batch_requests),
-        restart!("electrummaxbroadcastpackagetxs", electrum_max_broadcast_package_txs),
+        restart!(
+            "electrummaxbroadcastpackagetxs",
+            electrum_max_broadcast_package_txs
+        ),
         restart!("electrumfeehistogramttl", electrum_fee_histogram_ttl),
         restart!("electrumbanner", electrum_banner),
         restart!("electrumservername", electrum_server_name),
@@ -1091,7 +1121,10 @@ fn field_specs() -> Vec<FieldSpec> {
         restart!("stratumaddress", stratum_address),
         restart!("stratumdifficulty", stratum_difficulty),
         restart!("stratummaxconns", stratum_max_conns),
-        restart!("stratumallowplaintextremote", stratum_allow_plaintext_remote),
+        restart!(
+            "stratumallowplaintextremote",
+            stratum_allow_plaintext_remote
+        ),
         restart!("stratumv2bind", stratum_v2_bind),
         restart!("stratumv2key", stratum_v2_key),
         restart!("stratumv2maxchannels", stratum_v2_max_channels),
@@ -1104,7 +1137,11 @@ fn field_specs() -> Vec<FieldSpec> {
             key: "prune",
             diff: |old, new| {
                 let spelled = |c: &Config| {
-                    if c.prune_manual { "1".to_string() } else { c.prune.to_string() }
+                    if c.prune_manual {
+                        "1".to_string()
+                    } else {
+                        c.prune.to_string()
+                    }
                 };
                 let (o, n) = (spelled(old), spelled(new));
                 if o != n { Some((o, n)) } else { None }
@@ -1159,7 +1196,10 @@ fn field_specs() -> Vec<FieldSpec> {
         restart!("eventsgrpcmtls", events_grpc_mtls),
         restart!("eventsgrpcmtlsclientca", events_grpc_mtls_client_ca),
         restart!("eventsgrpcmtlsclientallow", events_grpc_mtls_client_allow),
-        restart!("eventsgrpctlshandshaketimeout", events_grpc_tls_handshake_timeout),
+        restart!(
+            "eventsgrpctlshandshaketimeout",
+            events_grpc_tls_handshake_timeout
+        ),
         restart!("eventszmqbind", events_zmq_bind),
         restart!("eventszmqhashtx", events_zmq_hashtx),
         restart!("eventszmqhashblock", events_zmq_hashblock),
@@ -1462,7 +1502,11 @@ mod tests {
         }
         // No stray keys: every classified key must be a real config key.
         let known: HashSet<&str> = config::KNOWN_CONFIG_KEYS.iter().copied().collect();
-        for k in spec_keys.iter().chain(load_only.iter()).chain(handler_reload.iter()) {
+        for k in spec_keys
+            .iter()
+            .chain(load_only.iter())
+            .chain(handler_reload.iter())
+        {
             assert!(
                 known.contains(k),
                 "{k:?} is classified but is not in KNOWN_CONFIG_KEYS"
@@ -1478,8 +1522,14 @@ mod tests {
         // A representative live key and a representative restart-only key.
         assert!(find("debug").apply.is_some(), "debug should be live");
         assert!(find("timeout").apply.is_some(), "timeout should be live");
-        assert!(find("dbcache").apply.is_none(), "dbcache should be restart-only");
-        assert!(find("rpcport").apply.is_none(), "rpcport should be restart-only");
+        assert!(
+            find("dbcache").apply.is_none(),
+            "dbcache should be restart-only"
+        );
+        assert!(
+            find("rpcport").apply.is_none(),
+            "rpcport should be restart-only"
+        );
     }
 
     /// An external-file key whose handler binds the path at startup must have a
@@ -1495,10 +1545,9 @@ mod tests {
     fn path_bound_file_keys_report_a_path_change_as_restart_required() {
         let specs = field_specs();
         for key in ["authfile", "alertfile"] {
-            let spec = specs
-                .iter()
-                .find(|s| s.key == key)
-                .unwrap_or_else(|| panic!("{key} must have a FieldSpec, not a handler entry alone"));
+            let spec = specs.iter().find(|s| s.key == key).unwrap_or_else(|| {
+                panic!("{key} must have a FieldSpec, not a handler entry alone")
+            });
             assert!(
                 spec.apply.is_none(),
                 "{key} binds its path at startup, so a path change is restart-required"
@@ -1606,7 +1655,10 @@ mod tests {
         assert_eq!(m.max_cluster_vsize, 10_000);
         let specs = field_specs();
         for key in ["limitclustercount", "limitclustersize"] {
-            assert!(specs.iter().find(|s| s.key == key).unwrap().apply.is_some(), "{key} is live");
+            assert!(
+                specs.iter().find(|s| s.key == key).unwrap().apply.is_some(),
+                "{key} is live"
+            );
         }
     }
 

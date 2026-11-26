@@ -228,7 +228,11 @@ fn block_summary_rows(
             .map_err(|e| EsploraError::Internal(e.to_string()))?,
         // A block of coinbases only (genesis, an empty block) spends nothing.
         None if spending == 0 => BlockFeeProfile::default(),
-        None => return Err(EsploraError::NotFoundReason(BLOCK_UNDO_UNAVAILABLE.to_string())),
+        None => {
+            return Err(EsploraError::NotFoundReason(
+                BLOCK_UNDO_UNAVAILABLE.to_string(),
+            ));
+        }
     };
     // The profile leaves out a transaction whose outputs exceed its inputs.
     // No connected block holds one, so a short profile means the undo row is
@@ -244,7 +248,11 @@ fn block_summary_rows(
         .iter()
         .zip(txids)
         .map(|(tx, txid)| {
-            let fee = if tx.is_coinbase() { 0 } else { fees.next().unwrap_or(0) };
+            let fee = if tx.is_coinbase() {
+                0
+            } else {
+                fees.next().unwrap_or(0)
+            };
             let value: u64 = tx.output.iter().map(|o| o.value.to_sat()).sum();
             BlockTxSummaryRow(txid.to_string(), fee, tx.weight().to_wu(), value)
         })
@@ -311,10 +319,7 @@ pub async fn block_txs_page(
 /// `block/:hash/txs` route). Blockstream's electrs answers 400 for both,
 /// with the same texts. The range check comes first and needs no
 /// arithmetic, so `usize::MAX` cannot overflow (review H5).
-fn block_page_bounds(
-    tx_count: usize,
-    start_index: usize,
-) -> EsploraResult<std::ops::Range<usize>> {
+fn block_page_bounds(tx_count: usize, start_index: usize) -> EsploraResult<std::ops::Range<usize>> {
     if start_index >= tx_count {
         return Err(EsploraError::NotFoundReason(
             "start index out of range".to_string(),
@@ -341,12 +346,12 @@ mod txssummary_tests;
 /// `chain::collect_blocks_descending`. Returns
 /// `(serialized_size_bytes, weight_units)`. A stripped block's filled form
 /// has the original's size and weight.
-pub fn try_compute_block_size_weight(
-    state: &EsploraState,
-    hash: &BlockHash,
-) -> Option<(u32, u32)> {
+pub fn try_compute_block_size_weight(state: &EsploraState, hash: &BlockHash) -> Option<(u32, u32)> {
     let block = state.chain.get_stored_block(hash)?.block;
-    Some((serialize(&block).len() as u32, block.weight().to_wu() as u32))
+    Some((
+        serialize(&block).len() as u32,
+        block.weight().to_wu() as u32,
+    ))
 }
 
 #[allow(dead_code)]

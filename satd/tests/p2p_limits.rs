@@ -3,13 +3,13 @@
 
 mod common;
 
+use bitcoin::BlockHash;
 use bitcoin::consensus::{deserialize, serialize};
 use bitcoin::hashes::Hash as _;
 use bitcoin::p2p::message::{CommandString, NetworkMessage, RawNetworkMessage};
 use bitcoin::p2p::message_blockdata::Inventory;
 use bitcoin::p2p::message_network::VersionMessage;
 use bitcoin::p2p::{Address, Magic, ServiceFlags};
-use bitcoin::BlockHash;
 use common::TestNode;
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpStream};
@@ -29,12 +29,16 @@ impl Peer {
         let stream = loop {
             match TcpStream::connect_timeout(&addr, Duration::from_secs(2)) {
                 Ok(s) => break s,
-                Err(_) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(100)),
+                Err(_) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(100))
+                }
                 Err(e) => panic!("connect to {addr}: {e}"),
             }
         };
         stream.set_nodelay(true).unwrap();
-        stream.set_write_timeout(Some(Duration::from_secs(30))).unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(30)))
+            .unwrap();
         let mut peer = Peer { stream };
         peer.send(NetworkMessage::Version(version()));
         let mut got_version = false;
@@ -67,16 +71,22 @@ impl Peer {
         let mut buf = header.to_vec();
         buf.resize(24 + len, 0);
         self.stream.read_exact(&mut buf[24..])?;
-        let raw: RawNetworkMessage =
-            deserialize(&buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+        let raw: RawNetworkMessage = deserialize(&buf)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
         Ok(raw.into_payload())
     }
 
     /// Answer pings until the node sends a message `pred` accepts.
-    fn recv_until(&mut self, timeout: Duration, pred: impl Fn(&NetworkMessage) -> bool) -> NetworkMessage {
+    fn recv_until(
+        &mut self,
+        timeout: Duration,
+        pred: impl Fn(&NetworkMessage) -> bool,
+    ) -> NetworkMessage {
         let deadline = Instant::now() + timeout;
         loop {
-            let left = deadline.saturating_duration_since(Instant::now()).max(Duration::from_millis(1));
+            let left = deadline
+                .saturating_duration_since(Instant::now())
+                .max(Duration::from_millis(1));
             match self.recv(left) {
                 Ok(NetworkMessage::Ping(n)) => self.send(NetworkMessage::Pong(n)),
                 Ok(m) if pred(&m) => return m,
@@ -91,7 +101,9 @@ impl Peer {
         self.send(NetworkMessage::Ping(0x1234));
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
-            let left = deadline.saturating_duration_since(Instant::now()).max(Duration::from_millis(1));
+            let left = deadline
+                .saturating_duration_since(Instant::now())
+                .max(Duration::from_millis(1));
             match self.recv(left) {
                 Ok(NetworkMessage::Pong(0x1234)) => return true,
                 Ok(NetworkMessage::Ping(n)) => self.send(NetworkMessage::Pong(n)),
@@ -111,7 +123,14 @@ impl Peer {
             }
             match self.recv(left) {
                 Ok(_) => {}
-                Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => return false,
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    return false;
+                }
                 Err(_) => return true,
             }
         }
@@ -135,11 +154,17 @@ fn version() -> VersionMessage {
 }
 
 fn rand_nonce() -> u64 {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos() as u64
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as u64
 }
 
 fn unknown(len: usize) -> NetworkMessage {
-    NetworkMessage::Unknown { command: CommandString::try_from_static("bigmsg").unwrap(), payload: vec![0x5a; len] }
+    NetworkMessage::Unknown {
+        command: CommandString::try_from_static("bigmsg").unwrap(),
+        payload: vec![0x5a; len],
+    }
 }
 
 /// Core's `MAX_PROTOCOL_MESSAGE_LENGTH`: a message of 4,000,000 bytes is
@@ -156,7 +181,10 @@ fn a_frame_over_four_million_bytes_ends_the_connection() {
 
     let mut peer = Peer::connect(port);
     peer.send(unknown(4_000_001));
-    assert!(peer.closed_within(Duration::from_secs(30)), "a 4,000,001-byte message ends the connection");
+    assert!(
+        peer.closed_within(Duration::from_secs(30)),
+        "a 4,000,001-byte message ends the connection"
+    );
     node.stop();
 }
 
@@ -166,7 +194,10 @@ fn a_frame_over_four_million_bytes_ends_the_connection() {
 fn an_inv_over_max_inv_sz_ends_the_connection() {
     let mut node = TestNode::start(&[]);
     let port = node.p2p_port.unwrap();
-    let entry = Inventory::Unknown { inv_type: 99, hash: [7u8; 32] };
+    let entry = Inventory::Unknown {
+        inv_type: 99,
+        hash: [7u8; 32],
+    };
 
     let mut peer = Peer::connect(port);
     peer.send(NetworkMessage::Inv(vec![entry; 50_000]));
@@ -174,7 +205,10 @@ fn an_inv_over_max_inv_sz_ends_the_connection() {
     // Misbehaviour ends the connection (a peer on 127.0.0.1 is disconnected,
     // not banned), so the refusal goes last.
     peer.send(NetworkMessage::Inv(vec![entry; 50_001]));
-    assert!(peer.closed_within(Duration::from_secs(30)), "50,001 entries end the connection");
+    assert!(
+        peer.closed_within(Duration::from_secs(30)),
+        "50,001 entries end the connection"
+    );
     node.stop();
 }
 
@@ -202,7 +236,9 @@ fn a_large_getdata_is_served_in_full_as_the_peer_reads() {
     let asked: Vec<BlockHash> = hashes.iter().copied().cycle().take(50_000).collect();
 
     let mut peer = Peer::connect(port);
-    peer.send(NetworkMessage::GetData(asked.iter().map(|h| Inventory::WitnessBlock(*h)).collect()));
+    peer.send(NetworkMessage::GetData(
+        asked.iter().map(|h| Inventory::WitnessBlock(*h)).collect(),
+    ));
     // Read nothing for a while: the node fills the socket and its queue, and
     // must hold the rest of the request rather than drop it.
     std::thread::sleep(Duration::from_secs(3));
@@ -244,17 +280,35 @@ fn a_repeated_tx_in_one_inv_is_processed_once() {
     ]));
     assert!(peer.alive());
     let log = std::fs::read_to_string(&node.stderr_log).unwrap();
-    assert_eq!(log.matches(&format!("got inv: tx {a} new")).count(), 1, "first sight of a, as tx");
-    assert_eq!(log.matches(&format!("got inv: witness-tx {a}")).count(), 0, "a again as witness-tx is a duplicate");
+    assert_eq!(
+        log.matches(&format!("got inv: tx {a} new")).count(),
+        1,
+        "first sight of a, as tx"
+    );
+    assert_eq!(
+        log.matches(&format!("got inv: witness-tx {a}")).count(),
+        0,
+        "a again as witness-tx is a duplicate"
+    );
     assert_eq!(log.matches(&format!("got inv: tx {b} new")).count(), 1);
     // A block inv is logged as well, as Core does.
-    let tip: BlockHash = node.rpc_call("getbestblockhash").unwrap()["result"].as_str().unwrap().parse().unwrap();
+    let tip: BlockHash = node.rpc_call("getbestblockhash").unwrap()["result"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
     peer.send(NetworkMessage::Inv(vec![Inventory::Block(tip)]));
     assert!(peer.alive());
     let log = std::fs::read_to_string(&node.stderr_log).unwrap();
-    assert_eq!(log.matches(&format!("got inv: block {tip} have")).count(), 1);
+    assert_eq!(
+        log.matches(&format!("got inv: block {tip} have")).count(),
+        1
+    );
     // The filter is per message: the next inv is processed afresh.
-    peer.send(NetworkMessage::Inv(vec![Inventory::Transaction(a), Inventory::Transaction(a)]));
+    peer.send(NetworkMessage::Inv(vec![
+        Inventory::Transaction(a),
+        Inventory::Transaction(a),
+    ]));
     assert!(peer.alive());
     let log = std::fs::read_to_string(&node.stderr_log).unwrap();
     assert_eq!(log.matches(&format!("got inv: tx {a}")).count(), 2);
@@ -272,10 +326,22 @@ fn a_filtered_block_request_disconnects_the_peer() {
     let port = node.p2p_port.unwrap();
     node.mine_blocks(1, ADDR);
     let mut peer = Peer::connect(port);
-    peer.send(NetworkMessage::GetData(vec![Inventory::Unknown { inv_type: 3, hash: [0x11; 32] }]));
-    assert!(peer.closed_within(Duration::from_secs(10)), "MSG_FILTERED_BLOCK must disconnect");
+    peer.send(NetworkMessage::GetData(vec![Inventory::Unknown {
+        inv_type: 3,
+        hash: [0x11; 32],
+    }]));
+    assert!(
+        peer.closed_within(Duration::from_secs(10)),
+        "MSG_FILTERED_BLOCK must disconnect"
+    );
     let mut peer = Peer::connect(port);
-    peer.send(NetworkMessage::GetData(vec![Inventory::Unknown { inv_type: 3 | (1 << 30), hash: [0x11; 32] }]));
-    assert!(peer.alive(), "the reserved witness form is an unknown type, not a violation");
+    peer.send(NetworkMessage::GetData(vec![Inventory::Unknown {
+        inv_type: 3 | (1 << 30),
+        hash: [0x11; 32],
+    }]));
+    assert!(
+        peer.alive(),
+        "the reserved witness form is an unknown type, not a violation"
+    );
     node.stop();
 }

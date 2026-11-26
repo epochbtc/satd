@@ -265,7 +265,10 @@ mod tests {
         // range (>= 2^31). `expand_descriptor` must return an error (handled by
         // the caller as "ignore"), never panic or overflow.
         let r = expand_descriptor(RANGED_WPKH, u32::MAX - 1, 3);
-        assert!(matches!(r, Err(DescriptorError::Derive(_, _))), "got: {r:?}");
+        assert!(
+            matches!(r, Err(DescriptorError::Derive(_, _))),
+            "got: {r:?}"
+        );
     }
 
     #[test]
@@ -304,10 +307,24 @@ mod tests {
         let ix = |v: &[(u32, u32, Scripthash)]| -> Vec<(u32, Scripthash)> {
             v.iter().map(|(_, i, s)| (*i, *s)).collect()
         };
-        assert_eq!(ix(&out[..5]), ix(&single0), "first branch == /0/* single-path");
-        assert_eq!(ix(&out[5..]), ix(&single1), "second branch == /1/* single-path");
-        assert!(out[..5].iter().all(|(b, _, _)| *b == 0), "first 5 are branch 0");
-        assert!(out[5..].iter().all(|(b, _, _)| *b == 1), "last 5 are branch 1");
+        assert_eq!(
+            ix(&out[..5]),
+            ix(&single0),
+            "first branch == /0/* single-path"
+        );
+        assert_eq!(
+            ix(&out[5..]),
+            ix(&single1),
+            "second branch == /1/* single-path"
+        );
+        assert!(
+            out[..5].iter().all(|(b, _, _)| *b == 0),
+            "first 5 are branch 0"
+        );
+        assert!(
+            out[5..].iter().all(|(b, _, _)| *b == 1),
+            "last 5 are branch 1"
+        );
         assert_ne!(
             ix(&out[..5]),
             ix(&out[5..]),
@@ -340,7 +357,10 @@ mod tests {
         let three = "wpkh(xpub6BosfCnifzxcFwrSzQiqu2DBVTshkCXacvNsWGYJVVhhawA7d4R5WSWGFNbi8Aw6ZRc1brxMyWMzG3DSSSSoekkudhUd9yLb6qx39T9nMdj/<0;1;2>/*)";
         assert!(matches!(
             expand_descriptor(three, 0, 5),
-            Err(DescriptorError::TooManyBranches { branches: 3, max: 2 })
+            Err(DescriptorError::TooManyBranches {
+                branches: 3,
+                max: 2
+            })
         ));
     }
 
@@ -354,13 +374,20 @@ mod tests {
         let big = "wpkh(xpub6BosfCnifzxcFwrSzQiqu2DBVTshkCXacvNsWGYJVVhhawA7d4R5WSWGFNbi8Aw6ZRc1brxMyWMzG3DSSSSoekkudhUd9yLb6qx39T9nMdj/<0;1;2;3;4;5;6;7>/*)";
         assert!(matches!(
             expand_descriptor(big, 0, 5),
-            Err(DescriptorError::TooManyBranches { branches: 8, max: 2 })
+            Err(DescriptorError::TooManyBranches {
+                branches: 8,
+                max: 2
+            })
         ));
         // And the cheap counter agrees with the parsed descriptor.
         let parsed = Descriptor::<DescriptorPublicKey>::from_str(big).unwrap();
         assert_eq!(multipath_branch_count(&parsed), 8);
         let single = Descriptor::<DescriptorPublicKey>::from_str(RANGED_WPKH).unwrap();
-        assert_eq!(multipath_branch_count(&single), 1, "single-path counts as 1");
+        assert_eq!(
+            multipath_branch_count(&single),
+            1,
+            "single-path counts as 1"
+        );
     }
 
     #[test]
@@ -374,7 +401,10 @@ mod tests {
         // window_offset formula (offset/gap_limit) got wrong.
         assert_eq!((out[0].0, out[0].1), (0, 0), "branch 0 at index 0");
         assert_eq!((out[1].0, out[1].1), (1, 0), "branch 1 at index 0");
-        assert_ne!(out[0].2, out[1].2, "the two branches derive distinct scripts");
+        assert_ne!(
+            out[0].2, out[1].2,
+            "the two branches derive distinct scripts"
+        );
     }
 
     #[test]
@@ -397,7 +427,10 @@ mod tests {
         // must return Err for the whole descriptor (nothing half-installed),
         // exactly like the single-path `huge_start_does_not_panic` case.
         let r = expand_descriptor(MULTIPATH_WPKH, u32::MAX - 1, 3);
-        assert!(matches!(r, Err(DescriptorError::Derive(_, _))), "got: {r:?}");
+        assert!(
+            matches!(r, Err(DescriptorError::Derive(_, _))),
+            "got: {r:?}"
+        );
     }
 
     #[test]
@@ -432,7 +465,10 @@ mod tests {
         for path in ["0/*h", "0h/*", "1h", "<0h;1>/*", "<0;1h>/*"] {
             let hardened = format!("wpkh({xpub}/{path})");
             assert!(
-                matches!(expand_descriptor(&hardened, 0, 4), Err(DescriptorError::HardenedDerivation)),
+                matches!(
+                    expand_descriptor(&hardened, 0, 4),
+                    Err(DescriptorError::HardenedDerivation)
+                ),
                 "{hardened}"
             );
         }

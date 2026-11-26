@@ -69,7 +69,9 @@ impl CoreZmqChain for ChainState {
     }
 
     fn tx_count(&self, hash: &BlockHash) -> Option<usize> {
-        self.get_block_index(hash).map(|e| e.num_tx as usize).filter(|n| *n > 0)
+        self.get_block_index(hash)
+            .map(|e| e.num_tx as usize)
+            .filter(|n| *n > 0)
     }
 
     fn chain_work(&self, hash: &BlockHash) -> Option<[u8; 32]> {
@@ -178,7 +180,11 @@ impl CoreZmqSink {
                     sockets.len() - 1
                 }
             };
-            table.push(Notifier { topic: n.topic, socket, seq: 0 });
+            table.push(Notifier {
+                topic: n.topic,
+                socket,
+                seq: 0,
+            });
         }
         let stats = sockets
             .iter()
@@ -242,12 +248,25 @@ impl CoreZmqSink {
 
     async fn on_event(&mut self, body: &NodeEventBody) {
         match body {
-            NodeEventBody::Mempool(MempoolEvent::Enter { txid, raw_tx, mempool_sequence, .. }) => {
+            NodeEventBody::Mempool(MempoolEvent::Enter {
+                txid,
+                raw_tx,
+                mempool_sequence,
+                ..
+            }) => {
                 self.tx_added(txid, raw_tx.as_deref(), *mempool_sequence);
             }
             NodeEventBody::Mempool(
-                MempoolEvent::LeaveEvicted { txid, mempool_sequence, .. }
-                | MempoolEvent::LeaveReplaced { txid, mempool_sequence, .. },
+                MempoolEvent::LeaveEvicted {
+                    txid,
+                    mempool_sequence,
+                    ..
+                }
+                | MempoolEvent::LeaveReplaced {
+                    txid,
+                    mempool_sequence,
+                    ..
+                },
             ) => {
                 if self.has(CoreZmqTopic::Sequence) {
                     let body = self.body(CoreZmqTopic::Sequence, || {
@@ -259,7 +278,12 @@ impl CoreZmqSink {
             // Core is silent on a removal by block inclusion: the block's own
             // messages carry the transaction.
             NodeEventBody::Mempool(MempoolEvent::LeaveConfirmed { .. }) => {}
-            NodeEventBody::Chain(ChainEvent::Reorg { old_tip, new_tip, to_height, .. }) => {
+            NodeEventBody::Chain(ChainEvent::Reorg {
+                old_tip,
+                new_tip,
+                to_height,
+                ..
+            }) => {
                 self.pending_reorg = Some(PendingReorg {
                     tip: *new_tip,
                     to_height: *to_height,
@@ -285,7 +309,10 @@ impl CoreZmqSink {
             let body = if self.listening(CoreZmqTopic::RawTx) {
                 let bytes = match raw_tx {
                     Some(tx) => Some(bitcoin::consensus::serialize(tx)),
-                    None => self.mempool.transaction(txid).map(|tx| bitcoin::consensus::serialize(&tx)),
+                    None => self
+                        .mempool
+                        .transaction(txid)
+                        .map(|tx| bitcoin::consensus::serialize(&tx)),
                 };
                 if bytes.is_none() {
                     // The event did not carry the transaction and it has
@@ -365,15 +392,18 @@ impl CoreZmqSink {
 
     async fn block_disconnected(&mut self, hash: BlockHash) {
         if self.has(CoreZmqTopic::HashTx) || self.has(CoreZmqTopic::RawTx) {
-            let block = if self.listening(CoreZmqTopic::HashTx) || self.listening(CoreZmqTopic::RawTx) {
-                self.read_block(hash).await
-            } else {
-                None
-            };
+            let block =
+                if self.listening(CoreZmqTopic::HashTx) || self.listening(CoreZmqTopic::RawTx) {
+                    self.read_block(hash).await
+                } else {
+                    None
+                };
             self.block_txs(hash, block.as_ref());
         }
         if self.has(CoreZmqTopic::Sequence) {
-            let body = self.body(CoreZmqTopic::Sequence, || sequence_body(hash.as_byte_array(), b'D', None));
+            let body = self.body(CoreZmqTopic::Sequence, || {
+                sequence_body(hash.as_byte_array(), b'D', None)
+            });
             self.publish(CoreZmqTopic::Sequence, body.as_ref());
         }
     }
@@ -414,12 +444,18 @@ impl CoreZmqSink {
         let tip_update = self.is_tip_update(hash, height);
         let want_txs = self.listening(CoreZmqTopic::HashTx) || self.listening(CoreZmqTopic::RawTx);
         let want_raw = tip_update && self.listening(CoreZmqTopic::RawBlock);
-        let block = if want_txs || want_raw { self.read_block(hash).await } else { None };
+        let block = if want_txs || want_raw {
+            self.read_block(hash).await
+        } else {
+            None
+        };
         if self.has(CoreZmqTopic::HashTx) || self.has(CoreZmqTopic::RawTx) {
             self.block_txs(hash, block.as_ref().filter(|_| want_txs));
         }
         if self.has(CoreZmqTopic::Sequence) {
-            let body = self.body(CoreZmqTopic::Sequence, || sequence_body(hash.as_byte_array(), b'C', None));
+            let body = self.body(CoreZmqTopic::Sequence, || {
+                sequence_body(hash.as_byte_array(), b'C', None)
+            });
             self.publish(CoreZmqTopic::Sequence, body.as_ref());
         }
         if tip_update {
@@ -528,7 +564,11 @@ mod tests {
             self.blocks.lock().unwrap().get(hash).cloned()
         }
         fn tx_count(&self, hash: &BlockHash) -> Option<usize> {
-            self.blocks.lock().unwrap().get(hash).map(|b| b.txdata.len())
+            self.blocks
+                .lock()
+                .unwrap()
+                .get(hash)
+                .map(|b| b.txdata.len())
         }
         fn in_initial_block_download(&self) -> bool {
             self.ibd.load(Ordering::Relaxed)
@@ -562,14 +602,20 @@ mod tests {
     fn block(tag: u8, n_tx: u8) -> Block {
         let mut b = bitcoin::constants::genesis_block(bitcoin::Network::Regtest);
         b.header.nonce = u32::from(tag);
-        b.txdata = (0..n_tx).map(|i| tx(tag.wrapping_mul(16).wrapping_add(i))).collect();
+        b.txdata = (0..n_tx)
+            .map(|i| tx(tag.wrapping_mul(16).wrapping_add(i)))
+            .collect();
         b
     }
 
     fn all_topics(address: &str) -> Vec<CoreZmqNotifier> {
         CoreZmqTopic::ALL
             .iter()
-            .map(|t| CoreZmqNotifier { topic: *t, address: address.into(), hwm: 1000 })
+            .map(|t| CoreZmqNotifier {
+                topic: *t,
+                address: address.into(),
+                hwm: 1000,
+            })
             .collect()
     }
 
@@ -583,8 +629,14 @@ mod tests {
         async fn new(notifiers: Vec<CoreZmqNotifier>) -> Self {
             let chain = Arc::new(FakeChain::default());
             let mempool = Arc::new(FakeMempool::default());
-            let sink = CoreZmqSink::bind(notifiers, chain.clone(), mempool.clone()).await.expect("bind");
-            Rig { sink, chain, mempool }
+            let sink = CoreZmqSink::bind(notifiers, chain.clone(), mempool.clone())
+                .await
+                .expect("bind");
+            Rig {
+                sink,
+                chain,
+                mempool,
+            }
         }
 
         fn add_block(&self, b: &Block) -> BlockHash {
@@ -605,13 +657,22 @@ mod tests {
         /// for every topic before this returns.
         async fn sub(&self, i: usize, topics: &[&str]) -> SubSocket {
             let mut s = SubSocket::new();
-            s.connect(&self.sink.sockets[i].local_endpoint()).await.expect("connect");
+            s.connect(&self.sink.sockets[i].local_endpoint())
+                .await
+                .expect("connect");
             for t in topics {
                 s.subscribe(t).await.expect("subscribe");
             }
             let deadline = Instant::now() + TIMEOUT;
-            let probe: Vec<&str> = if topics == [""] { vec!["hashblock"] } else { topics.to_vec() };
-            while !probe.iter().all(|t| self.sink.sockets[i].has_subscriber(t.as_bytes())) {
+            let probe: Vec<&str> = if topics == [""] {
+                vec!["hashblock"]
+            } else {
+                topics.to_vec()
+            };
+            while !probe
+                .iter()
+                .all(|t| self.sink.sockets[i].has_subscriber(t.as_bytes()))
+            {
                 assert!(Instant::now() < deadline, "subscription never registered");
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
@@ -629,7 +690,10 @@ mod tests {
 
     /// (topic, body, counter).
     async fn recv(s: &mut SubSocket) -> (String, Vec<u8>, u32) {
-        let m = tokio::time::timeout(TIMEOUT, s.recv()).await.expect("recv timed out").expect("recv");
+        let m = tokio::time::timeout(TIMEOUT, s.recv())
+            .await
+            .expect("recv timed out")
+            .expect("recv");
         let f = m.into_vec();
         assert_eq!(f.len(), 3);
         (
@@ -701,12 +765,21 @@ mod tests {
             mempool_sequence: 8,
         })
         .await;
-        rig.mempool(MempoolEvent::LeaveReplaced { txid, replacing_txid: txid, mempool_sequence: 9 }).await;
+        rig.mempool(MempoolEvent::LeaveReplaced {
+            txid,
+            replacing_txid: txid,
+            mempool_sequence: 9,
+        })
+        .await;
         let (topic, body, seq) = recv(&mut sub).await;
         let mut r = rev(txid.as_byte_array());
         r.push(b'R');
         r.extend_from_slice(&9u64.to_le_bytes());
-        assert_eq!((topic.as_str(), body, seq), ("sequence", r, 1), "LeaveConfirmed publishes nothing");
+        assert_eq!(
+            (topic.as_str(), body, seq),
+            ("sequence", r, 1),
+            "LeaveConfirmed publishes nothing"
+        );
         assert_quiet(&mut sub).await;
     }
 
@@ -715,19 +788,32 @@ mod tests {
     /// counter value spent, so a subscriber sees the gap.
     #[tokio::test]
     async fn rawtx_falls_back_to_the_mempool_then_leaves_a_gap() {
-        let notifiers =
-            vec![CoreZmqNotifier { topic: CoreZmqTopic::RawTx, address: "tcp://127.0.0.1:0".into(), hwm: 0 }];
+        let notifiers = vec![CoreZmqNotifier {
+            topic: CoreZmqTopic::RawTx,
+            address: "tcp://127.0.0.1:0".into(),
+            hwm: 0,
+        }];
         let mut rig = Rig::new(notifiers).await;
         let mut sub = rig.sub(0, &["rawtx"]).await;
         let (a, b, c) = (tx(1), tx(2), tx(3));
-        rig.mempool.0.lock().unwrap().insert(a.compute_txid(), a.clone());
+        rig.mempool
+            .0
+            .lock()
+            .unwrap()
+            .insert(a.compute_txid(), a.clone());
 
         rig.mempool(enter(&a, false, 1)).await;
         rig.mempool(enter(&b, false, 2)).await;
         rig.mempool(enter(&c, true, 3)).await;
         let m = recv_n(&mut sub, 2).await;
-        assert_eq!((m[0].1.clone(), m[0].2), (bitcoin::consensus::serialize(&a), 0));
-        assert_eq!((m[1].1.clone(), m[1].2), (bitcoin::consensus::serialize(&c), 2));
+        assert_eq!(
+            (m[0].1.clone(), m[0].2),
+            (bitcoin::consensus::serialize(&a), 0)
+        );
+        assert_eq!(
+            (m[1].1.clone(), m[1].2),
+            (bitcoin::consensus::serialize(&c), 2)
+        );
         assert_eq!(rig.sink.status.rawtx_unavailable_total(), 1);
     }
 
@@ -740,9 +826,21 @@ mod tests {
         let b = block(1, 2);
         let hash = rig.add_block(&b);
 
-        rig.chain(ChainEvent::BlockConnected { hash, height: 1 }).await;
+        rig.chain(ChainEvent::BlockConnected { hash, height: 1 })
+            .await;
         let m = recv_n(&mut sub, 7).await;
-        assert_eq!(topics(&m), ["hashtx", "rawtx", "hashtx", "rawtx", "sequence", "hashblock", "rawblock"]);
+        assert_eq!(
+            topics(&m),
+            [
+                "hashtx",
+                "rawtx",
+                "hashtx",
+                "rawtx",
+                "sequence",
+                "hashblock",
+                "rawblock"
+            ]
+        );
         assert_eq!(m[2].1, rev(b.txdata[1].compute_txid().as_byte_array()));
         assert_eq!(m[3].1, bitcoin::consensus::serialize(&b.txdata[1]));
         let mut c = rev(hash.as_byte_array());
@@ -751,11 +849,19 @@ mod tests {
         assert_eq!(m[5].1, rev(hash.as_byte_array()));
         assert_eq!(m[6].1, bitcoin::consensus::serialize(&b));
         let seqs: Vec<u32> = m.iter().map(|x| x.2).collect();
-        assert_eq!(seqs, [0, 0, 1, 1, 0, 0, 0], "each notifier counts its own messages");
+        assert_eq!(
+            seqs,
+            [0, 0, 1, 1, 0, 0, 0],
+            "each notifier counts its own messages"
+        );
 
-        rig.chain(ChainEvent::BlockDisconnected { hash, height: 1 }).await;
+        rig.chain(ChainEvent::BlockDisconnected { hash, height: 1 })
+            .await;
         let m = recv_n(&mut sub, 5).await;
-        assert_eq!(topics(&m), ["hashtx", "rawtx", "hashtx", "rawtx", "sequence"]);
+        assert_eq!(
+            topics(&m),
+            ["hashtx", "rawtx", "hashtx", "rawtx", "sequence"]
+        );
         let mut d = rev(hash.as_byte_array());
         d.push(b'D');
         assert_eq!(m[4].1, d);
@@ -763,13 +869,24 @@ mod tests {
     }
 
     fn hashblocks(m: &[(String, Vec<u8>, u32)]) -> Vec<Vec<u8>> {
-        m.iter().filter(|(t, _, _)| t == "hashblock").map(|(_, b, _)| b.clone()).collect()
+        m.iter()
+            .filter(|(t, _, _)| t == "hashblock")
+            .map(|(_, b, _)| b.clone())
+            .collect()
     }
 
     fn hashblock_and_sequence() -> Vec<CoreZmqNotifier> {
         vec![
-            CoreZmqNotifier { topic: CoreZmqTopic::HashBlock, address: "tcp://127.0.0.1:0".into(), hwm: 0 },
-            CoreZmqNotifier { topic: CoreZmqTopic::Sequence, address: "tcp://127.0.0.1:0".into(), hwm: 0 },
+            CoreZmqNotifier {
+                topic: CoreZmqTopic::HashBlock,
+                address: "tcp://127.0.0.1:0".into(),
+                hwm: 0,
+            },
+            CoreZmqNotifier {
+                topic: CoreZmqTopic::Sequence,
+                address: "tcp://127.0.0.1:0".into(),
+                hwm: 0,
+            },
         ]
     }
 
@@ -779,24 +896,67 @@ mod tests {
     async fn a_one_block_longer_reorg_announces_only_its_new_tip() {
         let mut rig = Rig::new(hashblock_and_sequence()).await;
         let mut sub = rig.sub(0, &[""]).await;
-        let (a1, a2) = (rig.add_block_at(&block(1, 1), 1), rig.add_block_at(&block(2, 1), 2));
+        let (a1, a2) = (
+            rig.add_block_at(&block(1, 1), 1),
+            rig.add_block_at(&block(2, 1), 2),
+        );
         let b1 = rig.add_block_at(&block(3, 1), 1);
         let b2 = rig.add_block_at(&block(4, 1), 2);
         let b3 = rig.add_block_at(&block(5, 1), 3);
 
-        rig.chain(ChainEvent::Reorg { from_height: 2, old_tip: a2, to_height: 3, new_tip: b3 }).await;
-        rig.chain(ChainEvent::BlockDisconnected { hash: a2, height: 2 }).await;
-        rig.chain(ChainEvent::BlockDisconnected { hash: a1, height: 1 }).await;
-        rig.chain(ChainEvent::BlockConnected { hash: b1, height: 1 }).await;
-        rig.chain(ChainEvent::BlockConnected { hash: b2, height: 2 }).await;
-        rig.chain(ChainEvent::BlockConnected { hash: b3, height: 3 }).await;
+        rig.chain(ChainEvent::Reorg {
+            from_height: 2,
+            old_tip: a2,
+            to_height: 3,
+            new_tip: b3,
+        })
+        .await;
+        rig.chain(ChainEvent::BlockDisconnected {
+            hash: a2,
+            height: 2,
+        })
+        .await;
+        rig.chain(ChainEvent::BlockDisconnected {
+            hash: a1,
+            height: 1,
+        })
+        .await;
+        rig.chain(ChainEvent::BlockConnected {
+            hash: b1,
+            height: 1,
+        })
+        .await;
+        rig.chain(ChainEvent::BlockConnected {
+            hash: b2,
+            height: 2,
+        })
+        .await;
+        rig.chain(ChainEvent::BlockConnected {
+            hash: b3,
+            height: 3,
+        })
+        .await;
         let m = recv_n(&mut sub, 6).await;
-        assert_eq!(topics(&m), ["sequence", "sequence", "sequence", "sequence", "sequence", "hashblock"]);
+        assert_eq!(
+            topics(&m),
+            [
+                "sequence",
+                "sequence",
+                "sequence",
+                "sequence",
+                "sequence",
+                "hashblock"
+            ]
+        );
         assert_eq!(hashblocks(&m), [rev(b3.as_byte_array())]);
 
         // The reorg is over: the next block is an ordinary tip update.
         let b4 = rig.add_block_at(&block(6, 1), 4);
-        rig.chain(ChainEvent::BlockConnected { hash: b4, height: 4 }).await;
+        rig.chain(ChainEvent::BlockConnected {
+            hash: b4,
+            height: 4,
+        })
+        .await;
         let m = recv_n(&mut sub, 2).await;
         assert_eq!(hashblocks(&m), [rev(b4.as_byte_array())]);
     }
@@ -809,26 +969,66 @@ mod tests {
     async fn a_reorg_announces_each_block_past_the_old_tips_work() {
         let mut rig = Rig::new(hashblock_and_sequence()).await;
         let mut sub = rig.sub(0, &[""]).await;
-        let (a1, a2) = (rig.add_block_at(&block(1, 1), 1), rig.add_block_at(&block(2, 1), 2));
-        let b: Vec<BlockHash> = (0..5u8).map(|i| rig.add_block_at(&block(10 + i, 1), u64::from(i) + 1)).collect();
+        let (a1, a2) = (
+            rig.add_block_at(&block(1, 1), 1),
+            rig.add_block_at(&block(2, 1), 2),
+        );
+        let b: Vec<BlockHash> = (0..5u8)
+            .map(|i| rig.add_block_at(&block(10 + i, 1), u64::from(i) + 1))
+            .collect();
 
-        rig.chain(ChainEvent::Reorg { from_height: 2, old_tip: a2, to_height: 5, new_tip: b[4] }).await;
-        rig.chain(ChainEvent::BlockDisconnected { hash: a2, height: 2 }).await;
-        rig.chain(ChainEvent::BlockDisconnected { hash: a1, height: 1 }).await;
+        rig.chain(ChainEvent::Reorg {
+            from_height: 2,
+            old_tip: a2,
+            to_height: 5,
+            new_tip: b[4],
+        })
+        .await;
+        rig.chain(ChainEvent::BlockDisconnected {
+            hash: a2,
+            height: 2,
+        })
+        .await;
+        rig.chain(ChainEvent::BlockDisconnected {
+            hash: a1,
+            height: 1,
+        })
+        .await;
         for (i, hash) in b.iter().enumerate() {
-            rig.chain(ChainEvent::BlockConnected { hash: *hash, height: i as u32 + 1 }).await;
+            rig.chain(ChainEvent::BlockConnected {
+                hash: *hash,
+                height: i as u32 + 1,
+            })
+            .await;
         }
         let m = recv_n(&mut sub, 10).await;
         let labels: Vec<String> = m
             .iter()
             .map(|(t, body, _)| match t.as_str() {
                 "sequence" => format!("{}", body[32] as char),
-                _ => format!("hashblock {}", b.iter().position(|h| rev(h.as_byte_array()) == *body).unwrap() + 1),
+                _ => format!(
+                    "hashblock {}",
+                    b.iter()
+                        .position(|h| rev(h.as_byte_array()) == *body)
+                        .unwrap()
+                        + 1
+                ),
             })
             .collect();
         assert_eq!(
             labels,
-            ["D", "D", "C", "C", "C", "hashblock 3", "C", "hashblock 4", "C", "hashblock 5"],
+            [
+                "D",
+                "D",
+                "C",
+                "C",
+                "C",
+                "hashblock 3",
+                "C",
+                "hashblock 4",
+                "C",
+                "hashblock 5"
+            ],
         );
         assert_quiet(&mut sub).await;
     }
@@ -840,12 +1040,28 @@ mod tests {
         let mut rig = Rig::new(hashblock_and_sequence()).await;
         let mut sub = rig.sub(0, &["hashblock"]).await;
         let a1 = rig.add_block(&block(1, 1));
-        let b: Vec<BlockHash> = (0..3u8).map(|i| rig.add_block_at(&block(10 + i, 1), u64::from(i) + 1)).collect();
+        let b: Vec<BlockHash> = (0..3u8)
+            .map(|i| rig.add_block_at(&block(10 + i, 1), u64::from(i) + 1))
+            .collect();
 
-        rig.chain(ChainEvent::Reorg { from_height: 1, old_tip: a1, to_height: 3, new_tip: b[2] }).await;
-        rig.chain(ChainEvent::BlockDisconnected { hash: a1, height: 1 }).await;
+        rig.chain(ChainEvent::Reorg {
+            from_height: 1,
+            old_tip: a1,
+            to_height: 3,
+            new_tip: b[2],
+        })
+        .await;
+        rig.chain(ChainEvent::BlockDisconnected {
+            hash: a1,
+            height: 1,
+        })
+        .await;
         for (i, hash) in b.iter().enumerate() {
-            rig.chain(ChainEvent::BlockConnected { hash: *hash, height: i as u32 + 1 }).await;
+            rig.chain(ChainEvent::BlockConnected {
+                hash: *hash,
+                height: i as u32 + 1,
+            })
+            .await;
         }
         let m = recv_n(&mut sub, 1).await;
         assert_eq!(hashblocks(&m), [rev(b[2].as_byte_array())]);
@@ -860,16 +1076,36 @@ mod tests {
     /// the height that ends the reorg, not the work.
     #[tokio::test]
     async fn a_disconnect_only_reorg_does_not_mute_later_blocks() {
-        let notifiers =
-            vec![CoreZmqNotifier { topic: CoreZmqTopic::HashBlock, address: "tcp://127.0.0.1:0".into(), hwm: 0 }];
+        let notifiers = vec![CoreZmqNotifier {
+            topic: CoreZmqTopic::HashBlock,
+            address: "tcp://127.0.0.1:0".into(),
+            hwm: 0,
+        }];
         let mut rig = Rig::new(notifiers).await;
         let mut sub = rig.sub(0, &["hashblock"]).await;
-        let (parent, invalid) = (rig.add_block_at(&block(1, 1), 1), rig.add_block_at(&block(2, 1), 2));
+        let (parent, invalid) = (
+            rig.add_block_at(&block(1, 1), 1),
+            rig.add_block_at(&block(2, 1), 2),
+        );
 
-        rig.chain(ChainEvent::Reorg { from_height: 2, old_tip: invalid, to_height: 1, new_tip: parent }).await;
-        rig.chain(ChainEvent::BlockDisconnected { hash: invalid, height: 2 }).await;
+        rig.chain(ChainEvent::Reorg {
+            from_height: 2,
+            old_tip: invalid,
+            to_height: 1,
+            new_tip: parent,
+        })
+        .await;
+        rig.chain(ChainEvent::BlockDisconnected {
+            hash: invalid,
+            height: 2,
+        })
+        .await;
         let next = rig.add_block_at(&block(3, 1), 2);
-        rig.chain(ChainEvent::BlockConnected { hash: next, height: 2 }).await;
+        rig.chain(ChainEvent::BlockConnected {
+            hash: next,
+            height: 2,
+        })
+        .await;
         let m = recv_n(&mut sub, 1).await;
         assert_eq!(hashblocks(&m), [rev(next.as_byte_array())]);
         assert_quiet(&mut sub).await;
@@ -882,7 +1118,8 @@ mod tests {
         let mut sub = rig.sub(0, &["hashblock", "rawblock", "sequence"]).await;
         rig.chain.ibd.store(true, Ordering::Relaxed);
         let hash = rig.add_block(&block(1, 1));
-        rig.chain(ChainEvent::BlockConnected { hash, height: 1 }).await;
+        rig.chain(ChainEvent::BlockConnected { hash, height: 1 })
+            .await;
         let m = recv_n(&mut sub, 1).await;
         assert_eq!(topics(&m), ["sequence"]);
         assert_quiet(&mut sub).await;
@@ -893,18 +1130,29 @@ mod tests {
     /// later sees the counter where Core's would be.
     #[tokio::test]
     async fn unheard_messages_still_advance_the_counter() {
-        let notifiers =
-            vec![CoreZmqNotifier { topic: CoreZmqTopic::HashTx, address: "tcp://127.0.0.1:0".into(), hwm: 0 }];
+        let notifiers = vec![CoreZmqNotifier {
+            topic: CoreZmqTopic::HashTx,
+            address: "tcp://127.0.0.1:0".into(),
+            hwm: 0,
+        }];
         let mut rig = Rig::new(notifiers).await;
         rig.mempool(enter(&tx(1), false, 1)).await;
         let hash = rig.add_block(&block(1, 3));
-        rig.chain(ChainEvent::BlockConnected { hash, height: 1 }).await;
-        assert_eq!(rig.chain.reads.load(Ordering::Relaxed), 0, "an unheard block is not read");
+        rig.chain(ChainEvent::BlockConnected { hash, height: 1 })
+            .await;
+        assert_eq!(
+            rig.chain.reads.load(Ordering::Relaxed),
+            0,
+            "an unheard block is not read"
+        );
 
         let mut sub = rig.sub(0, &["hashtx"]).await;
         rig.mempool(enter(&tx(2), false, 2)).await;
         let (_, _, seq) = recv(&mut sub).await;
-        assert_eq!(seq, 4, "one admission and three block transactions came before");
+        assert_eq!(
+            seq, 4,
+            "one admission and three block transactions came before"
+        );
         assert_eq!(rig.sink.status.messages_total(CoreZmqTopic::HashTx), 5);
     }
 
@@ -940,7 +1188,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let ipc = format!("ipc://{}", dir.path().join("z.sock").display());
         let mut notifiers = all_topics(&ipc);
-        notifiers.push(CoreZmqNotifier { topic: CoreZmqTopic::Sequence, address: "tcp://127.0.0.1:0".into(), hwm: 5 });
+        notifiers.push(CoreZmqNotifier {
+            topic: CoreZmqTopic::Sequence,
+            address: "tcp://127.0.0.1:0".into(),
+            hwm: 5,
+        });
         let rig = Rig::new(notifiers).await;
         assert_eq!(rig.sink.local_endpoints().len(), 2);
         assert_eq!(rig.sink.status.notifiers().len(), 6);
@@ -950,13 +1202,25 @@ mod tests {
     #[tokio::test]
     async fn bind_failure_names_the_option() {
         let notifiers = vec![
-            CoreZmqNotifier { topic: CoreZmqTopic::HashTx, address: "tcp://127.0.0.1:0".into(), hwm: 0 },
-            CoreZmqNotifier { topic: CoreZmqTopic::RawTx, address: "foo".into(), hwm: 0 },
+            CoreZmqNotifier {
+                topic: CoreZmqTopic::HashTx,
+                address: "tcp://127.0.0.1:0".into(),
+                hwm: 0,
+            },
+            CoreZmqNotifier {
+                topic: CoreZmqTopic::RawTx,
+                address: "foo".into(),
+                hwm: 0,
+            },
         ];
-        let err = CoreZmqSink::bind(notifiers, Arc::new(FakeChain::default()), Arc::new(FakeMempool::default()))
-            .await
-            .err()
-            .expect("an address that is not one fails");
+        let err = CoreZmqSink::bind(
+            notifiers,
+            Arc::new(FakeChain::default()),
+            Arc::new(FakeMempool::default()),
+        )
+        .await
+        .err()
+        .expect("an address that is not one fails");
         assert_eq!((err.option, err.address.as_str()), ("zmqpubrawtx", "foo"));
     }
 }

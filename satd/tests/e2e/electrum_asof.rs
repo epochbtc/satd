@@ -44,7 +44,12 @@ fn scripthash_of(script: &bitcoin::Script) -> String {
     hex::encode(h)
 }
 
-fn call(cli: &mut RawElectrum, id: u64, method: &str, params: serde_json::Value) -> serde_json::Value {
+fn call(
+    cli: &mut RawElectrum,
+    id: u64,
+    method: &str,
+    params: serde_json::Value,
+) -> serde_json::Value {
     cli.send(&json!({"id": id, "method": method, "params": params}).to_string());
     let v = cli.recv();
     assert_eq!(v["id"], id, "{v}");
@@ -64,12 +69,20 @@ fn test_e2e_electrum_answers_name_the_tip_they_were_read_at() {
     let mut plain = RawElectrum::connect(port);
     let v = call(&mut plain, 1, "server.version", json!(["test", "1.4"]));
     assert_eq!(v["result"][1], "1.4");
-    let v = call(&mut plain, 2, "blockchain.scripthash.get_history", json!([sh]));
+    let v = call(
+        &mut plain,
+        2,
+        "blockchain.scripthash.get_history",
+        json!([sh]),
+    );
     assert_eq!(v["result"].as_array().map(Vec::len), Some(3), "{v}");
     assert_eq!(v["chain_tip"], tip);
     let v = call(&mut plain, 3, "server.features", json!([]));
     assert_eq!(v["result"]["chain_tip"], true);
-    assert!(v.get("chain_tip").is_none(), "server.features is not stamped: {v}");
+    assert!(
+        v.get("chain_tip").is_none(),
+        "server.features is not stamped: {v}"
+    );
 
     // rbitcoin's dialect negotiates, and every stamped method names the tip.
     let mut cli = RawElectrum::connect(port);
@@ -85,19 +98,39 @@ fn test_e2e_electrum_answers_name_the_tip_they_were_read_at() {
         assert_eq!(v["chain_tip"], tip, "{method}");
         assert_eq!(v["chain_tip_height"], 3, "{method}");
     }
-    let coinbase = call(&mut cli, 5, "blockchain.transaction.id_from_pos", json!([3, 0]));
+    let coinbase = call(
+        &mut cli,
+        5,
+        "blockchain.transaction.id_from_pos",
+        json!([3, 0]),
+    );
     assert_eq!(coinbase["chain_tip"], tip);
     let txid = coinbase["result"].as_str().expect("txid").to_string();
-    let v = call(&mut cli, 6, "blockchain.transaction.get_merkle", json!([txid]));
+    let v = call(
+        &mut cli,
+        6,
+        "blockchain.transaction.get_merkle",
+        json!([txid]),
+    );
     assert_eq!(v["result"]["block_height"], 3);
     assert_eq!(v["chain_tip_height"], 3);
-    let v = call(&mut cli, 7, "blockchain.transaction.get", json!([txid, true]));
+    let v = call(
+        &mut cli,
+        7,
+        "blockchain.transaction.get",
+        json!([txid, true]),
+    );
     assert_eq!(v["result"]["confirmations"], 1);
     assert_eq!(v["chain_tip"], tip);
 
     // The next block moves the stamp with it.
     mine(&e2e, 1, &w);
-    let v = call(&mut cli, 8, "blockchain.scripthash.get_balance", json!([sh]));
+    let v = call(
+        &mut cli,
+        8,
+        "blockchain.scripthash.get_balance",
+        json!([sh]),
+    );
     assert_eq!(v["chain_tip"], best(&e2e));
     assert_eq!(v["chain_tip_height"], 4);
     e2e.node.stop();
@@ -123,7 +156,12 @@ fn test_e2e_electrum_trailing_asof_answers_as_of_an_ancestor() {
     let mut cli = RawElectrum::connect(e2e.electrum_port.expect("electrum port"));
     let v = call(&mut cli, 1, "server.version", json!(["test", "1.4"]));
     assert_eq!(v["result"][1], "1.4");
-    let v = call(&mut cli, 2, "blockchain.transaction.broadcast", json!([raw]));
+    let v = call(
+        &mut cli,
+        2,
+        "blockchain.transaction.broadcast",
+        json!([raw]),
+    );
     assert_eq!(v["result"], spend.as_str(), "{v}");
     mine(&e2e, 1, &w);
     let coinbase1 = common::coinbase_txid_at(&e2e.node, 1);
@@ -139,8 +177,18 @@ fn test_e2e_electrum_trailing_asof_answers_as_of_an_ancestor() {
             .map(|u| u["tx_hash"].as_str().unwrap().to_string())
             .collect()
     };
-    let live = call(&mut cli, 3, "blockchain.scripthash.listunspent", json!([sh_w]));
-    let then = call(&mut cli, 4, "blockchain.scripthash.listunspent", json!([sh_w, tag]));
+    let live = call(
+        &mut cli,
+        3,
+        "blockchain.scripthash.listunspent",
+        json!([sh_w]),
+    );
+    let then = call(
+        &mut cli,
+        4,
+        "blockchain.scripthash.listunspent",
+        json!([sh_w, tag]),
+    );
     assert!(!utxos(&live).contains(&coinbase1));
     assert!(utxos(&then).contains(&coinbase1));
     assert_eq!(utxos(&then).len(), 102, "one coinbase per block 1..=102");
@@ -148,35 +196,87 @@ fn test_e2e_electrum_trailing_asof_answers_as_of_an_ancestor() {
     assert_eq!(then["chain_tip_height"], 102);
 
     // `dest`: one transaction live, none as of 102; no balance then.
-    let v = call(&mut cli, 5, "blockchain.scripthash.get_history", json!([sh_dest]));
+    let v = call(
+        &mut cli,
+        5,
+        "blockchain.scripthash.get_history",
+        json!([sh_dest]),
+    );
     assert_eq!(v["result"].as_array().map(Vec::len), Some(1), "{v}");
-    let v = call(&mut cli, 6, "blockchain.scripthash.get_history", json!([sh_dest, tag]));
+    let v = call(
+        &mut cli,
+        6,
+        "blockchain.scripthash.get_history",
+        json!([sh_dest, tag]),
+    );
     assert_eq!(v["result"], json!([]), "{v}");
-    let v = call(&mut cli, 7, "blockchain.scripthash.get_balance", json!([sh_dest, tag]));
-    assert_eq!(v["result"], json!({"confirmed": 0, "unconfirmed": 0}), "{v}");
+    let v = call(
+        &mut cli,
+        7,
+        "blockchain.scripthash.get_balance",
+        json!([sh_dest, tag]),
+    );
+    assert_eq!(
+        v["result"],
+        json!({"confirmed": 0, "unconfirmed": 0}),
+        "{v}"
+    );
 
     // The spend: confirmed at 103, not found as of 102.
-    let v = call(&mut cli, 8, "blockchain.transaction.get", json!([spend, true]));
+    let v = call(
+        &mut cli,
+        8,
+        "blockchain.transaction.get",
+        json!([spend, true]),
+    );
     assert_eq!(v["result"]["confirmations"], 1, "{v}");
-    let v = call(&mut cli, 9, "blockchain.transaction.get", json!([spend, true, tag]));
+    let v = call(
+        &mut cli,
+        9,
+        "blockchain.transaction.get",
+        json!([spend, true, tag]),
+    );
     assert!(v.get("error").is_some(), "{v}");
 
     // Not on the best chain, or on a method that does not take it: an error.
     let unknown = format!("asof:{}", "00".repeat(32));
-    let v = call(&mut cli, 10, "blockchain.scripthash.get_balance", json!([sh_w, unknown]));
+    let v = call(
+        &mut cli,
+        10,
+        "blockchain.scripthash.get_balance",
+        json!([sh_w, unknown]),
+    );
     assert_eq!(v["error"]["message"], "asof not on chain", "{v}");
-    let v = call(&mut cli, 11, "blockchain.scripthash.get_mempool", json!([sh_w, tag]));
+    let v = call(
+        &mut cli,
+        11,
+        "blockchain.scripthash.get_mempool",
+        json!([sh_w, tag]),
+    );
     assert!(v.get("error").is_some(), "{v}");
     // A transaction only in the mempool: found live, not as of any block.
     let (raw, pending) =
         build_signed_p2wpkh_spend_of_coinbase(&e2e.node, &w, 2, dest.script_pubkey(), 1_000);
-    let v = call(&mut cli, 13, "blockchain.transaction.broadcast", json!([raw]));
+    let v = call(
+        &mut cli,
+        13,
+        "blockchain.transaction.broadcast",
+        json!([raw]),
+    );
     assert_eq!(v["result"], pending.as_str(), "{v}");
     let v = call(&mut cli, 14, "blockchain.transaction.get", json!([pending]));
     assert!(v["result"].is_string(), "{v}");
     let now = format!("asof:{}", best(&e2e));
-    let v = call(&mut cli, 15, "blockchain.transaction.get", json!([pending, now]));
-    assert!(v.get("error").is_some(), "the mempool is not part of an asof answer: {v}");
+    let v = call(
+        &mut cli,
+        15,
+        "blockchain.transaction.get",
+        json!([pending, now]),
+    );
+    assert!(
+        v.get("error").is_some(),
+        "the mempool is not part of an asof answer: {v}"
+    );
 
     let v = call(&mut cli, 12, "server.features", json!([]));
     assert_eq!(v["result"]["asof"], true);

@@ -10,15 +10,15 @@ use clap::Parser;
 use crossterm::{
     event::{self, Event, KeyCode, KeyModifiers},
     execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
-use ratatui::backend::CrosstermBackend;
-use ratatui::Terminal;
-use std::io;
 use parking_lot::Mutex;
+use ratatui::Terminal;
+use ratatui::backend::CrosstermBackend;
+use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::time::{interval, Duration};
+use tokio::time::{Duration, interval};
 
 use rpc::{RpcClient, RpcError};
 use state::{AppState, RpcFailure, ViewMode};
@@ -40,7 +40,11 @@ struct CliArgs {
 
     /// Bitcoin Core's `-signetchallenge=<hex>`: a custom signet keeps its
     /// data, and so its cookie, in `signet_<message start>`.
-    #[arg(long, value_name = "HEX", help = "Custom signet challenge (locates its cookie)")]
+    #[arg(
+        long,
+        value_name = "HEX",
+        help = "Custom signet challenge (locates its cookie)"
+    )]
     signetchallenge: Option<String>,
 
     #[arg(long, default_value = "127.0.0.1", help = "RPC host")]
@@ -66,7 +70,11 @@ struct CliArgs {
 
     /// Trust only this CA; the public roots no longer apply. A
     /// self-signed server certificate works here too, as its own anchor.
-    #[arg(long, value_name = "FILE", help = "PEM CA certificate to trust for -rpctls")]
+    #[arg(
+        long,
+        value_name = "FILE",
+        help = "PEM CA certificate to trust for -rpctls"
+    )]
     rpccacert: Option<PathBuf>,
 
     #[arg(long, value_name = "FILE", help = "PEM client certificate for mTLS")]
@@ -82,9 +90,21 @@ struct CliArgs {
 /// Convert single-dash flags to double-dash for clap compatibility.
 fn normalize_args(args: Vec<String>) -> Vec<String> {
     let known_flags = [
-        "regtest", "testnet", "testnet4", "signet", "signetchallenge", "rpcconnect", "rpcport",
-        "rpcuser", "rpcpassword", "rpccookiefile", "datadir",
-        "rpctls", "rpccacert", "rpcclientcert", "rpcclientkey",
+        "regtest",
+        "testnet",
+        "testnet4",
+        "signet",
+        "signetchallenge",
+        "rpcconnect",
+        "rpcport",
+        "rpcuser",
+        "rpcpassword",
+        "rpccookiefile",
+        "datadir",
+        "rpctls",
+        "rpccacert",
+        "rpcclientcert",
+        "rpcclientkey",
     ];
     args.into_iter()
         .map(|arg| {
@@ -129,11 +149,15 @@ const DEFAULT_SIGNET_CHALLENGE: &str = "512103ad5e0edad18cb1f0fc0d28a3d4f1f3e445
 /// `node::validation::signet::signet_data_dir`.
 fn signet_data_dir(challenge_hex: Option<&str>) -> String {
     use bitcoin::hashes::hex::FromHex;
-    use bitcoin::hashes::{sha256d, Hash};
+    use bitcoin::hashes::{Hash, sha256d};
     let Some(bytes) = challenge_hex.and_then(|h| Vec::<u8>::from_hex(h.trim()).ok()) else {
         return "signet".to_string();
     };
-    if Vec::<u8>::from_hex(DEFAULT_SIGNET_CHALLENGE).ok().as_deref() == Some(bytes.as_slice()) {
+    if Vec::<u8>::from_hex(DEFAULT_SIGNET_CHALLENGE)
+        .ok()
+        .as_deref()
+        == Some(bytes.as_slice())
+    {
         return "signet".to_string();
     }
     let digest = sha256d::Hash::hash(&bitcoin::consensus::serialize(&bytes)).to_byte_array();
@@ -265,70 +289,80 @@ fn run_app(
 
         // Handle input (50ms timeout)
         if event::poll(Duration::from_millis(50))?
-            && let Event::Key(key) = event::read()? {
-                let mut st = state.lock();
-                match key.code {
-                    KeyCode::Char('q') => {
-                        if st.show_help { st.show_help = false; }
-                        else if st.show_reorgs { st.show_reorgs = false; }
-                        else if st.shown_peer_detail().is_some() { st.peer_detail = None; }
-                        else { return Ok(()); }
-                    }
-                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            && let Event::Key(key) = event::read()?
+        {
+            let mut st = state.lock();
+            match key.code {
+                KeyCode::Char('q') => {
+                    if st.show_help {
+                        st.show_help = false;
+                    } else if st.show_reorgs {
+                        st.show_reorgs = false;
+                    } else if st.shown_peer_detail().is_some() {
+                        st.peer_detail = None;
+                    } else {
                         return Ok(());
                     }
-                    KeyCode::Char('h') | KeyCode::Char('?') => {
-                        st.show_reorgs = false;
-                        st.show_help = !st.show_help;
-                    }
-                    KeyCode::Char('r') => {
-                        st.show_help = false;
-                        st.show_reorgs = !st.show_reorgs;
-                    }
-                    KeyCode::Char('a') => {
-                        // Acknowledge & dismiss currently-visible warnings
-                        // for this session. They'll reappear if the
-                        // node clears and re-records them, or a new
-                        // id surfaces.
-                        st.dismiss_visible_warnings();
-                    }
-                    KeyCode::Char('w') => {
-                        // Re-show dismissed warnings (operator wants to
-                        // look at them again).
-                        st.dismissed_warnings.clear();
-                    }
-                    KeyCode::Esc => {
-                        if st.show_help { st.show_help = false; }
-                        else if st.show_reorgs { st.show_reorgs = false; }
-                        else { st.peer_detail = None; }
-                    }
-                    KeyCode::Enter => st.open_peer_detail(),
-                    KeyCode::Char('f') => st.toggle_flag_filter(),
-                    KeyCode::Char('1') => st.toggle_mode(ViewMode::Ibd),
-                    KeyCode::Char('2') => st.toggle_mode(ViewMode::Steady),
-                    KeyCode::Char('3') => st.toggle_mode(ViewMode::Mempool),
-                    KeyCode::Char('4') => st.toggle_mode(ViewMode::Chain),
-                    KeyCode::Char('5') => st.press_nap_key(),
-                    KeyCode::Up => match st.active_mode() {
-                        ViewMode::Mempool => {
-                            if st.selected_mempool_row > 0 {
-                                st.selected_mempool_row -= 1;
-                            }
-                        }
-                        ViewMode::Nap => st.move_nap_selection(-1),
-                        _ => st.move_peer_selection(-1),
-                    },
-                    KeyCode::Down => match st.active_mode() {
-                        ViewMode::Mempool => {
-                            if st.selected_mempool_row + 1 < st.mempool_top.len() {
-                                st.selected_mempool_row += 1;
-                            }
-                        }
-                        ViewMode::Nap => st.move_nap_selection(1),
-                        _ => st.move_peer_selection(1),
-                    },
-                    _ => {}
                 }
+                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    return Ok(());
+                }
+                KeyCode::Char('h') | KeyCode::Char('?') => {
+                    st.show_reorgs = false;
+                    st.show_help = !st.show_help;
+                }
+                KeyCode::Char('r') => {
+                    st.show_help = false;
+                    st.show_reorgs = !st.show_reorgs;
+                }
+                KeyCode::Char('a') => {
+                    // Acknowledge & dismiss currently-visible warnings
+                    // for this session. They'll reappear if the
+                    // node clears and re-records them, or a new
+                    // id surfaces.
+                    st.dismiss_visible_warnings();
+                }
+                KeyCode::Char('w') => {
+                    // Re-show dismissed warnings (operator wants to
+                    // look at them again).
+                    st.dismissed_warnings.clear();
+                }
+                KeyCode::Esc => {
+                    if st.show_help {
+                        st.show_help = false;
+                    } else if st.show_reorgs {
+                        st.show_reorgs = false;
+                    } else {
+                        st.peer_detail = None;
+                    }
+                }
+                KeyCode::Enter => st.open_peer_detail(),
+                KeyCode::Char('f') => st.toggle_flag_filter(),
+                KeyCode::Char('1') => st.toggle_mode(ViewMode::Ibd),
+                KeyCode::Char('2') => st.toggle_mode(ViewMode::Steady),
+                KeyCode::Char('3') => st.toggle_mode(ViewMode::Mempool),
+                KeyCode::Char('4') => st.toggle_mode(ViewMode::Chain),
+                KeyCode::Char('5') => st.press_nap_key(),
+                KeyCode::Up => match st.active_mode() {
+                    ViewMode::Mempool => {
+                        if st.selected_mempool_row > 0 {
+                            st.selected_mempool_row -= 1;
+                        }
+                    }
+                    ViewMode::Nap => st.move_nap_selection(-1),
+                    _ => st.move_peer_selection(-1),
+                },
+                KeyCode::Down => match st.active_mode() {
+                    ViewMode::Mempool => {
+                        if st.selected_mempool_row + 1 < st.mempool_top.len() {
+                            st.selected_mempool_row += 1;
+                        }
+                    }
+                    ViewMode::Nap => st.move_nap_selection(1),
+                    _ => st.move_peer_selection(1),
+                },
+                _ => {}
+            }
         }
 
         // Check stale
@@ -450,15 +484,14 @@ async fn poller(rpc: Arc<RpcClient>, state: Arc<Mutex<AppState>>) {
         }; // st dropped here, before any .await
 
         // Try getstartupinfo when main RPCs fail — satd may be loading
-        if need_startup_check
-            && let Ok(v) = rpc.get_startup_info().await {
-                let status = state::StartupStatus::from_json(&v);
-                let mut st = state.lock();
-                st.update_startup(status);
-                // getstartupinfo succeeding IS "an RPC succeeded": satd is
-                // reachable and starting, so dismiss any stale failure modal
-                // (e.g. a connect blip just before satd bound its RPC).
-                st.clear_failure();
+        if need_startup_check && let Ok(v) = rpc.get_startup_info().await {
+            let status = state::StartupStatus::from_json(&v);
+            let mut st = state.lock();
+            st.update_startup(status);
+            // getstartupinfo succeeding IS "an RPC succeeded": satd is
+            // reachable and starting, so dismiss any stale failure modal
+            // (e.g. a connect blip just before satd bound its RPC).
+            st.clear_failure();
         }
 
         // Slow polls (every ~5s = 3-4 fast ticks).
@@ -499,14 +532,32 @@ async fn poller(rpc: Arc<RpcClient>, state: Arc<Mutex<AppState>>) {
             // Heavy steady-state batch — only meaningful at chain tip.
             // Skipped during IBD because most fields would be nullish.
             if is_steady {
-                let (fees_res, mining_res, txstats_res, uptime_res, blockstats_res, mempool_summary_res, utxo_res, reorgs_res, mhist_res, policy_res) = tokio::join!(
+                let (
+                    fees_res,
+                    mining_res,
+                    txstats_res,
+                    uptime_res,
+                    blockstats_res,
+                    mempool_summary_res,
+                    utxo_res,
+                    reorgs_res,
+                    mhist_res,
+                    policy_res,
+                ) = tokio::join!(
                     rpc.estimate_fees(),
                     rpc.get_mining_info(),
                     rpc.get_chain_tx_stats(),
                     rpc.get_uptime(),
                     async {
                         let height = state.lock().blocks;
-                        if height > 0 { rpc.get_block_stats(height).await } else { Err(rpc::RpcError::Rpc { code: 0, message: "no blocks".into() }) }
+                        if height > 0 {
+                            rpc.get_block_stats(height).await
+                        } else {
+                            Err(rpc::RpcError::Rpc {
+                                code: 0,
+                                message: "no blocks".into(),
+                            })
+                        }
                     },
                     rpc.get_mempool_summary(),
                     rpc.get_tx_out_set_info(),
@@ -522,7 +573,12 @@ async fn poller(rpc: Arc<RpcClient>, state: Arc<Mutex<AppState>>) {
                     apply_poll!(st, "getchaintxstats", txstats_res, update_chain_tx_stats);
                     apply_poll!(st, "uptime", uptime_res, update_uptime);
                     apply_poll!(st, "getblockstats", blockstats_res, update_block_stats);
-                    apply_poll!(st, "getmempoolsummary", mempool_summary_res, update_mempool_dist);
+                    apply_poll!(
+                        st,
+                        "getmempoolsummary",
+                        mempool_summary_res,
+                        update_mempool_dist
+                    );
                     apply_poll!(st, "gettxoutsetinfo", utxo_res, update_utxo_info);
                     apply_poll!(st, "getreorghistory", reorgs_res, update_reorg_history);
                     apply_poll!(st, "getmempoolhistory", mhist_res, update_mempool_history);
@@ -554,7 +610,12 @@ async fn poller(rpc: Arc<RpcClient>, state: Arc<Mutex<AppState>>) {
                 if policy_loaded {
                     let quarantine_res = rpc.get_quarantine_info().await;
                     let mut st = state.lock();
-                    apply_poll!(st, "getquarantineinfo", quarantine_res, update_quarantine_info);
+                    apply_poll!(
+                        st,
+                        "getquarantineinfo",
+                        quarantine_res,
+                        update_quarantine_info
+                    );
                 } else {
                     // A ruleset removed while the rollup was failing must not
                     // leave that failure in the title bar for good.
@@ -603,9 +664,7 @@ fn resolve_failure(
     batch: Option<(RpcFailure, String)>,
 ) -> Option<(RpcFailure, String)> {
     match (cookie_error, &batch) {
-        (Some(msg), Some((RpcFailure::AuthFailed, _))) => {
-            Some((RpcFailure::CookieUnreadable, msg))
-        }
+        (Some(msg), Some((RpcFailure::AuthFailed, _))) => Some((RpcFailure::CookieUnreadable, msg)),
         _ => batch,
     }
 }
@@ -644,16 +703,15 @@ mod tests {
         let conn = RpcError::ConnectionFailed;
         let auth = RpcError::AuthFailed;
         let timeout = RpcError::Timeout;
-        let other = RpcError::Rpc { code: -1, message: "boom".into() };
+        let other = RpcError::Rpc {
+            code: -1,
+            message: "boom".into(),
+        };
 
         // AuthFailed always wins.
-        let (k, _) = classify_batch_error(&[
-            Some(&conn),
-            Some(&timeout),
-            Some(&auth),
-            Some(&other),
-        ])
-        .unwrap();
+        let (k, _) =
+            classify_batch_error(&[Some(&conn), Some(&timeout), Some(&auth), Some(&other)])
+                .unwrap();
         assert_eq!(k, RpcFailure::AuthFailed);
 
         // Without auth, ConnectionFailed wins over Timeout / Other.
@@ -686,7 +744,10 @@ mod tests {
         assert_eq!(k, RpcFailure::ConnectionFailed);
 
         // A non-(-32601) Rpc error is still surfaced as Other.
-        let internal = RpcError::Rpc { code: -32603, message: "internal".into() };
+        let internal = RpcError::Rpc {
+            code: -32603,
+            message: "internal".into(),
+        };
         let (k, _) = classify_batch_error(&[Some(&internal)]).unwrap();
         assert_eq!(k, RpcFailure::Other);
     }
@@ -753,12 +814,21 @@ mod cookie_dir_tests {
     fn the_cookie_directory_follows_the_chain() {
         assert_eq!(net_subdir(&args(&[])), None);
         assert_eq!(net_subdir(&args(&["-regtest"])).as_deref(), Some("regtest"));
-        assert_eq!(net_subdir(&args(&["-testnet"])).as_deref(), Some("testnet3"));
-        assert_eq!(net_subdir(&args(&["-testnet4"])).as_deref(), Some("testnet4"));
+        assert_eq!(
+            net_subdir(&args(&["-testnet"])).as_deref(),
+            Some("testnet3")
+        );
+        assert_eq!(
+            net_subdir(&args(&["-testnet4"])).as_deref(),
+            Some("testnet4")
+        );
         assert_eq!(net_subdir(&args(&["-signet"])).as_deref(), Some("signet"));
         assert_eq!(
-            net_subdir(&args(&["-signet", &format!("-signetchallenge={DEFAULT_SIGNET_CHALLENGE}")]))
-                .as_deref(),
+            net_subdir(&args(&[
+                "-signet",
+                &format!("-signetchallenge={DEFAULT_SIGNET_CHALLENGE}")
+            ]))
+            .as_deref(),
             Some("signet")
         );
         assert_eq!(

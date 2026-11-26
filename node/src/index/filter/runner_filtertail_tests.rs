@@ -146,14 +146,26 @@ fn tail_catchup_rows_survive_the_flush_of_pending_live_rows() {
     assert_eq!(cs.tip_hash(), b[2].block_hash());
 
     run_backfill(&cs, 3, a[2].block_hash());
-    assert_eq!(first_broken_link(&cs, 6), None, "chain as read before the flush");
+    assert_eq!(
+        first_broken_link(&cs, 6),
+        None,
+        "chain as read before the flush"
+    );
     cs.store_ref().flush().unwrap();
-    assert_eq!(first_broken_link(&cs, 6), None, "chain as stored after the flush");
+    assert_eq!(
+        first_broken_link(&cs, 6),
+        None,
+        "chain as stored after the flush"
+    );
 
     // The next live block chains off the corrected header.
     extend(&cs, b[2].block_hash(), 6, 1);
     cs.store_ref().flush().unwrap();
-    assert_eq!(first_broken_link(&cs, 7), None, "chain after the next live block");
+    assert_eq!(
+        first_broken_link(&cs, 7),
+        None,
+        "chain after the next live block"
+    );
 }
 
 /// The snapshot itself covers blocks whose live rows are still pending: the
@@ -171,9 +183,17 @@ fn snapshot_walk_rows_survive_the_flush_of_pending_live_rows() {
     let b = extend(&cs, a[2].block_hash(), 3, 3);
 
     run_backfill(&cs, 6, b[2].block_hash());
-    assert_eq!(first_broken_link(&cs, 6), None, "chain as read before the flush");
+    assert_eq!(
+        first_broken_link(&cs, 6),
+        None,
+        "chain as read before the flush"
+    );
     cs.store_ref().flush().unwrap();
-    assert_eq!(first_broken_link(&cs, 6), None, "chain as stored after the flush");
+    assert_eq!(
+        first_broken_link(&cs, 6),
+        None,
+        "chain as stored after the flush"
+    );
 }
 
 /// Must-succeed partner: with the index on from genesis, in-order live

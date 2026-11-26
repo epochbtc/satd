@@ -34,18 +34,32 @@ fn live_row(cache: &CoinCache) {
         txseq: 0,
     };
     let mut batch = StoreBatch::default();
-    batch.coin_puts.push((OutPoint::new(Txid::from_byte_array([1; 32]), 0), coin));
+    batch
+        .coin_puts
+        .push((OutPoint::new(Txid::from_byte_array([1; 32]), 0), coin));
     batch.tip = Some(BlockHash::from_byte_array([5; 32]));
-    batch.filter_puts.push(FilterRow { key: key(), filter: vec![1] });
-    batch.filter_header_puts.push(FilterHeaderRow { key: key(), header: LIVE });
+    batch.filter_puts.push(FilterRow {
+        key: key(),
+        filter: vec![1],
+    });
+    batch.filter_header_puts.push(FilterHeaderRow {
+        key: key(),
+        header: LIVE,
+    });
     cache.write_batch(batch).unwrap();
 }
 
 /// A backfill-shaped batch: filter rows only, so it passes through.
 fn backfill_row() -> StoreBatch {
     let mut batch = StoreBatch::default();
-    batch.filter_puts.push(FilterRow { key: key(), filter: vec![2] });
-    batch.filter_header_puts.push(FilterHeaderRow { key: key(), header: BACKFILL });
+    batch.filter_puts.push(FilterRow {
+        key: key(),
+        filter: vec![2],
+    });
+    batch.filter_header_puts.push(FilterHeaderRow {
+        key: key(),
+        header: BACKFILL,
+    });
     batch
 }
 
@@ -55,13 +69,22 @@ fn backfill_row() -> StoreBatch {
 fn a_pass_through_filter_row_survives_the_flush_of_the_pending_one() {
     let cache = CoinCache::new(Box::new(ControllableStore::new()), 10);
     live_row(&cache);
-    assert_eq!(cache.get_filter_header(FILTER_TYPE_BASIC, HEIGHT), Some(LIVE));
+    assert_eq!(
+        cache.get_filter_header(FILTER_TYPE_BASIC, HEIGHT),
+        Some(LIVE)
+    );
 
     cache.write_batch(backfill_row()).unwrap();
-    assert_eq!(cache.get_filter_header(FILTER_TYPE_BASIC, HEIGHT), Some(BACKFILL));
+    assert_eq!(
+        cache.get_filter_header(FILTER_TYPE_BASIC, HEIGHT),
+        Some(BACKFILL)
+    );
     assert_eq!(cache.get_filter(FILTER_TYPE_BASIC, HEIGHT), Some(vec![2]));
     cache.flush().unwrap();
-    assert_eq!(cache.get_filter_header(FILTER_TYPE_BASIC, HEIGHT), Some(BACKFILL));
+    assert_eq!(
+        cache.get_filter_header(FILTER_TYPE_BASIC, HEIGHT),
+        Some(BACKFILL)
+    );
     assert_eq!(cache.get_filter(FILTER_TYPE_BASIC, HEIGHT), Some(vec![2]));
 }
 
@@ -79,9 +102,15 @@ fn a_failed_pass_through_write_keeps_the_pending_filter_row() {
     cache
         .write_batch(backfill_row())
         .expect_err("the injected fault must surface");
-    assert_eq!(cache.get_filter_header(FILTER_TYPE_BASIC, HEIGHT), Some(LIVE));
+    assert_eq!(
+        cache.get_filter_header(FILTER_TYPE_BASIC, HEIGHT),
+        Some(LIVE)
+    );
     cache.flush().unwrap();
-    assert_eq!(cache.get_filter_header(FILTER_TYPE_BASIC, HEIGHT), Some(LIVE));
+    assert_eq!(
+        cache.get_filter_header(FILTER_TYPE_BASIC, HEIGHT),
+        Some(LIVE)
+    );
     assert_eq!(cache.get_filter(FILTER_TYPE_BASIC, HEIGHT), Some(vec![1]));
 }
 

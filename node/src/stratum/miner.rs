@@ -200,7 +200,8 @@ impl MinerTally {
     }
 
     pub fn last_share_secs(&self, now: Instant) -> Option<u64> {
-        self.last_share.map(|t| now.saturating_duration_since(t).as_secs())
+        self.last_share
+            .map(|t| now.saturating_duration_since(t).as_secs())
     }
 
     /// Estimated hashes per second: the work the accepted shares in the
@@ -210,7 +211,11 @@ impl MinerTally {
     /// is the window, or the time since the miner connected if that is
     /// shorter, so a new miner is not diluted by time before it existed.
     pub fn hashrate(&mut self, now: Instant) -> f64 {
-        while self.window.front().is_some_and(|(t, _)| now.saturating_duration_since(*t) > HASHRATE_WINDOW) {
+        while self
+            .window
+            .front()
+            .is_some_and(|(t, _)| now.saturating_duration_since(*t) > HASHRATE_WINDOW)
+        {
             self.window.pop_front();
         }
         let window_start = now.checked_sub(HASHRATE_WINDOW).unwrap_or(self.connected);
@@ -270,7 +275,11 @@ impl MinerTally {
         }
         self.last_status = now;
         let shares = std::mem::take(&mut self.since_status);
-        Some(StatusReport { shares, hashrate: self.hashrate(now), last_share_secs: self.last_share_secs(now) })
+        Some(StatusReport {
+            shares,
+            hashrate: self.hashrate(now),
+            last_share_secs: self.last_share_secs(now),
+        })
     }
 }
 
@@ -297,7 +306,12 @@ pub struct MinerRecord {
 }
 
 impl MinerRecord {
-    pub fn new(protocol: &'static str, peer: SocketAddr, channel_id: Option<u32>, difficulty: u64) -> Self {
+    pub fn new(
+        protocol: &'static str,
+        peer: SocketAddr,
+        channel_id: Option<u32>,
+        difficulty: u64,
+    ) -> Self {
         Self {
             protocol,
             peer,
@@ -313,7 +327,10 @@ impl MinerRecord {
 
     fn info(&mut self, now: Instant, now_secs: u64) -> serde_json::Value {
         let total = self.tally.total();
-        let last_share_time = self.tally.last_share_secs(now).map(|ago| now_secs.saturating_sub(ago));
+        let last_share_time = self
+            .tally
+            .last_share_secs(now)
+            .map(|ago| now_secs.saturating_sub(ago));
         let best = self.tally.best_share();
         serde_json::json!({
             "protocol": self.protocol,
@@ -346,7 +363,11 @@ impl MinerRegistry {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let record = Arc::new(Mutex::new(record));
         self.miners.lock().insert(id, record.clone());
-        MinerSlot { registry: self.clone(), id, record }
+        MinerSlot {
+            registry: self.clone(),
+            id,
+            record,
+        }
     }
 
     pub(crate) fn records(&self) -> Vec<Arc<Mutex<MinerRecord>>> {
@@ -357,7 +378,10 @@ impl MinerRegistry {
     /// Every connected miner, oldest first.
     pub fn info(&self) -> Vec<serde_json::Value> {
         let (now, now_secs) = (Instant::now(), crate::time::now_secs());
-        self.records().iter().map(|r| r.lock().info(now, now_secs)).collect()
+        self.records()
+            .iter()
+            .map(|r| r.lock().info(now, now_secs))
+            .collect()
     }
 
     /// How many miners are connected.
@@ -372,7 +396,10 @@ impl MinerRegistry {
     /// The estimated hashrate of every connected miner, summed.
     pub fn hashrate(&self) -> f64 {
         let now = Instant::now();
-        self.records().iter().map(|r| r.lock().tally.hashrate(now)).sum()
+        self.records()
+            .iter()
+            .map(|r| r.lock().tally.hashrate(now))
+            .sum()
     }
 }
 
@@ -452,7 +479,10 @@ mod tests {
         }
         let expected = 10.0 * 10_000.0 * 4_294_967_296.0 / 300.0;
         let got = tally.hashrate(t0 + Duration::from_secs(300));
-        assert!((got - expected).abs() / expected < 1e-9, "{got} vs {expected}");
+        assert!(
+            (got - expected).abs() / expected < 1e-9,
+            "{got} vs {expected}"
+        );
         assert_eq!(format_hashrate(got), "1.43 TH/s");
 
         // Past the window, early shares stop counting and the span stops growing.
@@ -460,7 +490,10 @@ mod tests {
         let got = tally.hashrate(later);
         let kept = 6.0; // the shares at 150..=300 s are within 600 s of 750 s
         let expected = kept * 10_000.0 * 4_294_967_296.0 / HASHRATE_WINDOW.as_secs_f64();
-        assert!((got - expected).abs() / expected < 1e-9, "{got} vs {expected}");
+        assert!(
+            (got - expected).abs() / expected < 1e-9,
+            "{got} vs {expected}"
+        );
     }
 
     /// The idle limit is twenty expected share intervals, within bounds.
@@ -473,15 +506,28 @@ mod tests {
 
         let observed = miner_idle_timeout(Some(rate(1.2e12, 20_160.0)));
         let interval = 20_160.0 * 4_294_967_296.0 / 1.2e12;
-        assert!((observed.as_secs_f64() - IDLE_SHARE_INTERVALS * interval).abs() < 1.0, "{observed:?}");
+        assert!(
+            (observed.as_secs_f64() - IDLE_SHARE_INTERVALS * interval).abs() < 1.0,
+            "{observed:?}"
+        );
         assert!(observed > Duration::from_secs(1_400), "{observed:?}");
 
         // A fast miner still gets the floor; a very slow one the ceiling.
-        assert_eq!(miner_idle_timeout(Some(rate(1.2e12, 10.0))), MIN_MINER_IDLE_TIMEOUT);
-        assert_eq!(miner_idle_timeout(Some(rate(1.0e9, 1.0e6))), MAX_MINER_IDLE_TIMEOUT);
+        assert_eq!(
+            miner_idle_timeout(Some(rate(1.2e12, 10.0))),
+            MIN_MINER_IDLE_TIMEOUT
+        );
+        assert_eq!(
+            miner_idle_timeout(Some(rate(1.0e9, 1.0e6))),
+            MAX_MINER_IDLE_TIMEOUT
+        );
         // No estimate, or a useless one: the fixed allowance.
         for unknown in [None, Some(0.0), Some(f64::NAN), Some(f64::INFINITY)] {
-            assert_eq!(miner_idle_timeout(unknown), UNESTIMATED_MINER_IDLE_TIMEOUT, "{unknown:?}");
+            assert_eq!(
+                miner_idle_timeout(unknown),
+                UNESTIMATED_MINER_IDLE_TIMEOUT,
+                "{unknown:?}"
+            );
         }
     }
 
@@ -582,7 +628,10 @@ mod tests {
         // Vardiff divides the difficulty by eight after a long silence.
         assert_eq!(miner_idle_timeout(tally.share_rate(1_000)), before);
         // Raised, the limit grows: shares at the new difficulty are rarer.
-        assert_eq!(miner_idle_timeout(tally.share_rate(16_000)), Duration::from_secs(1_200));
+        assert_eq!(
+            miner_idle_timeout(tally.share_rate(16_000)),
+            Duration::from_secs(1_200)
+        );
     }
 
     #[test]
@@ -593,17 +642,42 @@ mod tests {
         tally.accept(t0, 1_000, 90_000.0);
         tally.refuse(ShareOutcome::Rejected);
         tally.refuse(ShareOutcome::Stale);
-        assert_eq!(tally.total(), ShareCounts { accepted: 2, rejected: 1, stale: 1 });
+        assert_eq!(
+            tally.total(),
+            ShareCounts {
+                accepted: 2,
+                rejected: 1,
+                stale: 1
+            }
+        );
         assert_eq!(tally.best_share(), 90_000.0);
 
-        assert!(tally.status_due(t0 + STATUS_INTERVAL - Duration::from_secs(1)).is_none());
+        assert!(
+            tally
+                .status_due(t0 + STATUS_INTERVAL - Duration::from_secs(1))
+                .is_none()
+        );
         let report = tally.status_due(t0 + STATUS_INTERVAL).expect("due");
-        assert_eq!(report.shares, ShareCounts { accepted: 2, rejected: 1, stale: 1 });
+        assert_eq!(
+            report.shares,
+            ShareCounts {
+                accepted: 2,
+                rejected: 1,
+                stale: 1
+            }
+        );
         assert_eq!(report.last_share_secs, Some(STATUS_INTERVAL.as_secs()));
         // The interval restarts; the totals do not.
         tally.refuse(ShareOutcome::Rejected);
         let report = tally.status_due(t0 + STATUS_INTERVAL * 2).expect("due");
-        assert_eq!(report.shares, ShareCounts { accepted: 0, rejected: 1, stale: 0 });
+        assert_eq!(
+            report.shares,
+            ShareCounts {
+                accepted: 0,
+                rejected: 1,
+                stale: 0
+            }
+        );
         assert_eq!(tally.total().rejected, 2);
     }
 
@@ -639,7 +713,10 @@ mod tests {
     #[test]
     fn labels_cannot_break_a_log_line() {
         assert_eq!(label("bitaxe/BM1370/v2.9.0"), "bitaxe/BM1370/v2.9.0");
-        assert_eq!(label("evil\n2026-01-01 ERROR forged\r"), "evil2026-01-01 ERROR forged");
+        assert_eq!(
+            label("evil\n2026-01-01 ERROR forged\r"),
+            "evil2026-01-01 ERROR forged"
+        );
         assert_eq!(label(&"x".repeat(500)).len(), MAX_LABEL_CHARS);
         assert_eq!(label("  \u{1b}[31m  "), "[31m");
         assert_eq!(format_hashrate(0.0), "0.00 H/s");

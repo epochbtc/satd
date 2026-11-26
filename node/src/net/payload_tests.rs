@@ -67,7 +67,10 @@ fn version(payload: &[u8]) -> Result<VersionMessage, encode::Error> {
 #[test]
 fn a_version_without_a_relay_byte_reads_with_relay_true() {
     let payload = version_without_relay();
-    assert!(deserialize::<RawNetworkMessage>(&frame(b"version", &payload)).is_err(), "rust-bitcoin refuses it");
+    assert!(
+        deserialize::<RawNetworkMessage>(&frame(b"version", &payload)).is_err(),
+        "rust-bitcoin refuses it"
+    );
     let v = version(&payload).unwrap();
     assert_eq!(v.version, 70016);
     assert_eq!(v.services.to_u64(), 0x409);
@@ -83,7 +86,10 @@ fn a_version_without_a_relay_byte_reads_with_relay_true() {
     with_relay.push(0);
     assert!(!version(&with_relay).unwrap().relay);
     *with_relay.last_mut().unwrap() = 2;
-    assert!(version(&with_relay).unwrap().relay, "any non-zero byte is true");
+    assert!(
+        version(&with_relay).unwrap().relay,
+        "any non-zero byte is true"
+    );
 }
 
 /// Only the first four fields are required; each later one missing takes
@@ -91,7 +97,10 @@ fn a_version_without_a_relay_byte_reads_with_relay_true() {
 #[test]
 fn a_version_with_only_its_required_fields_takes_cores_defaults() {
     let v = version(&version_required()).unwrap();
-    assert_eq!((v.nonce, v.user_agent.as_str(), v.start_height, v.relay), (1, "", -1, true));
+    assert_eq!(
+        (v.nonce, v.user_agent.as_str(), v.start_height, v.relay),
+        (1, "", -1, true)
+    );
     assert_eq!(v.sender.port, 0);
 
     // A field cut short is refused, as Core's read throws.
@@ -120,11 +129,17 @@ fn a_version_user_agent_is_read_as_core_reads_it() {
         v.push(1);
         v
     };
-    assert_eq!(version(&with_agent(&[b'a'; 256])).unwrap().user_agent.len(), 256);
+    assert_eq!(
+        version(&with_agent(&[b'a'; 256])).unwrap().user_agent.len(),
+        256
+    );
     assert!(version(&with_agent(&[b'a'; 257])).is_err());
 
     let latin1 = with_agent(b"/caf\xe9/");
-    assert!(deserialize::<RawNetworkMessage>(&frame(b"version", &latin1)).is_err(), "rust-bitcoin refuses it");
+    assert!(
+        deserialize::<RawNetworkMessage>(&frame(b"version", &latin1)).is_err(),
+        "rust-bitcoin refuses it"
+    );
     let v = version(&latin1).unwrap();
     assert_eq!(v.user_agent, "/caf\u{fffd}/");
     assert_eq!(v.start_height, 5);
@@ -174,9 +189,13 @@ fn bytes_after_the_last_field_are_ignored() {
     ];
     for (command, payload) in cases {
         let name = String::from_utf8_lossy(command).into_owned();
-        let exact = decode_v1_frame(&frame(command, &payload)).unwrap_or_else(|e| panic!("{name}: {e}"));
+        let exact =
+            decode_v1_frame(&frame(command, &payload)).unwrap_or_else(|e| panic!("{name}: {e}"));
         let tailed = frame(command, &with_tail(&payload));
-        assert!(deserialize::<RawNetworkMessage>(&tailed).is_err(), "{name}: rust-bitcoin refuses it");
+        assert!(
+            deserialize::<RawNetworkMessage>(&tailed).is_err(),
+            "{name}: rust-bitcoin refuses it"
+        );
         assert_eq!(decode_v1_frame(&tailed).unwrap(), exact, "{name}");
         assert_eq!(exact.cmd(), name);
     }
@@ -189,10 +208,17 @@ fn a_sendcmpct_flag_is_any_non_zero_byte() {
     for (flag, expected) in [(0u8, false), (1, true), (2, true), (0xff, true)] {
         let payload = [&[flag][..], &2u64.to_le_bytes()].concat();
         let f = frame(b"sendcmpct", &payload);
-        assert_eq!(deserialize::<RawNetworkMessage>(&f).is_ok(), flag <= 1, "rust-bitcoin, flag {flag}");
+        assert_eq!(
+            deserialize::<RawNetworkMessage>(&f).is_ok(),
+            flag <= 1,
+            "rust-bitcoin, flag {flag}"
+        );
         assert_eq!(
             decode_v1_frame(&f).unwrap(),
-            NetworkMessage::SendCmpct(SendCmpct { send_compact: expected, version: 2 }),
+            NetworkMessage::SendCmpct(SendCmpct {
+                send_compact: expected,
+                version: 2
+            }),
             "flag {flag}"
         );
     }
@@ -204,9 +230,15 @@ fn a_sendcmpct_flag_is_any_non_zero_byte() {
 fn a_feefilter_is_read_whatever_its_value() {
     for rate in [-1i64, i64::MIN, 2_100_000_000_000_001, i64::MAX, 0, 1000] {
         let f = frame(b"feefilter", &rate.to_le_bytes());
-        assert_eq!(decode_v1_frame(&f).unwrap(), NetworkMessage::FeeFilter(rate));
+        assert_eq!(
+            decode_v1_frame(&f).unwrap(),
+            NetworkMessage::FeeFilter(rate)
+        );
     }
-    assert!(decode_v1_frame(&frame(b"feefilter", &[0; 7])).is_err(), "too short for an i64");
+    assert!(
+        decode_v1_frame(&frame(b"feefilter", &[0; 7])).is_err(),
+        "too short for an i64"
+    );
 }
 
 /// An inventory entry of type 0 (`MSG_ERROR`) carries a hash like any
@@ -220,9 +252,17 @@ fn an_inventory_entry_of_type_zero_keeps_the_list_in_step() {
     inv.extend_from_slice(&[0x33; 32]);
     inv.extend_from_slice(&1u32.to_le_bytes());
     inv.extend_from_slice(&[0x44; 32]);
-    let NetworkMessage::Inv(entries) = decode_v1_frame(&frame(b"inv", &inv)).unwrap() else { panic!("not inv") };
+    let NetworkMessage::Inv(entries) = decode_v1_frame(&frame(b"inv", &inv)).unwrap() else {
+        panic!("not inv")
+    };
     assert_eq!(entries.len(), 2);
-    assert_eq!(entries[0], Inventory::Unknown { inv_type: 0, hash: [0x33; 32] });
+    assert_eq!(
+        entries[0],
+        Inventory::Unknown {
+            inv_type: 0,
+            hash: [0x33; 32]
+        }
+    );
     assert!(entries[0].is_error());
     assert!(matches!(entries[1], Inventory::Transaction(t) if t.to_byte_array() == [0x44; 32]));
 }
@@ -235,12 +275,18 @@ fn an_inventory_entry_of_type_zero_keeps_the_list_in_step() {
 fn message_types_core_drops_are_not_acted_on() {
     let nonce = 9u64.to_le_bytes();
     let got = decode_v1_frame(&frame(b"pi\0ng", &nonce)).unwrap();
-    assert!(matches!(got, NetworkMessage::Unknown { ref command, .. } if command.as_ref() == "pi\0ng"), "{got:?}");
+    assert!(
+        matches!(got, NetworkMessage::Unknown { ref command, .. } if command.as_ref() == "pi\0ng"),
+        "{got:?}"
+    );
     let got = decode_v1_frame(&frame(b"ping\0\0\0\0\0\0\0x", &nonce)).unwrap();
     assert!(matches!(got, NetworkMessage::Unknown { .. }), "{got:?}");
     assert!(decode_v1_frame(&frame(b"p\xe9ng", &nonce)).is_err());
     // Trailing NULs are padding.
-    assert_eq!(decode_v1_frame(&frame(b"ping", &nonce)).unwrap(), NetworkMessage::Ping(9));
+    assert_eq!(
+        decode_v1_frame(&frame(b"ping", &nonce)).unwrap(),
+        NetworkMessage::Ping(9)
+    );
 }
 
 /// An unknown type is passed on whole; a bad checksum or a short frame is
@@ -248,11 +294,20 @@ fn message_types_core_drops_are_not_acted_on() {
 #[test]
 fn unknown_types_pass_and_corrupt_frames_are_refused() {
     let got = decode_v1_frame(&frame(b"napatt", &[1, 2, 3])).unwrap();
-    assert_eq!(got, NetworkMessage::Unknown { command: cmd("napatt"), payload: vec![1, 2, 3] });
+    assert_eq!(
+        got,
+        NetworkMessage::Unknown {
+            command: cmd("napatt"),
+            payload: vec![1, 2, 3]
+        }
+    );
 
     let mut bad = frame(b"ping", &9u64.to_le_bytes());
     bad[20] ^= 1;
-    assert!(matches!(decode_v1_frame(&bad), Err(encode::Error::InvalidChecksum { .. })));
+    assert!(matches!(
+        decode_v1_frame(&bad),
+        Err(encode::Error::InvalidChecksum { .. })
+    ));
     let good = frame(b"ping", &9u64.to_le_bytes());
     assert!(decode_v1_frame(&good[..good.len() - 1]).is_err());
     assert!(decode_v1_frame(&good[..20]).is_err());
@@ -273,12 +328,24 @@ fn what_rust_bitcoin_writes_reads_back() {
         NetworkMessage::Verack,
         NetworkMessage::Ping(3),
         NetworkMessage::FeeFilter(1000),
-        NetworkMessage::SendCmpct(SendCmpct { send_compact: true, version: 2 }),
-        NetworkMessage::Headers(vec![bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest).header]),
-        NetworkMessage::Block(bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest)),
-        NetworkMessage::GetData(vec![Inventory::WitnessBlock(bitcoin::BlockHash::all_zeros())]),
+        NetworkMessage::SendCmpct(SendCmpct {
+            send_compact: true,
+            version: 2,
+        }),
+        NetworkMessage::Headers(vec![
+            bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest).header,
+        ]),
+        NetworkMessage::Block(bitcoin::blockdata::constants::genesis_block(
+            bitcoin::Network::Regtest,
+        )),
+        NetworkMessage::GetData(vec![Inventory::WitnessBlock(
+            bitcoin::BlockHash::all_zeros(),
+        )]),
     ] {
-        let wire = encode::serialize(&RawNetworkMessage::new(bitcoin::p2p::Magic::REGTEST, msg.clone()));
+        let wire = encode::serialize(&RawNetworkMessage::new(
+            bitcoin::p2p::Magic::REGTEST,
+            msg.clone(),
+        ));
         assert_eq!(decode_v1_frame(&wire).unwrap(), msg);
     }
 }
@@ -291,7 +358,10 @@ fn what_rust_bitcoin_writes_reads_back() {
 fn a_transaction_with_no_inputs_reads_as_core_reads_it() {
     const EMPTY: [u8; 10] = [2, 0, 0, 0, 0, 0, 0, 0, 0, 0];
     let wire = frame(b"tx", &EMPTY);
-    assert!(deserialize::<RawNetworkMessage>(&wire).is_err(), "rust-bitcoin refuses it");
+    assert!(
+        deserialize::<RawNetworkMessage>(&wire).is_err(),
+        "rust-bitcoin refuses it"
+    );
     match decode_v1_frame(&wire).unwrap() {
         NetworkMessage::Tx(tx) => assert!(tx.input.is_empty() && tx.output.is_empty()),
         other => panic!("not a tx: {other:?}"),
@@ -311,7 +381,9 @@ fn a_transaction_with_no_inputs_reads_as_core_reads_it() {
 /// `headers`: one genesis header followed by `tx_count` as given.
 fn headers_with_tx_count(tx_count: &[u8]) -> Vec<u8> {
     let mut p = vec![1u8];
-    p.extend(encode::serialize(&bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest).header));
+    p.extend(encode::serialize(
+        &bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest).header,
+    ));
     p.extend_from_slice(tx_count);
     p
 }
@@ -322,7 +394,13 @@ fn headers_with_tx_count(tx_count: &[u8]) -> Vec<u8> {
 #[test]
 fn a_headers_tx_count_is_read_as_a_compact_size_and_ignored() {
     let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest).header;
-    for count in [&[0u8][..], &[1], &[0xfc], &[0xfd, 0x00, 0x01], &[0xfe, 0x00, 0x00, 0x00, 0x02]] {
+    for count in [
+        &[0u8][..],
+        &[1],
+        &[0xfc],
+        &[0xfd, 0x00, 0x01],
+        &[0xfe, 0x00, 0x00, 0x00, 0x02],
+    ] {
         match decode_payload(cmd("headers"), &headers_with_tx_count(count)) {
             Ok(NetworkMessage::Headers(h)) => assert_eq!(h, vec![genesis], "tx count {count:02x?}"),
             other => panic!("tx count {count:02x?}: {other:?}"),
@@ -340,8 +418,15 @@ fn a_headers_tx_count_is_read_as_a_compact_size_and_ignored() {
     }
     // Refused, as Core's `ReadCompactSize` refuses them: non-canonical,
     // above MAX_SIZE, truncated.
-    for count in [&[0xfd, 0x01, 0x00][..], &[0xfe, 0x01, 0x00, 0x00, 0x02], &[0xfd, 0x01]] {
-        assert!(decode_payload(cmd("headers"), &headers_with_tx_count(count)).is_err(), "tx count {count:02x?}");
+    for count in [
+        &[0xfd, 0x01, 0x00][..],
+        &[0xfe, 0x01, 0x00, 0x00, 0x02],
+        &[0xfd, 0x01],
+    ] {
+        assert!(
+            decode_payload(cmd("headers"), &headers_with_tx_count(count)).is_err(),
+            "tx count {count:02x?}"
+        );
     }
 }
 
@@ -368,12 +453,27 @@ fn read_indexes(payload: &[u8]) -> Result<Vec<u64>, encode::Error> {
 fn getblocktxn_indexes_are_bounded_to_16_bits() {
     assert_eq!(read_indexes(&getblocktxn(&[0, 1])).unwrap(), vec![0, 2]);
     assert_eq!(read_indexes(&getblocktxn(&[65535])).unwrap(), vec![65535]);
-    assert_eq!(read_indexes(&getblocktxn(&[65534, 0])).unwrap(), vec![65534, 65535]);
-    for refused in [&[65536][..], &[65535, 0], &[65534, 1], &[0, 65535], &[u64::MAX]] {
-        assert!(read_indexes(&getblocktxn(refused)).is_err(), "diffs {refused:?}");
+    assert_eq!(
+        read_indexes(&getblocktxn(&[65534, 0])).unwrap(),
+        vec![65534, 65535]
+    );
+    for refused in [
+        &[65536][..],
+        &[65535, 0],
+        &[65534, 1],
+        &[0, 65535],
+        &[u64::MAX],
+    ] {
+        assert!(
+            read_indexes(&getblocktxn(refused)).is_err(),
+            "diffs {refused:?}"
+        );
         // What rust-bitcoin's decoder made of it (it overflows only past u64).
         if refused != [u64::MAX] {
-            assert!(deserialize::<GetBlockTxn>(&getblocktxn(refused)).is_ok(), "premise: {refused:?}");
+            assert!(
+                deserialize::<GetBlockTxn>(&getblocktxn(refused)).is_ok(),
+                "premise: {refused:?}"
+            );
         }
     }
     // A step above MAX_SIZE is refused by `ReadCompactSize` itself.

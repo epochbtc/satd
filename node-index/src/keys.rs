@@ -53,7 +53,9 @@
 use bitcoin::hashes::{Hash, sha256};
 use bitcoin::{OutPoint, Script, Txid};
 
-use crate::txseq::{TXSEQ_LEN, TxSeq, VOUT_LEN, decode_txseq, decode_u24, encode_txseq, encode_u24};
+use crate::txseq::{
+    TXSEQ_LEN, TxSeq, VOUT_LEN, decode_txseq, decode_u24, encode_txseq, encode_u24,
+};
 
 /// `sha256(scriptPubKey)`. Modern Electrum convention; we do not
 /// implement the legacy `hash160` variant.
@@ -78,7 +80,6 @@ pub const FUNDING_VALUE_LEN: usize = 8;
 /// ordinal and the output index it created. The `prev_outpoint` the
 /// previous layout carried is this, resolved.
 pub const SPENDING_VALUE_LEN: usize = TXSEQ_LEN + VOUT_LEN;
-
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct AddrFundingKey {
@@ -352,7 +353,10 @@ mod tests {
         assert_eq!(encoded.len(), KEY_LEN_V3);
         // The prefix in the key must match the first 16 bytes of the
         // source scripthash.
-        assert_eq!(&encoded[..SCRIPTHASH_PREFIX_LEN], &sh[..SCRIPTHASH_PREFIX_LEN]);
+        assert_eq!(
+            &encoded[..SCRIPTHASH_PREFIX_LEN],
+            &sh[..SCRIPTHASH_PREFIX_LEN]
+        );
         let payload = decode_funding_key_v3(&encoded).expect("decode");
         let recovered = reconstruct_funding_key_v3(&sh, payload);
         assert_eq!(recovered, key);
@@ -392,7 +396,10 @@ mod tests {
         };
         let encoded = encode_spending_key_v3(&key);
         assert_eq!(encoded.len(), KEY_LEN_V3);
-        assert_eq!(&encoded[..SCRIPTHASH_PREFIX_LEN], &sh[..SCRIPTHASH_PREFIX_LEN]);
+        assert_eq!(
+            &encoded[..SCRIPTHASH_PREFIX_LEN],
+            &sh[..SCRIPTHASH_PREFIX_LEN]
+        );
         let payload = decode_spending_key_v3(&encoded).expect("decode");
         let recovered = reconstruct_spending_key_v3(&sh, payload);
         assert_eq!(recovered, key);

@@ -2,7 +2,7 @@
 //!
 //! Chains scriptSig → scriptPubKey → P2SH → witness evaluation.
 
-use crate::checker::{ExecData, SignatureChecker, SigVersion};
+use crate::checker::{ExecData, SigVersion, SignatureChecker};
 use crate::error::ScriptError;
 use crate::eval::eval_script;
 use crate::flags;

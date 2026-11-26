@@ -97,7 +97,9 @@ impl FlagPolicy {
         match s.trim().to_ascii_lowercase().as_str() {
             "observe" => Ok(FlagPolicy::Observe),
             "evict" => Ok(FlagPolicy::Evict),
-            other => Err(format!("-peerflagpolicy must be observe or evict, not \"{other}\"")),
+            other => Err(format!(
+                "-peerflagpolicy must be observe or evict, not \"{other}\""
+            )),
         }
     }
 
@@ -145,7 +147,8 @@ impl FlagSet {
 impl fmt::Display for FlagSet {
     /// The codes, in order: `CS`, or empty.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.iter().try_for_each(|flag| write!(f, "{}", flag.code()))
+        self.iter()
+            .try_for_each(|flag| write!(f, "{}", flag.code()))
     }
 }
 
@@ -273,7 +276,10 @@ pub fn evaluate(i: &Inputs, t: &Thresholds) -> Vec<(Flag, Evidence)> {
 
     // A peer whose handshake is a known crawler's needs no busy network
     // group: crawlers that return only every hour or two never make one.
-    let crawler_family = i.fingerprint.observed().filter(|f| matches!(f, Family::Bitnodes | Family::BitcoinSeeder));
+    let crawler_family = i
+        .fingerprint
+        .observed()
+        .filter(|f| matches!(f, Family::Bitnodes | Family::BitcoinSeeder));
     let busy_netgroup = i.netgroup_seen >= t.crawler_netgroup_min;
     if i.inbound
         && i.session_secs < t.crawler_session_max_secs
@@ -323,7 +329,10 @@ pub fn evaluate(i: &Inputs, t: &Thresholds) -> Vec<(Flag, Evidence)> {
     if let Fingerprint::Mismatch { claimed, observed } = i.fingerprint {
         out.push((
             Flag::FingerprintMismatch,
-            vec![("claimed", Value::Name(claimed.name())), ("observed", Value::Name(observed.name()))],
+            vec![
+                ("claimed", Value::Name(claimed.name())),
+                ("observed", Value::Name(observed.name())),
+            ],
         ));
     }
 
@@ -339,10 +348,16 @@ pub fn evaluate(i: &Inputs, t: &Thresholds) -> Vec<(Flag, Evidence)> {
     }
 
     if b.height_claim_gap >= t.height_gap_min {
-        let start_height = b.version.as_ref().map_or(0, |v| u64::try_from(v.start_height).unwrap_or(0));
+        let start_height = b
+            .version
+            .as_ref()
+            .map_or(0, |v| u64::try_from(v.start_height).unwrap_or(0));
         out.push((
             Flag::HeightLie,
-            vec![("height_claim_gap", num(u64::from(b.height_claim_gap))), ("start_height", num(start_height))],
+            vec![
+                ("height_claim_gap", num(u64::from(b.height_claim_gap))),
+                ("start_height", num(start_height)),
+            ],
         ));
     }
 
@@ -402,8 +417,17 @@ impl PeerFlags {
 
     /// Take a new evaluation; returns the flags carried for the first time
     /// this connection, with their evidence.
-    pub fn update(&mut self, fingerprint: Fingerprint, settled: bool, flags: Vec<(Flag, Evidence)>) -> Vec<(Flag, Evidence)> {
-        let gained: Vec<(Flag, Evidence)> = flags.iter().filter(|(f, _)| !self.ever.contains(*f)).cloned().collect();
+    pub fn update(
+        &mut self,
+        fingerprint: Fingerprint,
+        settled: bool,
+        flags: Vec<(Flag, Evidence)>,
+    ) -> Vec<(Flag, Evidence)> {
+        let gained: Vec<(Flag, Evidence)> = flags
+            .iter()
+            .filter(|(f, _)| !self.ever.contains(*f))
+            .cloned()
+            .collect();
         for (f, _) in &gained {
             self.ever.insert(*f);
         }
@@ -437,7 +461,11 @@ impl NetgroupWindow {
     }
 
     /// Forget connections older than `window`, then count by group.
-    pub fn counts(&mut self, now: Instant, window: Duration) -> std::collections::HashMap<u64, u32> {
+    pub fn counts(
+        &mut self,
+        now: Instant,
+        window: Duration,
+    ) -> std::collections::HashMap<u64, u32> {
         while let Some((_, at)) = self.seen.front() {
             if now.saturating_duration_since(*at) > window {
                 self.seen.pop_front();
@@ -500,7 +528,10 @@ impl FlagCounts {
 /// Seconds since the peer connected, by the node clock: `conn_time` is set
 /// from it, so `setmocktime` moves both ends alike.
 pub fn session_secs(info: &crate::net::peer::PeerInfo) -> u64 {
-    let start = info.conn_time.duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    let start = info
+        .conn_time
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
     crate::time::now_secs().saturating_sub(start)
 }
 
@@ -514,7 +545,9 @@ pub fn peer_json(info: &crate::net::peer::PeerInfo) -> serde_json::Value {
     let fingerprint = match p.fingerprint {
         // No row matched and the user agent names the family: reported
         // apart from a known family, with no `family` of its own.
-        Fingerprint::Known(family, Confidence::Claimed) => json!({"result": "claimed", "claimed": family.name()}),
+        Fingerprint::Known(family, Confidence::Claimed) => {
+            json!({"result": "claimed", "claimed": family.name()})
+        }
         Fingerprint::Known(family, confidence) => {
             json!({"result": "known", "family": family.name(), "confidence": confidence.name()})
         }
@@ -530,8 +563,10 @@ pub fn peer_json(info: &crate::net::peer::PeerInfo) -> serde_json::Value {
         .flags
         .iter()
         .map(|(flag, evidence)| {
-            let ev: serde_json::Map<String, serde_json::Value> =
-                evidence.iter().map(|(k, v)| (k.to_string(), serde_json::Value::from(v))).collect();
+            let ev: serde_json::Map<String, serde_json::Value> = evidence
+                .iter()
+                .map(|(k, v)| (k.to_string(), serde_json::Value::from(v)))
+                .collect();
             json!({"code": flag.code().to_string(), "name": flag.name(), "evidence": ev})
         })
         .collect();
@@ -617,13 +652,23 @@ mod tests {
     fn the_flag_policy_parses_and_names_its_flags() {
         assert_eq!(FlagPolicy::default(), FlagPolicy::Observe);
         assert_eq!(FlagPolicy::parse(" Evict "), Ok(FlagPolicy::Evict));
-        assert_eq!(FlagPolicy::parse("observe").map(FlagPolicy::name), Ok("observe"));
+        assert_eq!(
+            FlagPolicy::parse("observe").map(FlagPolicy::name),
+            Ok("observe")
+        );
         assert!(FlagPolicy::parse("ban").is_err());
         let mut all = FlagSet::default();
         Flag::ALL.into_iter().for_each(|f| all.insert(f));
         assert_eq!(all.eviction_flags().to_string(), "CSF");
         let mut rest = FlagSet::default();
-        [Flag::AddrAbuse, Flag::HeightLie, Flag::NotfoundPattern, Flag::Stalling].into_iter().for_each(|f| rest.insert(f));
+        [
+            Flag::AddrAbuse,
+            Flag::HeightLie,
+            Flag::NotfoundPattern,
+            Flag::Stalling,
+        ]
+        .into_iter()
+        .for_each(|f| rest.insert(f));
         assert!(rest.eviction_flags().is_empty());
     }
 
@@ -634,7 +679,11 @@ mod tests {
         assert_eq!(p.update(Fingerprint::Unknown, false, t.clone()).len(), 1);
         assert_eq!(p.update(Fingerprint::Unknown, false, Vec::new()).len(), 0);
         assert!(p.set().is_empty(), "a flag clears when its shape goes");
-        assert_eq!(p.update(Fingerprint::Unknown, false, t).len(), 0, "and is not logged again");
+        assert_eq!(
+            p.update(Fingerprint::Unknown, false, t).len(),
+            0,
+            "and is not logged again"
+        );
         assert!(p.set().contains(Flag::Stalling));
     }
 

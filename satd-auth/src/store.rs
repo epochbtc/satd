@@ -294,9 +294,9 @@ fn parse_table(path: &Path, content: &str) -> Result<TokenTable, StoreError> {
     let mut seen_ids: std::collections::HashSet<&str> = std::collections::HashSet::new();
 
     if let Some(tokens) = doc.get("token") {
-        let arr = tokens.as_array_of_tables().ok_or_else(|| {
-            malformed("`token` must be an array of tables (`[[token]]`)".into())
-        })?;
+        let arr = tokens
+            .as_array_of_tables()
+            .ok_or_else(|| malformed("`token` must be an array of tables (`[[token]]`)".into()))?;
         for (i, t) in arr.iter().enumerate() {
             let ctx = |d: String| malformed(format!("[[token]] #{}: {d}", i + 1));
 
@@ -337,17 +337,22 @@ fn parse_table(path: &Path, content: &str) -> Result<TokenTable, StoreError> {
                 Some(item) => Some(
                     item.as_integer()
                         .and_then(|n| u64::try_from(n).ok())
-                        .ok_or_else(|| ctx("`watch_quota` must be a non-negative integer".into()))?,
+                        .ok_or_else(
+                            || ctx("`watch_quota` must be a non-negative integer".into()),
+                        )?,
                 ),
             };
 
             let rate_limit = match t.get("rate_limit") {
                 None => None,
                 Some(item) => {
-                    let s = item
-                        .as_str()
-                        .ok_or_else(|| ctx("`rate_limit` must be a string like \"200/s\"".into()))?;
-                    Some(RatePolicy::parse(s).map_err(|bad| ctx(format!("invalid `rate_limit` `{bad}`")))?)
+                    let s = item.as_str().ok_or_else(|| {
+                        ctx("`rate_limit` must be a string like \"200/s\"".into())
+                    })?;
+                    Some(
+                        RatePolicy::parse(s)
+                            .map_err(|bad| ctx(format!("invalid `rate_limit` `{bad}`")))?,
+                    )
                 }
             };
 
@@ -395,21 +400,17 @@ fn parse_expires(item: &Item) -> Result<i64, String> {
     if let Some(dt) = item.as_datetime() {
         return datetime_to_unix(dt);
     }
-    Err("must be a TOML datetime (unquoted, e.g. 2026-12-31T00:00:00Z) \
+    Err(
+        "must be a TOML datetime (unquoted, e.g. 2026-12-31T00:00:00Z) \
          or an integer unix timestamp"
-        .to_string())
+            .to_string(),
+    )
 }
 
 fn datetime_to_unix(dt: &toml_edit::Datetime) -> Result<i64, String> {
-    let date = dt
-        .date
-        .ok_or_else(|| "must include a date".to_string())?;
+    let date = dt.date.ok_or_else(|| "must include a date".to_string())?;
     let (hour, minute, second) = match dt.time {
-        Some(t) => (
-            t.hour as i64,
-            t.minute as i64,
-            t.second.unwrap_or(0) as i64,
-        ),
+        Some(t) => (t.hour as i64, t.minute as i64, t.second.unwrap_or(0) as i64),
         None => (0, 0, 0),
     };
     let days = days_from_civil(date.year as i64, date.month as i64, date.day as i64);
@@ -492,7 +493,13 @@ capabilities = ["stream:subscribe", "stream:watch"]
         assert_eq!(&*entry.id, "btcpay");
         assert!(entry.caps.contains(crate::Capability::RpcRead));
         assert_eq!(entry.watch_quota, Some(50000));
-        assert_eq!(entry.rate_limit, Some(RatePolicy { burst: 200, per_sec: 200 }));
+        assert_eq!(
+            entry.rate_limit,
+            Some(RatePolicy {
+                burst: 200,
+                per_sec: 200
+            })
+        );
         assert!(entry.expires.is_none());
     }
 
@@ -500,7 +507,10 @@ capabilities = ["stream:subscribe", "stream:watch"]
     #[test]
     fn refuses_group_world_or_executable_perms() {
         let dir = tempfile::tempdir().unwrap();
-        let toml = format!("version = 1\n[[token]]\nid=\"x\"\nhash=\"{}\"\n", sha256_hex("t"));
+        let toml = format!(
+            "version = 1\n[[token]]\nid=\"x\"\nhash=\"{}\"\n",
+            sha256_hex("t")
+        );
         // Group/world bits and execute bits are all unsafe for a secret file.
         for (name, mode) in [
             ("g_world.toml", 0o644),
@@ -523,7 +533,10 @@ capabilities = ["stream:subscribe", "stream:watch"]
         // 0600 (rw) and 0400 (read-only — a deliberately immutable secret, like
         // an OpenSSH private key) are both owner-only and non-executable.
         let dir = tempfile::tempdir().unwrap();
-        let toml = format!("version = 1\n[[token]]\nid=\"x\"\nhash=\"{}\"\n", sha256_hex("t"));
+        let toml = format!(
+            "version = 1\n[[token]]\nid=\"x\"\nhash=\"{}\"\n",
+            sha256_hex("t")
+        );
         for (name, mode) in [("rw.toml", 0o600), ("ro.toml", 0o400)] {
             let p = write_file(dir.path(), name, &toml, mode);
             assert!(
@@ -583,8 +596,14 @@ capabilities = ["stream:subscribe", "stream:watch"]
         );
         let p = write_file(dir.path(), "blank.toml", &toml, 0o600);
         let store = TokenStore::load(&p).unwrap();
-        assert!(store.resolve("", 0).is_none(), "empty token must not resolve");
-        assert!(store.resolve("   ", 0).is_none(), "whitespace token must not resolve");
+        assert!(
+            store.resolve("", 0).is_none(),
+            "empty token must not resolve"
+        );
+        assert!(
+            store.resolve("   ", 0).is_none(),
+            "whitespace token must not resolve"
+        );
     }
 
     #[cfg(unix)]
@@ -616,7 +635,10 @@ capabilities = ["stream:subscribe", "stream:watch"]
         assert_eq!(store.snapshot().len(), 2);
 
         // Rewrite with only token "a".
-        let one = format!("version=1\n[[token]]\nid=\"a\"\nhash=\"{}\"\n", sha256_hex("aaa"));
+        let one = format!(
+            "version=1\n[[token]]\nid=\"a\"\nhash=\"{}\"\n",
+            sha256_hex("aaa")
+        );
         write_file(dir.path(), "auth.toml", &one, 0o600);
         let delta = store.reload().unwrap();
         assert_eq!(delta.removed, vec!["b".to_string()]);
@@ -643,22 +665,37 @@ capabilities = ["stream:subscribe", "stream:watch"]
         let path = write_file(dir.path(), "auth.toml", &body("expires = 1000\n"), 0o600);
         let store = TokenStore::load(&path).unwrap();
         let digest = token_digest("ws-secret");
-        assert!(store.resolve_digest(&digest, 999).is_some(), "valid before expiry");
-        assert!(store.resolve_digest(&digest, 1000).is_none(), "refused at expiry");
+        assert!(
+            store.resolve_digest(&digest, 999).is_some(),
+            "valid before expiry"
+        );
+        assert!(
+            store.resolve_digest(&digest, 1000).is_none(),
+            "refused at expiry"
+        );
 
         write_file(dir.path(), "auth.toml", &body(""), 0o600);
         store.reload().unwrap();
-        assert!(store.resolve_digest(&digest, 5000).is_some(), "the reload dropped the expiry");
+        assert!(
+            store.resolve_digest(&digest, 5000).is_some(),
+            "the reload dropped the expiry"
+        );
 
         write_file(dir.path(), "auth.toml", "version = 1\n", 0o600);
         store.reload().unwrap();
-        assert!(store.resolve_digest(&digest, 5000).is_none(), "removed by the reload");
+        assert!(
+            store.resolve_digest(&digest, 5000).is_none(),
+            "removed by the reload"
+        );
     }
 
     #[test]
     fn reload_error_retains_last_good_table() {
         let dir = tempfile::tempdir().unwrap();
-        let good = format!("version=1\n[[token]]\nid=\"a\"\nhash=\"{}\"\n", sha256_hex("aaa"));
+        let good = format!(
+            "version=1\n[[token]]\nid=\"a\"\nhash=\"{}\"\n",
+            sha256_hex("aaa")
+        );
         let p = write_file(dir.path(), "auth.toml", &good, 0o600);
         let store = TokenStore::load(&p).unwrap();
 

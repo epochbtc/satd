@@ -17,7 +17,9 @@ use crate::index::address::config::AddressIndexConfig;
 use crate::index::address::keys::{AddrFundingRowV3, AddrSpendingRowV3, Scripthash};
 use crate::index::address::subscribe::SubscribeError;
 use crate::index::address::trait_def::AddressIndex;
-use crate::index::address::types::{HistoryEntry, IndexError, MempoolHistoryEntry, StatusUpdate, Utxo};
+use crate::index::address::types::{
+    HistoryEntry, IndexError, MempoolHistoryEntry, StatusUpdate, Utxo,
+};
 use crate::storage::blockindex::{BlockIndexEntry, BlockStatus};
 use crate::storage::test_store::{ControllableStore, StoreControls};
 use crate::storage::{Store, StoreBatch};
@@ -192,8 +194,12 @@ fn pages_match_the_whole_history_from_every_cursor() {
     for limit in [1, 2, 7, 25] {
         for cursor in &cursors {
             assert_eq!(
-                index.confirmed_txs_newest_first(&SH, *cursor, limit).unwrap(),
-                whole.confirmed_txs_newest_first(&SH, *cursor, limit).unwrap(),
+                index
+                    .confirmed_txs_newest_first(&SH, *cursor, limit)
+                    .unwrap(),
+                whole
+                    .confirmed_txs_newest_first(&SH, *cursor, limit)
+                    .unwrap(),
                 "limit {limit}, cursor {cursor:?}"
             );
         }
@@ -210,7 +216,9 @@ fn a_cursor_outside_the_confirmed_history_is_none() {
         Txid::from_byte_array([0x42; 32]), // unknown
     ] {
         assert_eq!(
-            index.confirmed_txs_newest_first(&SH, Some(cursor), 25).unwrap(),
+            index
+                .confirmed_txs_newest_first(&SH, Some(cursor), 25)
+                .unwrap(),
             None,
             "cursor {cursor}"
         );
@@ -222,7 +230,9 @@ fn a_cursor_outside_the_confirmed_history_is_none() {
         .unwrap();
     let oldest = all.last().unwrap().1;
     assert_eq!(
-        index.confirmed_txs_newest_first(&SH, Some(oldest), 25).unwrap(),
+        index
+            .confirmed_txs_newest_first(&SH, Some(oldest), 25)
+            .unwrap(),
         Some(Vec::new())
     );
 }
@@ -234,7 +244,11 @@ fn a_cursor_outside_the_confirmed_history_is_none() {
 #[test]
 fn a_deep_page_resolves_only_the_rows_near_it() {
     let (index, controls) = chain(3_000, 2, |_, pos| {
-        if pos == 1 { Touch::Pays(1) } else { Touch::Nothing }
+        if pos == 1 {
+            Touch::Pays(1)
+        } else {
+            Touch::Nothing
+        }
     });
     let whole = WholeHistory(&index);
     let all = whole
@@ -252,7 +266,10 @@ fn a_deep_page_resolves_only_the_rows_near_it() {
             "a 25-row page at cursor {cursor:?} read {read} rows and resolved {resolved} \
              ordinals of a 3000-transaction history"
         );
-        assert_eq!(page, whole.confirmed_txs_newest_first(&SH, cursor, 25).unwrap());
+        assert_eq!(
+            page,
+            whole.confirmed_txs_newest_first(&SH, cursor, 25).unwrap()
+        );
     }
 }
 
@@ -274,9 +291,15 @@ fn check_history_cap_counts_transactions_and_refuses_one_past_the_cap() {
     let (index, _) = chain(60, 4, mixed);
     let n = distinct_count(&index);
     let rows = index.confirmed_history(&SH).unwrap().len();
-    assert!(rows > n, "fixture premise: more rows ({rows}) than transactions ({n})");
+    assert!(
+        rows > n,
+        "fixture premise: more rows ({rows}) than transactions ({n})"
+    );
 
-    assert!(index.check_history_cap(&SH, n).is_ok(), "a history at the cap is served");
+    assert!(
+        index.check_history_cap(&SH, n).is_ok(),
+        "a history at the cap is served"
+    );
     assert!(index.check_history_cap(&SH, n + 1).is_ok());
     assert!(matches!(
         index.check_history_cap(&SH, n - 1),
@@ -297,7 +320,11 @@ fn check_history_cap_counts_transactions_and_refuses_one_past_the_cap() {
 #[test]
 fn refusing_a_long_history_reads_only_about_cap_rows() {
     let (index, controls) = chain(3_000, 2, |_, pos| {
-        if pos == 1 { Touch::Pays(1) } else { Touch::Nothing }
+        if pos == 1 {
+            Touch::Pays(1)
+        } else {
+            Touch::Nothing
+        }
     });
     assert_eq!(distinct_count(&index), 3_000);
 
@@ -317,7 +344,10 @@ fn refusing_a_long_history_reads_only_about_cap_rows() {
     // through `capped_history_rows`.
     controls.reset_ordinal_read_counts();
     let refused = node_index::capped_history_rows(&index, &SH, 100, |_| None);
-    assert!(matches!(refused, Err(IndexError::HistoryTooLarge { cap: 100 })));
+    assert!(matches!(
+        refused,
+        Err(IndexError::HistoryTooLarge { cap: 100 })
+    ));
     let (read, resolved) = (controls.addr_rows_served(), controls.ordinals_resolved());
     assert!(
         read <= 101 && resolved == 0,
@@ -376,13 +406,20 @@ fn confirmed_history_order_is_the_display_string_order() {
     let mut expected = got.clone();
     expected.sort_by(|a, b| {
         let key = |e: &HistoryEntry| {
-            (e.height(), e.txid().to_string(), matches!(e, HistoryEntry::Spending { .. }))
+            (
+                e.height(),
+                e.txid().to_string(),
+                matches!(e, HistoryEntry::Spending { .. }),
+            )
         };
         key(a).cmp(&key(b))
     });
     assert_eq!(got, expected);
     // Fixture premise: some block holds several distinct txids.
-    assert!(got.windows(2).any(|w| w[0].height() == w[1].height() && w[0].txid() != w[1].txid()));
+    assert!(
+        got.windows(2)
+            .any(|w| w[0].height() == w[1].height() && w[0].txid() != w[1].txid())
+    );
 }
 
 /// What `get_first_use` answered before: the lowest `(height, txid)` over
@@ -421,8 +458,14 @@ fn first_confirmed_tx_is_the_lowest_txid_of_the_first_block() {
         (1, _) => Touch::Nothing,
         _ => Touch::Pays(1),
     });
-    assert_eq!(index.first_confirmed_tx(&SH).unwrap(), Some((1, txid(1, 2))));
-    assert_eq!(index.first_confirmed_tx(&SH).unwrap(), first_use_from_whole_history(&index));
+    assert_eq!(
+        index.first_confirmed_tx(&SH).unwrap(),
+        Some((1, txid(1, 2)))
+    );
+    assert_eq!(
+        index.first_confirmed_tx(&SH).unwrap(),
+        first_use_from_whole_history(&index)
+    );
 
     // A script whose first row is a spend.
     let (index, _) = chain(10, 2, |height, pos| match (height, pos) {
@@ -430,7 +473,10 @@ fn first_confirmed_tx_is_the_lowest_txid_of_the_first_block() {
         (5, _) => Touch::Pays(1),
         _ => Touch::Nothing,
     });
-    assert_eq!(index.first_confirmed_tx(&SH).unwrap(), Some((3, txid(3, 1))));
+    assert_eq!(
+        index.first_confirmed_tx(&SH).unwrap(),
+        Some((3, txid(3, 1)))
+    );
 }
 
 /// `get_first_use` read and resolved the whole history to report its first
@@ -438,11 +484,18 @@ fn first_confirmed_tx_is_the_lowest_txid_of_the_first_block() {
 #[test]
 fn first_confirmed_tx_reads_only_the_first_rows_of_a_long_history() {
     let (index, controls) = chain(3_000, 2, |_, pos| {
-        if pos == 1 { Touch::Pays(1) } else { Touch::Nothing }
+        if pos == 1 {
+            Touch::Pays(1)
+        } else {
+            Touch::Nothing
+        }
     });
     controls.reset_ordinal_read_counts();
     let got = index.first_confirmed_tx(&SH).unwrap();
     let read = controls.addr_rows_served();
     assert_eq!(got, Some((1, txid(1, 1))));
-    assert!(read <= 32, "first use read {read} rows of a 3000-transaction history");
+    assert!(
+        read <= 32,
+        "first use read {read} rows of a 3000-transaction history"
+    );
 }

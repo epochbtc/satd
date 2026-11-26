@@ -36,7 +36,7 @@ use tokio::sync::{broadcast, mpsc, watch};
 use tracing::{debug, warn};
 use zeroize::Zeroizing;
 
-use node_index::keys::{scripthash_of, Scripthash};
+use node_index::keys::{Scripthash, scripthash_of};
 use node_sp_index::{TweakEntry, compute_tweak_with_txid, scan_outputs};
 
 use crate::chain::events::ChainEvent;
@@ -128,7 +128,8 @@ impl SpWatchTarget {
         mut labels: Vec<u32>,
     ) -> Result<Self, SpTargetError> {
         let sk = SecretKey::from_slice(&scan_secret).map_err(|_| SpTargetError::BadScanSecret)?;
-        let spend = PublicKey::from_slice(spend_pubkey).map_err(|_| SpTargetError::BadSpendPubkey)?;
+        let spend =
+            PublicKey::from_slice(spend_pubkey).map_err(|_| SpTargetError::BadSpendPubkey)?;
         let scan_pubkey = sk.public_key(sp_secp()).serialize();
         labels.sort_unstable();
         labels.dedup();
@@ -908,7 +909,8 @@ impl WatchRegistry {
         self.script_items.fetch_sub(freed_scripts, Ordering::AcqRel);
         self.txid_items.fetch_sub(freed_txids, Ordering::AcqRel);
         self.depth_items.fetch_sub(depth_count, Ordering::AcqRel);
-        self.prefix_items.fetch_sub(freed_prefixes, Ordering::AcqRel);
+        self.prefix_items
+            .fetch_sub(freed_prefixes, Ordering::AcqRel);
         self.sp_items.fetch_sub(freed_sp, Ordering::AcqRel);
         if sub.wants_raw_tx {
             self.raw_tx_items.fetch_sub(1, Ordering::AcqRel);
@@ -931,7 +933,11 @@ impl WatchRegistry {
                 added += 1;
             }
         }
-        if inner.subs.get(&id).is_some_and(|s| !s.sp_targets.is_empty()) {
+        if inner
+            .subs
+            .get(&id)
+            .is_some_and(|s| !s.sp_targets.is_empty())
+        {
             inner.sp_subs.insert(id);
         }
         // SP targets bump `watch_items` too: they are the sole watch kind that
@@ -1160,7 +1166,10 @@ impl WatchRegistry {
                 ni.by_txid.entry(*t).or_default().insert(new_id);
             }
             for &(bits, masked) in &sub.prefixes {
-                ni.by_prefix.entry((bits, masked)).or_default().insert(new_id);
+                ni.by_prefix
+                    .entry((bits, masked))
+                    .or_default()
+                    .insert(new_id);
                 *ni.prefix_lens.entry(bits).or_default() += 1;
             }
             if !sub.sp_targets.is_empty() {
@@ -1195,7 +1204,14 @@ impl WatchRegistry {
             return;
         }
         let inner = self.read_inner();
-        scan_tx(&inner, ScanTx::intact(tx), false, None, self.wants_any_raw_tx(), &mut LiveSink);
+        scan_tx(
+            &inner,
+            ScanTx::intact(tx),
+            false,
+            None,
+            self.wants_any_raw_tx(),
+            &mut LiveSink,
+        );
     }
 
     /// Mempool **spend-side** script matching: the unconfirmed analogue of
@@ -1271,9 +1287,7 @@ impl WatchRegistry {
         let mut raw_tx_cache: Option<Arc<[u8]>> = None;
         let mut prefix_spends: HashMap<(u8, u32), Vec<SpentPrevoutMeta>> = HashMap::new();
         for (vin, (input, sh)) in tx.input.iter().zip(prev_scripthashes.iter()).enumerate() {
-            if scan_scripts
-                && let Some(subs) = inner.by_scripthash.get(sh)
-            {
+            if scan_scripts && let Some(subs) = inner.by_scripthash.get(sh) {
                 // Mempool-input `min_value`: gate on the spent prevout's value
                 // when retained (`streamprevoutmeta >= amount`). `None` (hash
                 // tier) fails closed for a floored script (see `floor_allows`)
@@ -1287,7 +1301,11 @@ impl WatchRegistry {
                     confirmed: false,
                     height: None,
                     amount: value,
-                    raw_tx: if wants_raw { raw_tx_bytes(&mut raw_tx_cache, stx) } else { None },
+                    raw_tx: if wants_raw {
+                        raw_tx_bytes(&mut raw_tx_cache, stx)
+                    } else {
+                        None
+                    },
                     raw_tx_stripped: false,
                 };
                 for sid in subs {
@@ -1315,11 +1333,14 @@ impl WatchRegistry {
                 for &bits in inner.prefix_lens.keys() {
                     let key = (bits, top & prefix_mask(bits));
                     if inner.by_prefix.contains_key(&key) {
-                        prefix_spends.entry(key).or_default().push(SpentPrevoutMeta {
-                            outpoint: input.previous_output,
-                            script_pubkey: script_pubkey.clone(),
-                            amount,
-                        });
+                        prefix_spends
+                            .entry(key)
+                            .or_default()
+                            .push(SpentPrevoutMeta {
+                                outpoint: input.previous_output,
+                                script_pubkey: script_pubkey.clone(),
+                                amount,
+                            });
                     }
                 }
             }
@@ -1394,7 +1415,11 @@ impl WatchRegistry {
         sp_scan_tx_outputs(
             &inner,
             &work,
-            ScanTx { tx, txid: entry.txid, stripped: false },
+            ScanTx {
+                tx,
+                txid: entry.txid,
+                stripped: false,
+            },
             &entry.tweak,
             false,
             None,
@@ -1590,7 +1615,13 @@ impl WatchRegistry {
 
     /// Lifecycle: a watched tx was RBF-replaced in the mempool.
     fn notify_replaced(&self, txid: Txid, replacing_txid: Txid) {
-        self.notify_lifecycle(&txid, WatchMatch::TxidReplaced { txid, replacing_txid });
+        self.notify_lifecycle(
+            &txid,
+            WatchMatch::TxidReplaced {
+                txid,
+                replacing_txid,
+            },
+        );
     }
 
     /// Lifecycle: a watched tx was evicted from the mempool by policy.
@@ -1769,7 +1800,11 @@ pub struct ScanTx<'a> {
 impl<'a> ScanTx<'a> {
     /// A transaction whose bytes are its own (the mempool, an intact block).
     fn intact(tx: &'a Transaction) -> Self {
-        Self { tx, txid: tx.compute_txid(), stripped: false }
+        Self {
+            tx,
+            txid: tx.compute_txid(),
+            stripped: false,
+        }
     }
 }
 
@@ -1802,7 +1837,11 @@ impl ScanBlock for StoredBlock {
             .txdata
             .iter()
             .enumerate()
-            .map(|(i, tx)| ScanTx { tx, txid: self.txid(i), stripped: self.tx_is_stripped(i) })
+            .map(|(i, tx)| ScanTx {
+                tx,
+                txid: self.txid(i),
+                stripped: self.tx_is_stripped(i),
+            })
             .collect()
     }
 }
@@ -1944,9 +1983,7 @@ fn scan_tx(
         let mut fired = HashSet::new();
         for (vout, out) in tx.output.iter().enumerate() {
             let sh = scripthash_of(&out.script_pubkey);
-            if scan_scripts
-                && let Some(subs) = inner.by_scripthash.get(&sh)
-            {
+            if scan_scripts && let Some(subs) = inner.by_scripthash.get(&sh) {
                 // Output-side `min_value`: gate on the funded output's value,
                 // which is always known and always carried on the event.
                 let value = out.value.to_sat();
@@ -1958,7 +1995,11 @@ fn scan_tx(
                     confirmed,
                     height,
                     amount: Some(value),
-                    raw_tx: if wants_raw { raw_tx_bytes(&mut raw_tx, stx) } else { None },
+                    raw_tx: if wants_raw {
+                        raw_tx_bytes(&mut raw_tx, stx)
+                    } else {
+                        None
+                    },
                     raw_tx_stripped: stx.stripped,
                 };
                 for sid in subs {
@@ -1969,7 +2010,14 @@ fn scan_tx(
             }
             if scan_prefixes {
                 deliver_prefix_funding(
-                    inner, &sh, &mut raw_tx, stx, confirmed, height, &mut fired, sink,
+                    inner,
+                    &sh,
+                    &mut raw_tx,
+                    stx,
+                    confirmed,
+                    height,
+                    &mut fired,
+                    sink,
                 );
             }
         }
@@ -2043,9 +2091,7 @@ fn scan_block_spent_scripts(
             };
             undo_idx += 1;
             let sh = scripthash_of(&spent.script_pubkey);
-            if scan_scripts
-                && let Some(subs) = inner.by_scripthash.get(&sh)
-            {
+            if scan_scripts && let Some(subs) = inner.by_scripthash.get(&sh) {
                 // Input-side `min_value`: gate on the spent prevout's value,
                 // recovered from undo data (symmetric with the output side).
                 // Always known for a confirmed spend, so always carried.
@@ -2058,7 +2104,11 @@ fn scan_block_spent_scripts(
                     confirmed: true,
                     height: Some(height),
                     amount: Some(value),
-                    raw_tx: if wants_raw { raw_tx_bytes(&mut raw_tx_cache, stx) } else { None },
+                    raw_tx: if wants_raw {
+                        raw_tx_bytes(&mut raw_tx_cache, stx)
+                    } else {
+                        None
+                    },
                     raw_tx_stripped: stx.stripped,
                 };
                 for sid in subs {
@@ -2075,11 +2125,14 @@ fn scan_block_spent_scripts(
                 for &bits in inner.prefix_lens.keys() {
                     let key = (bits, top & prefix_mask(bits));
                     if inner.by_prefix.contains_key(&key) {
-                        prefix_spends.entry(key).or_default().push(SpentPrevoutMeta {
-                            outpoint: input.previous_output,
-                            script_pubkey: spent.script_pubkey.clone(),
-                            amount: Some(spent.amount),
-                        });
+                        prefix_spends
+                            .entry(key)
+                            .or_default()
+                            .push(SpentPrevoutMeta {
+                                outpoint: input.previous_output,
+                                script_pubkey: spent.script_pubkey.clone(),
+                                amount: Some(spent.amount),
+                            });
                     }
                 }
             }
@@ -2273,7 +2326,13 @@ fn sp_scan_tx_outputs(
     let mut raw_tx_cache: Option<Arc<[u8]>> = None;
 
     for (sid, b_scan, target) in work {
-        let matches = scan_outputs(tweak, b_scan, &target.spend_pubkey, &target.labels, &out_xonly);
+        let matches = scan_outputs(
+            tweak,
+            b_scan,
+            &target.spend_pubkey,
+            &target.labels,
+            &out_xonly,
+        );
         if matches.is_empty() {
             continue;
         }
@@ -2301,7 +2360,11 @@ fn sp_scan_tx_outputs(
                 label: m.label_m,
                 confirmed,
                 height,
-                raw_tx: if wants_raw { raw_tx_bytes(&mut raw_tx_cache, stx) } else { None },
+                raw_tx: if wants_raw {
+                    raw_tx_bytes(&mut raw_tx_cache, stx)
+                } else {
+                    None
+                },
                 raw_tx_stripped: stx.stripped,
             };
             sink.emit(inner, *sid, &wm);
@@ -2350,8 +2413,7 @@ fn scan_block_sp_from_tweaks(
     }
     // txid → stored tweak. Row entries are one per SP-eligible tx (small); the
     // map lets us pair each with its transaction without relying on block order.
-    let by_txid: HashMap<Txid, &PublicKey> =
-        entries.iter().map(|e| (e.txid, &e.tweak)).collect();
+    let by_txid: HashMap<Txid, &PublicKey> = entries.iter().map(|e| (e.txid, &e.tweak)).collect();
     for &stx in txs {
         if stx.tx.is_coinbase() {
             continue;
@@ -2875,12 +2937,12 @@ pub async fn run_watch_matcher(
 
 #[cfg(test)]
 mod tests {
-    use node_sp_index::compute_tweak;
     use super::*;
     use bitcoin::absolute::LockTime;
     use bitcoin::hashes::Hash;
     use bitcoin::transaction::Version;
     use bitcoin::{Amount, ScriptBuf, Sequence, TxIn, TxOut, Witness};
+    use node_sp_index::compute_tweak;
 
     fn outpoint(byte: u8, vout: u32) -> OutPoint {
         OutPoint {
@@ -3142,7 +3204,10 @@ mod tests {
         handle.add_txids(&[txid], 0);
         reg.scan_block_disconnected(&block_at(1, vec![tx]), 10);
         match rx.try_recv().expect("unconfirmed fires") {
-            WatchMatch::TxidUnconfirmed { txid: t, prev_height } => {
+            WatchMatch::TxidUnconfirmed {
+                txid: t,
+                prev_height,
+            } => {
                 assert_eq!(t, txid);
                 assert_eq!(prev_height, 10);
             }
@@ -3261,7 +3326,10 @@ mod tests {
         chain.active.insert(10, bh);
 
         reg.tick_depths(12, &chain); // probe arms (10,bh), then fires
-        match rx.try_recv().expect("probe arms an already-buried tx and fires") {
+        match rx
+            .try_recv()
+            .expect("probe arms an already-buried tx and fires")
+        {
             WatchMatch::TxidDepthReached { depth, height, .. } => {
                 assert_eq!(depth, 3);
                 assert_eq!(height, 10);
@@ -3309,7 +3377,10 @@ mod tests {
         chain.active.insert(105, block_at(2, vec![]).block_hash());
         reg.tick_depths(105, &chain);
         assert!(
-            matches!(rx.try_recv(), Ok(WatchMatch::TxidDepthReached { depth: 6, .. })),
+            matches!(
+                rx.try_recv(),
+                Ok(WatchMatch::TxidDepthReached { depth: 6, .. })
+            ),
             "and it is not lost -- it fires when the depth is genuinely reached",
         );
     }
@@ -3397,7 +3468,10 @@ mod tests {
         reg.tick_depths(13, &chain);
         assert!(rx.try_recv().is_err(), "no premature finalize on reorg");
         // Lifecycle watch survives (not evicted).
-        assert!(reg.has_txid_watchers(), "lifecycle watch held through reorg");
+        assert!(
+            reg.has_txid_watchers(),
+            "lifecycle watch held through reorg"
+        );
     }
 
     #[test]
@@ -3481,8 +3555,14 @@ mod tests {
         reg.arm_depths_for_block(&block, 10);
         let _ = rx.try_recv(); // confirmed TxidMatched
         reg.tick_depths(11, &chain); // depth 2 → TxidFinalized
-        assert!(matches!(rx.try_recv(), Ok(WatchMatch::TxidFinalized { .. })));
-        assert!(!reg.has_txid_watchers(), "lifecycle watch evicted on finalize");
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(WatchMatch::TxidFinalized { .. })
+        ));
+        assert!(
+            !reg.has_txid_watchers(),
+            "lifecycle watch evicted on finalize"
+        );
         assert!(!reg.has_depth_watchers(), "close entry evicted on finalize");
         assert!(!reg.has_watchers(), "no residual watch items");
     }
@@ -3550,11 +3630,19 @@ mod tests {
         assert_eq!(handle.add_scripthashes_with_floors(&[(sh, 1_000)]), 1);
 
         // Below the floor: dropped.
-        reg.scan_block(&block_with(vec![funding_tx_value(spk.clone(), 999)]), 7, None);
+        reg.scan_block(
+            &block_with(vec![funding_tx_value(spk.clone(), 999)]),
+            7,
+            None,
+        );
         assert!(rx.try_recv().is_err(), "999 < 1000 floor → suppressed");
 
         // At the floor: delivered.
-        reg.scan_block(&block_with(vec![funding_tx_value(spk.clone(), 1_000)]), 8, None);
+        reg.scan_block(
+            &block_with(vec![funding_tx_value(spk.clone(), 1_000)]),
+            8,
+            None,
+        );
         match rx.try_recv().expect("1000 >= floor → delivered") {
             WatchMatch::ScriptMatched {
                 scripthash,
@@ -3596,7 +3684,10 @@ mod tests {
             spent_coins: vec![coin_with_value(spent_spk.clone(), 999)],
         };
         reg.scan_block(&block, 9, Some(&undo_low));
-        assert!(rx.try_recv().is_err(), "spent value below floor → suppressed");
+        assert!(
+            rx.try_recv().is_err(),
+            "spent value below floor → suppressed"
+        );
 
         // Spent prevout worth 1000 == floor → delivered.
         let undo_ok = UndoData {
@@ -3640,7 +3731,11 @@ mod tests {
         );
 
         // A 1000-value funding now falls below the updated 2000 floor → dropped.
-        reg.scan_block(&block_with(vec![funding_tx_value(spk.clone(), 1_000)]), 7, None);
+        reg.scan_block(
+            &block_with(vec![funding_tx_value(spk.clone(), 1_000)]),
+            7,
+            None,
+        );
         assert!(rx.try_recv().is_err(), "updated floor (2000) governs");
 
         // 2000 clears it.
@@ -3878,7 +3973,10 @@ mod tests {
             rx1.try_recv(),
             Ok(WatchMatch::OutpointSpent { .. })
         ));
-        assert!(rx2.try_recv().is_err(), "subscriber 2 watches a different outpoint");
+        assert!(
+            rx2.try_recv().is_err(),
+            "subscriber 2 watches a different outpoint"
+        );
     }
 
     // --- resync_range (matcher lag catch-up window) ---
@@ -3960,7 +4058,10 @@ mod tests {
         // The forward-only resync_range(100, 101, ..) would scan ONLY 101,
         // missing replacements 98'..100'. The reorg window must include them.
         let (from, to, _) = reorg_resync_range(101, 10_000).unwrap();
-        assert!(from <= 98, "must rescan down to the replaced heights, got {from}");
+        assert!(
+            from <= 98,
+            "must rescan down to the replaced heights, got {from}"
+        );
         assert_eq!(to, 101);
         // Contrast: the forward helper would have started at 101.
         assert_eq!(resync_range(100, 101, 10_000), Some((101, 101, 0)));
@@ -4013,9 +4114,17 @@ mod tests {
                 assert_eq!(pm.prefix, (prefix_top32(&sh) & prefix_mask(12), 12));
                 assert!(!pm.confirmed);
                 assert_eq!(pm.height, None);
-                assert!(pm.matched_prevouts.is_empty(), "funding side carries no prevout");
-                let decoded: Transaction = bitcoin::consensus::deserialize(pm.raw_tx.as_ref()).unwrap();
-                assert_eq!(decoded.compute_txid(), tx.compute_txid(), "raw_tx is the full tx");
+                assert!(
+                    pm.matched_prevouts.is_empty(),
+                    "funding side carries no prevout"
+                );
+                let decoded: Transaction =
+                    bitcoin::consensus::deserialize(pm.raw_tx.as_ref()).unwrap();
+                assert_eq!(
+                    decoded.compute_txid(),
+                    tx.compute_txid(),
+                    "raw_tx is the full tx"
+                );
             }
             other => panic!("wrong match: {other:?}"),
         }
@@ -4050,7 +4159,11 @@ mod tests {
             WatchMatch::PrefixMatched(pm) => {
                 assert!(pm.confirmed);
                 assert_eq!(pm.height, Some(9));
-                assert_eq!(pm.matched_prevouts.len(), 1, "spend side carries the prevout");
+                assert_eq!(
+                    pm.matched_prevouts.len(),
+                    1,
+                    "spend side carries the prevout"
+                );
                 let mp0 = &pm.matched_prevouts[0];
                 let (mop, mspk) = (&mp0.outpoint, &mp0.script_pubkey);
                 assert_eq!(*mop, op);
@@ -4074,7 +4187,11 @@ mod tests {
             bits_seen.push(pm.prefix.1);
         }
         bits_seen.sort_unstable();
-        assert_eq!(bits_seen, vec![8, 16], "both lengths fire as independent items");
+        assert_eq!(
+            bits_seen,
+            vec![8, 16],
+            "both lengths fire as independent items"
+        );
     }
 
     #[test]
@@ -4085,7 +4202,10 @@ mod tests {
         handle.add_prefixes(&[bucket(&watched, 16)]);
         // A different script (overwhelmingly likely in a different 16-bit bucket).
         reg.scan_mempool_tx(&funding_tx(ScriptBuf::from(vec![0x52, 0x53, 0x54])));
-        assert!(rx.try_recv().is_err(), "script outside the bucket must not match");
+        assert!(
+            rx.try_recv().is_err(),
+            "script outside the bucket must not match"
+        );
     }
 
     #[test]
@@ -4096,7 +4216,10 @@ mod tests {
         handle.add_prefixes(&[bucket(&sh, 8), bucket(&sh, 16)]);
         assert!(reg.has_prefix_watchers());
         drop(handle);
-        assert!(!reg.has_prefix_watchers(), "prefix counter cleared on deregister");
+        assert!(
+            !reg.has_prefix_watchers(),
+            "prefix counter cleared on deregister"
+        );
         assert!(!reg.has_watchers(), "prefixes also clear the reread gate");
         let inner = reg.read_inner();
         assert!(inner.by_prefix.is_empty() && inner.prefix_lens.is_empty());
@@ -4158,7 +4281,11 @@ mod tests {
                 spend += 1;
             }
         }
-        assert_eq!((funding, spend), (1, 1), "one funding + one spend prefix match");
+        assert_eq!(
+            (funding, spend),
+            (1, 1),
+            "one funding + one spend prefix match"
+        );
     }
 
     #[test]
@@ -4177,9 +4304,18 @@ mod tests {
             lock_time: LockTime::ZERO,
             input: vec![],
             output: vec![
-                TxOut { value: Amount::from_sat(1), script_pubkey: spk.clone() },
-                TxOut { value: Amount::from_sat(2), script_pubkey: spk.clone() },
-                TxOut { value: Amount::from_sat(3), script_pubkey: spk },
+                TxOut {
+                    value: Amount::from_sat(1),
+                    script_pubkey: spk.clone(),
+                },
+                TxOut {
+                    value: Amount::from_sat(2),
+                    script_pubkey: spk.clone(),
+                },
+                TxOut {
+                    value: Amount::from_sat(3),
+                    script_pubkey: spk,
+                },
             ],
         };
         reg.scan_mempool_tx(&tx);
@@ -4187,7 +4323,10 @@ mod tests {
         while let Ok(WatchMatch::PrefixMatched(_)) = rx.try_recv() {
             n += 1;
         }
-        assert_eq!(n, 1, "one funding event per bucket per tx, not one per output");
+        assert_eq!(
+            n, 1,
+            "one funding event per bucket per tx, not one per output"
+        );
     }
 
     #[test]
@@ -4206,8 +4345,18 @@ mod tests {
             version: Version::TWO,
             lock_time: LockTime::ZERO,
             input: vec![
-                TxIn { previous_output: op0, script_sig: ScriptBuf::new(), sequence: Sequence::MAX, witness: Witness::new() },
-                TxIn { previous_output: op1, script_sig: ScriptBuf::new(), sequence: Sequence::MAX, witness: Witness::new() },
+                TxIn {
+                    previous_output: op0,
+                    script_sig: ScriptBuf::new(),
+                    sequence: Sequence::MAX,
+                    witness: Witness::new(),
+                },
+                TxIn {
+                    previous_output: op1,
+                    script_sig: ScriptBuf::new(),
+                    sequence: Sequence::MAX,
+                    witness: Witness::new(),
+                },
             ],
             output: vec![],
         };
@@ -4225,7 +4374,10 @@ mod tests {
             }
             other => panic!("wrong match: {other:?}"),
         }
-        assert!(rx.try_recv().is_err(), "no second spend event for the same bucket");
+        assert!(
+            rx.try_recv().is_err(),
+            "no second spend event for the same bucket"
+        );
     }
 
     #[test]
@@ -4259,7 +4411,11 @@ mod tests {
                 );
                 let decoded: Transaction =
                     bitcoin::consensus::deserialize(pm.raw_tx.as_ref()).unwrap();
-                assert_eq!(decoded.compute_txid(), tx.compute_txid(), "raw_tx is the full tx");
+                assert_eq!(
+                    decoded.compute_txid(),
+                    tx.compute_txid(),
+                    "raw_tx is the full tx"
+                );
             }
             other => panic!("wrong match: {other:?}"),
         }
@@ -4275,7 +4431,10 @@ mod tests {
         // A spend whose prevout hashes into a different 16-bit bucket.
         let other = scripthash_of(&ScriptBuf::from(vec![0x53, 0x54, 0x55]));
         reg.scan_mempool_spent_scripts(&spending_tx(outpoint(0xbb, 0)), &[other], &[], &[], true);
-        assert!(rx.try_recv().is_err(), "prevout outside the bucket must not match");
+        assert!(
+            rx.try_recv().is_err(),
+            "prevout outside the bucket must not match"
+        );
     }
 
     #[test]
@@ -4296,7 +4455,10 @@ mod tests {
             &[],
             true,
         );
-        assert!(rx.try_recv().is_err(), "no prefix watchers → no spend-side delivery");
+        assert!(
+            rx.try_recv().is_err(),
+            "no prefix watchers → no spend-side delivery"
+        );
     }
 
     #[test]
@@ -4315,8 +4477,18 @@ mod tests {
             version: Version::TWO,
             lock_time: LockTime::ZERO,
             input: vec![
-                TxIn { previous_output: op0, script_sig: ScriptBuf::new(), sequence: Sequence::MAX, witness: Witness::new() },
-                TxIn { previous_output: op1, script_sig: ScriptBuf::new(), sequence: Sequence::MAX, witness: Witness::new() },
+                TxIn {
+                    previous_output: op0,
+                    script_sig: ScriptBuf::new(),
+                    sequence: Sequence::MAX,
+                    witness: Witness::new(),
+                },
+                TxIn {
+                    previous_output: op1,
+                    script_sig: ScriptBuf::new(),
+                    sequence: Sequence::MAX,
+                    witness: Witness::new(),
+                },
             ],
             output: vec![],
         };
@@ -4332,7 +4504,10 @@ mod tests {
             }
             other => panic!("wrong match: {other:?}"),
         }
-        assert!(rx.try_recv().is_err(), "no second event for the same bucket");
+        assert!(
+            rx.try_recv().is_err(),
+            "no second event for the same bucket"
+        );
     }
 
     #[test]
@@ -4359,8 +4534,18 @@ mod tests {
             version: Version::TWO,
             lock_time: LockTime::ZERO,
             input: vec![
-                TxIn { previous_output: op_a, script_sig: ScriptBuf::new(), sequence: Sequence::MAX, witness: Witness::new() },
-                TxIn { previous_output: op_b, script_sig: ScriptBuf::new(), sequence: Sequence::MAX, witness: Witness::new() },
+                TxIn {
+                    previous_output: op_a,
+                    script_sig: ScriptBuf::new(),
+                    sequence: Sequence::MAX,
+                    witness: Witness::new(),
+                },
+                TxIn {
+                    previous_output: op_b,
+                    script_sig: ScriptBuf::new(),
+                    sequence: Sequence::MAX,
+                    witness: Witness::new(),
+                },
             ],
             output: vec![],
         };
@@ -4375,8 +4560,16 @@ mod tests {
             by_bucket.insert(key, ops);
         }
         assert_eq!(by_bucket.len(), 2, "one event per distinct bucket");
-        assert_eq!(by_bucket.get(&ba), Some(&vec![op_a]), "bucket A carries only its prevout");
-        assert_eq!(by_bucket.get(&bb), Some(&vec![op_b]), "bucket B carries only its prevout");
+        assert_eq!(
+            by_bucket.get(&ba),
+            Some(&vec![op_a]),
+            "bucket A carries only its prevout"
+        );
+        assert_eq!(
+            by_bucket.get(&bb),
+            Some(&vec![op_b]),
+            "bucket B carries only its prevout"
+        );
     }
 
     #[test]
@@ -4600,9 +4793,24 @@ mod tests {
             version: Version::TWO,
             lock_time: LockTime::ZERO,
             input: vec![
-                TxIn { previous_output: outpoint(0xa0, 0), script_sig: ScriptBuf::new(), sequence: Sequence::MAX, witness: Witness::new() },
-                TxIn { previous_output: outpoint(0xa1, 1), script_sig: ScriptBuf::new(), sequence: Sequence::MAX, witness: Witness::new() },
-                TxIn { previous_output: outpoint(0xa2, 2), script_sig: ScriptBuf::new(), sequence: Sequence::MAX, witness: Witness::new() },
+                TxIn {
+                    previous_output: outpoint(0xa0, 0),
+                    script_sig: ScriptBuf::new(),
+                    sequence: Sequence::MAX,
+                    witness: Witness::new(),
+                },
+                TxIn {
+                    previous_output: outpoint(0xa1, 1),
+                    script_sig: ScriptBuf::new(),
+                    sequence: Sequence::MAX,
+                    witness: Witness::new(),
+                },
+                TxIn {
+                    previous_output: outpoint(0xa2, 2),
+                    script_sig: ScriptBuf::new(),
+                    sequence: Sequence::MAX,
+                    witness: Witness::new(),
+                },
             ],
             output: vec![],
         };
@@ -4610,7 +4818,13 @@ mod tests {
         reg.scan_mempool_spent_scripts(&tx, &[other, other, watched], &[], &[], true);
 
         match rx.try_recv().expect("the matching input fires") {
-            WatchMatch::ScriptMatched { scripthash, is_output, index, confirmed, .. } => {
+            WatchMatch::ScriptMatched {
+                scripthash,
+                is_output,
+                index,
+                confirmed,
+                ..
+            } => {
                 assert_eq!(scripthash, watched);
                 assert!(!is_output);
                 assert_eq!(index, 2, "vin is the true input index, not a match counter");
@@ -4629,7 +4843,10 @@ mod tests {
         // A spend of a different (unwatched) prevout script.
         let other = scripthash_of(&ScriptBuf::from(vec![0x53, 0x54]));
         reg.scan_mempool_spent_scripts(&spending_tx(outpoint(0xbb, 0)), &[other], &[], &[], true);
-        assert!(rx.try_recv().is_err(), "unwatched prevout script must not match");
+        assert!(
+            rx.try_recv().is_err(),
+            "unwatched prevout script must not match"
+        );
     }
 
     #[test]
@@ -4648,7 +4865,10 @@ mod tests {
             &[],
             true,
         );
-        assert!(rx.try_recv().is_err(), "no spend-side watcher → no spend-side delivery");
+        assert!(
+            rx.try_recv().is_err(),
+            "no spend-side watcher → no spend-side delivery"
+        );
     }
 
     #[test]
@@ -4668,12 +4888,20 @@ mod tests {
         let (mut exact, mut prefix) = (0, 0);
         while let Ok(m) = rx.try_recv() {
             match m {
-                WatchMatch::ScriptMatched { is_output: false, confirmed: false, .. } => exact += 1,
+                WatchMatch::ScriptMatched {
+                    is_output: false,
+                    confirmed: false,
+                    ..
+                } => exact += 1,
                 WatchMatch::PrefixMatched(pm) if !pm.confirmed => prefix += 1,
                 other => panic!("unexpected match: {other:?}"),
             }
         }
-        assert_eq!((exact, prefix), (1, 1), "one exact + one prefix spend match");
+        assert_eq!(
+            (exact, prefix),
+            (1, 1),
+            "one exact + one prefix spend match"
+        );
     }
 
     // --- Bounded historical rescan (§6.1) -----------------------------------
@@ -4701,7 +4929,9 @@ mod tests {
         assert_eq!(handle.add_scripthashes(&[sh]), 1);
         assert_eq!(handle.add_outpoints(&[op]), 1);
 
-        let eph = reg.clone_for_rescan(handle.sub_id()).expect("non-empty watch-set");
+        let eph = reg
+            .clone_for_rescan(handle.sub_id())
+            .expect("non-empty watch-set");
         // A block funding the watched script (output side) and spending the
         // watched outpoint.
         let block = block_with(vec![funding_tx(spk), spending_tx(op)]);
@@ -4751,7 +4981,9 @@ mod tests {
         let sh = scripthash_of(&spent_spk);
         assert_eq!(handle.add_scripthashes(&[sh]), 1);
 
-        let eph = reg.clone_for_rescan(handle.sub_id()).expect("non-empty watch-set");
+        let eph = reg
+            .clone_for_rescan(handle.sub_id())
+            .expect("non-empty watch-set");
         assert!(eph.has_script_watchers());
         let block = block_with(vec![coinbase_tx(), spending_tx(outpoint(0xaa, 3))]);
         let undo = UndoData {
@@ -4822,7 +5054,9 @@ mod tests {
         let sh = scripthash_of(&spk);
         assert_eq!(handle.add_scripthashes_with_floors(&[(sh, 1_000)]), 1);
 
-        let eph = reg.clone_for_rescan(handle.sub_id()).expect("non-empty watch-set");
+        let eph = reg
+            .clone_for_rescan(handle.sub_id())
+            .expect("non-empty watch-set");
 
         // Below the floor: no match collected.
         let below = block_with(vec![funding_tx_value(spk.clone(), 999)]);
@@ -4898,7 +5132,9 @@ mod tests {
         let secp = Secp256k1::new();
         // Input prevout: a key-path P2TR whose key contributes to the tweak.
         let a_in = SecretKey::from_slice(&[0x33u8; 32]).unwrap();
-        let x_in = PublicKey::from_secret_key(&secp, &a_in).x_only_public_key().0;
+        let x_in = PublicKey::from_secret_key(&secp, &a_in)
+            .x_only_public_key()
+            .0;
         let prevout_spk = p2tr_spk(x_in);
         let op = outpoint(0x44, 0);
         let input = taproot_input(op);
@@ -4962,7 +5198,10 @@ mod tests {
             SpWatchTarget::new(b_scan.secret_bytes(), &b_spend_pub.serialize(), vec![]).unwrap();
         assert_eq!(handle.add_silent_payments(std::slice::from_ref(&target)), 1);
         assert!(reg.has_sp_watchers());
-        assert!(reg.has_watchers(), "SP target keeps the block-scan gate hot");
+        assert!(
+            reg.has_watchers(),
+            "SP target keeps the block-scan gate hot"
+        );
 
         let block = block_with(vec![coinbase_tx(), tx]);
         reg.scan_block(&block, 100, Some(&undo));
@@ -5012,7 +5251,8 @@ mod tests {
         let reg = Arc::new(WatchRegistry::new());
         let (handle, mut rx) = reg.register(WATCH_CHANNEL_CAPACITY);
         let target =
-            SpWatchTarget::new(other_scan.secret_bytes(), &b_spend_pub.serialize(), vec![]).unwrap();
+            SpWatchTarget::new(other_scan.secret_bytes(), &b_spend_pub.serialize(), vec![])
+                .unwrap();
         handle.add_silent_payments(std::slice::from_ref(&target));
 
         reg.scan_block(&block_with(vec![coinbase_tx(), tx]), 7, Some(&undo));
@@ -5033,9 +5273,12 @@ mod tests {
         let b_spend_pub = PublicKey::from_secret_key(&secp, &b_spend);
         let (tx, _undo, _, _) = sp_payment(&b_scan, &b_spend_pub, 5_000);
         let (handle, mut rx) = reg.register(WATCH_CHANNEL_CAPACITY);
-        handle.add_silent_payments(&[
-            SpWatchTarget::new(b_scan.secret_bytes(), &b_spend_pub.serialize(), vec![]).unwrap(),
-        ]);
+        handle.add_silent_payments(&[SpWatchTarget::new(
+            b_scan.secret_bytes(),
+            &b_spend_pub.serialize(),
+            vec![],
+        )
+        .unwrap()]);
         reg.scan_block(&block_with(vec![coinbase_tx(), tx]), 3, None);
         assert!(rx.try_recv().is_err(), "no undo ⇒ no SP match");
     }
@@ -5047,7 +5290,8 @@ mod tests {
         let b_spend = SecretKey::from_slice(&[0x22u8; 32]).unwrap();
         let b_spend_pub = PublicKey::from_secret_key(&secp, &b_spend);
         let target =
-            SpWatchTarget::new(b_scan.secret_bytes(), &b_spend_pub.serialize(), vec![0, 3]).unwrap();
+            SpWatchTarget::new(b_scan.secret_bytes(), &b_spend_pub.serialize(), vec![0, 3])
+                .unwrap();
         let dbg = format!("{target:?}");
         assert!(dbg.contains("<redacted>"), "secret must be redacted: {dbg}");
         assert!(
@@ -5281,13 +5525,13 @@ mod tests {
 
         // Empty stored row ⇒ no fast-path match.
         assert!(
-            eph.scan_block_collect_accel(&block, 5, None, Some(&[])).is_empty(),
+            eph.scan_block_collect_accel(&block, 5, None, Some(&[]))
+                .is_empty(),
             "empty row ⇒ no fast-path match",
         );
         // Row naming a different tx ⇒ no match for this block's payment.
-        let other_txid = Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array(
-            [0xee; 32],
-        ));
+        let other_txid =
+            Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array([0xee; 32]));
         let wrong_entries = vec![TweakEntry {
             txid: other_txid,
             tweak,
@@ -5301,7 +5545,8 @@ mod tests {
         );
         // The recompute path (the fallback) still finds the payment.
         assert_eq!(
-            eph.scan_block_collect_accel(&block, 5, Some(&undo), None).len(),
+            eph.scan_block_collect_accel(&block, 5, Some(&undo), None)
+                .len(),
             1,
             "recompute fallback still matches",
         );
@@ -5477,19 +5722,20 @@ mod tests {
                 let tweak = expected["tweak"]
                     .as_str()
                     .map(|t| PublicKey::from_slice(&hex::decode(t).unwrap()).unwrap());
-                let expected_outputs = expected
-                    .get("outputs")
-                    .and_then(|v| v.as_array())
-                    .map(|arr| {
-                        arr.iter()
-                            .map(|o| {
-                                (
-                                    o["pub_key"].as_str().unwrap().to_string(),
-                                    o["priv_key_tweak"].as_str().unwrap().to_string(),
-                                )
-                            })
-                            .collect::<Vec<_>>()
-                    });
+                let expected_outputs =
+                    expected
+                        .get("outputs")
+                        .and_then(|v| v.as_array())
+                        .map(|arr| {
+                            arr.iter()
+                                .map(|o| {
+                                    (
+                                        o["pub_key"].as_str().unwrap().to_string(),
+                                        o["priv_key_tweak"].as_str().unwrap().to_string(),
+                                    )
+                                })
+                                .collect::<Vec<_>>()
+                        });
                 let n_outputs = expected.get("n_outputs").and_then(|v| v.as_u64());
 
                 cases.push(SpVectorCase {
@@ -5509,7 +5755,11 @@ mod tests {
         // Pin the vendored corpus exactly: the per-class floors in the tests
         // are deliberately loose, so a silent corpus swap must at least trip
         // this (update both on a deliberate re-vendor).
-        assert_eq!(cases.len(), 29, "vendored corpus changed: receiving entries");
+        assert_eq!(
+            cases.len(),
+            29,
+            "vendored corpus changed: receiving entries"
+        );
         cases
     }
 
@@ -5526,7 +5776,10 @@ mod tests {
         use bitcoin::secp256k1::Scalar;
         let secp = Secp256k1::new();
         let ecdh = tweak
-            .mul_tweak(&secp, &Scalar::from_be_bytes(b_scan.secret_bytes()).unwrap())
+            .mul_tweak(
+                &secp,
+                &Scalar::from_be_bytes(b_scan.secret_bytes()).unwrap(),
+            )
             .unwrap();
         let mut buf = ecdh.serialize().to_vec();
         buf.extend_from_slice(&k.to_be_bytes());
@@ -5659,7 +5912,10 @@ mod tests {
         assert!(null >= 2, "null-tweak cases not exercised: {null}");
         assert!(labeled >= 3, "labeled cases not exercised: {labeled}");
         assert!(kmax >= 1, "K_max case not exercised");
-        assert!(no_match >= 1, "eligible-but-unrelated-outputs case not exercised");
+        assert!(
+            no_match >= 1,
+            "eligible-but-unrelated-outputs case not exercised"
+        );
     }
 
     #[test]
@@ -5670,7 +5926,9 @@ mod tests {
         // zero kernel tweak derivation: corpus in, matches out.
         let mut checked = 0usize;
         for case in sp_vector_cases() {
-            let Some(exp_tweak) = case.tweak else { continue };
+            let Some(exp_tweak) = case.tweak else {
+                continue;
+            };
             let c = &case.comment;
             let reg = Arc::new(WatchRegistry::new());
             let (handle, mut rx) = reg.register(SP_VECTOR_CHANNEL);
@@ -5760,7 +6018,9 @@ mod tests {
         // identical matches — and the vector's expected count.
         let mut checked = 0usize;
         for case in sp_vector_cases() {
-            let Some(exp_tweak) = case.tweak else { continue };
+            let Some(exp_tweak) = case.tweak else {
+                continue;
+            };
             let c = &case.comment;
             let reg = Arc::new(WatchRegistry::new());
             let (handle, _rx) = reg.register(SP_VECTOR_CHANNEL);
@@ -5825,18 +6085,27 @@ mod tests {
         let (tx, undo, p0_xonly, _t) = sp_payment(&b_scan, &b_spend_pub, 12_345);
 
         let filler = spending_tx(outpoint(0x55, 1));
-        let spent_coins = vec![coin_with_spk(non_taproot_spk()), undo.spent_coins[0].clone()];
+        let spent_coins = vec![
+            coin_with_spk(non_taproot_spk()),
+            undo.spent_coins[0].clone(),
+        ];
 
         let reg = Arc::new(WatchRegistry::new());
         let (handle, mut rx) = reg.register(WATCH_CHANNEL_CAPACITY);
-        handle.add_silent_payments(&[
-            SpWatchTarget::new(b_scan.secret_bytes(), &b_spend_pub.serialize(), vec![]).unwrap(),
-        ]);
+        handle.add_silent_payments(&[SpWatchTarget::new(
+            b_scan.secret_bytes(),
+            &b_spend_pub.serialize(),
+            vec![],
+        )
+        .unwrap()]);
 
         let block = block_with(vec![coinbase_tx(), filler, tx]);
         reg.scan_block(&block, 42, Some(&UndoData { spent_coins }));
 
-        match rx.try_recv().expect("payment in the SECOND non-coinbase tx matches") {
+        match rx
+            .try_recv()
+            .expect("payment in the SECOND non-coinbase tx matches")
+        {
             WatchMatch::SilentPaymentMatched {
                 output_pubkey,
                 vout,
@@ -5898,7 +6167,10 @@ mod tests {
         let block = block_with(vec![coinbase_tx(), tx_b, tx_c]);
         reg.scan_block(&block, 5, Some(&UndoData { spent_coins }));
 
-        match rx1.try_recv().expect("subscriber 1 gets its target's match") {
+        match rx1
+            .try_recv()
+            .expect("subscriber 1 gets its target's match")
+        {
             WatchMatch::SilentPaymentMatched {
                 scan_pubkey,
                 txid,
@@ -5956,9 +6228,12 @@ mod tests {
 
         let reg = Arc::new(WatchRegistry::new());
         let (handle, mut rx) = reg.register(WATCH_CHANNEL_CAPACITY);
-        handle.add_silent_payments(&[
-            SpWatchTarget::new(b_scan.secret_bytes(), &b_spend_pub.serialize(), vec![]).unwrap(),
-        ]);
+        handle.add_silent_payments(&[SpWatchTarget::new(
+            b_scan.secret_bytes(),
+            &b_spend_pub.serialize(),
+            vec![],
+        )
+        .unwrap()]);
         reg.scan_block(&block_with(vec![coinbase_tx(), tx]), 6, Some(&undo));
 
         match rx.try_recv().expect("payment behind the OP_RETURN matches") {
@@ -6003,10 +6278,20 @@ mod tests {
 
         // Undo covers only tx_a's input.
         let block = block_with(vec![coinbase_tx(), tx_a, tx_b]);
-        reg.scan_block(&block, 8, Some(&UndoData { spent_coins: undo_a.spent_coins }));
+        reg.scan_block(
+            &block,
+            8,
+            Some(&UndoData {
+                spent_coins: undo_a.spent_coins,
+            }),
+        );
 
         match rx.try_recv().expect("covered tx still matches") {
-            WatchMatch::SilentPaymentMatched { scan_pubkey, amount, .. } => {
+            WatchMatch::SilentPaymentMatched {
+                scan_pubkey,
+                amount,
+                ..
+            } => {
                 assert_eq!(scan_pubkey, id_a);
                 assert_eq!(amount, 3_333);
             }
@@ -6030,9 +6315,12 @@ mod tests {
 
         let reg = Arc::new(WatchRegistry::new());
         let (handle, mut rx) = reg.register(WATCH_CHANNEL_CAPACITY);
-        handle.add_silent_payments(&[
-            SpWatchTarget::new(b_scan.secret_bytes(), &b_spend_pub.serialize(), vec![]).unwrap(),
-        ]);
+        handle.add_silent_payments(&[SpWatchTarget::new(
+            b_scan.secret_bytes(),
+            &b_spend_pub.serialize(),
+            vec![],
+        )
+        .unwrap()]);
         handle.set_raw_tx(true);
 
         // Block path.
@@ -6057,7 +6345,9 @@ mod tests {
         let cached = compute_tweak(&tx, &prev_scripts).expect("eligible tx yields a tweak");
         reg.scan_mempool_sp(&tx, Some(&cached));
         match rx.try_recv().expect("unconfirmed SP match") {
-            WatchMatch::SilentPaymentMatched { raw_tx, confirmed, .. } => {
+            WatchMatch::SilentPaymentMatched {
+                raw_tx, confirmed, ..
+            } => {
                 assert!(!confirmed);
                 assert_eq!(
                     raw_tx.expect("opt-in → raw_tx present").as_ref(),
@@ -6083,17 +6373,29 @@ mod tests {
         let mut data = vec![0x6a, 0x4d, 0xa0, 0x0f];
         data.extend(std::iter::repeat_n(0x5a, 4000));
         let mut stripped_tx = funding_tx_value(spk.clone(), 5_000);
-        stripped_tx.output.push(TxOut { value: Amount::ZERO, script_pubkey: ScriptBuf::from(data) });
+        stripped_tx.output.push(TxOut {
+            value: Amount::ZERO,
+            script_pubkey: ScriptBuf::from(data),
+        });
         let intact_tx = funding_tx_value(spk.clone(), 6_000);
         let (s_txid, i_txid) = (stripped_tx.compute_txid(), intact_tx.compute_txid());
         let intact_raw = bitcoin::consensus::serialize(&intact_tx);
         let mut block = block_with(vec![coinbase_tx(), stripped_tx, intact_tx]);
         block.header.merkle_root = block.compute_merkle_root().unwrap();
         let bytes = bitcoin::consensus::serialize(&block);
-        let (record, filled) = StripRecord::build(&bytes, &block, 4000).unwrap().expect("eligible");
+        let (record, filled) = StripRecord::build(&bytes, &block, 4000)
+            .unwrap()
+            .expect("eligible");
         let stored = StoredBlock::from_bytes(filled, Some(record), &block.block_hash()).unwrap();
-        assert!(stored.tx_is_stripped(1) && !stored.tx_is_stripped(2), "premise");
-        assert_ne!(stored.block.txdata[1].compute_txid(), s_txid, "premise: filled bytes hash elsewhere");
+        assert!(
+            stored.tx_is_stripped(1) && !stored.tx_is_stripped(2),
+            "premise"
+        );
+        assert_ne!(
+            stored.block.txdata[1].compute_txid(),
+            s_txid,
+            "premise: filled bytes hash elsewhere"
+        );
 
         let reg = Arc::new(WatchRegistry::new());
         let (handle, mut rx) = reg.register(WATCH_CHANNEL_CAPACITY);
@@ -6106,11 +6408,24 @@ mod tests {
             let (mut script, mut prefix, mut txid) = (0, 0, 0);
             for m in matches {
                 match m {
-                    WatchMatch::ScriptMatched { txid, raw_tx, raw_tx_stripped, .. } if txid == s_txid => {
-                        assert!(raw_tx.is_none() && raw_tx_stripped, "stripped: no bytes, flag set");
+                    WatchMatch::ScriptMatched {
+                        txid,
+                        raw_tx,
+                        raw_tx_stripped,
+                        ..
+                    } if txid == s_txid => {
+                        assert!(
+                            raw_tx.is_none() && raw_tx_stripped,
+                            "stripped: no bytes, flag set"
+                        );
                         script += 1;
                     }
-                    WatchMatch::ScriptMatched { txid, raw_tx, raw_tx_stripped, .. } => {
+                    WatchMatch::ScriptMatched {
+                        txid,
+                        raw_tx,
+                        raw_tx_stripped,
+                        ..
+                    } => {
                         assert_eq!(txid, i_txid, "only the two transactions match");
                         assert_eq!(raw_tx.as_deref(), Some(intact_raw.as_slice()));
                         assert!(!raw_tx_stripped);
@@ -6162,16 +6477,22 @@ mod tests {
 
         let secp = Secp256k1::new();
         let b_scan = SecretKey::from_slice(&[0x11u8; 32]).unwrap();
-        let b_spend_pub = PublicKey::from_secret_key(&secp, &SecretKey::from_slice(&[0x22u8; 32]).unwrap());
+        let b_spend_pub =
+            PublicKey::from_secret_key(&secp, &SecretKey::from_slice(&[0x22u8; 32]).unwrap());
         let (mut tx, undo, p0_xonly, tweak) = sp_payment(&b_scan, &b_spend_pub, 12_345);
         let mut data = vec![0x6a, 0x4d, 0xa0, 0x0f];
         data.extend(std::iter::repeat_n(0x5a, 4000));
-        tx.output.push(TxOut { value: Amount::ZERO, script_pubkey: ScriptBuf::from(data) });
+        tx.output.push(TxOut {
+            value: Amount::ZERO,
+            script_pubkey: ScriptBuf::from(data),
+        });
         let txid = tx.compute_txid();
         let mut block = block_with(vec![coinbase_tx(), tx]);
         block.header.merkle_root = block.compute_merkle_root().unwrap();
         let bytes = bitcoin::consensus::serialize(&block);
-        let (record, filled) = StripRecord::build(&bytes, &block, 4000).unwrap().expect("eligible");
+        let (record, filled) = StripRecord::build(&bytes, &block, 4000)
+            .unwrap()
+            .expect("eligible");
         let stored = StoredBlock::from_bytes(filled, Some(record), &block.block_hash()).unwrap();
         assert!(stored.tx_is_stripped(1), "premise");
 
@@ -6182,7 +6503,13 @@ mod tests {
         handle.add_silent_payments(std::slice::from_ref(&target));
         handle.set_raw_tx(true);
         let check = |m: WatchMatch| match m {
-            WatchMatch::SilentPaymentMatched { txid: got, output_pubkey, raw_tx, raw_tx_stripped, .. } => {
+            WatchMatch::SilentPaymentMatched {
+                txid: got,
+                output_pubkey,
+                raw_tx,
+                raw_tx_stripped,
+                ..
+            } => {
                 assert_eq!(got, txid, "the recorded txid, not the filled bytes' hash");
                 assert_eq!(output_pubkey, p0_xonly);
                 assert!(raw_tx.is_none() && raw_tx_stripped);
@@ -6206,4 +6533,3 @@ mod tests {
         got.into_iter().for_each(check);
     }
 }
-

@@ -22,7 +22,10 @@ fn block_page_bounds_serves_aligned_starts_inside_the_block() {
 
 #[test]
 fn block_page_bounds_past_the_end_is_404_start_index_out_of_range() {
-    let out_of_range = (StatusCode::NOT_FOUND, "start index out of range".to_string());
+    let out_of_range = (
+        StatusCode::NOT_FOUND,
+        "start index out of range".to_string(),
+    );
     assert_eq!(refusal(1, 25), out_of_range);
     assert_eq!(refusal(50, 50), out_of_range);
     assert_eq!(refusal(60, usize::MAX - usize::MAX % 25), out_of_range);

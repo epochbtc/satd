@@ -305,11 +305,14 @@ mod tests {
     fn picks_most_work_not_deepest() {
         let store = InMemoryStore::new();
         let (genesis, deep1, deep2, heavy) = (h(0), h(1), h(2), h(3));
-        chain(&store, &[
-            (deep1, genesis, EASY, BlockStatus::Valid),
-            (deep2, deep1, EASY, BlockStatus::Valid),
-            (heavy, genesis, HARDER, BlockStatus::Valid),
-        ]);
+        chain(
+            &store,
+            &[
+                (deep1, genesis, EASY, BlockStatus::Valid),
+                (deep2, deep1, EASY, BlockStatus::Valid),
+                (heavy, genesis, HARDER, BlockStatus::Valid),
+            ],
+        );
 
         let plan = plan_replay_from_block_index(&store, genesis, None).unwrap();
         assert_eq!(plan.tip_height(), 1);
@@ -326,12 +329,23 @@ mod tests {
     fn ignores_stored_height_and_chainwork_fields() {
         let store = InMemoryStore::new();
         let (genesis, a, b, liar) = (h(0), h(1), h(2), h(3));
-        chain(&store, &[
-            (a, genesis, EASY, BlockStatus::Valid),
-            (b, a, EASY, BlockStatus::Valid),
-        ]);
+        chain(
+            &store,
+            &[
+                (a, genesis, EASY, BlockStatus::Valid),
+                (b, a, EASY, BlockStatus::Valid),
+            ],
+        );
         // A one-block branch claiming enormous chainwork and an absurd height.
-        put(&store, liar, genesis, EASY, BlockStatus::Valid, 9_999, [0xffu8; 32]);
+        put(
+            &store,
+            liar,
+            genesis,
+            EASY,
+            BlockStatus::Valid,
+            9_999,
+            [0xffu8; 32],
+        );
 
         let plan = plan_replay_from_block_index(&store, genesis, None).unwrap();
         assert_eq!(
@@ -348,13 +362,16 @@ mod tests {
     fn invalid_block_excludes_its_descendants() {
         let store = InMemoryStore::new();
         let (genesis, a, bad, after_bad, side) = (h(0), h(1), h(2), h(3), h(4));
-        chain(&store, &[
-            (a, genesis, EASY, BlockStatus::Valid),
-            // Longer, but rooted in an invalidated block.
-            (bad, a, EASY, BlockStatus::Invalid),
-            (after_bad, bad, EASY, BlockStatus::Valid),
-            (side, a, EASY, BlockStatus::Valid),
-        ]);
+        chain(
+            &store,
+            &[
+                (a, genesis, EASY, BlockStatus::Valid),
+                // Longer, but rooted in an invalidated block.
+                (bad, a, EASY, BlockStatus::Invalid),
+                (after_bad, bad, EASY, BlockStatus::Valid),
+                (side, a, EASY, BlockStatus::Valid),
+            ],
+        );
 
         let plan = plan_replay_from_block_index(&store, genesis, None).unwrap();
         assert_eq!(plan.tip_hash(), side);
@@ -367,12 +384,15 @@ mod tests {
     fn header_only_gap_makes_a_branch_unconnectable() {
         let store = InMemoryStore::new();
         let (genesis, a, gap, past_gap, short) = (h(0), h(1), h(2), h(3), h(4));
-        chain(&store, &[
-            (a, genesis, EASY, BlockStatus::Valid),
-            (gap, a, EASY, BlockStatus::HeaderOnly),
-            (past_gap, gap, EASY, BlockStatus::Valid),
-            (short, a, EASY, BlockStatus::Valid),
-        ]);
+        chain(
+            &store,
+            &[
+                (a, genesis, EASY, BlockStatus::Valid),
+                (gap, a, EASY, BlockStatus::HeaderOnly),
+                (past_gap, gap, EASY, BlockStatus::Valid),
+                (short, a, EASY, BlockStatus::Valid),
+            ],
+        );
 
         let plan = plan_replay_from_block_index(&store, genesis, None).unwrap();
         assert_eq!(plan.tip_hash(), short);
@@ -388,11 +408,14 @@ mod tests {
         for _ in 0..8 {
             let store = InMemoryStore::new();
             // Insert in the "wrong" order too; the result must not depend on it.
-            chain(&store, &[
-                (a, genesis, EASY, BlockStatus::Valid),
-                (high, a, EASY, BlockStatus::Valid),
-                (low, a, EASY, BlockStatus::Valid),
-            ]);
+            chain(
+                &store,
+                &[
+                    (a, genesis, EASY, BlockStatus::Valid),
+                    (high, a, EASY, BlockStatus::Valid),
+                    (low, a, EASY, BlockStatus::Valid),
+                ],
+            );
             let plan = plan_replay_from_block_index(&store, genesis, None).unwrap();
             assert_eq!(plan.tip_hash(), low);
         }
@@ -408,11 +431,14 @@ mod tests {
         // `high` is the incumbent even though `low` sorts first, so hash order
         // and incumbent order disagree and only the incumbent rule can win.
         let store = InMemoryStore::new();
-        chain(&store, &[
-            (a, genesis, EASY, BlockStatus::Valid),
-            (low, a, EASY, BlockStatus::Valid),
-            (high, a, EASY, BlockStatus::Valid),
-        ]);
+        chain(
+            &store,
+            &[
+                (a, genesis, EASY, BlockStatus::Valid),
+                (low, a, EASY, BlockStatus::Valid),
+                (high, a, EASY, BlockStatus::Valid),
+            ],
+        );
         let plan = plan_replay_from_block_index(&store, genesis, Some(high)).unwrap();
         assert_eq!(
             plan.tip_hash(),
@@ -433,10 +459,13 @@ mod tests {
     fn forged_work_without_proof_is_excluded() {
         let store = InMemoryStore::new();
         let (genesis, a, b, forger) = (h(0), h(1), h(2), h(3));
-        chain(&store, &[
-            (a, genesis, EASY, BlockStatus::Valid),
-            (b, a, EASY, BlockStatus::Valid),
-        ]);
+        chain(
+            &store,
+            &[
+                (a, genesis, EASY, BlockStatus::Valid),
+                (b, a, EASY, BlockStatus::Valid),
+            ],
+        );
         // Claims a target ~2^32 times harder than the honest chain's, with a
         // nonce that does not meet it — the shape a flipped exponent byte
         // produces. `chain()` mines; this deliberately does not.
@@ -478,13 +507,16 @@ mod tests {
     fn orphan_strand_is_not_selected() {
         let store = InMemoryStore::new();
         let (genesis, a, orphan_root, x, y) = (h(0), h(1), h(100), h(101), h(102));
-        chain(&store, &[
-            (a, genesis, EASY, BlockStatus::Valid),
-            // orphan_root's parent (h(99)) is not in the index.
-            (orphan_root, h(99), EASY, BlockStatus::Valid),
-            (x, orphan_root, EASY, BlockStatus::Valid),
-            (y, x, EASY, BlockStatus::Valid),
-        ]);
+        chain(
+            &store,
+            &[
+                (a, genesis, EASY, BlockStatus::Valid),
+                // orphan_root's parent (h(99)) is not in the index.
+                (orphan_root, h(99), EASY, BlockStatus::Valid),
+                (x, orphan_root, EASY, BlockStatus::Valid),
+                (y, x, EASY, BlockStatus::Valid),
+            ],
+        );
 
         let plan = plan_replay_from_block_index(&store, genesis, None).unwrap();
         assert_eq!(plan.tip_hash(), a);

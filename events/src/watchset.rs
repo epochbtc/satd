@@ -111,7 +111,11 @@ type PrefixKey = (u8, u32);
 pub(crate) enum AddRejectReason {
     /// The net-new items cost `required` units; the principal already holds
     /// `held` of its `quota`.
-    QuotaExceeded { required: u64, held: u64, quota: u64 },
+    QuotaExceeded {
+        required: u64,
+        held: u64,
+        quota: u64,
+    },
     /// The per-principal add rate limit is spent.
     RateLimited { retry_after_secs: u32 },
     /// A per-connection cap: the add would bring the count to `requested`, past
@@ -136,7 +140,12 @@ pub(crate) enum RejectedItems {
     DepthAlarms(Vec<(Txid, u32)>),
     /// The descriptor and the window the add asked for. `kept` is true when an
     /// earlier window of the same descriptor stays watched.
-    Descriptor { descriptor: String, gap_limit: u32, start: u32, kept: bool },
+    Descriptor {
+        descriptor: String,
+        gap_limit: u32,
+        start: u32,
+        kept: bool,
+    },
     Prefixes(Vec<PrefixKey>),
     /// Silent-payment targets by identity `b_scan·G`, never the scan secret.
     SilentPayments(Vec<[u8; 33]>),
@@ -311,7 +320,11 @@ pub(crate) struct DesiredWatchSet {
 #[derive(Debug)]
 pub(crate) enum ReplaceOutcome {
     /// The replace applied; counts are by effective coverage.
-    Accepted { added: u32, removed: u32, unchanged: u32 },
+    Accepted {
+        added: u32,
+        removed: u32,
+        unchanged: u32,
+    },
     /// The target's total unit cost exceeds the principal's quota; the watch-set
     /// is left unchanged.
     Rejected { required: u64, quota: u64 },
@@ -395,7 +408,10 @@ impl WatchSet {
     /// A watch-set whose incremental adds are refused once it holds `entry_cap`
     /// entries across all kinds (`0` = no cap).
     pub(crate) fn with_entry_cap(entry_cap: usize) -> Self {
-        Self { entry_cap, ..Self::default() }
+        Self {
+            entry_cap,
+            ..Self::default()
+        }
     }
 
     /// The per-connection entry cap (`0` = none).
@@ -404,7 +420,10 @@ impl WatchSet {
     }
 
     fn room(&self) -> Room {
-        Room { len: self.len(), cap: self.entry_cap }
+        Room {
+            len: self.len(),
+            cap: self.entry_cap,
+        }
     }
 
     /// Add outpoints, charging the quota only for items not already watched and
@@ -416,8 +435,19 @@ impl WatchSet {
         register: impl FnOnce(&[OutPoint]),
     ) -> Result<(), AddRejected> {
         let room = self.room();
-        add_items(&mut self.outpoints, principal, incoming, "outpoints", room, register, |_| {})
-            .map_err(|(reason, items)| AddRejected { reason, items: RejectedItems::Outpoints(items) })
+        add_items(
+            &mut self.outpoints,
+            principal,
+            incoming,
+            "outpoints",
+            room,
+            register,
+            |_| {},
+        )
+        .map_err(|(reason, items)| AddRejected {
+            reason,
+            items: RejectedItems::Outpoints(items),
+        })
     }
 
     /// Add **directly-watched** scripthashes (an `AddScripts` control message).
@@ -443,9 +473,19 @@ impl WatchSet {
         // The registry/lease/floor handling is unchanged: `add_items` charges
         // net-new (scripts not already in `scripts`) and refreshes re-asserts.
         let room = self.room();
-        let added =
-            add_items(&mut self.scripts, principal, items.iter().copied(), kind, room, register, reassert)
-                .map_err(|(reason, items)| AddRejected { reason, items: RejectedItems::Scripts(items) });
+        let added = add_items(
+            &mut self.scripts,
+            principal,
+            items.iter().copied(),
+            kind,
+            room,
+            register,
+            reassert,
+        )
+        .map_err(|(reason, items)| AddRejected {
+            reason,
+            items: RejectedItems::Scripts(items),
+        });
         // Reconcile direct ownership for whatever is now watched: every script
         // that ended up in `scripts` (net-new committed, or already held) and is
         // not yet a direct owner becomes one. A net-new that failed the quota is
@@ -529,21 +569,37 @@ impl WatchSet {
             ));
         }
 
-        let old: Vec<Scripthash> = self.descriptors.get(&descriptor).cloned().unwrap_or_default();
+        let old: Vec<Scripthash> = self
+            .descriptors
+            .get(&descriptor)
+            .cloned()
+            .unwrap_or_default();
         let old_set: HashSet<Scripthash> = old.iter().copied().collect();
 
         // Scripts entering this descriptor's window (gain it as an owner).
-        let to_add: Vec<Scripthash> = new.iter().copied().filter(|s| !old_set.contains(s)).collect();
+        let to_add: Vec<Scripthash> = new
+            .iter()
+            .copied()
+            .filter(|s| !old_set.contains(s))
+            .collect();
         // Among those, the ones not currently watched at all are net-new to the
         // registry and must fit the quota atomically.
-        let net_new: Vec<Scripthash> =
-            to_add.iter().copied().filter(|s| !self.scripts.contains_key(s)).collect();
+        let net_new: Vec<Scripthash> = to_add
+            .iter()
+            .copied()
+            .filter(|s| !self.scripts.contains_key(s))
+            .collect();
 
         if !net_new.is_empty() {
             let room = self.room();
-            if let Err(reason) =
-                reserve_scripts(&mut self.scripts, principal, &net_new, "descriptor", room, register)
-            {
+            if let Err(reason) = reserve_scripts(
+                &mut self.scripts,
+                principal,
+                &net_new,
+                "descriptor",
+                room,
+                register,
+            ) {
                 // Quota/rate/cap rejected the net-new batch: change nothing
                 // (membership, ownership, and the prior window all stay as they
                 // were).
@@ -565,7 +621,10 @@ impl WatchSet {
                     retry_after_secs,
                     "descriptor re-assert rate-limited; skipping",
                 );
-                return Err((AddRejectReason::RateLimited { retry_after_secs }, !is_new_descriptor));
+                return Err((
+                    AddRejectReason::RateLimited { retry_after_secs },
+                    !is_new_descriptor,
+                ));
             }
         }
         // Commit ownership for every script that gained this descriptor.
@@ -589,7 +648,10 @@ impl WatchSet {
         self.clear_reverse_index(&descriptor, &old);
         let key: std::sync::Arc<str> = std::sync::Arc::from(descriptor.as_str());
         for (s, (branch, index)) in new.iter().zip(new_coords.iter()) {
-            self.script_descriptors.entry(*s).or_default().push((key.clone(), *branch, *index));
+            self.script_descriptors
+                .entry(*s)
+                .or_default()
+                .push((key.clone(), *branch, *index));
         }
 
         self.descriptors.insert(descriptor, new);
@@ -669,8 +731,10 @@ impl WatchSet {
         // Rebuilt reverse index (scripthash → (descriptor, branch, index)) so match
         // attribution stays correct across a replace — wholesale, so departed
         // descriptors' entries simply don't reappear.
-        let mut target_script_descriptors: HashMap<Scripthash, Vec<(std::sync::Arc<str>, u32, u32)>> =
-            HashMap::new();
+        let mut target_script_descriptors: HashMap<
+            Scripthash,
+            Vec<(std::sync::Arc<str>, u32, u32)>,
+        > = HashMap::new();
         for (desc, coords) in &desired.descriptors {
             if target_descriptors.contains_key(desc) {
                 continue;
@@ -701,7 +765,9 @@ impl WatchSet {
         // occurrence wins. One quota unit each; no shared ownership.
         let mut target_sp: HashMap<[u8; 33], node::events::SpWatchTarget> = HashMap::new();
         for t in &desired.sp_targets {
-            target_sp.entry(t.scan_pubkey()).or_insert_with(|| t.clone());
+            target_sp
+                .entry(t.scan_pubkey())
+                .or_insert_with(|| t.clone());
         }
         // Per-connection SP cap applies regardless of the generic entry cap
         // (`max_items` is 0/unlimited on the gRPC carrier). Checked before any
@@ -743,29 +809,64 @@ impl WatchSet {
         // item's metadata (floor / auto-close) is refreshed in place; membership
         // is idempotent so this never double-registers. Only genuinely departed
         // items are removed. Metadata-less kinds register net-new only.
-        let departed_scripts: Vec<Scripthash> =
-            self.scripts.keys().filter(|k| !target_scripts.contains(*k)).copied().collect();
-        let all_target_scripts: Vec<(Scripthash, u64)> =
-            target_scripts.iter().map(|sh| (*sh, target_floors.get(sh).copied().unwrap_or(0))).collect();
-        let departed_outpoints: Vec<OutPoint> =
-            self.outpoints.keys().filter(|k| !target_outpoints.contains(*k)).copied().collect();
-        let new_outpoints: Vec<OutPoint> =
-            target_outpoints.iter().filter(|k| !self.outpoints.contains_key(*k)).copied().collect();
-        let departed_txids: Vec<Txid> =
-            self.txids.keys().filter(|k| !target_txids.contains_key(*k)).copied().collect();
-        let departed_depths: Vec<(Txid, u32)> =
-            self.tx_depths.keys().filter(|k| !target_depths.contains(*k)).copied().collect();
-        let new_depths: Vec<(Txid, u32)> =
-            target_depths.iter().filter(|k| !self.tx_depths.contains_key(*k)).copied().collect();
-        let departed_prefixes: Vec<PrefixKey> =
-            self.prefixes.keys().filter(|k| !target_prefixes.contains_key(*k)).copied().collect();
-        let new_prefixes: Vec<PrefixKey> =
-            target_prefixes.keys().filter(|k| !self.prefixes.contains_key(*k)).copied().collect();
+        let departed_scripts: Vec<Scripthash> = self
+            .scripts
+            .keys()
+            .filter(|k| !target_scripts.contains(*k))
+            .copied()
+            .collect();
+        let all_target_scripts: Vec<(Scripthash, u64)> = target_scripts
+            .iter()
+            .map(|sh| (*sh, target_floors.get(sh).copied().unwrap_or(0)))
+            .collect();
+        let departed_outpoints: Vec<OutPoint> = self
+            .outpoints
+            .keys()
+            .filter(|k| !target_outpoints.contains(*k))
+            .copied()
+            .collect();
+        let new_outpoints: Vec<OutPoint> = target_outpoints
+            .iter()
+            .filter(|k| !self.outpoints.contains_key(*k))
+            .copied()
+            .collect();
+        let departed_txids: Vec<Txid> = self
+            .txids
+            .keys()
+            .filter(|k| !target_txids.contains_key(*k))
+            .copied()
+            .collect();
+        let departed_depths: Vec<(Txid, u32)> = self
+            .tx_depths
+            .keys()
+            .filter(|k| !target_depths.contains(*k))
+            .copied()
+            .collect();
+        let new_depths: Vec<(Txid, u32)> = target_depths
+            .iter()
+            .filter(|k| !self.tx_depths.contains_key(*k))
+            .copied()
+            .collect();
+        let departed_prefixes: Vec<PrefixKey> = self
+            .prefixes
+            .keys()
+            .filter(|k| !target_prefixes.contains_key(*k))
+            .copied()
+            .collect();
+        let new_prefixes: Vec<PrefixKey> = target_prefixes
+            .keys()
+            .filter(|k| !self.prefixes.contains_key(*k))
+            .copied()
+            .collect();
         // SP: departed = held identity absent from target; the full target set is
         // re-registered (kept + new) so a kept identity's label set is refreshed
         // in place (the node registry replaces by identity).
-        let departed_sp: Vec<[u8; 33]> =
-            self.silent_payments.keys().filter(|k| !target_sp.contains_key(*k)).copied().collect();
+        let departed_sp: Vec<[u8; 33]> = self
+            .silent_payments
+            .keys()
+            .filter(|k| !target_sp.contains_key(*k))
+            .copied()
+            .collect();
         let all_target_sp: Vec<node::events::SpWatchTarget> = target_sp.values().cloned().collect();
 
         // Counts by effective coverage (kept = in both, added = net-new).
@@ -775,12 +876,9 @@ impl WatchSet {
         let kept_depths = self.tx_depths.len() - departed_depths.len();
         let kept_prefixes = self.prefixes.len() - departed_prefixes.len();
         let kept_sp = self.silent_payments.len() - departed_sp.len();
-        let unchanged = (kept_scripts
-            + kept_outpoints
-            + kept_txids
-            + kept_depths
-            + kept_prefixes
-            + kept_sp) as u32;
+        let unchanged =
+            (kept_scripts + kept_outpoints + kept_txids + kept_depths + kept_prefixes + kept_sp)
+                as u32;
         let removed = (departed_scripts.len()
             + departed_outpoints.len()
             + departed_txids.len()
@@ -821,11 +919,17 @@ impl WatchSet {
                     Some(b)
                 }
                 Err(satd_auth::WatchReject::QuotaExceeded(q)) => {
-                    return ReplaceOutcome::Rejected { required: target_units, quota: q.max };
+                    return ReplaceOutcome::Rejected {
+                        required: target_units,
+                        quota: q.max,
+                    };
                 }
                 Err(_) => {
                     // Lacks `stream:watch`: no headroom, set left unchanged.
-                    return ReplaceOutcome::Rejected { required: target_units, quota: 0 };
+                    return ReplaceOutcome::Rejected {
+                        required: target_units,
+                        quota: 0,
+                    };
                 }
             }
         } else {
@@ -839,7 +943,10 @@ impl WatchSet {
         self.outpoints = target_outpoints.iter().map(|op| (*op, take(1))).collect();
         self.txids = target_txids.keys().map(|t| (*t, take(1))).collect();
         self.tx_depths = target_depths.iter().map(|k| (*k, take(1))).collect();
-        self.prefixes = target_prefixes.iter().map(|(k, units)| (*k, take(*units))).collect();
+        self.prefixes = target_prefixes
+            .iter()
+            .map(|(k, units)| (*k, take(*units)))
+            .collect();
         self.silent_payments = target_sp.keys().map(|id| (*id, take(1))).collect();
         self.script_owners = target_owners;
         self.script_direct = target_direct;
@@ -891,7 +998,11 @@ impl WatchSet {
             reg.remove_silent_payments(&departed_sp);
         }
 
-        ReplaceOutcome::Accepted { added, removed, unchanged }
+        ReplaceOutcome::Accepted {
+            added,
+            removed,
+            unchanged,
+        }
     }
 
     /// Defuse (drop **without** releasing) every current per-item lease. Used by
@@ -959,7 +1070,10 @@ impl WatchSet {
         &self,
         scripthash: &Scripthash,
     ) -> &[(std::sync::Arc<str>, u32, u32)] {
-        self.script_descriptors.get(scripthash).map(Vec::as_slice).unwrap_or(&[])
+        self.script_descriptors
+            .get(scripthash)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
     }
 
     /// Drop one owner from a scripthash. If that was its last owner, queue it in
@@ -994,8 +1108,19 @@ impl WatchSet {
         register: impl FnOnce(&[Txid]),
     ) -> Result<(), AddRejected> {
         let room = self.room();
-        add_items(&mut self.txids, principal, incoming, "transactions", room, register, |_| {})
-            .map_err(|(reason, items)| AddRejected { reason, items: RejectedItems::Transactions(items) })
+        add_items(
+            &mut self.txids,
+            principal,
+            incoming,
+            "transactions",
+            room,
+            register,
+            |_| {},
+        )
+        .map_err(|(reason, items)| AddRejected {
+            reason,
+            items: RejectedItems::Transactions(items),
+        })
     }
 
     /// Remove txids, releasing each removed item's quota unit.
@@ -1016,8 +1141,19 @@ impl WatchSet {
         register: impl FnOnce(&[(Txid, u32)]),
     ) -> Result<(), AddRejected> {
         let room = self.room();
-        add_items(&mut self.tx_depths, principal, incoming, "tx_depths", room, register, |_| {})
-            .map_err(|(reason, items)| AddRejected { reason, items: RejectedItems::DepthAlarms(items) })
+        add_items(
+            &mut self.tx_depths,
+            principal,
+            incoming,
+            "tx_depths",
+            room,
+            register,
+            |_| {},
+        )
+        .map_err(|(reason, items)| AddRejected {
+            reason,
+            items: RejectedItems::DepthAlarms(items),
+        })
     }
 
     /// Remove depth alarms, releasing each removed pair's quota unit.
@@ -1053,7 +1189,10 @@ impl WatchSet {
             register,
             |_| {},
         )
-        .map_err(|(reason, items)| AddRejected { reason, items: RejectedItems::Prefixes(items) })
+        .map_err(|(reason, items)| AddRejected {
+            reason,
+            items: RejectedItems::Prefixes(items),
+        })
     }
 
     /// Remove prefix watches, releasing each removed bucket's (multi-unit) lease.
@@ -1162,7 +1301,10 @@ impl WatchSet {
             if !reassert.is_empty() {
                 register(&reassert);
             }
-            return Err(rejected(AddRejectReason::RateLimited { retry_after_secs }, &net_new));
+            return Err(rejected(
+                AddRejectReason::RateLimited { retry_after_secs },
+                &net_new,
+            ));
         }
         let new_ids: Vec<[u8; 33]> = net_new.iter().map(|t| t.scan_pubkey()).collect();
         // Register net-new first (indices `[0, n_new)`) then the re-asserts, and
@@ -1212,7 +1354,10 @@ impl WatchSet {
                     // nothing new is retained.
                     Err(reason) => {
                         register(&to_register[n_new..]);
-                        Err(AddRejected { reason, items: RejectedItems::SilentPayments(new_ids) })
+                        Err(AddRejected {
+                            reason,
+                            items: RejectedItems::SilentPayments(new_ids),
+                        })
                     }
                 }
             }
@@ -1263,7 +1408,16 @@ fn add_items<T: Eq + Hash + Copy>(
     reassert: impl FnOnce(&[T]),
 ) -> Result<(), Refused<T>> {
     // The common case: every item costs exactly one unit.
-    add_items_priced(held, principal, incoming, |_| 1, kind, room, register, reassert)
+    add_items_priced(
+        held,
+        principal,
+        incoming,
+        |_| 1,
+        kind,
+        room,
+        register,
+        reassert,
+    )
 }
 
 /// Generalization of [`add_items`] where each item carries its own quota cost
@@ -1485,9 +1639,9 @@ mod tests {
     fn op(b: u8, vout: u32) -> OutPoint {
         use bitcoin::hashes::Hash;
         OutPoint {
-            txid: bitcoin::Txid::from_raw_hash(
-                bitcoin::hashes::sha256d::Hash::from_byte_array([b; 32]),
-            ),
+            txid: bitcoin::Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array(
+                [b; 32],
+            )),
             vout,
         }
     }
@@ -1514,7 +1668,8 @@ mod tests {
         let mut registered = 0;
         ws.add_outpoints(Some(&p), [op(1, 0), op(2, 0), op(3, 0)], |items| {
             registered = items.len();
-        }).unwrap();
+        })
+        .unwrap();
         assert_eq!(registered, 3);
         assert_eq!(q.current("tenant"), 3, "three items charged 3 units");
         assert_eq!(ws.len(), 3);
@@ -1533,16 +1688,26 @@ mod tests {
         let q = acct.quota();
         let mut ws = WatchSet::default();
 
-        ws.add_outpoints(Some(&p), [op(1, 0), op(2, 0)], |_| {}).unwrap();
+        ws.add_outpoints(Some(&p), [op(1, 0), op(2, 0)], |_| {})
+            .unwrap();
         assert_eq!(q.current("tenant"), 2);
 
         // A SEPARATE message re-asserts op(1) and adds op(3): only op(3) is new.
         let mut registered = Vec::new();
         ws.add_outpoints(Some(&p), [op(1, 0), op(3, 0)], |items| {
             registered = items.to_vec();
-        }).unwrap();
-        assert_eq!(registered, vec![op(3, 0)], "only the net-new item registers");
-        assert_eq!(q.current("tenant"), 3, "the re-asserted item is not double-charged");
+        })
+        .unwrap();
+        assert_eq!(
+            registered,
+            vec![op(3, 0)],
+            "only the net-new item registers"
+        );
+        assert_eq!(
+            q.current("tenant"),
+            3,
+            "the re-asserted item is not double-charged"
+        );
     }
 
     fn sh(b: u8) -> Scripthash {
@@ -1554,7 +1719,10 @@ mod tests {
     /// the reverse index records index == position (matching the old positional
     /// offset for a single branch).
     fn win(shs: &[Scripthash]) -> Vec<(u32, u32, Scripthash)> {
-        shs.iter().enumerate().map(|(i, s)| (0u32, i as u32, *s)).collect()
+        shs.iter()
+            .enumerate()
+            .map(|(i, s)| (0u32, i as u32, *s))
+            .collect()
     }
 
     #[test]
@@ -1569,8 +1737,19 @@ mod tests {
         let mut ws = WatchSet::default();
 
         let mut net_new = Vec::new();
-        ws.add_scripts(Some(&p), [sh(1), sh(2)], "scripts", |s| net_new = s.to_vec(), |_| {}).unwrap();
-        assert_eq!(net_new, vec![sh(1), sh(2)], "first add registers both as net-new");
+        ws.add_scripts(
+            Some(&p),
+            [sh(1), sh(2)],
+            "scripts",
+            |s| net_new = s.to_vec(),
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(
+            net_new,
+            vec![sh(1), sh(2)],
+            "first add registers both as net-new"
+        );
         assert_eq!(q.current("tenant"), 2);
 
         // Re-assert sh(1) (held) and add sh(3) (new) in one message: sh(1) must
@@ -1583,9 +1762,14 @@ mod tests {
             "scripts",
             |s| net_new2 = s.to_vec(),
             |s| reasserted = s.to_vec(),
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(net_new2, vec![sh(3)], "only the new script registers");
-        assert_eq!(reasserted, vec![sh(1)], "the held script is surfaced for refresh");
+        assert_eq!(
+            reasserted,
+            vec![sh(1)],
+            "the held script is surfaced for refresh"
+        );
         assert_eq!(q.current("tenant"), 3, "re-assert charges no extra quota");
 
         // A re-assert-ONLY message (no net-new) must still fire `reassert`.
@@ -1597,9 +1781,14 @@ mod tests {
             "scripts",
             |_| net_new3 = true,
             |s| reasserted3 = s.to_vec(),
-        ).unwrap();
+        )
+        .unwrap();
         assert!(!net_new3, "no net-new registration on a re-assert-only add");
-        assert_eq!(reasserted3, vec![sh(1), sh(2)], "both held scripts are surfaced");
+        assert_eq!(
+            reasserted3,
+            vec![sh(1), sh(2)],
+            "both held scripts are surfaced"
+        );
         assert_eq!(q.current("tenant"), 3, "re-assert-only add charges nothing");
     }
 
@@ -1614,17 +1803,32 @@ mod tests {
             Arc::from("tenant"),
             CapabilitySet::EMPTY.with(Capability::StreamWatch),
             Some(100),
-            Some(RatePolicy { burst: 1, per_sec: 1 }),
+            Some(RatePolicy {
+                burst: 1,
+                per_sec: 1,
+            }),
             acct.clone(),
         );
         let mut ws = WatchSet::default();
 
-        ws.add_scripts(Some(&p), [sh(1)], "scripts", |_| {}, |_| {}).unwrap();
+        ws.add_scripts(Some(&p), [sh(1)], "scripts", |_| {}, |_| {})
+            .unwrap();
         // Bucket now empty. Re-assert sh(1): a net-new add here would be
         // throttled, but a re-assert must bypass the rate limiter entirely.
         let mut reasserted = Vec::new();
-        ws.add_scripts(Some(&p), [sh(1)], "scripts", |_| {}, |s| reasserted = s.to_vec()).unwrap();
-        assert_eq!(reasserted, vec![sh(1)], "re-assert fires even with an empty rate bucket");
+        ws.add_scripts(
+            Some(&p),
+            [sh(1)],
+            "scripts",
+            |_| {},
+            |s| reasserted = s.to_vec(),
+        )
+        .unwrap();
+        assert_eq!(
+            reasserted,
+            vec![sh(1)],
+            "re-assert fires even with an empty rate bucket"
+        );
     }
 
     #[test]
@@ -1636,7 +1840,9 @@ mod tests {
         // Three net-new items but quota is 2 → the whole add is rejected.
         let mut registered = false;
         let rejected = ws
-            .add_outpoints(Some(&p), [op(1, 0), op(2, 0), op(3, 0)], |_| registered = true)
+            .add_outpoints(Some(&p), [op(1, 0), op(2, 0), op(3, 0)], |_| {
+                registered = true
+            })
             .unwrap_err();
         assert!(!registered, "an add that overflows quota registers nothing");
         assert_eq!(q.current("tenant"), 0, "no units charged on a rejected add");
@@ -1644,7 +1850,11 @@ mod tests {
         assert_eq!(
             rejected,
             AddRejected {
-                reason: AddRejectReason::QuotaExceeded { required: 3, held: 0, quota: 2 },
+                reason: AddRejectReason::QuotaExceeded {
+                    required: 3,
+                    held: 0,
+                    quota: 2
+                },
                 items: RejectedItems::Outpoints(vec![op(1, 0), op(2, 0), op(3, 0)]),
             },
             "the refusal names the cost, the quota and every refused item",
@@ -1663,7 +1873,14 @@ mod tests {
         let rejected = ws
             .add_outpoints(Some(&p), [op(1, 0), op(2, 0), op(3, 0)], |_| {})
             .unwrap_err();
-        assert_eq!(rejected.reason, AddRejectReason::QuotaExceeded { required: 2, held: 1, quota: 2 });
+        assert_eq!(
+            rejected.reason,
+            AddRejectReason::QuotaExceeded {
+                required: 2,
+                held: 1,
+                quota: 2
+            }
+        );
         assert_eq!(
             rejected.items,
             RejectedItems::Outpoints(vec![op(2, 0), op(3, 0)]),
@@ -1684,7 +1901,9 @@ mod tests {
             acct,
         );
         let mut ws = WatchSet::default();
-        let rejected = ws.add_scripts(Some(&p), [sh(1)], "scripts", |_| {}, |_| {}).unwrap_err();
+        let rejected = ws
+            .add_scripts(Some(&p), [sh(1)], "scripts", |_| {}, |_| {})
+            .unwrap_err();
         assert_eq!(rejected.reason, AddRejectReason::PermissionDenied);
         assert_eq!(rejected.items, RejectedItems::Scripts(vec![sh(1)]));
         assert_eq!(ws.len(), 0);
@@ -1693,7 +1912,8 @@ mod tests {
     #[test]
     fn entry_cap_refuses_growth_but_not_reasserts() {
         let mut ws = WatchSet::with_entry_cap(2);
-        ws.add_outpoints(None, [op(1, 0), op(2, 0)], |_| {}).unwrap();
+        ws.add_outpoints(None, [op(1, 0), op(2, 0)], |_| {})
+            .unwrap();
         // At the cap, a message that only re-asserts held items grows nothing.
         ws.add_outpoints(None, [op(1, 0)], |_| {}).unwrap();
         let mut registered = false;
@@ -1704,7 +1924,10 @@ mod tests {
         assert_eq!(
             rejected,
             AddRejected {
-                reason: AddRejectReason::CapExceeded { requested: 3, limit: 2 },
+                reason: AddRejectReason::CapExceeded {
+                    requested: 3,
+                    limit: 2
+                },
                 items: RejectedItems::Scripts(vec![sh(9)]),
             },
             "the cap spans every kind of watch",
@@ -1724,7 +1947,8 @@ mod tests {
         let mut ws = WatchSet::default();
         ws.add_transactions(Some(&p), [txid(1), txid(2)], |items| {
             assert_eq!(items.len(), 2)
-        }).unwrap();
+        })
+        .unwrap();
         assert_eq!(q.current("tenant"), 2, "two txids charge 2 units");
         ws.remove_transactions([txid(1)], |items| assert_eq!(items.len(), 1));
         assert_eq!(q.current("tenant"), 1, "per-remove release frees one unit");
@@ -1755,7 +1979,8 @@ mod tests {
         // Two depths on the SAME txid are two distinct items → two units.
         ws.add_tx_depths(Some(&p), [(txid(1), 1), (txid(1), 3)], |items| {
             assert_eq!(items.len(), 2)
-        }).unwrap();
+        })
+        .unwrap();
         assert_eq!(q.current("tenant"), 2, "(X,1) and (X,3) charge 2 units");
         assert_eq!(ws.len(), 2);
 
@@ -1763,7 +1988,8 @@ mod tests {
         let mut reg = Vec::new();
         ws.add_tx_depths(Some(&p), [(txid(1), 1), (txid(1), 6)], |items| {
             reg = items.to_vec()
-        }).unwrap();
+        })
+        .unwrap();
         assert_eq!(reg, vec![(txid(1), 6)], "only the net-new pair registers");
         assert_eq!(q.current("tenant"), 3);
 
@@ -1782,7 +2008,10 @@ mod tests {
 
         let mut called = false;
         ws.remove_outpoints([op(9, 9)], |_| called = true);
-        assert!(!called, "removing something not watched does not unregister");
+        assert!(
+            !called,
+            "removing something not watched does not unregister"
+        );
         assert_eq!(q.current("tenant"), 1, "quota unchanged");
     }
 
@@ -1791,7 +2020,8 @@ mod tests {
         let (p, acct) = tenant(10);
         let q = acct.quota();
         let mut ws = WatchSet::default();
-        ws.add_outpoints(Some(&p), [op(1, 0), op(2, 0)], |_| {}).unwrap();
+        ws.add_outpoints(Some(&p), [op(1, 0), op(2, 0)], |_| {})
+            .unwrap();
         assert_eq!(q.current("tenant"), 2);
         drop(ws);
         assert_eq!(q.current("tenant"), 0, "full teardown releases all leases");
@@ -1804,7 +2034,8 @@ mod tests {
         // No principal → no quota, items still tracked for dedup/removal.
         ws.add_outpoints(None, [op(1, 0), op(1, 0), op(2, 0)], |items| {
             registered = items.len();
-        }).unwrap();
+        })
+        .unwrap();
         assert_eq!(registered, 2, "intra-message dedup still applies");
         assert_eq!(ws.len(), 2);
     }
@@ -1819,14 +2050,18 @@ mod tests {
             Arc::from("tenant"),
             CapabilitySet::EMPTY.with(Capability::StreamWatch),
             Some(100),
-            Some(RatePolicy { burst: 1, per_sec: 1 }),
+            Some(RatePolicy {
+                burst: 1,
+                per_sec: 1,
+            }),
             acct.clone(),
         );
         let q = acct.quota();
         let mut ws = WatchSet::default();
 
         let mut reg1 = 0;
-        ws.add_outpoints(Some(&p), [op(1, 0)], |items| reg1 = items.len()).unwrap();
+        ws.add_outpoints(Some(&p), [op(1, 0)], |items| reg1 = items.len())
+            .unwrap();
         assert_eq!(reg1, 1, "first add is within the burst");
         assert_eq!(q.current("tenant"), 1);
 
@@ -1834,7 +2069,9 @@ mod tests {
         // registered or charged, and the existing watch-set is intact (no
         // teardown).
         let mut reg2 = 0;
-        let rejected = ws.add_outpoints(Some(&p), [op(2, 0)], |items| reg2 = items.len()).unwrap_err();
+        let rejected = ws
+            .add_outpoints(Some(&p), [op(2, 0)], |items| reg2 = items.len())
+            .unwrap_err();
         assert!(
             matches!(rejected.reason, AddRejectReason::RateLimited { retry_after_secs } if retry_after_secs >= 1),
             "a throttled add says when to retry: {rejected:?}",
@@ -1880,14 +2117,23 @@ mod tests {
         let c32 = parse_prefix(&[0x11, 0x22, 0x33, 0x44], 32, 8, 32).unwrap(); // 1 unit
 
         let mut reg = 0;
-        ws.add_prefixes(Some(&p), [c24, c32], |keys| reg = keys.len()).unwrap();
+        ws.add_prefixes(Some(&p), [c24, c32], |keys| reg = keys.len())
+            .unwrap();
         assert_eq!(reg, 2);
         assert_eq!(q.current("tenant"), (1 << 8) + 1, "coarseness-priced units");
-        assert_eq!(ws.len(), 2, "two buckets = two items regardless of unit cost");
+        assert_eq!(
+            ws.len(),
+            2,
+            "two buckets = two items regardless of unit cost"
+        );
 
         // Removing the coarse bucket releases all of its units.
         ws.remove_prefixes([c24.0], |keys| assert_eq!(keys.len(), 1));
-        assert_eq!(q.current("tenant"), 1, "per-bucket release frees its full cost");
+        assert_eq!(
+            q.current("tenant"),
+            1,
+            "per-bucket release frees its full cost"
+        );
         assert_eq!(ws.len(), 1);
     }
 
@@ -1903,7 +2149,11 @@ mod tests {
         let mut called = false;
         ws.add_prefixes(Some(&p), [a], |_| called = true).unwrap();
         assert!(!called, "re-asserted bucket registers nothing");
-        assert_eq!(q.current("tenant"), charged, "dedup: the bucket is not double-charged");
+        assert_eq!(
+            q.current("tenant"),
+            charged,
+            "dedup: the bucket is not double-charged"
+        );
     }
 
     #[test]
@@ -1914,16 +2164,25 @@ mod tests {
         // A k=24 prefix costs 1<<8 = 256 units > quota 10 → whole add rejected.
         let c = parse_prefix(&[0xaa, 0xbb, 0xcc], 24, 8, 32).unwrap();
         let mut registered = false;
-        let rejected = ws.add_prefixes(Some(&p), [c], |_| registered = true).unwrap_err();
+        let rejected = ws
+            .add_prefixes(Some(&p), [c], |_| registered = true)
+            .unwrap_err();
         assert_eq!(
             rejected,
             AddRejected {
-                reason: AddRejectReason::QuotaExceeded { required: 1 << 8, held: 0, quota: 10 },
+                reason: AddRejectReason::QuotaExceeded {
+                    required: 1 << 8,
+                    held: 0,
+                    quota: 10
+                },
                 items: RejectedItems::Prefixes(vec![c.0]),
             },
             "a prefix refusal states its coarseness price",
         );
-        assert!(!registered, "a prefix add that overflows quota registers nothing");
+        assert!(
+            !registered,
+            "a prefix add that overflows quota registers nothing"
+        );
         assert_eq!(q.current("tenant"), 0);
         assert_eq!(ws.len(), 0);
     }
@@ -1944,7 +2203,10 @@ mod tests {
             Arc::from("tenant"),
             CapabilitySet::EMPTY.with(Capability::StreamWatch),
             Some(100),
-            Some(RatePolicy { burst: 2, per_sec: 1 }),
+            Some(RatePolicy {
+                burst: 2,
+                per_sec: 1,
+            }),
             acct.clone(),
         );
         let mut ws = WatchSet::default();
@@ -1952,9 +2214,13 @@ mod tests {
         ws.add_outpoints(Some(&p), [op(1, 0)], |_| {}).unwrap();
         ws.add_outpoints(Some(&p), [op(1, 0)], |_| {}).unwrap(); // duplicate → no-op, free
         let mut reg3 = 0;
-        ws.add_outpoints(Some(&p), [op(2, 0)], |items| reg3 = items.len()).unwrap();
+        ws.add_outpoints(Some(&p), [op(2, 0)], |items| reg3 = items.len())
+            .unwrap();
 
-        assert_eq!(reg3, 1, "a no-op duplicate must not have spent the rate budget");
+        assert_eq!(
+            reg3, 1,
+            "a no-op duplicate must not have spent the rate budget"
+        );
         assert_eq!(ws.len(), 2, "both distinct watches registered");
     }
 
@@ -1973,14 +2239,23 @@ mod tests {
             win(&[sh(1), sh(2), sh(3)]),
             |s| registered = s.to_vec(),
             |_| {},
-        ).unwrap();
-        assert_eq!(registered, vec![sh(1), sh(2), sh(3)], "every derived script registers");
+        )
+        .unwrap();
+        assert_eq!(
+            registered,
+            vec![sh(1), sh(2), sh(3)],
+            "every derived script registers"
+        );
         assert_eq!(q.current("tenant"), 3, "one unit per derived script");
         assert_eq!(ws.len(), 3);
 
         let mut unregistered = Vec::new();
         ws.remove_descriptor("D", |s| unregistered = s.to_vec());
-        assert_eq!(unregistered.len(), 3, "removing the descriptor releases all its scripts");
+        assert_eq!(
+            unregistered.len(),
+            3,
+            "removing the descriptor releases all its scripts"
+        );
         assert_eq!(q.current("tenant"), 0, "all units returned");
         assert_eq!(ws.len(), 0);
     }
@@ -1992,7 +2267,8 @@ mod tests {
         let mut ws = WatchSet::default();
 
         // Directly watch sh(2), then a descriptor whose window also contains it.
-        ws.add_scripts(Some(&p), [sh(2)], "scripts", |_| {}, |_| {}).unwrap();
+        ws.add_scripts(Some(&p), [sh(2)], "scripts", |_| {}, |_| {})
+            .unwrap();
         assert_eq!(q.current("tenant"), 1);
         let mut registered = Vec::new();
         ws.add_descriptor(
@@ -2001,18 +2277,34 @@ mod tests {
             win(&[sh(1), sh(2), sh(3)]),
             |s| registered = s.to_vec(),
             |_| {},
-        ).unwrap();
+        )
+        .unwrap();
         // sh(2) was already watched → only sh(1), sh(3) are net-new.
-        assert_eq!(registered, vec![sh(1), sh(3)], "the shared script is not re-charged");
+        assert_eq!(
+            registered,
+            vec![sh(1), sh(3)],
+            "the shared script is not re-charged"
+        );
         assert_eq!(q.current("tenant"), 3, "sh1 + sh2(direct) + sh3");
 
         // Removing the descriptor drops sh(1)/sh(3) but NOT sh(2) — the direct
         // add still owns it.
         let mut unregistered = Vec::new();
         ws.remove_descriptor("D", |s| unregistered = s.to_vec());
-        assert_eq!(unregistered.len(), 2, "only the descriptor-only scripts release");
-        assert!(!unregistered.contains(&sh(2)), "the shared, still-direct script stays");
-        assert_eq!(q.current("tenant"), 1, "sh(2) lease held by its direct owner");
+        assert_eq!(
+            unregistered.len(),
+            2,
+            "only the descriptor-only scripts release"
+        );
+        assert!(
+            !unregistered.contains(&sh(2)),
+            "the shared, still-direct script stays"
+        );
+        assert_eq!(
+            q.current("tenant"),
+            1,
+            "sh(2) lease held by its direct owner"
+        );
         assert_eq!(ws.len(), 1);
 
         // Now the direct remove drops the last owner.
@@ -2027,8 +2319,10 @@ mod tests {
         let q = acct.quota();
         let mut ws = WatchSet::default();
 
-        ws.add_descriptor(Some(&p), "D1".into(), win(&[sh(1), sh(2)]), |_| {}, |_| {}).unwrap();
-        ws.add_descriptor(Some(&p), "D2".into(), win(&[sh(2), sh(3)]), |_| {}, |_| {}).unwrap();
+        ws.add_descriptor(Some(&p), "D1".into(), win(&[sh(1), sh(2)]), |_| {}, |_| {})
+            .unwrap();
+        ws.add_descriptor(Some(&p), "D2".into(), win(&[sh(2), sh(3)]), |_| {}, |_| {})
+            .unwrap();
         // sh(2) shared → charged once; total sh1 + sh2 + sh3.
         assert_eq!(q.current("tenant"), 3);
         assert_eq!(ws.len(), 3);
@@ -2036,7 +2330,11 @@ mod tests {
         // Drop D1: sh(1) releases, sh(2) stays (still owned by D2).
         let mut unregistered = Vec::new();
         ws.remove_descriptor("D1", |s| unregistered = s.to_vec());
-        assert_eq!(unregistered, vec![sh(1)], "only D1's exclusive script releases");
+        assert_eq!(
+            unregistered,
+            vec![sh(1)],
+            "only D1's exclusive script releases"
+        );
         assert_eq!(q.current("tenant"), 2);
 
         // Drop D2: sh(2) and sh(3) release.
@@ -2051,7 +2349,14 @@ mod tests {
         let q = acct.quota();
         let mut ws = WatchSet::default();
 
-        ws.add_descriptor(Some(&p), "D".into(), win(&[sh(1), sh(2), sh(3)]), |_| {}, |_| {}).unwrap();
+        ws.add_descriptor(
+            Some(&p),
+            "D".into(),
+            win(&[sh(1), sh(2), sh(3)]),
+            |_| {},
+            |_| {},
+        )
+        .unwrap();
         assert_eq!(q.current("tenant"), 3);
 
         // Slide the window forward: {1,2,3} → {3,4,5}. 1,2 leave; 4,5 enter; 3 stays.
@@ -2063,8 +2368,13 @@ mod tests {
             win(&[sh(3), sh(4), sh(5)]),
             |s| registered = s.to_vec(),
             |s| unregistered = s.to_vec(),
-        ).unwrap();
-        assert_eq!(registered, vec![sh(4), sh(5)], "scripts entering the window register");
+        )
+        .unwrap();
+        assert_eq!(
+            registered,
+            vec![sh(4), sh(5)],
+            "scripts entering the window register"
+        );
         let mut u = unregistered.clone();
         u.sort();
         assert_eq!(u, vec![sh(1), sh(2)], "scripts leaving the window release");
@@ -2078,7 +2388,8 @@ mod tests {
         let q = acct.quota();
         let mut ws = WatchSet::default();
 
-        ws.add_descriptor(Some(&p), "D".into(), win(&[sh(1)]), |_| {}, |_| {}).unwrap();
+        ws.add_descriptor(Some(&p), "D".into(), win(&[sh(1)]), |_| {}, |_| {})
+            .unwrap();
         assert_eq!(q.current("tenant"), 1);
 
         // A direct RemoveScripts does not touch descriptor ownership.
@@ -2106,7 +2417,14 @@ mod tests {
         );
         assert_eq!(
             rejected,
-            Err((AddRejectReason::QuotaExceeded { required: 3, held: 0, quota: 2 }, false)),
+            Err((
+                AddRejectReason::QuotaExceeded {
+                    required: 3,
+                    held: 0,
+                    quota: 2
+                },
+                false
+            )),
             "a new descriptor that does not fit is refused and not kept",
         );
         assert!(!registered, "an over-quota descriptor registers nothing");
@@ -2121,17 +2439,29 @@ mod tests {
         let (p, acct) = tenant(2);
         let q = acct.quota();
         let mut ws = WatchSet::default();
-        ws.add_descriptor(Some(&p), "D".into(), win(&[sh(1)]), |_| {}, |_| {}).unwrap();
+        ws.add_descriptor(Some(&p), "D".into(), win(&[sh(1)]), |_| {}, |_| {})
+            .unwrap();
 
         // Sliding to two new scripts needs 2 units with only 1 free.
-        let rejected = ws.add_descriptor(Some(&p), "D".into(), win(&[sh(2), sh(3)]), |_| {}, |_| {});
+        let rejected =
+            ws.add_descriptor(Some(&p), "D".into(), win(&[sh(2), sh(3)]), |_| {}, |_| {});
         assert_eq!(
             rejected,
-            Err((AddRejectReason::QuotaExceeded { required: 2, held: 1, quota: 2 }, true)),
+            Err((
+                AddRejectReason::QuotaExceeded {
+                    required: 2,
+                    held: 1,
+                    quota: 2
+                },
+                true
+            )),
             "a refused slide reports that the earlier window is kept",
         );
         assert!(ws.holds_descriptor("D"));
-        assert!(ws.scripts.contains_key(&sh(1)), "the earlier window still watches its script");
+        assert!(
+            ws.scripts.contains_key(&sh(1)),
+            "the earlier window still watches its script"
+        );
         assert_eq!(q.current("tenant"), 1);
     }
 
@@ -2141,7 +2471,8 @@ mod tests {
         let q = acct.quota();
         let mut ws = WatchSet::default();
 
-        ws.add_descriptor(Some(&p), "D".into(), win(&[sh(1), sh(2)]), |_| {}, |_| {}).unwrap();
+        ws.add_descriptor(Some(&p), "D".into(), win(&[sh(1), sh(2)]), |_| {}, |_| {})
+            .unwrap();
         // Same descriptor, same window: nothing net-new, nothing released.
         let mut registered = false;
         let mut unregistered = false;
@@ -2151,8 +2482,12 @@ mod tests {
             win(&[sh(1), sh(2)]),
             |_| registered = true,
             |_| unregistered = true,
-        ).unwrap();
-        assert!(!registered && !unregistered, "a no-op re-assert touches nothing");
+        )
+        .unwrap();
+        assert!(
+            !registered && !unregistered,
+            "a no-op re-assert touches nothing"
+        );
         assert_eq!(q.current("tenant"), 2, "no double-charge");
 
         // One removal clears it (ownership was counted once, not twice).
@@ -2178,7 +2513,9 @@ mod tests {
     }
     impl WatchRegistry for MockReg {
         fn add_scripthashes_with_floors(&self, items: &[(Scripthash, u64)]) {
-            self.added_scripts.borrow_mut().extend(items.iter().map(|(s, _)| *s));
+            self.added_scripts
+                .borrow_mut()
+                .extend(items.iter().map(|(s, _)| *s));
         }
         fn remove_scripthashes(&self, s: &[Scripthash]) {
             self.removed_scripts.borrow_mut().extend_from_slice(s);
@@ -2192,7 +2529,9 @@ mod tests {
         fn add_prefixes(&self, _: &[PrefixKey]) {}
         fn remove_prefixes(&self, _: &[PrefixKey]) {}
         fn add_silent_payments(&self, targets: &[node::events::SpWatchTarget]) {
-            self.added_sp.borrow_mut().extend(targets.iter().map(|t| t.scan_pubkey()));
+            self.added_sp
+                .borrow_mut()
+                .extend(targets.iter().map(|t| t.scan_pubkey()));
         }
         fn remove_silent_payments(&self, scan_pubkeys: &[[u8; 33]]) {
             self.removed_sp.borrow_mut().extend_from_slice(scan_pubkeys);
@@ -2216,15 +2555,32 @@ mod tests {
         let (p, acct) = tenant(3); // room for exactly 3 units
         let q = acct.quota();
         let mut ws = WatchSet::default();
-        ws.replace(Some(&p), desired_scripts(&[sh(1), sh(2), sh(3)]), 0, &MockReg::default());
+        ws.replace(
+            Some(&p),
+            desired_scripts(&[sh(1), sh(2), sh(3)]),
+            0,
+            &MockReg::default(),
+        );
         assert_eq!(q.current("tenant"), 3);
 
         // Swap all three for three DISJOINT scripts. At quota this only fits
         // because the replace releases the old units before acquiring the new
         // (no transient doubling — the tenant can never hold 6).
-        let outcome = ws.replace(Some(&p), desired_scripts(&[sh(4), sh(5), sh(6)]), 0, &MockReg::default());
+        let outcome = ws.replace(
+            Some(&p),
+            desired_scripts(&[sh(4), sh(5), sh(6)]),
+            0,
+            &MockReg::default(),
+        );
         assert!(
-            matches!(outcome, ReplaceOutcome::Accepted { added: 3, removed: 3, unchanged: 0 }),
+            matches!(
+                outcome,
+                ReplaceOutcome::Accepted {
+                    added: 3,
+                    removed: 3,
+                    unchanged: 0
+                }
+            ),
             "disjoint same-size swap must fit at quota, got {outcome:?}",
         );
         assert_eq!(q.current("tenant"), 3, "still exactly 3 units held");
@@ -2237,7 +2593,8 @@ mod tests {
         let q = acct.quota();
         let mut ws = WatchSet::default();
         // sh1 watched as a DIRECT script.
-        ws.add_scripts(Some(&p), [sh(1)], "s", |_| {}, |_| {}).unwrap();
+        ws.add_scripts(Some(&p), [sh(1)], "s", |_| {}, |_| {})
+            .unwrap();
         assert_eq!(q.current("tenant"), 1);
 
         // Reload covers the same scripthash via a DESCRIPTOR instead — the exact
@@ -2255,11 +2612,21 @@ mod tests {
         let reg = MockReg::default();
         let outcome = ws.replace(Some(&p), desired, 0, &reg);
         assert!(
-            matches!(outcome, ReplaceOutcome::Accepted { added: 0, removed: 0, unchanged: 1 }),
+            matches!(
+                outcome,
+                ReplaceOutcome::Accepted {
+                    added: 0,
+                    removed: 0,
+                    unchanged: 1
+                }
+            ),
             "same effective scripthash → unchanged, got {outcome:?}",
         );
         // The kept scripthash was NEVER unregistered → no matcher gap.
-        assert!(reg.removed_scripts.borrow().is_empty(), "a kept script must not be unregistered");
+        assert!(
+            reg.removed_scripts.borrow().is_empty(),
+            "a kept script must not be unregistered"
+        );
         assert_eq!(q.current("tenant"), 1, "no re-charge for the kept script");
         assert!(ws.descriptors.contains_key("d") && !ws.script_direct.contains(&sh(1)));
         assert!(ws.scripts.contains_key(&sh(1)), "still effectively watched");
@@ -2285,7 +2652,11 @@ mod tests {
             sp_targets: Vec::new(),
         };
         ws.replace(Some(&p), d1, 0, &MockReg::default());
-        assert_eq!(attrib(&ws, sh(1)), vec![("a".to_string(), 0, 5)], "new descriptor attributes at its coordinate");
+        assert_eq!(
+            attrib(&ws, sh(1)),
+            vec![("a".to_string(), 0, 5)],
+            "new descriptor attributes at its coordinate"
+        );
 
         // Replace with a different descriptor covering a different script.
         let d2 = DesiredWatchSet {
@@ -2298,7 +2669,11 @@ mod tests {
             sp_targets: Vec::new(),
         };
         ws.replace(Some(&p), d2, 0, &MockReg::default());
-        assert_eq!(attrib(&ws, sh(2)), vec![("b".to_string(), 1, 9)], "replaced-in descriptor attributes correctly");
+        assert_eq!(
+            attrib(&ws, sh(2)),
+            vec![("b".to_string(), 1, 9)],
+            "replaced-in descriptor attributes correctly"
+        );
         assert!(
             ws.descriptor_attribution(&sh(1)).is_empty(),
             "a descriptor dropped by the replace leaves no stale attribution",
@@ -2329,19 +2704,37 @@ mod tests {
         };
         let outcome = ws.replace(Some(&p), desired, 0, &MockReg::default());
         assert!(
-            matches!(outcome, ReplaceOutcome::Accepted { added: 2, removed: 0, unchanged: 0 }),
+            matches!(
+                outcome,
+                ReplaceOutcome::Accepted {
+                    added: 2,
+                    removed: 0,
+                    unchanged: 0
+                }
+            ),
             "duplicate descriptor counts its scripts once, got {outcome:?}",
         );
-        assert_eq!(q.current("tenant"), 2, "two scripthashes, two units — not four");
+        assert_eq!(
+            q.current("tenant"),
+            2,
+            "two scripthashes, two units — not four"
+        );
         assert_eq!(ws.script_owners.get(&sh(1)), Some(&1), "one owner, not two");
         assert_eq!(ws.script_owners.get(&sh(2)), Some(&1));
 
         // The single RemoveDescriptor now fully clears both scripthashes.
         let mut unregistered = Vec::new();
         ws.remove_descriptor("d", |s| unregistered.extend_from_slice(s));
-        assert!(ws.scripts.is_empty(), "RemoveDescriptor clears the whole descriptor's coverage");
+        assert!(
+            ws.scripts.is_empty(),
+            "RemoveDescriptor clears the whole descriptor's coverage"
+        );
         assert!(ws.script_owners.is_empty(), "no stranded owners");
-        assert_eq!(unregistered.len(), 2, "both scripthashes unregistered from the matcher");
+        assert_eq!(
+            unregistered.len(),
+            2,
+            "both scripthashes unregistered from the matcher"
+        );
         assert_eq!(q.current("tenant"), 0, "all units released");
     }
 
@@ -2350,14 +2743,25 @@ mod tests {
         let (p, acct) = tenant(2);
         let q = acct.quota();
         let mut ws = WatchSet::default();
-        ws.replace(Some(&p), desired_scripts(&[sh(1), sh(2)]), 0, &MockReg::default());
+        ws.replace(
+            Some(&p),
+            desired_scripts(&[sh(1), sh(2)]),
+            0,
+            &MockReg::default(),
+        );
         assert_eq!(q.current("tenant"), 2);
 
         // Target needs 3 units > quota 2 → rejected whole; the old set stays.
         let reg = MockReg::default();
         let outcome = ws.replace(Some(&p), desired_scripts(&[sh(3), sh(4), sh(5)]), 0, &reg);
         assert!(
-            matches!(outcome, ReplaceOutcome::Rejected { required: 3, quota: 2 }),
+            matches!(
+                outcome,
+                ReplaceOutcome::Rejected {
+                    required: 3,
+                    quota: 2
+                }
+            ),
             "over-quota target must be rejected, got {outcome:?}",
         );
         assert!(ws.scripts.contains_key(&sh(1)) && ws.scripts.contains_key(&sh(2)));
@@ -2378,7 +2782,12 @@ mod tests {
         // than `max_items` entries.
         let mut ws = WatchSet::default();
         // Seed a 2-entry set within a cap of 2 (no auth → no quota bound).
-        let outcome = ws.replace(None, desired_scripts(&[sh(1), sh(2)]), 2, &MockReg::default());
+        let outcome = ws.replace(
+            None,
+            desired_scripts(&[sh(1), sh(2)]),
+            2,
+            &MockReg::default(),
+        );
         assert!(matches!(outcome, ReplaceOutcome::Accepted { added: 2, .. }));
         assert_eq!(ws.len(), 2);
 
@@ -2386,7 +2795,13 @@ mod tests {
         let reg = MockReg::default();
         let outcome = ws.replace(None, desired_scripts(&[sh(3), sh(4), sh(5)]), 2, &reg);
         assert!(
-            matches!(outcome, ReplaceOutcome::CapExceeded { limit: 2, requested: 3 }),
+            matches!(
+                outcome,
+                ReplaceOutcome::CapExceeded {
+                    limit: 2,
+                    requested: 3
+                }
+            ),
             "over-cap target must be rejected, got {outcome:?}",
         );
         assert_eq!(ws.len(), 2, "old set intact");
@@ -2397,12 +2812,28 @@ mod tests {
         );
 
         // A target of exactly the cap (2) is allowed — and may swap membership.
-        let outcome = ws.replace(None, desired_scripts(&[sh(6), sh(7)]), 2, &MockReg::default());
-        assert!(matches!(outcome, ReplaceOutcome::Accepted { .. }), "at-cap target fits");
+        let outcome = ws.replace(
+            None,
+            desired_scripts(&[sh(6), sh(7)]),
+            2,
+            &MockReg::default(),
+        );
+        assert!(
+            matches!(outcome, ReplaceOutcome::Accepted { .. }),
+            "at-cap target fits"
+        );
         assert_eq!(ws.len(), 2);
         // max_items = 0 disables the cap entirely.
-        let outcome = ws.replace(None, desired_scripts(&[sh(1), sh(2), sh(3), sh(4)]), 0, &MockReg::default());
-        assert!(matches!(outcome, ReplaceOutcome::Accepted { .. }), "cap 0 ⇒ unlimited");
+        let outcome = ws.replace(
+            None,
+            desired_scripts(&[sh(1), sh(2), sh(3), sh(4)]),
+            0,
+            &MockReg::default(),
+        );
+        assert!(
+            matches!(outcome, ReplaceOutcome::Accepted { .. }),
+            "cap 0 ⇒ unlimited"
+        );
         assert_eq!(ws.len(), 4);
     }
 
@@ -2411,10 +2842,22 @@ mod tests {
         let (p, acct) = tenant(10);
         let q = acct.quota();
         let mut ws = WatchSet::default();
-        ws.replace(Some(&p), desired_scripts(&[sh(1), sh(2)]), 0, &MockReg::default());
+        ws.replace(
+            Some(&p),
+            desired_scripts(&[sh(1), sh(2)]),
+            0,
+            &MockReg::default(),
+        );
         let reg = MockReg::default();
         let outcome = ws.replace(Some(&p), desired_scripts(&[]), 0, &reg);
-        assert!(matches!(outcome, ReplaceOutcome::Accepted { added: 0, removed: 2, unchanged: 0 }));
+        assert!(matches!(
+            outcome,
+            ReplaceOutcome::Accepted {
+                added: 0,
+                removed: 2,
+                unchanged: 0
+            }
+        ));
         assert_eq!(ws.scripts.len(), 0);
         assert_eq!(q.current("tenant"), 0, "all units released");
         let mut rmd = reg.removed_scripts.borrow().clone();
@@ -2425,10 +2868,18 @@ mod tests {
     #[test]
     fn replace_without_auth_holds_no_leases() {
         let mut ws = WatchSet::default();
-        let outcome = ws.replace(None, desired_scripts(&[sh(1), sh(2)]), 0, &MockReg::default());
+        let outcome = ws.replace(
+            None,
+            desired_scripts(&[sh(1), sh(2)]),
+            0,
+            &MockReg::default(),
+        );
         assert!(matches!(outcome, ReplaceOutcome::Accepted { added: 2, .. }));
         assert_eq!(ws.scripts.len(), 2);
-        assert!(ws.scripts.values().all(Option::is_none), "auth disabled → no leases");
+        assert!(
+            ws.scripts.values().all(Option::is_none),
+            "auth disabled → no leases"
+        );
     }
 
     #[test]
@@ -2439,15 +2890,21 @@ mod tests {
         // script, so each past the first has an empty net-new set — exactly the
         // "free descriptor" path (no quota unit, no rate token) the cap bounds.
         for i in 0..MAX_DESCRIPTORS_PER_CONNECTION {
-            ws.add_descriptor(None, format!("D{i}"), win(&[sh(1)]), |_| {}, |_| {}).unwrap();
+            ws.add_descriptor(None, format!("D{i}"), win(&[sh(1)]), |_| {}, |_| {})
+                .unwrap();
         }
         assert_eq!(ws.descriptors.len(), MAX_DESCRIPTORS_PER_CONNECTION);
 
         // One more *distinct* descriptor is rejected outright — the map, which is
         // invisible to the quota and to `len()`, does not grow past the cap.
         let mut registered = false;
-        let rejected =
-            ws.add_descriptor(None, "overflow".into(), win(&[sh(1)]), |_| registered = true, |_| {});
+        let rejected = ws.add_descriptor(
+            None,
+            "overflow".into(),
+            win(&[sh(1)]),
+            |_| registered = true,
+            |_| {},
+        );
         assert_eq!(
             rejected,
             Err((
@@ -2458,7 +2915,10 @@ mod tests {
                 false,
             )),
         );
-        assert!(!registered, "a descriptor rejected by the cap registers nothing");
+        assert!(
+            !registered,
+            "a descriptor rejected by the cap registers nothing"
+        );
         assert_eq!(
             ws.descriptors.len(),
             MAX_DESCRIPTORS_PER_CONNECTION,
@@ -2469,7 +2929,14 @@ mod tests {
         // Re-asserting (sliding) an already-retained descriptor at the cap still
         // works — the count cap must never block a window slide.
         let mut slid = Vec::new();
-        ws.add_descriptor(None, "D0".into(), win(&[sh(2)]), |s| slid = s.to_vec(), |_| {}).unwrap();
+        ws.add_descriptor(
+            None,
+            "D0".into(),
+            win(&[sh(2)]),
+            |s| slid = s.to_vec(),
+            |_| {},
+        )
+        .unwrap();
         assert_eq!(
             ws.descriptors.len(),
             MAX_DESCRIPTORS_PER_CONNECTION,
@@ -2498,7 +2965,14 @@ mod tests {
     fn attribution_reports_descriptor_branch_and_index() {
         let (p, _acct) = tenant(10);
         let mut ws = WatchSet::default();
-        ws.add_descriptor(Some(&p), "D".into(), win(&[sh(10), sh(11), sh(12)]), |_| {}, |_| {}).unwrap();
+        ws.add_descriptor(
+            Some(&p),
+            "D".into(),
+            win(&[sh(10), sh(11), sh(12)]),
+            |_| {},
+            |_| {},
+        )
+        .unwrap();
         // `win` models a single-branch /0/* window: branch 0, index = position.
         assert_eq!(attrib(&ws, sh(10)), vec![("D".to_string(), 0, 0)]);
         assert_eq!(attrib(&ws, sh(11)), vec![("D".to_string(), 0, 1)]);
@@ -2512,16 +2986,26 @@ mod tests {
         let (p, _acct) = tenant(10);
         let mut ws = WatchSet::default();
         let two_branch = vec![(0u32, 7u32, sh(1)), (1u32, 7u32, sh(2))];
-        ws.add_descriptor(Some(&p), "M".into(), two_branch, |_| {}, |_| {}).unwrap();
-        assert_eq!(attrib(&ws, sh(1)), vec![("M".to_string(), 0, 7)], "external branch");
-        assert_eq!(attrib(&ws, sh(2)), vec![("M".to_string(), 1, 7)], "change branch, same index");
+        ws.add_descriptor(Some(&p), "M".into(), two_branch, |_| {}, |_| {})
+            .unwrap();
+        assert_eq!(
+            attrib(&ws, sh(1)),
+            vec![("M".to_string(), 0, 7)],
+            "external branch"
+        );
+        assert_eq!(
+            attrib(&ws, sh(2)),
+            vec![("M".to_string(), 1, 7)],
+            "change branch, same index"
+        );
     }
 
     #[test]
     fn direct_scripts_have_no_attribution() {
         let (p, _acct) = tenant(10);
         let mut ws = WatchSet::default();
-        ws.add_scripts(Some(&p), [sh(1)], "scripts", |_| {}, |_| {}).unwrap();
+        ws.add_scripts(Some(&p), [sh(1)], "scripts", |_| {}, |_| {})
+            .unwrap();
         assert!(ws.descriptor_attribution(&sh(1)).is_empty());
     }
 
@@ -2529,8 +3013,10 @@ mod tests {
     fn overlapping_descriptors_attribute_a_shared_script_to_both() {
         let (p, _acct) = tenant(10);
         let mut ws = WatchSet::default();
-        ws.add_descriptor(Some(&p), "A".into(), win(&[sh(1), sh(2)]), |_| {}, |_| {}).unwrap();
-        ws.add_descriptor(Some(&p), "B".into(), win(&[sh(9), sh(2)]), |_| {}, |_| {}).unwrap();
+        ws.add_descriptor(Some(&p), "A".into(), win(&[sh(1), sh(2)]), |_| {}, |_| {})
+            .unwrap();
+        ws.add_descriptor(Some(&p), "B".into(), win(&[sh(9), sh(2)]), |_| {}, |_| {})
+            .unwrap();
         // sh(2) is offset 1 in A and offset 1 in B.
         let mut got = attrib(&ws, sh(2));
         got.sort();
@@ -2541,23 +3027,53 @@ mod tests {
     fn sliding_a_window_updates_offsets_and_drops_departed_scripts() {
         let (p, _acct) = tenant(10);
         let mut ws = WatchSet::default();
-        ws.add_descriptor(Some(&p), "D".into(), win(&[sh(1), sh(2), sh(3)]), |_| {}, |_| {}).unwrap();
+        ws.add_descriptor(
+            Some(&p),
+            "D".into(),
+            win(&[sh(1), sh(2), sh(3)]),
+            |_| {},
+            |_| {},
+        )
+        .unwrap();
         // Slide: {1,2,3} → {3,4,5}. sh(3) moves from offset 2 to offset 0.
-        ws.add_descriptor(Some(&p), "D".into(), win(&[sh(3), sh(4), sh(5)]), |_| {}, |_| {}).unwrap();
-        assert_eq!(attrib(&ws, sh(3)), vec![("D".to_string(), 0, 0)], "surviving script re-offset");
+        ws.add_descriptor(
+            Some(&p),
+            "D".into(),
+            win(&[sh(3), sh(4), sh(5)]),
+            |_| {},
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(
+            attrib(&ws, sh(3)),
+            vec![("D".to_string(), 0, 0)],
+            "surviving script re-offset"
+        );
         assert_eq!(attrib(&ws, sh(4)), vec![("D".to_string(), 0, 1)]);
-        assert!(ws.descriptor_attribution(&sh(1)).is_empty(), "departed script loses attribution");
+        assert!(
+            ws.descriptor_attribution(&sh(1)).is_empty(),
+            "departed script loses attribution"
+        );
     }
 
     #[test]
     fn removing_a_descriptor_clears_attribution_but_keeps_shared() {
         let (p, _acct) = tenant(10);
         let mut ws = WatchSet::default();
-        ws.add_descriptor(Some(&p), "A".into(), win(&[sh(1), sh(2)]), |_| {}, |_| {}).unwrap();
-        ws.add_descriptor(Some(&p), "B".into(), win(&[sh(2)]), |_| {}, |_| {}).unwrap();
+        ws.add_descriptor(Some(&p), "A".into(), win(&[sh(1), sh(2)]), |_| {}, |_| {})
+            .unwrap();
+        ws.add_descriptor(Some(&p), "B".into(), win(&[sh(2)]), |_| {}, |_| {})
+            .unwrap();
         ws.remove_descriptor("A", |_| {});
-        assert!(ws.descriptor_attribution(&sh(1)).is_empty(), "A's exclusive script cleared");
-        assert_eq!(attrib(&ws, sh(2)), vec![("B".to_string(), 0, 0)], "B still attributes the shared script");
+        assert!(
+            ws.descriptor_attribution(&sh(1)).is_empty(),
+            "A's exclusive script cleared"
+        );
+        assert_eq!(
+            attrib(&ws, sh(2)),
+            vec![("B".to_string(), 0, 0)],
+            "B still attributes the shared script"
+        );
     }
 
     // ---- Silent-payment (Tier 2) watch-set tests -------------------------
@@ -2567,7 +3083,8 @@ mod tests {
     fn sp_target(seed: u8) -> node::events::SpWatchTarget {
         use bitcoin::secp256k1::{PublicKey, Secp256k1, SecretKey};
         let secp = Secp256k1::new();
-        let spend = PublicKey::from_secret_key(&secp, &SecretKey::from_slice(&[0x22u8; 32]).unwrap());
+        let spend =
+            PublicKey::from_secret_key(&secp, &SecretKey::from_slice(&[0x22u8; 32]).unwrap());
         node::events::SpWatchTarget::new([seed; 32], &spend.serialize(), vec![]).unwrap()
     }
 
@@ -2580,14 +3097,20 @@ mod tests {
         let mut registered = 0;
         ws.add_silent_payments(Some(&p), vec![sp_target(1), sp_target(2)], |ts| {
             registered = ts.len();
-        }).unwrap();
+        })
+        .unwrap();
         assert_eq!(registered, 2);
         assert_eq!(q.current("tenant"), 2, "two SP targets charge 2 units");
         assert_eq!(ws.len(), 2);
 
         // Re-asserting a held identity is not double-charged.
-        ws.add_silent_payments(Some(&p), vec![sp_target(1)], |_| {}).unwrap();
-        assert_eq!(q.current("tenant"), 2, "re-asserted identity is not recharged");
+        ws.add_silent_payments(Some(&p), vec![sp_target(1)], |_| {})
+            .unwrap();
+        assert_eq!(
+            q.current("tenant"),
+            2,
+            "re-asserted identity is not recharged"
+        );
 
         let mut unregistered = 0;
         ws.remove_silent_payments([sp_target(1).scan_pubkey()], |ids| unregistered = ids.len());
@@ -2604,11 +3127,15 @@ mod tests {
             Arc::from("tenant"),
             CapabilitySet::EMPTY.with(Capability::StreamWatch),
             Some(100),
-            Some(RatePolicy { burst: 1, per_sec: 1 }),
+            Some(RatePolicy {
+                burst: 1,
+                per_sec: 1,
+            }),
             acct,
         );
         let mut ws = WatchSet::default();
-        ws.add_silent_payments(Some(&p), vec![sp_target(1)], |_| {}).unwrap(); // the only token
+        ws.add_silent_payments(Some(&p), vec![sp_target(1)], |_| {})
+            .unwrap(); // the only token
 
         // A label-only re-assert needs no token: it applies and nothing is refused.
         let mut applied = Vec::new();
@@ -2626,9 +3153,19 @@ mod tests {
                 applied = ts.iter().map(|t| t.scan_pubkey()).collect();
             })
             .unwrap_err();
-        assert!(matches!(rejected.reason, AddRejectReason::RateLimited { .. }), "{rejected:?}");
-        assert_eq!(rejected.items, RejectedItems::SilentPayments(vec![sp_target(2).scan_pubkey()]));
-        assert_eq!(applied, vec![sp_target(1).scan_pubkey()], "the re-assert's labels still apply");
+        assert!(
+            matches!(rejected.reason, AddRejectReason::RateLimited { .. }),
+            "{rejected:?}"
+        );
+        assert_eq!(
+            rejected.items,
+            RejectedItems::SilentPayments(vec![sp_target(2).scan_pubkey()])
+        );
+        assert_eq!(
+            applied,
+            vec![sp_target(1).scan_pubkey()],
+            "the re-assert's labels still apply"
+        );
         assert_eq!(ws.len(), 1);
     }
 
@@ -2642,7 +3179,8 @@ mod tests {
         let (p, acct) = tenant(10);
         let q = acct.quota();
         let mut ws = WatchSet::default();
-        ws.add_silent_payments(Some(&p), vec![sp_target(1)], |_| {}).unwrap();
+        ws.add_silent_payments(Some(&p), vec![sp_target(1)], |_| {})
+            .unwrap();
         assert_eq!(ws.len(), 1);
         assert_eq!(q.current("tenant"), 1);
 
@@ -2650,7 +3188,8 @@ mod tests {
         let mut forwarded: Vec<[u8; 33]> = Vec::new();
         ws.add_silent_payments(Some(&p), vec![sp_target(1)], |ts| {
             forwarded = ts.iter().map(|t| t.scan_pubkey()).collect();
-        }).unwrap();
+        })
+        .unwrap();
         assert_eq!(
             forwarded,
             vec![id1],
@@ -2664,13 +3203,16 @@ mod tests {
     fn sp_incremental_add_respects_cap() {
         // No quota bound (loopback): only the SP cap gates the add.
         let mut ws = WatchSet::default();
-        let full: Vec<_> = (1..=MAX_SP_TARGETS_PER_CONNECTION as u8).map(sp_target).collect();
+        let full: Vec<_> = (1..=MAX_SP_TARGETS_PER_CONNECTION as u8)
+            .map(sp_target)
+            .collect();
         ws.add_silent_payments(None, full, |_| {}).unwrap();
         assert_eq!(ws.len(), MAX_SP_TARGETS_PER_CONNECTION);
         // One more target over the cap is refused whole; the set is unchanged.
         let mut registered = false;
-        let rejected =
-            ws.add_silent_payments(None, vec![sp_target(200)], |_| registered = true).unwrap_err();
+        let rejected = ws
+            .add_silent_payments(None, vec![sp_target(200)], |_| registered = true)
+            .unwrap_err();
         assert!(!registered, "an over-cap target reaches no matcher");
         assert_eq!(
             rejected,
@@ -2683,7 +3225,11 @@ mod tests {
             },
             "an SP refusal names the target by identity",
         );
-        assert_eq!(ws.len(), MAX_SP_TARGETS_PER_CONNECTION, "over-cap add is shed");
+        assert_eq!(
+            ws.len(),
+            MAX_SP_TARGETS_PER_CONNECTION,
+            "over-cap add is shed"
+        );
     }
 
     #[test]
@@ -2697,7 +3243,14 @@ mod tests {
         d.sp_targets = vec![sp_target(1), sp_target(2)];
         let outcome = ws.replace(Some(&p), d, 0, &reg);
         assert!(
-            matches!(outcome, ReplaceOutcome::Accepted { added: 2, removed: 0, unchanged: 0 }),
+            matches!(
+                outcome,
+                ReplaceOutcome::Accepted {
+                    added: 2,
+                    removed: 0,
+                    unchanged: 0
+                }
+            ),
             "two SP targets added, got {outcome:?}",
         );
         assert_eq!(reg.added_sp.borrow().len(), 2, "both identities registered");
@@ -2709,7 +3262,14 @@ mod tests {
         reg.added_sp.borrow_mut().clear();
         let outcome = ws.replace(Some(&p), d2, 0, &reg);
         assert!(
-            matches!(outcome, ReplaceOutcome::Accepted { added: 1, removed: 1, unchanged: 1 }),
+            matches!(
+                outcome,
+                ReplaceOutcome::Accepted {
+                    added: 1,
+                    removed: 1,
+                    unchanged: 1
+                }
+            ),
             "one kept, one dropped, one added, got {outcome:?}",
         );
         assert_eq!(
@@ -2725,13 +3285,18 @@ mod tests {
         let mut ws = WatchSet::default();
         let reg = MockReg::default();
         let mut d = desired_scripts(&[]);
-        d.sp_targets = (1..=(MAX_SP_TARGETS_PER_CONNECTION as u8 + 1)).map(sp_target).collect();
+        d.sp_targets = (1..=(MAX_SP_TARGETS_PER_CONNECTION as u8 + 1))
+            .map(sp_target)
+            .collect();
         let outcome = ws.replace(None, d, 0, &reg);
         assert!(
             matches!(outcome, ReplaceOutcome::CapExceeded { limit, .. } if limit == MAX_SP_TARGETS_PER_CONNECTION as u64),
             "over the SP cap is rejected, got {outcome:?}",
         );
         assert_eq!(ws.len(), 0, "rejected replace leaves the set unchanged");
-        assert!(reg.added_sp.borrow().is_empty(), "no registration on a rejected replace");
+        assert!(
+            reg.added_sp.borrow().is_empty(),
+            "no registration on a rejected replace"
+        );
     }
 }

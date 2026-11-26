@@ -107,7 +107,11 @@ impl RpcClient {
         }
     }
 
-    pub async fn call(&self, method: &str, params: &[serde_json::Value]) -> Result<serde_json::Value, RpcError> {
+    pub async fn call(
+        &self,
+        method: &str,
+        params: &[serde_json::Value],
+    ) -> Result<serde_json::Value, RpcError> {
         let result = self.call_inner(method, params).await;
         // On auth failure, try refreshing the cookie and retrying once
         if matches!(result, Err(RpcError::AuthFailed)) && self.refresh_auth() {
@@ -116,7 +120,11 @@ impl RpcClient {
         result
     }
 
-    async fn call_inner(&self, method: &str, params: &[serde_json::Value]) -> Result<serde_json::Value, RpcError> {
+    async fn call_inner(
+        &self,
+        method: &str,
+        params: &[serde_json::Value],
+    ) -> Result<serde_json::Value, RpcError> {
         let body = serde_json::json!({
             "jsonrpc": "2.0",
             "id": "sat-tui",
@@ -125,7 +133,8 @@ impl RpcClient {
         });
 
         let auth = self.auth_header.read().clone();
-        let response = self.client
+        let response = self
+            .client
             .post(&self.url)
             .header("Content-Type", "application/json")
             .header("Authorization", &auth)
@@ -146,16 +155,27 @@ impl RpcClient {
             return Err(RpcError::AuthFailed);
         }
 
-        let resp: serde_json::Value = response.json().await
+        let resp: serde_json::Value = response
+            .json()
+            .await
             .map_err(|e| RpcError::Request(e.to_string()))?;
 
         if let Some(error) = resp.get("error").filter(|e| !e.is_null()) {
             let code = error.get("code").and_then(|c| c.as_i64()).unwrap_or(0);
-            let msg = error.get("message").and_then(|m| m.as_str()).unwrap_or("Unknown error");
-            return Err(RpcError::Rpc { code, message: msg.to_string() });
+            let msg = error
+                .get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or("Unknown error");
+            return Err(RpcError::Rpc {
+                code,
+                message: msg.to_string(),
+            });
         }
 
-        Ok(resp.get("result").cloned().unwrap_or(serde_json::Value::Null))
+        Ok(resp
+            .get("result")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null))
     }
 
     // Convenience methods for each RPC we need
@@ -200,12 +220,14 @@ impl RpcClient {
         // Positional: [targets_array, mode]. Targets map mempool.space tiers:
         // 1=High, 3=Medium, 6=Low. `none` tier is the economy_feerate that
         // estimatefees always returns alongside targets.
-        self.call("estimatefees", &[serde_json::json!([1, 3, 6])]).await
+        self.call("estimatefees", &[serde_json::json!([1, 3, 6])])
+            .await
     }
 
     pub async fn get_reorg_history(&self) -> Result<serde_json::Value, RpcError> {
         // 7-day window is plenty for the TUI display.
-        self.call("getreorghistory", &[serde_json::json!(7 * 86_400)]).await
+        self.call("getreorghistory", &[serde_json::json!(7 * 86_400)])
+            .await
     }
 
     pub async fn get_warnings(&self) -> Result<serde_json::Value, RpcError> {
@@ -215,11 +237,13 @@ impl RpcClient {
     pub async fn get_mempool_history(&self) -> Result<serde_json::Value, RpcError> {
         // 40-minute window: at 10s snapshot cadence + 256-cap default ring
         // that's the full depth. Larger values just waste bytes on the wire.
-        self.call("getmempoolhistory", &[serde_json::json!(2400)]).await
+        self.call("getmempoolhistory", &[serde_json::json!(2400)])
+            .await
     }
 
     pub async fn get_block_stats(&self, height: u32) -> Result<serde_json::Value, RpcError> {
-        self.call("getblockstats", &[serde_json::json!(height.to_string())]).await
+        self.call("getblockstats", &[serde_json::json!(height.to_string())])
+            .await
     }
 
     /// The mempool aggregate this TUI renders: a vsize histogram over the
@@ -232,7 +256,8 @@ impl RpcClient {
     /// rows. `getmempoolsummary` computes the aggregate node-side and returns
     /// a reply bounded by `top_n`.
     pub async fn get_mempool_summary(&self) -> Result<serde_json::Value, RpcError> {
-        self.call("getmempoolsummary", &[serde_json::json!(MEMPOOL_TOP_N)]).await
+        self.call("getmempoolsummary", &[serde_json::json!(MEMPOOL_TOP_N)])
+            .await
     }
 
     /// Ruleset metadata and quarantine totals; `{"loaded": false}` when no
@@ -258,12 +283,17 @@ impl RpcClient {
     }
 
     pub async fn get_block_hash(&self, height: u32) -> Result<serde_json::Value, RpcError> {
-        self.call("getblockhash", &[serde_json::json!(height)]).await
+        self.call("getblockhash", &[serde_json::json!(height)])
+            .await
     }
 
     /// Verbose=true: returns the JSON header (with `time`, `chainwork`, etc.).
     pub async fn get_block_header(&self, hash: &str) -> Result<serde_json::Value, RpcError> {
-        self.call("getblockheader", &[serde_json::json!(hash), serde_json::json!(true)]).await
+        self.call(
+            "getblockheader",
+            &[serde_json::json!(hash), serde_json::json!(true)],
+        )
+        .await
     }
 
     pub async fn get_index_info(&self) -> Result<serde_json::Value, RpcError> {
@@ -343,8 +373,8 @@ impl std::fmt::Display for RpcError {
 
 /// Read cookie file and return (user, pass).
 pub fn read_cookie_file(path: &Path) -> Result<(String, String), String> {
-    let content = std::fs::read_to_string(path)
-        .map_err(|e| format!("Cannot read cookie file: {}", e))?;
+    let content =
+        std::fs::read_to_string(path).map_err(|e| format!("Cannot read cookie file: {}", e))?;
     let (user, pass) = content
         .trim()
         .split_once(':')
@@ -373,11 +403,13 @@ mod tests {
     fn with_cookie_surfaces_read_error_for_missing_file() {
         let path = scratch("missing.cookie");
         let _ = std::fs::remove_file(&path);
-        let c = RpcClient::with_cookie("127.0.0.1", 8332, path, &ClientTlsOptions::default())
-            .unwrap();
+        let c =
+            RpcClient::with_cookie("127.0.0.1", 8332, path, &ClientTlsOptions::default()).unwrap();
         // The real read error is kept, not laundered into an empty auth
         // header that would only ever produce a confusing downstream 401.
-        let err = c.cookie_error().expect("a missing cookie must surface a read error");
+        let err = c
+            .cookie_error()
+            .expect("a missing cookie must surface a read error");
         assert!(err.contains("Cannot read cookie file"), "got: {err}");
         assert!(
             c.auth_header.read().is_empty(),
@@ -389,15 +421,29 @@ mod tests {
     fn refresh_auth_recovers_once_cookie_becomes_readable() {
         let path = scratch("recover.cookie");
         let _ = std::fs::remove_file(&path);
-        let c = RpcClient::with_cookie("127.0.0.1", 8332, path.clone(), &ClientTlsOptions::default())
-            .unwrap();
-        assert!(c.cookie_error().is_some(), "missing cookie -> error recorded");
+        let c = RpcClient::with_cookie(
+            "127.0.0.1",
+            8332,
+            path.clone(),
+            &ClientTlsOptions::default(),
+        )
+        .unwrap();
+        assert!(
+            c.cookie_error().is_some(),
+            "missing cookie -> error recorded"
+        );
 
         // satd relaxes the cookie to 0640 at READY; the next auth-failure
         // retry re-reads it and the client flips back to a good state.
         std::fs::write(&path, "__cookie__:s3cr3t").unwrap();
-        assert!(c.refresh_auth(), "refresh must succeed once the cookie is readable");
-        assert!(c.cookie_error().is_none(), "the read error must clear on success");
+        assert!(
+            c.refresh_auth(),
+            "refresh must succeed once the cookie is readable"
+        );
+        assert!(
+            c.cookie_error().is_none(),
+            "the read error must clear on success"
+        );
         assert!(
             c.auth_header.read().starts_with("Basic "),
             "auth header must be rebuilt from the cookie"

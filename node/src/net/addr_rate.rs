@@ -52,7 +52,8 @@ impl AddrTokenBucket {
     /// A clock that went backwards earns nothing.
     pub fn refill(&mut self, now_micros: u64) {
         if self.tokens < MAX_ADDR_PROCESSING_TOKEN_BUCKET {
-            let elapsed_secs = now_micros.saturating_sub(self.refilled_at_micros) as f64 / 1_000_000.0;
+            let elapsed_secs =
+                now_micros.saturating_sub(self.refilled_at_micros) as f64 / 1_000_000.0;
             self.tokens = (self.tokens + elapsed_secs * MAX_ADDR_RATE_PER_SECOND)
                 .min(MAX_ADDR_PROCESSING_TOKEN_BUCKET);
         }

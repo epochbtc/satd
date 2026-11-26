@@ -16,7 +16,11 @@ fn freed_bytes_counts_only_whole_blocks_inside_the_range() {
         (100_000, 100_000, 94_208),
     ];
     for (offset, len, freed) in cases {
-        assert_eq!(freed_bytes(offset, len, BS), freed, "offset {offset} len {len}");
+        assert_eq!(
+            freed_bytes(offset, len, BS),
+            freed,
+            "offset {offset} len {len}"
+        );
     }
     assert_eq!(freed_bytes(0, BS, 0), 0, "a zero block size frees nothing");
 }
@@ -26,13 +30,19 @@ fn unsupported_errors_are_told_apart_from_io_failures() {
     let dir = Path::new("/blocks");
     for code in [libc::EOPNOTSUPP, libc::ENOTSUP, libc::ENOSYS] {
         assert!(
-            matches!(classify(io::Error::from_raw_os_error(code), dir), PunchError::Unsupported(_)),
+            matches!(
+                classify(io::Error::from_raw_os_error(code), dir),
+                PunchError::Unsupported(_)
+            ),
             "errno {code} must read as unsupported"
         );
     }
     for code in [libc::EIO, libc::ENOSPC, libc::EBADF] {
         assert!(
-            matches!(classify(io::Error::from_raw_os_error(code), dir), PunchError::Io { .. }),
+            matches!(
+                classify(io::Error::from_raw_os_error(code), dir),
+                PunchError::Io { .. }
+            ),
             "errno {code} is an I/O failure, not a missing feature"
         );
     }
@@ -67,9 +77,17 @@ fn an_invalid_block_size_is_refused_not_divided_by() {
     let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
     for fs_block in [0, 3, 4095, 2 << 20] {
         let err = zero_and_punch(&file, 0, 4096, &PunchCaps { fs_block }).unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "fs_block {fs_block}");
+        assert_eq!(
+            err.kind(),
+            io::ErrorKind::InvalidInput,
+            "fs_block {fs_block}"
+        );
     }
-    assert_eq!(std::fs::read(&path).unwrap(), vec![1u8; 8192], "nothing was touched");
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        vec![1u8; 8192],
+        "nothing was touched"
+    );
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -110,7 +128,10 @@ mod on_disk {
     fn probe_passes_and_leaves_no_file_behind() {
         let dir = tempfile::tempdir().unwrap();
         let caps = probe(dir.path()).expect("probe passes");
-        assert!(caps.fs_block >= 512 && caps.fs_block.is_power_of_two(), "{caps:?}");
+        assert!(
+            caps.fs_block >= 512 && caps.fs_block.is_power_of_two(),
+            "{caps:?}"
+        );
         assert!(!dir.path().join(PROBE_FILE_NAME).exists());
     }
 
@@ -145,7 +166,11 @@ mod on_disk {
         assert_eq!(freed, 2 * bs);
 
         let after = file.metadata().unwrap();
-        assert_eq!(after.len(), FILE_LEN as u64, "the apparent size must not change");
+        assert_eq!(
+            after.len(),
+            FILE_LEN as u64,
+            "the apparent size must not change"
+        );
         assert!(
             before - after.blocks() >= 2 * bs / 512,
             "allocation must drop by two blocks: {before} -> {} (512-byte units)",
@@ -154,9 +179,18 @@ mod on_disk {
 
         let data = contents(dir.path());
         let (s, e) = (offset as usize, (offset + len) as usize);
-        assert!(data[s..e].iter().all(|b| *b == 0), "the range must read back as zeros");
-        assert!(data[..s].iter().all(|b| *b == FILL), "bytes before the range changed");
-        assert!(data[e..].iter().all(|b| *b == FILL), "bytes after the range changed");
+        assert!(
+            data[s..e].iter().all(|b| *b == 0),
+            "the range must read back as zeros"
+        );
+        assert!(
+            data[..s].iter().all(|b| *b == FILL),
+            "bytes before the range changed"
+        );
+        assert!(
+            data[e..].iter().all(|b| *b == FILL),
+            "bytes after the range changed"
+        );
     }
 
     /// A range with no whole block inside it is still zeroed exactly, and
@@ -186,7 +220,11 @@ mod on_disk {
         let len = FILE_LEN as u64;
         for (offset, n) in [(len - 100, 4 * caps.fs_block), (len, 1), (len + 4096, 4096)] {
             let err = zero_and_punch(&file, offset, n, &caps).unwrap_err();
-            assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "offset {offset} len {n}");
+            assert_eq!(
+                err.kind(),
+                io::ErrorKind::InvalidInput,
+                "offset {offset} len {n}"
+            );
         }
         assert_eq!(contents(dir.path()), vec![FILL; FILE_LEN]);
         // A range ending exactly at the end is fine.

@@ -64,7 +64,10 @@ pub(super) fn history() -> Vec<HistoryEntry> {
             height: 5,
             txid: txid(2),
             vin: 0,
-            prev_outpoint: OutPoint { txid: txid(1), vout: 0 },
+            prev_outpoint: OutPoint {
+                txid: txid(1),
+                vout: 0,
+            },
         },
         fund(5, 3, 1, 3_000),
         fund(8, 4, 0, 4_000),
@@ -73,7 +76,10 @@ pub(super) fn history() -> Vec<HistoryEntry> {
             height: 9,
             txid: txid(5),
             vin: 0,
-            prev_outpoint: OutPoint { txid: txid(2), vout: 0 },
+            prev_outpoint: OutPoint {
+                txid: txid(2),
+                vout: 0,
+            },
         },
     ]
 }
@@ -100,9 +106,16 @@ impl AddressIndex for FixedIndex {
             height,
             amount_sat,
         };
-        Ok(vec![utxo(5, 3, 1, 3_000), utxo(8, 4, 0, 4_000), utxo(8, 4, 1, 5_000)])
+        Ok(vec![
+            utxo(5, 3, 1, 3_000),
+            utxo(8, 4, 0, 4_000),
+            utxo(8, 4, 1, 5_000),
+        ])
     }
-    fn subscribe(&self, _sh: Scripthash) -> Result<broadcast::Receiver<StatusUpdate>, SubscribeError> {
+    fn subscribe(
+        &self,
+        _sh: Scripthash,
+    ) -> Result<broadcast::Receiver<StatusUpdate>, SubscribeError> {
         // The stream holds the receiver; the sender may go.
         Ok(broadcast::channel(4).1)
     }
@@ -174,9 +187,15 @@ pub(super) fn esplora_state(cap: usize) -> (EsploraState, tempfile::TempDir) {
 }
 
 fn assert_refused(err: EsploraError, cap: usize) {
-    assert!(matches!(err, EsploraError::HistoryTooLarge(c) if c == cap), "{err:?}");
+    assert!(
+        matches!(err, EsploraError::HistoryTooLarge(c) if c == cap),
+        "{err:?}"
+    );
     let msg = err.to_string();
-    assert_eq!(msg, format!("Too many history entries (more than {cap} transactions)"));
+    assert_eq!(
+        msg,
+        format!("Too many history entries (more than {cap} transactions)")
+    );
     assert_eq!(err.into_response().status(), StatusCode::BAD_REQUEST);
 }
 
@@ -245,7 +264,9 @@ async fn status_stream_is_refused_over_the_cap_and_opens_at_it() {
 
     let (state, _dir) = esplora_state(5);
     assert!(
-        crate::handlers::sse::scripthash_sse(State(state), None, Path(wire)).await.is_ok(),
+        crate::handlers::sse::scripthash_sse(State(state), None, Path(wire))
+            .await
+            .is_ok(),
         "a stream at the cap opens"
     );
 }

@@ -95,7 +95,11 @@ impl HealthWindow {
     /// are stale (a reorg, or the same block reconnected by
     /// `reconsiderblock`) and dropped, and a height gap clears the window.
     pub fn record(&mut self, hash: BlockHash, stats: MinedBlockStats) {
-        let keep = self.blocks.iter().take_while(|b| b.height < stats.height).count();
+        let keep = self
+            .blocks
+            .iter()
+            .take_while(|b| b.height < stats.height)
+            .count();
         self.blocks.truncate(keep);
         self.hashes.truncate(keep);
         if let Some(last) = self.blocks.last()
@@ -173,7 +177,9 @@ impl HealthWindow {
         match std::fs::read(&path) {
             Ok(bytes) => match parse(&bytes) {
                 Ok((blocks, hash)) => {
-                    let ends_at_tip = blocks.last().is_none_or(|b| b.height == tip.0 && hash == tip.1);
+                    let ends_at_tip = blocks
+                        .last()
+                        .is_none_or(|b| b.height == tip.0 && hash == tip.1);
                     if ends_at_tip {
                         self.tip_hash = (!blocks.is_empty()).then_some(hash);
                         self.hashes = vec![None; blocks.len()];
@@ -193,7 +199,9 @@ impl HealthWindow {
                 }
             },
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => tracing::warn!(file = %path.display(), error = %e, "cannot read mempool health stats"),
+            Err(e) => {
+                tracing::warn!(file = %path.display(), error = %e, "cannot read mempool health stats")
+            }
         }
         self.path = Some(path);
     }
@@ -292,7 +300,14 @@ mod tests {
     fn add(w: &mut HealthWindow, removed: u64, block: u64, height: &mut u64) {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1 << 32);
         let unique = hash(NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
-        w.record(unique, MinedBlockStats { height: *height, block_weight: block, mempool_txs_weight: removed });
+        w.record(
+            unique,
+            MinedBlockStats {
+                height: *height,
+                block_weight: block,
+                mempool_txs_weight: removed,
+            },
+        );
         *height += 1;
     }
 
@@ -317,7 +332,10 @@ mod tests {
                 assert!(!healthy(&custom));
             }
             add(&mut custom, 500, 1000, &mut h);
-            assert!(healthy(&custom), "below one block of activity the ratio is skipped");
+            assert!(
+                healthy(&custom),
+                "below one block of activity the ratio is skipped"
+            );
         }
 
         let mut height = 100;
@@ -372,13 +390,29 @@ mod tests {
     #[test]
     fn a_callers_report_of_a_recorded_block_keeps_its_coverage() {
         let mut w = HealthWindow::default();
-        let stats = MinedBlockStats { height: 7, block_weight: 1000, mempool_txs_weight: 900 };
+        let stats = MinedBlockStats {
+            height: 7,
+            block_weight: 1000,
+            mempool_txs_weight: 900,
+        };
         w.record(hash(7), stats);
         // The caller's cleanup of the same block finds nothing left to remove.
-        w.merge(hash(7), MinedBlockStats { mempool_txs_weight: 0, ..stats });
+        w.merge(
+            hash(7),
+            MinedBlockStats {
+                mempool_txs_weight: 0,
+                ..stats
+            },
+        );
         assert_eq!(w.blocks(), &[stats]);
         // What it does remove is added, never past the block's weight.
-        w.merge(hash(7), MinedBlockStats { mempool_txs_weight: 500, ..stats });
+        w.merge(
+            hash(7),
+            MinedBlockStats {
+                mempool_txs_weight: 500,
+                ..stats
+            },
+        );
         assert_eq!(w.blocks()[0].mempool_txs_weight, 1000);
     }
 
@@ -387,12 +421,32 @@ mod tests {
     #[test]
     fn a_late_callers_report_keeps_the_rows_above_it() {
         let mut w = HealthWindow::default();
-        let a = MinedBlockStats { height: 7, block_weight: 1000, mempool_txs_weight: 900 };
-        let b = MinedBlockStats { height: 8, block_weight: 2000, mempool_txs_weight: 1800 };
+        let a = MinedBlockStats {
+            height: 7,
+            block_weight: 1000,
+            mempool_txs_weight: 900,
+        };
+        let b = MinedBlockStats {
+            height: 8,
+            block_weight: 2000,
+            mempool_txs_weight: 1800,
+        };
         w.record(hash(7), a);
         w.record(hash(8), b);
-        w.merge(hash(7), MinedBlockStats { mempool_txs_weight: 0, ..a });
-        w.merge(hash(8), MinedBlockStats { mempool_txs_weight: 0, ..b });
+        w.merge(
+            hash(7),
+            MinedBlockStats {
+                mempool_txs_weight: 0,
+                ..a
+            },
+        );
+        w.merge(
+            hash(8),
+            MinedBlockStats {
+                mempool_txs_weight: 0,
+                ..b
+            },
+        );
         assert_eq!(w.blocks(), &[a, b]);
     }
 
@@ -401,16 +455,33 @@ mod tests {
     #[test]
     fn a_callers_report_of_a_reorged_out_block_is_dropped() {
         let mut w = HealthWindow::default();
-        let a = MinedBlockStats { height: 7, block_weight: 1000, mempool_txs_weight: 900 };
+        let a = MinedBlockStats {
+            height: 7,
+            block_weight: 1000,
+            mempool_txs_weight: 900,
+        };
         w.record(hash(6), MinedBlockStats { height: 6, ..a });
         w.record(hash(7), a);
         // Block 7 is replaced by 7' (and 8) before the caller reports 7.
-        let a2 = MinedBlockStats { mempool_txs_weight: 100, ..a };
+        let a2 = MinedBlockStats {
+            mempool_txs_weight: 100,
+            ..a
+        };
         w.record(hash(70), a2);
         w.record(hash(8), MinedBlockStats { height: 8, ..a });
         let before = w.blocks().to_vec();
-        w.merge(hash(7), MinedBlockStats { mempool_txs_weight: 1000, ..a });
-        assert_eq!(w.blocks(), &before[..], "the dead block's report touched nothing");
+        w.merge(
+            hash(7),
+            MinedBlockStats {
+                mempool_txs_weight: 1000,
+                ..a
+            },
+        );
+        assert_eq!(
+            w.blocks(),
+            &before[..],
+            "the dead block's report touched nothing"
+        );
     }
 
     /// `invalidateblock` then `reconsiderblock` reconnects the same blocks:
@@ -419,7 +490,11 @@ mod tests {
     #[test]
     fn a_reconnected_block_is_not_counted_twice() {
         let mut w = HealthWindow::default();
-        let a = MinedBlockStats { height: 7, block_weight: 1000, mempool_txs_weight: 900 };
+        let a = MinedBlockStats {
+            height: 7,
+            block_weight: 1000,
+            mempool_txs_weight: 900,
+        };
         w.record(hash(7), a);
         w.record(hash(7), a);
         assert_eq!(w.blocks(), &[a]);
@@ -432,7 +507,14 @@ mod tests {
         w.open(dir.path(), (0, BlockHash::all_zeros()));
         let mut height = 10;
         for _ in 0..HEALTH_WINDOW_BLOCKS {
-            w.record(hash(height), MinedBlockStats { height, block_weight: WEIGHT, mempool_txs_weight: WEIGHT });
+            w.record(
+                hash(height),
+                MinedBlockStats {
+                    height,
+                    block_weight: WEIGHT,
+                    mempool_txs_weight: WEIGHT,
+                },
+            );
             height += 1;
         }
         let (path, bytes) = w.flush_job().unwrap();

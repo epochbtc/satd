@@ -522,7 +522,12 @@ mod tests {
                 // shift the vout of the taproot output that follows it.
                 TxOut {
                     value: Amount::from_sat(9999),
-                    script_pubkey: ScriptBuf::from(vec![0x00, 0x14].into_iter().chain([0x11; 20]).collect::<Vec<u8>>()),
+                    script_pubkey: ScriptBuf::from(
+                        vec![0x00, 0x14]
+                            .into_iter()
+                            .chain([0x11; 20])
+                            .collect::<Vec<u8>>(),
+                    ),
                 },
                 TxOut {
                     value: Amount::from_sat(5000),

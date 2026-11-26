@@ -69,7 +69,9 @@ fn draw_quarantine(f: &mut Frame, area: Rect, q: &QuarantineView) {
         .border_style(Style::default().fg(Color::DarkGray))
         .title(Span::styled(
             title,
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
         ));
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -78,7 +80,10 @@ fn draw_quarantine(f: &mut Frame, area: Rect, q: &QuarantineView) {
     }
 
     let totals = Rect { height: 1, ..inner };
-    f.render_widget(Paragraph::new(Line::from(quarantine_totals_spans(q))), totals);
+    f.render_widget(
+        Paragraph::new(Line::from(quarantine_totals_spans(q))),
+        totals,
+    );
 
     let table_area = Rect {
         y: inner.y + 1,
@@ -101,8 +106,10 @@ fn draw_quarantine(f: &mut Frame, area: Rect, q: &QuarantineView) {
     let rule_rows = q.rule_rows();
     let body_rows = table_area.height.saturating_sub(1) as usize;
     let rows: Vec<Row> = if rule_rows.is_empty() {
-        vec![Row::new(vec![Cell::from("(the ruleset has no quarantine rules)")])
-            .style(Style::default().fg(Color::DarkGray))]
+        vec![
+            Row::new(vec![Cell::from("(the ruleset has no quarantine rules)")])
+                .style(Style::default().fg(Color::DarkGray)),
+        ]
     } else {
         quarantine_table_rows(&rule_rows, body_rows)
     };
@@ -111,7 +118,9 @@ fn draw_quarantine(f: &mut Frame, area: Rect, q: &QuarantineView) {
 
 fn quarantine_totals_spans(q: &QuarantineView) -> Vec<Span<'static>> {
     let gray = Style::default().fg(Color::Gray);
-    let white = Style::default().fg(Color::White).add_modifier(Modifier::BOLD);
+    let white = Style::default()
+        .fg(Color::White)
+        .add_modifier(Modifier::BOLD);
     let budget = if q.budget_bytes > 0 {
         format!(
             " of {} ({:.1}%)",
@@ -132,7 +141,10 @@ fn quarantine_totals_spans(q: &QuarantineView) -> Vec<Span<'static>> {
         spans.push(Span::styled("   Confirmed anyway ", gray));
         spans.push(Span::styled(format_num(h.confirmed_anyway), white));
         spans.push(Span::styled("   Foregone fees ", gray));
-        spans.push(Span::styled(format!("{} sat", format_num(h.foregone_fees_sat)), white));
+        spans.push(Span::styled(
+            format!("{} sat", format_num(h.foregone_fees_sat)),
+            white,
+        ));
     }
     if q.fuel_exhausted > 0 {
         spans.push(Span::styled(
@@ -142,7 +154,10 @@ fn quarantine_totals_spans(q: &QuarantineView) -> Vec<Span<'static>> {
     }
     if q.relay_withholding > 0 {
         spans.push(Span::styled(
-            format!("   ⚠ {} rules withhold Lightning enforcement relay", q.relay_withholding),
+            format!(
+                "   ⚠ {} rules withhold Lightning enforcement relay",
+                q.relay_withholding
+            ),
             Style::default().fg(Color::LightRed),
         ));
     }
@@ -151,11 +166,18 @@ fn quarantine_totals_spans(q: &QuarantineView) -> Vec<Span<'static>> {
 
 /// Table rows for at most `limit` lines. When the rules do not fit, the last
 /// line counts the rest instead of silently dropping them.
-fn quarantine_table_rows(rows: &[crate::state::QuarantineRuleRow], limit: usize) -> Vec<Row<'static>> {
+fn quarantine_table_rows(
+    rows: &[crate::state::QuarantineRuleRow],
+    limit: usize,
+) -> Vec<Row<'static>> {
     if limit == 0 {
         return Vec::new();
     }
-    let shown = if rows.len() > limit { limit - 1 } else { rows.len() };
+    let shown = if rows.len() > limit {
+        limit - 1
+    } else {
+        rows.len()
+    };
     let mut out: Vec<Row<'static>> = rows[..shown]
         .iter()
         .map(|r| {
@@ -163,7 +185,11 @@ fn quarantine_table_rows(rows: &[crate::state::QuarantineRuleRow], limit: usize)
             let rates = if s.count == 0 {
                 "-".to_string()
             } else {
-                format!("{:.1}-{:.1}", s.min_fee_rate as f64 / 1_000.0, s.max_fee_rate as f64 / 1_000.0)
+                format!(
+                    "{:.1}-{:.1}",
+                    s.min_fee_rate as f64 / 1_000.0,
+                    s.max_fee_rate as f64 / 1_000.0
+                )
             };
             let style = if s.count > 0 {
                 Style::default()
@@ -182,8 +208,11 @@ fn quarantine_table_rows(rows: &[crate::state::QuarantineRuleRow], limit: usize)
         .collect();
     if shown < rows.len() {
         out.push(
-            Row::new(vec![Cell::from(format!("... {} more rules", rows.len() - shown))])
-                .style(Style::default().fg(Color::DarkGray)),
+            Row::new(vec![Cell::from(format!(
+                "... {} more rules",
+                rows.len() - shown
+            ))])
+            .style(Style::default().fg(Color::DarkGray)),
         );
     }
     out
@@ -197,18 +226,32 @@ fn draw_title(f: &mut Frame, area: Rect, state: &AppState) {
     } else {
         ("○ ", Color::Yellow, "syncing")
     };
-    let uptime_str = state.uptime_secs
+    let uptime_str = state
+        .uptime_secs
         .map(|s| format!(" up {} ", format_duration(s)))
         .unwrap_or_default();
     let title = Line::from(vec![
-        Span::styled(" satd ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            " satd ",
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::styled(
             format!(" {} ", state.chain_name),
             Style::default().fg(Color::White),
         ),
-        Span::styled(dot_glyph, Style::default().fg(dot_color).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            dot_glyph,
+            Style::default().fg(dot_color).add_modifier(Modifier::BOLD),
+        ),
         Span::styled(format!("{} ", health_label), Style::default().fg(dot_color)),
-        Span::styled(" mempool ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            " mempool ",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::styled(uptime_str, Style::default().fg(Color::DarkGray)),
     ]);
     f.render_widget(Paragraph::new(title), area);
@@ -220,7 +263,9 @@ fn draw_summary(f: &mut Frame, area: Rect, state: &AppState) {
         .border_style(Style::default().fg(Color::DarkGray))
         .title(Span::styled(
             " Summary ",
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
         ));
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -234,7 +279,11 @@ fn draw_summary(f: &mut Frame, area: Rect, state: &AppState) {
     // Latest snapshot gives us max fee and netdelta.
     let (max_rate, delta_str) = if let Some(last) = state.mempool_history.last() {
         let mx = last.max_fee_rate_sat_per_kvb as f64 / 1_000.0;
-        let mx_str = if mx > 0.0 { format!("{:.1}", mx) } else { "-".into() };
+        let mx_str = if mx > 0.0 {
+            format!("{:.1}", mx)
+        } else {
+            "-".into()
+        };
         let delta = if state.mempool_size == 0 {
             // Distinguish "we have data, mempool is genuinely empty" from
             // "we're still waiting for our second history snapshot". Both
@@ -260,17 +309,31 @@ fn draw_summary(f: &mut Frame, area: Rect, state: &AppState) {
 
     let line1 = Line::from(vec![
         Span::styled("  Txs ", Style::default().fg(Color::Gray)),
-        Span::styled(format_num(state.mempool_size), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            format_num(state.mempool_size),
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::styled("   Bytes ", Style::default().fg(Color::Gray)),
-        Span::styled(format_bytes(state.mempool_bytes), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            format_bytes(state.mempool_bytes),
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::styled("   Min ", Style::default().fg(Color::Gray)),
         Span::styled(min_rate, Style::default().fg(Color::White)),
         Span::styled("   Max ", Style::default().fg(Color::Gray)),
-        Span::styled(format!("{} sat/vB", max_rate), Style::default().fg(Color::White)),
+        Span::styled(
+            format!("{} sat/vB", max_rate),
+            Style::default().fg(Color::White),
+        ),
     ]);
-    let line2 = Line::from(vec![
-        Span::styled(format!("  {}", delta_str), Style::default().fg(Color::DarkGray)),
-    ]);
+    let line2 = Line::from(vec![Span::styled(
+        format!("  {}", delta_str),
+        Style::default().fg(Color::DarkGray),
+    )]);
 
     render_lines(f, inner, &[line1, line2]);
 }
@@ -281,7 +344,9 @@ fn draw_histogram(f: &mut Frame, area: Rect, state: &AppState) {
         .border_style(Style::default().fg(Color::DarkGray))
         .title(Span::styled(
             " Feerate histogram (vbytes per sat/vB band) ",
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
         ));
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -293,7 +358,12 @@ fn draw_histogram(f: &mut Frame, area: Rect, state: &AppState) {
     // entirely (zero-width bars just look like a misrendered panel).
     if total_weight == 0 && inner.height >= 3 {
         let msg_y = inner.y + (inner.height.saturating_sub(3)) / 2;
-        let msg_area = Rect { x: inner.x, y: msg_y, width: inner.width, height: 1 };
+        let msg_area = Rect {
+            x: inner.x,
+            y: msg_y,
+            width: inner.width,
+            height: 1,
+        };
         let msg = if state.mempool_size == 0 {
             "Mempool is empty — no fee distribution to display."
         } else {
@@ -348,7 +418,10 @@ fn draw_histogram(f: &mut Frame, area: Rect, state: &AppState) {
                 Style::default().fg(Color::DarkGray),
             ),
             Span::styled(bar, Style::default().fg(color)),
-            Span::styled(format!("  {}", format_bytes(vbytes)), Style::default().fg(Color::White)),
+            Span::styled(
+                format!("  {}", format_bytes(vbytes)),
+                Style::default().fg(Color::White),
+            ),
         ]);
         let row = Rect {
             x: inner.x,
@@ -413,9 +486,15 @@ fn tier_spans(fees: &FeeSummary) -> Vec<Span<'static>> {
         if i > 0 {
             spans.push(Span::styled("   ", Style::default()));
         }
-        spans.push(Span::styled((*label).to_string(), Style::default().fg(Color::DarkGray)));
+        spans.push(Span::styled(
+            (*label).to_string(),
+            Style::default().fg(Color::DarkGray),
+        ));
         let val = v.map(|n| format!("{:.1}", n)).unwrap_or_else(|| "-".into());
-        spans.push(Span::styled(val, Style::default().fg(*color).add_modifier(Modifier::BOLD)));
+        spans.push(Span::styled(
+            val,
+            Style::default().fg(*color).add_modifier(Modifier::BOLD),
+        ));
     }
     spans
 }
@@ -435,7 +514,8 @@ fn tier_color_for_rate(rate_sat_per_vb: u64, tiers: &[(&str, Option<f64>, Color)
 
 /// Aggregate wire histogram (feerate_sat_per_kvb, weight) into display buckets.
 fn aggregate_histogram(snap: Option<&MempoolSnapshot>) -> Vec<(&'static str, u64)> {
-    let mut out: Vec<(&'static str, u64)> = FEERATE_BUCKETS.iter().map(|(_, _, l)| (*l, 0u64)).collect();
+    let mut out: Vec<(&'static str, u64)> =
+        FEERATE_BUCKETS.iter().map(|(_, _, l)| (*l, 0u64)).collect();
     let Some(snap) = snap else { return out };
     for b in &snap.histogram {
         let rate_vb = b.feerate_sat_per_kvb / 1_000;
@@ -472,7 +552,9 @@ fn draw_trend(f: &mut Frame, area: Rect, state: &AppState) {
         .border_style(Style::default().fg(Color::DarkGray))
         .title(Span::styled(
             title,
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
         ));
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -482,13 +564,22 @@ fn draw_trend(f: &mut Frame, area: Rect, state: &AppState) {
 
     let bytes: Vec<u64> = state.mempool_history.iter().map(|s| s.bytes).collect();
     let txs: Vec<u64> = state.mempool_history.iter().map(|s| s.size).collect();
-    let min_fees: Vec<u64> = state.mempool_history.iter().map(|s| s.min_fee_rate_sat_per_kvb).collect();
+    let min_fees: Vec<u64> = state
+        .mempool_history
+        .iter()
+        .map(|s| s.min_fee_rate_sat_per_kvb)
+        .collect();
 
     // All-zero history (e.g. mempool stayed empty during catch-up) makes
     // sparklines render as a flat invisible line — paint a hint instead.
     if bytes.iter().all(|b| *b == 0) && txs.iter().all(|t| *t == 0) {
         let msg_y = inner.y + inner.height / 2;
-        let msg_area = Rect { x: inner.x, y: msg_y, width: inner.width, height: 1 };
+        let msg_area = Rect {
+            x: inner.x,
+            y: msg_y,
+            width: inner.width,
+            height: 1,
+        };
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 "no mempool activity yet",
@@ -512,14 +603,16 @@ fn draw_trend(f: &mut Frame, area: Rect, state: &AppState) {
         if y + slot_h > inner.y + inner.height {
             break;
         }
-        let label_area = Rect { x: inner.x, y, width: inner.width, height: 1 };
+        let label_area = Rect {
+            x: inner.x,
+            y,
+            width: inner.width,
+            height: 1,
+        };
         f.render_widget(
             Paragraph::new(Line::from(vec![
                 Span::styled(format!("  {}", label), Style::default().fg(Color::Gray)),
-                Span::styled(
-                    summarise(data),
-                    Style::default().fg(Color::DarkGray),
-                ),
+                Span::styled(summarise(data), Style::default().fg(Color::DarkGray)),
             ])),
             label_area,
         );
@@ -559,7 +652,9 @@ fn draw_top_n(f: &mut Frame, area: Rect, state: &AppState) {
         .border_style(Style::default().fg(Color::DarkGray))
         .title(Span::styled(
             title,
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
         ));
 
     if state.mempool_top.is_empty() {
@@ -567,7 +662,12 @@ fn draw_top_n(f: &mut Frame, area: Rect, state: &AppState) {
         f.render_widget(block, area);
         if inner.height >= 1 {
             let msg_y = inner.y + inner.height / 2;
-            let msg_area = Rect { x: inner.x, y: msg_y, width: inner.width, height: 1 };
+            let msg_area = Rect {
+                x: inner.x,
+                y: msg_y,
+                width: inner.width,
+                height: 1,
+            };
             let msg = if state.mempool_size == 0 {
                 "Mempool is empty — no transactions to rank."
             } else {
@@ -609,7 +709,11 @@ fn draw_top_n(f: &mut Frame, area: Rect, state: &AppState) {
 
 fn top_row(i: usize, e: &MempoolTopEntry, selected: bool) -> Row<'static> {
     let base = Style::default();
-    let style = if selected { base.fg(Color::Yellow) } else { base };
+    let style = if selected {
+        base.fg(Color::Yellow)
+    } else {
+        base
+    };
     Row::new(vec![
         Cell::from(format!("{}", i + 1)),
         Cell::from(format_hash(&e.txid)),
@@ -629,7 +733,10 @@ fn draw_footer(f: &mut Frame, area: Rect, state: &AppState) {
         Span::styled(": help  ", Style::default().fg(Color::DarkGray)),
         Span::styled("r", Style::default().fg(Color::White)),
         Span::styled(": reorgs  ", Style::default().fg(Color::DarkGray)),
-        Span::styled(crate::ui::view_keys(state), Style::default().fg(Color::White)),
+        Span::styled(
+            crate::ui::view_keys(state),
+            Style::default().fg(Color::White),
+        ),
         Span::styled(": view  ", Style::default().fg(Color::DarkGray)),
         Span::raw("\u{2191}\u{2193}"),
         Span::styled(": scroll top-N", Style::default().fg(Color::DarkGray)),
@@ -662,7 +769,11 @@ mod tests {
         terminal.draw(|f| draw(f, state)).unwrap();
         let buffer = terminal.backend().buffer();
         (0..height)
-            .map(|y| (0..width).map(|x| buffer[(x, y)].symbol()).collect::<String>())
+            .map(|y| {
+                (0..width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
             .collect::<Vec<_>>()
             .join("\n")
     }
@@ -697,14 +808,26 @@ mod tests {
     #[test]
     fn a_loaded_policy_shows_what_it_holds() {
         let screen = render(120, 45, &with_policy(2));
-        assert!(screen.contains("Quarantine (policy v1, 2 rules; not counted above)"), "{screen}");
-        assert!(screen.contains("Held 2,345 txs, 1.00 MB of 300.00 MB (0.3%)"), "{screen}");
+        assert!(
+            screen.contains("Quarantine (policy v1, 2 rules; not counted above)"),
+            "{screen}"
+        );
+        assert!(
+            screen.contains("Held 2,345 txs, 1.00 MB of 300.00 MB (0.3%)"),
+            "{screen}"
+        );
         assert!(screen.contains("Confirmed anyway 17"), "{screen}");
         assert!(screen.contains("Foregone fees 98,765 sat"), "{screen}");
         let rule0 = screen.lines().find(|l| l.contains("rule0")).expect(&screen);
-        assert!(rule0.contains("1.0-12.5") && rule0.contains("100"), "{rule0}");
+        assert!(
+            rule0.contains("1.0-12.5") && rule0.contains("100"),
+            "{rule0}"
+        );
         let rule1 = screen.lines().find(|l| l.contains("rule1")).expect(&screen);
-        assert!(rule1.contains(" - ") && rule1.contains("99"), "a rule holding nothing: {rule1}");
+        assert!(
+            rule1.contains(" - ") && rule1.contains("99"),
+            "a rule holding nothing: {rule1}"
+        );
         // The rest of the view is still there under it.
         assert!(screen.contains("Feerate histogram"), "{screen}");
         assert!(screen.contains("Top by ancestor feerate"), "{screen}");
@@ -721,6 +844,9 @@ mod tests {
     fn rules_past_the_cap_are_counted_not_dropped() {
         let screen = render(120, 45, &with_policy(QUARANTINE_MAX_RULE_ROWS + 3));
         assert!(screen.contains("... 4 more rules"), "{screen}");
-        assert!(screen.contains("rule0"), "the largest holding is shown first: {screen}");
+        assert!(
+            screen.contains("rule0"),
+            "the largest holding is shown first: {screen}"
+        );
     }
 }

@@ -25,7 +25,12 @@ fn coin(chain: &mut Chain, signer: &Signer, n: u8) -> OutPoint {
     let op = outpoint(n);
     chain.coins.insert(
         op,
-        Coin { value: VALUE, script_pubkey: signer.spk.clone(), height: COIN_HEIGHT, coinbase: false },
+        Coin {
+            value: VALUE,
+            script_pubkey: signer.spk.clone(),
+            height: COIN_HEIGHT,
+            coinbase: false,
+        },
     );
     op
 }
@@ -51,8 +56,13 @@ fn on_disk(path: &std::path::Path) -> Vec<Attestation> {
     held.into_values().collect()
 }
 
-fn submit(p: &Publisher, chain: &Chain, att: &Attestation) -> Result<Option<sha256::Hash>, PublishError> {
-    p.submit(chain, &att.message(), &encode_signature(att.signature())).map(|(_, replaced)| replaced)
+fn submit(
+    p: &Publisher,
+    chain: &Chain,
+    att: &Attestation,
+) -> Result<Option<sha256::Hash>, PublishError> {
+    p.submit(chain, &att.message(), &encode_signature(att.signature()))
+        .map(|(_, replaced)| replaced)
 }
 
 fn rule(r: Result<impl std::fmt::Debug, PublishError>) -> &'static str {
@@ -71,8 +81,14 @@ fn a_submitted_attestation_is_stored_and_survives_a_reload() {
     assert_eq!(submit(&p, &chain, &att), Ok(None));
     assert_eq!(submit(&p, &chain, &legacy_att), Ok(None));
     assert!(store::journal_path(&path).exists());
-    assert!(!path.with_extension("dat.tmp").exists(), "no temporary file left behind");
-    assert!(!path.with_extension("journal.tmp").exists(), "no temporary file left behind");
+    assert!(
+        !path.with_extension("dat.tmp").exists(),
+        "no temporary file left behind"
+    );
+    assert!(
+        !path.with_extension("journal.tmp").exists(),
+        "no temporary file left behind"
+    );
 
     let p = Publisher::open(path, &chain).unwrap();
     let listed = p.list(&chain);
@@ -92,7 +108,10 @@ fn signature_strings_by_prefix() {
     let p = Publisher::open(path, &chain).unwrap();
     let smp = encode_signature(att.signature());
     assert!(smp.starts_with("smp"));
-    assert!(p.submit(&chain, &att.message(), &smp[3..]).is_ok(), "unprefixed is simple for P2WPKH");
+    assert!(
+        p.submit(&chain, &att.message(), &smp[3..]).is_ok(),
+        "unprefixed is simple for P2WPKH"
+    );
 
     let full = p2wsh_full(bitcoin::script::Builder::new(), 0, 0, 0);
     let op = coin(&mut chain, &full, 8);
@@ -102,13 +121,22 @@ fn signature_strings_by_prefix() {
 
     // The signed `to_sign` in hex, as Sparrow exports it, is the full proof.
     let hex_att = attest(&chain, &full, op, "k2", "v", ANCHOR);
-    let NapSignature::Full(tx) = hex_att.signature() else { panic!("a full proof") };
+    let NapSignature::Full(tx) = hex_att.signature() else {
+        panic!("a full proof")
+    };
     let hex = bitcoin::consensus::encode::serialize_hex(tx);
-    let (stored, _) = p.submit(&chain, &hex_att.message(), &hex.to_uppercase()).unwrap();
+    let (stored, _) = p
+        .submit(&chain, &hex_att.message(), &hex.to_uppercase())
+        .unwrap();
     assert_eq!(stored.attestation, hex_att, "the same full proof");
-    let bad = p.submit(&chain, &hex_att.message(), &hex[..hex.len() - 2]).unwrap_err();
+    let bad = p
+        .submit(&chain, &hex_att.message(), &hex[..hex.len() - 2])
+        .unwrap_err();
     assert_eq!(bad.rule(), "format");
-    assert!(bad.to_string().contains("neither a transaction in hex"), "{bad}");
+    assert!(
+        bad.to_string().contains("neither a transaction in hex"),
+        "{bad}"
+    );
 
     let legacy = p2pkh();
     let op = coin(&mut chain, &legacy, 9);
@@ -117,11 +145,21 @@ fn signature_strings_by_prefix() {
     assert!(!legacy_sig.starts_with("smp") && !legacy_sig.starts_with("ful"));
     assert_eq!(submit(&p, &chain, &legacy_att), Ok(None));
     // Unprefixed is simple for a segwit coin, so a legacy signature fails.
-    assert!(p.submit(&chain, &att.message().replace("value: yes", "value: no"), &legacy_sig).is_err());
+    assert!(
+        p.submit(
+            &chain,
+            &att.message().replace("value: yes", "value: no"),
+            &legacy_sig
+        )
+        .is_err()
+    );
 
     let pof = p.submit(&chain, &att.message(), "pofAAAA").unwrap_err();
     assert_eq!(pof.rule(), "format");
-    assert!(pof.to_string().contains("sign without extra inputs"), "{pof}");
+    assert!(
+        pof.to_string().contains("sign without extra inputs"),
+        "{pof}"
+    );
 }
 
 #[test]
@@ -135,7 +173,10 @@ fn rejections_name_the_rule() {
     assert_eq!(rule(p.submit(&chain, "not a message", &sig)), "format");
     assert_eq!(rule(p.submit(&chain, &att.message(), "smp!!")), "format");
     let wrong_value = att.message().replace("value: yes", "value: no");
-    assert_eq!(rule(p.submit(&chain, &wrong_value, &sig)), "signature-invalid");
+    assert_eq!(
+        rule(p.submit(&chain, &wrong_value, &sig)),
+        "signature-invalid"
+    );
 
     let op = coin(&mut chain, &signer, 8);
     chain.coins.get_mut(&op).unwrap().height = ANCHOR - MIN_COIN_AGE + 1;
@@ -161,11 +202,17 @@ fn one_attestation_per_key_and_the_newer_one_wins() {
     let p = Publisher::open(path, &chain).unwrap();
 
     assert_eq!(submit(&p, &chain, &old), Ok(None));
-    assert_eq!(submit(&p, &chain, &old), Ok(None), "the same attestation again changes nothing");
+    assert_eq!(
+        submit(&p, &chain, &old),
+        Ok(None),
+        "the same attestation again changes nothing"
+    );
     assert_eq!(submit(&p, &chain, &new), Ok(Some(old.id())));
     assert_eq!(
         submit(&p, &chain, &old),
-        Err(PublishError::Superseded { anchor_height: ANCHOR }),
+        Err(PublishError::Superseded {
+            anchor_height: ANCHOR
+        }),
     );
     assert_eq!(p.list(&chain)[0].attestation, new);
 
@@ -191,14 +238,23 @@ fn an_outpoint_holds_at_most_32_keys() {
     let extra = attest(&chain, &signer, op, "one too many", "yes", ANCHOR);
     assert_eq!(submit(&p, &chain, &extra), Err(PublishError::KeyLimit));
     let draft = p.create(&chain, op, "one too many", "yes").unwrap();
-    assert!(draft.warnings.iter().any(|w| w.contains("refuse")), "{:?}", draft.warnings);
+    assert!(
+        draft.warnings.iter().any(|w| w.contains("refuse")),
+        "{:?}",
+        draft.warnings
+    );
 
     // Replacing one of the 32, or a key on another outpoint, is fine.
     let replace = attest(&chain, &signer, op, "key0", "no", ANCHOR);
     assert!(matches!(submit(&p, &chain, &replace), Ok(Some(_))));
     let elsewhere = attest(&chain, &signer, other, "one too many", "yes", ANCHOR);
     assert_eq!(submit(&p, &chain, &elsewhere), Ok(None));
-    assert!(p.create(&chain, op, "key1", "x").unwrap().warnings.is_empty());
+    assert!(
+        p.create(&chain, op, "key1", "x")
+            .unwrap()
+            .warnings
+            .is_empty()
+    );
 }
 
 #[test]
@@ -211,8 +267,20 @@ fn create_anchors_below_the_tip_and_checks_the_coin() {
 
     let draft = p.create(&chain, op, "bip_xyz.support", "yes").unwrap();
     assert_eq!(draft.anchor_height, TIP - ANCHOR_DEPTH);
-    assert_eq!(Some(draft.anchor_hash), chain.block_hash(TIP - ANCHOR_DEPTH));
-    assert_eq!(draft.message, message::render(&op, "bip_xyz.support", "yes", draft.anchor_height, &draft.anchor_hash));
+    assert_eq!(
+        Some(draft.anchor_hash),
+        chain.block_hash(TIP - ANCHOR_DEPTH)
+    );
+    assert_eq!(
+        draft.message,
+        message::render(
+            &op,
+            "bip_xyz.support",
+            "yes",
+            draft.anchor_height,
+            &draft.anchor_hash
+        )
+    );
     assert!(draft.warnings.is_empty());
     // A message signed as drafted is accepted.
     let text = (signer.sign)(&draft.message);
@@ -223,7 +291,11 @@ fn create_anchors_below_the_tip_and_checks_the_coin() {
     let long = "v".repeat(MAX_VALUE_LEN);
     let draft = p.create(&chain, op, "a.much.longer.key", &long).unwrap();
     assert!(draft.message.len() > COLDCARD_MESSAGE_LIMIT);
-    assert!(draft.warnings.iter().any(|w| w.contains("Coldcard")), "{:?}", draft.warnings);
+    assert!(
+        draft.warnings.iter().any(|w| w.contains("Coldcard")),
+        "{:?}",
+        draft.warnings
+    );
 
     // The coin must hold enough to attest.
     let value = chain.coins[&op].value;
@@ -246,11 +318,17 @@ fn create_anchors_below_the_tip_and_checks_the_coin() {
     assert!(p.create(&chain, op, "k", "v").is_ok());
     chain.network = bitcoin::Network::Bitcoin;
 
-    assert_eq!(rule(p.create(&chain, outpoint(99), "k", "v")), "coin-not-found");
+    assert_eq!(
+        rule(p.create(&chain, outpoint(99), "k", "v")),
+        "coin-not-found"
+    );
     assert_eq!(rule(p.create(&chain, op, "", "v")), "format");
     assert_eq!(rule(p.create(&chain, op, "k", "line\nbreak")), "format");
     chain.tip = ANCHOR_DEPTH - 1;
-    assert_eq!(p.create(&chain, op, "k", "v").unwrap_err(), PublishError::ChainTooShort);
+    assert_eq!(
+        p.create(&chain, op, "k", "v").unwrap_err(),
+        PublishError::ChainTooShort
+    );
 }
 
 #[test]
@@ -270,7 +348,11 @@ fn a_new_tip_drops_spent_coins_and_keeps_the_rest() {
     p.on_tip(&behind);
     assert_eq!(p.list(&chain).len(), 2);
     let reopened = Publisher::open(path.clone(), &behind).unwrap();
-    assert_eq!(reopened.list(&chain).len(), 2, "a reload behind the anchor keeps everything");
+    assert_eq!(
+        reopened.list(&chain).len(),
+        2,
+        "a reload behind the anchor keeps everything"
+    );
 
     // On a fork without the anchor, a missing coin may be back on the
     // anchor's branch: kept, not served.
@@ -282,7 +364,11 @@ fn a_new_tip_drops_spent_coins_and_keeps_the_rest() {
     chain.fork_at = u32::MAX;
     chain.coins.insert(att.outpoint(), spent_coin);
     p.on_tip(&chain);
-    assert_eq!(p.serving().len(), 2, "back on the anchor's branch, both are valid again");
+    assert_eq!(
+        p.serving().len(),
+        2,
+        "back on the anchor's branch, both are valid again"
+    );
 
     // On a chain holding the anchor, the coin was spent.
     chain.coins.remove(&att.outpoint());
@@ -304,20 +390,33 @@ fn a_lost_anchor_or_a_stale_one_is_kept_but_not_served() {
 
     chain.fork_at = ANCHOR;
     // Listing between tips does not hide the change from the next tip.
-    assert_eq!(p.list(&chain)[0].status, Some(Err(Rejection::AnchorNotOnChain)));
+    assert_eq!(
+        p.list(&chain)[0].status,
+        Some(Err(Rejection::AnchorNotOnChain))
+    );
     assert_eq!(p.serving(), vec![att.clone()]);
     p.on_tip(&chain);
     assert!(p.serving().is_empty());
-    assert_eq!(p.list(&chain)[0].status, Some(Err(Rejection::AnchorNotOnChain)));
+    assert_eq!(
+        p.list(&chain)[0].status,
+        Some(Err(Rejection::AnchorNotOnChain))
+    );
 
     chain.fork_at = u32::MAX;
     p.on_tip(&chain);
-    assert_eq!(p.serving(), vec![att.clone()], "back on the chain, served again");
+    assert_eq!(
+        p.serving(),
+        vec![att.clone()],
+        "back on the chain, served again"
+    );
 
     chain.tip = ANCHOR + FRESHNESS_WINDOW;
     p.on_tip(&chain);
     assert!(p.serving().is_empty());
-    assert!(matches!(p.list(&chain)[0].status, Some(Err(Rejection::Stale { .. }))));
+    assert!(matches!(
+        p.list(&chain)[0].status,
+        Some(Err(Rejection::Stale { .. }))
+    ));
 }
 
 /// A coin's scriptPubKey never changes, so a signature is verified once.
@@ -357,10 +456,18 @@ fn removal_stops_publishing() {
     let (chain, att) = setup(&p2wpkh(), COIN_HEIGHT, ANCHOR);
     let p = Publisher::open(path.clone(), &chain).unwrap();
     submit(&p, &chain, &att).unwrap();
-    assert_eq!(p.remove(att.outpoint(), "another key"), Err(PublishError::NotFound));
+    assert_eq!(
+        p.remove(att.outpoint(), "another key"),
+        Err(PublishError::NotFound)
+    );
     assert_eq!(p.remove(att.outpoint(), att.key()), Ok(att.clone()));
     assert!(p.list(&chain).is_empty());
-    assert!(Publisher::open(path, &chain).unwrap().list(&chain).is_empty());
+    assert!(
+        Publisher::open(path, &chain)
+            .unwrap()
+            .list(&chain)
+            .is_empty()
+    );
 }
 
 #[test]
@@ -380,8 +487,15 @@ fn a_failed_write_changes_nothing() {
     let listed = p.list(&chain);
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].attestation, att);
-    assert!(!path.with_extension("journal.tmp").exists(), "no temporary file left behind");
-    assert_eq!(store::load(&path).unwrap(), vec![att], "the file is as it was");
+    assert!(
+        !path.with_extension("journal.tmp").exists(),
+        "no temporary file left behind"
+    );
+    assert_eq!(
+        store::load(&path).unwrap(),
+        vec![att],
+        "the file is as it was"
+    );
 }
 
 #[test]
@@ -390,13 +504,20 @@ fn the_store_file_refuses_anything_it_did_not_write() {
     let legacy = attest(&chain, &p2pkh(), outpoint(9), "k", "v", ANCHOR);
     let good = store::encode([&att, &legacy].into_iter());
     assert_eq!(store::decode(&good), Ok(vec![att.clone(), legacy]));
-    assert_eq!(store::decode(&store::encode(std::iter::empty())), Ok(vec![]));
+    assert_eq!(
+        store::decode(&store::encode(std::iter::empty())),
+        Ok(vec![])
+    );
 
     let mut flipped = good.clone();
     flipped[20] ^= 1;
     assert!(store::decode(&flipped).unwrap_err().contains("checksum"));
     assert!(store::decode(&good[..good.len() - 1]).is_err());
-    assert!(store::decode(&good[..10]).unwrap_err().contains("truncated"));
+    assert!(
+        store::decode(&good[..10])
+            .unwrap_err()
+            .contains("truncated")
+    );
 
     // With a valid checksum, the header and the entries are still checked.
     let reseal = |body: &[u8]| {
@@ -407,19 +528,42 @@ fn the_store_file_refuses_anything_it_did_not_write() {
     let body = &good[..good.len() - 32];
     let mut magic = body.to_vec();
     magic[0] = b'X';
-    assert!(store::decode(&reseal(&magic)).unwrap_err().contains("not a NAP"));
+    assert!(
+        store::decode(&reseal(&magic))
+            .unwrap_err()
+            .contains("not a NAP")
+    );
     let mut version = body.to_vec();
     version[4] = 2;
-    assert!(store::decode(&reseal(&version)).unwrap_err().contains("version 2"));
+    assert!(
+        store::decode(&reseal(&version))
+            .unwrap_err()
+            .contains("version 2")
+    );
     let mut count = body.to_vec();
     count[8] = 3;
-    assert!(store::decode(&reseal(&count)).unwrap_err().contains("entry 2"));
+    assert!(
+        store::decode(&reseal(&count))
+            .unwrap_err()
+            .contains("entry 2")
+    );
     count[8] = 1;
-    assert!(store::decode(&reseal(&count)).unwrap_err().contains("follow the last entry"));
+    assert!(
+        store::decode(&reseal(&count))
+            .unwrap_err()
+            .contains("follow the last entry")
+    );
 
     // Two for one key (not something the publisher writes): the newer wins.
     let (_dir, path) = store_path();
-    let newer = attest(&chain, &p2wpkh(), att.outpoint(), att.key(), "no", ANCHOR + 1);
+    let newer = attest(
+        &chain,
+        &p2wpkh(),
+        att.outpoint(),
+        att.key(),
+        "no",
+        ANCHOR + 1,
+    );
     for order in [[&att, &newer], [&newer, &att]] {
         store::save(&path, &store::encode(order.into_iter())).unwrap();
         let listed = Publisher::open(path.clone(), &chain).unwrap().list(&chain);
@@ -441,7 +585,10 @@ fn recovery_sets_a_damaged_store_aside_and_starts_empty() {
     let (chain, att) = setup(&p2wpkh(), COIN_HEIGHT, ANCHOR);
 
     let (p, aside) = Publisher::open_recovering(path.clone(), &chain).unwrap();
-    assert!(aside.is_none(), "a missing store is an empty one, not a damaged one");
+    assert!(
+        aside.is_none(),
+        "a missing store is an empty one, not a damaged one"
+    );
     submit(&p, &chain, &att).unwrap();
     let (p, aside) = Publisher::open_recovering(path.clone(), &chain).unwrap();
     assert!(aside.is_none());
@@ -449,15 +596,30 @@ fn recovery_sets_a_damaged_store_aside_and_starts_empty() {
 
     let damaged = b"not a store".to_vec();
     std::fs::write(&path, &damaged).unwrap();
-    assert!(Publisher::open(path.clone(), &chain).is_err(), "without recovery, still an error");
+    assert!(
+        Publisher::open(path.clone(), &chain).is_err(),
+        "without recovery, still an error"
+    );
     let (p, aside) = Publisher::open_recovering(path.clone(), &chain).unwrap();
     let (aside, why) = aside.expect("the damaged file was set aside");
     assert!(why.contains("truncated"), "{why}");
     // The file and the journal that followed it.
     assert_eq!(aside.len(), 2, "{aside:?}");
     let aside = &aside[0];
-    assert!(aside.file_name().unwrap().to_str().unwrap().starts_with("attestations.dat.bad-"), "{aside:?}");
-    assert_eq!(std::fs::read(aside).unwrap(), damaged, "the damaged file is kept as it was");
+    assert!(
+        aside
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with("attestations.dat.bad-"),
+        "{aside:?}"
+    );
+    assert_eq!(
+        std::fs::read(aside).unwrap(),
+        damaged,
+        "the damaged file is kept as it was"
+    );
     assert!(!path.exists());
     assert!(p.list(&chain).is_empty());
     submit(&p, &chain, &att).unwrap();
@@ -493,16 +655,28 @@ fn a_change_appends_one_record_and_leaves_the_file_alone() {
     // first: no change rewrites what is stored. A DER signature's length
     // varies by a byte.
     let grew: Vec<u64> = lens.windows(2).map(|w| w[1] - w[0]).collect();
-    assert!(grew[1..].iter().all(|g| g.abs_diff(grew[1]) <= 1), "{grew:?}");
+    assert!(
+        grew[1..].iter().all(|g| g.abs_diff(grew[1]) <= 1),
+        "{grew:?}"
+    );
     assert!(grew[0].abs_diff(grew[1] + 40) <= 1, "{grew:?}");
-    assert!(!path.exists(), "the file is written only when the journal is folded in");
+    assert!(
+        !path.exists(),
+        "the file is written only when the journal is folded in"
+    );
     assert_eq!(on_disk(&path), atts);
     p.remove(atts[3].outpoint(), "k").unwrap();
     let mut left = atts.clone();
     left.remove(3);
     assert_eq!(on_disk(&path), left);
     let reopened = Publisher::open(path, &chain).unwrap().list(&chain);
-    assert_eq!(reopened.iter().map(|p| p.attestation.clone()).collect::<Vec<_>>(), left);
+    assert_eq!(
+        reopened
+            .iter()
+            .map(|p| p.attestation.clone())
+            .collect::<Vec<_>>(),
+        left
+    );
 }
 
 #[test]
@@ -524,7 +698,11 @@ fn a_torn_last_record_is_dropped_and_the_journal_goes_on() {
         std::fs::write(store::journal_path(&path), torn).unwrap();
         let p = Publisher::open(path.clone(), &chain).unwrap();
         assert_eq!(on_disk(&path), vec![atts[0].clone()]);
-        assert_eq!(std::fs::read(store::journal_path(&path)).unwrap(), whole[..first_end], "the torn end is cut off");
+        assert_eq!(
+            std::fs::read(store::journal_path(&path)).unwrap(),
+            whole[..first_end],
+            "the torn end is cut off"
+        );
         // The next change follows the last whole record.
         submit(&p, &chain, &atts[2]).unwrap();
         assert_eq!(on_disk(&path), vec![atts[0].clone(), atts[2].clone()]);
@@ -550,7 +728,15 @@ fn a_damaged_record_before_the_end_is_an_error_and_recovery_sets_both_files_asid
     let (aside, _) = aside.unwrap();
     // No file was written yet, so the journal is all there is to set aside.
     assert_eq!(aside.len(), 1, "{aside:?}");
-    assert!(aside[0].file_name().unwrap().to_str().unwrap().starts_with("attestations.journal.bad-"), "{aside:?}");
+    assert!(
+        aside[0]
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with("attestations.journal.bad-"),
+        "{aside:?}"
+    );
     assert_eq!(std::fs::read(&aside[0]).unwrap(), damaged, "kept as it was");
     assert!(!jpath.exists());
     assert!(p.list(&chain).is_empty());
@@ -581,7 +767,9 @@ fn a_journal_that_outgrows_the_file_is_folded_into_it() {
     let (_dir, path) = store_path();
     let mut chain = Chain::new();
     let atts = attested(&mut chain, 20);
-    let p = Publisher::open(path.clone(), &chain).unwrap().with_compaction_at(1);
+    let p = Publisher::open(path.clone(), &chain)
+        .unwrap()
+        .with_compaction_at(1);
     for att in &atts {
         submit(&p, &chain, att).unwrap();
     }
@@ -591,7 +779,13 @@ fn a_journal_that_outgrows_the_file_is_folded_into_it() {
     assert!(p.journal_len() <= file, "{} > {file}", p.journal_len());
     assert_eq!(on_disk(&path), atts[1..]);
     let reopened = Publisher::open(path.clone(), &chain).unwrap().list(&chain);
-    assert_eq!(reopened.iter().map(|p| p.attestation.clone()).collect::<Vec<_>>(), atts[1..]);
+    assert_eq!(
+        reopened
+            .iter()
+            .map(|p| p.attestation.clone())
+            .collect::<Vec<_>>(),
+        atts[1..]
+    );
     // Under the real threshold a store this small is never rewritten.
     let (_dir, path) = store_path();
     let p = Publisher::open(path.clone(), &chain).unwrap();
@@ -612,7 +806,11 @@ struct Hooked<'a> {
 
 impl<'a> Hooked<'a> {
     fn new(chain: &'a Chain, reads: usize, hook: Option<Box<dyn FnOnce() + 'a>>) -> Self {
-        Hooked { chain, hook: std::cell::Cell::new(hook), reads: std::cell::Cell::new(reads) }
+        Hooked {
+            chain,
+            hook: std::cell::Cell::new(hook),
+            reads: std::cell::Cell::new(reads),
+        }
     }
 }
 
@@ -637,12 +835,23 @@ fn a_recheck_that_cannot_read_the_chain_is_busy() {
     let (_dir, path) = store_path();
     let signer = p2wpkh();
     let (chain, old) = setup(&signer, COIN_HEIGHT, ANCHOR);
-    let older = attest(&chain, &signer, old.outpoint(), old.key(), "no", ANCHOR - 100);
+    let older = attest(
+        &chain,
+        &signer,
+        old.outpoint(),
+        old.key(),
+        "no",
+        ANCHOR - 100,
+    );
     let p = Publisher::open(path, &chain).unwrap();
     submit(&p, &chain, &old).unwrap();
     // Two reads for the submission itself; the re-check gets none.
     let stuck = Hooked::new(&chain, 2, None);
-    let r = p.submit(&stuck, &older.message(), &encode_signature(older.signature()));
+    let r = p.submit(
+        &stuck,
+        &older.message(),
+        &encode_signature(older.signature()),
+    );
     assert_eq!(r.unwrap_err(), PublishError::Busy);
 }
 
@@ -673,15 +882,32 @@ fn a_tip_pass_does_not_judge_an_entry_replaced_during_it() {
 #[test]
 fn a_lost_anchor_is_reported_only_when_the_chain_has_reached_it() {
     let lost = || Err(Rejection::AnchorNotOnChain);
-    let stale = || Err(Rejection::Stale { age: FRESHNESS_WINDOW });
+    let stale = || {
+        Err(Rejection::Stale {
+            age: FRESHNESS_WINDOW,
+        })
+    };
     let valid = Ok(VALUE);
-    let said = |before: Option<&Result<bitcoin::Amount, Rejection>>, now, tip| transition(before, now, tip, ANCHOR).1;
+    let said = |before: Option<&Result<bitcoin::Amount, Rejection>>, now, tip| {
+        transition(before, now, tip, ANCHOR).1
+    };
     assert_eq!(said(Some(&valid), lost(), ANCHOR), Some(Report::LostAnchor));
-    assert_eq!(said(None, lost(), ANCHOR + 1), Some(Report::LostAnchor), "found at startup");
-    assert_eq!(said(None, lost(), ANCHOR - 1), None, "behind the anchor: IBD, not a reorg");
+    assert_eq!(
+        said(None, lost(), ANCHOR + 1),
+        Some(Report::LostAnchor),
+        "found at startup"
+    );
+    assert_eq!(
+        said(None, lost(), ANCHOR - 1),
+        None,
+        "behind the anchor: IBD, not a reorg"
+    );
     assert_eq!(said(Some(&valid), lost(), ANCHOR - 1), None);
     assert_eq!(said(Some(&lost()), lost(), ANCHOR), None, "reported once");
-    assert_eq!(said(Some(&valid), stale(), TIP), Some(Report::NoLongerValid(stale().unwrap_err())));
+    assert_eq!(
+        said(Some(&valid), stale(), TIP),
+        Some(Report::NoLongerValid(stale().unwrap_err()))
+    );
     assert_eq!(said(Some(&stale()), stale(), TIP), None);
     assert_eq!(said(Some(&valid), Ok(VALUE), TIP), None);
 
@@ -689,11 +915,20 @@ fn a_lost_anchor_is_reported_only_when_the_chain_has_reached_it() {
     // yet reported), then the new branch passes its height without it.
     let (mid, said_mid) = transition(Some(&valid), lost(), ANCHOR - 1, ANCHOR);
     assert_eq!((mid.clone(), said_mid), (None, None));
-    assert_eq!(transition(mid.as_ref(), lost(), ANCHOR + 5, ANCHOR).1, Some(Report::LostAnchor));
+    assert_eq!(
+        transition(mid.as_ref(), lost(), ANCHOR + 5, ANCHOR).1,
+        Some(Report::LostAnchor)
+    );
     // The same blocks coming back: valid again, nothing to report.
-    assert_eq!(transition(mid.as_ref(), Ok(VALUE), ANCHOR + 5, ANCHOR), (Some(Ok(VALUE)), None));
+    assert_eq!(
+        transition(mid.as_ref(), Ok(VALUE), ANCHOR + 5, ANCHOR),
+        (Some(Ok(VALUE)), None)
+    );
     // Already reported, then behind: stays reported.
-    assert_eq!(transition(Some(&lost()), lost(), ANCHOR - 1, ANCHOR), (Some(lost()), None));
+    assert_eq!(
+        transition(Some(&lost()), lost(), ANCHOR - 1, ANCHOR),
+        (Some(lost()), None)
+    );
 }
 
 /// An entry the chain has never held still for is "not judged yet", not a
@@ -719,23 +954,49 @@ fn the_store_holds_at_most_the_operators_limit() {
     let op2 = coin(&mut chain, &signer, 8);
     let b = attest(&chain, &signer, op2, "k", "v", ANCHOR);
     let c = attest(&chain, &signer, a.outpoint(), "another key", "v", ANCHOR);
-    let p = Publisher::open(path.clone(), &chain).unwrap().with_max_attestations(2);
+    let p = Publisher::open(path.clone(), &chain)
+        .unwrap()
+        .with_max_attestations(2);
     submit(&p, &chain, &a).unwrap();
     submit(&p, &chain, &b).unwrap();
-    assert_eq!(submit(&p, &chain, &c), Err(PublishError::StoreFull { max: 2 }));
+    assert_eq!(
+        submit(&p, &chain, &c),
+        Err(PublishError::StoreFull { max: 2 })
+    );
     assert_eq!(rule(submit(&p, &chain, &c)), "store-full");
     let draft = p.create(&chain, a.outpoint(), "another key", "v").unwrap();
-    assert!(draft.warnings.iter().any(|w| w.contains("-napmaxattestations")), "{:?}", draft.warnings);
-    assert!(p.create(&chain, a.outpoint(), a.key(), "no").unwrap().warnings.is_empty(), "a replacement fits");
+    assert!(
+        draft
+            .warnings
+            .iter()
+            .any(|w| w.contains("-napmaxattestations")),
+        "{:?}",
+        draft.warnings
+    );
+    assert!(
+        p.create(&chain, a.outpoint(), a.key(), "no")
+            .unwrap()
+            .warnings
+            .is_empty(),
+        "a replacement fits"
+    );
     let newer = attest(&chain, &signer, a.outpoint(), a.key(), "no", ANCHOR);
-    assert_eq!(submit(&p, &chain, &newer), Ok(Some(a.id())), "replacing one is allowed at the limit");
+    assert_eq!(
+        submit(&p, &chain, &newer),
+        Ok(Some(a.id())),
+        "replacing one is allowed at the limit"
+    );
 
     // Lowered below what is stored: everything is kept, nothing new taken.
-    let p = Publisher::open(path.clone(), &chain).unwrap().with_max_attestations(1);
+    let p = Publisher::open(path.clone(), &chain)
+        .unwrap()
+        .with_max_attestations(1);
     assert_eq!(p.list(&chain).len(), 2);
     assert_eq!(rule(submit(&p, &chain, &c)), "store-full");
     // 0 is no limit.
-    let p = Publisher::open(path, &chain).unwrap().with_max_attestations(0);
+    let p = Publisher::open(path, &chain)
+        .unwrap()
+        .with_max_attestations(0);
     assert_eq!(submit(&p, &chain, &c), Ok(None));
 }
 
@@ -767,37 +1028,65 @@ fn a_signed_draft_psbt_is_finalized_and_stored() {
     let (mut chain, _) = setup(&signer, COIN_HEIGHT, ANCHOR);
     let op = coin(&mut chain, &signer, 7);
     let p = Publisher::open(path, &chain).unwrap();
-    let b64 = |psbt: &bitcoin::psbt::Psbt| base64::engine::general_purpose::STANDARD.encode(psbt.serialize());
+    let b64 = |psbt: &bitcoin::psbt::Psbt| {
+        base64::engine::general_purpose::STANDARD.encode(psbt.serialize())
+    };
     let sign = |mut psbt: bitcoin::psbt::Psbt| {
         let sighash = SighashCache::new(&psbt.unsigned_tx)
             .p2wpkh_signature_hash(0, &signer.spk, bitcoin::Amount::ZERO, EcdsaSighashType::All)
             .unwrap();
         let sk = super::tests::secret(1);
-        let signature = Secp256k1::new().sign_ecdsa(&SecpMessage::from_digest(sighash.to_byte_array()), &sk);
+        let signature =
+            Secp256k1::new().sign_ecdsa(&SecpMessage::from_digest(sighash.to_byte_array()), &sk);
         let pk = bitcoin::PublicKey::new(sk.public_key(&Secp256k1::new()));
-        psbt.inputs[0]
-            .partial_sigs
-            .insert(pk, bitcoin::ecdsa::Signature { signature, sighash_type: EcdsaSighashType::All });
+        psbt.inputs[0].partial_sigs.insert(
+            pk,
+            bitcoin::ecdsa::Signature {
+                signature,
+                sighash_type: EcdsaSighashType::All,
+            },
+        );
         psbt
     };
 
     let draft = p.create(&chain, op, "bip_xyz.support", "yes").unwrap();
     let other = p.create(&chain, op, "bip_xyz.support", "no").unwrap();
 
-    let unsigned = p.submit(&chain, &draft.message, &b64(&draft.psbt)).unwrap_err();
+    let unsigned = p
+        .submit(&chain, &draft.message, &b64(&draft.psbt))
+        .unwrap_err();
     assert_eq!(unsigned.rule(), "format");
-    assert!(unsigned.to_string().contains("not fully signed"), "{unsigned}");
+    assert!(
+        unsigned.to_string().contains("not fully signed"),
+        "{unsigned}"
+    );
 
-    let mismatch = p.submit(&chain, &draft.message, &b64(&sign(other.psbt.clone()))).unwrap_err();
-    assert!(mismatch.to_string().contains("different message"), "{mismatch}");
+    let mismatch = p
+        .submit(&chain, &draft.message, &b64(&sign(other.psbt.clone())))
+        .unwrap_err();
+    assert!(
+        mismatch.to_string().contains("different message"),
+        "{mismatch}"
+    );
 
     let foreign = crate::bip322::psbt::create(&p2pkh().spk, draft.message.as_bytes());
-    let foreign = p.submit(&chain, &draft.message, &b64(&foreign)).unwrap_err();
-    assert!(foreign.to_string().contains("different scriptPubKey"), "{foreign}");
+    let foreign = p
+        .submit(&chain, &draft.message, &b64(&foreign))
+        .unwrap_err();
+    assert!(
+        foreign.to_string().contains("different scriptPubKey"),
+        "{foreign}"
+    );
 
-    let (stored, _) = p.submit(&chain, &draft.message, &b64(&sign(draft.psbt.clone()))).unwrap();
+    let (stored, _) = p
+        .submit(&chain, &draft.message, &b64(&sign(draft.psbt.clone())))
+        .unwrap();
     assert_eq!(stored.status, Some(Ok(VALUE)));
-    assert_eq!(*stored.attestation.signature(), (signer.sign)(&draft.message), "the same simple proof");
+    assert_eq!(
+        *stored.attestation.signature(),
+        (signer.sign)(&draft.message),
+        "the same simple proof"
+    );
 }
 
 /// The chain a real-wallet vector was signed against: the anchor block and
@@ -817,8 +1106,13 @@ impl ChainView for Signed {
         self.anchor_height + ANCHOR_DEPTH
     }
     fn block_hash(&self, height: u32) -> Option<bitcoin::BlockHash> {
-        (height <= self.tip_height())
-            .then(|| if height == self.anchor_height { self.anchor_hash } else { hash_at(height, false) })
+        (height <= self.tip_height()).then(|| {
+            if height == self.anchor_height {
+                self.anchor_hash
+            } else {
+                hash_at(height, false)
+            }
+        })
     }
     fn median_time_past(&self, height: u32) -> u32 {
         mtp(height)
@@ -848,7 +1142,10 @@ fn verification_cost_per_wallet_format() {
     const ROUNDS: u32 = 2_000;
     let vectors: serde_json::Value =
         serde_json::from_str(include_str!("testdata/wallet-signatures.json")).unwrap();
-    println!("{:<62} {:>6} {:>10} {:>10}", "wallet", "bytes", "us/verify", "verify/s");
+    println!(
+        "{:<62} {:>6} {:>10} {:>10}",
+        "wallet", "bytes", "us/verify", "verify/s"
+    );
     for v in vectors.as_array().unwrap() {
         let field = |k: &str| v[k].as_str().unwrap();
         let msg = message::parse(field("message")).unwrap();
@@ -866,7 +1163,9 @@ fn verification_cost_per_wallet_format() {
         };
         let (_dir, path) = store_path();
         let p = Publisher::open(path, &chain).unwrap();
-        let (stored, _) = p.submit(&chain, field("message"), field("signature")).unwrap();
+        let (stored, _) = p
+            .submit(&chain, field("message"), field("signature"))
+            .unwrap();
         let att = stored.attestation;
         let start = std::time::Instant::now();
         for _ in 0..ROUNDS {
@@ -910,7 +1209,9 @@ fn real_wallet_signatures_are_accepted() {
         };
         let (_dir, path) = store_path();
         let p = Publisher::open(path, &chain).unwrap();
-        let (stored, _) = p.submit(&chain, text, signature).unwrap_or_else(|e| panic!("{wallet}: {e}"));
+        let (stored, _) = p
+            .submit(&chain, text, signature)
+            .unwrap_or_else(|e| panic!("{wallet}: {e}"));
         assert_eq!(stored.status, Some(Ok(VALUE)), "{wallet}");
         let format = match stored.attestation.signature() {
             NapSignature::Simple(_) => "simple",
@@ -921,7 +1222,10 @@ fn real_wallet_signatures_are_accepted() {
         // The signature commits to the text: another value fails.
         let other = text.replace("\nvalue: yes\n", "\nvalue: no\n");
         assert_ne!(other, text);
-        assert!(p.submit(&chain, &other, signature).is_err(), "{wallet}: signs any value");
+        assert!(
+            p.submit(&chain, &other, signature).is_err(),
+            "{wallet}: signs any value"
+        );
     }
 }
 
@@ -943,12 +1247,21 @@ fn a_damaged_length_is_an_error_not_a_torn_end() {
     std::fs::write(&jpath, &damaged).unwrap();
     let err = Publisher::open(path.clone(), &chain).err().unwrap();
     assert!(err.contains("longer than any record"), "{err}");
-    assert_eq!(std::fs::read(&jpath).unwrap(), damaged, "nothing is cut off");
+    assert_eq!(
+        std::fs::read(&jpath).unwrap(),
+        damaged,
+        "nothing is cut off"
+    );
     // A record kind the journal does not write is damage too.
     let mut damaged = whole.clone();
     damaged[40] = 9;
     std::fs::write(&jpath, &damaged).unwrap();
-    assert!(Publisher::open(path.clone(), &chain).err().unwrap().contains("unknown record kind"));
+    assert!(
+        Publisher::open(path.clone(), &chain)
+            .err()
+            .unwrap()
+            .contains("unknown record kind")
+    );
     // Zeros after the last record, as a filesystem may leave after a power
     // loss, are a torn end.
     let mut zeros = whole.clone();
@@ -991,7 +1304,9 @@ fn a_file_that_cannot_be_written_is_not_rewritten_on_every_change() {
     let (_dir, path) = store_path();
     let mut chain = Chain::new();
     let atts = attested(&mut chain, 40);
-    let p = Publisher::open(path.clone(), &chain).unwrap().with_compaction_at(1);
+    let p = Publisher::open(path.clone(), &chain)
+        .unwrap()
+        .with_compaction_at(1);
     // The file's path is a directory: every compaction fails at the rename,
     // while the journal takes each change.
     std::fs::create_dir_all(&path).unwrap();
@@ -1001,8 +1316,16 @@ fn a_file_that_cannot_be_written_is_not_rewritten_on_every_change() {
     assert_eq!(on_disk_journal_only(&path), atts);
     // Tried again only once the journal has doubled since the last try:
     // a handful of times for forty changes, not forty.
-    assert!(p.compactions() <= 7, "{} compactions for {} changes", p.compactions(), atts.len());
-    assert!(p.compactions() >= 2, "still tried again as the journal grows");
+    assert!(
+        p.compactions() <= 7,
+        "{} compactions for {} changes",
+        p.compactions(),
+        atts.len()
+    );
+    assert!(
+        p.compactions() >= 2,
+        "still tried again as the journal grows"
+    );
     // Once the file can be written, the next try succeeds, and after it the
     // usual threshold applies again, not the backed-off one.
     std::fs::remove_dir(&path).unwrap();
@@ -1018,7 +1341,10 @@ fn a_file_that_cannot_be_written_is_not_rewritten_on_every_change() {
             // succeeds, each is at the usual size: as soon as the journal
             // outgrows the file, within a record, not at a backed-off one.
             if let Some(f) = file {
-                assert!(before <= f + 300, "the journal reached {before} bytes over a file of {f}");
+                assert!(
+                    before <= f + 300,
+                    "the journal reached {before} bytes over a file of {f}"
+                );
                 folds += 1;
             }
             file = Some(std::fs::metadata(&path).unwrap().len());
@@ -1058,7 +1384,13 @@ fn a_fold_leaves_the_file_holding_everything_as_an_older_build_reads_it() {
     let (_dir, path) = store_path();
     let mut chain = Chain::new();
     let atts = attested(&mut chain, 5);
-    assert_eq!(Publisher::open(path.clone(), &chain).unwrap().fold_journal(), Ok(false), "nothing to fold");
+    assert_eq!(
+        Publisher::open(path.clone(), &chain)
+            .unwrap()
+            .fold_journal(),
+        Ok(false),
+        "nothing to fold"
+    );
     let p = Publisher::open(path.clone(), &chain).unwrap();
     for att in &atts {
         submit(&p, &chain, att).unwrap();

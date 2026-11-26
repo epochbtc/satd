@@ -6,7 +6,7 @@
 //!
 //! Run: `cargo bench --bench tx_valid`
 
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, criterion_group, criterion_main};
 
 mod common;
 use common::{load_tx_valid_cases, make_criterion, run_suite};

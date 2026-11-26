@@ -7,7 +7,7 @@
 use std::time::SystemTime;
 
 use super::p1c_tests::pm_with_coins;
-use super::txrequest_tests::{add_peer_with, MockClock};
+use super::txrequest_tests::{MockClock, add_peer_with};
 use super::*;
 use crate::net::behavior::replay_fixture;
 use crate::net::fingerprint::{Confidence, Family, Fingerprint};
@@ -16,15 +16,26 @@ use crate::net::flow::InFlight;
 
 /// A peer replaying the handshake of capture `fixture`, at `addr`, connected
 /// `session_secs` ago.
-fn scripted(pm: &PeerManager, id: PeerId, fixture: &str, addr: &str, session_secs: u64) -> mpsc::Receiver<NetworkMessage> {
+fn scripted(
+    pm: &PeerManager,
+    id: PeerId,
+    fixture: &str,
+    addr: &str,
+    session_secs: u64,
+) -> mpsc::Receiver<NetworkMessage> {
     let r = replay_fixture(fixture);
-    let direction = if r.inbound { Direction::Inbound } else { Direction::Outbound };
+    let direction = if r.inbound {
+        Direction::Inbound
+    } else {
+        Direction::Outbound
+    };
     let rx = add_peer_with(pm, id, direction, |info| {
         info.addr = addr.parse().unwrap();
         if direction == Direction::Inbound {
             info.conn_type = ConnType::Inbound;
         }
-        info.conn_time = SystemTime::UNIX_EPOCH + Duration::from_secs(crate::time::now_secs() - session_secs);
+        info.conn_time =
+            SystemTime::UNIX_EPOCH + Duration::from_secs(crate::time::now_secs() - session_secs);
         info.behavior.handshake = r.capture.clone();
         info.behavior.version = r.version.clone();
     });
@@ -36,7 +47,11 @@ fn deliver(pm: &PeerManager, id: PeerId, msg: NetworkMessage) {
     pm.handle_message(id, msg, InFlight::new(None));
 }
 
-fn with_behavior(pm: &PeerManager, id: PeerId, f: impl FnOnce(&mut crate::net::behavior::PeerBehavior)) {
+fn with_behavior(
+    pm: &PeerManager,
+    id: PeerId,
+    f: impl FnOnce(&mut crate::net::behavior::PeerBehavior),
+) {
     f(&mut pm.peers.write().get_mut(&id).unwrap().info.behavior);
 }
 
@@ -50,8 +65,16 @@ fn codes(flags: &[(Flag, Vec<(&'static str, Value)>)]) -> String {
     flags.iter().map(|(f, _)| f.code()).collect()
 }
 
-fn evidence(flags: &[(Flag, Vec<(&'static str, Value)>)], flag: Flag) -> Vec<(&'static str, Value)> {
-    flags.iter().find(|(f, _)| *f == flag).unwrap_or_else(|| panic!("{flag:?} not raised: {flags:?}")).1.clone()
+fn evidence(
+    flags: &[(Flag, Vec<(&'static str, Value)>)],
+    flag: Flag,
+) -> Vec<(&'static str, Value)> {
+    flags
+        .iter()
+        .find(|(f, _)| *f == flag)
+        .unwrap_or_else(|| panic!("{flag:?} not raised: {flags:?}"))
+        .1
+        .clone()
 }
 
 fn n(v: u64) -> Value {
@@ -69,7 +92,13 @@ fn getheaders(pm: &PeerManager) -> NetworkMessage {
 /// the node counts each when its handshake finishes.
 fn busy_netgroup(pm: &PeerManager) {
     for id in 101..=102 {
-        let _rx = scripted(pm, id, "core-31.2-inbound", &format!("11.22.{id}.1:8333"), 0);
+        let _rx = scripted(
+            pm,
+            id,
+            "core-31.2-inbound",
+            &format!("11.22.{id}.1:8333"),
+            0,
+        );
         pm.note_inbound_netgroup(id);
         pm.disconnect_peer(id, "test");
     }
@@ -83,7 +112,13 @@ fn no_capture_raises_a_flag_by_its_handshake_alone() {
     let (pm, _dir) = pm_with_coins(&[]);
     for (i, name) in crate::net::behavior::fixture_names().iter().enumerate() {
         let id = 1 + i as PeerId; // add_peer_cap keeps each id to one IPv4 octet
-        let _rx = scripted(&pm, id, name, &format!("11.{}.{}.1:8333", i / 250, i % 250), 30);
+        let _rx = scripted(
+            &pm,
+            id,
+            name,
+            &format!("11.{}.{}.1:8333", i / 250, i % 250),
+            30,
+        );
         assert_eq!(codes(&flags_of(&pm, id)), "", "{name}");
     }
 }
@@ -95,16 +130,31 @@ fn crawler_fires_on_a_short_getaddr_session_from_a_busy_netgroup() {
     let _clock = MockClock::install();
     let (pm, _dir) = pm_with_coins(&[]);
     busy_netgroup(&pm);
-    let _rx = scripted(&pm, 7, "bitcoin-seeder-92d2b46-inbound", "11.22.7.7:8333", 4);
+    let _rx = scripted(
+        &pm,
+        7,
+        "bitcoin-seeder-92d2b46-inbound",
+        "11.22.7.7:8333",
+        4,
+    );
     pm.note_inbound_netgroup(7);
     deliver(&pm, 7, NetworkMessage::GetAddr);
     let flags = flags_of(&pm, 7);
     assert_eq!(codes(&flags), "C");
     assert_eq!(
         evidence(&flags, Flag::Crawler),
-        [("session_secs", n(4)), ("getaddr_in", n(1)), ("headers_req", n(0)), ("blocks_req", n(0)), ("netgroup_seen", n(3))]
+        [
+            ("session_secs", n(4)),
+            ("getaddr_in", n(1)),
+            ("headers_req", n(0)),
+            ("blocks_req", n(0)),
+            ("netgroup_seen", n(3))
+        ]
     );
-    assert_eq!(pm.peers.read()[&7].info.flags.fingerprint.observed(), Some(Family::BitcoinSeeder));
+    assert_eq!(
+        pm.peers.read()[&7].info.flags.fingerprint.observed(),
+        Some(Family::BitcoinSeeder)
+    );
 }
 
 /// `C` still fires two minutes in: crawlers seen on a live node held the
@@ -114,7 +164,13 @@ fn crawler_fires_on_a_two_minute_getaddr_session() {
     let _clock = MockClock::install();
     let (pm, _dir) = pm_with_coins(&[]);
     busy_netgroup(&pm);
-    let _rx = scripted(&pm, 7, "bitcoin-seeder-92d2b46-inbound", "11.22.7.7:8333", 122);
+    let _rx = scripted(
+        &pm,
+        7,
+        "bitcoin-seeder-92d2b46-inbound",
+        "11.22.7.7:8333",
+        122,
+    );
     pm.note_inbound_netgroup(7);
     deliver(&pm, 7, NetworkMessage::GetAddr);
     let flags = flags_of(&pm, 7);
@@ -166,7 +222,13 @@ fn crawler_needs_a_repeating_netgroup_and_a_short_session() {
     assert_eq!(codes(&flags_of(&pm, 7)), "", "alone in its group");
 
     busy_netgroup(&pm);
-    let _rx = scripted(&pm, 8, "bitcoin-seeder-92d2b46-inbound", "11.22.8.8:8333", 600);
+    let _rx = scripted(
+        &pm,
+        8,
+        "bitcoin-seeder-92d2b46-inbound",
+        "11.22.8.8:8333",
+        600,
+    );
     pm.note_inbound_netgroup(8);
     deliver(&pm, 8, NetworkMessage::GetAddr);
     assert_eq!(codes(&flags_of(&pm, 8)), "", "ten minutes in");
@@ -204,7 +266,11 @@ fn crawler_is_never_an_outbound_peer() {
     pm.peers.write().get_mut(&7).unwrap().info.flags.netgroup = key;
     deliver(&pm, 7, NetworkMessage::GetAddr);
     assert_eq!(codes(&flags_of(&pm, 7)), "");
-    assert_eq!(codes(&flags_of(&pm, 9)), "", "and the inbound one has not asked for addresses");
+    assert_eq!(
+        codes(&flags_of(&pm, 9)),
+        "",
+        "and the inbound one has not asked for addresses"
+    );
 }
 
 /// Sessions are measured by the node clock, which `conn_time` is set
@@ -218,7 +284,13 @@ fn sessions_are_timed_by_the_node_clock() {
     crate::time::set_mock_time(Some(crate::time::now_secs() - 60));
     let (pm, _dir) = pm_with_coins(&[]);
     busy_netgroup(&pm);
-    let _rx = scripted(&pm, 7, "bitcoin-seeder-92d2b46-inbound", "11.22.7.7:8333", 4);
+    let _rx = scripted(
+        &pm,
+        7,
+        "bitcoin-seeder-92d2b46-inbound",
+        "11.22.7.7:8333",
+        4,
+    );
     pm.note_inbound_netgroup(7);
     deliver(&pm, 7, NetworkMessage::GetAddr);
     let flags = flags_of(&pm, 7);
@@ -233,7 +305,13 @@ fn a_crawler_gone_before_the_timer_is_judged_as_it_leaves() {
     let _clock = MockClock::install();
     let (pm, _dir) = pm_with_coins(&[]);
     busy_netgroup(&pm);
-    let _rx = scripted(&pm, 7, "bitcoin-seeder-92d2b46-inbound", "11.22.7.7:8333", 2);
+    let _rx = scripted(
+        &pm,
+        7,
+        "bitcoin-seeder-92d2b46-inbound",
+        "11.22.7.7:8333",
+        2,
+    );
     pm.note_inbound_netgroup(7);
     deliver(&pm, 7, NetworkMessage::GetAddr);
     pm.disconnect_peer(7, "test");
@@ -251,7 +329,9 @@ fn announce_and_request(pm: &PeerManager, id: PeerId, count: u32, delay: Duratio
         hash[..4].copy_from_slice(&i.to_le_bytes());
         with_behavior(pm, id, |b| {
             b.note_tx_announced(&hash, t0);
-            let getdata = NetworkMessage::GetData(vec![Inventory::WTx(bitcoin::Wtxid::from_byte_array(hash))]);
+            let getdata = NetworkMessage::GetData(vec![Inventory::WTx(
+                bitcoin::Wtxid::from_byte_array(hash),
+            )]);
             b.note_received(&getdata, t0 + delay);
         });
     }
@@ -289,7 +369,13 @@ fn spy_spares_an_honest_relaying_core_peer() {
     let (pm, _dir) = pm_with_coins(&[]);
     let _rx = scripted(&pm, 7, "core-31.2-inbound", "11.22.7.7:8333", 3 * 3_600);
     announce_and_request(&pm, 7, 600, Duration::from_micros(400));
-    deliver(&pm, 7, NetworkMessage::Inv(vec![Inventory::WTx(bitcoin::Wtxid::from_byte_array([9; 32]))]));
+    deliver(
+        &pm,
+        7,
+        NetworkMessage::Inv(vec![Inventory::WTx(bitcoin::Wtxid::from_byte_array(
+            [9; 32],
+        ))]),
+    );
     assert_eq!(codes(&flags_of(&pm, 7)), "", "it announces transactions");
     let (pm, _dir) = pm_with_coins(&[]);
     let _rx = scripted(&pm, 7, "core-31.2-inbound", "11.22.7.7:8333", 3 * 3_600);
@@ -306,11 +392,41 @@ fn spy_spares_an_honest_relaying_core_peer() {
 fn spy_needs_every_condition() {
     let _clock = MockClock::install();
     let cases: [(&str, u64, u32, Duration, bool); 5] = [
-        ("an hour connected", 3_600, 600, Duration::from_micros(400), true),
-        ("too few announcements", 3 * 3_600, 100, Duration::from_micros(400), true),
-        ("slow to ask", 3 * 3_600, 600, Duration::from_millis(80), true),
-        ("relay off", 3 * 3_600, 600, Duration::from_micros(400), false),
-        ("asks for half", 3 * 3_600, 300, Duration::from_micros(400), true),
+        (
+            "an hour connected",
+            3_600,
+            600,
+            Duration::from_micros(400),
+            true,
+        ),
+        (
+            "too few announcements",
+            3 * 3_600,
+            100,
+            Duration::from_micros(400),
+            true,
+        ),
+        (
+            "slow to ask",
+            3 * 3_600,
+            600,
+            Duration::from_millis(80),
+            true,
+        ),
+        (
+            "relay off",
+            3 * 3_600,
+            600,
+            Duration::from_micros(400),
+            false,
+        ),
+        (
+            "asks for half",
+            3 * 3_600,
+            300,
+            Duration::from_micros(400),
+            true,
+        ),
     ];
     for (why, session, asked, delay, relay) in cases {
         let (pm, _dir) = pm_with_coins(&[]);
@@ -338,12 +454,17 @@ fn fingerprint_mismatch_fires_on_a_borrowed_user_agent() {
     let _clock = MockClock::install();
     let (pm, _dir) = pm_with_coins(&[]);
     let _rx = scripted(&pm, 7, "btcd-0.27.0-inbound", "11.22.7.7:8333", 30);
-    with_behavior(&pm, 7, |b| b.version.as_mut().unwrap().user_agent = "/Satoshi:31.2.0/".into());
+    with_behavior(&pm, 7, |b| {
+        b.version.as_mut().unwrap().user_agent = "/Satoshi:31.2.0/".into()
+    });
     let flags = flags_of(&pm, 7);
     assert_eq!(codes(&flags), "F");
     assert_eq!(
         evidence(&flags, Flag::FingerprintMismatch),
-        [("claimed", Value::Name("core")), ("observed", Value::Name("btcd"))]
+        [
+            ("claimed", Value::Name("core")),
+            ("observed", Value::Name("btcd"))
+        ]
     );
 }
 
@@ -354,7 +475,10 @@ fn fingerprint_mismatch_spares_btcd_under_its_own_agent() {
     let (pm, _dir) = pm_with_coins(&[]);
     let _rx = scripted(&pm, 7, "btcd-0.27.0-inbound", "11.22.7.7:8333", 30);
     assert_eq!(codes(&flags_of(&pm, 7)), "");
-    assert_eq!(pm.peers.read()[&7].info.flags.fingerprint, Fingerprint::Known(Family::Btcd, Confidence::Low));
+    assert_eq!(
+        pm.peers.read()[&7].info.flags.fingerprint,
+        Fingerprint::Known(Family::Btcd, Confidence::Low)
+    );
 }
 
 /// `A`: a second `getaddr` in one connection.
@@ -367,7 +491,14 @@ fn addr_abuse_fires_on_repeated_getaddr() {
     deliver(&pm, 7, NetworkMessage::GetAddr);
     let flags = flags_of(&pm, 7);
     assert_eq!(codes(&flags), "A");
-    assert_eq!(evidence(&flags, Flag::AddrAbuse), [("getaddr_in", n(2)), ("addr_in", n(0)), ("addr_rate_limited", n(0))]);
+    assert_eq!(
+        evidence(&flags, Flag::AddrAbuse),
+        [
+            ("getaddr_in", n(2)),
+            ("addr_in", n(0)),
+            ("addr_rate_limited", n(0))
+        ]
+    );
 }
 
 /// `A`: addresses past what the token bucket takes.
@@ -376,10 +507,19 @@ fn addr_abuse_fires_on_addresses_past_the_rate_limit() {
     let _clock = MockClock::install();
     let (pm, _dir) = pm_with_coins(&[]);
     let _rx = scripted(&pm, 7, "core-31.2-inbound", "11.22.7.7:8333", 120);
-    pm.peers.write().get_mut(&7).unwrap().info.addr_rate.rate_limited = 1_001;
+    pm.peers
+        .write()
+        .get_mut(&7)
+        .unwrap()
+        .info
+        .addr_rate
+        .rate_limited = 1_001;
     let flags = flags_of(&pm, 7);
     assert_eq!(codes(&flags), "A");
-    assert_eq!(evidence(&flags, Flag::AddrAbuse)[2], ("addr_rate_limited", n(1_001)));
+    assert_eq!(
+        evidence(&flags, Flag::AddrAbuse)[2],
+        ("addr_rate_limited", n(1_001))
+    );
 }
 
 /// `A`, honest: one `getaddr`, and some addresses dropped by the limit.
@@ -389,7 +529,13 @@ fn addr_abuse_spares_one_getaddr_and_a_few_dropped_addresses() {
     let (pm, _dir) = pm_with_coins(&[]);
     let _rx = scripted(&pm, 7, "core-31.2-inbound", "11.22.7.7:8333", 120);
     deliver(&pm, 7, NetworkMessage::GetAddr);
-    pm.peers.write().get_mut(&7).unwrap().info.addr_rate.rate_limited = 40;
+    pm.peers
+        .write()
+        .get_mut(&7)
+        .unwrap()
+        .info
+        .addr_rate
+        .rate_limited = 40;
     assert_eq!(codes(&flags_of(&pm, 7)), "");
 }
 
@@ -406,7 +552,10 @@ fn height_lie_fires_on_a_claim_it_would_not_serve() {
     });
     let flags = flags_of(&pm, 7);
     assert_eq!(codes(&flags), "H");
-    assert_eq!(evidence(&flags, Flag::HeightLie), [("height_claim_gap", n(100)), ("start_height", n(1_000))]);
+    assert_eq!(
+        evidence(&flags, Flag::HeightLie),
+        [("height_claim_gap", n(100)), ("start_height", n(1_000))]
+    );
 }
 
 /// `H`, honest: served what it claimed, or a block short (a tip that moved).
@@ -424,7 +573,9 @@ fn height_lie_spares_a_peer_that_served_its_claim() {
 }
 
 fn announce_from_peer(pm: &PeerManager, id: PeerId, count: u8) {
-    let invs: Vec<Inventory> = (0..count).map(|i| Inventory::WTx(bitcoin::Wtxid::from_byte_array([i; 32]))).collect();
+    let invs: Vec<Inventory> = (0..count)
+        .map(|i| Inventory::WTx(bitcoin::Wtxid::from_byte_array([i; 32])))
+        .collect();
     deliver(pm, id, NetworkMessage::Inv(invs));
 }
 
@@ -440,7 +591,11 @@ fn notfound_pattern_fires_on_announcements_it_does_not_serve() {
     assert_eq!(codes(&flags), "N");
     assert_eq!(
         evidence(&flags, Flag::NotfoundPattern),
-        [("notfound_after_inv", n(20)), ("inv_tx_in", n(50)), ("notfound_permille", n(400))]
+        [
+            ("notfound_after_inv", n(20)),
+            ("inv_tx_in", n(50)),
+            ("notfound_permille", n(400))
+        ]
     );
 }
 
@@ -524,7 +679,11 @@ fn getpeerbehavior_reports_a_peer_without_its_address() {
     pm.evaluate_peer_flags();
     let all = pm.get_peer_behavior(None).unwrap();
     assert_eq!(all.len(), pm.peers.read().len());
-    assert!(all.windows(2).all(|w| w[0]["id"].as_u64() < w[1]["id"].as_u64()), "ordered by id");
+    assert!(
+        all.windows(2)
+            .all(|w| w[0]["id"].as_u64() < w[1]["id"].as_u64()),
+        "ordered by id"
+    );
     let one = &pm.get_peer_behavior(Some(7)).unwrap()[0];
     assert!(all.contains(one));
     assert_eq!(one["id"], 7);

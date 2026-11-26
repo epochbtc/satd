@@ -45,12 +45,11 @@ use std::time::Duration;
 
 use satd_events_client::{Cursor, Event, StreamClient};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 
 use crate::common::{
-    script_prefix_hex,
-    build_signed_p2wpkh_spend_seq, block1_coinbase_txid, display_to_internal_hex,
-    e2e_test_timeout, DeterministicWallet, StreamingNode,
+    DeterministicWallet, StreamingNode, block1_coinbase_txid, build_signed_p2wpkh_spend_seq,
+    display_to_internal_hex, e2e_test_timeout, script_prefix_hex,
 };
 
 // ---- the shared watch spec --------------------------------------------------
@@ -128,7 +127,9 @@ impl Spec {
     /// different order would sequence the acks differently.
     async fn apply(&self, h: &satd_events_client::WatchHandle) {
         if self.categories != 0 {
-            h.set_categories(self.categories).await.expect("set_categories");
+            h.set_categories(self.categories)
+                .await
+                .expect("set_categories");
         }
         if self.include_raw_tx {
             h.set_watch_options(true).await.expect("set_watch_options");
@@ -142,15 +143,21 @@ impl Spec {
             h.add_scripts(items).await.expect("add_scripts");
         }
         if !self.outpoints.is_empty() {
-            let items: Vec<_> =
-                self.outpoints.iter().map(|o| (hash32(&o.txid), o.vout)).collect();
+            let items: Vec<_> = self
+                .outpoints
+                .iter()
+                .map(|o| (hash32(&o.txid), o.vout))
+                .collect();
             h.add_outpoints(items).await.expect("add_outpoints");
         }
 
         let mut by_policy: Vec<(u32, Vec<[u8; 32]>)> = Vec::new();
         for lc in &self.lifecycles {
             let txid = hash32(&lc.txid);
-            match by_policy.iter_mut().find(|(p, _)| *p == lc.auto_close_depth) {
+            match by_policy
+                .iter_mut()
+                .find(|(p, _)| *p == lc.auto_close_depth)
+            {
                 Some((_, v)) => v.push(txid),
                 None => by_policy.push((lc.auto_close_depth, vec![txid])),
             }
@@ -162,10 +169,11 @@ impl Spec {
         }
 
         if !self.depth_alarms.is_empty() {
-            let txids: Vec<[u8; 32]> =
-                self.depth_alarms.iter().map(|d| hash32(&d.txid)).collect();
+            let txids: Vec<[u8; 32]> = self.depth_alarms.iter().map(|d| hash32(&d.txid)).collect();
             let depths: Vec<u32> = self.depth_alarms.iter().map(|d| d.depth).collect();
-            h.add_depth_alarms(txids, depths).await.expect("add_depth_alarms");
+            h.add_depth_alarms(txids, depths)
+                .await
+                .expect("add_depth_alarms");
         }
         for d in &self.descriptors {
             h.add_descriptor(&d.descriptor, d.gap_limit, d.start)
@@ -178,7 +186,9 @@ impl Spec {
                 .iter()
                 .map(|p| (hex_bytes(&p.prefix), p.bits))
                 .collect();
-            h.add_script_prefixes(items).await.expect("add_script_prefixes");
+            h.add_script_prefixes(items)
+                .await
+                .expect("add_script_prefixes");
         }
         if !self.silent_payments.is_empty() {
             let items: Vec<_> = self
@@ -190,7 +200,9 @@ impl Spec {
                     labels: sp.labels.clone(),
                 })
                 .collect();
-            h.add_silent_payments(items).await.expect("add_silent_payments");
+            h.add_silent_payments(items)
+                .await
+                .expect("add_silent_payments");
         }
     }
 }
@@ -220,7 +232,11 @@ fn hash33(s: &str) -> [u8; 33] {
 
 fn auto_close_from_depth(depth: u32) -> satd_events_client::AutoClose {
     use satd_events_client::AutoClose;
-    if depth == 0 { AutoClose::Never } else { AutoClose::AtDepth(depth) }
+    if depth == 0 {
+        AutoClose::Never
+    } else {
+        AutoClose::AtDepth(depth)
+    }
 }
 
 // ---- canonical rendering ----------------------------------------------------
@@ -237,7 +253,13 @@ mod canonical {
         match ev {
             // `time` is the node's wall clock at admission: identical in both
             // dumps only by luck. Dropped.
-            Event::MempoolEnter { txid, fee, vsize, fee_rate_sat_per_kvb, .. } => obj(
+            Event::MempoolEnter {
+                txid,
+                fee,
+                vsize,
+                fee_rate_sat_per_kvb,
+                ..
+            } => obj(
                 "mempool_enter",
                 [
                     ("txid", json!(hexs(txid))),
@@ -246,7 +268,11 @@ mod canonical {
                     ("fee_rate_sat_per_kvb", json!(fee_rate_sat_per_kvb)),
                 ],
             ),
-            Event::MempoolLeaveConfirmed { txid, block_hash, height } => obj(
+            Event::MempoolLeaveConfirmed {
+                txid,
+                block_hash,
+                height,
+            } => obj(
                 "mempool_leave_confirmed",
                 [
                     ("txid", json!(hexs(txid))),
@@ -256,9 +282,15 @@ mod canonical {
             ),
             Event::MempoolLeaveEvicted { txid, reason } => obj(
                 "mempool_leave_evicted",
-                [("txid", json!(hexs(txid))), ("reason", json!(evict_name(*reason)))],
+                [
+                    ("txid", json!(hexs(txid))),
+                    ("reason", json!(evict_name(*reason))),
+                ],
             ),
-            Event::MempoolLeaveReplaced { txid, replacing_txid } => obj(
+            Event::MempoolLeaveReplaced {
+                txid,
+                replacing_txid,
+            } => obj(
                 "mempool_leave_replaced",
                 [
                     ("txid", json!(hexs(txid))),
@@ -274,7 +306,12 @@ mod canonical {
                 "block_disconnected",
                 [("hash", json!(hexs(hash))), ("height", json!(height))],
             ),
-            Event::Reorg { from_height, old_tip, to_height, new_tip } => obj(
+            Event::Reorg {
+                from_height,
+                old_tip,
+                to_height,
+                new_tip,
+            } => obj(
                 "reorg",
                 [
                     ("from_height", json!(from_height)),
@@ -286,7 +323,13 @@ mod canonical {
             // Timer-driven; filtered before the diff. uptime_ns dropped for the
             // same reason as `time`.
             Event::Heartbeat { .. } => obj("heartbeat", []),
-            Event::Status { kind, state, severity, message, details } => obj(
+            Event::Status {
+                kind,
+                state,
+                severity,
+                message,
+                details,
+            } => obj(
                 "status",
                 [
                     ("kind", json!(status_kind_name(*kind))),
@@ -297,7 +340,12 @@ mod canonical {
                 ],
             ),
 
-            Event::OutpointSpent { outpoint, spending_txid, spending_vin, confirmed } => obj(
+            Event::OutpointSpent {
+                outpoint,
+                spending_txid,
+                spending_vin,
+                confirmed,
+            } => obj(
                 "outpoint_spent",
                 [
                     ("outpoint", outpoint_val(&outpoint.txid, outpoint.vout)),
@@ -344,7 +392,11 @@ mod canonical {
                     ),
                 ],
             ),
-            Event::TxidMatched { txid, confirmed, height } => obj(
+            Event::TxidMatched {
+                txid,
+                confirmed,
+                height,
+            } => obj(
                 "txid_matched",
                 [
                     ("txid", json!(hexs(txid))),
@@ -352,7 +404,10 @@ mod canonical {
                     ("height", json!(height)),
                 ],
             ),
-            Event::TxidReplaced { txid, replacing_txid } => obj(
+            Event::TxidReplaced {
+                txid,
+                replacing_txid,
+            } => obj(
                 "txid_replaced",
                 [
                     ("txid", json!(hexs(txid))),
@@ -365,9 +420,16 @@ mod canonical {
             ),
             Event::TxidUnconfirmed { txid, prev_height } => obj(
                 "txid_unconfirmed",
-                [("txid", json!(hexs(txid))), ("prev_height", json!(prev_height))],
+                [
+                    ("txid", json!(hexs(txid))),
+                    ("prev_height", json!(prev_height)),
+                ],
             ),
-            Event::TxidDepthReached { txid, depth, height } => obj(
+            Event::TxidDepthReached {
+                txid,
+                depth,
+                height,
+            } => obj(
                 "txid_depth_reached",
                 [
                     ("txid", json!(hexs(txid))),
@@ -375,7 +437,11 @@ mod canonical {
                     ("height", json!(height)),
                 ],
             ),
-            Event::TxidFinalized { txid, depth, height } => obj(
+            Event::TxidFinalized {
+                txid,
+                depth,
+                height,
+            } => obj(
                 "txid_finalized",
                 [
                     ("txid", json!(hexs(txid))),
@@ -449,7 +515,12 @@ mod canonical {
                     ("raw_tx_stripped", json!(raw_tx_stripped)),
                 ],
             ),
-            Event::BlockTweaks { block_hash, height, entries, filtered } => obj(
+            Event::BlockTweaks {
+                block_hash,
+                height,
+                entries,
+                filtered,
+            } => obj(
                 "block_tweaks",
                 [
                     ("block_hash", json!(hexs(block_hash))),
@@ -463,21 +534,31 @@ mod canonical {
             ),
             Event::MempoolTweak { entry } => obj("mempool_tweak", [("entry", tweak_entry(entry))]),
 
-            Event::Lagged { dropped_count, resume_cursor } => obj(
+            Event::Lagged {
+                dropped_count,
+                resume_cursor,
+            } => obj(
                 "lagged",
                 [
                     ("dropped_count", json!(dropped_count)),
                     ("resume_cursor", cursor_val(resume_cursor.as_ref())),
                 ],
             ),
-            Event::ReplayGap { resume_height, first_height } => obj(
+            Event::ReplayGap {
+                resume_height,
+                first_height,
+            } => obj(
                 "replay_gap",
                 [
                     ("resume_height", json!(resume_height)),
                     ("first_height", json!(first_height)),
                 ],
             ),
-            Event::CursorAccepted { from, clamped, earliest_replayed } => obj(
+            Event::CursorAccepted {
+                from,
+                clamped,
+                earliest_replayed,
+            } => obj(
                 "cursor_accepted",
                 [
                     ("from", cursor_val(from.as_ref())),
@@ -485,14 +566,21 @@ mod canonical {
                     ("earliest_replayed", json!(earliest_replayed)),
                 ],
             ),
-            Event::CursorRejected { reason, current_head } => obj(
+            Event::CursorRejected {
+                reason,
+                current_head,
+            } => obj(
                 "cursor_rejected",
                 [
                     ("reason", json!(cursor_reject_name(*reason))),
                     ("current_head", cursor_val(current_head.as_ref())),
                 ],
             ),
-            Event::WatchSetReplaced { added, removed, unchanged } => obj(
+            Event::WatchSetReplaced {
+                added,
+                removed,
+                unchanged,
+            } => obj(
                 "watch_set_replaced",
                 [
                     ("added", json!(added)),
@@ -500,7 +588,11 @@ mod canonical {
                     ("unchanged", json!(unchanged)),
                 ],
             ),
-            Event::WatchSetRejected { reason, required, quota } => obj(
+            Event::WatchSetRejected {
+                reason,
+                required,
+                quota,
+            } => obj(
                 "watch_set_rejected",
                 [
                     ("reason", json!(watch_set_reject_name(*reason))),
@@ -517,23 +609,31 @@ mod canonical {
                     ("held", json!(r.held)),
                     ("quota", json!(r.quota)),
                     ("retry_after_secs", json!(r.retry_after_secs)),
-                    ("scripthashes", json!(r.scripthashes.iter().map(|b| hexs(b)).collect::<Vec<_>>())),
+                    (
+                        "scripthashes",
+                        json!(r.scripthashes.iter().map(|b| hexs(b)).collect::<Vec<_>>()),
+                    ),
                     (
                         "outpoints",
-                        json!(r
-                            .outpoints
-                            .iter()
-                            .map(|(t, v)| json!({ "txid": hexs(t), "vout": v }))
-                            .collect::<Vec<_>>()),
+                        json!(
+                            r.outpoints
+                                .iter()
+                                .map(|(t, v)| json!({ "txid": hexs(t), "vout": v }))
+                                .collect::<Vec<_>>()
+                        ),
                     ),
-                    ("txids", json!(r.txids.iter().map(|b| hexs(b)).collect::<Vec<_>>())),
+                    (
+                        "txids",
+                        json!(r.txids.iter().map(|b| hexs(b)).collect::<Vec<_>>()),
+                    ),
                     (
                         "depth_alarms",
-                        json!(r
-                            .depth_alarms
-                            .iter()
-                            .map(|(t, d)| json!({ "txid": hexs(t), "depth": d }))
-                            .collect::<Vec<_>>()),
+                        json!(
+                            r.depth_alarms
+                                .iter()
+                                .map(|(t, d)| json!({ "txid": hexs(t), "depth": d }))
+                                .collect::<Vec<_>>()
+                        ),
                     ),
                     (
                         "descriptor",
@@ -548,16 +648,24 @@ mod canonical {
                     ),
                     (
                         "prefixes",
-                        json!(r
-                            .prefixes
-                            .iter()
-                            .map(|(p, bits)| json!({ "prefix": hexs(p), "bits": bits }))
-                            .collect::<Vec<_>>()),
+                        json!(
+                            r.prefixes
+                                .iter()
+                                .map(|(p, bits)| json!({ "prefix": hexs(p), "bits": bits }))
+                                .collect::<Vec<_>>()
+                        ),
                     ),
-                    ("scan_pubkeys", json!(r.scan_pubkeys.iter().map(|b| hexs(b)).collect::<Vec<_>>())),
+                    (
+                        "scan_pubkeys",
+                        json!(r.scan_pubkeys.iter().map(|b| hexs(b)).collect::<Vec<_>>()),
+                    ),
                 ],
             ),
-            Event::RescanAccepted { from_height, to_height, clamped } => obj(
+            Event::RescanAccepted {
+                from_height,
+                to_height,
+                clamped,
+            } => obj(
                 "rescan_accepted",
                 [
                     ("from_height", json!(from_height)),
@@ -572,7 +680,11 @@ mod canonical {
                     ("tip_height", json!(tip_height)),
                 ],
             ),
-            Event::RescanComplete { from_height, to_height, matches } => obj(
+            Event::RescanComplete {
+                from_height,
+                to_height,
+                matches,
+            } => obj(
                 "rescan_complete",
                 [
                     ("from_height", json!(from_height)),
@@ -808,7 +920,10 @@ async fn rust_dump(
 
     while let Some(ev) = stream.message().await.expect("rust dumper recv") {
         if !is_ready {
-            if matches!(ev, Event::RescanRejected { .. } | Event::RescanAccepted { .. }) {
+            if matches!(
+                ev,
+                Event::RescanRejected { .. } | Event::RescanAccepted { .. }
+            ) {
                 is_ready = true;
                 if let Some(tx) = ready.take() {
                     let _ = tx.send(());
@@ -890,7 +1005,10 @@ fn which_go() -> Option<PathBuf> {
 
 fn repo_root() -> PathBuf {
     // CARGO_MANIFEST_DIR is <repo>/satd for this crate.
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent().unwrap().to_path_buf()
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .to_path_buf()
 }
 
 // ---- the harness --------------------------------------------------------------
@@ -953,7 +1071,9 @@ async fn parity_begin(
     let go_bin = paritydump_binary(tmp.path())?;
 
     let args = node_args.to_vec();
-    let sn = tokio::task::spawn_blocking(move || StreamingNode::start(&args)).await.unwrap();
+    let sn = tokio::task::spawn_blocking(move || StreamingNode::start(&args))
+        .await
+        .unwrap();
     let wallet = DeterministicWallet::from_secret([WALLET_SEED; 32]);
     let addr = wallet.address.to_string();
     let rpc = sn.node.rpc_handle();
@@ -1076,18 +1196,24 @@ impl ParityRun {
         for _ in 0..n {
             let rpc = self.sn.node.rpc_handle();
             let target = self.addr.clone();
-            tokio::task::spawn_blocking(move || rpc.mine(1, &target)).await.unwrap();
+            tokio::task::spawn_blocking(move || rpc.mine(1, &target))
+                .await
+                .unwrap();
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
     }
 
     /// Mine `n` blocks to an address neither dumper watches.
     async fn mine_unwatched(&self, n: u32) {
-        let unwatched = DeterministicWallet::from_secret([UNWATCHED_SEED; 32]).address.to_string();
+        let unwatched = DeterministicWallet::from_secret([UNWATCHED_SEED; 32])
+            .address
+            .to_string();
         for _ in 0..n {
             let rpc = self.sn.node.rpc_handle();
             let target = unwatched.clone();
-            tokio::task::spawn_blocking(move || rpc.mine(1, &target)).await.unwrap();
+            tokio::task::spawn_blocking(move || rpc.mine(1, &target))
+                .await
+                .unwrap();
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
     }
@@ -1098,7 +1224,12 @@ impl ParityRun {
     /// the node. A scenario that discards the returned pair broadcasts nothing,
     /// which is how the original harness silently compared only block events
     /// while claiming to cover mempool admission.
-    async fn broadcast_spend(&self, dest: bitcoin::ScriptBuf, fee_sat: u64, sequence: u32) -> String {
+    async fn broadcast_spend(
+        &self,
+        dest: bitcoin::ScriptBuf,
+        fee_sat: u64,
+        sequence: u32,
+    ) -> String {
         let rpc = self.sn.node.rpc_handle();
         let w = self.wallet.clone();
         let (raw, txid) = tokio::task::spawn_blocking(move || {
@@ -1107,7 +1238,9 @@ impl ParityRun {
         .await
         .unwrap();
         let rpc = self.sn.node.rpc_handle();
-        let sent = tokio::task::spawn_blocking(move || rpc.send_raw_tx(&raw)).await.unwrap();
+        let sent = tokio::task::spawn_blocking(move || rpc.send_raw_tx(&raw))
+            .await
+            .unwrap();
         assert_eq!(sent, txid, "sendrawtransaction returns the computed txid");
         // Let the mempool events reach both streams before anything confirms.
         tokio::time::sleep(Duration::from_millis(500)).await;
@@ -1185,7 +1318,11 @@ impl ParityRun {
                 go_lines.len(),
                 rust_lines.len(),
                 first_diff,
-                if stderr.is_empty() { "(empty)" } else { stderr.as_str() }
+                if stderr.is_empty() {
+                    "(empty)"
+                } else {
+                    stderr.as_str()
+                }
             );
         }
     }
@@ -1204,7 +1341,10 @@ async fn parity_script_and_outpoint_mempool_then_confirmed() {
                 scripthash: canonical::hexs(&sha256(i.wallet.address.script_pubkey().as_bytes())),
                 min_value: None,
             }],
-            outpoints: vec![SpecOutpoint { txid: i.coinbase_internal.to_string(), vout: 0 }],
+            outpoints: vec![SpecOutpoint {
+                txid: i.coinbase_internal.to_string(),
+                vout: 0,
+            }],
             ..Default::default()
         },
         3,
@@ -1215,7 +1355,9 @@ async fn parity_script_and_outpoint_mempool_then_confirmed() {
         return;
     };
 
-    let dest = DeterministicWallet::from_secret([0x42; 32]).address.script_pubkey();
+    let dest = DeterministicWallet::from_secret([0x42; 32])
+        .address
+        .script_pubkey();
     run.broadcast_spend(dest, 1_000, 0xffff_ffff).await;
     // Three blocks to the watched address: each yields a coinbase script match.
     run.mine_watched(3).await;
@@ -1276,7 +1418,7 @@ fn wait_for_exit(proc: &mut std::process::Child, timeout: Duration) -> bool {
 }
 
 fn sha256(b: &[u8]) -> [u8; 32] {
-    use bitcoin::hashes::{sha256, Hash};
+    use bitcoin::hashes::{Hash, sha256};
     sha256::Hash::hash(b).to_byte_array()
 }
 
@@ -1308,7 +1450,9 @@ async fn parity_reorg_disconnects_and_renarrates() {
     // deterministically; a two-node race would make the diff a scheduling
     // artifact rather than a finding.
     let tip_hash = run.rpc_string("getbestblockhash", vec![]).await;
-    let resp = run.rpc_call("invalidateblock", vec![serde_json::json!(tip_hash)]).await;
+    let resp = run
+        .rpc_call("invalidateblock", vec![serde_json::json!(tip_hash)])
+        .await;
     assert!(resp["error"].is_null(), "invalidateblock errored: {resp:?}");
     tokio::time::sleep(Duration::from_millis(400)).await;
 
@@ -1335,7 +1479,13 @@ async fn parity_reorg_disconnects_and_renarrates() {
          a stuck tip here means the replacement blocks were rejected"
     );
 
-    run.finish(&["reorg", "block_disconnected", "block_connected", "script_matched"]).await;
+    run.finish(&[
+        "reorg",
+        "block_disconnected",
+        "block_connected",
+        "script_matched",
+    ])
+    .await;
 }
 
 /// S3: transaction lifecycle and depth alarms.
@@ -1359,7 +1509,10 @@ async fn parity_lifecycle_and_depth_alarms() {
                 txid: i.coinbase_internal.to_string(),
                 auto_close_depth: 104,
             }],
-            depth_alarms: vec![SpecDepth { txid: i.coinbase_internal.to_string(), depth: 103 }],
+            depth_alarms: vec![SpecDepth {
+                txid: i.coinbase_internal.to_string(),
+                depth: 103,
+            }],
             ..Default::default()
         },
         3,
@@ -1372,7 +1525,8 @@ async fn parity_lifecycle_and_depth_alarms() {
 
     run.mine_unwatched(3).await;
 
-    run.finish(&["txid_depth_reached", "txid_finalized", "block_connected"]).await;
+    run.finish(&["txid_depth_reached", "txid_finalized", "block_connected"])
+        .await;
 }
 
 /// S5: a privacy prefix watch, decoys and all.
@@ -1400,7 +1554,9 @@ async fn parity_prefix_watch_including_decoys() {
         return;
     };
 
-    let dest = DeterministicWallet::from_secret([0x43; 32]).address.script_pubkey();
+    let dest = DeterministicWallet::from_secret([0x43; 32])
+        .address
+        .script_pubkey();
     run.broadcast_spend(dest, 1_000, 0xffff_ffff).await;
     run.mine_watched(3).await;
 

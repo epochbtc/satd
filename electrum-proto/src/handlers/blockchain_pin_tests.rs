@@ -7,8 +7,8 @@
 //! the transactions at 8 and 9 are late. The fixture's txindex has none of
 //! them, so a late row is height `0` with no fee.
 
-use bitcoin::hashes::Hash as _;
 use bitcoin::BlockHash;
+use bitcoin::hashes::Hash as _;
 use node::chain::pin::Pin;
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
@@ -137,7 +137,8 @@ fn confirmations_count_to_the_pin() {
     for salt in 0..3 {
         crate::test_support::extend_tip(&state.chain, 2_000 + salt);
     }
-    let got = transaction_get(&state, json!([txid.to_string(), true]), &pin_at(height + 1)).unwrap();
+    let got =
+        transaction_get(&state, json!([txid.to_string(), true]), &pin_at(height + 1)).unwrap();
     assert_eq!(got["confirmations"], 2);
 }
 
@@ -189,13 +190,19 @@ async fn stamped_answers_name_the_pinned_tip_on_every_connection() {
     );
 
     // Unstamped methods, and errors, carry no stamp.
-    let wire = serde_json::to_value(call(&mut subs, request("blockchain.scripthash.get_mempool")))
-        .unwrap();
+    let wire = serde_json::to_value(call(
+        &mut subs,
+        request("blockchain.scripthash.get_mempool"),
+    ))
+    .unwrap();
     assert!(wire.get("chain_tip").is_none(), "{wire}");
     let mut bad = request("blockchain.scripthash.get_balance");
     bad.params = Some(json!(["not a scripthash"]));
     let wire = serde_json::to_value(call(&mut subs, bad)).unwrap();
-    assert!(wire.get("error").is_some() && wire.get("chain_tip").is_none(), "{wire}");
+    assert!(
+        wire.get("error").is_some() && wire.get("chain_tip").is_none(),
+        "{wire}"
+    );
 }
 
 fn spend(prev: bitcoin::OutPoint, value: u64) -> bitcoin::Transaction {
@@ -230,7 +237,13 @@ fn a_late_transaction_has_its_mempool_height_and_fee() {
         crate::test_support::extend_tip(&state.chain, 3_000 + salt);
     }
     let pin = pin_at(state.chain.tip_height());
-    let a = spend(bitcoin::OutPoint { txid: first, vout: 0 }, 5_000_000_000 - 1_000);
+    let a = spend(
+        bitcoin::OutPoint {
+            txid: first,
+            vout: 0,
+        },
+        5_000_000_000 - 1_000,
+    );
     let b = spend(
         bitcoin::OutPoint {
             txid: a.compute_txid(),
@@ -264,7 +277,13 @@ fn a_late_transaction_with_a_parent_in_a_stripped_block_keeps_its_fee() {
     for salt in 0..100 {
         crate::test_support::extend_tip(&state.chain, 5_000 + salt);
     }
-    let mut parent = spend(bitcoin::OutPoint { txid: first, vout: 0 }, 5_000_000_000 - 1_000);
+    let mut parent = spend(
+        bitcoin::OutPoint {
+            txid: first,
+            vout: 0,
+        },
+        5_000_000_000 - 1_000,
+    );
     let mut data = vec![0x6a, 0x4d, 0x84, 0x13];
     data.resize(5_000, 0x5a);
     parent.output.push(bitcoin::TxOut {
@@ -274,12 +293,18 @@ fn a_late_transaction_with_a_parent_in_a_stripped_block_keeps_its_fee() {
     // `regtest_block` adds the salt to the time: a salt that dates the block
     // now takes the tip out of initial block download, where strips wait.
     let now_salt = |height: u32| {
-        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as u32;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as u32;
         now - 1_708_000_000 - 600 * height
     };
     let parent_height = state.chain.tip_height() + 1;
     let parent_block = extend_tip_with(&state.chain, now_salt(parent_height), vec![parent.clone()]);
-    let stripped = state.chain.strip_block(&parent_block.block_hash(), 4_096).expect("strip");
+    let stripped = state
+        .chain
+        .strip_block(&parent_block.block_hash(), 4_096)
+        .expect("strip");
     assert!(
         matches!(stripped, node::chain::state::StripOutcome::Stripped(_)),
         "premise: the parent's block is stripped: {stripped:?}"
@@ -292,7 +317,11 @@ fn a_late_transaction_with_a_parent_in_a_stripped_block_keeps_its_fee() {
         },
         5_000_000_000 - 3_000,
     );
-    extend_tip_with(&state.chain, now_salt(parent_height + 1) + 1, vec![child.clone()]);
+    extend_tip_with(
+        &state.chain,
+        now_salt(parent_height + 1) + 1,
+        vec![child.clone()],
+    );
 
     assert_eq!(
         super::LateFacts::new(&state, &pin).of(&child.compute_txid()),
@@ -303,8 +332,8 @@ fn a_late_transaction_with_a_parent_in_a_stripped_block_keeps_its_fee() {
 mod races {
     //! Reads that a block connecting mid-request splits.
 
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use bitcoin::{OutPoint, Txid};
     use node_index::{
@@ -340,7 +369,10 @@ mod races {
         fn utxos(&self, sh: &Scripthash) -> Result<Vec<Utxo>, IndexError> {
             self.inner.utxos(sh)
         }
-        fn subscribe(&self, sh: Scripthash) -> Result<broadcast::Receiver<StatusUpdate>, SubscribeError> {
+        fn subscribe(
+            &self,
+            sh: Scripthash,
+        ) -> Result<broadcast::Receiver<StatusUpdate>, SubscribeError> {
             self.inner.subscribe(sh)
         }
     }
@@ -377,7 +409,10 @@ mod races {
         fn utxos(&self, sh: &Scripthash) -> Result<Vec<Utxo>, IndexError> {
             self.0.utxos(sh)
         }
-        fn subscribe(&self, sh: Scripthash) -> Result<broadcast::Receiver<StatusUpdate>, SubscribeError> {
+        fn subscribe(
+            &self,
+            sh: Scripthash,
+        ) -> Result<broadcast::Receiver<StatusUpdate>, SubscribeError> {
             self.0.subscribe(sh)
         }
     }
@@ -437,7 +472,10 @@ mod races {
             }
             Ok(utxos)
         }
-        fn subscribe(&self, sh: Scripthash) -> Result<broadcast::Receiver<StatusUpdate>, SubscribeError> {
+        fn subscribe(
+            &self,
+            sh: Scripthash,
+        ) -> Result<broadcast::Receiver<StatusUpdate>, SubscribeError> {
             self.inner.subscribe(sh)
         }
     }
@@ -451,7 +489,13 @@ mod races {
         for salt in 0..100 {
             crate::test_support::extend_tip(&state.chain, 5_000 + salt);
         }
-        let tx = spend(OutPoint { txid: first, vout: 0 }, 5_000_000_000 - 1_000);
+        let tx = spend(
+            OutPoint {
+                txid: first,
+                vout: 0,
+            },
+            5_000_000_000 - 1_000,
+        );
         let txid = state
             .mempool
             .accept_transaction(
@@ -476,12 +520,8 @@ mod races {
     fn an_output_confirming_mid_listunspent_is_listed_once() {
         let (state, _dir, txid) = confirming_mid_read();
         let sh = node_index::scripthash_of(&crate::test_support::anyone_can_spend());
-        let got = scripthash_listunspent(
-            &state,
-            json!([scripthash_to_wire_hex(&sh)]),
-            &pin_at(9),
-        )
-        .unwrap();
+        let got = scripthash_listunspent(&state, json!([scripthash_to_wire_hex(&sh)]), &pin_at(9))
+            .unwrap();
         assert_eq!(
             got,
             json!([{"height": 0, "tx_hash": txid.to_string(), "tx_pos": 0, "value": 5_000_000_000u64 - 1_000}])
@@ -507,7 +547,10 @@ mod races {
         fn utxos(&self, sh: &Scripthash) -> Result<Vec<Utxo>, IndexError> {
             self.inner.utxos(sh)
         }
-        fn subscribe(&self, sh: Scripthash) -> Result<broadcast::Receiver<StatusUpdate>, SubscribeError> {
+        fn subscribe(
+            &self,
+            sh: Scripthash,
+        ) -> Result<broadcast::Receiver<StatusUpdate>, SubscribeError> {
             self.inner.subscribe(sh)
         }
     }
@@ -524,7 +567,13 @@ mod races {
             crate::test_support::extend_tip(&state.chain, 6_000 + salt);
         }
         let pin = pin_at(state.chain.tip_height());
-        let parent = spend(OutPoint { txid: first, vout: 0 }, 5_000_000_000 - 1_000);
+        let parent = spend(
+            OutPoint {
+                txid: first,
+                vout: 0,
+            },
+            5_000_000_000 - 1_000,
+        );
         extend_tip_with(&state.chain, 6_500, vec![parent.clone()]);
         let child = spend(
             OutPoint {
@@ -552,7 +601,10 @@ mod races {
         ))]);
 
         let history = scripthash_get_history(&state, sh.clone(), &pin).unwrap();
-        assert_eq!(history, json!([{"height": -1, "tx_hash": txid.to_string(), "fee": 1_000}]));
+        assert_eq!(
+            history,
+            json!([{"height": -1, "tx_hash": txid.to_string(), "fee": 1_000}])
+        );
         let utxos = scripthash_listunspent(&state, sh.clone(), &pin).unwrap();
         assert_eq!(utxos[0]["height"], -1, "{utxos}");
 
@@ -572,7 +624,10 @@ mod races {
         let rows = scripthash_get_history(&state, params(), &pin_at(9)).unwrap();
         let rows = rows.as_array().unwrap();
         assert_eq!(rows.len(), 6, "{rows:?}");
-        assert_eq!(rows[5], json!({"height": 0, "tx_hash": txid.to_string(), "fee": 1_000}));
+        assert_eq!(
+            rows[5],
+            json!({"height": 0, "tx_hash": txid.to_string(), "fee": 1_000})
+        );
     }
 }
 
@@ -646,8 +701,15 @@ async fn trailing_asof_pins_stamps_and_is_refused_where_it_does_not_apply() {
     let tag = format!("asof:{five}");
     let sh = scripthash_to_wire_hex(&SH);
 
-    let wire = dispatched(&state, with_params("blockchain.scripthash.get_balance", json!([sh, tag])));
-    assert_eq!(wire["result"], json!({"confirmed": 5_000, "unconfirmed": 0}), "{wire}");
+    let wire = dispatched(
+        &state,
+        with_params("blockchain.scripthash.get_balance", json!([sh, tag])),
+    );
+    assert_eq!(
+        wire["result"],
+        json!({"confirmed": 5_000, "unconfirmed": 0}),
+        "{wire}"
+    );
     assert_eq!(wire["chain_tip"], five.to_string());
     assert_eq!(wire["chain_tip_height"], 5);
 
@@ -655,21 +717,41 @@ async fn trailing_asof_pins_stamps_and_is_refused_where_it_does_not_apply() {
     let coinbase = state.electrum_extras.txid_at_pos(5, 0).unwrap();
     let wire = dispatched(
         &state,
-        with_params("blockchain.transaction.get", json!([coinbase.to_string(), true, tag])),
+        with_params(
+            "blockchain.transaction.get",
+            json!([coinbase.to_string(), true, tag]),
+        ),
     );
     assert_eq!(wire["result"]["confirmations"], 1, "{wire}");
 
-    let error = |wire: &Value| wire["error"]["message"].as_str().unwrap_or_default().to_string();
+    let error = |wire: &Value| {
+        wire["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string()
+    };
     let unknown = format!("asof:{}", BlockHash::all_zeros());
-    let wire = dispatched(&state, with_params("blockchain.scripthash.get_balance", json!([sh, unknown])));
+    let wire = dispatched(
+        &state,
+        with_params("blockchain.scripthash.get_balance", json!([sh, unknown])),
+    );
     assert_eq!(error(&wire), "asof not on chain", "{wire}");
     assert!(wire.get("chain_tip").is_none());
 
-    let wire = dispatched(&state, with_params("blockchain.scripthash.get_balance", json!([sh, "asof:xyz"])));
+    let wire = dispatched(
+        &state,
+        with_params("blockchain.scripthash.get_balance", json!([sh, "asof:xyz"])),
+    );
     assert_eq!(error(&wire), "asof must be asof:<blockhash>", "{wire}");
 
-    let wire = dispatched(&state, with_params("blockchain.scripthash.get_mempool", json!([sh, tag])));
-    assert_eq!(error(&wire), "asof is not supported by blockchain.scripthash.get_mempool");
+    let wire = dispatched(
+        &state,
+        with_params("blockchain.scripthash.get_mempool", json!([sh, tag])),
+    );
+    assert_eq!(
+        error(&wire),
+        "asof is not supported by blockchain.scripthash.get_mempool"
+    );
 
     let (tx, _rx) = mpsc::channel(8);
     let mut subs = Subscriptions::new(tx, 10);

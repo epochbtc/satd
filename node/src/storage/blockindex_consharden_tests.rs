@@ -37,9 +37,18 @@ const CORE_WORK: &[(u32, &str)] = &[
     (0x2101_0000, "0"),
     (0xff12_3456, "0"),
     // Small exponents keep the mantissa's top bytes.
-    (0x0112_3456, "d79435e50d79435e50d79435e50d79435e50d79435e50d79435e50d79435e50"),
-    (0x0212_3456, "e0f7d0fc35d34ac057e0cda2850689332253d0537bf68d97f968bd609c6c4"),
-    (0x0312_3456, "e0fff97690309e2f96677e115e465ed2d49ebff2a34c636177dcdb14856"),
+    (
+        0x0112_3456,
+        "d79435e50d79435e50d79435e50d79435e50d79435e50d79435e50d79435e50",
+    ),
+    (
+        0x0212_3456,
+        "e0f7d0fc35d34ac057e0cda2850689332253d0537bf68d97f968bd609c6c4",
+    ),
+    (
+        0x0312_3456,
+        "e0fff97690309e2f96677e115e465ed2d49ebff2a34c636177dcdb14856",
+    ),
     // Exponents 33 and 34 that do not overflow.
     (0x2100_00ff, "101"),
     (0x2100_0100, "ff"),
@@ -64,7 +73,10 @@ fn block_work_is_cores_get_bits_proof() {
 fn bits_without_work_add_nothing_to_chainwork() {
     let parent = work_for_bits(CompactTarget::from_consensus(0x1d00_ffff));
     for bits in [0x0000_0000u32, 0x0492_3456, 0x2300_0001] {
-        assert_eq!(add_u256(&parent, &work_for_bits(CompactTarget::from_consensus(bits))), parent);
+        assert_eq!(
+            add_u256(&parent, &work_for_bits(CompactTarget::from_consensus(bits))),
+            parent
+        );
     }
 }
 

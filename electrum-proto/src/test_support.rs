@@ -56,7 +56,12 @@ pub fn regtest_block(parent: BlockHash, height: u32, salt: u32, txs: Vec<Transac
         },
         txdata,
     };
-    if block.txdata.iter().skip(1).any(|tx| tx.input.iter().any(|i| !i.witness.is_empty())) {
+    if block
+        .txdata
+        .iter()
+        .skip(1)
+        .any(|tx| tx.input.iter().any(|i| !i.witness.is_empty()))
+    {
         // BIP 141: the coinbase commits to the witnesses, with an all-zero
         // reserved value as its own witness.
         let reserved = [0u8; 32];
@@ -83,7 +88,11 @@ pub fn extend_tip_with(chain: &ChainState, salt: u32, txs: Vec<Transaction>) -> 
     let (tip, height) = chain.tip_snapshot();
     let block = regtest_block(tip, height + 1, salt, txs);
     chain.accept_block(&block).expect("connect test block");
-    assert_eq!(chain.tip_snapshot().0, block.block_hash(), "the block became the tip");
+    assert_eq!(
+        chain.tip_snapshot().0,
+        block.block_hash(),
+        "the block became the tip"
+    );
     block
 }
 

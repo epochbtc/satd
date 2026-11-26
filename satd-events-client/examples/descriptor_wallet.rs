@@ -14,7 +14,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .nth(1)
         .unwrap_or_else(|| "http://127.0.0.1:50051".into());
 
-    let mut client = StreamClient::builder(endpoint).keepalive_default().connect().await?;
+    let mut client = StreamClient::builder(endpoint)
+        .keepalive_default()
+        .connect()
+        .await?;
     let (watch, mut events) = client.watch().await?;
 
     // A ranged descriptor; the node expands it to scripts [0, 20).
@@ -25,7 +28,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     while let Some(event) = events.message().await? {
         match event {
-            Event::ScriptMatched { txid, is_output, index, confirmed, descriptors, .. } => {
+            Event::ScriptMatched {
+                txid,
+                is_output,
+                index,
+                confirmed,
+                descriptors,
+                ..
+            } => {
                 // Attribution gives the exact (branch, derivation_index) the
                 // server derived the matched script at — no need to re-expand
                 // the descriptor or maintain a reverse scripthash index.

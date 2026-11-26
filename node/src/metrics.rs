@@ -54,8 +54,7 @@ pub struct MetricsContext {
     pub version: &'static str,
     /// Subscription registry handle for active-subscribers gauge.
     /// Optional so test backends without a registry still render.
-    pub addr_subs:
-        Option<Arc<crate::index::address::SubscriptionRegistry>>,
+    pub addr_subs: Option<Arc<crate::index::address::SubscriptionRegistry>>,
     /// Address-index runtime config — exposed as an `enabled` gauge
     /// so operators can confirm at a glance which DB-backed indexes
     /// are live.
@@ -299,7 +298,10 @@ impl MetricsContext {
                 "BIP 152 cmpctblock messages sent, by kind: announce (a new block pushed to a high-bandwidth peer) or getdata (an answer to MSG_CMPCT_BLOCK).",
                 "counter",
             );
-            for (kind, v) in [("announce", &cb.sent_announce), ("getdata", &cb.sent_getdata)] {
+            for (kind, v) in [
+                ("announce", &cb.sent_announce),
+                ("getdata", &cb.sent_getdata),
+            ] {
                 metric_sample(
                     &mut out,
                     "satd_net_compact_block_sent_total",
@@ -557,7 +559,10 @@ impl MetricsContext {
             "# HELP satd_spindex_backfill_progress_ratio Fraction of the silent-payment-index deferred backfill completed, over the walked span [taproot activation, snapshot]. 1.0 means a deferred backfill ran to completion; 0.0 means no backfill progress and does NOT imply the index is incomplete (an index built inline from genesis needs no backfill and stays at 0.0) - read satd_spindex_synced and satd_spindex_backfill_state to tell those apart; do not alert on this gauge alone."
         );
         let _ = writeln!(out, "# TYPE satd_spindex_backfill_progress_ratio gauge");
-        let _ = writeln!(out, "satd_spindex_backfill_progress_ratio {sp_backfill_ratio}");
+        let _ = writeln!(
+            out,
+            "satd_spindex_backfill_progress_ratio {sp_backfill_ratio}"
+        );
 
         // The three gauges that make the ratio interpretable (#535).
         //
@@ -631,7 +636,10 @@ impl MetricsContext {
         // OP_RETURN pruning (plan §2.13), only on a node that strips or still
         // holds stripped blocks, so a node that never used it exports none.
         if self.chain_state.opreturn_prune_active() {
-            let examined = self.chain_state.opreturn_strip_meta().map_or(0, |m| m.next_height);
+            let examined = self
+                .chain_state
+                .opreturn_strip_meta()
+                .map_or(0, |m| m.next_height);
             // On the HTTP task: the totals as last added up, never a CF scan.
             let summary = self.chain_state.opreturn_strip_summary_last();
             metric(
@@ -693,7 +701,9 @@ impl MetricsContext {
         // Node-health gauges, rendered only when the detector task is running.
         render_health_metrics(&mut out, self.health.as_deref());
         render_assumeutxo_metrics(&mut out, &self.chain_state);
-        self.chain_state.template_validity().render_metrics(&mut out);
+        self.chain_state
+            .template_validity()
+            .render_metrics(&mut out);
 
         // Webhook delivery counters, rendered only when a hook is configured.
         render_webhook_metrics(&mut out, self.webhooks.as_deref());
@@ -829,7 +839,12 @@ fn render_stratum(out: &mut String, stats: &crate::stratum::StratumStats) {
         ("rejected", &stats.shares_rejected),
         ("stale", &stats.shares_stale),
     ] {
-        metric_sample(out, "satd_stratum_shares_total", &[("result", result)], v.load(Relaxed));
+        metric_sample(
+            out,
+            "satd_stratum_shares_total",
+            &[("result", result)],
+            v.load(Relaxed),
+        );
     }
     metric(
         out,
@@ -845,7 +860,11 @@ fn render_stratum(out: &mut String, stats: &crate::stratum::StratumStats) {
         "Estimated hashrate of the connected miners, from the difficulty of the shares each had accepted over the last ten minutes.",
         "gauge",
     );
-    let _ = writeln!(out, "satd_stratum_hashrate_hashes_per_second {}", stats.miners.hashrate());
+    let _ = writeln!(
+        out,
+        "satd_stratum_hashrate_hashes_per_second {}",
+        stats.miners.hashrate()
+    );
 }
 
 /// The Core-compatible ZMQ publisher (`-zmqpub*`). Rendered only while it
@@ -936,7 +955,12 @@ fn render_peer_flags(out: &mut String, counts: &crate::net::flags::FlagCounts) {
     );
     for (flag, n) in Flag::ALL.iter().zip(counts.flagged) {
         let code = flag.code().to_string();
-        metric_sample(out, "satd_peer_flagged", &[("flag", code.as_str())], n as u64);
+        metric_sample(
+            out,
+            "satd_peer_flagged",
+            &[("flag", code.as_str())],
+            n as u64,
+        );
     }
     metric_header(
         out,
@@ -945,9 +969,19 @@ fn render_peer_flags(out: &mut String, counts: &crate::net::flags::FlagCounts) {
         "gauge",
     );
     for (family, n) in Family::ALL.iter().zip(counts.families) {
-        metric_sample(out, "satd_peer_fingerprint", &[("family", family.name())], n as u64);
+        metric_sample(
+            out,
+            "satd_peer_fingerprint",
+            &[("family", family.name())],
+            n as u64,
+        );
     }
-    metric_sample(out, "satd_peer_fingerprint", &[("family", "unknown")], counts.unknown as u64);
+    metric_sample(
+        out,
+        "satd_peer_fingerprint",
+        &[("family", "unknown")],
+        counts.unknown as u64,
+    );
     metric_header(
         out,
         "satd_peer_fingerprint_claimed",
@@ -955,7 +989,12 @@ fn render_peer_flags(out: &mut String, counts: &crate::net::flags::FlagCounts) {
         "gauge",
     );
     for (family, n) in Family::ALL.iter().zip(counts.claimed) {
-        metric_sample(out, "satd_peer_fingerprint_claimed", &[("family", family.name())], n as u64);
+        metric_sample(
+            out,
+            "satd_peer_fingerprint_claimed",
+            &[("family", family.name())],
+            n as u64,
+        );
     }
 }
 
@@ -994,9 +1033,19 @@ fn render_peer_survey(out: &mut String, m: Option<&crate::net::manager::SurveyMe
         "gauge",
     );
     for (family, n) in Family::ALL.iter().zip(m.families) {
-        metric_sample(out, "satd_peer_survey_family", &[("family", family.name())], n as u64);
+        metric_sample(
+            out,
+            "satd_peer_survey_family",
+            &[("family", family.name())],
+            n as u64,
+        );
     }
-    metric_sample(out, "satd_peer_survey_family", &[("family", "unknown")], m.unknown as u64);
+    metric_sample(
+        out,
+        "satd_peer_survey_family",
+        &[("family", "unknown")],
+        m.unknown as u64,
+    );
     metric_header(
         out,
         "satd_peer_survey_claimed",
@@ -1004,7 +1053,12 @@ fn render_peer_survey(out: &mut String, m: Option<&crate::net::manager::SurveyMe
         "gauge",
     );
     for (family, n) in Family::ALL.iter().zip(m.claimed) {
-        metric_sample(out, "satd_peer_survey_claimed", &[("family", family.name())], n as u64);
+        metric_sample(
+            out,
+            "satd_peer_survey_claimed",
+            &[("family", family.name())],
+            n as u64,
+        );
     }
     metric_header(
         out,
@@ -1013,7 +1067,12 @@ fn render_peer_survey(out: &mut String, m: Option<&crate::net::manager::SurveyMe
         "gauge",
     );
     for (family, n) in Family::ALL.iter().zip(m.fake) {
-        metric_sample(out, "satd_peer_survey_fake", &[("family", family.name())], n as u64);
+        metric_sample(
+            out,
+            "satd_peer_survey_fake",
+            &[("family", family.name())],
+            n as u64,
+        );
     }
     metric(
         out,
@@ -1039,15 +1098,32 @@ fn render_peer_survey(out: &mut String, m: Option<&crate::net::manager::SurveyMe
         &[],
         m.mismatches as u64,
     );
-    metric(out, "satd_peer_survey_v2", "Survey records reached over BIP 324.", "gauge", &[], m.v2 as u64);
+    metric(
+        out,
+        "satd_peer_survey_v2",
+        "Survey records reached over BIP 324.",
+        "gauge",
+        &[],
+        m.v2 as u64,
+    );
     metric_header(
         out,
         "satd_peer_survey_connections_total",
         "Survey connections since start: completed, or failed at the dial or the handshake.",
         "counter",
     );
-    metric_sample(out, "satd_peer_survey_connections_total", &[("result", "completed")], m.completed);
-    metric_sample(out, "satd_peer_survey_connections_total", &[("result", "failed")], m.failed);
+    metric_sample(
+        out,
+        "satd_peer_survey_connections_total",
+        &[("result", "completed")],
+        m.completed,
+    );
+    metric_sample(
+        out,
+        "satd_peer_survey_connections_total",
+        &[("result", "failed")],
+        m.failed,
+    );
     metric_header(
         out,
         "satd_peer_survey_probes_total",
@@ -1056,7 +1132,12 @@ fn render_peer_survey(out: &mut String, m: Option<&crate::net::manager::SurveyMe
     );
     for (probe, row) in Probe::ALL.iter().zip(m.probe_outcomes) {
         for (outcome, n) in ["answered", "silent", "disconnected"].iter().zip(row) {
-            metric_sample(out, "satd_peer_survey_probes_total", &[("probe", probe.name()), ("outcome", outcome)], n);
+            metric_sample(
+                out,
+                "satd_peer_survey_probes_total",
+                &[("probe", probe.name()), ("outcome", outcome)],
+                n,
+            );
         }
     }
 }
@@ -1070,9 +1151,16 @@ fn render_peer_survey(out: &mut String, m: Option<&crate::net::manager::SurveyMe
 /// only, no address.
 fn render_crawl(out: &mut String, m: Option<&crate::net::manager::CrawlMetrics>) {
     use crate::net::crawlbook::Network;
-    use crate::net::crawlreport::{Transport, DIALLED};
+    use crate::net::crawlreport::{DIALLED, Transport};
     use crate::net::fingerprint::Family;
-    metric(out, "satd_crawl_enabled", "1 when the network crawl (-crawl) is on.", "gauge", &[], u64::from(m.is_some()));
+    metric(
+        out,
+        "satd_crawl_enabled",
+        "1 when the network crawl (-crawl) is on.",
+        "gauge",
+        &[],
+        u64::from(m.is_some()),
+    );
     let Some(m) = m else {
         return;
     };
@@ -1093,9 +1181,19 @@ fn render_crawl(out: &mut String, m: Option<&crate::net::manager::CrawlMetrics>)
         u64::from(m.stopped),
     );
     let a = &m.aggregate;
-    metric_header(out, "satd_crawl_book_entries", "Addresses in the crawl's book (crawlbook.dat), by network.", "gauge");
+    metric_header(
+        out,
+        "satd_crawl_book_entries",
+        "Addresses in the crawl's book (crawlbook.dat), by network.",
+        "gauge",
+    );
     for (n, c) in Network::ALL.iter().zip(a.learned) {
-        metric_sample(out, "satd_crawl_book_entries", &[("network", n.name())], c as u64);
+        metric_sample(
+            out,
+            "satd_crawl_book_entries",
+            &[("network", n.name())],
+            c as u64,
+        );
     }
     metric_header(
         out,
@@ -1104,7 +1202,12 @@ fn render_crawl(out: &mut String, m: Option<&crate::net::manager::CrawlMetrics>)
         "gauge",
     );
     for (n, c) in DIALLED.iter().zip(a.reachable) {
-        metric_sample(out, "satd_crawl_reachable", &[("network", n.name())], c as u64);
+        metric_sample(
+            out,
+            "satd_crawl_reachable",
+            &[("network", n.name())],
+            c as u64,
+        );
     }
     metric_header(
         out,
@@ -1113,7 +1216,12 @@ fn render_crawl(out: &mut String, m: Option<&crate::net::manager::CrawlMetrics>)
         "gauge",
     );
     for (t, c) in Transport::ALL.iter().zip(a.transport) {
-        metric_sample(out, "satd_crawl_transport", &[("class", t.name())], c as u64);
+        metric_sample(
+            out,
+            "satd_crawl_transport",
+            &[("class", t.name())],
+            c as u64,
+        );
     }
     metric(
         out,
@@ -1130,9 +1238,19 @@ fn render_crawl(out: &mut String, m: Option<&crate::net::manager::CrawlMetrics>)
         "gauge",
     );
     for (family, n) in Family::ALL.iter().zip(a.families) {
-        metric_sample(out, "satd_crawl_family", &[("family", family.name())], n as u64);
+        metric_sample(
+            out,
+            "satd_crawl_family",
+            &[("family", family.name())],
+            n as u64,
+        );
     }
-    metric_sample(out, "satd_crawl_family", &[("family", "unknown")], a.unknown as u64);
+    metric_sample(
+        out,
+        "satd_crawl_family",
+        &[("family", "unknown")],
+        a.unknown as u64,
+    );
     metric_header(
         out,
         "satd_crawl_claimed",
@@ -1140,7 +1258,12 @@ fn render_crawl(out: &mut String, m: Option<&crate::net::manager::CrawlMetrics>)
         "gauge",
     );
     for (family, n) in Family::ALL.iter().zip(a.claimed) {
-        metric_sample(out, "satd_crawl_claimed", &[("family", family.name())], n as u64);
+        metric_sample(
+            out,
+            "satd_crawl_claimed",
+            &[("family", family.name())],
+            n as u64,
+        );
     }
     metric_header(
         out,
@@ -1149,7 +1272,12 @@ fn render_crawl(out: &mut String, m: Option<&crate::net::manager::CrawlMetrics>)
         "gauge",
     );
     for (family, n) in Family::ALL.iter().zip(a.fake) {
-        metric_sample(out, "satd_crawl_fake", &[("family", family.name())], n as u64);
+        metric_sample(
+            out,
+            "satd_crawl_fake",
+            &[("family", family.name())],
+            n as u64,
+        );
     }
     metric(
         out,
@@ -1181,11 +1309,36 @@ fn render_crawl(out: &mut String, m: Option<&crate::net::manager::CrawlMetrics>)
         "Crawl sessions since start: a handshake completed (reached) or not.",
         "counter",
     );
-    metric_sample(out, "satd_crawl_sessions_total", &[("result", "reached")], m.reached);
-    metric_sample(out, "satd_crawl_sessions_total", &[("result", "unreached")], m.unreached);
-    metric_header(out, "satd_crawl_sessions_in_flight", "Crawl sessions open, clearnet and Tor.", "gauge");
-    metric_sample(out, "satd_crawl_sessions_in_flight", &[("network", "clearnet")], m.in_flight.0 as u64);
-    metric_sample(out, "satd_crawl_sessions_in_flight", &[("network", "tor")], m.in_flight.1 as u64);
+    metric_sample(
+        out,
+        "satd_crawl_sessions_total",
+        &[("result", "reached")],
+        m.reached,
+    );
+    metric_sample(
+        out,
+        "satd_crawl_sessions_total",
+        &[("result", "unreached")],
+        m.unreached,
+    );
+    metric_header(
+        out,
+        "satd_crawl_sessions_in_flight",
+        "Crawl sessions open, clearnet and Tor.",
+        "gauge",
+    );
+    metric_sample(
+        out,
+        "satd_crawl_sessions_in_flight",
+        &[("network", "clearnet")],
+        m.in_flight.0 as u64,
+    );
+    metric_sample(
+        out,
+        "satd_crawl_sessions_in_flight",
+        &[("network", "tor")],
+        m.in_flight.1 as u64,
+    );
     metric(
         out,
         "satd_crawl_bytes_sent_total",
@@ -1216,9 +1369,24 @@ fn render_alt_slots(out: &mut String, c: &crate::net::manager::AltSlotCounts) {
         "Alt-slots (-altslots) by state: filled by a peer matching -altprefer, held by an ordinary fallback peer, or empty.",
         "gauge",
     );
-    metric_sample(out, "satd_peer_alt_slots", &[("state", "matched")], c.matched as u64);
-    metric_sample(out, "satd_peer_alt_slots", &[("state", "fallback")], c.fallback as u64);
-    metric_sample(out, "satd_peer_alt_slots", &[("state", "empty")], c.empty as u64);
+    metric_sample(
+        out,
+        "satd_peer_alt_slots",
+        &[("state", "matched")],
+        c.matched as u64,
+    );
+    metric_sample(
+        out,
+        "satd_peer_alt_slots",
+        &[("state", "fallback")],
+        c.fallback as u64,
+    );
+    metric_sample(
+        out,
+        "satd_peer_alt_slots",
+        &[("state", "empty")],
+        c.empty as u64,
+    );
 }
 
 /// Emit the `# HELP` / `# TYPE` pair for a metric family, once.
@@ -2057,7 +2225,10 @@ async fn accept_https(
     listener
 }
 
-fn respond(answerer: &Answerer, req: hyper::Request<hyper::body::Incoming>) -> hyper::Response<String> {
+fn respond(
+    answerer: &Answerer,
+    req: hyper::Request<hyper::body::Incoming>,
+) -> hyper::Response<String> {
     if req.method() != hyper::Method::GET {
         return plain_response(405, "method not allowed\n");
     }
@@ -2098,18 +2269,27 @@ fn startup_response(status: &StartupStatus, path: &str) -> hyper::Response<Strin
                 ),
                 "/status.json" => {
                     let view = crate::status::startup::view(&snap, status.version, network);
-                    page_response("application/json", crate::status::startup::json(&snap, &view))
+                    page_response(
+                        "application/json",
+                        crate::status::startup::json(&snap, &view),
+                    )
                 }
                 _ => {
                     let view = crate::status::startup::view(&snap, status.version, network);
-                    page_response("text/html; charset=utf-8", crate::status::render::html(&view))
+                    page_response(
+                        "text/html; charset=utf-8",
+                        crate::status::render::html(&view),
+                    )
                 }
             }
         }
         "/healthz" => plain_response(200, "ok\n"),
         "/readyz" => plain_response(
             503,
-            &format!("not ready: {}\n", crate::status::startup::not_ready_reason(&snap)),
+            &format!(
+                "not ready: {}\n",
+                crate::status::startup::not_ready_reason(&snap)
+            ),
         ),
         _ => plain_response(404, "not found\n"),
     }
@@ -2128,7 +2308,10 @@ fn render_startup_prometheus(
         "satd_build_info",
         "Build metadata. Always 1; inspect labels for version and network.",
         "gauge",
-        &[("version", status.version), ("network", network_label(status.network))],
+        &[
+            ("version", status.version),
+            ("network", network_label(status.network)),
+        ],
         1,
     );
     metric(
@@ -2214,7 +2397,10 @@ fn status_response(ctx: &MetricsContext, path: &str) -> hyper::Response<String> 
                     crate::status::render::json(&snapshot, &view),
                 )
             } else {
-                ("text/html; charset=utf-8", crate::status::render::html(&view))
+                (
+                    "text/html; charset=utf-8",
+                    crate::status::render::html(&view),
+                )
             }
         }
     };
@@ -2323,7 +2509,10 @@ mod tests {
             Fingerprint::Known(Family::Core, Confidence::High),
             Fingerprint::Unknown,
         ] {
-            counts.add(&crate::net::flags::PeerFlags { fingerprint: fp, ..Default::default() });
+            counts.add(&crate::net::flags::PeerFlags {
+                fingerprint: fp,
+                ..Default::default()
+            });
         }
         let mut out = String::new();
         render_peer_flags(&mut out, &counts);
@@ -2471,8 +2660,7 @@ mod tests {
 
             for label in EXPECTED {
                 let expected = u64::from(label == current.label());
-                let line =
-                    format!("satd_spindex_backfill_state{{state=\"{label}\"}} {expected}\n");
+                let line = format!("satd_spindex_backfill_state{{state=\"{label}\"}} {expected}\n");
                 assert!(
                     out.contains(&line),
                     "missing or wrong series for state={label:?} while current is {current:?}:\n{out}"
@@ -2638,7 +2826,9 @@ mod tests {
         // And every hook is still represented.
         for id in ["pager", "deadman", "relay"] {
             assert!(
-                out.contains(&format!("satd_alertwebhook_delivered_total{{hook=\"{id}\"}}")),
+                out.contains(&format!(
+                    "satd_alertwebhook_delivered_total{{hook=\"{id}\"}}"
+                )),
                 "missing series for {id}:\n{out}"
             );
         }
@@ -2651,23 +2841,41 @@ mod tests {
         stats.shares_accepted.store(7, Ordering::Relaxed);
         stats.shares_stale.store(1, Ordering::Relaxed);
         let peer = "127.0.0.1:4000".parse().unwrap();
-        let miner = stats.miners.register(crate::stratum::miner::MinerRecord::new("v1", peer, None, 1_000));
+        let miner = stats
+            .miners
+            .register(crate::stratum::miner::MinerRecord::new(
+                "v1", peer, None, 1_000,
+            ));
         let mut out = String::new();
         render_stratum(&mut out, &stats);
         assert_one_header_per_family(&out);
-        assert!(out.contains("satd_stratum_shares_total{result=\"accepted\"} 7"), "{out}");
-        assert!(out.contains("satd_stratum_shares_total{result=\"stale\"} 1"), "{out}");
+        assert!(
+            out.contains("satd_stratum_shares_total{result=\"accepted\"} 7"),
+            "{out}"
+        );
+        assert!(
+            out.contains("satd_stratum_shares_total{result=\"stale\"} 1"),
+            "{out}"
+        );
         assert!(out.contains("satd_stratum_miners 1"), "{out}");
-        assert!(out.contains("satd_stratum_hashrate_hashes_per_second 0"), "{out}");
+        assert!(
+            out.contains("satd_stratum_hashrate_hashes_per_second 0"),
+            "{out}"
+        );
         drop(miner);
         let mut out = String::new();
         render_stratum(&mut out, &stats);
-        assert!(out.contains("satd_stratum_miners 0"), "a disconnected miner leaves the gauge: {out}");
+        assert!(
+            out.contains("satd_stratum_miners 0"),
+            "a disconnected miner leaves the gauge: {out}"
+        );
     }
 
     #[test]
     fn core_zmq_metrics_are_valid_exposition_format() {
-        use crate::events::core_zmq::{CoreZmqNotifier, CoreZmqSocketStats, CoreZmqStatus, CoreZmqTopic};
+        use crate::events::core_zmq::{
+            CoreZmqNotifier, CoreZmqSocketStats, CoreZmqStatus, CoreZmqTopic,
+        };
         struct Socket;
         impl CoreZmqSocketStats for Socket {
             fn subscriber_count(&self) -> usize {
@@ -2690,8 +2898,14 @@ mod tests {
         let mut out = String::new();
         render_core_zmq(&mut out, &status);
         assert_one_header_per_family(&out);
-        assert!(out.contains("satd_zmq_messages_total{topic=\"rawtx\"} 2"), "{out}");
-        assert!(out.contains("satd_zmq_messages_total{topic=\"hashblock\"} 0"), "{out}");
+        assert!(
+            out.contains("satd_zmq_messages_total{topic=\"rawtx\"} 2"),
+            "{out}"
+        );
+        assert!(
+            out.contains("satd_zmq_messages_total{topic=\"hashblock\"} 0"),
+            "{out}"
+        );
         assert!(out.contains("satd_zmq_subscribers 2"), "{out}");
         assert!(out.contains("satd_zmq_subscriber_drops_total 5"), "{out}");
         assert!(out.contains("satd_zmq_events_lagged_total 3"), "{out}");
@@ -2715,7 +2929,10 @@ mod tests {
         let m = WebhookMetrics::new();
         let mut out = String::new();
         render_webhook_metrics(&mut out, Some(&m));
-        assert!(out.is_empty(), "an empty registry must leak nothing:\n{out}");
+        assert!(
+            out.is_empty(),
+            "an empty registry must leak nothing:\n{out}"
+        );
 
         // A registered hook exports its counters, labelled by id.
         let c = m.hook("ops");
@@ -2723,9 +2940,18 @@ mod tests {
         c.dropped.store(2, Ordering::Relaxed);
         let mut out = String::new();
         render_webhook_metrics(&mut out, Some(&m));
-        assert!(out.contains(r#"satd_alertwebhook_delivered_total{hook="ops"} 7"#), "{out}");
-        assert!(out.contains(r#"satd_alertwebhook_dropped_total{hook="ops"} 2"#), "{out}");
-        assert!(out.contains(r#"satd_alertwebhook_queue_depth{hook="ops"} 0"#), "{out}");
+        assert!(
+            out.contains(r#"satd_alertwebhook_delivered_total{hook="ops"} 7"#),
+            "{out}"
+        );
+        assert!(
+            out.contains(r#"satd_alertwebhook_dropped_total{hook="ops"} 2"#),
+            "{out}"
+        );
+        assert!(
+            out.contains(r#"satd_alertwebhook_queue_depth{hook="ops"} 0"#),
+            "{out}"
+        );
     }
 
     #[test]
@@ -2795,9 +3021,13 @@ mod tests {
         let mut types: HashMap<&str, usize> = HashMap::new();
         for line in out.lines() {
             if let Some(rest) = line.strip_prefix("# HELP ") {
-                *helps.entry(rest.split(' ').next().unwrap_or("")).or_default() += 1;
+                *helps
+                    .entry(rest.split(' ').next().unwrap_or(""))
+                    .or_default() += 1;
             } else if let Some(rest) = line.strip_prefix("# TYPE ") {
-                *types.entry(rest.split(' ').next().unwrap_or("")).or_default() += 1;
+                *types
+                    .entry(rest.split(' ').next().unwrap_or(""))
+                    .or_default() += 1;
             }
         }
         for (name, n) in helps {
@@ -2861,10 +3091,16 @@ mod tests {
         health.set_disk_free_for_test(Some(4096));
         let mut out = String::new();
         render_health_metrics(&mut out, Some(&health));
-        assert!(out.contains("satd_alert_active{kind=\"disk_low\"} 1"), "{out}");
+        assert!(
+            out.contains("satd_alert_active{kind=\"disk_low\"} 1"),
+            "{out}"
+        );
         assert!(out.contains("satd_disk_free_bytes 4096"), "{out}");
         // Unrelated conditions stay at 0.
-        assert!(out.contains("satd_alert_active{kind=\"tip_stall\"} 0"), "{out}");
+        assert!(
+            out.contains("satd_alert_active{kind=\"tip_stall\"} 0"),
+            "{out}"
+        );
     }
 
     /// The AssumeUTXO gauges: attached/rejected always, the heights only while
@@ -2879,9 +3115,15 @@ mod tests {
         let (cs, dir) = crate::chain::state::tests::make_chain_state();
         let mut out = String::new();
         render_assumeutxo_metrics(&mut out, &cs);
-        assert!(out.contains("satd_assumeutxo_background_attached 0"), "{out}");
+        assert!(
+            out.contains("satd_assumeutxo_background_attached 0"),
+            "{out}"
+        );
         assert!(out.contains("satd_assumeutxo_snapshot_rejected 0"), "{out}");
-        assert!(!out.contains("satd_assumeutxo_background_tip_height"), "{out}");
+        assert!(
+            !out.contains("satd_assumeutxo_background_tip_height"),
+            "{out}"
+        );
         assert!(!out.contains("satd_assumeutxo_snapshot_height"), "{out}");
 
         let blocks = crate::chain::state::tests::build_and_connect_chain(&cs, 3);
@@ -2898,8 +3140,14 @@ mod tests {
         let mut out = String::new();
         render_assumeutxo_metrics(&mut out, &cs);
         assert_one_header_per_family(&out);
-        assert!(out.contains("satd_assumeutxo_background_attached 1"), "{out}");
-        assert!(out.contains("satd_assumeutxo_background_tip_height 1"), "{out}");
+        assert!(
+            out.contains("satd_assumeutxo_background_attached 1"),
+            "{out}"
+        );
+        assert!(
+            out.contains("satd_assumeutxo_background_tip_height 1"),
+            "{out}"
+        );
         assert!(out.contains("satd_assumeutxo_snapshot_height 3"), "{out}");
         assert!(out.contains("satd_assumeutxo_snapshot_rejected 0"), "{out}");
 
@@ -2910,7 +3158,10 @@ mod tests {
         let mut out = String::new();
         render_assumeutxo_metrics(&mut out, &cs);
         assert!(out.contains("satd_assumeutxo_snapshot_rejected 1"), "{out}");
-        assert!(out.contains("satd_assumeutxo_background_tip_height 3"), "{out}");
+        assert!(
+            out.contains("satd_assumeutxo_background_tip_height 3"),
+            "{out}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2922,7 +3173,10 @@ mod tests {
         // No policy ⇒ no policy metrics (byte-identical to engine-compiled-out).
         let mut out = String::new();
         render_policy_metrics(&mut out, &mp);
-        assert!(out.is_empty(), "no-policy node must emit zero policy metrics");
+        assert!(
+            out.is_empty(),
+            "no-policy node must emit zero policy metrics"
+        );
 
         // Empty-but-loaded ruleset (`version 1`) is inert (I8): still nothing —
         // this is the deep-review bug (gating on policy_snapshot() leaked it).
@@ -2944,7 +3198,9 @@ mod tests {
         let mut out3 = String::new();
         render_policy_metrics(&mut out3, &mp);
         assert!(out3.contains("satd_policy_evaluations_total"));
-        assert!(out3.contains("satd_policy_quarantined_total{rule=\"spam\",scope=\"relay+template\"}"));
+        assert!(
+            out3.contains("satd_policy_quarantined_total{rule=\"spam\",scope=\"relay+template\"}")
+        );
     }
     /// A rebuilding node's startup status, for the startup listener tests.
     fn startup_status(status_page: bool) -> Arc<StartupStatus> {
@@ -2970,10 +3226,13 @@ mod tests {
             .await
             .unwrap();
         let mut raw = Vec::new();
-        tokio::time::timeout(std::time::Duration::from_secs(10), stream.read_to_end(&mut raw))
-            .await
-            .expect("the startup server closes its connection after one response")
-            .unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            stream.read_to_end(&mut raw),
+        )
+        .await
+        .expect("the startup server closes its connection after one response")
+        .unwrap();
         let raw = String::from_utf8(raw).unwrap();
         let (head, body) = raw.split_once("\r\n\r\n").unwrap();
         let status = head[9..12].parse().unwrap();
@@ -3002,7 +3261,9 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         // The next is dropped at accept: no answer, just EOF.
         let mut refused = tokio::net::TcpStream::connect(addr).await.unwrap();
-        let _ = refused.write_all(b"GET /healthz HTTP/1.1\r\nHost: satd\r\n\r\n").await;
+        let _ = refused
+            .write_all(b"GET /healthz HTTP/1.1\r\nHost: satd\r\n\r\n")
+            .await;
         let mut raw = Vec::new();
         let _ = tokio::time::timeout(
             std::time::Duration::from_secs(5),
@@ -3010,7 +3271,11 @@ mod tests {
         )
         .await
         .expect("a socket over the cap is closed");
-        assert!(raw.is_empty(), "over the cap: {:?}", String::from_utf8_lossy(&raw));
+        assert!(
+            raw.is_empty(),
+            "over the cap: {:?}",
+            String::from_utf8_lossy(&raw)
+        );
 
         // The silent socket is closed once the header budget runs out...
         let mut buf = [0u8; 16];
@@ -3018,7 +3283,10 @@ mod tests {
             tokio::time::timeout(std::time::Duration::from_secs(5), silent.read(&mut buf)).await,
             Ok(Ok(0)) | Ok(Err(_))
         );
-        assert!(closed, "a silent socket must be closed after the header budget");
+        assert!(
+            closed,
+            "a silent socket must be closed after the header budget"
+        );
         // ...which frees its slot.
         let (code, _, body) = get(addr, "/healthz").await;
         assert_eq!((code, body.as_str()), (200, "ok\n"));
@@ -3043,7 +3311,10 @@ mod tests {
 
         let (code, head, body) = get(addr, "/metrics").await;
         assert_eq!(code, 200);
-        assert!(head.contains("content-type: text/plain; version=0.0.4"), "{head}");
+        assert!(
+            head.contains("content-type: text/plain; version=0.0.4"),
+            "{head}"
+        );
         for line in [
             "satd_build_info{version=\"0.6.0-pre\",network=\"mainnet\"} 1",
             "satd_startup_phase{phase=\"reindex_chainstate\"} 1",
@@ -3052,24 +3323,47 @@ mod tests {
         ] {
             assert!(body.lines().any(|l| l == line), "no `{line}` in:\n{body}");
         }
-        assert!(body.lines().any(|l| l.starts_with("satd_startup_elapsed_seconds ")), "{body}");
+        assert!(
+            body.lines()
+                .any(|l| l.starts_with("satd_startup_elapsed_seconds ")),
+            "{body}"
+        );
         // No ETA is known yet, so the series is absent rather than zero.
         assert!(!body.contains("satd_startup_eta_seconds"), "{body}");
         // One HELP/TYPE pair per family: a strict parser drops the whole page
         // on a repeat.
         for family in body.lines().filter_map(|l| l.strip_prefix("# HELP ")) {
             let name = family.split(' ').next().unwrap();
-            assert_eq!(body.matches(&format!("# HELP {name} ")).count(), 1, "{name}");
+            assert_eq!(
+                body.matches(&format!("# HELP {name} ")).count(),
+                1,
+                "{name}"
+            );
         }
 
         let (code, head, page) = get(addr, "/status").await;
         assert_eq!(code, 200);
         assert!(head.contains("content-type: text/html"), "{head}");
-        assert!(head.contains(&format!("content-security-policy: {}", STATUS_CSP.to_ascii_lowercase())), "{head}");
-        assert!(head.contains("connection: close"), "one request per connection: {head}");
+        assert!(
+            head.contains(&format!(
+                "content-security-policy: {}",
+                STATUS_CSP.to_ascii_lowercase()
+            )),
+            "{head}"
+        );
+        assert!(
+            head.contains("connection: close"),
+            "one request per connection: {head}"
+        );
         assert!(page.contains(">rebuilding chainstate<"), "the top line");
-        assert!(page.contains("412,930 of 967,870 blocks (42.7%)"), "the progress");
-        assert!(page.contains("data-s=\"chain\" hidden"), "the chain card is hidden");
+        assert!(
+            page.contains("412,930 of 967,870 blocks (42.7%)"),
+            "the progress"
+        );
+        assert!(
+            page.contains("data-s=\"chain\" hidden"),
+            "the chain card is hidden"
+        );
 
         let (code, head, body) = get(addr, "/status.json").await;
         assert_eq!(code, 200);
@@ -3125,20 +3419,31 @@ mod tests {
 
         stop.send(true).unwrap();
         let listener = first.await.unwrap();
-        assert_eq!(listener.local_addr().unwrap(), addr, "the same socket comes back");
+        assert_eq!(
+            listener.local_addr().unwrap(),
+            addr,
+            "the same socket comes back"
+        );
 
         // Nothing is accepting now; the connection still succeeds.
         let waiting = tokio::spawn(get(addr, "/readyz"));
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        assert!(!waiting.is_finished(), "answered while no server held the listener");
+        assert!(
+            !waiting.is_finished(),
+            "answered while no server held the listener"
+        );
 
         let next = startup_status(true);
-        next.progress.set_phase("chain_init", "Initializing chain state...");
+        next.progress
+            .set_phase("chain_init", "Initializing chain state...");
         let (stop2, stop_rx2) = tokio::sync::watch::channel(false);
         let second = tokio::spawn(serve_startup_http(next, listener, stop_rx2));
         let (code, _, body) = waiting.await.unwrap();
         assert_eq!(code, 503);
-        assert_eq!(body, "not ready: starting: Initializing chain state...\n", "the new server answered");
+        assert_eq!(
+            body, "not ready: starting: Initializing chain state...\n",
+            "the new server answered"
+        );
         stop2.send(true).unwrap();
         second.await.unwrap();
     }

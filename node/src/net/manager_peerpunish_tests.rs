@@ -32,7 +32,13 @@ fn mk_pm() -> (Arc<PeerManager>, tempfile::TempDir) {
     let mempool = Arc::new(Mempool::new(1_000_000, 0));
     let fee_estimator = Arc::new(FeeEstimator::new());
     let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    let pm = PeerManager::new(chain_state, mempool, fee_estimator, Network::Regtest, shutdown_rx);
+    let pm = PeerManager::new(
+        chain_state,
+        mempool,
+        fee_estimator,
+        Network::Regtest,
+        shutdown_rx,
+    );
     (pm, dir)
 }
 
@@ -96,7 +102,10 @@ fn outcome(pm: &PeerManager, id: PeerId) -> Outcome {
 fn misbehaviour_follows_cores_ladder() {
     use crate::net::permissions::NetPermissions;
     let noban = |mut info: PeerInfo| {
-        info.permissions = NetPermissions { noban: true, ..NetPermissions::NONE };
+        info.permissions = NetPermissions {
+            noban: true,
+            ..NetPermissions::NONE
+        };
         info
     };
     let manual = |mut info: PeerInfo| {
@@ -108,24 +117,64 @@ fn misbehaviour_follows_cores_ladder() {
         info
     };
     let cases: Vec<(&str, PeerInfo, Outcome)> = vec![
-        ("an inbound peer", peer(1, "10.62.0.1:50000", Direction::Inbound), Outcome::Banned),
-        ("an outbound peer", peer(1, "10.62.0.2:8333", Direction::Outbound), Outcome::Banned),
+        (
+            "an inbound peer",
+            peer(1, "10.62.0.1:50000", Direction::Inbound),
+            Outcome::Banned,
+        ),
+        (
+            "an outbound peer",
+            peer(1, "10.62.0.2:8333", Direction::Outbound),
+            Outcome::Banned,
+        ),
         // Private, but not local: Core's `IsLocal` is loopback and 0.0.0.0/8.
-        ("a peer on a private network", peer(1, "192.168.7.5:8333", Direction::Inbound), Outcome::Banned),
-        ("a noban peer", noban(peer(1, "10.62.0.3:50000", Direction::Inbound)), Outcome::Kept),
-        ("a manual peer", manual(peer(1, "10.62.0.4:8333", Direction::Outbound)), Outcome::Kept),
+        (
+            "a peer on a private network",
+            peer(1, "192.168.7.5:8333", Direction::Inbound),
+            Outcome::Banned,
+        ),
+        (
+            "a noban peer",
+            noban(peer(1, "10.62.0.3:50000", Direction::Inbound)),
+            Outcome::Kept,
+        ),
+        (
+            "a manual peer",
+            manual(peer(1, "10.62.0.4:8333", Direction::Outbound)),
+            Outcome::Kept,
+        ),
         // Manual comes before local in the ladder.
-        ("a manual peer on loopback", manual(peer(1, "127.0.0.1:8333", Direction::Outbound)), Outcome::Kept),
-        ("a peer on 127.0.0.1", peer(1, "127.0.0.1:50000", Direction::Inbound), Outcome::Disconnected),
-        ("a peer elsewhere in 127.0.0.0/8", peer(1, "127.5.6.7:50000", Direction::Inbound), Outcome::Disconnected),
-        ("a peer on ::1", peer(1, "[::1]:50000", Direction::Inbound), Outcome::Disconnected),
+        (
+            "a manual peer on loopback",
+            manual(peer(1, "127.0.0.1:8333", Direction::Outbound)),
+            Outcome::Kept,
+        ),
+        (
+            "a peer on 127.0.0.1",
+            peer(1, "127.0.0.1:50000", Direction::Inbound),
+            Outcome::Disconnected,
+        ),
+        (
+            "a peer elsewhere in 127.0.0.0/8",
+            peer(1, "127.5.6.7:50000", Direction::Inbound),
+            Outcome::Disconnected,
+        ),
+        (
+            "a peer on ::1",
+            peer(1, "[::1]:50000", Direction::Inbound),
+            Outcome::Disconnected,
+        ),
         // What a dual-stack listener reports for an IPv4 loopback peer.
         (
             "a peer on ::ffff:127.0.0.1",
             peer(1, "[::ffff:127.0.0.1]:50000", Direction::Inbound),
             Outcome::Disconnected,
         ),
-        ("an inbound onion peer", onion(peer(1, "127.0.0.1:50000", Direction::Inbound)), Outcome::Disconnected),
+        (
+            "an inbound onion peer",
+            onion(peer(1, "127.0.0.1:50000", Direction::Inbound)),
+            Outcome::Disconnected,
+        ),
         // Tor on another host (`-bind=<lan address>:<port>=onion`): the
         // address is the Tor host's, shared by every onion peer, so it is not
         // banned either. See `misbehaviour_action`.
@@ -134,7 +183,11 @@ fn misbehaviour_follows_cores_ladder() {
             onion(peer(1, "192.168.1.20:50000", Direction::Inbound)),
             Outcome::Disconnected,
         ),
-        ("an outbound peer on loopback", peer(1, "127.0.0.1:8333", Direction::Outbound), Outcome::Disconnected),
+        (
+            "an outbound peer on loopback",
+            peer(1, "127.0.0.1:8333", Direction::Outbound),
+            Outcome::Disconnected,
+        ),
     ];
     for (case, info, expected) in cases {
         let (pm, _dir) = mk_pm();
@@ -157,9 +210,15 @@ fn a_misbehaving_outbound_onion_peer_is_banned_by_its_onion_host() {
     let _rx = add_peer(&pm, info);
     pm.add_ban_score(1, BAN_THRESHOLD, "test");
 
-    assert!(!pm.peers.read().contains_key(&1), "the peer is disconnected");
+    assert!(
+        !pm.peers.read().contains_key(&1),
+        "the peer is disconnected"
+    );
     let now = crate::time::now_secs();
-    assert!(pm.ban_list.read().is_onion_banned(host, now), "its onion host is banned");
+    assert!(
+        pm.ban_list.read().is_onion_banned(host, now),
+        "its onion host is banned"
+    );
     assert!(
         !pm.is_addr_banned(&"0.0.0.0:8333".parse().unwrap()),
         "the shared placeholder is not a peer's address"
@@ -175,7 +234,12 @@ fn kept_peers_stay_however_often_they_misbehave() {
         let (pm, _dir) = mk_pm();
         let mut info = peer(1, "10.62.0.5:8333", Direction::Outbound);
         match case {
-            "noban" => info.permissions = NetPermissions { noban: true, ..NetPermissions::NONE },
+            "noban" => {
+                info.permissions = NetPermissions {
+                    noban: true,
+                    ..NetPermissions::NONE
+                }
+            }
             _ => info.conn_type = ConnType::Manual,
         }
         let _rx = add_peer(&pm, info);
@@ -213,7 +277,9 @@ fn an_out_of_range_getblocktxn_from_an_inbound_onion_peer_bans_nothing() {
         None,
     )
     .expect("mine a regtest block");
-    pm.chain_state.accept_block(&block).expect("accept the block");
+    pm.chain_state
+        .accept_block(&block)
+        .expect("accept the block");
     let request = || {
         NetworkMessage::GetBlockTxn(bitcoin::p2p::message_compact_blocks::GetBlockTxn {
             txs_request: bitcoin::bip152::BlockTransactionsRequest {
@@ -227,7 +293,10 @@ fn an_out_of_range_getblocktxn_from_an_inbound_onion_peer_bans_nothing() {
     onion.inbound_onion = true;
     let _rx = add_peer(&pm, onion);
     pm.handle_message(1, request(), InFlight::adopt(None));
-    assert!(!pm.peers.read().contains_key(&1), "the onion peer is disconnected");
+    assert!(
+        !pm.peers.read().contains_key(&1),
+        "the onion peer is disconnected"
+    );
     assert!(pm.list_banned().is_empty(), "and nothing is banned");
     assert!(
         !pm.is_addr_banned(&"127.0.0.1:50001".parse().unwrap()),
@@ -237,7 +306,10 @@ fn an_out_of_range_getblocktxn_from_an_inbound_onion_peer_bans_nothing() {
     let ordinary: SocketAddr = "10.62.0.7:50000".parse().unwrap();
     let _rx = add_peer(&pm, peer(2, "10.62.0.7:50000", Direction::Inbound));
     pm.handle_message(2, request(), InFlight::adopt(None));
-    assert!(!pm.peers.read().contains_key(&2), "the ordinary peer is disconnected");
+    assert!(
+        !pm.peers.read().contains_key(&2),
+        "the ordinary peer is disconnected"
+    );
     assert!(pm.is_addr_banned(&ordinary), "and its address banned");
 }
 
@@ -257,7 +329,9 @@ fn an_empty_getblocktxn_disconnects_without_a_ban_or_a_reply() {
         None,
     )
     .expect("mine a regtest block");
-    pm.chain_state.accept_block(&block).expect("accept the block");
+    pm.chain_state
+        .accept_block(&block)
+        .expect("accept the block");
     let request = |indexes: Vec<u64>| {
         NetworkMessage::GetBlockTxn(bitcoin::p2p::message_compact_blocks::GetBlockTxn {
             txs_request: bitcoin::bip152::BlockTransactionsRequest {
@@ -269,16 +343,27 @@ fn an_empty_getblocktxn_disconnects_without_a_ban_or_a_reply() {
 
     let mut rx = add_peer(&pm, peer(1, "10.62.0.8:50000", Direction::Inbound));
     pm.handle_message(1, request(vec![0]), InFlight::adopt(None));
-    assert_eq!(outcome(&pm, 1), Outcome::Kept, "a one-index request keeps the peer");
+    assert_eq!(
+        outcome(&pm, 1),
+        Outcome::Kept,
+        "a one-index request keeps the peer"
+    );
     assert!(
         matches!(rx.try_recv(), Ok(NetworkMessage::BlockTxn(_))),
         "and is answered with blocktxn"
     );
 
     pm.handle_message(1, request(vec![]), InFlight::adopt(None));
-    assert_eq!(outcome(&pm, 1), Outcome::Disconnected, "an empty request disconnects, bans nothing");
+    assert_eq!(
+        outcome(&pm, 1),
+        Outcome::Disconnected,
+        "an empty request disconnects, bans nothing"
+    );
     assert!(
-        !matches!(rx.try_recv(), Ok(NetworkMessage::BlockTxn(_) | NetworkMessage::Block(_))),
+        !matches!(
+            rx.try_recv(),
+            Ok(NetworkMessage::BlockTxn(_) | NetworkMessage::Block(_))
+        ),
         "and is not answered"
     );
 }
@@ -308,7 +393,11 @@ async fn a_peer_accepted_on_the_onion_listener_is_marked_inbound_onion() {
         pm.accept_inbound_with_perms(accepted, peer_addr, NetPermissions::NONE, inbound_onion);
         let peers = pm.peers.read();
         let marked: Vec<bool> = peers.values().map(|h| h.info.inbound_onion).collect();
-        assert_eq!(marked, vec![inbound_onion], "accepted with inbound_onion = {inbound_onion}");
+        assert_eq!(
+            marked,
+            vec![inbound_onion],
+            "accepted with inbound_onion = {inbound_onion}"
+        );
     }
 }
 
@@ -321,21 +410,21 @@ fn a_block_ahead_of_the_clock_is_not_charged_to_its_sender() {
     use crate::chain::connect::ConnectError;
     use crate::chain::state::ChainError;
     use crate::validation::ValidationError;
-    assert!(!PeerManager::store_error_is_the_blocks(&ChainError::Validation(
-        ValidationError::TimeTooNew
-    )));
-    assert!(PeerManager::store_error_is_the_blocks(&ChainError::Validation(
-        ValidationError::TimeTooOld
-    )));
-    assert!(PeerManager::store_error_is_the_blocks(&ChainError::Connect(
-        ConnectError::LocktimeNotFinal
-    )));
-    assert!(PeerManager::store_error_is_the_blocks(&ChainError::Connect(
-        ConnectError::BadCoinbaseHeight
-    )));
-    assert!(!PeerManager::store_error_is_the_blocks(&ChainError::Connect(
-        ConnectError::Interrupted
-    )));
+    assert!(!PeerManager::store_error_is_the_blocks(
+        &ChainError::Validation(ValidationError::TimeTooNew)
+    ));
+    assert!(PeerManager::store_error_is_the_blocks(
+        &ChainError::Validation(ValidationError::TimeTooOld)
+    ));
+    assert!(PeerManager::store_error_is_the_blocks(
+        &ChainError::Connect(ConnectError::LocktimeNotFinal)
+    ));
+    assert!(PeerManager::store_error_is_the_blocks(
+        &ChainError::Connect(ConnectError::BadCoinbaseHeight)
+    ));
+    assert!(!PeerManager::store_error_is_the_blocks(
+        &ChainError::Connect(ConnectError::Interrupted)
+    ));
 }
 
 /// The sender of a stored block that fails when the connector reaches it is
@@ -355,7 +444,10 @@ fn the_source_of_a_block_that_fails_to_connect_is_charged() {
 
     pm.ibd_block_connected(&good);
     pm.punish_block_source(&good, "bad-txns-inputs-missingorspent");
-    assert!(pm.peers.read().contains_key(&2), "a connected block's sender is not charged");
+    assert!(
+        pm.peers.read().contains_key(&2),
+        "a connected block's sender is not charged"
+    );
 
     pm.punish_block_source(&bad, "block-script-verify-flag-failed");
     assert_eq!(outcome(&pm, 1), Outcome::Banned);
@@ -372,12 +464,18 @@ fn block_processor_refusals_charge_the_sender_as_core_does() {
     use crate::validation::ValidationError;
     let charged = |e: ChainError| PeerManager::block_error_is_the_blocks(&e);
     assert!(charged(ChainError::Connect(ConnectError::LocktimeNotFinal)));
-    assert!(charged(ChainError::Connect(ConnectError::BadCoinbaseHeight)));
+    assert!(charged(ChainError::Connect(
+        ConnectError::BadCoinbaseHeight
+    )));
     assert!(charged(ChainError::Validation(ValidationError::TimeTooOld)));
     assert!(charged(ChainError::CheckpointMismatch(10)));
     assert!(charged(ChainError::ForkBeforeCheckpoint(10)));
-    assert!(!charged(ChainError::Validation(ValidationError::TimeTooNew)));
-    assert!(!charged(ChainError::Validation(ValidationError::BadMerkleRoot)));
+    assert!(!charged(ChainError::Validation(
+        ValidationError::TimeTooNew
+    )));
+    assert!(!charged(ChainError::Validation(
+        ValidationError::BadMerkleRoot
+    )));
     assert!(!charged(ChainError::Connect(ConnectError::Interrupted)));
     assert!(!charged(ChainError::FlatFile("disk".into())));
 }
@@ -403,9 +501,15 @@ fn a_reorg_that_fails_on_a_stored_ancestor_charges_that_ancestors_sender() {
     cs.accept_block(&b1).unwrap();
     cs.accept_block(&b2).unwrap();
 
-    let missing = bitcoin::OutPoint { txid: bitcoin::Txid::from_byte_array([9; 32]), vout: 0 };
+    let missing = bitcoin::OutPoint {
+        txid: bitcoin::Txid::from_byte_array([9; 32]),
+        vout: 0,
+    };
     let s2 = build_test_block_spending(b1.block_hash(), 2, t + 1201, missing);
-    assert!(matches!(cs.accept_block(&s2), Ok(crate::chain::state::BlockAcceptance::Stored(_))));
+    assert!(matches!(
+        cs.accept_block(&s2),
+        Ok(crate::chain::state::BlockAcceptance::Stored(_))
+    ));
     pm.block_sources.lock().record(s2.block_hash(), 1);
 
     let s3 = build_test_block(s2.block_hash(), 3, t + 1800);
@@ -413,8 +517,14 @@ fn a_reorg_that_fails_on_a_stored_ancestor_charges_that_ancestors_sender() {
     assert!(PeerManager::block_error_is_the_blocks(&err), "{err:?}");
     pm.charge_refused_block(&s3, 2, false, &err);
 
-    assert!(pm.peers.read().contains_key(&2), "the peer whose block triggered the reorg is not charged");
-    assert!(!pm.peers.read().contains_key(&1), "the peer that sent the failing block is");
+    assert!(
+        pm.peers.read().contains_key(&2),
+        "the peer whose block triggered the reorg is not charged"
+    );
+    assert!(
+        !pm.peers.read().contains_key(&1),
+        "the peer that sent the failing block is"
+    );
 }
 
 /// When the refused block is the one that failed, its sender is charged,
@@ -423,7 +533,10 @@ fn a_reorg_that_fails_on_a_stored_ancestor_charges_that_ancestors_sender() {
 fn a_block_that_fails_itself_charges_its_sender_unless_rebuilt() {
     use crate::chain::state::tests::{build_test_block, build_test_block_spending};
     use bitcoin::hashes::Hash as _;
-    let missing = bitcoin::OutPoint { txid: bitcoin::Txid::from_byte_array([9; 32]), vout: 0 };
+    let missing = bitcoin::OutPoint {
+        txid: bitcoin::Txid::from_byte_array([9; 32]),
+        vout: 0,
+    };
     for (via_compact, charged) in [(false, true), (true, false)] {
         let (pm, _dir) = mk_pm();
         let _a = add_peer(&pm, peer(1, "10.62.0.1:50000", Direction::Inbound));
@@ -434,7 +547,11 @@ fn a_block_that_fails_itself_charges_its_sender_unless_rebuilt() {
         let bad = build_test_block_spending(b1.block_hash(), 2, 1_710_001_200, missing);
         let err = cs.accept_block(&bad).expect_err("missing input");
         pm.charge_refused_block(&bad, 1, via_compact, &err);
-        assert_eq!(!pm.peers.read().contains_key(&1), charged, "via_compact = {via_compact}");
+        assert_eq!(
+            !pm.peers.read().contains_key(&1),
+            charged,
+            "via_compact = {via_compact}"
+        );
     }
 }
 
@@ -473,7 +590,10 @@ fn a_header_forking_below_the_last_checkpoint_bans_its_sender() {
             parent = b.block_hash();
             blocks.push(b);
         }
-        cs.set_checkpoints_for_test(vec![Checkpoint { height: 4, hash: parent }]);
+        cs.set_checkpoints_for_test(vec![Checkpoint {
+            height: 4,
+            hash: parent,
+        }]);
         for b in &blocks {
             cs.accept_block(b).expect("connect fixture block");
         }
@@ -481,18 +601,34 @@ fn a_header_forking_below_the_last_checkpoint_bans_its_sender() {
         let fee_estimator = Arc::new(FeeEstimator::new());
         let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         (
-            PeerManager::new(Arc::new(cs), mempool, fee_estimator, Network::Regtest, shutdown_rx),
+            PeerManager::new(
+                Arc::new(cs),
+                mempool,
+                fee_estimator,
+                Network::Regtest,
+                shutdown_rx,
+            ),
             dir,
         )
     };
     let _rx1 = add_peer(&pm, peer(1, "10.63.0.1:50000", Direction::Inbound));
     let _rx2 = add_peer(&pm, peer(2, "10.63.0.2:50000", Direction::Inbound));
-    let h1 = pm.chain_state.get_block_hash_by_height(1).expect("height 1");
-    let h2 = pm.chain_state.get_block_hash_by_height(2).expect("height 2");
+    let h1 = pm
+        .chain_state
+        .get_block_hash_by_height(1)
+        .expect("height 1");
+    let h2 = pm
+        .chain_state
+        .get_block_hash_by_height(2)
+        .expect("height 2");
 
     let known = pm.chain_state.get_block_index(&h2).expect("indexed").header;
     pm.handle_headers(2, vec![known]);
-    assert_eq!(outcome(&pm, 2), Outcome::Kept, "a known main-chain header charges nothing");
+    assert_eq!(
+        outcome(&pm, 2),
+        Outcome::Kept,
+        "a known main-chain header charges nothing"
+    );
 
     let fork = build_test_block(h1, 2, 1_707_100_002);
     pm.handle_headers(1, vec![fork.header]);

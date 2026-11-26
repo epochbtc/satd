@@ -1,11 +1,11 @@
 use crate::chain::state::ChainState;
 use crate::mempool::pool::Mempool;
 use crate::mining::template::create_template;
-use crate::storage::blockindex::{sub_u256, target_to_difficulty, u256_to_f64};
 use crate::rpc::util::univalue_double;
 use crate::storage::blockindex::BlockStatus;
+use crate::storage::blockindex::{sub_u256, target_to_difficulty, u256_to_f64};
 use crate::validation::pow::difficulty_adjustment_interval;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// Core's `RPC_DESERIALIZATION_ERROR`.
 const RPC_DESERIALIZATION_ERROR: i32 = -22;
@@ -39,8 +39,11 @@ pub fn submit_block(
     // (`validation::decode`). `Block::consensus_decode` read at most
     // `MAX_VEC_SIZE` bytes; the slice keeps that limit.
     let mut block: bitcoin::Block = {
-        let limit = block_bytes.len().min(bitcoin::consensus::encode::MAX_VEC_SIZE);
-        crate::validation::decode::read_block(&mut &block_bytes[..limit]).map_err(|_| decode_failed())?
+        let limit = block_bytes
+            .len()
+            .min(bitcoin::consensus::encode::MAX_VEC_SIZE);
+        crate::validation::decode::read_block(&mut &block_bytes[..limit])
+            .map_err(|_| decode_failed())?
     };
 
     // Core runs `UpdateUncommittedBlockStructures` whenever the parent is in
@@ -137,7 +140,11 @@ pub(crate) fn rejection_answer(
             let invalid = chain_state
                 .get_block_index(hash)
                 .is_some_and(|entry| entry.status == BlockStatus::Invalid);
-            let answer = if invalid { "duplicate-invalid" } else { "duplicate" };
+            let answer = if invalid {
+                "duplicate-invalid"
+            } else {
+                "duplicate"
+            };
             Ok(Value::String(answer.to_string()))
         }
         E::DecodeFailed => Err((RPC_DESERIALIZATION_ERROR, e.to_string())),
@@ -177,11 +184,18 @@ pub fn generate_to_address(
     max_tries: u64,
     stop: &dyn Fn() -> bool,
 ) -> Result<Value, (i32, String)> {
-    let hashes = crate::mining::miner::mine_blocks_until(chain_state, mempool, address, nblocks, max_tries, stop)
-        .map_err(|e| match &e {
-            crate::mining::miner::MineError::BadAddress(_) => (-5, format!("Invalid address: {e}")),
-            _ => (-1, e.to_string()),
-        })?;
+    let hashes = crate::mining::miner::mine_blocks_until(
+        chain_state,
+        mempool,
+        address,
+        nblocks,
+        max_tries,
+        stop,
+    )
+    .map_err(|e| match &e {
+        crate::mining::miner::MineError::BadAddress(_) => (-5, format!("Invalid address: {e}")),
+        _ => (-1, e.to_string()),
+    })?;
 
     Ok(json!(hashes))
 }
@@ -202,14 +216,18 @@ pub fn generate_to_descriptor(
     // names `scantxoutset` — so `generatetodescriptor` refused every
     // key-based descriptor Core accepts, under the wrong code, in a message
     // about a different RPC.
-    let script = crate::rpc::descriptor::descriptor_to_coinbase_script(
-        descriptor,
-        chain_state.network,
-    )?;
+    let script =
+        crate::rpc::descriptor::descriptor_to_coinbase_script(descriptor, chain_state.network)?;
 
-    let hashes =
-        crate::mining::miner::mine_blocks_to_script_until(chain_state, mempool, script, nblocks, max_tries, stop)
-        .map_err(|e| (-1, e.to_string()))?;
+    let hashes = crate::mining::miner::mine_blocks_to_script_until(
+        chain_state,
+        mempool,
+        script,
+        nblocks,
+        max_tries,
+        stop,
+    )
+    .map_err(|e| (-1, e.to_string()))?;
 
     Ok(json!(hashes))
 }
@@ -254,7 +272,10 @@ pub fn template_gate(
         return Err((-9, "satd is not connected!".to_string()));
     }
     if initial_block_download {
-        return Err((-10, "satd is in initial sync and waiting for blocks...".to_string()));
+        return Err((
+            -10,
+            "satd is in initial sync and waiting for blocks...".to_string(),
+        ));
     }
     Ok(())
 }
@@ -265,15 +286,25 @@ pub fn template_gate(
 /// does, and a template that fails is an error with Core's message rather
 /// than work for a miner (`mining::validity`). The script-level check follows
 /// in the background, once per tip.
-pub fn get_block_template(chain_state: &ChainState, mempool: &Mempool) -> Result<Value, (i32, String)> {
+pub fn get_block_template(
+    chain_state: &ChainState,
+    mempool: &Mempool,
+) -> Result<Value, (i32, String)> {
     use crate::mining::validity::{Check, CheckOrigin};
     let template = create_template(chain_state, mempool);
-    let outcome = crate::mining::validity::check_template(chain_state, &template, Check::Structural);
-    chain_state.template_validity().record(Check::Structural, &outcome, CheckOrigin::GetBlockTemplate);
+    let outcome =
+        crate::mining::validity::check_template(chain_state, &template, Check::Structural);
+    chain_state.template_validity().record(
+        Check::Structural,
+        &outcome,
+        CheckOrigin::GetBlockTemplate,
+    );
     if let crate::chain::state::TemplateVerdict::Invalid(reason) = &outcome.verdict {
         return Err((-1, format!("TestBlockValidity failed: {reason}")));
     }
-    chain_state.template_validity().queue_full_check_for_gbt(&template);
+    chain_state
+        .template_validity()
+        .queue_full_check_for_gbt(&template);
     let pre_segwit =
         !crate::validation::block::segwit_active_at(chain_state.network, template.height);
     let scale = crate::validation::block::WITNESS_SCALE_FACTOR as u64;
@@ -370,15 +401,15 @@ pub fn get_block_template(chain_state: &ChainState, mempool: &Mempool) -> Result
 /// `getmininginfo.next`: the block after `tip` as Core's
 /// `NextEmptyBlockIndex` builds it — timestamped `max(MTP + 1, now)` on the
 /// node clock, with the `nBits` that timestamp requires.
-fn next_block_info(chain_state: &ChainState, tip: &crate::storage::blockindex::BlockIndexEntry) -> Value {
+fn next_block_info(
+    chain_state: &ChainState,
+    tip: &crate::storage::blockindex::BlockIndexEntry,
+) -> Value {
     let now = u32::try_from(crate::time::now_secs()).unwrap_or(u32::MAX);
     let time = now.max(crate::rpc::blockchain::block_median_time(chain_state, tip) + 1);
-    let bits = crate::validation::pow::next_bits(
-        chain_state.network,
-        tip,
-        time,
-        |hash| chain_state.get_block_index(hash),
-    )
+    let bits = crate::validation::pow::next_bits(chain_state.network, tip, time, |hash| {
+        chain_state.get_block_index(hash)
+    })
     .unwrap_or(tip.header.bits);
     json!({
         "height": tip.height + 1,
@@ -473,7 +504,10 @@ pub fn get_network_hash_ps(
     height: i64,
 ) -> Result<f64, (i32, String)> {
     if nblocks < -1 || nblocks == 0 {
-        return Err((-8, "Invalid nblocks. Must be a positive number or -1.".to_string()));
+        return Err((
+            -8,
+            "Invalid nblocks. Must be a positive number or -1.".to_string(),
+        ));
     }
     let tip_height = chain_state.tip_height();
     if height < -1 || height > i64::from(tip_height) {
@@ -483,7 +517,11 @@ pub fn get_network_hash_ps(
     // Core indexes the active chain for an explicit height and takes the tip
     // otherwise; from there it walks parent pointers, which is what the rest
     // of this function does.
-    let at_height = if height >= 0 { height as u32 } else { tip_height };
+    let at_height = if height >= 0 {
+        height as u32
+    } else {
+        tip_height
+    };
     let Some(hash) = chain_state.get_block_hash_by_height(at_height) else {
         return Ok(0.0);
     };
@@ -534,8 +572,8 @@ pub fn get_block_template_proposal(
     chain_state: &ChainState,
     hex_data: &str,
 ) -> Result<Value, (i32, String)> {
-    let block_bytes = hex::decode(hex_data)
-        .map_err(|_| (-22, "Block decode failed".to_string()))?;
+    let block_bytes =
+        hex::decode(hex_data).map_err(|_| (-22, "Block decode failed".to_string()))?;
     let block: bitcoin::Block = crate::validation::decode::deserialize_block(&block_bytes)
         .map_err(|_| (-22, "Block decode failed".to_string()))?;
 
@@ -559,9 +597,8 @@ pub fn submit_header(chain_state: &ChainState, hex_header: &str) -> Result<Value
     // Core's `submitheader` accepts the full block hex (or just the 80-byte
     // header). `bitcoin::consensus::deserialize` enforces an exact-size
     // match, so trim to the first 80 bytes.
-    let header: bitcoin::block::Header =
-        bitcoin::consensus::deserialize(&header_bytes[..80])
-            .map_err(|_| "Header decode failed".to_string())?;
+    let header: bitcoin::block::Header = bitcoin::consensus::deserialize(&header_bytes[..80])
+        .map_err(|_| "Header decode failed".to_string())?;
     chain_state
         .accept_header(&header)
         .map_err(|e| e.to_string())?;

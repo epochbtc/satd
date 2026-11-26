@@ -45,8 +45,8 @@ fn index_mid_backfill() -> (Arc<RocksAddressIndex>, Arc<dyn Store>, tempfile::Te
     use crate::storage::blockindex::{BlockIndexEntry, BlockStatus};
 
     let dir = tempfile::tempdir().unwrap();
-    let store = Arc::new(RocksDbStore::open(dir.path(), false, 16, false, -1).unwrap())
-        as Arc<dyn Store>;
+    let store =
+        Arc::new(RocksDbStore::open(dir.path(), false, 16, false, -1).unwrap()) as Arc<dyn Store>;
     let txid = Txid::from_byte_array([0x31; 32]);
     let hash = bitcoin::BlockHash::from_byte_array([5u8; 32]);
     let genesis = bitcoin::constants::genesis_block(bitcoin::Network::Regtest);
@@ -94,11 +94,20 @@ fn a_recompute_refused_during_a_backfill_is_owed_until_it_completes() {
     let mempool = Mempool::new(8 * 1024 * 1024, 1);
 
     recompute_all_active(&index, &registry, &mempool);
-    assert!(rx.try_recv().is_err(), "nothing is pushed while the index refuses reads");
-    assert!(!index.take_status_recompute_owed(), "not payable while the backfill runs");
+    assert!(
+        rx.try_recv().is_err(),
+        "nothing is pushed while the index refuses reads"
+    );
+    assert!(
+        !index.take_status_recompute_owed(),
+        "not payable while the backfill runs"
+    );
 
     set_cursor(store.as_ref(), BackfillState::Completed);
-    assert!(index.take_status_recompute_owed(), "payable once it completes");
+    assert!(
+        index.take_status_recompute_owed(),
+        "payable once it completes"
+    );
     assert!(!index.take_status_recompute_owed(), "and paid only once");
     recompute_all_active(&index, &registry, &mempool);
     assert!(rx.try_recv().is_ok(), "the recompute pushes the status");
@@ -134,7 +143,10 @@ async fn the_notifier_pushes_the_status_once_the_backfill_completes() {
         })
         .ok();
     tokio::time::sleep(Duration::from_millis(500)).await;
-    assert!(rx.try_recv().is_err(), "nothing is pushed while the index refuses reads");
+    assert!(
+        rx.try_recv().is_err(),
+        "nothing is pushed while the index refuses reads"
+    );
 
     set_cursor(store.as_ref(), BackfillState::Completed);
     let pushed = tokio::time::timeout(Duration::from_secs(20), rx.recv()).await;

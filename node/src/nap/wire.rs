@@ -26,7 +26,9 @@
 use bitcoin::consensus::encode::{self, Decodable, Encodable};
 use bitcoin::{BlockHash, OutPoint, Transaction, Witness};
 
-use super::{Attestation, LEGACY_SIGNATURE_LEN, MAX_ATTESTATION_SIZE, NapSignature, VERSION, message};
+use super::{
+    Attestation, LEGACY_SIGNATURE_LEN, MAX_ATTESTATION_SIZE, NapSignature, VERSION, message,
+};
 
 /// Why bytes or fields do not make an attestation.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -74,7 +76,8 @@ impl NapSignature {
     pub fn from_bytes(format: u8, bytes: &[u8]) -> Result<Self, FormatError> {
         let sig = match format {
             0 => NapSignature::Simple(
-                encode::deserialize::<Witness>(bytes).map_err(|e| FormatError::Signature(e.to_string()))?,
+                encode::deserialize::<Witness>(bytes)
+                    .map_err(|e| FormatError::Signature(e.to_string()))?,
             ),
             1 => NapSignature::Full(
                 encode::deserialize::<Transaction>(bytes)
@@ -116,7 +119,8 @@ impl Encodable for Attestation {
 }
 
 pub(super) fn serialized_size(att: &Attestation) -> usize {
-    att.consensus_encode(&mut bitcoin::io::sink()).expect("a sink does not fail")
+    att.consensus_encode(&mut bitcoin::io::sink())
+        .expect("a sink does not fail")
 }
 
 impl Attestation {
@@ -161,7 +165,14 @@ impl Attestation {
         // Printable ASCII is UTF-8.
         let key = String::from_utf8(key).expect("checked printable");
         let value = String::from_utf8(value).expect("checked printable");
-        Ok(Attestation { outpoint, key, value, anchor_height, anchor_hash, signature })
+        Ok(Attestation {
+            outpoint,
+            key,
+            value,
+            anchor_height,
+            anchor_hash,
+            signature,
+        })
     }
 }
 
@@ -170,7 +181,9 @@ impl Attestation {
 fn bytes(r: &mut &[u8]) -> Result<Vec<u8>, FormatError> {
     let len = encode::VarInt::consensus_decode(r)?.0;
     if len > MAX_ATTESTATION_SIZE as u64 {
-        return Err(FormatError::TooLarge(usize::try_from(len).unwrap_or(usize::MAX)));
+        return Err(FormatError::TooLarge(
+            usize::try_from(len).unwrap_or(usize::MAX),
+        ));
     }
     let len = len as usize;
     if r.len() < len {

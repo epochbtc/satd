@@ -60,7 +60,11 @@ pub fn share_target(difficulty: u64) -> [u8; 32] {
 /// session whose difficulty drifted above the network's.
 pub fn effective_share_target(difficulty: u64, block_target: &[u8; 32]) -> [u8; 32] {
     let share = share_target(difficulty);
-    if share >= *block_target { share } else { *block_target }
+    if share >= *block_target {
+        share
+    } else {
+        *block_target
+    }
 }
 
 /// The network difficulty implied by a block target, in pool-difficulty
@@ -71,7 +75,11 @@ pub fn network_difficulty(block_target: &[u8; 32]) -> u64 {
         return u64::MAX;
     }
     let d = u256_to_f64(&DIFF1_TARGET) / target;
-    if d >= u64::MAX as f64 { u64::MAX } else { (d as u64).max(1) }
+    if d >= u64::MAX as f64 {
+        u64::MAX
+    } else {
+        (d as u64).max(1)
+    }
 }
 
 /// The difficulty a header hash achieved, in pool-difficulty units:
@@ -80,7 +88,11 @@ pub fn hash_difficulty(hash: &bitcoin::BlockHash) -> f64 {
     let mut be = hash.to_byte_array();
     be.reverse();
     let value = u256_to_f64(&be);
-    if value <= 0.0 { f64::INFINITY } else { u256_to_f64(&DIFF1_TARGET) / value }
+    if value <= 0.0 {
+        f64::INFINITY
+    } else {
+        u256_to_f64(&DIFF1_TARGET) / value
+    }
 }
 
 /// Whether a block hash, as a 256-bit number, is at or below `target`.
@@ -134,9 +146,9 @@ pub fn validate_share(
     // share target the session has.
     let hash = header.block_hash();
     if hash_meets_target(&hash, &work.block_target) {
-        return Ok(ShareResult::Block(Box::new(job.reconstruct_block(
-            extranonce, ntime, nonce, version,
-        ))));
+        return Ok(ShareResult::Block(Box::new(
+            job.reconstruct_block(extranonce, ntime, nonce, version),
+        )));
     }
     let hash_difficulty = hash_difficulty(&hash);
     if hash_meets_target(&hash, share_target) {
@@ -224,7 +236,17 @@ mod tests {
         let extranonce = [5u8; 8];
         let (nonce, result) = (0u32..64)
             .find_map(|nonce| {
-                match validate_share(&job, &extranonce, NTIME, nonce, 0x2000_0000, &target, u64::from(NTIME)).unwrap() {
+                match validate_share(
+                    &job,
+                    &extranonce,
+                    NTIME,
+                    nonce,
+                    0x2000_0000,
+                    &target,
+                    u64::from(NTIME),
+                )
+                .unwrap()
+                {
                     ShareResult::Block(block) => Some((nonce, block)),
                     _ => None,
                 }
@@ -243,13 +265,37 @@ mod tests {
         let job = job(0x1d00ffff);
         let target = effective_share_target(1 << 40, &job.work.block_target);
         assert_eq!(target, job.work.block_target, "clamped to the block target");
-        let result = validate_share(&job, &[0u8; 8], NTIME, 7, 0x2000_0000, &target, u64::from(NTIME)).unwrap();
-        assert!(matches!(result, ShareResult::LowDifficulty { .. }), "{result:?}");
+        let result = validate_share(
+            &job,
+            &[0u8; 8],
+            NTIME,
+            7,
+            0x2000_0000,
+            &target,
+            u64::from(NTIME),
+        )
+        .unwrap();
+        assert!(
+            matches!(result, ShareResult::LowDifficulty { .. }),
+            "{result:?}"
+        );
 
         let mut hard = [0u8; 32];
         hard[31] = 1;
-        let result = validate_share(&job, &[0u8; 8], NTIME, 7, 0x2000_0000, &hard, u64::from(NTIME)).unwrap();
-        assert!(matches!(result, ShareResult::LowDifficulty { .. }), "{result:?}");
+        let result = validate_share(
+            &job,
+            &[0u8; 8],
+            NTIME,
+            7,
+            0x2000_0000,
+            &hard,
+            u64::from(NTIME),
+        )
+        .unwrap();
+        assert!(
+            matches!(result, ShareResult::LowDifficulty { .. }),
+            "{result:?}"
+        );
 
         assert!(validate_share(&job, &[0u8; 4], NTIME, 7, 0x2000_0000, &hard, 0).is_err());
     }
@@ -293,7 +339,8 @@ mod tests {
             parent,
         ));
         assert_eq!(work.min_difficulty_after, Some(parent + 1_200));
-        let job = ActiveTemplate::build(work, 1, bitcoin::ScriptBuf::new_op_return([3]), 8).unwrap();
+        let job =
+            ActiveTemplate::build(work, 1, bitcoin::ScriptBuf::new_op_return([3]), 8).unwrap();
         let easy = [0xff; 32];
         let now = u64::from(parent + 2_000);
         assert!(!matches!(
@@ -321,7 +368,17 @@ mod tests {
         let job = job(0x1d00ffff);
         let target = share_target(1);
         for nonce in 0..16 {
-            match validate_share(&job, &[0u8; 8], NTIME, nonce, 0x2000_0000, &target, u64::from(NTIME)).unwrap() {
+            match validate_share(
+                &job,
+                &[0u8; 8],
+                NTIME,
+                nonce,
+                0x2000_0000,
+                &target,
+                u64::from(NTIME),
+            )
+            .unwrap()
+            {
                 ShareResult::Share { hash_difficulty } => assert!(hash_difficulty >= 1.0),
                 ShareResult::LowDifficulty { hash_difficulty } => assert!(hash_difficulty < 1.0),
                 other => panic!("{other:?}"),

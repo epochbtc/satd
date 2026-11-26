@@ -21,10 +21,7 @@ impl RocksSpendIndex {
 }
 
 impl SpendIndex for RocksSpendIndex {
-    fn spend_of(
-        &self,
-        outpoint: &OutPoint,
-    ) -> Result<Option<SpendingRef>, node_index::IndexError> {
+    fn spend_of(&self, outpoint: &OutPoint) -> Result<Option<SpendingRef>, node_index::IndexError> {
         if !self.cfg.enabled {
             return Err(node_index::IndexError::Disabled);
         }
@@ -101,9 +98,9 @@ mod tests {
 
     fn fixture_outpoint(byte: u8) -> OutPoint {
         OutPoint {
-            txid: bitcoin::Txid::from_raw_hash(
-                bitcoin::hashes::sha256d::Hash::from_byte_array([byte; 32]),
-            ),
+            txid: bitcoin::Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array(
+                [byte; 32],
+            )),
             vout: 0,
         }
     }
@@ -261,7 +258,10 @@ mod tests {
         let bulk = idx.spends_of_tx(&funding).unwrap();
         let one_at_a_time: Vec<(u32, SpendingRef)> = (0..20u32)
             .filter_map(|vout| {
-                let op = OutPoint { txid: funding, vout };
+                let op = OutPoint {
+                    txid: funding,
+                    vout,
+                };
                 idx.spend_of(&op).unwrap().map(|sref| (vout, sref))
             })
             .collect();

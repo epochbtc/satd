@@ -17,7 +17,7 @@ use bitcoin::p2p::message::{NetworkMessage, RawNetworkMessage};
 use bitcoin::p2p::message_network::VersionMessage;
 use bitcoin::p2p::{Address, Magic, ServiceFlags};
 use common::{TestNode, find_available_port, test_timeout};
-use node::net::crawlbook::{BookParams, CrawlAddr, CrawlBook, GetaddrResult, CRAWL_FILE};
+use node::net::crawlbook::{BookParams, CRAWL_FILE, CrawlAddr, CrawlBook, GetaddrResult};
 use node::net::peer::PeerAddr;
 use serde_json::json;
 use std::io::{self, Read, Write};
@@ -58,13 +58,22 @@ fn core(answer: Vec<(u16, bool)>) -> Shape {
 /// Core with its inbound slots full: it completes the handshake, then
 /// evicts the new connection before sending anything more.
 fn evicting_core() -> Shape {
-    Shape { after_verack: vec![], close_after_verack: true, ..core(vec![]) }
+    Shape {
+        after_verack: vec![],
+        close_after_verack: true,
+        ..core(vec![])
+    }
 }
 
 /// An impostor claiming Core 25.0: `version` and `verack`, nothing
 /// between them and nothing after, the connection held open.
 fn fake_core() -> Shape {
-    Shape { user_agent: "/Satoshi:25.0.0/", negotiation: vec![], after_verack: vec![], ..core(vec![]) }
+    Shape {
+        user_agent: "/Satoshi:25.0.0/",
+        negotiation: vec![],
+        after_verack: vec![],
+        ..core(vec![])
+    }
 }
 
 fn btcd(answer: Vec<(u16, bool)>) -> Shape {
@@ -93,16 +102,24 @@ fn recv(stream: &mut TcpStream) -> io::Result<NetworkMessage> {
     let mut buf = header.to_vec();
     buf.resize(24 + len, 0);
     stream.read_exact(&mut buf[24..])?;
-    let raw: RawNetworkMessage = deserialize(&buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+    let raw: RawNetworkMessage =
+        deserialize(&buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
     Ok(raw.into_payload())
 }
 
 fn loopback_entry(port: u16, v2: bool) -> AddrV2Message {
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as u32;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as u32;
     let services = ServiceFlags::NETWORK | ServiceFlags::WITNESS;
     AddrV2Message {
         time: now - 60,
-        services: if v2 { services | ServiceFlags::P2P_V2 } else { services },
+        services: if v2 {
+            services | ServiceFlags::P2P_V2
+        } else {
+            services
+        },
         addr: AddrV2::Ipv4(Ipv4Addr::LOCALHOST),
         port,
     }
@@ -146,7 +163,11 @@ fn serve(mut stream: TcpStream, shape: &Shape, connection: usize) -> io::Result<
                 }
             }
             NetworkMessage::GetAddr => {
-                let entries = shape.answer.iter().map(|(p, v2)| loopback_entry(*p, *v2)).collect();
+                let entries = shape
+                    .answer
+                    .iter()
+                    .map(|(p, v2)| loopback_entry(*p, *v2))
+                    .collect();
                 send(&mut stream, NetworkMessage::AddrV2(entries))?;
             }
             NetworkMessage::Ping(n) => send(&mut stream, NetworkMessage::Pong(n))?,
@@ -194,7 +215,9 @@ fn peer(port: u16) -> PeerAddr {
 fn sessions_done(node: &TestNode, port: u16) -> usize {
     let log = std::fs::read_to_string(&node.stderr_log).unwrap_or_default();
     let addr = format!("addr=127.0.0.1:{port}");
-    log.lines().filter(|l| l.contains("crawl session done") && l.contains(&addr)).count()
+    log.lines()
+        .filter(|l| l.contains("crawl session done") && l.contains(&addr))
+        .count()
 }
 
 fn wait_for(what: &str, secs: u64, f: impl Fn() -> bool) {
@@ -210,8 +233,17 @@ fn wait_for(what: &str, secs: u64, f: impl Fn() -> bool) {
 
 fn read_book(node: &TestNode) -> CrawlBook {
     let path = node.datadir.join("regtest").join(CRAWL_FILE);
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
-    CrawlBook::load(&path, Magic::REGTEST.to_bytes(), now, BookParams::for_network(bitcoin::Network::Regtest)).unwrap()
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    CrawlBook::load(
+        &path,
+        Magic::REGTEST.to_bytes(),
+        now,
+        BookParams::for_network(bitcoin::Network::Regtest),
+    )
+    .unwrap()
 }
 
 /// A cluster crawled to completion: the crawler starts from one scripted
@@ -261,11 +293,22 @@ fn a_regtest_cluster_is_crawled_to_completion() {
     let deadline = Instant::now() + test_timeout(420);
     while !done(&c) {
         assert!(Instant::now() < deadline, "the crawl did not complete");
-        assert_eq!(c.rpc_ok("getconnectioncount", vec![]), 0, "no crawl connection is a peer");
+        assert_eq!(
+            c.rpc_ok("getconnectioncount", vec![]),
+            0,
+            "no crawl connection is a peer"
+        );
         assert_eq!(c.rpc_ok("getpeerinfo", vec![]), json!([]));
         std::thread::sleep(Duration::from_millis(500));
     }
-    assert_eq!((s1_accepts.load(Ordering::SeqCst), s2_accepts.load(Ordering::SeqCst)), (1, 1), "v1 alone, no v2 attempt");
+    assert_eq!(
+        (
+            s1_accepts.load(Ordering::SeqCst),
+            s2_accepts.load(Ordering::SeqCst)
+        ),
+        (1, 1),
+        "v1 alone, no v2 attempt"
+    );
     let survey = c.rpc_ok("getpeersurvey", vec![]);
     assert_eq!(survey["superseded_by_crawl"], true, "{survey}");
     check_reports(&c, metrics_port, &[s1, s2, dead, xp, yp]);
@@ -281,41 +324,79 @@ fn a_regtest_cluster_is_crawled_to_completion() {
         use std::os::unix::fs::PermissionsExt as _;
         let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
         let snap = snaps.join(node::net::crawlsnapshot::snapshot_file_name(files[0]));
-        assert_eq!(mode(&snap), mode(&c.datadir.join("regtest").join(CRAWL_FILE)));
-        assert_eq!(mode(&snap) & 0o077, 0o077 & mode(&c.datadir.join("regtest")) & 0o666);
+        assert_eq!(
+            mode(&snap),
+            mode(&c.datadir.join("regtest").join(CRAWL_FILE))
+        );
+        assert_eq!(
+            mode(&snap) & 0o077,
+            0o077 & mode(&c.datadir.join("regtest")) & 0o666
+        );
     }
 
     let book = read_book(&c);
-    assert_eq!(book.len(), 5, "{:?}", book.rows().map(|(a, _)| a.clone()).collect::<Vec<_>>());
+    assert_eq!(
+        book.len(),
+        5,
+        "{:?}",
+        book.rows().map(|(a, _)| a.clone()).collect::<Vec<_>>()
+    );
     let counts = book.counts();
-    assert_eq!((counts.learned[0], counts.reached[0]), (5, 4), "ipv4: learned, reached");
+    assert_eq!(
+        (counts.learned[0], counts.reached[0]),
+        (5, 4),
+        "ipv4: learned, reached"
+    );
     assert_eq!(&counts.learned[1..], &[0; 4]);
-    let entry = |port| book.get(&CrawlAddr::Peer(peer(port))).unwrap_or_else(|| panic!("{port} in the book"));
+    let entry = |port| {
+        book.get(&CrawlAddr::Peer(peer(port)))
+            .unwrap_or_else(|| panic!("{port} in the book"))
+    };
     for (port, entries) in [(s1, 3), (s2, 2)] {
         let e = entry(port);
-        assert_eq!((e.v2_ok, e.v1_ok, e.v2_only), (None, Some(true), false), "scripted {port}");
+        assert_eq!(
+            (e.v2_ok, e.v1_ok, e.v2_only),
+            (None, Some(true), false),
+            "scripted {port}"
+        );
         let obs = e.observation.as_ref().unwrap();
-        assert!(matches!(obs.getaddr, Some(GetaddrResult::Answered { entries: n, .. }) if n == entries), "{obs:?}");
+        assert!(
+            matches!(obs.getaddr, Some(GetaddrResult::Answered { entries: n, .. }) if n == entries),
+            "{obs:?}"
+        );
         assert!(obs.probes.any());
     }
-    assert_eq!(entry(s1).observation.as_ref().unwrap().user_agent, "/Satoshi:32.1.0/");
+    assert_eq!(
+        entry(s1).observation.as_ref().unwrap().user_agent,
+        "/Satoshi:32.1.0/"
+    );
     for port in [xp, yp] {
         let e = entry(port);
-        assert_eq!((e.v2_ok, e.v1_ok, e.v2_only), (Some(true), Some(true), false), "satd {port}");
+        assert_eq!(
+            (e.v2_ok, e.v1_ok, e.v2_only),
+            (Some(true), Some(true), false),
+            "satd {port}"
+        );
         assert!(e.last_v1_check.is_some() && e.last_discovery.is_some());
         let obs = e.observation.as_ref().unwrap();
         assert!(obs.user_agent.starts_with("/satd:"), "{obs:?}");
         assert!(obs.getaddr.is_some(), "the discovery's getaddr is kept");
     }
     let d = entry(dead);
-    assert_eq!((d.last_success, d.failures, d.source_count()), (None, 1, 2), "named by both scripted peers");
+    assert_eq!(
+        (d.last_success, d.failures, d.source_count()),
+        (None, 1, 2),
+        "named by both scripted peers"
+    );
     assert!(d.retry_at.is_some());
 
     // The book and its timers survive a restart: nothing is due, so the
     // restarted crawl changes nothing.
     c.restart_preserving_datadir(&args);
     wait_for("the book loaded", 30, || {
-        std::fs::read_to_string(&c.stderr_log).unwrap_or_default().contains("Crawl started")
+        std::fs::read_to_string(&c.stderr_log)
+            .unwrap_or_default()
+            .contains("Crawl started")
     });
     std::thread::sleep(Duration::from_secs(5));
     c.stop();
@@ -338,11 +419,19 @@ fn check_reports(c: &TestNode, metrics_port: u16, ports: &[u16]) {
     assert_eq!(info["state"], "running", "{info}");
     assert_eq!(info["held_by"], json!([]));
     assert_eq!(info["peersurvey_superseded"], false);
-    assert_eq!(info["limits"]["networks"], json!(["ipv4", "ipv6"]), "no proxy, so no onion");
+    assert_eq!(
+        info["limits"]["networks"],
+        json!(["ipv4", "ipv6"]),
+        "no proxy, so no onion"
+    );
     assert_eq!(info["book"]["entries"], 5, "{info}");
     assert_eq!(info["book"]["learned"]["ipv4"], 5);
     assert_eq!(info["book"]["ever_reached"]["ipv4"], 4);
-    assert_eq!(info["reachable"], json!({ "total": 4, "ipv4": 4, "ipv6": 0, "onion": 0 }), "{info}");
+    assert_eq!(
+        info["reachable"],
+        json!({ "total": 4, "ipv4": 4, "ipv6": 0, "onion": 0 }),
+        "{info}"
+    );
     assert_eq!(info["transport"]["v1_v2_untried"]["count"], 2, "{info}");
     assert_eq!(info["transport"]["v1_only"]["count"], 0, "{info}");
     assert_eq!(info["transport"]["v2_and_v1"]["count"], 2, "{info}");
@@ -350,30 +439,60 @@ fn check_reports(c: &TestNode, metrics_port: u16, ports: &[u16]) {
     // Every reachable address in exactly one of the family (or unknown),
     // claimed, fake and closed-early tallies; which family the classifier
     // gives a crawl session's transcript is its own test's.
-    let sum = |key: &str| info[key].as_object().unwrap().values().map(|f| f["count"].as_u64().unwrap()).sum::<u64>();
-    let counted = sum("families") + sum("claimed") + sum("fake") + info["closed_early"]["count"].as_u64().unwrap();
+    let sum = |key: &str| {
+        info[key]
+            .as_object()
+            .unwrap()
+            .values()
+            .map(|f| f["count"].as_u64().unwrap())
+            .sum::<u64>()
+    };
+    let counted = sum("families")
+        + sum("claimed")
+        + sum("fake")
+        + info["closed_early"]["count"].as_u64().unwrap();
     assert_eq!(counted, 4, "{info}");
     assert!(info["sessions"]["reached"].as_u64().unwrap() >= 6);
     assert!(info["totals"]["totalbytesrecv"].as_u64().unwrap() > 0);
     let text = info.to_string();
-    assert!(!text.contains("127.0.0.1") && !text.contains("Satoshi"), "counts only: {text}");
+    assert!(
+        !text.contains("127.0.0.1") && !text.contains("Satoshi"),
+        "counts only: {text}"
+    );
 
     let rows = c.rpc_ok("getcrawlnodes", vec![]);
     let rows = rows.as_array().unwrap();
     assert_eq!(rows.len(), 5);
     for port in ports {
         let addr = format!("127.0.0.1:{port}");
-        let row = rows.iter().find(|r| r["addr"] == addr).unwrap_or_else(|| panic!("{addr} in {rows:?}"));
-        assert!(row.get("observation").is_none(), "no observation without verbose");
+        let row = rows
+            .iter()
+            .find(|r| r["addr"] == addr)
+            .unwrap_or_else(|| panic!("{addr} in {rows:?}"));
+        assert!(
+            row.get("observation").is_none(),
+            "no observation without verbose"
+        );
     }
-    let verbose = c.rpc_call_with_named_params("getcrawlnodes", json!({ "verbose": true })).unwrap();
-    let rows = verbose["result"].as_array().unwrap_or_else(|| panic!("{verbose}"));
-    let s1 = rows.iter().find(|r| r["addr"] == format!("127.0.0.1:{}", ports[0])).unwrap();
+    let verbose = c
+        .rpc_call_with_named_params("getcrawlnodes", json!({ "verbose": true }))
+        .unwrap();
+    let rows = verbose["result"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{verbose}"));
+    let s1 = rows
+        .iter()
+        .find(|r| r["addr"] == format!("127.0.0.1:{}", ports[0]))
+        .unwrap();
     assert_eq!(s1["observation"]["subver"], "/Satoshi:32.1.0/");
     assert_eq!(s1["observation"]["getaddr"]["entries"], 3);
     let help = c.rpc_ok("help", vec![]);
     let help = help.as_str().unwrap();
-    assert!(help.contains("getcrawlinfo") && help.contains("getcrawlnodes") && help.contains("dumpcrawlsnapshot"));
+    assert!(
+        help.contains("getcrawlinfo")
+            && help.contains("getcrawlnodes")
+            && help.contains("dumpcrawlsnapshot")
+    );
 
     // The export: keyed by default, no address and no crawled port in it,
     // under a key created 0600 on first use; raw only when asked.
@@ -383,7 +502,10 @@ fn check_reports(c: &TestNode, metrics_port: u16, ports: &[u16]) {
     let text = keyed.to_string();
     assert!(!text.contains("127.0.0.1"), "keyed: {text}");
     for port in ports {
-        assert!(!text.contains(&format!(":{port}")), "keyed: no crawled port in {text}");
+        assert!(
+            !text.contains(&format!(":{port}")),
+            "keyed: no crawled port in {text}"
+        );
     }
     for (id, node) in keyed["nodes"].as_object().unwrap() {
         assert_eq!(id.len(), 32, "{id}");
@@ -394,15 +516,28 @@ fn check_reports(c: &TestNode, metrics_port: u16, ports: &[u16]) {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
-        assert_eq!(std::fs::metadata(&key).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(
+            std::fs::metadata(&key).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
-    let raw = c.rpc_call_with_named_params("dumpcrawlsnapshot", json!({ "raw": true })).unwrap();
+    let raw = c
+        .rpc_call_with_named_params("dumpcrawlsnapshot", json!({ "raw": true }))
+        .unwrap();
     let raw = &raw["result"];
     assert_eq!(raw["total_nodes"], 4, "{raw}");
-    assert!(raw["nodes"].get(format!("127.0.0.1:{}", ports[0])).is_some(), "raw: {raw}");
+    assert!(
+        raw["nodes"]
+            .get(format!("127.0.0.1:{}", ports[0]))
+            .is_some(),
+        "raw: {raw}"
+    );
 
     let base = format!("http://127.0.0.1:{metrics_port}");
-    let body = reqwest::blocking::get(format!("{base}/metrics")).unwrap().text().unwrap();
+    let body = reqwest::blocking::get(format!("{base}/metrics"))
+        .unwrap()
+        .text()
+        .unwrap();
     for line in [
         "satd_crawl_enabled 1",
         "satd_crawl_running 1",
@@ -414,18 +549,27 @@ fn check_reports(c: &TestNode, metrics_port: u16, ports: &[u16]) {
         assert!(body.lines().any(|l| l == line), "missing `{line}`");
     }
     assert!(!body.contains("127.0.0.1"), "no address in the metrics");
-    let status: serde_json::Value = reqwest::blocking::get(format!("{base}/status.json")).unwrap().json().unwrap();
+    let status: serde_json::Value = reqwest::blocking::get(format!("{base}/status.json"))
+        .unwrap()
+        .json()
+        .unwrap();
     let crawl = &status["snapshot"]["crawl"];
     assert_eq!(crawl["state"], "running", "{status}");
     assert_eq!(crawl["book_entries"], 5);
     assert_eq!(crawl["reachable_ipv4"], 4);
     assert_eq!(crawl["v1_v2_untried"], 2);
     assert_eq!(crawl["v1_only"], 0);
-    let page = reqwest::blocking::get(format!("{base}/status")).unwrap().text().unwrap();
+    let page = reqwest::blocking::get(format!("{base}/status"))
+        .unwrap()
+        .text()
+        .unwrap();
     for text in [status.to_string(), page] {
         assert!(!text.contains("127.0.0.1"), "no address on the status page");
         for port in ports {
-            assert!(!text.contains(&format!(":{port}")), "no crawled port on the status page");
+            assert!(
+                !text.contains(&format!(":{port}")),
+                "no crawled port on the status page"
+            );
         }
     }
 }
@@ -447,16 +591,30 @@ fn peers_dat_is_unchanged_by_a_crawl() {
     node.stop();
     let peers = node.datadir.join("regtest").join("peers.dat");
     let before = std::fs::read(&peers).unwrap();
-    assert_eq!(accepts.load(Ordering::SeqCst), 0, "fixture: the node dials nothing itself");
+    assert_eq!(
+        accepts.load(Ordering::SeqCst),
+        0,
+        "fixture: the node dials nothing itself"
+    );
 
     node.restart_preserving_datadir(&["--maxconnections=0", "--crawl=1", "--loglevel=debug"]);
-    wait_for("the crawl of the book's address and its answer", 120, || {
-        sessions_done(&node, port) >= 1 && sessions_done(&node, dead) >= 1
-    });
+    wait_for(
+        "the crawl of the book's address and its answer",
+        120,
+        || sessions_done(&node, port) >= 1 && sessions_done(&node, dead) >= 1,
+    );
     node.stop();
     assert!(accepts.load(Ordering::SeqCst) >= 1);
-    assert_eq!(read_book(&node).len(), 3, "the address, and the two it named");
-    assert_eq!(std::fs::read(&peers).unwrap(), before, "peers.dat byte for byte");
+    assert_eq!(
+        read_book(&node).len(),
+        3,
+        "the address, and the two it named"
+    );
+    assert_eq!(
+        std::fs::read(&peers).unwrap(),
+        before,
+        "peers.dat byte for byte"
+    );
 }
 
 /// No session starts while the node is in initial block download; the
@@ -465,21 +623,42 @@ fn peers_dat_is_unchanged_by_a_crawl() {
 #[test]
 fn nothing_is_dialled_in_initial_block_download() {
     let (l, port) = bind();
-    let accepts = scripted(l, core(vec![(closed_port(), false), (closed_port(), false)]));
+    let accepts = scripted(
+        l,
+        core(vec![(closed_port(), false), (closed_port(), false)]),
+    );
     let seed = format!("--crawlseed=127.0.0.1:{port}");
     let mut node = TestNode::start(&["--maxconnections=0", "--crawl=1", &seed, "--loglevel=info"]);
     std::thread::sleep(test_timeout(12));
-    assert_eq!(accepts.load(Ordering::SeqCst), 0, "no session in initial block download");
+    assert_eq!(
+        accepts.load(Ordering::SeqCst),
+        0,
+        "no session in initial block download"
+    );
     let log = std::fs::read_to_string(&node.stderr_log).unwrap_or_default();
-    assert!(log.contains("The crawl waits for the node to leave initial block download"), "{log}");
-    assert!(log.contains("Crawl enabled: it will dial tens of thousands of addresses"), "the startup warning");
+    assert!(
+        log.contains("The crawl waits for the node to leave initial block download"),
+        "{log}"
+    );
+    assert!(
+        log.contains("Crawl enabled: it will dial tens of thousands of addresses"),
+        "the startup warning"
+    );
     let info = node.rpc_ok("getcrawlinfo", vec![]);
-    assert_eq!((info["state"].clone(), info["held_by"].clone()), (json!("held"), json!(["initial_block_download"])));
+    assert_eq!(
+        (info["state"].clone(), info["held_by"].clone()),
+        (json!("held"), json!(["initial_block_download"]))
+    );
     assert_eq!(info["started"], false);
     node.rpc_ok("generatetoaddress", vec![json!(1), json!(ADDR)]);
-    wait_for("the first crawl session", 60, || accepts.load(Ordering::SeqCst) >= 1);
+    wait_for("the first crawl session", 60, || {
+        accepts.load(Ordering::SeqCst) >= 1
+    });
     let info = node.rpc_ok("getcrawlinfo", vec![]);
-    assert_eq!((info["state"].clone(), info["held_by"].clone()), (json!("running"), json!([])));
+    assert_eq!(
+        (info["state"].clone(), info["held_by"].clone()),
+        (json!("running"), json!([]))
+    );
     assert_eq!(info["started"], true);
     node.stop();
 }
@@ -510,15 +689,31 @@ fn the_crawl_counts_fake_and_closed_early_apart() {
     let mut c = TestNode::start(&args);
     c.rpc_ok("generatetoaddress", vec![json!(1), json!(ADDR)]);
     // The fake's discovery session waits out its getaddr and probes.
-    wait_for("both sessions", 300, || sessions_done(&c, fake) >= 1 && sessions_done(&c, early) >= 1);
+    wait_for("both sessions", 300, || {
+        sessions_done(&c, fake) >= 1 && sessions_done(&c, early) >= 1
+    });
 
-    wait_for("the aggregate", 10, || c.rpc_ok("getcrawlinfo", vec![])["reachable"]["total"] == 2);
+    wait_for("the aggregate", 10, || {
+        c.rpc_ok("getcrawlinfo", vec![])["reachable"]["total"] == 2
+    });
     let info = c.rpc_ok("getcrawlinfo", vec![]);
     let check_info = |info: &serde_json::Value| {
-        assert_eq!(info["reachable"], json!({ "total": 2, "ipv4": 2, "ipv6": 0, "onion": 0 }), "both reachable: {info}");
+        assert_eq!(
+            info["reachable"],
+            json!({ "total": 2, "ipv4": 2, "ipv6": 0, "onion": 0 }),
+            "both reachable: {info}"
+        );
         assert_eq!(info["transport"]["v1_v2_untried"]["count"], 2, "{info}");
-        assert_eq!(info["fake"]["core"], json!({ "count": 1, "share": 0.5 }), "{info}");
-        assert_eq!(info["closed_early"], json!({ "count": 1, "share": 0.5 }), "{info}");
+        assert_eq!(
+            info["fake"]["core"],
+            json!({ "count": 1, "share": 0.5 }),
+            "{info}"
+        );
+        assert_eq!(
+            info["closed_early"],
+            json!({ "count": 1, "share": 0.5 }),
+            "{info}"
+        );
         assert_eq!(info["families"]["core"]["count"], 0, "{info}");
         assert_eq!(info["families"]["unknown"]["count"], 0, "{info}");
         assert_eq!(info["claimed"]["core"]["count"], 0, "{info}");
@@ -527,9 +722,17 @@ fn the_crawl_counts_fake_and_closed_early_apart() {
     check_info(&info);
     assert!(!info.to_string().contains("Satoshi"), "counts only");
 
-    let verbose = c.rpc_call_with_named_params("getcrawlnodes", json!({ "verbose": true })).unwrap();
-    let rows = verbose["result"].as_array().unwrap_or_else(|| panic!("{verbose}"));
-    let row = |port: u16| rows.iter().find(|r| r["addr"] == format!("127.0.0.1:{port}")).expect("a row");
+    let verbose = c
+        .rpc_call_with_named_params("getcrawlnodes", json!({ "verbose": true }))
+        .unwrap();
+    let rows = verbose["result"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{verbose}"));
+    let row = |port: u16| {
+        rows.iter()
+            .find(|r| r["addr"] == format!("127.0.0.1:{port}"))
+            .expect("a row")
+    };
     let f = row(fake);
     assert_eq!(f["fingerprint"], "fake/core", "{f}");
     assert_eq!(f["family"], serde_json::Value::Null);
@@ -539,15 +742,26 @@ fn the_crawl_counts_fake_and_closed_early_apart() {
     let e = row(early);
     assert_eq!(e["fingerprint"], "closed-early", "{e}");
     assert_eq!(e["family"], serde_json::Value::Null);
-    assert_eq!((e["reachable"].clone(), e["transport"].clone()), (json!(true), json!("v1_v2_untried")));
+    assert_eq!(
+        (e["reachable"].clone(), e["transport"].clone()),
+        (json!(true), json!("v1_v2_untried"))
+    );
     assert_eq!(e["observation"]["claimed"], "core");
     assert_eq!(e["observation"]["subver"], "/Satoshi:32.1.0/");
     assert_eq!(e["observation"]["version"], 70016);
-    assert_eq!(e["observation"]["getaddr"], serde_json::Value::Null, "closed: no getaddr");
+    assert_eq!(
+        e["observation"]["getaddr"],
+        serde_json::Value::Null,
+        "closed: no getaddr"
+    );
 
     let keyed = c.rpc_ok("dumpcrawlsnapshot", vec![]);
     let text = keyed.to_string();
-    assert!(!text.contains("127.0.0.1") && !text.contains(&format!(":{fake}")) && !text.contains(&format!(":{early}")));
+    assert!(
+        !text.contains("127.0.0.1")
+            && !text.contains(&format!(":{fake}"))
+            && !text.contains(&format!(":{early}"))
+    );
     let mut fingerprints: Vec<String> = keyed["nodes"]
         .as_object()
         .unwrap()
@@ -557,7 +771,10 @@ fn the_crawl_counts_fake_and_closed_early_apart() {
     fingerprints.sort();
     assert_eq!(fingerprints, ["closed-early", "fake/core"], "{keyed}");
 
-    let body = reqwest::blocking::get(format!("http://127.0.0.1:{metrics_port}/metrics")).unwrap().text().unwrap();
+    let body = reqwest::blocking::get(format!("http://127.0.0.1:{metrics_port}/metrics"))
+        .unwrap()
+        .text()
+        .unwrap();
     for line in [
         "satd_crawl_reachable{network=\"ipv4\"} 2",
         "satd_crawl_fake{family=\"core\"} 1",
@@ -572,9 +789,22 @@ fn the_crawl_counts_fake_and_closed_early_apart() {
 
     // The verdicts survive a restart: nothing is due, so the book stands.
     let book = read_book(&c);
-    let verdict = |b: &CrawlBook, port: u16| b.get(&CrawlAddr::Peer(peer(port))).unwrap().observation.as_ref().unwrap().verdict;
-    assert_eq!(verdict(&book, early), node::net::survey::Verdict::ClosedEarly);
-    assert_eq!(verdict(&book, fake), node::net::survey::Verdict::Fake(node::net::fingerprint::Family::Core));
+    let verdict = |b: &CrawlBook, port: u16| {
+        b.get(&CrawlAddr::Peer(peer(port)))
+            .unwrap()
+            .observation
+            .as_ref()
+            .unwrap()
+            .verdict
+    };
+    assert_eq!(
+        verdict(&book, early),
+        node::net::survey::Verdict::ClosedEarly
+    );
+    assert_eq!(
+        verdict(&book, fake),
+        node::net::survey::Verdict::Fake(node::net::fingerprint::Family::Core)
+    );
     c.restart_preserving_datadir(&args);
     check_info(&c.rpc_ok("getcrawlinfo", vec![]));
     c.stop();
@@ -583,7 +813,10 @@ fn the_crawl_counts_fake_and_closed_early_apart() {
 /// The `getcrawlnodes` row of the address on `port`.
 fn crawl_row(node: &TestNode, port: u16) -> Option<serde_json::Value> {
     let rows = node.rpc_ok("getcrawlnodes", vec![]);
-    rows.as_array()?.iter().find(|r| r["addr"] == format!("127.0.0.1:{port}")).cloned()
+    rows.as_array()?
+        .iter()
+        .find(|r| r["addr"] == format!("127.0.0.1:{port}"))
+        .cloned()
 }
 
 /// A node that closes the first two crawl sessions straight after the
@@ -596,7 +829,13 @@ fn crawl_row(node: &TestNode, port: u16) -> Option<serde_json::Value> {
 #[test]
 fn a_closed_early_address_is_retried_until_it_settles() {
     let (l, port) = bind();
-    let accepts = scripted(l, Shape { evict_first: 2, ..core(vec![]) });
+    let accepts = scripted(
+        l,
+        Shape {
+            evict_first: 2,
+            ..core(vec![])
+        },
+    );
     let metrics_port = find_available_port();
     let args = [
         "--maxconnections=0".to_string(),
@@ -609,38 +848,74 @@ fn a_closed_early_address_is_retried_until_it_settles() {
     let mut c = TestNode::start(&args);
     // Frozen before the crawl leaves initial block download, so every
     // session is timed by it.
-    let mut now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    let mut now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
     c.rpc_ok("setmocktime", vec![json!(now)]);
     c.rpc_ok("generatetoaddress", vec![json!(1), json!(ADDR)]);
 
     for (n, wait) in [(1u64, 900u64), (2, 1_800)] {
-        wait_for("a closed-early session", 300, || sessions_done(&c, port) >= n as usize);
-        wait_for("its row", 10, || crawl_row(&c, port).is_some_and(|r| r["retry"]["count"] == n));
+        wait_for("a closed-early session", 300, || {
+            sessions_done(&c, port) >= n as usize
+        });
+        wait_for("its row", 10, || {
+            crawl_row(&c, port).is_some_and(|r| r["retry"]["count"] == n)
+        });
         let row = crawl_row(&c, port).unwrap();
         assert_eq!(row["fingerprint"], "closed-early", "{row}");
         let due = row["retry"]["next_due"].as_u64().unwrap();
-        assert!((now + wait * 4 / 5..=now + wait * 6 / 5).contains(&due), "retry {n} due in {} s: {row}", due as i64 - now as i64);
-        wait_for("the aggregate", 15, || c.rpc_ok("getcrawlinfo", vec![])["retries"]["pending"] == 1);
-        let body = reqwest::blocking::get(format!("http://127.0.0.1:{metrics_port}/metrics")).unwrap().text().unwrap();
-        assert!(body.lines().any(|l| l == "satd_crawl_closed_early_retries 1"), "{body}");
+        assert!(
+            (now + wait * 4 / 5..=now + wait * 6 / 5).contains(&due),
+            "retry {n} due in {} s: {row}",
+            due as i64 - now as i64
+        );
+        wait_for("the aggregate", 15, || {
+            c.rpc_ok("getcrawlinfo", vec![])["retries"]["pending"] == 1
+        });
+        let body = reqwest::blocking::get(format!("http://127.0.0.1:{metrics_port}/metrics"))
+            .unwrap()
+            .text()
+            .unwrap();
+        assert!(
+            body.lines()
+                .any(|l| l == "satd_crawl_closed_early_retries 1"),
+            "{body}"
+        );
         // Not before its time.
         std::thread::sleep(Duration::from_secs(3));
-        assert_eq!(accepts.load(Ordering::SeqCst), n as usize, "nothing is due before the retry");
+        assert_eq!(
+            accepts.load(Ordering::SeqCst),
+            n as usize,
+            "nothing is due before the retry"
+        );
         c.rpc_ok("setmocktime", vec![json!(due)]);
         now = due;
     }
     wait_for("the third session", 300, || sessions_done(&c, port) >= 3);
-    wait_for("its row", 10, || crawl_row(&c, port).is_some_and(|r| r["fingerprint"] != "closed-early"));
+    wait_for("its row", 10, || {
+        crawl_row(&c, port).is_some_and(|r| r["fingerprint"] != "closed-early")
+    });
     let row = crawl_row(&c, port).unwrap();
     // A liveness session sends no getaddr: Core is observed or only claimed.
-    assert!(row["fingerprint"].as_str().unwrap().starts_with("core/"), "{row}");
+    assert!(
+        row["fingerprint"].as_str().unwrap().starts_with("core/"),
+        "{row}"
+    );
     assert!(row.get("retry").is_none(), "settled: no retry: {row}");
     assert_eq!(accepts.load(Ordering::SeqCst), 3);
-    wait_for("the aggregate", 15, || c.rpc_ok("getcrawlinfo", vec![])["retries"]["pending"] == 0);
+    wait_for("the aggregate", 15, || {
+        c.rpc_ok("getcrawlinfo", vec![])["retries"]["pending"] == 0
+    });
     let info = c.rpc_ok("getcrawlinfo", vec![]);
-    assert_eq!(info["retries"], json!({ "pending": 0, "exhausted": 0 }), "{info}");
+    assert_eq!(
+        info["retries"],
+        json!({ "pending": 0, "exhausted": 0 }),
+        "{info}"
+    );
     assert_eq!(info["closed_early"]["count"], 0, "{info}");
-    let core = info["families"]["core"]["count"].as_u64().unwrap() + info["claimed"]["core"]["count"].as_u64().unwrap();
+    let core = info["families"]["core"]["count"].as_u64().unwrap()
+        + info["claimed"]["core"]["count"].as_u64().unwrap();
     assert_eq!(core, 1, "{info}");
     c.stop();
 }

@@ -139,7 +139,11 @@ pub trait HurdleSource {
     /// The block's hurdle, `Ok(None)` for a block with no transaction at or
     /// above min relay, and [`Unreadable`] when the block or its undo data is
     /// not stored (pruned, or below an AssumeUTXO snapshot).
-    fn hurdle(&self, hash: &BlockHash, min_relay_sat_per_kvb: u64) -> Result<Option<u64>, Unreadable>;
+    fn hurdle(
+        &self,
+        hash: &BlockHash,
+        min_relay_sat_per_kvb: u64,
+    ) -> Result<Option<u64>, Unreadable>;
 }
 
 /// The per-block hurdle store and the estimates read from it.
@@ -167,7 +171,12 @@ impl HurdleHistory {
     }
 
     pub fn with_capacity(capacity: usize) -> Self {
-        Self { rows: VecDeque::new(), table: [None; LADDER.len()], backfill_blocked: false, capacity }
+        Self {
+            rows: VecDeque::new(),
+            table: [None; LADDER.len()],
+            backfill_blocked: false,
+            capacity,
+        }
     }
 
     /// Rows held.
@@ -223,7 +232,11 @@ impl HurdleHistory {
             };
             match chain.hurdle(&parent, min_relay_sat_per_kvb) {
                 Ok(hurdle) => {
-                    self.rows.push_front(Row { height: oldest.height - 1, hash: parent, hurdle });
+                    self.rows.push_front(Row {
+                        height: oldest.height - 1,
+                        hash: parent,
+                        hurdle,
+                    });
                     changed = true;
                     read += 1;
                 }
@@ -254,7 +267,11 @@ impl HurdleHistory {
         let (mut hash, mut height) = chain.tip();
         // Rows wholly older than the history's span: start again at the
         // tip and let the backfill read downward.
-        if self.rows.back().is_some_and(|r| r.height as usize + self.capacity <= height as usize) {
+        if self
+            .rows
+            .back()
+            .is_some_and(|r| r.height as usize + self.capacity <= height as usize)
+        {
             self.rows.clear();
             self.backfill_blocked = false;
         }
@@ -265,7 +282,11 @@ impl HurdleHistory {
             }
             // A row at this height on another branch is popped by the
             // line above once the walk steps below it.
-            if self.rows.back().is_some_and(|r| r.height == height && r.hash == hash) {
+            if self
+                .rows
+                .back()
+                .is_some_and(|r| r.height == height && r.hash == hash)
+            {
                 break;
             }
             walked.push((height, hash));
@@ -295,7 +316,11 @@ impl HurdleHistory {
             // A block at the top that cannot be read (it always can, short
             // of corruption) counts as one with no hurdle.
             let hurdle = chain.hurdle(&hash, min_relay).unwrap_or(None);
-            self.rows.push_back(Row { height: h, hash, hurdle });
+            self.rows.push_back(Row {
+                height: h,
+                hash,
+                hurdle,
+            });
         }
         while self.rows.len() > self.capacity {
             self.rows.pop_front();
@@ -339,14 +364,21 @@ pub fn estimate_from_hurdles(hurdles: &[u64], target: u32) -> Option<HistoryEsti
     let (mut selected, source) = if windows >= ANALOG_READY_WINDOWS {
         let levels = window_levels(hurdles, l, windows);
         let now = median(&hurdles[hurdles.len() - l..]);
-        (select_analogs(&levels, &outcomes, now), HistorySource::Analog)
+        (
+            select_analogs(&levels, &outcomes, now),
+            HistorySource::Analog,
+        )
     } else {
         (outcomes, HistorySource::Plain)
     };
     selected.sort_unstable();
     let economical = log_quantile(&selected, quantile(target, false));
     let conservative = log_quantile(&selected, quantile(target, true));
-    Some(HistoryEstimate { economical, conservative, source })
+    Some(HistoryEstimate {
+        economical,
+        conservative,
+        source,
+    })
 }
 
 /// `clamp(N/4, 3, 144)` blocks of lookback.
@@ -413,7 +445,11 @@ fn select_analogs(levels: &[u64], outcomes: &[u64], now: u64) -> Vec<u64> {
     let band = ANALOG_BAND.ln();
     let in_band = by_distance.iter().filter(|(d, _)| *d <= band).count();
     if in_band >= ANALOG_MIN_NEIGHBORS {
-        return by_distance.into_iter().filter(|(d, _)| *d <= band).map(|(_, o)| o).collect();
+        return by_distance
+            .into_iter()
+            .filter(|(d, _)| *d <= band)
+            .map(|(_, o)| o)
+            .collect();
     }
     let k = ANALOG_MIN_NEIGHBORS.min(by_distance.len());
     by_distance.select_nth_unstable_by(k - 1, |a, b| a.0.total_cmp(&b.0));
@@ -576,7 +612,11 @@ fn parse(bytes: &[u8], network_magic: [u8; 4]) -> Result<Vec<Row>, String> {
         {
             return Err("non-consecutive heights".into());
         }
-        rows.push(Row { height, hash, hurdle: (raw != NO_HURDLE).then_some(raw) });
+        rows.push(Row {
+            height,
+            hash,
+            hurdle: (raw != NO_HURDLE).then_some(raw),
+        });
     }
     Ok(rows)
 }
@@ -645,10 +685,13 @@ pub fn spawn_fee_history(
             was_backfilling = more;
             if due && let Some((path, magic)) = save_to.clone() {
                 let hist = history.clone();
-                let saved = tokio::task::spawn_blocking(move || hist.read().save(&path, magic)).await;
+                let saved =
+                    tokio::task::spawn_blocking(move || hist.read().save(&path, magic)).await;
                 match saved {
                     Ok(Ok(())) => saved_at = newest,
-                    Ok(Err(e)) => tracing::warn!(target: "fees", error = %e, "cannot save fee history"),
+                    Ok(Err(e)) => {
+                        tracing::warn!(target: "fees", error = %e, "cannot save fee history")
+                    }
                     Err(_) => return,
                 }
             }

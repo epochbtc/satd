@@ -49,16 +49,11 @@ mod script_serde {
     use bitcoin::ScriptBuf;
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-    pub fn serialize<S: Serializer>(
-        script: &ScriptBuf,
-        serializer: S,
-    ) -> Result<S::Ok, S::Error> {
+    pub fn serialize<S: Serializer>(script: &ScriptBuf, serializer: S) -> Result<S::Ok, S::Error> {
         script.as_bytes().serialize(serializer)
     }
 
-    pub fn deserialize<'de, D: Deserializer<'de>>(
-        deserializer: D,
-    ) -> Result<ScriptBuf, D::Error> {
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<ScriptBuf, D::Error> {
         let bytes: Vec<u8> = Vec::deserialize(deserializer)?;
         Ok(ScriptBuf::from_bytes(bytes))
     }
@@ -202,7 +197,17 @@ mod tests {
     /// case decodes to a truncated value instead of `None`.
     #[test]
     fn varints_fill_a_u64_and_no_more() {
-        for v in [0, 1, 0x7f, 0x80, u64::from(u32::MAX), 1 << 62, (1 << 63) - 1, 1 << 63, u64::MAX] {
+        for v in [
+            0,
+            1,
+            0x7f,
+            0x80,
+            u64::from(u32::MAX),
+            1 << 62,
+            (1 << 63) - 1,
+            1 << 63,
+            u64::MAX,
+        ] {
             let mut buf = Vec::new();
             encode_varint(v, &mut buf);
             assert_eq!(decode_varint(&buf), Some((v, buf.len())), "{v:#x}");
@@ -252,9 +257,9 @@ mod tests {
     fn test_outpoint_key_roundtrip() {
         use bitcoin::hashes::Hash;
         let outpoint = bitcoin::OutPoint {
-            txid: bitcoin::Txid::from_raw_hash(
-                bitcoin::hashes::sha256d::Hash::from_byte_array([0xab; 32]),
-            ),
+            txid: bitcoin::Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array(
+                [0xab; 32],
+            )),
             vout: 42,
         };
         let key = outpoint_to_key(&outpoint);
@@ -283,9 +288,9 @@ mod tests {
     fn test_outpoint_key_zero_vout() {
         use bitcoin::hashes::Hash;
         let outpoint = bitcoin::OutPoint {
-            txid: bitcoin::Txid::from_raw_hash(
-                bitcoin::hashes::sha256d::Hash::from_byte_array([0x42; 32]),
-            ),
+            txid: bitcoin::Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array(
+                [0x42; 32],
+            )),
             vout: 0,
         };
         let key = outpoint_to_key(&outpoint);
@@ -299,9 +304,9 @@ mod tests {
     fn test_outpoint_key_max_vout() {
         use bitcoin::hashes::Hash;
         let outpoint = bitcoin::OutPoint {
-            txid: bitcoin::Txid::from_raw_hash(
-                bitcoin::hashes::sha256d::Hash::from_byte_array([0xff; 32]),
-            ),
+            txid: bitcoin::Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array(
+                [0xff; 32],
+            )),
             vout: u32::MAX,
         };
         let key = outpoint_to_key(&outpoint);
@@ -332,13 +337,20 @@ mod tests {
     fn test_compact_roundtrip_p2wpkh() {
         let coin = Coin {
             amount: 5_000_000_000,
-            script_pubkey: bitcoin::ScriptBuf::from_bytes(vec![0x00, 0x14, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab]),
+            script_pubkey: bitcoin::ScriptBuf::from_bytes(vec![
+                0x00, 0x14, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab,
+                0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab,
+            ]),
             height: 800_000,
             coinbase: false,
             txseq: node_index::TXSEQ_UNKNOWN,
         };
         let encoded = coin.serialize_compact();
-        assert!(encoded.len() < 35, "compact should be <35 bytes, got {}", encoded.len());
+        assert!(
+            encoded.len() < 35,
+            "compact should be <35 bytes, got {}",
+            encoded.len()
+        );
         let decoded = Coin::deserialize_compact(&encoded).unwrap();
         assert_eq!(decoded.amount, coin.amount);
         assert_eq!(decoded.height, coin.height);
@@ -473,14 +485,21 @@ mod tests {
     fn test_compact_smaller_than_bincode() {
         let coin = Coin {
             amount: 100_000_000, // 1 BTC
-            script_pubkey: bitcoin::ScriptBuf::from_bytes(vec![0x00, 0x14, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab]),
+            script_pubkey: bitcoin::ScriptBuf::from_bytes(vec![
+                0x00, 0x14, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab,
+                0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab,
+            ]),
             height: 500_000,
             coinbase: false,
             txseq: node_index::TXSEQ_UNKNOWN,
         };
         let compact = coin.serialize_compact();
         let bincode_encoded = bincode::serialize(&coin).unwrap();
-        assert!(compact.len() < bincode_encoded.len(),
-            "compact {} should be smaller than bincode {}", compact.len(), bincode_encoded.len());
+        assert!(
+            compact.len() < bincode_encoded.len(),
+            "compact {} should be smaller than bincode {}",
+            compact.len(),
+            bincode_encoded.len()
+        );
     }
 }

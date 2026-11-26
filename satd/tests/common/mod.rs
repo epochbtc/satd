@@ -315,7 +315,9 @@ fn wait_for_listener(
             ));
         }
         if Instant::now() >= deadline {
-            return Err(format!("{what} listener on {addr} never accepted a connection"));
+            return Err(format!(
+                "{what} listener on {addr} never accepted a connection"
+            ));
         }
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -335,7 +337,11 @@ fn requested_tls_binds_recognises_the_three_tls_flags_and_nothing_else() {
     let got: Vec<(&str, u16)> = binds.iter().map(|(f, a)| (*f, a.port())).collect();
     assert_eq!(
         got,
-        vec![("rpctlsbind", 18443), ("rpcreadonlytlsbind", 18444), ("esploratlsbind", 18445)]
+        vec![
+            ("rpctlsbind", 18443),
+            ("rpcreadonlytlsbind", 18444),
+            ("esploratlsbind", 18445)
+        ]
     );
 }
 
@@ -409,9 +415,7 @@ impl TestNode {
                 Err(reason) => {
                     last_failure = format!("attempt {attempt}/{MAX_ATTEMPTS}: {reason}");
                     if attempt < MAX_ATTEMPTS {
-                        eprintln!(
-                            "satd startup failed ({last_failure}); retrying on a fresh port"
-                        );
+                        eprintln!("satd startup failed ({last_failure}); retrying on a fresh port");
                     }
                 }
             }
@@ -801,7 +805,9 @@ impl TestNode {
         if let Some(err) = resp.get("error").filter(|e| !e.is_null()) {
             panic!("{method}{params:?} was refused: {err}");
         }
-        resp.get("result").cloned().unwrap_or(serde_json::Value::Null)
+        resp.get("result")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null)
     }
 
     /// Call with `params` exactly as given -- an array or, for Core's named
@@ -1177,8 +1183,7 @@ impl StreamingNode {
         self.node.stop();
         let mut args = vec!["--events-grpc-bind=127.0.0.1:0", "--streamws=127.0.0.1:0"];
         args.extend_from_slice(extra_args);
-        let mut fresh =
-            TestNode::start_with_datadir(&self.node.datadir, self.node.rpcport, &args);
+        let mut fresh = TestNode::start_with_datadir(&self.node.datadir, self.node.rpcport, &args);
         std::mem::swap(&mut self.node.process, &mut fresh.process);
         self.node.cookie = std::mem::take(&mut fresh.cookie);
         self.node.p2p_port = fresh.p2p_port;
@@ -1288,7 +1293,10 @@ impl RpcHandle {
             .timeout(rpc_timeout())
             .build()
             .unwrap();
-        let (user, pass) = self.cookie.split_once(':').unwrap_or(("__cookie__", "none"));
+        let (user, pass) = self
+            .cookie
+            .split_once(':')
+            .unwrap_or(("__cookie__", "none"));
         let response = client
             .post(&url)
             .basic_auth(user, Some(pass))
@@ -1319,8 +1327,7 @@ impl RpcHandle {
 
     /// Current best-block height.
     pub fn block_count(&self) -> u64 {
-        self.call("getblockcount", vec![])
-            .expect("getblockcount")["result"]
+        self.call("getblockcount", vec![]).expect("getblockcount")["result"]
             .as_u64()
             .expect("height")
     }
@@ -1425,7 +1432,7 @@ pub fn block1_coinbase_txid<R: BlockingRpc>(node: &R) -> String {
 /// `sha256(scriptPubKey)` as natural-order hex — the watch-set scripthash form
 /// (`AddScripts` input and `ScriptMatched.scripthash` output both use this).
 pub fn scripthash_hex(spk: &bitcoin::Script) -> String {
-    use bitcoin::hashes::{sha256, Hash as _};
+    use bitcoin::hashes::{Hash as _, sha256};
     hex::encode(sha256::Hash::hash(spk.as_bytes()).to_byte_array())
 }
 
@@ -1433,8 +1440,11 @@ pub fn scripthash_hex(spk: &bitcoin::Script) -> String {
 /// script-prefix bucket for `AddScriptPrefixes`. `bits` must be a multiple of 8
 /// in `1..=32` (the tests use byte-aligned prefixes to avoid sub-byte masking).
 pub fn script_prefix_hex(spk: &bitcoin::Script, bits: u32) -> String {
-    assert!(bits.is_multiple_of(8) && (8..=32).contains(&bits), "byte-aligned bits");
-    use bitcoin::hashes::{sha256, Hash as _};
+    assert!(
+        bits.is_multiple_of(8) && (8..=32).contains(&bits),
+        "byte-aligned bits"
+    );
+    use bitcoin::hashes::{Hash as _, sha256};
     let sh = sha256::Hash::hash(spk.as_bytes()).to_byte_array();
     hex::encode(&sh[..(bits / 8) as usize])
 }
@@ -1574,8 +1584,8 @@ fn build_signed_p2wpkh_spend_inner<R: BlockingRpc>(
     use bitcoin::secp256k1::{Message, Secp256k1};
     use bitcoin::sighash::{EcdsaSighashType, SighashCache};
     use bitcoin::{
-        absolute::LockTime, Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut,
-        Witness,
+        Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness,
+        absolute::LockTime,
     };
     use std::str::FromStr;
 
@@ -1638,8 +1648,11 @@ pub fn coinbase_txid_at<R: BlockingRpc>(node: &R, height: u64) -> String {
         .as_str()
         .expect("hash string")
         .to_string();
-    node.rpc("getblock", vec![serde_json::json!(hash), serde_json::json!(1)])
-        .expect("getblock")["result"]["tx"][0]
+    node.rpc(
+        "getblock",
+        vec![serde_json::json!(hash), serde_json::json!(1)],
+    )
+    .expect("getblock")["result"]["tx"][0]
         .as_str()
         .expect("coinbase txid")
         .to_string()
@@ -1666,21 +1679,27 @@ pub fn build_signed_p2wpkh_spend_of_coinbase<R: BlockingRpc>(
     use bitcoin::secp256k1::{Message, Secp256k1};
     use bitcoin::sighash::{EcdsaSighashType, SighashCache};
     use bitcoin::{
-        absolute::LockTime, Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut,
-        Witness,
+        Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness,
+        absolute::LockTime,
     };
     use std::str::FromStr;
 
     let cb_txid = bitcoin::Txid::from_str(&coinbase_txid_at(node, height)).expect("txid parse");
     // Regtest subsidy is 50 BTC until the first halving at height 150.
-    assert!(height < 150, "helper assumes the pre-halving regtest subsidy");
+    assert!(
+        height < 150,
+        "helper assumes the pre-halving regtest subsidy"
+    );
     let cb_value_sat: u64 = 50 * 100_000_000;
 
     let mut spend = Transaction {
         version: bitcoin::transaction::Version::TWO,
         lock_time: LockTime::ZERO,
         input: vec![TxIn {
-            previous_output: OutPoint { txid: cb_txid, vout: 0 },
+            previous_output: OutPoint {
+                txid: cb_txid,
+                vout: 0,
+            },
             script_sig: ScriptBuf::new(),
             sequence: Sequence(0xffff_ffff),
             witness: Witness::new(),
@@ -1743,8 +1762,8 @@ pub fn build_signed_p2wpkh_spend_of_coinbases<R: BlockingRpc>(
     use bitcoin::secp256k1::{Message, Secp256k1};
     use bitcoin::sighash::{EcdsaSighashType, SighashCache};
     use bitcoin::{
-        absolute::LockTime, Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut,
-        Witness,
+        Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness,
+        absolute::LockTime,
     };
     use std::str::FromStr;
 
@@ -1756,8 +1775,7 @@ pub fn build_signed_p2wpkh_spend_of_coinbases<R: BlockingRpc>(
         .iter()
         .map(|(h, _)| {
             assert!(*h < 150, "helper assumes the pre-halving regtest subsidy");
-            let txid =
-                bitcoin::Txid::from_str(&coinbase_txid_at(node, *h)).expect("txid parse");
+            let txid = bitcoin::Txid::from_str(&coinbase_txid_at(node, *h)).expect("txid parse");
             TxIn {
                 previous_output: OutPoint { txid, vout: 0 },
                 script_sig: ScriptBuf::new(),
@@ -1840,7 +1858,7 @@ pub fn build_signed_p2wpkh_spend_of_coinbases<R: BlockingRpc>(
 /// failure mode is a wrong answer, not an error, which is why this asserts the
 /// clean-shutdown marker rather than trusting the caller.
 pub fn dump_sp_tweaks_cf(datadir: &std::path::Path) -> Vec<(u32, Vec<u8>)> {
-    use rocksdb::{IteratorMode, Options, DB};
+    use rocksdb::{DB, IteratorMode, Options};
 
     let net_dir = datadir.join("regtest");
     assert!(
@@ -1892,7 +1910,7 @@ pub struct AuthFixture {
 /// Write a 0600 `auth.toml` with the given tokens (sha256-hashed) and return
 /// the fixture. Mirrors the bearer-auth test setup in `regtest.rs`.
 pub fn write_authfile(tokens: &[TokenSpec]) -> AuthFixture {
-    use bitcoin::hashes::{sha256, Hash as _};
+    use bitcoin::hashes::{Hash as _, sha256};
     use std::io::Write as _;
     let dir = tempfile::tempdir().expect("tempdir");
     let authfile = dir.path().join("auth.toml");
@@ -2039,7 +2057,7 @@ pub fn get_rpc_str(node: &TestNode, method: &str) -> Option<String> {
 /// stay in the current layout; only the stamp moves, which is all the open
 /// path reads before deciding to refuse or rebuild.
 pub fn stamp_chainstate_schema(datadir: &std::path::Path, version: u32) {
-    use rocksdb::{Options, DB};
+    use rocksdb::{DB, Options};
 
     let path = datadir.join("regtest").join("chainstate");
     let opts = Options::default();
@@ -2054,7 +2072,7 @@ pub fn stamp_chainstate_schema(datadir: &std::path::Path, version: u32) {
 
 /// Read the chainstate schema stamp of a stopped regtest node's datadir.
 pub fn read_chainstate_schema(datadir: &std::path::Path) -> Option<u32> {
-    use rocksdb::{Options, DB};
+    use rocksdb::{DB, Options};
 
     let path = datadir.join("regtest").join("chainstate");
     let opts = Options::default();

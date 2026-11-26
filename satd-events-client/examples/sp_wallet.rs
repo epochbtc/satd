@@ -18,7 +18,7 @@
 //! ```
 
 use bitcoin::secp256k1::{PublicKey, Scalar, Secp256k1, SecretKey};
-use satd_events_client::{parse_txid, Event, SilentPaymentTarget, StreamClient};
+use satd_events_client::{Event, SilentPaymentTarget, StreamClient, parse_txid};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -41,13 +41,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     println!("watching scan key {}", hex(&target.scan_pubkey()?));
 
-    let mut client = StreamClient::builder(endpoint).keepalive_default().connect().await?;
+    let mut client = StreamClient::builder(endpoint)
+        .keepalive_default()
+        .connect()
+        .await?;
     let (watch, mut events) = client.watch().await?;
     watch.add_silent_payments([target]).await?;
 
     while let Some(event) = events.message().await? {
         if let Event::SilentPaymentMatched {
-            txid, vout, output_pubkey, amount, tweak, k, label, confirmed, ..
+            txid,
+            vout,
+            output_pubkey,
+            amount,
+            tweak,
+            k,
+            label,
+            confirmed,
+            ..
         } = event
         {
             // Re-derive the full spending key offline from T, k, and (for a

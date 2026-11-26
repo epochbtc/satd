@@ -13,20 +13,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .nth(1)
         .unwrap_or_else(|| "http://127.0.0.1:50051".into());
 
-    let mut client = StreamClient::builder(endpoint).keepalive_default().connect().await?;
+    let mut client = StreamClient::builder(endpoint)
+        .keepalive_default()
+        .connect()
+        .await?;
     let (watch, mut events) = client.watch().await?;
 
     let txid = [0u8; 32]; // replace with the txid to track
 
     // Lifecycle watch that self-evicts (emitting TxidFinalized) at 6 confs.
-    watch.add_tx_lifecycle([txid], AutoClose::AtDepth(6)).await?;
+    watch
+        .add_tx_lifecycle([txid], AutoClose::AtDepth(6))
+        .await?;
     // Single-shot alarms at 1 and 3 confs (cross product of txids × depths).
     watch.add_depth_alarms([txid], [1, 3]).await?;
 
     while let Some(event) = events.message().await? {
         match event {
-            Event::TxidMatched { confirmed, height, .. } => {
-                println!("seen ({}) at height {height}", if confirmed { "confirmed" } else { "mempool" });
+            Event::TxidMatched {
+                confirmed, height, ..
+            } => {
+                println!(
+                    "seen ({}) at height {height}",
+                    if confirmed { "confirmed" } else { "mempool" }
+                );
             }
             Event::TxidDepthReached { depth, height, .. } => {
                 println!("depth alarm: {depth} confs at height {height}");

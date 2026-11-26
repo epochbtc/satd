@@ -3,12 +3,17 @@
 //! prefix nesting, and the empty-body / unrecognized-arm fallback.
 
 use satd_events_client::{
-    proto as pb, CursorRejectReason, DescriptorMatch, Event, EvictReason, StatusKind,
-    StatusSeverity, StatusState, WatchAddKind, WatchAddRejectReason,
+    CursorRejectReason, DescriptorMatch, Event, EvictReason, StatusKind, StatusSeverity,
+    StatusState, WatchAddKind, WatchAddRejectReason, proto as pb,
 };
 
 fn node_event(body: pb::node_event::Body) -> pb::NodeEvent {
-    pb::NodeEvent { schema_version: 1, stamp: None, cursor: None, body: Some(body) }
+    pb::NodeEvent {
+        schema_version: 1,
+        stamp: None,
+        cursor: None,
+        body: Some(body),
+    }
 }
 
 #[test]
@@ -30,10 +35,20 @@ fn script_matched_carries_descriptor_attribution() {
         raw_tx_stripped: false,
     }));
     match Event::from(ev) {
-        Event::ScriptMatched { descriptors, is_output, amount, raw_tx, .. } => {
+        Event::ScriptMatched {
+            descriptors,
+            is_output,
+            amount,
+            raw_tx,
+            ..
+        } => {
             assert!(is_output);
             assert_eq!(amount, Some(50_000), "in-band matched value (#456)");
-            assert_eq!(raw_tx, Some(vec![0xde, 0xad, 0xbe, 0xef]), "opt-in raw_tx (#456)");
+            assert_eq!(
+                raw_tx,
+                Some(vec![0xde, 0xad, 0xbe, 0xef]),
+                "opt-in raw_tx (#456)"
+            );
             assert_eq!(
                 descriptors,
                 vec![DescriptorMatch {
@@ -64,7 +79,12 @@ fn script_matched_without_descriptor_is_empty_attribution() {
         raw_tx_stripped: false,
     }));
     match Event::from(ev) {
-        Event::ScriptMatched { descriptors, amount, raw_tx, .. } => {
+        Event::ScriptMatched {
+            descriptors,
+            amount,
+            raw_tx,
+            ..
+        } => {
             assert!(descriptors.is_empty());
             assert_eq!(amount, None, "has_amount=false → None (not a real 0-value)");
             assert_eq!(raw_tx, None, "empty raw_tx → None");
@@ -83,17 +103,22 @@ fn block_connected_maps() {
     }));
     assert_eq!(
         Event::from(ev),
-        Event::BlockConnected { hash: vec![0xab; 32], height: 42 }
+        Event::BlockConnected {
+            hash: vec![0xab; 32],
+            height: 42
+        }
     );
 }
 
 #[test]
 fn evict_reason_maps() {
     let ev = node_event(pb::node_event::Body::Mempool(pb::MempoolEvent {
-        body: Some(pb::mempool_event::Body::LeaveEvicted(pb::MempoolLeaveEvicted {
-            txid: vec![1; 32],
-            reason: pb::EvictReason::FullPool as i32,
-        })),
+        body: Some(pb::mempool_event::Body::LeaveEvicted(
+            pb::MempoolLeaveEvicted {
+                txid: vec![1; 32],
+                reason: pb::EvictReason::FullPool as i32,
+            },
+        )),
     }));
     match Event::from(ev) {
         Event::MempoolLeaveEvicted { reason, .. } => assert_eq!(reason, EvictReason::FullPool),
@@ -103,7 +128,10 @@ fn evict_reason_maps() {
 
 #[test]
 fn spent_prevout_has_amount_becomes_option() {
-    let prefix = pb::ScriptPrefix { prefix: vec![0xff], bits: 8 };
+    let prefix = pb::ScriptPrefix {
+        prefix: vec![0xff],
+        bits: 8,
+    };
     let retained = pb::SpentPrevout {
         outpoint_txid: vec![2; 32],
         outpoint_vout: 1,
@@ -154,13 +182,21 @@ fn spent_prevout_has_amount_becomes_option() {
 
 #[test]
 fn lagged_carries_resume_cursor() {
-    let cursor = pb::Cursor { height: 100, tx_index: 0, mempool_seq: 5, instance_id: 9 };
+    let cursor = pb::Cursor {
+        height: 100,
+        tx_index: 0,
+        mempool_seq: 5,
+        instance_id: 9,
+    };
     let ev = node_event(pb::node_event::Body::Lagged(pb::Lagged {
         dropped_count: 12,
         resume_cursor: Some(cursor),
     }));
     match Event::from(ev) {
-        Event::Lagged { dropped_count, resume_cursor } => {
+        Event::Lagged {
+            dropped_count,
+            resume_cursor,
+        } => {
             assert_eq!(dropped_count, 12);
             assert_eq!(resume_cursor, Some(cursor));
         }
@@ -170,34 +206,57 @@ fn lagged_carries_resume_cursor() {
 
 #[test]
 fn empty_body_is_unknown() {
-    let ev = pb::NodeEvent { schema_version: 1, stamp: None, cursor: None, body: None };
+    let ev = pb::NodeEvent {
+        schema_version: 1,
+        stamp: None,
+        cursor: None,
+        body: None,
+    };
     assert_eq!(Event::from(ev), Event::Unknown);
 }
 
 #[test]
 fn set_cursor_accepted_maps() {
-    let cursor = pb::Cursor { height: 50, tx_index: 0, mempool_seq: 0, instance_id: 7 };
+    let cursor = pb::Cursor {
+        height: 50,
+        tx_index: 0,
+        mempool_seq: 0,
+        instance_id: 7,
+    };
     let ev = node_event(pb::node_event::Body::SetCursorResult(pb::SetCursorResult {
-        outcome: Some(pb::set_cursor_result::Outcome::Accepted(pb::CursorAccepted {
-            from: Some(cursor),
-            clamped: true,
-            earliest_replayed: 41,
-        })),
+        outcome: Some(pb::set_cursor_result::Outcome::Accepted(
+            pb::CursorAccepted {
+                from: Some(cursor),
+                clamped: true,
+                earliest_replayed: 41,
+            },
+        )),
     }));
     assert_eq!(
         Event::from(ev),
-        Event::CursorAccepted { from: Some(cursor), clamped: true, earliest_replayed: 41 }
+        Event::CursorAccepted {
+            from: Some(cursor),
+            clamped: true,
+            earliest_replayed: 41
+        }
     );
 }
 
 #[test]
 fn set_cursor_rejected_maps_reason() {
-    let head = pb::Cursor { height: 99, tx_index: 0, mempool_seq: 3, instance_id: 1 };
+    let head = pb::Cursor {
+        height: 99,
+        tx_index: 0,
+        mempool_seq: 3,
+        instance_id: 1,
+    };
     let ev = node_event(pb::node_event::Body::SetCursorResult(pb::SetCursorResult {
-        outcome: Some(pb::set_cursor_result::Outcome::Rejected(pb::CursorRejected {
-            reason: pb::cursor_rejected::Reason::ConcurrentReanchor as i32,
-            current_head: Some(head),
-        })),
+        outcome: Some(pb::set_cursor_result::Outcome::Rejected(
+            pb::CursorRejected {
+                reason: pb::cursor_rejected::Reason::ConcurrentReanchor as i32,
+                current_head: Some(head),
+            },
+        )),
     }));
     assert_eq!(
         Event::from(ev),
@@ -211,66 +270,104 @@ fn set_cursor_rejected_maps_reason() {
 #[test]
 fn watch_add_rejected_maps_reason_numbers_and_items() {
     use pb::watch_add_rejected::{Kind, Reason};
-    let ev = node_event(pb::node_event::Body::WatchAddRejected(pb::WatchAddRejected {
-        kind: Kind::Descriptor as i32,
-        reason: Reason::QuotaExceeded as i32,
-        required: 20,
-        held: 90,
-        quota: 100,
-        descriptor: "wpkh(xpub...)".into(),
-        gap_limit: 20,
-        start: 40,
-        descriptor_kept: true,
-        ..Default::default()
-    }));
+    let ev = node_event(pb::node_event::Body::WatchAddRejected(
+        pb::WatchAddRejected {
+            kind: Kind::Descriptor as i32,
+            reason: Reason::QuotaExceeded as i32,
+            required: 20,
+            held: 90,
+            quota: 100,
+            descriptor: "wpkh(xpub...)".into(),
+            gap_limit: 20,
+            start: 40,
+            descriptor_kept: true,
+            ..Default::default()
+        },
+    ));
     let Event::WatchAddRejected(r) = Event::from(ev) else {
         panic!("expected WatchAddRejected");
     };
-    assert_eq!((r.kind, r.reason), (WatchAddKind::Descriptor, WatchAddRejectReason::QuotaExceeded));
+    assert_eq!(
+        (r.kind, r.reason),
+        (
+            WatchAddKind::Descriptor,
+            WatchAddRejectReason::QuotaExceeded
+        )
+    );
     assert_eq!((r.required, r.held, r.quota), (20, 90, 100));
-    let d = r.descriptor.expect("a descriptor refusal names its descriptor");
-    assert_eq!((d.descriptor.as_str(), d.gap_limit, d.start, d.kept), ("wpkh(xpub...)", 20, 40, true));
+    let d = r
+        .descriptor
+        .expect("a descriptor refusal names its descriptor");
+    assert_eq!(
+        (d.descriptor.as_str(), d.gap_limit, d.start, d.kept),
+        ("wpkh(xpub...)", 20, 40, true)
+    );
 
-    let ev = node_event(pb::node_event::Body::WatchAddRejected(pb::WatchAddRejected {
-        kind: Kind::DepthAlarms as i32,
-        reason: Reason::RateLimited as i32,
-        retry_after_secs: 3,
-        depth_alarms: vec![pb::WatchDepthAlarm { txid: vec![0x22; 32], depth: 6 }],
-        ..Default::default()
-    }));
+    let ev = node_event(pb::node_event::Body::WatchAddRejected(
+        pb::WatchAddRejected {
+            kind: Kind::DepthAlarms as i32,
+            reason: Reason::RateLimited as i32,
+            retry_after_secs: 3,
+            depth_alarms: vec![pb::WatchDepthAlarm {
+                txid: vec![0x22; 32],
+                depth: 6,
+            }],
+            ..Default::default()
+        },
+    ));
     let Event::WatchAddRejected(r) = Event::from(ev) else {
         panic!("expected WatchAddRejected");
     };
-    assert_eq!((r.kind, r.reason, r.retry_after_secs), (WatchAddKind::DepthAlarms, WatchAddRejectReason::RateLimited, 3));
+    assert_eq!(
+        (r.kind, r.reason, r.retry_after_secs),
+        (
+            WatchAddKind::DepthAlarms,
+            WatchAddRejectReason::RateLimited,
+            3
+        )
+    );
     assert_eq!(r.depth_alarms, vec![(vec![0x22; 32], 6)]);
-    assert!(r.descriptor.is_none(), "only the descriptor kind carries a descriptor");
+    assert!(
+        r.descriptor.is_none(),
+        "only the descriptor kind carries a descriptor"
+    );
 }
 
 #[test]
 fn watch_add_rejected_unknown_codes_are_unknown() {
-    let ev = node_event(pb::node_event::Body::WatchAddRejected(pb::WatchAddRejected {
-        kind: 99,
-        reason: 99,
-        ..Default::default()
-    }));
+    let ev = node_event(pb::node_event::Body::WatchAddRejected(
+        pb::WatchAddRejected {
+            kind: 99,
+            reason: 99,
+            ..Default::default()
+        },
+    ));
     let Event::WatchAddRejected(r) = Event::from(ev) else {
         panic!("expected WatchAddRejected");
     };
-    assert_eq!((r.kind, r.reason), (WatchAddKind::Unknown, WatchAddRejectReason::Unknown));
+    assert_eq!(
+        (r.kind, r.reason),
+        (WatchAddKind::Unknown, WatchAddRejectReason::Unknown)
+    );
 }
 
 #[test]
 fn set_cursor_rejected_unknown_reason_is_unknown_variant() {
     // A reason code from a newer server maps to the catch-all, not a panic.
     let ev = node_event(pb::node_event::Body::SetCursorResult(pb::SetCursorResult {
-        outcome: Some(pb::set_cursor_result::Outcome::Rejected(pb::CursorRejected {
-            reason: 9999,
-            current_head: None,
-        })),
+        outcome: Some(pb::set_cursor_result::Outcome::Rejected(
+            pb::CursorRejected {
+                reason: 9999,
+                current_head: None,
+            },
+        )),
     }));
     assert_eq!(
         Event::from(ev),
-        Event::CursorRejected { reason: CursorRejectReason::Unknown, current_head: None }
+        Event::CursorRejected {
+            reason: CursorRejectReason::Unknown,
+            current_head: None
+        }
     );
 }
 
@@ -349,7 +446,13 @@ fn silent_payment_matched_unconfirmed_has_no_height_or_label() {
         },
     ));
     match Event::from(ev) {
-        Event::SilentPaymentMatched { label, confirmed, height, raw_tx, .. } => {
+        Event::SilentPaymentMatched {
+            label,
+            confirmed,
+            height,
+            raw_tx,
+            ..
+        } => {
             assert_eq!(label, None, "has_label=false → None (not label 0)");
             assert!(!confirmed, "mempool match is unconfirmed");
             assert_eq!(height, None, "unconfirmed → None (not height 0)");
@@ -377,12 +480,22 @@ fn block_tweaks_maps_entries() {
                 }],
             },
             // tweaks_only compact form: no txid/max_value, and no outputs.
-            pb::TweakEntry { tweak: vec![0x02; 33], txid: vec![], max_value: 0, taproot_outputs: vec![] },
+            pb::TweakEntry {
+                tweak: vec![0x02; 33],
+                txid: vec![],
+                max_value: 0,
+                taproot_outputs: vec![],
+            },
         ],
         filtered: true,
     }));
     match Event::from(ev) {
-        Event::BlockTweaks { block_hash, height, entries, filtered } => {
+        Event::BlockTweaks {
+            block_hash,
+            height,
+            entries,
+            filtered,
+        } => {
             assert_eq!(block_hash, vec![0x55; 32]);
             assert_eq!(height, 840_000);
             assert!(filtered);
@@ -419,7 +532,11 @@ fn mempool_tweak_maps_to_typed_event() {
     match Event::from(ev) {
         Event::MempoolTweak { entry } => {
             assert_eq!(entry.tweak, vec![0x03; 33]);
-            assert_eq!(entry.txid, vec![0x77; 32], "txid always present on a mempool tweak");
+            assert_eq!(
+                entry.txid,
+                vec![0x77; 32],
+                "txid always present on a mempool tweak"
+            );
             assert_eq!(entry.max_value, 33_000);
             // A mempool tweak always carries the tx's taproot outputs so the
             // match is confirmed at admission without a fetch.
@@ -459,7 +576,12 @@ fn status_decodes_a_fully_specified_event() {
         pb::StatusSeverity::Critical as i32,
     );
     match Event::from(ev) {
-        Event::Status { kind, state, severity, .. } => {
+        Event::Status {
+            kind,
+            state,
+            severity,
+            ..
+        } => {
             assert_eq!(kind, StatusKind::DiskLow);
             assert_eq!(state, StatusState::Raised);
             assert_eq!(severity, StatusSeverity::Critical);
@@ -472,11 +594,18 @@ fn status_decodes_a_fully_specified_event() {
 fn an_unset_severity_survives_the_wire_boundary_as_unspecified() {
     // The regression the ordering fix exists for, exercised end to end: a
     // producer that omits `severity` must not out-page `Critical`.
-    let ev = status_event(pb::StatusKind::DiskLow as i32, pb::StatusState::Raised as i32, 0);
+    let ev = status_event(
+        pb::StatusKind::DiskLow as i32,
+        pb::StatusState::Raised as i32,
+        0,
+    );
     match Event::from(ev) {
         Event::Status { severity, .. } => {
             assert_eq!(severity, StatusSeverity::Unspecified);
-            assert!(severity < StatusSeverity::Warning, "an unset severity must not page");
+            assert!(
+                severity < StatusSeverity::Warning,
+                "an unset severity must not page"
+            );
         }
         other => panic!("expected status, got {other:?}"),
     }
@@ -484,7 +613,11 @@ fn an_unset_severity_survives_the_wire_boundary_as_unspecified() {
 
 #[test]
 fn an_unrecognized_severity_survives_the_wire_boundary_above_critical() {
-    let ev = status_event(pb::StatusKind::DiskLow as i32, pb::StatusState::Raised as i32, 99);
+    let ev = status_event(
+        pb::StatusKind::DiskLow as i32,
+        pb::StatusState::Raised as i32,
+        99,
+    );
     match Event::from(ev) {
         Event::Status { severity, .. } => {
             assert_eq!(severity, StatusSeverity::Unknown(99));
@@ -498,11 +631,18 @@ fn an_unrecognized_severity_survives_the_wire_boundary_above_critical() {
 fn a_negative_severity_is_unrecognized_not_unset() {
     // A "rank by proto value" reimplementation gets this backwards and sorts a
     // negative below everything, including `Unspecified`.
-    let ev = status_event(pb::StatusKind::DiskLow as i32, pb::StatusState::Raised as i32, -1);
+    let ev = status_event(
+        pb::StatusKind::DiskLow as i32,
+        pb::StatusState::Raised as i32,
+        -1,
+    );
     match Event::from(ev) {
         Event::Status { severity, .. } => {
             assert_eq!(severity, StatusSeverity::Unknown(-1));
-            assert!(severity > StatusSeverity::Critical, "negative is unrecognized, not quiet");
+            assert!(
+                severity > StatusSeverity::Critical,
+                "negative is unrecognized, not quiet"
+            );
         }
         other => panic!("expected status, got {other:?}"),
     }
@@ -539,10 +679,12 @@ fn an_unrecognized_evict_reason_is_unknown_not_unspecified() {
     // through it reported a reason added by a newer node as "unspecified" and
     // left `EvictReason::Unknown` unconstructible.
     let ev = node_event(pb::node_event::Body::Mempool(pb::MempoolEvent {
-        body: Some(pb::mempool_event::Body::LeaveEvicted(pb::MempoolLeaveEvicted {
-            txid: vec![1; 32],
-            reason: 99,
-        })),
+        body: Some(pb::mempool_event::Body::LeaveEvicted(
+            pb::MempoolLeaveEvicted {
+                txid: vec![1; 32],
+                reason: 99,
+            },
+        )),
     }));
     match Event::from(ev) {
         Event::MempoolLeaveEvicted { reason, .. } => assert_eq!(reason, EvictReason::Unknown(99)),
@@ -553,10 +695,12 @@ fn an_unrecognized_evict_reason_is_unknown_not_unspecified() {
 #[test]
 fn an_unset_evict_reason_is_still_unspecified() {
     let ev = node_event(pb::node_event::Body::Mempool(pb::MempoolEvent {
-        body: Some(pb::mempool_event::Body::LeaveEvicted(pb::MempoolLeaveEvicted {
-            txid: vec![1; 32],
-            reason: 0,
-        })),
+        body: Some(pb::mempool_event::Body::LeaveEvicted(
+            pb::MempoolLeaveEvicted {
+                txid: vec![1; 32],
+                reason: 0,
+            },
+        )),
     }));
     match Event::from(ev) {
         Event::MempoolLeaveEvicted { reason, .. } => assert_eq!(reason, EvictReason::Unspecified),
@@ -581,7 +725,12 @@ fn a_stripped_transaction_maps_to_no_bytes_and_the_flag() {
         raw_tx_stripped: true,
     }));
     match Event::from(script) {
-        Event::ScriptMatched { raw_tx, raw_tx_stripped, txid, .. } => {
+        Event::ScriptMatched {
+            raw_tx,
+            raw_tx_stripped,
+            txid,
+            ..
+        } => {
             assert_eq!(raw_tx, None);
             assert!(raw_tx_stripped);
             assert_eq!(txid, vec![0x22; 32]);
@@ -589,7 +738,10 @@ fn a_stripped_transaction_maps_to_no_bytes_and_the_flag() {
         other => panic!("expected ScriptMatched, got {other:?}"),
     }
     let prefix = node_event(pb::node_event::Body::PrefixMatched(pb::PrefixMatched {
-        prefix: Some(pb::ScriptPrefix { prefix: vec![0xab], bits: 8 }),
+        prefix: Some(pb::ScriptPrefix {
+            prefix: vec![0xab],
+            bits: 8,
+        }),
         raw_tx: vec![],
         raw_tx_stripped: true,
         txid: vec![0x33; 32],
@@ -605,23 +757,29 @@ fn a_stripped_transaction_maps_to_no_bytes_and_the_flag() {
         }
         other => panic!("expected prefix match, got {other:?}"),
     }
-    let sp = node_event(pb::node_event::Body::SilentPaymentMatched(pb::SilentPaymentMatched {
-        scan_pubkey: vec![0x02; 33],
-        txid: vec![0x44; 32],
-        vout: 0,
-        output_pubkey: vec![0x55; 32],
-        amount: 1,
-        tweak: vec![0x02; 33],
-        k: 0,
-        has_label: false,
-        label: 0,
-        confirmed: true,
-        height: 9,
-        raw_tx: vec![],
-        raw_tx_stripped: true,
-    }));
+    let sp = node_event(pb::node_event::Body::SilentPaymentMatched(
+        pb::SilentPaymentMatched {
+            scan_pubkey: vec![0x02; 33],
+            txid: vec![0x44; 32],
+            vout: 0,
+            output_pubkey: vec![0x55; 32],
+            amount: 1,
+            tweak: vec![0x02; 33],
+            k: 0,
+            has_label: false,
+            label: 0,
+            confirmed: true,
+            height: 9,
+            raw_tx: vec![],
+            raw_tx_stripped: true,
+        },
+    ));
     match Event::from(sp) {
-        Event::SilentPaymentMatched { raw_tx, raw_tx_stripped, .. } => {
+        Event::SilentPaymentMatched {
+            raw_tx,
+            raw_tx_stripped,
+            ..
+        } => {
             assert_eq!(raw_tx, None);
             assert!(raw_tx_stripped);
         }

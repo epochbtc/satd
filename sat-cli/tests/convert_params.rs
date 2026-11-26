@@ -65,10 +65,19 @@ fn capture(args: &[&str], stdin: &str) -> Captured {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    child.stdin.take().unwrap().write_all(stdin.as_bytes()).unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(stdin.as_bytes())
+        .unwrap();
     let out = child.wait_with_output().unwrap();
     let _ = std::fs::remove_dir_all(&datadir);
-    assert!(out.status.success(), "sat-cli failed: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "sat-cli failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     sink.join().unwrap()
 }
 
@@ -84,8 +93,14 @@ fn positional_arguments_convert_as_bitcoin_cli_does() {
         params(&["signmessagewithprivkey", "cVpF924E", "123"]),
         serde_json::json!(["cVpF924E", "123"])
     );
-    assert_eq!(params(&["decodescript", "5151"]), serde_json::json!(["5151"]));
-    assert_eq!(params(&["getblock", "00ab", "2"]), serde_json::json!(["00ab", 2]));
+    assert_eq!(
+        params(&["decodescript", "5151"]),
+        serde_json::json!(["5151"])
+    );
+    assert_eq!(
+        params(&["getblock", "00ab", "2"]),
+        serde_json::json!(["00ab", 2])
+    );
 }
 
 #[test]
@@ -114,7 +129,10 @@ fn a_listed_argument_that_is_not_json_is_refused() {
         .unwrap();
     let _ = std::fs::remove_dir_all(&datadir);
     assert_eq!(out.status.code(), Some(1));
-    assert_eq!(String::from_utf8_lossy(&out.stderr).trim(), "error: Error parsing JSON: notabool");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr).trim(),
+        "error: Error parsing JSON: notabool"
+    );
 }
 
 #[test]
@@ -122,10 +140,16 @@ fn stdin_lines_are_arguments_and_stdinrpcpass_takes_the_first() {
     // Core keeps an empty line as an empty argument, and a line that looks
     // like a flag is still an argument.
     let c = capture(&["-rpcpassword=p", "-stdin", "echo"], "line1\n\n123\n-5\n");
-    assert_eq!(c.body["params"], serde_json::json!(["line1", "", "123", "-5"]));
+    assert_eq!(
+        c.body["params"],
+        serde_json::json!(["line1", "", "123", "-5"])
+    );
 
     // The method itself may come from stdin, after the password.
-    let c = capture(&["-rpcpassword=other", "-stdinrpcpass", "-stdin"], "pw\ngetblock\n00ab\n2\n");
+    let c = capture(
+        &["-rpcpassword=other", "-stdinrpcpass", "-stdin"],
+        "pw\ngetblock\n00ab\n2\n",
+    );
     assert_eq!(c.body["method"], "getblock");
     assert_eq!(c.body["params"], serde_json::json!(["00ab", 2]));
 
@@ -137,6 +161,12 @@ fn stdin_lines_are_arguments_and_stdinrpcpass_takes_the_first() {
     let c = capture(&["-rpcpassword=p", "-stdin"], "--named\ngetblockcount\n");
     assert_eq!(c.body["method"], "--named");
     assert_eq!(c.body["params"], serde_json::json!(["getblockcount"]));
-    let c = capture(&["-rpcpassword=p", "-stdin", "echo"], "--help\n--rpcuser=x\n");
-    assert_eq!(c.body["params"], serde_json::json!(["--help", "--rpcuser=x"]));
+    let c = capture(
+        &["-rpcpassword=p", "-stdin", "echo"],
+        "--help\n--rpcuser=x\n",
+    );
+    assert_eq!(
+        c.body["params"],
+        serde_json::json!(["--help", "--rpcuser=x"])
+    );
 }

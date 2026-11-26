@@ -22,8 +22,8 @@ use crate::validation::script::{NoopVerifier, ScriptVerifier};
 #[path = "state_strip.rs"]
 mod strip;
 pub use strip::{
-    FAILPOINT_ENV, PassReport, RestoreItem, RestoreProgress, StripConfig, StripError, StripOutcome, StripStats, WorkerStatus,
-    run_strip_worker,
+    FAILPOINT_ENV, PassReport, RestoreItem, RestoreProgress, StripConfig, StripError, StripOutcome,
+    StripStats, WorkerStatus, run_strip_worker,
 };
 
 /// The node's current time in seconds since the Unix epoch, for the
@@ -1078,135 +1078,135 @@ impl ChainState {
 
         // Check if we have an existing tip
         if let Some(tip_hash) = store.get_tip()
-            && let Some(entry) = store.get_block_index(&tip_hash) {
-                // Seed the best-header pointer from the highest-CHAINWORK
-                // header in the index — NOT the highest-height header, which
-                // the pollutable best-known-at-height index would give and
-                // which can name a competing branch after a crash. One-time
-                // O(n) scan at load; thereafter maintained incrementally by
-                // chainwork in accept_header/accept_headers/accept_block. Seeded
-                // with the active tip so a scan miss still yields a sane value.
-                let mut best_header = (tip_hash, entry.chainwork);
-                // Seeded in the same pass: every hash, minus every hash some
-                // other entry names as its parent, is the leaf set.
-                let mut all: std::collections::HashSet<BlockHash> =
-                    std::collections::HashSet::new();
-                let mut parents: std::collections::HashSet<BlockHash> =
-                    std::collections::HashSet::new();
-                // Propagate a scan failure rather than swallowing it: a
-                // block_index that cannot be iterated is corruption that
-                // must fail startup loudly, not silently degrade the
-                // competing-chain pull path to the active tip.
-                let scan_stats = store.for_each_block_index(&mut |h, e| {
-                    // Skip invalidated branches, as Core's
-                    // `RecalculateBestHeader` does: an `invalidateblock` before
-                    // the restart marked them, and seeding the header tip from
-                    // one would put it straight back on a branch this node has
-                    // already refused — the same defect through the restart
-                    // door. The leaf set below still takes them: a tip whose
-                    // marks an operator may yet clear with `reconsiderblock`
-                    // stays known.
-                    if e.status != BlockStatus::Invalid
-                        && compare_u256(&e.chainwork, &best_header.1) > 0
-                    {
-                        best_header = (h, e.chainwork);
-                    }
-                    all.insert(h);
-                    parents.insert(e.header.prev_blockhash);
-                })?;
-                let tips: std::collections::HashSet<BlockHash> =
-                    all.difference(&parents).copied().collect();
-                // The header tip is the best header's height, as it is at
-                // run time (Core's `m_best_header->nHeight`). Headers may be
-                // ahead of blocks if we crashed during IBD.
-                let htip = store
-                    .get_block_index(&best_header.0)
-                    .map_or(entry.height, |e| e.height);
-                // Rows dropped mid-scan (bad key / bad value) don't return
-                // Err but DO mean the best-header seed may have missed a
-                // heavier branch — surface them instead of masking.
-                if scan_stats.skipped_bad_key > 0 || scan_stats.skipped_bad_value > 0 {
-                    tracing::warn!(
-                        skipped_bad_key = scan_stats.skipped_bad_key,
-                        skipped_bad_value = scan_stats.skipped_bad_value,
-                        "block_index scan skipped undecodable rows while seeding \
-                         best-header; index may be partially corrupt"
-                    );
+            && let Some(entry) = store.get_block_index(&tip_hash)
+        {
+            // Seed the best-header pointer from the highest-CHAINWORK
+            // header in the index — NOT the highest-height header, which
+            // the pollutable best-known-at-height index would give and
+            // which can name a competing branch after a crash. One-time
+            // O(n) scan at load; thereafter maintained incrementally by
+            // chainwork in accept_header/accept_headers/accept_block. Seeded
+            // with the active tip so a scan miss still yields a sane value.
+            let mut best_header = (tip_hash, entry.chainwork);
+            // Seeded in the same pass: every hash, minus every hash some
+            // other entry names as its parent, is the leaf set.
+            let mut all: std::collections::HashSet<BlockHash> = std::collections::HashSet::new();
+            let mut parents: std::collections::HashSet<BlockHash> =
+                std::collections::HashSet::new();
+            // Propagate a scan failure rather than swallowing it: a
+            // block_index that cannot be iterated is corruption that
+            // must fail startup loudly, not silently degrade the
+            // competing-chain pull path to the active tip.
+            let scan_stats = store.for_each_block_index(&mut |h, e| {
+                // Skip invalidated branches, as Core's
+                // `RecalculateBestHeader` does: an `invalidateblock` before
+                // the restart marked them, and seeding the header tip from
+                // one would put it straight back on a branch this node has
+                // already refused — the same defect through the restart
+                // door. The leaf set below still takes them: a tip whose
+                // marks an operator may yet clear with `reconsiderblock`
+                // stays known.
+                if e.status != BlockStatus::Invalid
+                    && compare_u256(&e.chainwork, &best_header.1) > 0
+                {
+                    best_header = (h, e.chainwork);
                 }
-
-                tracing::info!(
-                    height = entry.height,
-                    headers_tip = htip,
-                    hash = %tip_hash,
-                    "Loaded chain tip from storage"
+                all.insert(h);
+                parents.insert(e.header.prev_blockhash);
+            })?;
+            let tips: std::collections::HashSet<BlockHash> =
+                all.difference(&parents).copied().collect();
+            // The header tip is the best header's height, as it is at
+            // run time (Core's `m_best_header->nHeight`). Headers may be
+            // ahead of blocks if we crashed during IBD.
+            let htip = store
+                .get_block_index(&best_header.0)
+                .map_or(entry.height, |e| e.height);
+            // Rows dropped mid-scan (bad key / bad value) don't return
+            // Err but DO mean the best-header seed may have missed a
+            // heavier branch — surface them instead of masking.
+            if scan_stats.skipped_bad_key > 0 || scan_stats.skipped_bad_value > 0 {
+                tracing::warn!(
+                    skipped_bad_key = scan_stats.skipped_bad_key,
+                    skipped_bad_value = scan_stats.skipped_bad_value,
+                    "block_index scan skipped undecodable rows while seeding \
+                         best-header; index may be partially corrupt"
                 );
-                let mut cs = Self {
-                    store,
-                    flat_files: Arc::new(Mutex::new(flat_files)),
-                    blocks_dir,
-                    blocks_xor_key,
-                    tip: RwLock::new(ChainTip {
-                        hash: tip_hash,
-                        height: entry.height,
-                    }),
-                    network,
-                    script_verifier,
-                    assumevalid,
-                    checkpoints,
-                    enforce_checkpoints: true,
-                    headers_tip_height: AtomicU32::new(htip),
-                    best_header: RwLock::new(best_header),
-                    header_row_changes: Mutex::new(Vec::new()),
-                    tips: RwLock::new(tips),
-                    sequence_ids: Mutex::new(SequenceIds::default()),
-                    blocks_indexed: AtomicU64::new(0),
-                    last_activation_attempt: Mutex::new(None),
-                    reorg_aborts: AtomicU64::new(0),
-                    mtp_cache: Mutex::new(Vec::with_capacity(12)),
-                    av_ancestry: Mutex::new(Default::default()),
-                    minimum_chain_work_override: None,
-                    left_ibd: std::sync::atomic::AtomicBool::new(false),
-                    connector_scan_last: Mutex::new(None),
-                    num_threads,
-                    address_index,
-                    sp_index,
-                    #[cfg(feature = "block-filter-index")]
-                    filter_index,
-                    reorg_log: std::sync::OnceLock::new(),
-                    warnings: std::sync::Arc::new(crate::warnings::NodeWarnings::new()),
-                    template_validity: Default::default(),
-                    mempool: std::sync::OnceLock::new(),
-                    chain_event_tx: parking_lot::Mutex::new(None),
-                    chain_gen: AtomicU64::new(0),
-                    mutation_depth: AtomicU32::new(0),
-                    tip_retreats: AtomicU64::new(0),
-                    connect_heartbeat: AtomicU64::new(0),
-                    manager_heartbeat: AtomicU64::new(0),
-                    connect_phases: std::sync::Arc::new(
-                        crate::chain::connect_phase::ConnectPhaseTracker::new(),
-                    ),
-                    background: RwLock::new(None),
-                    background_alerts: Default::default(),
-                    #[cfg(test)]
-                    bg_connect_faults: Default::default(),
-                    #[cfg(test)]
-                    bg_handoff_faults: Default::default(),
-                    signet_challenge: None,
-                    genesis_hash,
-                    accept_lock: std::sync::Arc::new(Mutex::new(())),
-                    pow_valid_block_hook: RwLock::new(None),
-                    snapshot_load_active: std::sync::atomic::AtomicBool::new(false),
-                    startup_stop: std::sync::OnceLock::new(),
-                    bulk_load: std::sync::atomic::AtomicBool::new(false),
-                    strip: Default::default(),
-                };
-                cs.set_signet_challenge(signet_challenge);
-                // Self-heal a tip left durably `Invalid` by a crash mid-
-                // invalidateblock (no-op in the normal case).
-                cs.reconcile_invalid_tip()?;
-                cs.start_group_commit();
-                return Ok(cs);
             }
+
+            tracing::info!(
+                height = entry.height,
+                headers_tip = htip,
+                hash = %tip_hash,
+                "Loaded chain tip from storage"
+            );
+            let mut cs = Self {
+                store,
+                flat_files: Arc::new(Mutex::new(flat_files)),
+                blocks_dir,
+                blocks_xor_key,
+                tip: RwLock::new(ChainTip {
+                    hash: tip_hash,
+                    height: entry.height,
+                }),
+                network,
+                script_verifier,
+                assumevalid,
+                checkpoints,
+                enforce_checkpoints: true,
+                headers_tip_height: AtomicU32::new(htip),
+                best_header: RwLock::new(best_header),
+                header_row_changes: Mutex::new(Vec::new()),
+                tips: RwLock::new(tips),
+                sequence_ids: Mutex::new(SequenceIds::default()),
+                blocks_indexed: AtomicU64::new(0),
+                last_activation_attempt: Mutex::new(None),
+                reorg_aborts: AtomicU64::new(0),
+                mtp_cache: Mutex::new(Vec::with_capacity(12)),
+                av_ancestry: Mutex::new(Default::default()),
+                minimum_chain_work_override: None,
+                left_ibd: std::sync::atomic::AtomicBool::new(false),
+                connector_scan_last: Mutex::new(None),
+                num_threads,
+                address_index,
+                sp_index,
+                #[cfg(feature = "block-filter-index")]
+                filter_index,
+                reorg_log: std::sync::OnceLock::new(),
+                warnings: std::sync::Arc::new(crate::warnings::NodeWarnings::new()),
+                template_validity: Default::default(),
+                mempool: std::sync::OnceLock::new(),
+                chain_event_tx: parking_lot::Mutex::new(None),
+                chain_gen: AtomicU64::new(0),
+                mutation_depth: AtomicU32::new(0),
+                tip_retreats: AtomicU64::new(0),
+                connect_heartbeat: AtomicU64::new(0),
+                manager_heartbeat: AtomicU64::new(0),
+                connect_phases: std::sync::Arc::new(
+                    crate::chain::connect_phase::ConnectPhaseTracker::new(),
+                ),
+                background: RwLock::new(None),
+                background_alerts: Default::default(),
+                #[cfg(test)]
+                bg_connect_faults: Default::default(),
+                #[cfg(test)]
+                bg_handoff_faults: Default::default(),
+                signet_challenge: None,
+                genesis_hash,
+                accept_lock: std::sync::Arc::new(Mutex::new(())),
+                pow_valid_block_hook: RwLock::new(None),
+                snapshot_load_active: std::sync::atomic::AtomicBool::new(false),
+                startup_stop: std::sync::OnceLock::new(),
+                bulk_load: std::sync::atomic::AtomicBool::new(false),
+                strip: Default::default(),
+            };
+            cs.set_signet_challenge(signet_challenge);
+            // Self-heal a tip left durably `Invalid` by a crash mid-
+            // invalidateblock (no-op in the normal case).
+            cs.reconcile_invalid_tip()?;
+            cs.start_group_commit();
+            return Ok(cs);
+        }
 
         // Fresh node: store genesis block.
         //
@@ -1244,14 +1244,16 @@ impl ChainState {
                 data_pos: entry.data_pos,
             }
         } else if let Some(pos) = genesis_record_on_disk(&mut flat_files, &genesis) {
-            tracing::info!(
-                "Genesis is the first record of blk00000.dat; indexing it there"
-            );
+            tracing::info!("Genesis is the first record of blk00000.dat; indexing it there");
             pos
         } else {
             let block_data = serialize(&genesis);
             let pos = flat_files
-                .write_block(&block_data, block_magic(network, signet_challenge.as_deref()), 0)
+                .write_block(
+                    &block_data,
+                    block_magic(network, signet_challenge.as_deref()),
+                    0,
+                )
                 .map_err(|e| ChainError::FlatFile(e.to_string()))?;
             // Same data-before-pointer ordering `write_block_durable`
             // enforces on the steady-state paths. This one runs once per
@@ -1520,7 +1522,11 @@ impl ChainState {
         } else {
             sub_u256(&tip.chainwork, &buffer)
         };
-        if compare_u256(&near_tip, &min_work) > 0 { near_tip } else { min_work }
+        if compare_u256(&near_tip, &min_work) > 0 {
+            near_tip
+        } else {
+            min_work
+        }
     }
 
     /// Core's `AcceptBlock` gates (v32.1 `validation.cpp`) for a block a
@@ -1540,11 +1546,18 @@ impl ChainState {
     ///
     /// Everything else, including a block whose parent is unknown or that
     /// the index already holds with its data, goes on to the usual checks.
-    pub fn peer_block_gate(&self, header: &bitcoin::block::Header, requested: bool) -> PeerBlockGate {
+    pub fn peer_block_gate(
+        &self,
+        header: &bitcoin::block::Header,
+        requested: bool,
+    ) -> PeerBlockGate {
         use crate::storage::blockindex::{add_u256, work_for_bits};
         let hash = header.block_hash();
         let existing = self.store.get_block_index(&hash);
-        if existing.as_ref().is_some_and(|e| e.status != BlockStatus::HeaderOnly) {
+        if existing
+            .as_ref()
+            .is_some_and(|e| e.status != BlockStatus::HeaderOnly)
+        {
             return PeerBlockGate::Process;
         }
         let (height, chainwork) = match existing {
@@ -1616,7 +1629,10 @@ impl ChainState {
 
     /// The block `hash` as the start of a headers presync: its index entry
     /// and median time past. `None` if it is not in the index.
-    pub fn headers_sync_chain_start(&self, hash: &BlockHash) -> Option<crate::net::headerssync::ChainStart> {
+    pub fn headers_sync_chain_start(
+        &self,
+        hash: &BlockHash,
+    ) -> Option<crate::net::headerssync::ChainStart> {
         let entry = self.store.get_block_index(hash)?;
         let mtp = validation::pow::median_time_past_of(&entry, |h| self.store.get_block_index(h));
         Some(crate::net::headerssync::ChainStart::new(*hash, &entry, mtp))
@@ -1648,7 +1664,10 @@ impl ChainState {
     /// challenge: `-signetchallenge` on a custom signet, the default
     /// signet's otherwise. No-op off signet. Core checks it in `CheckBlock`
     /// on every signet whenever it checks proof of work, assumevalid or not.
-    fn check_signet_solution(&self, block: &Block) -> Result<(), crate::validation::ValidationError> {
+    fn check_signet_solution(
+        &self,
+        block: &Block,
+    ) -> Result<(), crate::validation::ValidationError> {
         if let Some(challenge) = self.signet_challenge() {
             validation::signet::check_signet_block_solution(block, challenge, self.genesis_hash)?;
         }
@@ -1659,10 +1678,7 @@ impl ChainState {
     /// startup after both ChainState and Mempool are constructed.
     /// Test backends that don't exercise the reorg re-add path skip
     /// this; the per-perform_reorg branch tolerates absence.
-    pub fn set_mempool(
-        &self,
-        mempool: std::sync::Arc<crate::mempool::pool::Mempool>,
-    ) {
+    pub fn set_mempool(&self, mempool: std::sync::Arc<crate::mempool::pool::Mempool>) {
         let _ = self.mempool.set(mempool);
     }
 
@@ -1812,10 +1828,13 @@ impl ChainState {
         #[cfg(test)]
         {
             let take = |c: &AtomicU32| {
-                c.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1)).is_ok()
+                c.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
+                    .is_ok()
             };
             if take(&self.bg_connect_faults.0) {
-                return Err(ChainError::FlatFile("injected background write failure".into()));
+                return Err(ChainError::FlatFile(
+                    "injected background write failure".into(),
+                ));
             }
             if take(&self.bg_connect_faults.1) {
                 return Err(ChainError::CheckpointMismatch(bg.tip_height() + 1));
@@ -1881,7 +1900,9 @@ impl ChainState {
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
             .is_ok()
         {
-            return Err(ChainError::FlatFile("injected handoff flush failure".into()));
+            return Err(ChainError::FlatFile(
+                "injected handoff flush failure".into(),
+            ));
         }
         match bg.verify_at_snapshot()? {
             HandoffOutcome::Validated => {
@@ -2004,8 +2025,8 @@ impl ChainState {
                 }
                 let vout = vout_u64 as u32;
                 if let Some((prev_txid, prev_vout)) = prev {
-                    let strictly_increasing = txid_bytes > prev_txid
-                        || (txid_bytes == prev_txid && vout > prev_vout);
+                    let strictly_increasing =
+                        txid_bytes > prev_txid || (txid_bytes == prev_txid && vout > prev_vout);
                     if !strictly_increasing {
                         return Err(ChainError::Snapshot(
                             "snapshot outpoints are not strictly increasing (duplicate or \
@@ -2310,11 +2331,7 @@ impl ChainState {
     pub fn subscribe_chain_events(
         &self,
     ) -> Option<tokio::sync::broadcast::Receiver<crate::chain::events::ChainEvent>> {
-        self.chain_event_tx
-            .lock()
-            
-            .as_ref()
-            .map(|tx| tx.subscribe())
+        self.chain_event_tx.lock().as_ref().map(|tx| tx.subscribe())
     }
 
     /// Emit a chain event. Best-effort: a slow consumer that misses
@@ -2386,8 +2403,13 @@ impl ChainState {
     /// share clusters with the mempool transactions already spending them,
     /// and one past the cluster limits is cut back. The caller runs
     /// `remove_for_reorg` after, as Core runs `removeForReorg`.
-    fn return_to_mempool(&self, mempool: &crate::mempool::pool::Mempool, disconnected: &[bitcoin::Transaction]) {
-        let returned = mempool.accept_reorged_transactions(disconnected, self, &*self.script_verifier);
+    fn return_to_mempool(
+        &self,
+        mempool: &crate::mempool::pool::Mempool,
+        disconnected: &[bitcoin::Transaction],
+    ) {
+        let returned =
+            mempool.accept_reorged_transactions(disconnected, self, &*self.script_verifier);
         mempool.trim_reorged_clusters(&returned);
     }
 
@@ -2677,7 +2699,10 @@ impl ChainState {
             return true;
         }
         if !self.left_ibd.swap(true, Ordering::Relaxed) {
-            tracing::info!(height = tip.height, "Leaving initial block download (latching to false)");
+            tracing::info!(
+                height = tip.height,
+                "Leaving initial block download (latching to false)"
+            );
         }
         false
     }
@@ -2762,8 +2787,10 @@ impl ChainState {
     /// 8-byte header per indexed block (~minute on the current mainnet).
     pub fn audit_block_files(
         &self,
-    ) -> Result<crate::storage::blockfile_audit::BlockfileAuditReport, crate::storage::blockfile_audit::AuditError>
-    {
+    ) -> Result<
+        crate::storage::blockfile_audit::BlockfileAuditReport,
+        crate::storage::blockfile_audit::AuditError,
+    > {
         crate::storage::blockfile_audit::audit_blockfiles(&*self.store, &self.blocks_dir)
     }
 
@@ -3024,7 +3051,6 @@ impl ChainState {
         self.store.get_block_hash_by_height(height)
     }
 
-
     /// Direct store handle for tests that need to construct index states the
     /// public API cannot reach — e.g. a stale sibling block that exists in the
     /// block index but is deliberately absent from the height index.
@@ -3146,12 +3172,9 @@ impl ChainState {
         // Difficulty check. The retarget seed and the testnet min-difficulty
         // walk-back follow parent pointers, so they stay on this header's own
         // branch and are immune to height→hash index gaps.
-        validation::pow::check_difficulty(
-            header,
-            &parent,
-            self.network,
-            |h| self.store.get_block_index(h),
-        )?;
+        validation::pow::check_difficulty(header, &parent, self.network, |h| {
+            self.store.get_block_index(h)
+        })?;
 
         // `bad-fork-prior-to-checkpoint`, where Core checks it: after the
         // difficulty, before the time and version rules.
@@ -3171,8 +3194,10 @@ impl ChainState {
         )?;
 
         // Store as header-only
-        let chainwork =
-            crate::storage::blockindex::add_u256(&parent.chainwork, &crate::storage::blockindex::work_for_bits(header.bits));
+        let chainwork = crate::storage::blockindex::add_u256(
+            &parent.chainwork,
+            &crate::storage::blockindex::work_for_bits(header.bits),
+        );
         let entry = BlockIndexEntry {
             header: *header,
             height: new_height,
@@ -3398,7 +3423,10 @@ impl ChainState {
             batch.height_hash_removes.push(h);
             h += 1;
         }
-        let counts = (batch.height_hash_puts.len(), batch.height_hash_removes.len());
+        let counts = (
+            batch.height_hash_puts.len(),
+            batch.height_hash_removes.len(),
+        );
         if counts != (0, 0) {
             let _accept_guard = self.accept_lock.lock();
             self.write_chain_batch(batch)?;
@@ -3410,10 +3438,7 @@ impl ChainState {
     /// Returns (accepted_count, error). Stops at the first header refused for
     /// anything but being known already; the `accepted_count` headers before
     /// it are committed.
-    pub fn accept_headers(
-        &self,
-        headers: &[bitcoin::block::Header],
-    ) -> (u32, Option<ChainError>) {
+    pub fn accept_headers(&self, headers: &[bitcoin::block::Header]) -> (u32, Option<ChainError>) {
         let mut batch = crate::storage::StoreBatch::default();
         // Entries staged in this batch, by hash, so consecutive headers
         // resolve their parent and their retarget ancestors before anything
@@ -3450,7 +3475,10 @@ impl ChainState {
                 // would re-point height→hash at a no-longer-active block, exactly
                 // the clobber this change exists to prevent.
                 if existing.status == BlockStatus::DataStored
-                    && self.store.get_block_hash_by_height(existing.height).is_none()
+                    && self
+                        .store
+                        .get_block_hash_by_height(existing.height)
+                        .is_none()
                 {
                     batch.height_hash_puts.push((existing.height, hash));
                 }
@@ -3481,21 +3509,16 @@ impl ChainState {
             }
 
             // Difficulty check
-            if let Err(e) = validation::pow::check_difficulty(
-                header,
-                &parent,
-                self.network,
-                |h| {
-                    // Ancestors by parent hash (retarget seed and testnet
-                    // walk-back): in-batch headers (this batch's predecessors)
-                    // first, then the store. Parent pointers, not the height
-                    // index, keep both on this header's own branch.
-                    batch_index
-                        .get(h)
-                        .cloned()
-                        .or_else(|| self.store.get_block_index(h))
-                },
-            ) {
+            if let Err(e) = validation::pow::check_difficulty(header, &parent, self.network, |h| {
+                // Ancestors by parent hash (retarget seed and testnet
+                // walk-back): in-batch headers (this batch's predecessors)
+                // first, then the store. Parent pointers, not the height
+                // index, keep both on this header's own branch.
+                batch_index
+                    .get(h)
+                    .cloned()
+                    .or_else(|| self.store.get_block_index(h))
+            }) {
                 refused = Some(e.into());
                 break;
             }
@@ -3508,19 +3531,14 @@ impl ChainState {
             // Time and version, as in `accept_header`. The MTP walk resolves
             // ancestors the same way the difficulty check does: this batch's
             // predecessors first, then the store.
-            if let Err(e) = connect::check_header_context(
-                header,
-                &parent,
-                new_height,
-                self.network,
-                now,
-                |h| {
+            if let Err(e) =
+                connect::check_header_context(header, &parent, new_height, self.network, now, |h| {
                     batch_index
                         .get(h)
                         .cloned()
                         .or_else(|| self.store.get_block_index(h))
-                },
-            ) {
+                })
+            {
                 refused = Some(e.into());
                 break;
             }
@@ -3560,8 +3578,7 @@ impl ChainState {
         }
 
         if (accepted > 0 || !batch.height_hash_puts.is_empty())
-            && let Err(e) =
-                self.commit_accepted_headers(batch, &batch_index, best_in_batch)
+            && let Err(e) = self.commit_accepted_headers(batch, &batch_index, best_in_batch)
         {
             return (0, Some(e.into()));
         }
@@ -3668,7 +3685,10 @@ impl ChainState {
     pub(crate) fn scale_active_chain_work_for_test(&self, factor: u32) {
         use crate::storage::blockindex::{add_u256, work_for_bits};
         let genesis = self.get_block_hash_by_height(0).expect("genesis row");
-        let mut work = self.get_block_index(&genesis).expect("genesis entry").chainwork;
+        let mut work = self
+            .get_block_index(&genesis)
+            .expect("genesis entry")
+            .chainwork;
         let mut batch = crate::storage::StoreBatch::default();
         for h in 1..=self.tip_height() {
             let hash = self.get_block_hash_by_height(h).expect("active row");
@@ -3680,7 +3700,9 @@ impl ChainState {
             entry.chainwork = work;
             batch.block_index_puts.push((hash, entry));
         }
-        self.store.write_batch(batch).expect("reweighted rows written");
+        self.store
+            .write_batch(batch)
+            .expect("reweighted rows written");
     }
 
     /// Core's `ChainstateManager::RecalculateBestHeader`: rescan the block
@@ -3903,7 +3925,10 @@ impl ChainState {
         // base may legitimately be absent from the map. Scope the walk to the
         // range this chainstate owns (the background validates the rest as it
         // connects), so the audit does not false-fail mid-background-sync.
-        let floor = self.background().map(|bg| bg.snapshot_height()).unwrap_or(0);
+        let floor = self
+            .background()
+            .map(|bg| bg.snapshot_height())
+            .unwrap_or(0);
 
         if let Some(p) = &progress {
             p.set_phase("checkblockindex", "Verifying block-index consistency…");
@@ -4196,7 +4221,13 @@ impl ChainState {
                 let Some(best_entry) = self.store.get_block_index(&best_hash) else {
                     return Some(av::NOT_IN_BEST_HEADER_CHAIN);
                 };
-                if !ancestry.av_on_best_chain(av_hash, av_entry.height, &best_hash, best_entry.height, get) {
+                if !ancestry.av_on_best_chain(
+                    av_hash,
+                    av_entry.height,
+                    &best_hash,
+                    best_entry.height,
+                    get,
+                ) {
                     return Some(av::NOT_IN_BEST_HEADER_CHAIN);
                 }
                 drop(ancestry);
@@ -4206,7 +4237,11 @@ impl ChainState {
                 let Some(entry) = self.store.get_block_index(hash) else {
                     return Some(av::NOT_IN_BEST_HEADER_CHAIN);
                 };
-                if !av::more_than_two_weeks_on_top(&best_work, &entry.chainwork, best_entry.header.bits) {
+                if !av::more_than_two_weeks_on_top(
+                    &best_work,
+                    &entry.chainwork,
+                    best_entry.header.bits,
+                ) {
                     return Some(av::TOO_RECENT);
                 }
                 None
@@ -4225,7 +4260,9 @@ impl ChainState {
                 // cache chain) makes every freshly mined block look years
                 // stale, and the whole chain connects unverified.
                 match self.store.get_block_index(hash) {
-                    Some(entry) if now.saturating_sub(entry.header.time as u64) > *max_age_secs => None,
+                    Some(entry) if now.saturating_sub(entry.header.time as u64) > *max_age_secs => {
+                        None
+                    }
                     _ => Some(av::NEWER_THAN_AGE),
                 }
             }
@@ -4260,9 +4297,10 @@ impl ChainState {
         let mut timestamps: Vec<u32> = Vec::new();
         for h in start..height {
             if let Some(hash) = self.store.get_block_hash_by_height(h)
-                && let Some(entry) = self.store.get_block_index(&hash) {
-                    timestamps.push(entry.header.time);
-                }
+                && let Some(entry) = self.store.get_block_index(&hash)
+            {
+                timestamps.push(entry.header.time);
+            }
         }
         connect::median_of(timestamps)
     }
@@ -4549,11 +4587,13 @@ impl ChainState {
         // left, so a strip never sees Normal while writes run WAL-less.
         let bulk = mode == crate::storage::WriteMode::BulkLoad;
         if bulk {
-            self.bulk_load.store(true, std::sync::atomic::Ordering::Release);
+            self.bulk_load
+                .store(true, std::sync::atomic::Ordering::Release);
         }
         self.store.set_write_mode(mode);
         if !bulk {
-            self.bulk_load.store(false, std::sync::atomic::Ordering::Release);
+            self.bulk_load
+                .store(false, std::sync::atomic::Ordering::Release);
         }
     }
 
@@ -4633,7 +4673,9 @@ impl ChainState {
             let (pos, pending) = flat
                 .write_block_pending(block_data, self.block_magic(), height)
                 .map_err(|e| ChainError::FlatFile(e.to_string()))?;
-            let sync = flat.sync_handle().map_err(|e| ChainError::FlatFile(e.to_string()))?;
+            let sync = flat
+                .sync_handle()
+                .map_err(|e| ChainError::FlatFile(e.to_string()))?;
             (pos, pending, sync)
         };
         if let Some(sync) = sync {
@@ -4641,7 +4683,8 @@ impl ChainState {
             if let Some(probe) = DURABLE_SYNC_PROBE.get() {
                 probe(self);
             }
-            sync.sync().map_err(|e| ChainError::FlatFile(e.to_string()))?;
+            sync.sync()
+                .map_err(|e| ChainError::FlatFile(e.to_string()))?;
             self.flat_files.lock().mark_synced(sync);
         }
         Ok((pos, pending))
@@ -5050,9 +5093,7 @@ impl ChainState {
                 start_file..=end_file,
                 |block_bytes, pos: FlatFilePos| {
                     blocks_scanned += 1;
-                    let Ok(block) =
-                        bitcoin::consensus::deserialize::<Block>(block_bytes)
-                    else {
+                    let Ok(block) = bitcoin::consensus::deserialize::<Block>(block_bytes) else {
                         return std::ops::ControlFlow::Continue(());
                     };
                     let hash = block.block_hash();
@@ -5186,9 +5227,7 @@ impl ChainState {
         // after a restart, or once the entry has been evicted. That is a real
         // limit on what it can detect — the startup ancestry audit is the pass
         // that reads the persisted state cold.
-        if let Err(e) =
-            self.require_connected_parent(&current_tip, &pre.hash, pre.height)
-        {
+        if let Err(e) = self.require_connected_parent(&current_tip, &pre.hash, pre.height) {
             phases.enter(ConnectPhase::Idle);
             return Err(e);
         }
@@ -5228,8 +5267,11 @@ impl ChainState {
         // against the same coins the connect thread will validate).
         let use_noop = self.should_skip_scripts(pre.height, &pre.hash);
         let noop = NoopVerifier;
-        let base_verifier: &dyn ScriptVerifier =
-            if use_noop { &noop } else { &*self.script_verifier };
+        let base_verifier: &dyn ScriptVerifier = if use_noop {
+            &noop
+        } else {
+            &*self.script_verifier
+        };
 
         // Connect block using the pre-fetched data.
         // Wins: flat file I/O eliminated, cache warmed, pre-verified scripts skipped.
@@ -5517,7 +5559,8 @@ impl ChainState {
     /// caller sees "unavailable", never a block whose recomputed txids are
     /// wrong.
     pub fn get_block(&self, hash: &BlockHash) -> Option<Block> {
-        self.get_stored_block(hash).and_then(StoredBlock::into_intact)
+        self.get_stored_block(hash)
+            .and_then(StoredBlock::into_intact)
     }
 
     /// Report a live `block_index` entry whose block data is unusable.
@@ -5638,7 +5681,9 @@ impl ChainState {
 
     /// The raw bytes of the block record at `pos`, xor-decoded.
     fn read_block_bytes_direct(&self, pos: &FlatFilePos) -> Option<Vec<u8>> {
-        let path = self.blocks_dir.join(format!("blk{:05}.dat", pos.file_number));
+        let path = self
+            .blocks_dir
+            .join(format!("blk{:05}.dat", pos.file_number));
         let mut file = match std::fs::File::open(&path) {
             Ok(f) => f,
             Err(e) => {
@@ -5656,7 +5701,11 @@ impl ChainState {
             tracing::warn!(file = %path.display(), pos = pos.data_pos, "read_block_direct: header read failed: {}", e);
             return None;
         }
-        crate::storage::flatfile::xor_in_place(&mut header, &self.blocks_xor_key, pos.data_pos as u64);
+        crate::storage::flatfile::xor_in_place(
+            &mut header,
+            &self.blocks_xor_key,
+            pos.data_pos as u64,
+        );
         let size = u32::from_le_bytes([header[4], header[5], header[6], header[7]]) as usize;
         if size == 0 || size > 4_000_000 {
             tracing::warn!(file = %path.display(), pos = pos.data_pos, size, "read_block_direct: invalid block size");
@@ -5667,7 +5716,11 @@ impl ChainState {
             tracing::warn!(file = %path.display(), pos = pos.data_pos, size, "read_block_direct: data read failed: {}", e);
             return None;
         }
-        crate::storage::flatfile::xor_in_place(&mut data, &self.blocks_xor_key, pos.data_pos as u64 + 8);
+        crate::storage::flatfile::xor_in_place(
+            &mut data,
+            &self.blocks_xor_key,
+            pos.data_pos as u64 + 8,
+        );
         Some(data)
     }
 
@@ -5775,12 +5828,9 @@ impl ChainState {
 
         // Difficulty check
         let store_ref = &*self.store;
-        validation::pow::check_difficulty(
-            &block.header,
-            &parent,
-            self.network,
-            |h| store_ref.get_block_index(h),
-        )?;
+        validation::pow::check_difficulty(&block.header, &parent, self.network, |h| {
+            store_ref.get_block_index(h)
+        })?;
 
         // A block that arrives without its header accepted first is held to
         // the header rule `AcceptBlockHeader` would have applied to it; one
@@ -5847,7 +5897,11 @@ impl ChainState {
     /// `store_block`'s second half: index a staged block under the accept
     /// lock.
     fn commit_block_store(&self, staged: StagedBlockStore) -> Result<(BlockHash, u32), ChainError> {
-        let StagedBlockStore { hash: block_hash, entry, _pending: pending } = staged;
+        let StagedBlockStore {
+            hash: block_hash,
+            entry,
+            _pending: pending,
+        } = staged;
         let new_height = entry.height;
         let mut batch = crate::storage::StoreBatch::default();
         // Write height_hash so the forward connect loop can find this block even
@@ -5916,7 +5970,8 @@ impl ChainState {
             // synced its bytes. Held before the height row is written, so a
             // reader that finds the height finds the entry.
             let fresh = self.store.get_block_index(&block_hash).is_none();
-            self.store.hold_block_row(block_hash, entry.clone(), pending);
+            self.store
+                .hold_block_row(block_hash, entry.clone(), pending);
             if let Err(e) = self.write_chain_batch(batch) {
                 // The store failed: leave the block unindexed, as a failed
                 // batch did when the entry was part of it.
@@ -6171,9 +6226,7 @@ impl ChainState {
             "Repaired block data from a peer-supplied copy"
         );
 
-        Ok(BlockDataRepair::Repaired {
-            height,
-        })
+        Ok(BlockDataRepair::Repaired { height })
     }
 
     /// Record a failed connect of a stored block against it, as `accept_block`
@@ -6354,7 +6407,11 @@ impl ChainState {
         // Determine script verifier
         let use_noop = self.should_skip_scripts(entry.height, hash);
         let noop = NoopVerifier;
-        let verifier: &dyn ScriptVerifier = if use_noop { &noop } else { &*self.script_verifier };
+        let verifier: &dyn ScriptVerifier = if use_noop {
+            &noop
+        } else {
+            &*self.script_verifier
+        };
 
         // Connect block
         let mtp = self.median_time_past_for_connect(entry.height)?;
@@ -6675,7 +6732,10 @@ impl ChainState {
             if let Some(p) = &progress {
                 p.set_current(height as u64);
             }
-            tracing::info!(height, "Chainstate rebuild stopped on request, flushed at this height");
+            tracing::info!(
+                height,
+                "Chainstate rebuild stopped on request, flushed at this height"
+            );
             Ok(true)
         };
         let result = (|| -> Result<bool, ChainError> {
@@ -6992,8 +7052,11 @@ impl ChainState {
         self.check_signet_solution(&pre.block)?;
         let use_noop = self.should_skip_scripts(pre.height, &pre.hash);
         let noop = NoopVerifier;
-        let verifier: &dyn ScriptVerifier =
-            if use_noop { &noop } else { &*self.script_verifier };
+        let verifier: &dyn ScriptVerifier = if use_noop {
+            &noop
+        } else {
+            &*self.script_verifier
+        };
         let pre_verified = if pre.script_verified_txs.is_empty() {
             None
         } else {
@@ -7091,8 +7154,11 @@ impl ChainState {
 
         let use_noop = self.should_skip_scripts(height, &hash);
         let noop = NoopVerifier;
-        let verifier: &dyn ScriptVerifier =
-            if use_noop { &noop } else { &*self.script_verifier };
+        let verifier: &dyn ScriptVerifier = if use_noop {
+            &noop
+        } else {
+            &*self.script_verifier
+        };
 
         // Resolve MTP through the plan, exactly as the prefetch path does.
         //
@@ -7132,7 +7198,6 @@ impl ChainState {
         self.set_tip(hash, height);
         Ok(())
     }
-
 
     /// Plan the replay of a from-genesis reindex over the block tree built by
     /// the phase-1 flat-file scan.
@@ -7529,7 +7594,10 @@ impl ChainState {
         if let Some(p) = &progress {
             p.set_phase("reindex_scan", "Scanning block files (phase 1/2)");
         }
-        tracing::info!(resume, "Phase 1: scanning the block files for block headers");
+        tracing::info!(
+            resume,
+            "Phase 1: scanning the block files for block headers"
+        );
         let mut header_by_hash: HashMap<BlockHash, HeaderRef> = HashMap::new();
         let mut children: HashMap<BlockHash, Vec<BlockHash>> = HashMap::new();
         let mut scanned: u64 = 0;
@@ -7573,7 +7641,8 @@ impl ChainState {
                     // does not meet is rejected, and an easier one only lowers
                     // its own score. The target must also be one the network
                     // allows (`powLimit`), as in `accept_header`.
-                    if validation::pow::check_proof_of_work_bounded(&header, self.network).is_err() {
+                    if validation::pow::check_proof_of_work_bounded(&header, self.network).is_err()
+                    {
                         tracing::warn!(
                             block = %hash,
                             "reindex: flat-file record fails proof of work; not indexing it"
@@ -7662,7 +7731,13 @@ impl ChainState {
             genesis_hash,
             &bitcoin::constants::genesis_block(self.network).header,
             &|hash, header, parent, ancestor| {
-                self.check_reindex_header(hash, header, parent, ancestor, checkpoint_chain.as_deref())
+                self.check_reindex_header(
+                    hash,
+                    header,
+                    parent,
+                    ancestor,
+                    checkpoint_chain.as_deref(),
+                )
             },
         );
         drop(checkpoint_chain);
@@ -7864,7 +7939,11 @@ impl ChainState {
                 p.set_current((resume_from + connected) as u64);
             }
             let height = self.tip_height();
-            tracing::info!(connected, height, "Reindex stopped on request, flushed at this height");
+            tracing::info!(
+                connected,
+                height,
+                "Reindex stopped on request, flushed at this height"
+            );
             Ok(FlatFileReindexEnd::Stopped { height })
         };
         let stop_requested = || self.replay_stop_requested();
@@ -7940,8 +8019,11 @@ impl ChainState {
 
             let use_noop = self.should_skip_scripts(height, &hash);
             let noop = NoopVerifier;
-            let verifier: &dyn ScriptVerifier =
-                if use_noop { &noop } else { &*self.script_verifier };
+            let verifier: &dyn ScriptVerifier = if use_noop {
+                &noop
+            } else {
+                &*self.script_verifier
+            };
 
             let mtp = self.median_time_past_for_connect(height)?;
             let batch = match connect::connect_block(&connect::ConnectParams {
@@ -8207,7 +8289,9 @@ impl ChainState {
                 return fail(format!("block {hash} at height {h} was not scanned"));
             };
             let Some(entry) = self.store.get_block_index(hash) else {
-                return fail(format!("block {hash} at height {h} is not in the block index"));
+                return fail(format!(
+                    "block {hash} at height {h} is not in the block index"
+                ));
             };
             chainwork = add_u256(&chainwork, &work_for_bits(file.header.bits));
             if entry.height != h
@@ -8227,8 +8311,16 @@ impl ChainState {
                     entry.data_pos,
                     file.pos.file_number,
                     file.pos.data_pos,
-                    if entry.header == file.header { "matches" } else { "differs" },
-                    if entry.chainwork == chainwork { "matches" } else { "differs" },
+                    if entry.header == file.header {
+                        "matches"
+                    } else {
+                        "differs"
+                    },
+                    if entry.chainwork == chainwork {
+                        "matches"
+                    } else {
+                        "differs"
+                    },
                 ));
             }
             if let Some(p) = progress
@@ -8292,7 +8384,8 @@ impl ChainState {
         let mut indexed = 0u64;
         let mut skipped = 0u64;
         // Side blocks left unindexed, whose children must stay unindexed too.
-        let mut not_indexed: std::collections::HashSet<BlockHash> = std::collections::HashSet::new();
+        let mut not_indexed: std::collections::HashSet<BlockHash> =
+            std::collections::HashSet::new();
         for (hash, height, work) in side {
             let Some(entry) = header_by_hash.get(hash) else {
                 skipped += 1;
@@ -8455,7 +8548,9 @@ impl ChainState {
             None => TemplateVerdict::Superseded,
             Some(Ok(None)) => TemplateVerdict::Valid,
             // The tip moved before the check started.
-            Some(Ok(Some(reason))) if reason == "inconclusive-not-best-prevblk" => TemplateVerdict::Superseded,
+            Some(Ok(Some(reason))) if reason == "inconclusive-not-best-prevblk" => {
+                TemplateVerdict::Superseded
+            }
             Some(Ok(Some(reason))) => TemplateVerdict::Invalid(reason),
             // An internal error (a missing parent entry) is not a verdict on
             // the template.
@@ -8488,9 +8583,7 @@ impl ChainState {
                     BlockStatus::Invalid => "duplicate-invalid",
                     // Header-only or stored-but-unvalidated: the node knows
                     // the block but has not decided about its contents.
-                    BlockStatus::HeaderOnly | BlockStatus::DataStored => {
-                        "duplicate-inconclusive"
-                    }
+                    BlockStatus::HeaderOnly | BlockStatus::DataStored => "duplicate-inconclusive",
                 }
                 .to_string(),
             ));
@@ -8503,7 +8596,9 @@ impl ChainState {
             return Ok(Some("inconclusive-not-best-prevblk".to_string()));
         }
 
-        let parent = self.store.get_block_index(&tip_hash)
+        let parent = self
+            .store
+            .get_block_index(&tip_hash)
             .ok_or(ChainError::BadPrevBlock)?;
         let height = parent.height + 1;
 
@@ -8515,21 +8610,18 @@ impl ChainState {
 
         // Difficulty bits must match the expected value.
         let store_ref = &*self.store;
-        if let Err(e) = validation::pow::check_difficulty(
-            &block.header,
-            &parent,
-            self.network,
-            |h| store_ref.get_block_index(h),
-        ) {
+        if let Err(e) =
+            validation::pow::check_difficulty(&block.header, &parent, self.network, |h| {
+                store_ref.get_block_index(h)
+            })
+        {
             return Ok(Some(e.to_string()));
         }
 
         // Timestamp checks: MTP (time-too-old) and future (time-too-new).
-        if let Err(e) = validation::pow::check_timestamp(
-            &block.header,
-            &parent,
-            |h| store_ref.get_block_index(h),
-        ) {
+        if let Err(e) = validation::pow::check_timestamp(&block.header, &parent, |h| {
+            store_ref.get_block_index(h)
+        }) {
             return Ok(Some(e.to_string()));
         }
         if let Err(e) = validation::pow::check_future_timestamp(&block.header, unix_now_secs()) {
@@ -8571,7 +8663,10 @@ impl ChainState {
             block,
             height,
             parent_chainwork: &parent.chainwork,
-            flat_pos: crate::storage::flatfile::FlatFilePos { file_number: 0, data_pos: 0 },
+            flat_pos: crate::storage::flatfile::FlatFilePos {
+                file_number: 0,
+                data_pos: 0,
+            },
             script_verifier,
             median_time_past: mtp,
             network: self.network,
@@ -8635,9 +8730,10 @@ impl ChainState {
 
         // Check for duplicate (HeaderOnly entries are OK — we're now providing data)
         if let Some(existing) = self.store.get_block_index(&block_hash)
-            && existing.status != BlockStatus::HeaderOnly {
-                return Err(ChainError::Duplicate);
-            }
+            && existing.status != BlockStatus::HeaderOnly
+        {
+            return Err(ChainError::Duplicate);
+        }
 
         // Find parent
         let prev_hash = block.header.prev_blockhash;
@@ -8697,12 +8793,9 @@ impl ChainState {
 
         // Difficulty check
         let store_ref = &*self.store;
-        validation::pow::check_difficulty(
-            &block.header,
-            &parent,
-            self.network,
-            |h| store_ref.get_block_index(h),
-        )?;
+        validation::pow::check_difficulty(&block.header, &parent, self.network, |h| {
+            store_ref.get_block_index(h)
+        })?;
 
         // A block that arrives without its header accepted first is held to
         // the header rule `AcceptBlockHeader` would have applied to it; one
@@ -8851,7 +8944,9 @@ impl ChainState {
             // the arrival order before anything can consult the tie-break.
             let newly_connectable = self.note_block_data_arrived(block_hash, &entry);
 
-            let tip_entry = self.store.get_block_index(&current_tip)
+            let tip_entry = self
+                .store
+                .get_block_index(&current_tip)
                 .ok_or(ChainError::BadPrevBlock)?;
 
             // Core's `FindMostWorkChain`: of the chains whose every block has
@@ -8915,7 +9010,11 @@ impl ChainState {
                 // As at the end of the connect below: a block that arrived
                 // without its header announced first (`submitblock`) must not
                 // leave the tip out-working the best header.
-                self.update_best_header(target.header.block_hash(), target.chainwork, target.height);
+                self.update_best_header(
+                    target.header.block_hash(),
+                    target.chainwork,
+                    target.height,
+                );
                 return Ok(
                     if self.active_chain_hash_at_height(new_height) == Some(block_hash) {
                         BlockAcceptance::Connected(block_hash)
@@ -9034,7 +9133,11 @@ impl ChainState {
                     })?;
                     side_failed_at = Some((*side_hash, side_entry.height));
                     let side_block = self.get_block(side_hash).ok_or_else(|| {
-                        self.reorg_read_error(side_hash, side_entry.height, "block data missing for reorg connect")
+                        self.reorg_read_error(
+                            side_hash,
+                            side_entry.height,
+                            "block data missing for reorg connect",
+                        )
                     })?;
                     let parent_entry = self
                         .store
@@ -9059,8 +9162,11 @@ impl ChainState {
                     )?;
                     let use_noop = self.should_skip_scripts(side_entry.height, side_hash);
                     let noop = NoopVerifier;
-                    let verifier: &dyn ScriptVerifier =
-                        if use_noop { &noop } else { &*self.script_verifier };
+                    let verifier: &dyn ScriptVerifier = if use_noop {
+                        &noop
+                    } else {
+                        &*self.script_verifier
+                    };
                     let mtp = self.median_time_past_for_connect(side_entry.height)?;
                     let side_flat_pos = FlatFilePos {
                         file_number: side_entry.file_number,
@@ -9082,8 +9188,8 @@ impl ChainState {
                         script_skip_txs: None,
                         address_index: &self.address_index,
                         sp_index: &self.sp_index,
-            #[cfg(feature = "block-filter-index")]
-            filter_index: &self.filter_index,
+                        #[cfg(feature = "block-filter-index")]
+                        filter_index: &self.filter_index,
                         phase_tracker: None,
                         interrupt: None,
                     })
@@ -9219,7 +9325,11 @@ impl ChainState {
         // Determine script verifier: skip if below assumevalid height
         let use_noop = self.should_skip_scripts(new_height, &block_hash);
         let noop = NoopVerifier;
-        let verifier: &dyn ScriptVerifier = if use_noop { &noop } else { &*self.script_verifier };
+        let verifier: &dyn ScriptVerifier = if use_noop {
+            &noop
+        } else {
+            &*self.script_verifier
+        };
 
         // Connect block (process transactions, update UTXOs, verify scripts).
         // If the triggering block fails inside an in-progress reorg, roll
@@ -9229,27 +9339,29 @@ impl ChainState {
         // window this node cannot read fails the same way, as a connect
         // failure that is not a verdict on the block.
         let mtp = self.median_time_past_for_connect(new_height);
-        let connect_attempt = mtp.and_then(|mtp| connect::connect_block(&connect::ConnectParams {
-            replay_plan: None,
-            store: &*self.store,
-            block,
-            height: new_height,
-            parent_chainwork: &parent.chainwork,
-            flat_pos,
-            script_verifier: verifier,
-            median_time_past: mtp,
-            network: self.network,
-            pre_verified_txs: None,
-            num_threads: self.num_threads,
-            precomputed_txids: None,
-            script_skip_txs: None,
-            address_index: &self.address_index,
-            sp_index: &self.sp_index,
-            #[cfg(feature = "block-filter-index")]
-            filter_index: &self.filter_index,
-            phase_tracker: None,
-            interrupt: None,
-        }));
+        let connect_attempt = mtp.and_then(|mtp| {
+            connect::connect_block(&connect::ConnectParams {
+                replay_plan: None,
+                store: &*self.store,
+                block,
+                height: new_height,
+                parent_chainwork: &parent.chainwork,
+                flat_pos,
+                script_verifier: verifier,
+                median_time_past: mtp,
+                network: self.network,
+                pre_verified_txs: None,
+                num_threads: self.num_threads,
+                precomputed_txids: None,
+                script_skip_txs: None,
+                address_index: &self.address_index,
+                sp_index: &self.sp_index,
+                #[cfg(feature = "block-filter-index")]
+                filter_index: &self.filter_index,
+                phase_tracker: None,
+                interrupt: None,
+            })
+        });
         let batch = match connect_attempt {
             Ok(b) => b,
             Err(e) => {
@@ -9424,12 +9536,10 @@ impl ChainState {
                 });
             }
             for (hash, height) in &pending.original_disconnected {
-                self.emit_chain_event(
-                    crate::chain::events::ChainEvent::BlockDisconnected {
-                        hash: *hash,
-                        height: *height,
-                    },
-                );
+                self.emit_chain_event(crate::chain::events::ChainEvent::BlockDisconnected {
+                    hash: *hash,
+                    height: *height,
+                });
             }
             for (side_block, side_height) in &pending.reconnected_blocks {
                 self.emit_chain_event(crate::chain::events::ChainEvent::BlockConnected {
@@ -9691,15 +9801,18 @@ impl ChainState {
                 break;
             }
 
-            let entry = self.store.get_block_index(&current)
+            let entry = self
+                .store
+                .get_block_index(&current)
                 .ok_or(ChainError::BadPrevBlock)?;
 
             let block = self.get_block(&current).ok_or_else(|| {
                 self.reorg_read_error(&current, entry.height, "block data missing for reorg")
             })?;
 
-            let undo = self.store.get_undo(&current)
-                .ok_or(ChainError::FlatFile("undo data missing for reorg".to_string()))?;
+            let undo = self.store.get_undo(&current).ok_or(ChainError::FlatFile(
+                "undo data missing for reorg".to_string(),
+            ))?;
 
             let prev_hash = entry.header.prev_blockhash;
             // The ordinal this block's first transaction took. `chain_tx`
@@ -9722,17 +9835,17 @@ impl ChainState {
                     })?
             };
             let batch = disconnect::disconnect_block(&disconnect::DisconnectParams {
-            store: &*self.store,
-            block: &block,
-            undo: &undo,
-            block_height: entry.height,
-            prev_hash,
-            first_txseq,
-            address_index: &self.address_index,
-            #[cfg(feature = "block-filter-index")]
-            filter_index: &self.filter_index,
-            sp_index: &self.sp_index,
-        })?;
+                store: &*self.store,
+                block: &block,
+                undo: &undo,
+                block_height: entry.height,
+                prev_hash,
+                first_txseq,
+                address_index: &self.address_index,
+                #[cfg(feature = "block-filter-index")]
+                filter_index: &self.filter_index,
+                sp_index: &self.sp_index,
+            })?;
             combined_batch.merge(batch);
 
             // Capture non-coinbase txs for mempool re-add, in block
@@ -9870,14 +9983,19 @@ impl ChainState {
         if self.active_chain_contains(&hash, entry.height) {
             let (mut cursor, _) = self.tip_snapshot();
             loop {
-                let e = self.store.get_block_index(&cursor).ok_or(ChainError::BadPrevBlock)?;
+                let e = self
+                    .store
+                    .get_block_index(&cursor)
+                    .ok_or(ChainError::BadPrevBlock)?;
                 if e.height < entry.height {
                     break;
                 }
                 // A record that cannot be read refuses too: the marks would
                 // otherwise land before the disconnect hit the same fault.
                 if self.store.get_opreturn_strip(&cursor)?.is_some() {
-                    return Err(ChainError::InvalidArgument(stripped_block_message_for(self, &cursor, e.height)));
+                    return Err(ChainError::InvalidArgument(stripped_block_message_for(
+                        self, &cursor, e.height,
+                    )));
                 }
                 cursor = e.header.prev_blockhash;
             }
@@ -9933,29 +10051,31 @@ impl ChainState {
         // one-line `bad-txns-inputs-missingorspent` from this call.
         // The truncation's failure is the same partial success: the marks
         // are durable either way.
-        truncate_to_parent().and_then(|()| self.activate_best_chain()).map_err(|e| {
-            tracing::error!(
-                %hash,
-                height = entry.height,
-                error = %e,
-                "invalidateblock: the branch is marked invalid, but re-activating \
-                 the best valid chain failed"
-            );
-            match e {
-                // A deliberate refusal with its own actionable message — the
-                // AssumeUTXO reorg-depth guard is the reachable case — keeps
-                // its variant (and its -8 at the RPC boundary) rather than
-                // being buried in a generic activation failure. The partial-
-                // success context still needs saying: the marks are durable.
-                ChainError::InvalidArgument(msg) => ChainError::InvalidArgument(format!(
-                    "{msg} — the invalidation marks are in place; reconsiderblock undoes them"
-                )),
-                e => ChainError::ReactivationFailed(format!(
-                    "{e}. The node will retry activation as blocks arrive; \
+        truncate_to_parent()
+            .and_then(|()| self.activate_best_chain())
+            .map_err(|e| {
+                tracing::error!(
+                    %hash,
+                    height = entry.height,
+                    error = %e,
+                    "invalidateblock: the branch is marked invalid, but re-activating \
+                     the best valid chain failed"
+                );
+                match e {
+                    // A deliberate refusal with its own actionable message — the
+                    // AssumeUTXO reorg-depth guard is the reachable case — keeps
+                    // its variant (and its -8 at the RPC boundary) rather than
+                    // being buried in a generic activation failure. The partial-
+                    // success context still needs saying: the marks are durable.
+                    ChainError::InvalidArgument(msg) => ChainError::InvalidArgument(format!(
+                        "{msg} — the invalidation marks are in place; reconsiderblock undoes them"
+                    )),
+                    e => ChainError::ReactivationFailed(format!(
+                        "{e}. The node will retry activation as blocks arrive; \
                      reconsiderblock undoes the invalidation."
-                )),
-            }
-        })?;
+                    )),
+                }
+            })?;
 
         // Core's `InvalidateBlock` ends with `RecalculateBestHeader()`. The
         // marks written above are what make the old header tip unreachable, so
@@ -10447,9 +10567,14 @@ impl ChainState {
         // cannot reconnect no matter how much work it carries — which is not
         // what an operator asking to reconsider it means, and leaves the node
         // reporting a header tip it cannot reach.
-        let mut up = self.store.get_block_index(&root).map(|e| e.header.prev_blockhash);
+        let mut up = self
+            .store
+            .get_block_index(&root)
+            .map(|e| e.header.prev_blockhash);
         while let Some(h) = up {
-            let Some(mut e) = self.store.get_block_index(&h) else { break };
+            let Some(mut e) = self.store.get_block_index(&h) else {
+                break;
+            };
             up = (e.height > 0).then_some(e.header.prev_blockhash);
             if e.status == BlockStatus::Invalid {
                 e.status = if e.num_tx == 0 {
@@ -11085,8 +11210,11 @@ impl ChainState {
                 self.require_connected_parent(&e.header.prev_blockhash, h, e.height)?;
                 let use_noop = self.should_skip_scripts(e.height, h);
                 let noop = NoopVerifier;
-                let verifier: &dyn ScriptVerifier =
-                    if use_noop { &noop } else { &*self.script_verifier };
+                let verifier: &dyn ScriptVerifier = if use_noop {
+                    &noop
+                } else {
+                    &*self.script_verifier
+                };
                 let mtp = self.median_time_past_for_connect(e.height)?;
                 let flat_pos = FlatFilePos {
                     file_number: e.file_number,
@@ -11295,7 +11423,10 @@ impl ChainState {
         // files is deleted this round (see below).
         let (append_file_at_plan, pending_at_plan) = {
             let flat_files = self.flat_files.lock();
-            (flat_files.current_file(), flat_files.files_with_pending_records())
+            (
+                flat_files.current_file(),
+                flat_files.files_with_pending_records(),
+            )
         };
 
         // Per file: the highest height of any block whose record is in it,
@@ -11573,7 +11704,10 @@ mod opreturn_strip_tests;
 /// and the D4 rescan fast path). Backed by the same durable rows the connect
 /// path commits atomically with the chainstate.
 impl node_sp_index::SpIndex for ChainState {
-    fn tweaks_at(&self, height: u32) -> Result<node_sp_index::SpBlockRow, node_sp_index::SpIndexError> {
+    fn tweaks_at(
+        &self,
+        height: u32,
+    ) -> Result<node_sp_index::SpBlockRow, node_sp_index::SpIndexError> {
         if !self.sp_index.enabled {
             return Err(node_sp_index::SpIndexError::Disabled);
         }
@@ -11871,10 +12005,7 @@ impl DumpState<'_> {
             // per-coin form; it exists only to match Core's
             // `m_assumeutxo_data.hash_serialized`.
             self.txout_buf.clear();
-            let op = OutPoint {
-                txid,
-                vout: *vout,
-            };
+            let op = OutPoint { txid, vout: *vout };
             cc::write_txout_ser(&mut self.txout_buf, &op, coin).map_err(DumpError::Io)?;
             bitcoin::hashes::HashEngine::input(&mut self.hs3_engine, &self.txout_buf);
 
@@ -11990,7 +12121,10 @@ pub(crate) fn network_magic(network: Network) -> [u8; 4] {
 /// fresh satd or Core datadir writes it: the record's payload must be the
 /// genesis block byte for byte. `None` when the file is missing, unreadable,
 /// or begins with anything else.
-fn genesis_record_on_disk(flat_files: &mut FlatFileManager, genesis: &Block) -> Option<FlatFilePos> {
+fn genesis_record_on_disk(
+    flat_files: &mut FlatFileManager,
+    genesis: &Block,
+) -> Option<FlatFilePos> {
     let pos = FlatFilePos {
         file_number: 0,
         data_pos: 0,
@@ -12180,7 +12314,10 @@ pub(crate) mod tests {
             cs.tip_snapshot()
         });
 
-        assert!(out.is_none(), "a read the chain moved under is not coherent");
+        assert!(
+            out.is_none(),
+            "a read the chain moved under is not coherent"
+        );
         assert_eq!(
             seen.get(),
             COHERENT_READ_ATTEMPTS as u32,
@@ -12203,7 +12340,10 @@ pub(crate) mod tests {
         assert_eq!(cs.view_change(&view), ViewChange::Unchanged);
 
         let guard = cs.begin_chain_mutation();
-        assert!(cs.begin_view().is_none(), "no view while a mutation is open");
+        assert!(
+            cs.begin_view().is_none(),
+            "no view while a mutation is open"
+        );
         assert_eq!(cs.view_change(&view), ViewChange::InFlight);
         drop(guard);
 
@@ -12329,7 +12469,9 @@ pub(crate) mod tests {
     /// re-validates the same chain must reproduce for its handoff to pass.
     pub(crate) fn utxo_anchor(cs: &ChainState) -> [u8; 32] {
         cs.store.flush().unwrap();
-        crate::storage::compressed_coin::hash_utxo_set(&*cs.store).unwrap().0
+        crate::storage::compressed_coin::hash_utxo_set(&*cs.store)
+            .unwrap()
+            .0
     }
 
     pub(crate) fn build_and_connect_chain(cs: &ChainState, n: u32) -> Vec<Block> {
@@ -12416,7 +12558,10 @@ pub(crate) mod tests {
     /// WAL or no WAL, so a row in the backing store is a row that can survive
     /// a power loss. Checks every such row against what the block files have
     /// synced. Genesis is written by the constructor and left out.
-    fn assert_backing_rows_are_synced(cs: &ChainState, sizes: &std::collections::HashMap<BlockHash, u64>) {
+    fn assert_backing_rows_are_synced(
+        cs: &ChainState,
+        sizes: &std::collections::HashMap<BlockHash, u64>,
+    ) {
         let (file, len) = cs.flat_files.lock().synced_through();
         cs.store
             .inner_for_test()
@@ -12446,7 +12591,10 @@ pub(crate) mod tests {
     /// exemption.
     #[test]
     fn a_stored_blocks_row_waits_for_its_bytes_to_be_synced() {
-        for mode in [crate::storage::WriteMode::Normal, crate::storage::WriteMode::BulkLoad] {
+        for mode in [
+            crate::storage::WriteMode::Normal,
+            crate::storage::WriteMode::BulkLoad,
+        ] {
             let (cs, dir) = make_chain_state();
             cs.set_write_mode(mode);
             let genesis = bitcoin::constants::genesis_block(Network::Regtest);
@@ -12455,18 +12603,35 @@ pub(crate) mod tests {
             cs.accept_header(&b1.header).unwrap();
             cs.store_block(&b1).unwrap();
 
-            assert_eq!(cs.store.get_block_index(&hash).unwrap().status, BlockStatus::DataStored);
-            assert!(cs.flat_files.lock().has_unsynced_writes(), "no fsync per stored block");
+            assert_eq!(
+                cs.store.get_block_index(&hash).unwrap().status,
+                BlockStatus::DataStored
+            );
+            assert!(
+                cs.flat_files.lock().has_unsynced_writes(),
+                "no fsync per stored block"
+            );
             assert_ne!(
-                cs.store.inner_for_test().get_block_index(&hash).unwrap().status,
+                cs.store
+                    .inner_for_test()
+                    .get_block_index(&hash)
+                    .unwrap()
+                    .status,
                 BlockStatus::DataStored,
                 "{mode:?}: the row is held while its bytes are unsynced"
             );
 
             cs.store.commit_held_rows().unwrap();
-            assert!(!cs.flat_files.lock().has_unsynced_writes(), "the commit synced the file");
+            assert!(
+                !cs.flat_files.lock().has_unsynced_writes(),
+                "the commit synced the file"
+            );
             assert_eq!(
-                cs.store.inner_for_test().get_block_index(&hash).unwrap().status,
+                cs.store
+                    .inner_for_test()
+                    .get_block_index(&hash)
+                    .unwrap()
+                    .status,
                 BlockStatus::DataStored
             );
             let _ = std::fs::remove_dir_all(&dir);
@@ -12487,14 +12652,25 @@ pub(crate) mod tests {
         let b1 = build_test_block(genesis.block_hash(), 1, 1_300_000_001);
 
         DURABLE_SYNC_PROBE.set(Some(|cs| {
-            SAW.set(if cs.flat_files.try_lock().is_some() { 1 } else { 2 });
+            SAW.set(if cs.flat_files.try_lock().is_some() {
+                1
+            } else {
+                2
+            });
         }));
         let accepted = cs.accept_block(&b1);
         DURABLE_SYNC_PROBE.set(None);
         accepted.unwrap();
 
-        assert_eq!(SAW.get(), 1, "the fsync must run with the flat-file lock free");
-        assert!(!cs.flat_files.lock().has_unsynced_writes(), "the record is synced on return");
+        assert_eq!(
+            SAW.get(),
+            1,
+            "the fsync must run with the flat-file lock free"
+        );
+        assert!(
+            !cs.flat_files.lock().has_unsynced_writes(),
+            "the record is synced on return"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -12525,7 +12701,8 @@ pub(crate) mod tests {
             assert_backing_rows_are_synced(&cs, &sizes);
             // The connector runs a few blocks behind the download.
             while connected + 5 <= i {
-                cs.connect_stored_block(&blocks[connected].block_hash()).unwrap();
+                cs.connect_stored_block(&blocks[connected].block_hash())
+                    .unwrap();
                 connected += 1;
                 assert_backing_rows_are_synced(&cs, &sizes);
             }
@@ -12541,7 +12718,10 @@ pub(crate) mod tests {
         }
         cs.flush_coin_cache().unwrap();
         assert_backing_rows_are_synced(&cs, &sizes);
-        assert!(cs.store.held_row_count() < blocks.len(), "rows were committed along the way");
+        assert!(
+            cs.store.held_row_count() < blocks.len(),
+            "rows were committed along the way"
+        );
 
         // Power loss: the unsynced tail goes. Every row the backing store has
         // must still read back its block.
@@ -12556,9 +12736,15 @@ pub(crate) mod tests {
                 {
                     return;
                 }
-                let pos = FlatFilePos { file_number: entry.file_number, data_pos: entry.data_pos };
+                let pos = FlatFilePos {
+                    file_number: entry.file_number,
+                    data_pos: entry.data_pos,
+                };
                 let bytes = flat.read_block(&pos).unwrap_or_else(|e| {
-                    panic!("height {}: the row survived, its bytes did not: {e}", entry.height)
+                    panic!(
+                        "height {}: the row survived, its bytes did not: {e}",
+                        entry.height
+                    )
                 });
                 let block: Block = bitcoin::consensus::deserialize(&bytes).unwrap();
                 assert_eq!(block.block_hash(), hash);
@@ -12602,9 +12788,16 @@ pub(crate) mod tests {
             let read = rx.recv_timeout(std::time::Duration::from_secs(2));
             drop(flat);
             flush.join().unwrap().unwrap();
-            assert!(read.is_ok(), "the pruner's read waited on a flush that waited on the pruner");
+            assert!(
+                read.is_ok(),
+                "the pruner's read waited on a flush that waited on the pruner"
+            );
         });
-        assert_eq!(cs.store.held_row_count(), 0, "the flush committed the held row");
+        assert_eq!(
+            cs.store.held_row_count(),
+            0,
+            "the flush committed the held row"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -12627,10 +12820,20 @@ pub(crate) mod tests {
         let mut batch = crate::storage::StoreBatch::default();
         batch.block_index_puts.push((hash, header_only));
         cs.store.write_batch(batch).unwrap();
-        assert_eq!(cs.store.get_block_index(&hash).unwrap().status, BlockStatus::DataStored);
+        assert_eq!(
+            cs.store.get_block_index(&hash).unwrap().status,
+            BlockStatus::DataStored
+        );
 
         cs.store.commit_held_rows().unwrap();
-        assert_eq!(cs.store.inner_for_test().get_block_index(&hash).unwrap().status, BlockStatus::DataStored);
+        assert_eq!(
+            cs.store
+                .inner_for_test()
+                .get_block_index(&hash)
+                .unwrap()
+                .status,
+            BlockStatus::DataStored
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -12650,11 +12853,17 @@ pub(crate) mod tests {
         controls.fail_next_write();
         assert!(cs.store_block(&b1).is_err());
         assert_eq!(cs.store.held_row_count(), 0);
-        assert_eq!(cs.store.get_block_index(&hash).unwrap().status, BlockStatus::HeaderOnly);
+        assert_eq!(
+            cs.store.get_block_index(&hash).unwrap().status,
+            BlockStatus::HeaderOnly
+        );
 
         // And it can be stored again.
         cs.store_block(&b1).unwrap();
-        assert_eq!(cs.store.get_block_index(&hash).unwrap().status, BlockStatus::DataStored);
+        assert_eq!(
+            cs.store.get_block_index(&hash).unwrap().status,
+            BlockStatus::DataStored
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -12699,17 +12908,33 @@ pub(crate) mod tests {
             cs.store_block(b).unwrap();
         }
         cs.store_block(&blocks[31]).unwrap();
-        assert!(!cs.sequence_ids.lock().ids.contains_key(&blocks[31].block_hash()), "32 waits for 31");
+        assert!(
+            !cs.sequence_ids
+                .lock()
+                .ids
+                .contains_key(&blocks[31].block_hash()),
+            "32 waits for 31"
+        );
         cs.store_block(&blocks[30]).unwrap();
         for b in &blocks[32..] {
             cs.store_block(b).unwrap();
         }
 
-        let ids: Vec<i32> = blocks.iter().map(|b| cs.sequence_ids.lock().ids[&b.block_hash()]).collect();
-        assert!(ids.windows(2).all(|w| w[0] < w[1]), "ids run in chain order: {ids:?}");
+        let ids: Vec<i32> = blocks
+            .iter()
+            .map(|b| cs.sequence_ids.lock().ids[&b.block_hash()])
+            .collect();
+        assert!(
+            ids.windows(2).all(|w| w[0] < w[1]),
+            "ids run in chain order: {ids:?}"
+        );
         for b in &blocks {
             let entry = cs.get_block_index(&b.block_hash()).unwrap();
-            assert!(cs.is_connectable(&entry).unwrap(), "height {}: the walk agrees", entry.height);
+            assert!(
+                cs.is_connectable(&entry).unwrap(),
+                "height {}: the walk agrees",
+                entry.height
+            );
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -12723,12 +12948,23 @@ pub(crate) mod tests {
     fn a_prune_flushes_the_chainstate_first() {
         let (cs, dir) = make_chain_state();
         build_and_connect_chain(&cs, 5);
-        assert!(cs.store.dirty_count() > 0, "connected blocks leave dirty coins");
+        assert!(
+            cs.store.dirty_count() > 0,
+            "connected blocks leave dirty coins"
+        );
         assert_ne!(cs.store.inner_for_test().get_tip(), Some(cs.tip_hash()));
 
         cs.prune_up_to(2);
-        assert_eq!(cs.store.dirty_count(), 0, "the prune flushed the coin cache");
-        assert_eq!(cs.store.inner_for_test().get_tip(), Some(cs.tip_hash()), "and the tip with it");
+        assert_eq!(
+            cs.store.dirty_count(),
+            0,
+            "the prune flushed the coin cache"
+        );
+        assert_eq!(
+            cs.store.inner_for_test().get_tip(),
+            Some(cs.tip_hash()),
+            "and the tip with it"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -12751,17 +12987,34 @@ pub(crate) mod tests {
         let mut batch = crate::storage::StoreBatch::default();
         batch.block_index_puts.push((hash, invalid));
         cs.store.write_batch(batch).unwrap();
-        assert_eq!(cs.store.get_block_index(&hash).unwrap().status, BlockStatus::Invalid);
+        assert_eq!(
+            cs.store.get_block_index(&hash).unwrap().status,
+            BlockStatus::Invalid
+        );
         assert_ne!(
-            cs.store.inner_for_test().get_block_index(&hash).unwrap().status,
+            cs.store
+                .inner_for_test()
+                .get_block_index(&hash)
+                .unwrap()
+                .status,
             BlockStatus::Invalid,
             "the newer row waits for the sync too"
         );
 
         cs.store.commit_held_rows().unwrap();
-        assert_eq!(cs.store.inner_for_test().get_block_index(&hash).unwrap().status, BlockStatus::Invalid);
+        assert_eq!(
+            cs.store
+                .inner_for_test()
+                .get_block_index(&hash)
+                .unwrap()
+                .status,
+            BlockStatus::Invalid
+        );
         cs.store.drop_read_overlays();
-        assert_eq!(cs.store.get_block_index(&hash).unwrap().status, BlockStatus::Invalid);
+        assert_eq!(
+            cs.store.get_block_index(&hash).unwrap().status,
+            BlockStatus::Invalid
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -12782,7 +13035,11 @@ pub(crate) mod tests {
         // witness. This is what a hostile peer could have planted.
         let mut forged = target.clone();
         forged.txdata[0].input[0].witness.push([0xde; 64]);
-        assert_eq!(forged.block_hash(), hash, "the forgery must be hash-invisible");
+        assert_eq!(
+            forged.block_hash(),
+            hash,
+            "the forgery must be hash-invisible"
+        );
         assert_ne!(serialize(&forged), serialize(&target));
         overwrite_block_record(&cs, &dir, &hash, &forged);
 
@@ -12884,10 +13141,7 @@ pub(crate) mod tests {
         punch_block_data_hole(&cs, &dir, &hash);
 
         let outcome = cs.repair_block_data(&target).expect("repair must succeed");
-        assert_eq!(
-            outcome,
-            BlockDataRepair::Repaired { height: 2 }
-        );
+        assert_eq!(outcome, BlockDataRepair::Repaired { height: 2 });
 
         // The block reads back byte-identically, and the entry was repointed
         // without disturbing anything else about it.
@@ -13204,7 +13458,9 @@ pub(crate) mod tests {
         // The malleated twin: duplicate the trailing transaction. Same merkle
         // root, therefore the same header and the same block hash.
         let mut malleated = honest.clone();
-        malleated.txdata.push(malleated.txdata.last().unwrap().clone());
+        malleated
+            .txdata
+            .push(malleated.txdata.last().unwrap().clone());
         assert_eq!(
             malleated.block_hash(),
             honest.block_hash(),
@@ -13311,7 +13567,10 @@ pub(crate) mod tests {
         let b6 = build_test_block(tip, 6, 1_500_000_006);
         assert_ne!(b6.block_hash(), a6.block_hash());
         cs.accept_header(&b6.header).unwrap();
-        assert!(cs.get_block_index(&b6.block_hash()).is_some(), "still known by hash");
+        assert!(
+            cs.get_block_index(&b6.block_hash()).is_some(),
+            "still known by hash"
+        );
         assert_eq!(
             cs.get_block_hash_by_height(6),
             Some(a6.block_hash()),
@@ -13360,7 +13619,11 @@ pub(crate) mod tests {
         assert_eq!(cs.get_block_hash_by_height(6), Some(b6.block_hash()));
         assert_eq!(cs.get_block_hash_by_height(7), Some(b7.block_hash()));
         assert_eq!(cs.get_block_hash_by_height(8), Some(b8.block_hash()));
-        assert_eq!(cs.get_block_hash_by_height(5), Some(tip), "connected chain untouched");
+        assert_eq!(
+            cs.get_block_hash_by_height(5),
+            Some(tip),
+            "connected chain untouched"
+        );
         let mut changes = cs.take_header_row_changes();
         changes.sort();
         assert_eq!(
@@ -13451,9 +13714,16 @@ pub(crate) mod tests {
         let (accepted, err) = cs.accept_headers(&fork);
         assert!(err.is_none(), "{err:?}");
         assert_eq!(accepted, 10);
-        assert!(cs.get_block_index(&parent).is_some(), "stored: no work threshold in this PR");
+        assert!(
+            cs.get_block_index(&parent).is_some(),
+            "stored: no work threshold in this PR"
+        );
         assert_eq!(cs.best_header_hash(), tip);
-        assert_eq!(cs.headers_tip_height(), 3, "a low-work header chain raised the header tip");
+        assert_eq!(
+            cs.headers_tip_height(),
+            3,
+            "a low-work header chain raised the header tip"
+        );
 
         // One header on the reweighted tip out-works the fork.
         let b4 = build_test_block(tip, 4, 1_500_000_004);
@@ -13492,8 +13762,16 @@ pub(crate) mod tests {
         let b4 = build_test_block(tip, 4, 1_500_000_004);
         cs.accept_header(&b4.header).unwrap();
         assert_eq!(cs.best_header_hash(), b4.block_hash());
-        assert_eq!(cs.headers_tip_height(), 4, "the header tip stayed on the lighter, taller chain");
-        assert_eq!(cs.get_block_hash_by_height(5), None, "rows above the new best are dropped");
+        assert_eq!(
+            cs.headers_tip_height(),
+            4,
+            "the header tip stayed on the lighter, taller chain"
+        );
+        assert_eq!(
+            cs.get_block_hash_by_height(5),
+            None,
+            "rows above the new best are dropped"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -13523,7 +13801,11 @@ pub(crate) mod tests {
         assert_eq!(cs.get_block_hash_by_height(6), Some(a6.block_hash()));
         assert_eq!(cs.get_block_hash_by_height(7), Some(a7.block_hash()));
         assert_eq!(cs.get_block_hash_by_height(5), Some(tip));
-        assert_eq!(cs.repair_header_rows_above_tip().unwrap(), (0, 0), "idempotent");
+        assert_eq!(
+            cs.repair_header_rows_above_tip().unwrap(),
+            (0, 0),
+            "idempotent"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -13548,7 +13830,10 @@ pub(crate) mod tests {
         assert_eq!(cs.get_block_hash_by_height(8), None);
         assert_eq!(cs.get_block_hash_by_height(6), Some(a6.block_hash()));
         for (i, b) in blocks.iter().enumerate() {
-            assert_eq!(cs.get_block_hash_by_height(i as u32 + 1), Some(b.block_hash()));
+            assert_eq!(
+                cs.get_block_hash_by_height(i as u32 + 1),
+                Some(b.block_hash())
+            );
         }
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -13570,7 +13855,11 @@ pub(crate) mod tests {
         drop_height_hash(&cs, 4);
         let (_, err) = cs.accept_headers(&[b4.header]);
         assert!(err.is_none(), "{err:?}");
-        assert_eq!(cs.get_block_hash_by_height(4), Some(b4.block_hash()), "the resume row is restored");
+        assert_eq!(
+            cs.get_block_hash_by_height(4),
+            Some(b4.block_hash()),
+            "the resume row is restored"
+        );
 
         // Side blocks at the tip's height and below it, stored, with the
         // rows at those heights gone.
@@ -13585,8 +13874,16 @@ pub(crate) mod tests {
         let (_, err) = cs.accept_headers(&[s3.header, s2.header]);
         assert!(err.is_none(), "{err:?}");
         assert_eq!(cs.tip_hash(), tip, "premise: the tip did not move");
-        assert_eq!(cs.get_block_hash_by_height(3), None, "a side block never takes the tip's slot");
-        assert_eq!(cs.get_block_hash_by_height(2), None, "nor a slot below the tip");
+        assert_eq!(
+            cs.get_block_hash_by_height(3),
+            None,
+            "a side block never takes the tip's slot"
+        );
+        assert_eq!(
+            cs.get_block_hash_by_height(2),
+            None,
+            "nor a slot below the tip"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -13599,7 +13896,10 @@ pub(crate) mod tests {
         let (cs, dir) = make_chain_state();
         let blocks = build_and_connect_chain(&cs, 3);
         let b4 = build_test_block(blocks[2].block_hash(), 4, 1_400_000_004);
-        assert!(cs.get_block_index(&b4.block_hash()).is_none(), "premise: header never accepted");
+        assert!(
+            cs.get_block_index(&b4.block_hash()).is_none(),
+            "premise: header never accepted"
+        );
         cs.store_block(&b4).unwrap();
         assert_eq!(cs.get_block_hash_by_height(4), Some(b4.block_hash()));
         assert_eq!(cs.next_block_to_connect(4), Some(b4.block_hash()));
@@ -13657,7 +13957,10 @@ pub(crate) mod tests {
         // Re-announce the disconnected block's header: the repair branch sees a
         // Valid (not DataStored) block and must leave the mapping absent.
         let (_accepted, err) = cs.accept_headers(&[blocks[4].header]);
-        assert!(err.is_none(), "re-announcing a known header should not error: {err:?}");
+        assert!(
+            err.is_none(),
+            "re-announcing a known header should not error: {err:?}"
+        );
         assert_eq!(
             cs.get_block_hash_by_height(5),
             None,
@@ -13701,7 +14004,10 @@ pub(crate) mod tests {
             drop(guard);
         });
 
-        assert!(done.load(Ordering::SeqCst), "accept_header completes once the lock is free");
+        assert!(
+            done.load(Ordering::SeqCst),
+            "accept_header completes once the lock is free"
+        );
         assert_eq!(
             cs.get_block_hash_by_height(4),
             Some(h4_hash),
@@ -13795,7 +14101,10 @@ pub(crate) mod tests {
         // tx count. Verify per height against an independent running sum.
         let genesis = bitcoin::constants::genesis_block(Network::Regtest);
         let mut expected = genesis.txdata.len() as u64;
-        assert_eq!(cs.cumulative_tx_count(&genesis.block_hash()), Some(expected));
+        assert_eq!(
+            cs.cumulative_tx_count(&genesis.block_hash()),
+            Some(expected)
+        );
         for (i, b) in blocks.iter().enumerate() {
             expected += b.txdata.len() as u64;
             assert_eq!(
@@ -13943,7 +14252,11 @@ pub(crate) mod tests {
             cs.store_block(blk).unwrap();
         }
         cs.invalidate_block(main3).unwrap();
-        assert_eq!(cs.tip_hash(), first.block_hash(), "arrival order picks first");
+        assert_eq!(
+            cs.tip_hash(),
+            first.block_hash(),
+            "arrival order picks first"
+        );
 
         cs.precious_block(second.block_hash()).unwrap();
         assert_eq!(
@@ -14054,9 +14367,8 @@ pub(crate) mod tests {
             cs.invalidate_block(genesis),
             Err(ChainError::InvalidArgument(_))
         ));
-        let bogus = BlockHash::from_raw_hash(
-            bitcoin::hashes::sha256d::Hash::from_byte_array([7u8; 32]),
-        );
+        let bogus =
+            BlockHash::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array([7u8; 32]));
         assert!(matches!(
             cs.invalidate_block(bogus),
             Err(ChainError::BlockNotFound)
@@ -14102,7 +14414,11 @@ pub(crate) mod tests {
         let side = build_test_block(block1, 2, 1_700_000_222);
         cs.accept_header(&side.header).unwrap();
         cs.store_block(&side).unwrap();
-        assert_eq!(cs.tip_hash(), main_tip, "side store does not change the tip");
+        assert_eq!(
+            cs.tip_hash(),
+            main_tip,
+            "side store does not change the tip"
+        );
 
         // Invalidating a side-chain block must not touch the active chain.
         cs.invalidate_block(side.block_hash()).unwrap();
@@ -14415,7 +14731,11 @@ pub(crate) mod tests {
         }
         // #977: the failed activation leaves the node on a1's parent, not
         // back on a2, which it has just marked invalid.
-        assert_eq!(cs.tip_hash(), base_tip, "the tip must fall back to the invalidated block's parent");
+        assert_eq!(
+            cs.tip_hash(),
+            base_tip,
+            "the tip must fall back to the invalidated block's parent"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -14443,7 +14763,10 @@ pub(crate) mod tests {
 
         // A heavier branch whose second block spends a coin that does not
         // exist: it is stored, and fails when the re-activation connects it.
-        let missing = bitcoin::OutPoint { txid: bitcoin::Txid::from_byte_array([7; 32]), vout: 0 };
+        let missing = bitcoin::OutPoint {
+            txid: bitcoin::Txid::from_byte_array([7; 32]),
+            vout: 0,
+        };
         let b1 = build_test_block(base_tip, 4, 1_600_000_014);
         let b2 = build_test_block_spending(b1.block_hash(), 5, 1_600_000_015, missing);
         let b3 = build_test_block(b2.block_hash(), 6, 1_600_000_016);
@@ -14455,9 +14778,16 @@ pub(crate) mod tests {
         cs.invalidate_block(a1.block_hash())
             .expect("b2 failing leaves b1, which out-works the parent");
 
-        assert_eq!(cs.tip_hash(), b1.block_hash(), "the tip must be the best valid chain left");
+        assert_eq!(
+            cs.tip_hash(),
+            b1.block_hash(),
+            "the tip must be the best valid chain left"
+        );
         assert_eq!(cs.tip_height(), 4);
-        assert_eq!(cs.get_block_index(&b1.block_hash()).unwrap().status, BlockStatus::Valid);
+        assert_eq!(
+            cs.get_block_index(&b1.block_hash()).unwrap().status,
+            BlockStatus::Valid
+        );
         for b in [&a1, &a2, &b2, &b3] {
             assert_eq!(
                 cs.get_block_index(&b.block_hash()).unwrap().status,
@@ -14491,7 +14821,10 @@ pub(crate) mod tests {
         cs.accept_block(&a1).unwrap();
 
         // B: the most work, with an invalid block in the middle.
-        let missing = bitcoin::OutPoint { txid: bitcoin::Txid::from_byte_array([7; 32]), vout: 0 };
+        let missing = bitcoin::OutPoint {
+            txid: bitcoin::Txid::from_byte_array([7; 32]),
+            vout: 0,
+        };
         let b1 = build_test_block_spending(base_tip, 4, 1_600_000_014, missing);
         let b2 = build_test_block(b1.block_hash(), 5, 1_600_000_015);
         let b3 = build_test_block(b2.block_hash(), 6, 1_600_000_016);
@@ -14502,21 +14835,38 @@ pub(crate) mod tests {
             cs.accept_header(&b.header).unwrap();
             cs.store_block(b).unwrap();
         }
-        assert_eq!(cs.tip_hash(), a1.block_hash(), "storing the branches activates neither");
+        assert_eq!(
+            cs.tip_hash(),
+            a1.block_hash(),
+            "storing the branches activates neither"
+        );
 
         cs.invalidate_block(a1.block_hash())
             .expect("B fails, and C is activated in its place");
 
-        assert_eq!(cs.tip_hash(), c2.block_hash(), "the node must end on C's tip");
+        assert_eq!(
+            cs.tip_hash(),
+            c2.block_hash(),
+            "the node must end on C's tip"
+        );
         assert_eq!(cs.tip_height(), 5);
         for b in [&a1, &b1, &b2, &b3] {
-            assert_eq!(cs.get_block_index(&b.block_hash()).unwrap().status, BlockStatus::Invalid);
+            assert_eq!(
+                cs.get_block_index(&b.block_hash()).unwrap().status,
+                BlockStatus::Invalid
+            );
         }
         for b in [&c1, &c2] {
-            assert_eq!(cs.get_block_index(&b.block_hash()).unwrap().status, BlockStatus::Valid);
+            assert_eq!(
+                cs.get_block_index(&b.block_hash()).unwrap().status,
+                BlockStatus::Valid
+            );
         }
         // C's coinbases are coins, and B's are not.
-        let coinbase = |b: &Block| bitcoin::OutPoint { txid: b.txdata[0].compute_txid(), vout: 0 };
+        let coinbase = |b: &Block| bitcoin::OutPoint {
+            txid: b.txdata[0].compute_txid(),
+            vout: 0,
+        };
         assert!(cs.get_coin(&coinbase(&c2)).is_some());
         assert!(cs.get_coin(&coinbase(&b1)).is_none());
 
@@ -14541,7 +14891,10 @@ pub(crate) mod tests {
         assert_eq!(cs.tip_hash(), base_tip);
 
         // B: more work than A, with an invalid second block. Stored only.
-        let missing = bitcoin::OutPoint { txid: bitcoin::Txid::from_byte_array([7; 32]), vout: 0 };
+        let missing = bitcoin::OutPoint {
+            txid: bitcoin::Txid::from_byte_array([7; 32]),
+            vout: 0,
+        };
         let b1 = build_test_block(base_tip, 4, 1_600_000_014);
         let b2 = build_test_block_spending(b1.block_hash(), 5, 1_600_000_015, missing);
         let b3 = build_test_block(b2.block_hash(), 6, 1_600_000_016);
@@ -14554,12 +14907,22 @@ pub(crate) mod tests {
         cs.reconsider_block(a1.block_hash())
             .expect("B fails at b2, and A is activated in its place");
 
-        assert_eq!(cs.tip_hash(), a2.block_hash(), "the node must end on the reconsidered branch");
+        assert_eq!(
+            cs.tip_hash(),
+            a2.block_hash(),
+            "the node must end on the reconsidered branch"
+        );
         for b in [&b2, &b3] {
-            assert_eq!(cs.get_block_index(&b.block_hash()).unwrap().status, BlockStatus::Invalid);
+            assert_eq!(
+                cs.get_block_index(&b.block_hash()).unwrap().status,
+                BlockStatus::Invalid
+            );
         }
         for b in [&a1, &a2] {
-            assert_eq!(cs.get_block_index(&b.block_hash()).unwrap().status, BlockStatus::Valid);
+            assert_eq!(
+                cs.get_block_index(&b.block_hash()).unwrap().status,
+                BlockStatus::Valid
+            );
         }
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -14580,7 +14943,10 @@ pub(crate) mod tests {
 
         // Three branches, each out-working the parent, each failing at its
         // first block.
-        let missing = bitcoin::OutPoint { txid: bitcoin::Txid::from_byte_array([7; 32]), vout: 0 };
+        let missing = bitcoin::OutPoint {
+            txid: bitcoin::Txid::from_byte_array([7; 32]),
+            vout: 0,
+        };
         let mut branches: Vec<Vec<Block>> = Vec::new();
         for (i, len) in [3u32, 2, 1].into_iter().enumerate() {
             let t = 1_600_000_100 + 100 * i as u32;
@@ -14610,7 +14976,10 @@ pub(crate) mod tests {
             );
         }
         // Nothing is left to try.
-        assert_eq!(cs.find_best_valid_tip().unwrap().header.block_hash(), base_tip);
+        assert_eq!(
+            cs.find_best_valid_tip().unwrap().header.block_hash(),
+            base_tip
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -14833,9 +15202,15 @@ pub(crate) mod tests {
         // And the RPC's view: every leaf, plus the active tip.
         let reported: std::collections::HashSet<BlockHash> =
             cs.chain_tip_hashes().into_iter().collect();
-        assert!(reported.contains(&cs.tip_hash()), "the active tip is always reported");
+        assert!(
+            reported.contains(&cs.tip_hash()),
+            "the active tip is always reported"
+        );
         for h in scan_leaves(&cs) {
-            assert!(reported.contains(&h), "a leaf is missing from getchaintips: {h}");
+            assert!(
+                reported.contains(&h),
+                "a leaf is missing from getchaintips: {h}"
+            );
         }
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -14858,13 +15233,7 @@ pub(crate) mod tests {
         let coin = OutPoint::new(blocks[0].txdata[0].compute_txid(), 0);
 
         // 200 blocks of relative lock against 101 confirmations: not final.
-        let bad = build_test_block_sequence_locked(
-            cs.tip_hash(),
-            102,
-            1_300_000_200,
-            coin,
-            200,
-        );
+        let bad = build_test_block_sequence_locked(cs.tip_hash(), 102, 1_300_000_200, coin, 200);
         assert_eq!(
             cs.test_block_validity(&bad).unwrap().as_deref(),
             Some("bad-txns-nonBIP68-final"),
@@ -14879,13 +15248,7 @@ pub(crate) mod tests {
 
         // The control: a lock the chain does satisfy is accepted, so the
         // refusal above is the sequence lock and not the fixture.
-        let good = build_test_block_sequence_locked(
-            cs.tip_hash(),
-            102,
-            1_300_000_200,
-            coin,
-            10,
-        );
+        let good = build_test_block_sequence_locked(cs.tip_hash(), 102, 1_300_000_200, coin, 10);
         assert_eq!(cs.test_block_validity(&good).unwrap(), None);
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -14953,16 +15316,25 @@ pub(crate) mod tests {
         let coin_before = cs.get_coin(&coinbase);
 
         let next = build_test_block(tip_before, 3, 1_300_000_003);
-        assert_eq!(cs.test_block_validity(&next).unwrap(), None, "fixture must be valid");
+        assert_eq!(
+            cs.test_block_validity(&next).unwrap(),
+            None,
+            "fixture must be valid"
+        );
 
         assert_eq!(cs.tip_hash(), tip_before, "a proposal moved the tip");
-        assert_eq!(cs.tip_height(), height_before, "a proposal moved the height");
+        assert_eq!(
+            cs.tip_height(),
+            height_before,
+            "a proposal moved the height"
+        );
         assert!(
             cs.get_block_index(&next.block_hash()).is_none(),
             "a proposal wrote a block index entry"
         );
         assert!(
-            cs.get_coin(&OutPoint::new(next.txdata[0].compute_txid(), 0)).is_none(),
+            cs.get_coin(&OutPoint::new(next.txdata[0].compute_txid(), 0))
+                .is_none(),
             "a proposal published the proposed block's coins"
         );
         assert_eq!(
@@ -15006,7 +15378,10 @@ pub(crate) mod tests {
             );
             drop(guard);
         });
-        assert!(done.load(Ordering::SeqCst), "the proposal completes once the lock is free");
+        assert!(
+            done.load(Ordering::SeqCst),
+            "the proposal completes once the lock is free"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -15035,12 +15410,14 @@ pub(crate) mod tests {
         let blocks = build_and_connect_chain(&cs, 6);
 
         // Invalidate low on the chain: 2..6 are all marked.
-        cs.invalidate_block(blocks[1].block_hash()).expect("invalidated");
+        cs.invalidate_block(blocks[1].block_hash())
+            .expect("invalidated");
         assert_eq!(cs.tip_height(), 1);
 
         // Reconsider the *tip*, as the Core test does. Clearing only its own
         // subtree would leave heights 2..5 invalid and the tip unreachable.
-        cs.reconsider_block(blocks[5].block_hash()).expect("reconsidered");
+        cs.reconsider_block(blocks[5].block_hash())
+            .expect("reconsidered");
         assert_eq!(
             cs.tip_height(),
             6,
@@ -15061,7 +15438,8 @@ pub(crate) mod tests {
 
         // Invalidate height 5: the active chain truncates to 4, and the header
         // tip has to come with it.
-        cs.invalidate_block(blocks[4].block_hash()).expect("invalidated");
+        cs.invalidate_block(blocks[4].block_hash())
+            .expect("invalidated");
         assert_eq!(cs.tip_height(), 4);
         assert_eq!(
             cs.headers_tip_height(),
@@ -15071,7 +15449,8 @@ pub(crate) mod tests {
         assert_eq!(cs.best_header_hash(), blocks[3].block_hash());
 
         // Reconsidering puts the branch — and the header tip — back.
-        cs.reconsider_block(blocks[4].block_hash()).expect("reconsidered");
+        cs.reconsider_block(blocks[4].block_hash())
+            .expect("reconsidered");
         assert_eq!(cs.tip_height(), 10);
         assert_eq!(
             cs.headers_tip_height(),
@@ -15108,7 +15487,10 @@ pub(crate) mod tests {
             );
             drop(guard);
         });
-        assert!(done.load(Ordering::SeqCst), "prune completes once the lock is free");
+        assert!(
+            done.load(Ordering::SeqCst),
+            "prune completes once the lock is free"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -15231,11 +15613,19 @@ pub(crate) mod tests {
         for b in &blocks[4..8] {
             assert!(cs.accept_block(b).expect("accept").connected());
         }
-        assert_eq!(cs.tip_height(), 8, "blocks 9 and 10 are stored, not connected");
+        assert_eq!(
+            cs.tip_height(),
+            8,
+            "blocks 9 and 10 are stored, not connected"
+        );
 
         // Every block at or below the cut is in file 0, and no connected
         // block above it is: the height rows alone call file 0 deletable.
-        assert_eq!(cs.prune_up_to(4), 0, "file 0 holds blocks 9 and 10, above the tip");
+        assert_eq!(
+            cs.prune_up_to(4),
+            0,
+            "file 0 holds blocks 9 and 10, above the tip"
+        );
         assert!(cs.flat_files.lock().file_exists(0));
 
         // The connector takes them from their records.
@@ -15258,7 +15648,10 @@ pub(crate) mod tests {
         for b in &blocks[8..10] {
             assert!(cs.is_pruned(&b.block_hash()));
         }
-        assert!(cs.flat_files.lock().file_exists(1), "file 1 holds blocks 11 and 12");
+        assert!(
+            cs.flat_files.lock().file_exists(1),
+            "file 1 holds blocks 11 and 12"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -15301,7 +15694,9 @@ pub(crate) mod tests {
         }
         assert_eq!(cs.tip_height(), 8);
         assert_eq!(
-            cs.get_block_index(&blocks[4].block_hash()).unwrap().file_number,
+            cs.get_block_index(&blocks[4].block_hash())
+                .unwrap()
+                .file_number,
             2,
             "blocks 5..=8 are past file 0"
         );
@@ -15337,11 +15732,19 @@ pub(crate) mod tests {
         }
 
         controls.fail_block_index_scans(true);
-        assert_eq!(cs.prune_up_to(6), 0, "a failed scan proves nothing deletable");
+        assert_eq!(
+            cs.prune_up_to(6),
+            0,
+            "a failed scan proves nothing deletable"
+        );
         assert!(cs.flat_files.lock().file_exists(0));
 
         controls.fail_block_index_scans(false);
-        assert_eq!(cs.prune_up_to(6), 1, "the same prune goes ahead once the scan reads");
+        assert_eq!(
+            cs.prune_up_to(6),
+            1,
+            "the same prune goes ahead once the scan reads"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -15368,7 +15771,8 @@ pub(crate) mod tests {
         }
         let fork = build_test_block(blocks[2].block_hash(), 4, 1_300_000_999);
         assert!(cs.accept_block(&fork).expect("accept fork").connected());
-        cs.invalidate_block(fork.block_hash()).expect("invalidate the fork");
+        cs.invalidate_block(fork.block_hash())
+            .expect("invalidate the fork");
         assert_eq!(cs.tip_height(), 3);
 
         // File 1: blocks 4..=8.
@@ -15383,14 +15787,19 @@ pub(crate) mod tests {
         for b in &blocks[8..] {
             cs.accept_header(&b.header).expect("header");
         }
-        cs.invalidate_block(blocks[8].block_hash()).expect("invalidate the headers");
+        cs.invalidate_block(blocks[8].block_hash())
+            .expect("invalidate the headers");
         for b in &blocks[8..] {
             let entry = cs.get_block_index(&b.block_hash()).unwrap();
             assert_eq!(entry.status, BlockStatus::Invalid);
             assert_eq!((entry.num_tx, entry.file_number), (0, 0), "no record");
         }
 
-        assert_eq!(cs.prune_up_to(3), 0, "the invalidated block 4 is stored in file 0");
+        assert_eq!(
+            cs.prune_up_to(3),
+            0,
+            "the invalidated block 4 is stored in file 0"
+        );
         assert!(cs.get_block(&fork.block_hash()).is_some());
 
         assert_eq!(cs.prune_up_to(4), 1, "headers alone do not hold file 0");
@@ -15410,7 +15819,8 @@ pub(crate) mod tests {
             cs.warnings().list().iter().all(|w| w.id != corrupt),
             "a pruned record is not corruption"
         );
-        cs.reconsider_block(fork.block_hash()).expect("reconsider the fork");
+        cs.reconsider_block(fork.block_hash())
+            .expect("reconsider the fork");
         assert_eq!(
             cs.get_block_index(&fork.block_hash()).unwrap().status,
             BlockStatus::HeaderOnly
@@ -15444,7 +15854,11 @@ pub(crate) mod tests {
             assert!(cs.accept_block(b).expect("accept").connected());
         }
 
-        let (h1, h2, h3) = (blocks[0].block_hash(), blocks[1].block_hash(), blocks[2].block_hash());
+        let (h1, h2, h3) = (
+            blocks[0].block_hash(),
+            blocks[1].block_hash(),
+            blocks[2].block_hash(),
+        );
         let h4 = blocks[3].block_hash();
         // Block 4 as the scan will see it: stored, and marked invalid.
         let mut stored_invalid = cs.get_block_index(&h4).unwrap();
@@ -15545,7 +15959,11 @@ pub(crate) mod tests {
         };
         repoint(&cs, &blocks[2], 3);
 
-        let (h1, h2, h3) = (blocks[0].block_hash(), blocks[1].block_hash(), blocks[2].block_hash());
+        let (h1, h2, h3) = (
+            blocks[0].block_hash(),
+            blocks[1].block_hash(),
+            blocks[2].block_hash(),
+        );
         let deleted = std::thread::scope(|s| {
             // Hold the lock the mutation section needs, so the prune plans
             // (the scan takes no lock) and then waits.
@@ -15576,7 +15994,11 @@ pub(crate) mod tests {
             cs.flat_files.lock().file_exists(2),
             "file 2 was appended to after the plan"
         );
-        assert_eq!(cs.get_block(&h2).as_ref(), Some(&blocks[1]), "block 2's repaired record");
+        assert_eq!(
+            cs.get_block(&h2).as_ref(),
+            Some(&blocks[1]),
+            "block 2's repaired record"
+        );
         assert_eq!(cs.get_block(&h3).as_ref(), Some(&blocks[2]));
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -15660,7 +16082,9 @@ pub(crate) mod tests {
             // The prune has planned once its scan starts.
             let scans = controls.block_index_scans();
             let prune = s.spawn(|| cs.prune_up_to(6));
-            wait("the prune never scanned", &|| controls.block_index_scans() > scans);
+            wait("the prune never scanned", &|| {
+                controls.block_index_scans() > scans
+            });
 
             drop(guard);
             let written = writer.join().unwrap();
@@ -15686,16 +16110,34 @@ pub(crate) mod tests {
         let (cs, dir, controls, blocks) = chain_with_a_file_below_the_cut();
         let h2 = blocks[1].block_hash();
         // Block 2's record is lost: its entry points past the end of file 0.
-        repoint_block_record(&cs, &h2, FlatFilePos { file_number: 0, data_pos: u32::MAX / 2 });
+        repoint_block_record(
+            &cs,
+            &h2,
+            FlatFilePos {
+                file_number: 0,
+                data_pos: u32::MAX / 2,
+            },
+        );
         assert!(cs.get_block(&h2).is_none());
 
-        let (deleted, repaired) =
-            prune_while_a_write_waits_to_commit(&cs, &controls, || cs.repair_block_data(&blocks[1]));
-        assert!(matches!(repaired, Ok(BlockDataRepair::Repaired { height: 2 })));
+        let (deleted, repaired) = prune_while_a_write_waits_to_commit(&cs, &controls, || {
+            cs.repair_block_data(&blocks[1])
+        });
+        assert!(matches!(
+            repaired,
+            Ok(BlockDataRepair::Repaired { height: 2 })
+        ));
 
-        assert_eq!(deleted, 0, "block 2's record was pending in file 1 when the prune planned");
+        assert_eq!(
+            deleted, 0,
+            "block 2's record was pending in file 1 when the prune planned"
+        );
         assert!(cs.flat_files.lock().file_exists(1));
-        assert_eq!(cs.get_block(&h2).as_ref(), Some(&blocks[1]), "block 2's repaired record");
+        assert_eq!(
+            cs.get_block(&h2).as_ref(),
+            Some(&blocks[1]),
+            "block 2's repaired record"
+        );
 
         // The entry is committed now, so the next round sees block 2 in file 1.
         assert_eq!(cs.prune_up_to(6), 1, "file 1 goes");
@@ -15703,7 +16145,10 @@ pub(crate) mod tests {
         for b in [&blocks[1], &blocks[4], &blocks[5]] {
             assert!(cs.is_pruned(&b.block_hash()));
         }
-        assert!(cs.flat_files.lock().file_exists(0), "file 0 holds blocks 7 and 8");
+        assert!(
+            cs.flat_files.lock().file_exists(0),
+            "file 0 holds blocks 7 and 8"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -15721,9 +16166,15 @@ pub(crate) mod tests {
 
         let (deleted, stored) =
             prune_while_a_write_waits_to_commit(&cs, &controls, || cs.store_block(&fork));
-        assert_eq!(stored.expect("store the fork block"), (fork.block_hash(), 2));
+        assert_eq!(
+            stored.expect("store the fork block"),
+            (fork.block_hash(), 2)
+        );
 
-        assert_eq!(deleted, 0, "the fork block's record was pending in file 1 when the prune planned");
+        assert_eq!(
+            deleted, 0,
+            "the fork block's record was pending in file 1 when the prune planned"
+        );
         assert_eq!(cs.get_block(&fork.block_hash()).as_ref(), Some(&fork));
 
         // The fork block's row is held until a group commit syncs its bytes.
@@ -15791,7 +16242,11 @@ pub(crate) mod tests {
             BlockStatus::Invalid,
             "the operator's Invalid mark survives the connector"
         );
-        assert_eq!(cs.tip_hash(), blocks[2].block_hash(), "the tip did not move");
+        assert_eq!(
+            cs.tip_hash(),
+            blocks[2].block_hash(),
+            "the tip did not move"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -15971,8 +16426,7 @@ pub(crate) mod tests {
         // Default (tip): cumulative through height 3 = 10; the one-month
         // window is clamped to height - 1 = 2 → window sums heights 2..=3 =
         // 3+4 = 7.
-        let tip_stats =
-            crate::rpc::blockchain::get_chain_tx_stats(&cs, None, None).unwrap();
+        let tip_stats = crate::rpc::blockchain::get_chain_tx_stats(&cs, None, None).unwrap();
         assert_eq!(tip_stats["txcount"], 10);
         assert_eq!(tip_stats["window_block_count"], 2);
         assert_eq!(tip_stats["window_tx_count"], 7);
@@ -15989,9 +16443,8 @@ pub(crate) mod tests {
         assert_eq!(hist["window_final_block_height"], 2);
 
         // An unknown block hash → error.
-        let bogus = BlockHash::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array(
-            [0xEE; 32],
-        ));
+        let bogus =
+            BlockHash::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array([0xEE; 32]));
         assert!(crate::rpc::blockchain::get_chain_tx_stats(&cs, None, Some(bogus)).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -15999,9 +16452,8 @@ pub(crate) mod tests {
     #[test]
     fn snapshot_seed_sets_cumulative_at_base() {
         let (cs, dir) = make_chain_state();
-        let base_hash = BlockHash::from_raw_hash(
-            bitcoin::hashes::sha256d::Hash::from_byte_array([0x7E; 32]),
-        );
+        let base_hash =
+            BlockHash::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array([0x7E; 32]));
         let anchor = crate::chain::assumeutxo::AssumeUtxoData {
             height: 840_000,
             blockhash: base_hash,
@@ -16071,9 +16523,8 @@ pub(crate) mod tests {
         let (cs, dir, hashes) = chain_state_with_seeded_chain(&[1, 2, 3, 4]);
 
         // Inject a side block at height 2 and repoint the height index at it.
-        let bogus = BlockHash::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array(
-            [0xB0; 32],
-        ));
+        let bogus =
+            BlockHash::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array([0xB0; 32]));
         let base_header = bitcoin::constants::genesis_block(Network::Regtest).header;
         let bogus_entry = BlockIndexEntry {
             header: base_header,
@@ -16182,8 +16633,7 @@ pub(crate) mod tests {
 
         // Anchor = the primary's UTXO-set hash at the snapshot height.
         cs.store.flush().unwrap();
-        let (anchor, _) =
-            crate::storage::compressed_coin::hash_utxo_set(&*cs.store).unwrap();
+        let (anchor, _) = crate::storage::compressed_coin::hash_utxo_set(&*cs.store).unwrap();
 
         // Attach a background that must reproduce that hash by
         // re-validating genesis→N into its own coins DB.
@@ -16330,11 +16780,12 @@ pub(crate) mod tests {
         );
         let mut rx = publisher.subscribe();
         let health = Arc::new(crate::health::HealthState::new());
-        cs.background_alerts().install_sink(crate::health::AlertSink {
-            warnings: warnings.clone(),
-            publisher: publisher.clone(),
-            health: Some(health.clone()),
-        });
+        cs.background_alerts()
+            .install_sink(crate::health::AlertSink {
+                warnings: warnings.clone(),
+                publisher: publisher.clone(),
+                health: Some(health.clone()),
+            });
 
         let blocks = build_and_connect_chain(&cs, 3);
         cs.attach_background(
@@ -16351,7 +16802,11 @@ pub(crate) mod tests {
         }
 
         let kind = StatusKind::AssumeutxoValidationFailed;
-        assert!(health.is_active(kind), "satd_alert_active{{kind=\"{}\"}} must read 1", kind.as_str());
+        assert!(
+            health.is_active(kind),
+            "satd_alert_active{{kind=\"{}\"}} must read 1",
+            kind.as_str()
+        );
         let entry = warnings
             .list()
             .into_iter()
@@ -16365,8 +16820,14 @@ pub(crate) mod tests {
             })
             .collect();
         assert_eq!(raised.len(), 1, "{raised:?}");
-        assert_eq!((raised[0].kind, raised[0].state), (kind, StatusState::Raised));
-        assert_eq!(raised[0].details.get("snapshot_height").map(String::as_str), Some("3"));
+        assert_eq!(
+            (raised[0].kind, raised[0].state),
+            (kind, StatusState::Raised)
+        );
+        assert_eq!(
+            raised[0].details.get("snapshot_height").map(String::as_str),
+            Some("3")
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -16410,8 +16871,14 @@ pub(crate) mod tests {
         // The tip and the base's height row are durable, not just in
         // memory: a restart reopens on the snapshot base.
         assert_eq!(dst.store.get_tip(), Some(snap_hash));
-        assert_eq!(dst.store.get_block_hash_by_height(snap_height), Some(snap_hash));
-        assert!(dst.has_background(), "background must be attached after load");
+        assert_eq!(
+            dst.store.get_block_hash_by_height(snap_height),
+            Some(snap_hash)
+        );
+        assert!(
+            dst.has_background(),
+            "background must be attached after load"
+        );
 
         // getchainstates now reports two chainstates: the snapshot
         // (validated=false, carries snapshot_blockhash) and background.
@@ -16597,7 +17064,10 @@ pub(crate) mod tests {
         cs.snapshot_load_active.store(true, Ordering::SeqCst);
 
         assert!(
-            matches!(cs.accept_block(&b3), Err(ChainError::SnapshotLoadInProgress)),
+            matches!(
+                cs.accept_block(&b3),
+                Err(ChainError::SnapshotLoadInProgress)
+            ),
             "accept_block must refuse during a snapshot load"
         );
         assert!(
@@ -16688,7 +17158,10 @@ pub(crate) mod tests {
             .expect_err("attach_background must fail when its dir is unusable");
         // The anchor hash is VALID here; the failure is purely the
         // background open. The node must not be left bootstrapped.
-        assert!(matches!(err, ChainError::Storage(_) | ChainError::Snapshot(_)));
+        assert!(matches!(
+            err,
+            ChainError::Storage(_) | ChainError::Snapshot(_)
+        ));
         assert_eq!(dst.tip_height(), 0, "tip must stay at genesis");
         assert!(!dst.has_background(), "no background may be attached");
         assert_eq!(dst.coin_count(), 0, "no snapshot coins may persist");
@@ -16946,7 +17419,10 @@ pub(crate) mod tests {
             assert!(check_genesis(&store, Network::Regtest).is_ok());
             for network in [Network::Testnet4, Network::Signet, Network::Bitcoin] {
                 assert!(
-                    matches!(check_genesis(&store, network), Err(ChainError::WrongGenesis)),
+                    matches!(
+                        check_genesis(&store, network),
+                        Err(ChainError::WrongGenesis)
+                    ),
                     "{network:?}, tip {with_tip}"
                 );
             }
@@ -16975,7 +17451,9 @@ pub(crate) mod tests {
             Default::default(),
             Default::default(),
         );
-        let err = result.err().expect("a regtest store opened as testnet4 is refused");
+        let err = result
+            .err()
+            .expect("a regtest store opened as testnet4 is refused");
         assert_eq!(
             err.to_string(),
             "Incorrect or no genesis block found. Wrong datadir for network?"
@@ -17000,8 +17478,8 @@ pub(crate) mod tests {
     /// written to `blocks_dir` and the existing flat_pos survives.
     #[test]
     fn chain_state_new_reuses_genesis_flatpos_when_block_index_populated() {
-        use crate::storage::blockindex::BlockIndexEntry;
         use crate::storage::StoreBatch;
+        use crate::storage::blockindex::BlockIndexEntry;
 
         let dir = std::env::temp_dir().join(format!(
             "satd-genesis-reuse-{}-{}",
@@ -17080,19 +17558,12 @@ pub(crate) mod tests {
         let blk_files: Vec<_> = std::fs::read_dir(&blocks_dir)
             .unwrap()
             .filter_map(Result::ok)
-            .filter(|e| {
-                e.file_name()
-                    .to_string_lossy()
-                    .starts_with("blk")
-            })
+            .filter(|e| e.file_name().to_string_lossy().starts_with("blk"))
             .collect();
         assert!(
             blk_files.is_empty(),
             "blocks_dir should be empty; got {:?}",
-            blk_files
-                .iter()
-                .map(|e| e.file_name())
-                .collect::<Vec<_>>()
+            blk_files.iter().map(|e| e.file_name()).collect::<Vec<_>>()
         );
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -17429,10 +17900,22 @@ pub(crate) mod tests {
         assert_eq!(cs.tip_height(), 2);
         assert_eq!(cs.tip_hash(), a2_hash);
 
-        let a1_op = OutPoint { txid: a1.txdata[0].compute_txid(), vout: 0 };
-        let a2_op = OutPoint { txid: a2.txdata[0].compute_txid(), vout: 0 };
-        assert!(cs.get_coin(&a1_op).is_some(), "A1 coin present before reorg");
-        assert!(cs.get_coin(&a2_op).is_some(), "A2 coin present before reorg");
+        let a1_op = OutPoint {
+            txid: a1.txdata[0].compute_txid(),
+            vout: 0,
+        };
+        let a2_op = OutPoint {
+            txid: a2.txdata[0].compute_txid(),
+            vout: 0,
+        };
+        assert!(
+            cs.get_coin(&a1_op).is_some(),
+            "A1 coin present before reorg"
+        );
+        assert!(
+            cs.get_coin(&a2_op).is_some(),
+            "A2 coin present before reorg"
+        );
 
         // Competing chain B with strictly more work (3 blocks > 2). B1/B2
         // are valid side blocks; B3 is the triggering block and is invalid
@@ -17445,9 +17928,9 @@ pub(crate) mod tests {
         assert_eq!(cs.tip_hash(), a2_hash, "no reorg before B has more work");
 
         let bogus = OutPoint {
-            txid: bitcoin::Txid::from_raw_hash(
-                bitcoin::hashes::sha256d::Hash::from_byte_array([0x9e; 32]),
-            ),
+            txid: bitcoin::Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array(
+                [0x9e; 32],
+            )),
             vout: 0,
         };
         let b3 = build_test_block_spending(b2_hash, 3, 1_700_000_013, bogus);
@@ -17460,8 +17943,14 @@ pub(crate) mod tests {
         // The original chain must be fully restored.
         assert_eq!(cs.tip_height(), 2, "tip height restored to chain A");
         assert_eq!(cs.tip_hash(), a2_hash, "tip hash restored to chain A");
-        assert!(cs.get_coin(&a1_op).is_some(), "A1 coin survives failed reorg");
-        assert!(cs.get_coin(&a2_op).is_some(), "A2 coin survives failed reorg");
+        assert!(
+            cs.get_coin(&a1_op).is_some(),
+            "A1 coin survives failed reorg"
+        );
+        assert!(
+            cs.get_coin(&a2_op).is_some(),
+            "A2 coin survives failed reorg"
+        );
 
         // The crux: flush. A pre-fix bug would elide the disconnected-then-
         // not-restored FRESH coins here, silently dropping live UTXOs.
@@ -17478,7 +17967,8 @@ pub(crate) mod tests {
 
         // Sanity: the node still accepts the next valid block on chain A.
         let a3 = build_test_block(a2_hash, 3, 1_700_000_020);
-        cs.accept_block(&a3).expect("chain A still extendable after failed reorg");
+        cs.accept_block(&a3)
+            .expect("chain A still extendable after failed reorg");
         assert_eq!(cs.tip_height(), 3);
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -17488,8 +17978,9 @@ pub(crate) mod tests {
     fn remine(block: &mut Block) {
         use bitcoin::pow::CompactTarget;
         block.header.merkle_root = block.compute_merkle_root().unwrap();
-        let target =
-            crate::storage::blockindex::target_from_compact(CompactTarget::from_consensus(0x207fffff));
+        let target = crate::storage::blockindex::target_from_compact(
+            CompactTarget::from_consensus(0x207fffff),
+        );
         for nonce in 0u32..2_000_000 {
             block.header.nonce = nonce;
             let mut hash_be = *block.block_hash().as_raw_hash().as_byte_array();
@@ -17507,11 +17998,14 @@ pub(crate) mod tests {
     #[test]
     fn reorg_remining_the_same_transactions_keeps_the_utxo_counters_exact() {
         use bitcoin::blockdata::locktime::absolute::LockTime;
-        use bitcoin::{Amount, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness, transaction};
+        use bitcoin::{
+            Amount, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness, transaction,
+        };
 
         let db = tempfile::TempDir::new().unwrap();
-        let inner = crate::storage::rocksdb_store::RocksDbStore::open(db.path(), false, 16, false, -1)
-            .unwrap();
+        let inner =
+            crate::storage::rocksdb_store::RocksDbStore::open(db.path(), false, 16, false, -1)
+                .unwrap();
         let (cs, dir) = make_chain_state_with_store(Box::new(inner));
         let genesis_hash = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
 
@@ -17537,13 +18031,28 @@ pub(crate) mod tests {
             }],
             output: values
                 .iter()
-                .map(|v| TxOut { value: Amount::from_sat(*v), script_pubkey: ScriptBuf::new() })
+                .map(|v| TxOut {
+                    value: Amount::from_sat(*v),
+                    script_pubkey: ScriptBuf::new(),
+                })
                 .collect(),
         };
         // T spends the height-1 coinbase into t0 and t1; U spends t0 inside
         // the same block. Both blocks at height 102 carry T and U.
-        let t = spend(OutPoint { txid: first_coinbase.unwrap(), vout: 0 }, &[1_000_000_000, 3_900_000_000]);
-        let u = spend(OutPoint { txid: t.compute_txid(), vout: 0 }, &[900_000_000]);
+        let t = spend(
+            OutPoint {
+                txid: first_coinbase.unwrap(),
+                vout: 0,
+            },
+            &[1_000_000_000, 3_900_000_000],
+        );
+        let u = spend(
+            OutPoint {
+                txid: t.compute_txid(),
+                vout: 0,
+            },
+            &[900_000_000],
+        );
 
         let mut a102 = build_test_block(a101, 102, 1_700_000_102);
         a102.txdata.extend([t.clone(), u.clone()]);
@@ -17572,10 +18081,17 @@ pub(crate) mod tests {
             })
             .unwrap();
         assert_eq!(walked, 104, "coins on disk");
-        assert_eq!(walked_amount, 102 * 5_000_000_000 + 3_900_000_000 + 900_000_000);
+        assert_eq!(
+            walked_amount,
+            102 * 5_000_000_000 + 3_900_000_000 + 900_000_000
+        );
         assert_eq!(base.coin_count, walked, "meta utxo_count vs coins on disk");
         assert_eq!(cs.coin_count(), walked, "utxo_count vs coins on disk");
-        assert_eq!(cs.coin_total_amount(), walked_amount, "total_amount vs coins on disk");
+        assert_eq!(
+            cs.coin_total_amount(),
+            walked_amount,
+            "total_amount vs coins on disk"
+        );
 
         drop(cs);
         let _ = std::fs::remove_dir_all(&dir);
@@ -17623,19 +18139,30 @@ pub(crate) mod tests {
         // leave tip height != 1 or the UTXO set out of sync with the tip.
         assert_eq!(cs.tip_height(), 1, "tip advanced by exactly one block");
         let tip = cs.tip_hash();
-        assert!(tip == x_hash || tip == y_hash, "tip is one of the two competitors");
+        assert!(
+            tip == x_hash || tip == y_hash,
+            "tip is one of the two competitors"
+        );
         assert_eq!(cs.coin_count(), 1, "exactly the winning coinbase is live");
 
         let winner = if tip == x_hash { &x } else { &y };
-        let win_op = OutPoint { txid: winner.txdata[0].compute_txid(), vout: 0 };
-        assert!(cs.get_coin(&win_op).is_some(), "winning coinbase is in the UTXO set");
+        let win_op = OutPoint {
+            txid: winner.txdata[0].compute_txid(),
+            vout: 0,
+        };
+        assert!(
+            cs.get_coin(&win_op).is_some(),
+            "winning coinbase is in the UTXO set"
+        );
 
         // Survives a flush + a further extend — proving the loser's connect
         // attempt left no half-applied delta behind.
-        cs.flush_coin_cache().expect("flush after concurrent accept");
+        cs.flush_coin_cache()
+            .expect("flush after concurrent accept");
         assert_eq!(cs.coin_count(), 1, "coin set stable across flush");
         let next = build_test_block(tip, 2, 1_700_100_010);
-        cs.accept_block(&next).expect("chain extendable after concurrent accept");
+        cs.accept_block(&next)
+            .expect("chain extendable after concurrent accept");
         assert_eq!(cs.tip_height(), 2);
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -17706,15 +18233,13 @@ pub(crate) mod tests {
         assert_eq!(cs.tip_hash(), b3_hash);
 
         // New tip's cumulative reflects the B chain from genesis.
-        let expected = genesis_txs
-            + b1.txdata.len() as u64
-            + b2.txdata.len() as u64
-            + b3.txdata.len() as u64;
+        let expected =
+            genesis_txs + b1.txdata.len() as u64 + b2.txdata.len() as u64 + b3.txdata.len() as u64;
         assert_eq!(cs.cumulative_tx_count(&b3_hash), Some(expected));
 
         // The orphaned A2 is off the active chain → getchaintxstats refuses it.
-        let err = crate::rpc::blockchain::get_chain_tx_stats(&cs, Some(1), Some(a2_hash))
-            .unwrap_err();
+        let err =
+            crate::rpc::blockchain::get_chain_tx_stats(&cs, Some(1), Some(a2_hash)).unwrap_err();
         assert!(err.contains("not in main chain"), "got: {err}");
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -17795,7 +18320,10 @@ pub(crate) mod tests {
 
         // Long enough that the height-1 coinbase is mature when spent at 103.
         let base = build_and_connect_chain(&cs, 102);
-        let spend = OutPoint { txid: base[0].txdata[0].compute_txid(), vout: 0 };
+        let spend = OutPoint {
+            txid: base[0].txdata[0].compute_txid(),
+            vout: 0,
+        };
         let coinbase_value = base[0].txdata[0].output[0].value.to_sat();
 
         let b = build_test_block_spending(base[101].block_hash(), 103, 1_600_000_013, spend);
@@ -18136,7 +18664,10 @@ pub(crate) mod tests {
         );
         // A sub-range and a clamp-to-tip both behave.
         assert_eq!(cs.active_chain_range(2, 2), vec![(2, a2_hash)]);
-        assert_eq!(cs.active_chain_range(1, 99), vec![(1, a1_hash), (2, a2_hash)]);
+        assert_eq!(
+            cs.active_chain_range(1, 99),
+            vec![(1, a1_hash), (2, a2_hash)]
+        );
         assert!(cs.active_chain_range(3, 3).is_empty(), "above tip → empty");
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -18151,8 +18682,7 @@ pub(crate) mod tests {
         // appear ahead of the final triggering block's connect.
         use crate::chain::events::ChainEvent;
         let (cs, dir) = make_chain_state();
-        let (chain_tx, mut chain_rx) =
-            tokio::sync::broadcast::channel::<ChainEvent>(64);
+        let (chain_tx, mut chain_rx) = tokio::sync::broadcast::channel::<ChainEvent>(64);
         cs.set_chain_event_sender(chain_tx);
         let genesis_hash = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
 
@@ -18190,31 +18720,55 @@ pub(crate) mod tests {
         // BlockDisconnected(A1), BlockConnected(B1), BlockConnected(B2),
         // BlockConnected(B3).
         assert_eq!(events.len(), 6, "events emitted: {:?}", events);
-        assert!(matches!(
-            events[0],
-            ChainEvent::Reorg { from_height: 2, old_tip, to_height: 3, new_tip }
-                if old_tip == a2_hash && new_tip == b3_hash
-        ), "first event (reorg marker): {:?}", events[0]);
-        assert!(matches!(
-            events[1],
-            ChainEvent::BlockDisconnected { hash, height: 2 } if hash == a2_hash
-        ), "second event: {:?}", events[1]);
-        assert!(matches!(
-            events[2],
-            ChainEvent::BlockDisconnected { hash, height: 1 } if hash == a1_hash
-        ), "third event: {:?}", events[2]);
-        assert!(matches!(
-            events[3],
-            ChainEvent::BlockConnected { hash, height: 1 } if hash == b1_hash
-        ), "fourth event: {:?}", events[3]);
-        assert!(matches!(
-            events[4],
-            ChainEvent::BlockConnected { hash, height: 2 } if hash == b2_hash
-        ), "fifth event: {:?}", events[4]);
-        assert!(matches!(
-            events[5],
-            ChainEvent::BlockConnected { hash, height: 3 } if hash == b3_hash
-        ), "sixth event: {:?}", events[5]);
+        assert!(
+            matches!(
+                events[0],
+                ChainEvent::Reorg { from_height: 2, old_tip, to_height: 3, new_tip }
+                    if old_tip == a2_hash && new_tip == b3_hash
+            ),
+            "first event (reorg marker): {:?}",
+            events[0]
+        );
+        assert!(
+            matches!(
+                events[1],
+                ChainEvent::BlockDisconnected { hash, height: 2 } if hash == a2_hash
+            ),
+            "second event: {:?}",
+            events[1]
+        );
+        assert!(
+            matches!(
+                events[2],
+                ChainEvent::BlockDisconnected { hash, height: 1 } if hash == a1_hash
+            ),
+            "third event: {:?}",
+            events[2]
+        );
+        assert!(
+            matches!(
+                events[3],
+                ChainEvent::BlockConnected { hash, height: 1 } if hash == b1_hash
+            ),
+            "fourth event: {:?}",
+            events[3]
+        );
+        assert!(
+            matches!(
+                events[4],
+                ChainEvent::BlockConnected { hash, height: 2 } if hash == b2_hash
+            ),
+            "fifth event: {:?}",
+            events[4]
+        );
+        assert!(
+            matches!(
+                events[5],
+                ChainEvent::BlockConnected { hash, height: 3 } if hash == b3_hash
+            ),
+            "sixth event: {:?}",
+            events[5]
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -18264,9 +18818,18 @@ pub(crate) mod tests {
             "{:?}",
             events[0]
         );
-        let disconnected = events.iter().filter(|e| matches!(e, ChainEvent::BlockDisconnected { .. })).count();
-        let connected = events.iter().filter(|e| matches!(e, ChainEvent::BlockConnected { .. })).count();
-        assert_eq!((disconnected, connected), (DEPTH as usize, DEPTH as usize + 1));
+        let disconnected = events
+            .iter()
+            .filter(|e| matches!(e, ChainEvent::BlockDisconnected { .. }))
+            .count();
+        let connected = events
+            .iter()
+            .filter(|e| matches!(e, ChainEvent::BlockConnected { .. }))
+            .count();
+        assert_eq!(
+            (disconnected, connected),
+            (DEPTH as usize, DEPTH as usize + 1)
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -18388,8 +18951,14 @@ pub(crate) mod tests {
         let a2_coinbase_txid = a2.txdata[0].compute_txid();
 
         // Verify A-chain UTXOs exist before reorg
-        let a1_cb_op = OutPoint { txid: a1_coinbase_txid, vout: 0 };
-        let a2_cb_op = OutPoint { txid: a2_coinbase_txid, vout: 0 };
+        let a1_cb_op = OutPoint {
+            txid: a1_coinbase_txid,
+            vout: 0,
+        };
+        let a2_cb_op = OutPoint {
+            txid: a2_coinbase_txid,
+            vout: 0,
+        };
         assert!(cs.get_coin(&a1_cb_op).is_some());
         assert!(cs.get_coin(&a2_cb_op).is_some());
 
@@ -18412,25 +18981,45 @@ pub(crate) mod tests {
 
         // After reorg: A-chain coinbase UTXOs must NOT exist
         assert!(
-            cs.get_coin(&OutPoint { txid: a1_coinbase_txid, vout: 0 }).is_none(),
+            cs.get_coin(&OutPoint {
+                txid: a1_coinbase_txid,
+                vout: 0
+            })
+            .is_none(),
             "A1 coinbase UTXO should not exist after reorg"
         );
         assert!(
-            cs.get_coin(&OutPoint { txid: a2_coinbase_txid, vout: 0 }).is_none(),
+            cs.get_coin(&OutPoint {
+                txid: a2_coinbase_txid,
+                vout: 0
+            })
+            .is_none(),
             "A2 coinbase UTXO should not exist after reorg"
         );
 
         // B-chain coinbase UTXOs must exist
         assert!(
-            cs.get_coin(&OutPoint { txid: b1_coinbase_txid, vout: 0 }).is_some(),
+            cs.get_coin(&OutPoint {
+                txid: b1_coinbase_txid,
+                vout: 0
+            })
+            .is_some(),
             "B1 coinbase UTXO should exist after reorg"
         );
         assert!(
-            cs.get_coin(&OutPoint { txid: b2_coinbase_txid, vout: 0 }).is_some(),
+            cs.get_coin(&OutPoint {
+                txid: b2_coinbase_txid,
+                vout: 0
+            })
+            .is_some(),
             "B2 coinbase UTXO should exist after reorg"
         );
         assert!(
-            cs.get_coin(&OutPoint { txid: b3_coinbase_txid, vout: 0 }).is_some(),
+            cs.get_coin(&OutPoint {
+                txid: b3_coinbase_txid,
+                vout: 0
+            })
+            .is_some(),
             "B3 coinbase UTXO should exist after reorg"
         );
 
@@ -18468,10 +19057,14 @@ pub(crate) mod tests {
         .unwrap();
 
         // Inject a fake checkpoint at height 1 with an impossible hash
-        let fake_hash: BlockHash = "0000000000000000000000000000000000000000000000000000000000000001"
-            .parse()
-            .unwrap();
-        cs.checkpoints = vec![Checkpoint { height: 1, hash: fake_hash }];
+        let fake_hash: BlockHash =
+            "0000000000000000000000000000000000000000000000000000000000000001"
+                .parse()
+                .unwrap();
+        cs.checkpoints = vec![Checkpoint {
+            height: 1,
+            hash: fake_hash,
+        }];
 
         let genesis_hash = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
         let block1 = build_test_block(genesis_hash, 1, 1_300_000_001);
@@ -18511,15 +19104,25 @@ pub(crate) mod tests {
         // A sibling at the same height: same work, different hash. Valid, worth
         // storing, but it does not win.
         let sibling = build_test_block(genesis_hash, 1, 1_300_000_099);
-        assert_ne!(sibling.block_hash(), block1.block_hash(), "a genuine sibling");
-        let second = cs.accept_block(&sibling).expect("a valid sibling is accepted, not rejected");
+        assert_ne!(
+            sibling.block_hash(),
+            block1.block_hash(),
+            "a genuine sibling"
+        );
+        let second = cs
+            .accept_block(&sibling)
+            .expect("a valid sibling is accepted, not rejected");
         assert!(
             !second.connected(),
             "an equal-work sibling is stored, not connected -- anything that \
              follows a connect (mempool removal, fee sampling, confirmation \
              events) must not run for it",
         );
-        assert_eq!(second.hash(), sibling.block_hash(), "and it reports its own hash");
+        assert_eq!(
+            second.hash(),
+            sibling.block_hash(),
+            "and it reports its own hash"
+        );
         assert_eq!(
             cs.tip_hash(),
             block1.block_hash(),
@@ -18539,7 +19142,10 @@ pub(crate) mod tests {
         let mut hashes = vec![genesis_hash];
         for i in 1..=5u32 {
             let block = build_test_block(parent, i, 1_300_000_000 + i);
-            parent = cs.accept_block(&block).unwrap_or_else(|_| panic!("accept block {}", i)).hash();
+            parent = cs
+                .accept_block(&block)
+                .unwrap_or_else(|_| panic!("accept block {}", i))
+                .hash();
             hashes.push(parent);
         }
         assert_eq!(cs.tip_height(), 5);
@@ -18554,7 +19160,10 @@ pub(crate) mod tests {
         // All blocks are in file 0, and blocks 4,5 are also in file 0,
         // so the file should NOT be deleted (contains recent blocks too)
         // This tests the safety check.
-        assert_eq!(deleted, 0, "Should not delete file containing recent blocks");
+        assert_eq!(
+            deleted, 0,
+            "Should not delete file containing recent blocks"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -18710,7 +19319,13 @@ pub(crate) mod tests {
 
         // Coinbase UTXO should exist
         let coinbase_txid = block1.txdata[0].compute_txid();
-        assert!(cs.get_coin(&OutPoint { txid: coinbase_txid, vout: 0 }).is_some());
+        assert!(
+            cs.get_coin(&OutPoint {
+                txid: coinbase_txid,
+                vout: 0
+            })
+            .is_some()
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -18734,7 +19349,10 @@ pub(crate) mod tests {
         // Try to connect block 2 before block 1 — should fail
         let result = cs.connect_stored_block(&hash2);
         assert!(
-            matches!(result, Err(ChainError::BadPrevBlock | ChainError::PrevBlockNotFound)),
+            matches!(
+                result,
+                Err(ChainError::BadPrevBlock | ChainError::PrevBlockNotFound)
+            ),
             "Connecting height 2 before 1 should fail, got {:?}",
             result
         );
@@ -18786,14 +19404,18 @@ pub(crate) mod tests {
         let (cs, dir) = make_chain_state();
 
         // Build a header whose prev_blockhash is unknown
-        let fake_parent: BlockHash = "0000000000000000000000000000000000000000000000000000000000abcdef"
-            .parse()
-            .unwrap();
+        let fake_parent: BlockHash =
+            "0000000000000000000000000000000000000000000000000000000000abcdef"
+                .parse()
+                .unwrap();
         let block = build_test_block(fake_parent, 1, 1_300_000_001);
 
         let result = cs.accept_header(&block.header);
         assert!(
-            matches!(result, Err(ChainError::BadPrevBlock | ChainError::PrevBlockNotFound)),
+            matches!(
+                result,
+                Err(ChainError::BadPrevBlock | ChainError::PrevBlockNotFound)
+            ),
             "accept_header with unknown parent should return PrevBlockNotFound, got {:?}",
             result
         );
@@ -18846,7 +19468,11 @@ pub(crate) mod tests {
         let (cs, dir) = make_chain_state();
         let genesis_hash = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
 
-        assert_eq!(cs.headers_tip_height(), 0, "Initial headers_tip should be 0");
+        assert_eq!(
+            cs.headers_tip_height(),
+            0,
+            "Initial headers_tip should be 0"
+        );
 
         let block1 = build_test_block(genesis_hash, 1, 1_300_000_001);
         let hash1 = cs.accept_header(&block1.header).unwrap();
@@ -18921,7 +19547,10 @@ pub(crate) mod tests {
 
         // Also verify MTP at height 1 (only genesis block)
         let mtp_1 = cs.get_median_time_past(1);
-        assert_eq!(mtp_1, genesis_time, "MTP at height 1 should be genesis time");
+        assert_eq!(
+            mtp_1, genesis_time,
+            "MTP at height 1 should be genesis time"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -18936,7 +19565,10 @@ pub(crate) mod tests {
         let mut a_hashes = Vec::new();
         for i in 1..=10u32 {
             let block = build_test_block(parent_a, i, 1_400_000_000 + i);
-            parent_a = cs.accept_block(&block).unwrap_or_else(|e| panic!("accept A{}: {}", i, e)).hash();
+            parent_a = cs
+                .accept_block(&block)
+                .unwrap_or_else(|e| panic!("accept A{}: {}", i, e))
+                .hash();
             a_hashes.push(parent_a);
         }
         assert_eq!(cs.tip_height(), 10);
@@ -18951,7 +19583,10 @@ pub(crate) mod tests {
         }
         // Verify A-chain UTXOs exist
         for op in &a_coinbase_outpoints {
-            assert!(cs.get_coin(op).is_some(), "A-chain UTXO should exist before reorg");
+            assert!(
+                cs.get_coin(op).is_some(),
+                "A-chain UTXO should exist before reorg"
+            );
         }
 
         // Build chain B: 11 blocks from genesis (more work => triggers reorg)
@@ -18959,7 +19594,10 @@ pub(crate) mod tests {
         let mut b_hashes = Vec::new();
         for i in 1..=11u32 {
             let block = build_test_block(parent_b, i, 1_500_000_000 + i);
-            parent_b = cs.accept_block(&block).unwrap_or_else(|e| panic!("accept B{}: {}", i, e)).hash();
+            parent_b = cs
+                .accept_block(&block)
+                .unwrap_or_else(|e| panic!("accept B{}: {}", i, e))
+                .hash();
             b_hashes.push(parent_b);
         }
 
@@ -19041,11 +19679,19 @@ pub(crate) mod tests {
         let a1_txid = a1.txdata[0].compute_txid();
         let a2_txid = a2.txdata[0].compute_txid();
         assert!(
-            cs.get_coin(&OutPoint { txid: a1_txid, vout: 0 }).is_none(),
+            cs.get_coin(&OutPoint {
+                txid: a1_txid,
+                vout: 0
+            })
+            .is_none(),
             "A1 coinbase should be removed after reorg"
         );
         assert!(
-            cs.get_coin(&OutPoint { txid: a2_txid, vout: 0 }).is_none(),
+            cs.get_coin(&OutPoint {
+                txid: a2_txid,
+                vout: 0
+            })
+            .is_none(),
             "A2 coinbase should be removed after reorg"
         );
 
@@ -19053,9 +19699,27 @@ pub(crate) mod tests {
         let b1_txid = b1.txdata[0].compute_txid();
         let b2_txid = b2.txdata[0].compute_txid();
         let b3_txid = b3.txdata[0].compute_txid();
-        assert!(cs.get_coin(&OutPoint { txid: b1_txid, vout: 0 }).is_some());
-        assert!(cs.get_coin(&OutPoint { txid: b2_txid, vout: 0 }).is_some());
-        assert!(cs.get_coin(&OutPoint { txid: b3_txid, vout: 0 }).is_some());
+        assert!(
+            cs.get_coin(&OutPoint {
+                txid: b1_txid,
+                vout: 0
+            })
+            .is_some()
+        );
+        assert!(
+            cs.get_coin(&OutPoint {
+                txid: b2_txid,
+                vout: 0
+            })
+            .is_some()
+        );
+        assert!(
+            cs.get_coin(&OutPoint {
+                txid: b3_txid,
+                vout: 0
+            })
+            .is_some()
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -19141,7 +19805,10 @@ pub(crate) mod tests {
         let mut parent = genesis_hash;
         for (i, &ts) in timestamps.iter().enumerate() {
             let block = build_test_block(parent, (i + 1) as u32, ts);
-            parent = cs.accept_block(&block).unwrap_or_else(|e| panic!("accept block {}: {}", i + 1, e)).hash();
+            parent = cs
+                .accept_block(&block)
+                .unwrap_or_else(|e| panic!("accept block {}: {}", i + 1, e))
+                .hash();
         }
         assert_eq!(cs.tip_height(), 5);
 
@@ -19178,7 +19845,10 @@ pub(crate) mod tests {
         for i in 1..=12u32 {
             let ts = base_time + i * 100;
             let block = build_test_block(parent, i, ts);
-            parent = cs.accept_block(&block).unwrap_or_else(|e| panic!("accept block {}: {}", i, e)).hash();
+            parent = cs
+                .accept_block(&block)
+                .unwrap_or_else(|e| panic!("accept block {}: {}", i, e))
+                .hash();
             block_timestamps.push(ts);
         }
         assert_eq!(cs.tip_height(), 12);
@@ -19234,12 +19904,9 @@ pub(crate) mod tests {
 
         // Connect them one by one in order
         for (i, hash) in hashes.iter().enumerate() {
-            let connected = cs.connect_stored_block(hash).unwrap_or_else(|e| panic!(
-                "connect_stored_block {} at height {}: {}",
-                hash,
-                i + 1,
-                e
-            ));
+            let connected = cs.connect_stored_block(hash).unwrap_or_else(|e| {
+                panic!("connect_stored_block {} at height {}: {}", hash, i + 1, e)
+            });
             assert_eq!(connected, *hash);
             assert_eq!(cs.tip_height(), (i + 1) as u32);
             assert_eq!(cs.tip_hash(), *hash);
@@ -19283,13 +19950,17 @@ pub(crate) mod tests {
         }
 
         // Connect block 1 (should succeed — parent is genesis = current tip)
-        cs.connect_stored_block(&hashes[0]).expect("connect block 1");
+        cs.connect_stored_block(&hashes[0])
+            .expect("connect block 1");
         assert_eq!(cs.tip_height(), 1);
 
         // Try to connect block 3 (skipping block 2) — should fail with BadPrevBlock
         let result = cs.connect_stored_block(&hashes[2]);
         assert!(
-            matches!(result, Err(ChainError::BadPrevBlock | ChainError::PrevBlockNotFound)),
+            matches!(
+                result,
+                Err(ChainError::BadPrevBlock | ChainError::PrevBlockNotFound)
+            ),
             "Connecting block 3 before block 2 should fail with BadPrevBlock, got {:?}",
             result
         );
@@ -19450,7 +20121,8 @@ pub(crate) mod tests {
         // Block 6 connects onto the untouched tip, and the connector's
         // stored-tail drain takes block 7 from there.
         assert!(cs.accept_block(&b6).unwrap().connected());
-        cs.connect_stored_block(&b7.block_hash()).expect("block 7 connects");
+        cs.connect_stored_block(&b7.block_hash())
+            .expect("block 7 connects");
         assert_eq!(cs.tip_hash(), b7.block_hash());
         assert_eq!(cs.reorg_abort_count(), 0);
 
@@ -19480,7 +20152,11 @@ pub(crate) mod tests {
         let r3 = cs.accept_block(&b3);
         assert!(matches!(r3, Ok(BlockAcceptance::Stored(_))), "B3: {r3:?}");
         assert_eq!(cs.tip_hash(), a3_hash);
-        assert_eq!(cs.reorg_abort_count(), 0, "no reorg before the branch is complete");
+        assert_eq!(
+            cs.reorg_abort_count(),
+            0,
+            "no reorg before the branch is complete"
+        );
 
         let r2 = cs.accept_block(&b2);
         assert!(
@@ -19602,9 +20278,9 @@ pub(crate) mod tests {
         let a3_hash = cs.accept_block(&a3).unwrap().hash();
 
         let bogus = OutPoint {
-            txid: bitcoin::Txid::from_raw_hash(
-                bitcoin::hashes::sha256d::Hash::from_byte_array([0x5b; 32]),
-            ),
+            txid: bitcoin::Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array(
+                [0x5b; 32],
+            )),
             vout: 0,
         };
         let b2 = build_test_block(a1_hash, 2, 1_300_000_012);
@@ -19626,12 +20302,19 @@ pub(crate) mod tests {
                 "{what} must be marked invalid"
             );
         }
-        assert_ne!(cs.get_block_index(&b2.block_hash()).unwrap().status, BlockStatus::Invalid);
+        assert_ne!(
+            cs.get_block_index(&b2.block_hash()).unwrap().status,
+            BlockStatus::Invalid
+        );
 
         // Clear the attempt key, so only the mark can stop a second try.
         *cs.last_activation_attempt.lock() = None;
         assert_eq!(cs.activate_best_stored_chain().unwrap(), None);
-        assert_eq!(cs.reorg_abort_count(), 1, "the branch must not be tried again");
+        assert_eq!(
+            cs.reorg_abort_count(),
+            1,
+            "the branch must not be tried again"
+        );
         assert_eq!(cs.tip_hash(), a3_hash);
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -19688,9 +20371,9 @@ pub(crate) mod tests {
         let a3_hash = cs.accept_block(&a3).unwrap().hash();
 
         let bogus = OutPoint {
-            txid: bitcoin::Txid::from_raw_hash(
-                bitcoin::hashes::sha256d::Hash::from_byte_array([0x5c; 32]),
-            ),
+            txid: bitcoin::Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array(
+                [0x5c; 32],
+            )),
             vout: 0,
         };
         let b2 = build_test_block(a1_hash, 2, 1_300_000_012);
@@ -19717,7 +20400,10 @@ pub(crate) mod tests {
     /// forking at A1 whose headers are known. `bad` is the height of the B
     /// block that spends a coin that does not exist, which passes every check
     /// before the connect. Returns the A3 hash and the three B blocks.
-    fn chain_with_a_heavier_branch_failing_at(cs: &ChainState, bad: u32) -> (BlockHash, [Block; 3]) {
+    fn chain_with_a_heavier_branch_failing_at(
+        cs: &ChainState,
+        bad: u32,
+    ) -> (BlockHash, [Block; 3]) {
         use bitcoin::hashes::Hash;
         let genesis_hash = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
         let a1 = build_test_block(genesis_hash, 1, 1_300_000_001);
@@ -19728,9 +20414,9 @@ pub(crate) mod tests {
         let a3_hash = cs.accept_block(&a3).unwrap().hash();
 
         let bogus = OutPoint {
-            txid: bitcoin::Txid::from_raw_hash(
-                bitcoin::hashes::sha256d::Hash::from_byte_array([0x5d; 32]),
-            ),
+            txid: bitcoin::Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array(
+                [0x5d; 32],
+            )),
             vout: 0,
         };
         let mut prev = a1_hash;
@@ -19770,7 +20456,9 @@ pub(crate) mod tests {
         assert!(
             matches!(
                 r3,
-                Err(ChainError::Connect(connect::ConnectError::MissingOrSpentInput { .. }))
+                Err(ChainError::Connect(
+                    connect::ConnectError::MissingOrSpentInput { .. }
+                ))
             ),
             "B3 failed its own connect and must be rejected, got {r3:?}"
         );
@@ -19850,10 +20538,17 @@ pub(crate) mod tests {
         );
 
         assert_eq!(cs.activate_best_stored_chain().unwrap(), None);
-        assert_eq!(cs.reorg_abort_count(), 1, "nothing changed, so no second attempt");
+        assert_eq!(
+            cs.reorg_abort_count(),
+            1,
+            "nothing changed, so no second attempt"
+        );
 
         cs.repair_block_data(&b3).expect("repair B3");
-        assert_eq!(cs.activate_best_stored_chain().unwrap(), Some(b4.block_hash()));
+        assert_eq!(
+            cs.activate_best_stored_chain().unwrap(),
+            Some(b4.block_hash())
+        );
         assert_eq!(cs.tip_hash(), b4.block_hash());
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -19913,12 +20608,17 @@ pub(crate) mod tests {
         let (tx, mut rx) = tokio::sync::broadcast::channel::<ChainEvent>(16);
         cs.set_chain_event_sender(tx);
         let r7 = cs.accept_block(&b7);
-        assert!(matches!(r7, Ok(BlockAcceptance::Connected(_))), "B7: {r7:?}");
+        assert!(
+            matches!(r7, Ok(BlockAcceptance::Connected(_))),
+            "B7: {r7:?}"
+        );
         assert_eq!(cs.tip_hash(), b8.block_hash());
 
         let events: Vec<ChainEvent> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
         assert!(
-            events.iter().all(|e| matches!(e, ChainEvent::BlockConnected { .. })),
+            events
+                .iter()
+                .all(|e| matches!(e, ChainEvent::BlockConnected { .. })),
             "connects only: {events:?}"
         );
         assert_eq!(events.len(), 3, "{events:?}");
@@ -19979,7 +20679,10 @@ pub(crate) mod tests {
             txid: base[0].txdata[0].compute_txid(),
             vout: 0,
         };
-        assert!(cs.get_coin(&mature).is_some(), "the coinbase must be spendable");
+        assert!(
+            cs.get_coin(&mature).is_some(),
+            "the coinbase must be spendable"
+        );
         let fork_point = cs.tip_hash();
 
         // Branch A spends it, and the delta is made durable.
@@ -20020,7 +20723,10 @@ pub(crate) mod tests {
         );
 
         // Spelled out, so a regression names the artifact rather than a count.
-        assert!(cs.get_coin(&mature).is_none(), "the coinbase is still spent on B");
+        assert!(
+            cs.get_coin(&mature).is_none(),
+            "the coinbase is still spent on B"
+        );
         assert_eq!(cs.get_block_hash_by_height(102), Some(b102_hash));
         assert_eq!(cs.tip_height(), 104);
         if let Some(loc) = cs.get_tx_location(&spend_txid) {
@@ -20122,12 +20828,7 @@ pub(crate) mod tests {
             v[v.len() / 2]
         };
         let trunk_at = |h: u32| BASE + 1000 * h;
-        let b_times: Vec<u32> = vec![
-            BASE + 15_500,
-            BASE + 15_600,
-            BASE + 15_700,
-            BASE + 15_800,
-        ];
+        let b_times: Vec<u32> = vec![BASE + 15_500, BASE + 15_600, BASE + 15_700, BASE + 15_800];
 
         // MTP at height 23 under each branch: the eleven blocks at 12..=22.
         let window_23 = |branch: &[u32]| -> u32 {
@@ -20162,12 +20863,17 @@ pub(crate) mod tests {
         // Sent on its own, B23 is refused before it is written, as Core's
         // `AcceptBlock` refuses it in `ContextualCheckBlock`, and judged
         // against its own branch's MTP there too.
-        let refused = cs.accept_block(&b23).expect_err("B23 is non-final on its own branch");
+        let refused = cs
+            .accept_block(&b23)
+            .expect_err("B23 is non-final on its own branch");
         assert!(
             refused.to_string().contains("nonfinal"),
             "refused before the write for its locktime: {refused}"
         );
-        assert!(cs.get_block_index(&b23.block_hash()).is_none(), "B23 must not be indexed");
+        assert!(
+            cs.get_block_index(&b23.block_hash()).is_none(),
+            "B23 must not be indexed"
+        );
 
         // Index it anyway, as a reindex scan or an older satd could have, so
         // the reorg path's own MTP is still the thing under test below.
@@ -20194,7 +20900,11 @@ pub(crate) mod tests {
 
         // The failed reorg must leave the node on A, not part-way onto B.
         assert_eq!(cs.tip_height(), 23);
-        assert_eq!(cs.tip_hash(), a_parent, "aborted reorg must restore A's tip");
+        assert_eq!(
+            cs.tip_hash(),
+            a_parent,
+            "aborted reorg must restore A's tip"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -20552,11 +21262,11 @@ pub(crate) mod tests {
             txid: blocks[3].txdata[0].compute_txid(),
             vout: 0,
         };
-        let coin = cs.get_coin(&victim).expect("the coin exists before removal");
+        let coin = cs
+            .get_coin(&victim)
+            .expect("the coin exists before removal");
         let mut batch = crate::storage::StoreBatch::default();
-        batch
-            .coin_removes
-            .push((victim, coin.amount, coin.height));
+        batch.coin_removes.push((victim, coin.amount, coin.height));
         cs.store.write_batch(batch).unwrap();
         flush_and_drop_caches(&cs);
 
@@ -20690,7 +21400,10 @@ pub(crate) mod tests {
         force_status(&cs, &blocks[2].block_hash(), BlockStatus::Pruned);
 
         let report = cs.verify_chainstate_default();
-        assert_eq!(report.pruned, 1, "the pruned block should be counted as pruned");
+        assert_eq!(
+            report.pruned, 1,
+            "the pruned block should be counted as pruned"
+        );
         assert!(
             report.unreadable.is_empty(),
             "a deliberately pruned block is not an unreadable one"
@@ -20729,7 +21442,8 @@ pub(crate) mod tests {
                 .into_script(),
         });
         block.header.merkle_root = block.compute_merkle_root().unwrap();
-        cs.accept_block(&block).expect("accept a block with an OP_RETURN output");
+        cs.accept_block(&block)
+            .expect("accept a block with an OP_RETURN output");
         flush_and_drop_caches(&cs);
 
         let report = cs.verify_chainstate_default();
@@ -20774,7 +21488,11 @@ pub(crate) mod tests {
         cs.accept_header(&canonical.header).unwrap();
 
         cs.invalidate_block(branch.block_hash()).unwrap();
-        assert_eq!(cs.tip_height(), 3, "invalidation truncates to the fork point");
+        assert_eq!(
+            cs.tip_height(),
+            3,
+            "invalidation truncates to the fork point"
+        );
 
         // Now the block arrives and is stored. Storing does not connect.
         cs.store_block(&canonical).unwrap();
@@ -21129,7 +21847,10 @@ pub(crate) mod tests {
         let mut wrong_height = entry.clone();
         wrong_height.height = 7;
 
-        for (what, entry) in [("another block's entry", sibling_entry), ("an entry at another height", wrong_height)] {
+        for (what, entry) in [
+            ("another block's entry", sibling_entry),
+            ("an entry at another height", wrong_height),
+        ] {
             let pre = PreprocessedBlock {
                 height: 6,
                 hash: next.block_hash(),
@@ -21148,7 +21869,10 @@ pub(crate) mod tests {
                 context_free_checked: false,
             };
             let result = cs.connect_preprocessed_block(pre);
-            assert!(matches!(result, Err(ChainError::FlatFile(_))), "{what} must be refused, got {result:?}");
+            assert!(
+                matches!(result, Err(ChainError::FlatFile(_))),
+                "{what} must be refused, got {result:?}"
+            );
             assert_eq!(cs.tip_height(), 5, "{what}: the tip must not have moved");
         }
 
@@ -21164,7 +21888,10 @@ pub(crate) mod tests {
         let t = BlockHash::from_byte_array([1; 32]);
         let t2 = BlockHash::from_byte_array([2; 32]);
         assert!(cs.connector_scan_due(t, 5));
-        assert!(!cs.connector_scan_due(t, 5), "throttled for the same tip and height");
+        assert!(
+            !cs.connector_scan_due(t, 5),
+            "throttled for the same tip and height"
+        );
         assert!(cs.connector_scan_due(t2, 5), "the tip moved");
         assert!(cs.connector_scan_due(t2, 6), "the height moved");
         assert!(!cs.connector_scan_due(t2, 6));
@@ -21173,7 +21900,10 @@ pub(crate) mod tests {
             .unwrap();
         *cs.connector_scan_last.lock() = Some((t2, 6, long_ago));
         assert!(cs.connector_scan_due(t2, 6), "the interval passed");
-        assert!(!cs.connector_scan_due(t2, 6), "and the throttle is re-armed");
+        assert!(
+            !cs.connector_scan_due(t2, 6),
+            "and the throttle is re-armed"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -21212,8 +21942,8 @@ pub(crate) mod tests {
     #[test]
     fn dump_utxo_snapshot_roundtrip_via_codec() {
         use crate::storage::compressed_coin::{
-            deserialize_coin, read_compact_size, write_txout_ser, SnapshotMetadata,
-            SNAPSHOT_MAGIC_BYTES, SNAPSHOT_VERSION,
+            SNAPSHOT_MAGIC_BYTES, SNAPSHOT_VERSION, SnapshotMetadata, deserialize_coin,
+            read_compact_size, write_txout_ser,
         };
         use std::io::BufReader;
         use std::io::Read as _;
@@ -21498,12 +22228,16 @@ pub(crate) mod tests {
         let mut parent = genesis_hash;
         for i in 1..=5u32 {
             let block = build_test_block(parent, i, 1_300_000_000 + i);
-            parent = cs.accept_block(&block).unwrap_or_else(|e| panic!("accept block {}: {}", i, e)).hash();
+            parent = cs
+                .accept_block(&block)
+                .unwrap_or_else(|e| panic!("accept block {}: {}", i, e))
+                .hash();
         }
         assert_eq!(cs.tip_height(), 5);
 
         // Flush the coin cache — should not error
-        cs.flush_coin_cache().expect("flush_coin_cache should succeed");
+        cs.flush_coin_cache()
+            .expect("flush_coin_cache should succeed");
 
         // Verify coin_count reflects all connected blocks' UTXOs
         // Genesis coinbase is unspendable, so only the 5 block coinbases count
@@ -21573,7 +22307,10 @@ pub(crate) mod tests {
         let mut parent = genesis_hash;
         for i in 1..=5u32 {
             let block = build_test_block(parent, i, 1_300_000_000 + i);
-            parent = cs.accept_block(&block).unwrap_or_else(|e| panic!("accept block {}: {}", i, e)).hash();
+            parent = cs
+                .accept_block(&block)
+                .unwrap_or_else(|e| panic!("accept block {}: {}", i, e))
+                .hash();
         }
         assert_eq!(cs.tip_height(), 5);
 
@@ -21604,10 +22341,9 @@ pub(crate) mod tests {
 
         // Verify some header-only entries exist at various heights
         for h in [6, 100, 500, 999, 1000] {
-            let hash = cs.get_block_hash_by_height(h).unwrap_or_else(|| panic!(
-                "Height {} should have a hash mapping",
-                h
-            ));
+            let hash = cs
+                .get_block_hash_by_height(h)
+                .unwrap_or_else(|| panic!("Height {} should have a hash mapping", h));
             let entry = cs.get_block_index(&hash).unwrap();
             assert_eq!(
                 entry.status,
@@ -21822,7 +22558,11 @@ pub(crate) mod tests {
         // header and puts the block on the planned path; the payload then fails
         // `check_block` on its merkle root.
         let mut corrupt = build_test_block(main_hashes[0], 2, 1_709_100_002);
-        assert_eq!(corrupt.block_hash(), main_hashes[1], "test setup: same block");
+        assert_eq!(
+            corrupt.block_hash(),
+            main_hashes[1],
+            "test setup: same block"
+        );
         let mut script = corrupt.txdata[0].input[0].script_sig.to_bytes();
         let last = script.len() - 1;
         script[last] ^= 0xff;
@@ -22217,7 +22957,11 @@ pub(crate) mod tests {
         let stale = build_test_block_spending(parent, 102, 1_700_400_102, mature);
         let stale_hash = cs.accept_block(&stale).expect("store stale 102").hash();
         assert_ne!(main_hash, stale_hash);
-        assert_eq!(cs.tip_hash(), main_hash, "equal work must not reorg the tip");
+        assert_eq!(
+            cs.tip_hash(),
+            main_hash,
+            "equal work must not reorg the tip"
+        );
 
         let re = reindexing_chain_state_over(&dir);
         re.reindex_from_flat_files(None, None, None)
@@ -22273,7 +23017,8 @@ pub(crate) mod tests {
         let expected_coins = cs.store.coin_count();
 
         let re = reindexing_chain_state_over(&dir);
-        re.reindex_from_flat_files(None, None, None).expect("reindex");
+        re.reindex_from_flat_files(None, None, None)
+            .expect("reindex");
 
         assert_eq!(re.tip_hash(), b_tip, "replay must follow the most work");
         assert_eq!(re.tip_height(), 8);
@@ -22417,7 +23162,10 @@ pub(crate) mod tests {
         // is what decides.
         let sibling = build_test_block(main_hashes[2], 4, 1_704_000_999);
         let sibling_hash = cs.accept_block(&sibling).expect("store tip sibling").hash();
-        assert_ne!(sibling_hash, real_tip, "fixture must produce a distinct sibling");
+        assert_ne!(
+            sibling_hash, real_tip,
+            "fixture must produce a distinct sibling"
+        );
         assert_eq!(cs.tip_hash(), real_tip, "equal work must not reorg the tip");
 
         cs.flush_coin_cache().expect("flush before snapshotting");
@@ -22478,7 +23226,10 @@ pub(crate) mod tests {
         // The planned block, and an equal-work sibling of it that is also on
         // disk — the wrong-but-well-formed record a corrupt position lands on.
         let planned = build_test_block(genesis_hash, 1, 1_705_000_001);
-        let planned_hash = cs.accept_block(&planned).expect("accept planned block").hash();
+        let planned_hash = cs
+            .accept_block(&planned)
+            .expect("accept planned block")
+            .hash();
         let wrong = build_test_block(genesis_hash, 1, 1_705_000_999);
         let wrong_hash = cs.accept_block(&wrong).expect("store sibling").hash();
         assert_ne!(planned_hash, wrong_hash, "fixture must produce two records");
@@ -22490,8 +23241,14 @@ pub(crate) mod tests {
 
         cs.flush_coin_cache().expect("flush before clearing");
         cs.store.flush().unwrap();
-        let entry = cs.store.get_block_index(&planned_hash).expect("planned entry");
-        let parent = cs.store.get_block_index(&genesis_hash).expect("genesis entry");
+        let entry = cs
+            .store
+            .get_block_index(&planned_hash)
+            .expect("planned entry");
+        let parent = cs
+            .store
+            .get_block_index(&genesis_hash)
+            .expect("genesis entry");
         cs.store.clear_chainstate().unwrap();
         {
             let mut tip = cs.tip.write();
@@ -22597,7 +23354,10 @@ pub(crate) mod tests {
         );
         let text = e.to_string();
         assert!(text.starts_with("stored block data unreadable"), "{text}");
-        assert!(!text.contains("write"), "a failed read is not a write: {text}");
+        assert!(
+            !text.contains("write"),
+            "a failed read is not a write: {text}"
+        );
         assert_eq!(
             ChainError::FlatFile("No space left on device".into()).to_string(),
             "block file error: No space left on device"
@@ -22780,7 +23540,9 @@ pub(crate) mod tests {
         remine_header(&mut forged.header);
         let mut batch = crate::storage::StoreBatch::default();
         batch.block_index_puts.push((genesis_hash, forged));
-        cs.store.write_batch(batch).expect("write forged genesis entry");
+        cs.store
+            .write_batch(batch)
+            .expect("write forged genesis entry");
         cs.store.invalidate_block_index_cache(&genesis_hash);
         cs.store.flush().unwrap();
 
@@ -22798,7 +23560,11 @@ pub(crate) mod tests {
             matches!(err, ChainError::BadPrevBlock),
             "unexpected error: {err:?}"
         );
-        assert_eq!(cs.tip_height(), 0, "nothing may connect on a forged base case");
+        assert_eq!(
+            cs.tip_height(),
+            0,
+            "nothing may connect on a forged base case"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -22843,7 +23609,11 @@ pub(crate) mod tests {
         // above its own ancestors' MTP or it would not have been storable.
         let stale = build_test_block(hashes[9], 10, BASE + 650);
         let stale_hash = cs.accept_block(&stale).expect("store stale sibling").hash();
-        assert_eq!(cs.tip_hash(), hashes[12], "the sibling must not win the tip");
+        assert_eq!(
+            cs.tip_hash(),
+            hashes[12],
+            "the sibling must not win the tip"
+        );
 
         // Block 13 goes on disk and into the index WITHOUT being connected —
         // the state a reindex actually finds. It cannot be accepted normally:
@@ -22923,7 +23693,11 @@ pub(crate) mod tests {
         }
         let stale = build_test_block(hashes[9], 10, BASE + 650);
         let stale_hash = cs.accept_block(&stale).expect("store stale sibling").hash();
-        assert_eq!(cs.tip_hash(), hashes[12], "the sibling must not win the tip");
+        assert_eq!(
+            cs.tip_hash(),
+            hashes[12],
+            "the sibling must not win the tip"
+        );
 
         let bogus = OutPoint {
             txid: stale.txdata[0].compute_txid(),
@@ -23033,7 +23807,11 @@ pub(crate) mod tests {
             matches!(err, ChainError::BadPrevBlock),
             "unexpected error: {err:?}"
         );
-        assert_eq!(cs.tip_hash(), h1, "the tip must not advance past the refusal");
+        assert_eq!(
+            cs.tip_hash(),
+            h1,
+            "the tip must not advance past the refusal"
+        );
         cs.flush_coin_cache().expect("flush after the refusal");
         assert!(
             cs.get_coin(&OutPoint {
@@ -23099,7 +23877,9 @@ pub(crate) mod tests {
 
         let err = cs
             .reindex_chainstate(None, None, Some((real_tip, real_height)))
-            .expect_err("a replay that cannot reach the previous height must fail, not report success");
+            .expect_err(
+                "a replay that cannot reach the previous height must fail, not report success",
+            );
         assert!(
             matches!(err, ChainError::BadPrevBlock),
             "expected a coverage failure, got {err:?}"
@@ -23348,7 +24128,11 @@ pub(crate) mod tests {
         }
         let short = reindex_warning(&re, "reindex.short")
             .expect("a replay the dropped record cut short must say so");
-        assert!(short.message.contains("height 2, below height 6"), "{}", short.message);
+        assert!(
+            short.message.contains("height 2, below height 6"),
+            "{}",
+            short.message
+        );
         assert_eq!(
             short.context["orphaned_blocks"], 1,
             "block 4 is where the stored chain picks up without its parent"
@@ -23373,7 +24157,10 @@ pub(crate) mod tests {
         let err = re
             .reindex_from_flat_files(None, None, None)
             .expect_err("block files with no chain out of genesis must not pass for a reindex");
-        assert!(matches!(err, ChainError::BadPrevBlock), "unexpected error: {err:?}");
+        assert!(
+            matches!(err, ChainError::BadPrevBlock),
+            "unexpected error: {err:?}"
+        );
         assert_eq!(re.tip_height(), 0);
     }
 
@@ -23411,7 +24198,8 @@ pub(crate) mod tests {
         cs.store.flush().unwrap();
 
         let re = reindexing_chain_state_over(&dir);
-        re.reindex_from_flat_files(None, None, None).expect("reindex");
+        re.reindex_from_flat_files(None, None, None)
+            .expect("reindex");
         assert_eq!(re.tip_hash(), a[4].block_hash());
         for b in &s {
             assert_eq!(
@@ -23437,8 +24225,14 @@ pub(crate) mod tests {
             txid: b.txdata[0].compute_txid(),
             vout: 0,
         };
-        assert!(re.get_coin(&coinbase(&s[0])).is_some(), "s3's coinbase must be live");
-        assert!(re.get_coin(&coinbase(&a[2])).is_none(), "a3's coinbase must be gone");
+        assert!(
+            re.get_coin(&coinbase(&s[0])).is_some(),
+            "s3's coinbase must be live"
+        );
+        assert!(
+            re.get_coin(&coinbase(&a[2])).is_none(),
+            "a3's coinbase must be gone"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -23481,7 +24275,8 @@ pub(crate) mod tests {
         let expected_coins = cs.store.coin_count();
 
         let re = reindexing_chain_state_over(&dir);
-        re.reindex_from_flat_files(None, None, None).expect("reindex");
+        re.reindex_from_flat_files(None, None, None)
+            .expect("reindex");
         assert_eq!(re.tip_hash(), main_tip);
         re.flush_coin_cache().expect("flush reindexed state");
         assert_eq!(re.store.coin_count(), expected_coins);
@@ -23510,7 +24305,8 @@ pub(crate) mod tests {
     fn mined_at_bits(mut block: Block, bits: u32) -> Block {
         block.header.bits = bitcoin::pow::CompactTarget::from_consensus(bits);
         block.header.nonce = 0;
-        while validation::pow::check_proof_of_work_bounded(&block.header, Network::Regtest).is_err() {
+        while validation::pow::check_proof_of_work_bounded(&block.header, Network::Regtest).is_err()
+        {
             block.header.nonce += 1;
         }
         block
@@ -23569,7 +24365,8 @@ pub(crate) mod tests {
         cs.store.flush().unwrap();
 
         let re = reindexing_chain_state_over(&dir);
-        re.reindex_from_flat_files(None, None, None).expect("reindex");
+        re.reindex_from_flat_files(None, None, None)
+            .expect("reindex");
         assert_eq!(
             re.tip_hash(),
             main[4],
@@ -23610,7 +24407,8 @@ pub(crate) mod tests {
         cs.store.flush().unwrap();
 
         let re = reindexing_chain_state_over(&dir);
-        re.reindex_from_flat_files(None, None, None).expect("reindex");
+        re.reindex_from_flat_files(None, None, None)
+            .expect("reindex");
         assert_eq!(re.tip_hash(), main[4]);
         assert!(
             re.store.get_block_index(&old.block_hash()).is_none(),
@@ -23644,8 +24442,12 @@ pub(crate) mod tests {
 
         // A checkpoint at the sibling's own height, naming the main block.
         let mut re = reindexing_chain_state_over(&dir);
-        re.set_checkpoints_for_test(vec![Checkpoint { height: 3, hash: main[2] }]);
-        re.reindex_from_flat_files(None, None, None).expect("reindex");
+        re.set_checkpoints_for_test(vec![Checkpoint {
+            height: 3,
+            hash: main[2],
+        }]);
+        re.reindex_from_flat_files(None, None, None)
+            .expect("reindex");
         assert_eq!(re.tip_hash(), main[4]);
         assert!(
             re.store.get_block_index(&sibling_hash).is_none(),
@@ -23654,9 +24456,17 @@ pub(crate) mod tests {
 
         // A checkpoint above the sibling: it forks below the last checkpoint.
         let mut re = reindexing_chain_state_over(&dir);
-        re.set_checkpoints_for_test(vec![Checkpoint { height: 4, hash: main[3] }]);
-        re.reindex_from_flat_files(None, None, None).expect("reindex");
-        assert_eq!(re.tip_hash(), main[4], "the checkpoint's ancestors must replay");
+        re.set_checkpoints_for_test(vec![Checkpoint {
+            height: 4,
+            hash: main[3],
+        }]);
+        re.reindex_from_flat_files(None, None, None)
+            .expect("reindex");
+        assert_eq!(
+            re.tip_hash(),
+            main[4],
+            "the checkpoint's ancestors must replay"
+        );
         assert!(
             re.store.get_block_index(&sibling_hash).is_none(),
             "a side block forking below the last checkpoint was indexed"
@@ -23664,9 +24474,13 @@ pub(crate) mod tests {
 
         // With checkpoints off, the same sibling is an ordinary side block.
         let mut re = reindexing_chain_state_over(&dir);
-        re.set_checkpoints_for_test(vec![Checkpoint { height: 4, hash: main[3] }]);
+        re.set_checkpoints_for_test(vec![Checkpoint {
+            height: 4,
+            hash: main[3],
+        }]);
         re.set_enforce_checkpoints(false);
-        re.reindex_from_flat_files(None, None, None).expect("reindex");
+        re.reindex_from_flat_files(None, None, None)
+            .expect("reindex");
         assert_eq!(
             re.store.get_block_index(&sibling_hash).map(|e| e.status),
             Some(BlockStatus::DataStored)
@@ -23704,11 +24518,17 @@ pub(crate) mod tests {
         stop.request_on_poll(12);
         re.set_startup_stop(stop);
 
-        let end = re.reindex_from_flat_files(None, None, None).expect("reindex");
+        let end = re
+            .reindex_from_flat_files(None, None, None)
+            .expect("reindex");
 
         assert_eq!(end, FlatFileReindexEnd::Stopped { height: 5 });
         assert_eq!(re.tip_hash(), hashes[4]);
-        assert_eq!(re.store.dirty_count(), 0, "the stop flushes what it connected");
+        assert_eq!(
+            re.store.dirty_count(),
+            0,
+            "the stop flushes what it connected"
+        );
         assert!(
             re.store.get_block_index(&hashes[5]).is_none(),
             "nothing past the stop is indexed"
@@ -23767,7 +24587,11 @@ pub(crate) mod tests {
         assert!(!outcome.is_complete());
         assert_eq!((outcome.tip_height, outcome.plan_tip_height), (5, 20));
         assert_eq!(cs.tip_hash(), hashes[4]);
-        assert_eq!(cs.store.dirty_count(), 0, "the stop flushes what it connected");
+        assert_eq!(
+            cs.store.dirty_count(),
+            0,
+            "the stop flushes what it connected"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -23788,12 +24612,21 @@ pub(crate) mod tests {
         stop.request_on_poll(13);
         re.set_startup_stop(stop);
 
-        let end = re.reindex_from_flat_files(None, None, None).expect("reindex");
+        let end = re
+            .reindex_from_flat_files(None, None, None)
+            .expect("reindex");
 
         assert_eq!(end, FlatFileReindexEnd::Stopped { height: 5 });
         assert_eq!(re.tip_hash(), hashes[4]);
-        assert_eq!(re.store.dirty_count(), 0, "the stop flushes what it connected");
-        assert!(re.store.get_block_index(&hashes[5]).is_none(), "block 6 was abandoned");
+        assert_eq!(
+            re.store.dirty_count(),
+            0,
+            "the stop flushes what it connected"
+        );
+        assert!(
+            re.store.get_block_index(&hashes[5]).is_none(),
+            "block 6 was abandoned"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -23822,7 +24655,11 @@ pub(crate) mod tests {
         assert!(outcome.stopped);
         assert_eq!((outcome.tip_height, outcome.plan_tip_height), (5, 20));
         assert_eq!(cs.tip_hash(), hashes[4]);
-        assert_eq!(cs.store.dirty_count(), 0, "the stop flushes what it connected");
+        assert_eq!(
+            cs.store.dirty_count(),
+            0,
+            "the stop flushes what it connected"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -23839,11 +24676,14 @@ pub(crate) mod tests {
         let (cs, dir) = make_chain_state();
         let hashes = build_chain(&cs, 30, 1_701_300_000);
         let whole = reindexing_chain_state_over(&dir);
-        whole.reindex_from_flat_files(None, None, None).expect("uninterrupted reindex");
+        whole
+            .reindex_from_flat_files(None, None, None)
+            .expect("uninterrupted reindex");
         let (expected, _) = crate::storage::compressed_coin::hash_utxo_set(&*whole.store).unwrap();
 
         let re = reindexing_chain_state_over(&dir);
-        re.reindex_from_flat_files(Some(8), None, None).expect("first run");
+        re.reindex_from_flat_files(Some(8), None, None)
+            .expect("first run");
         assert_eq!(re.tip_height(), 8);
         let progress = crate::startup_progress::StartupProgress::new();
         let end = re
@@ -23853,8 +24693,15 @@ pub(crate) mod tests {
         assert_eq!(end, FlatFileReindexEnd::Finished);
         assert_eq!(re.tip_hash(), hashes[29]);
         let (got, _) = crate::storage::compressed_coin::hash_utxo_set(&*re.store).unwrap();
-        assert_eq!(got, expected, "the continued reindex ends on the same UTXO set");
-        assert_eq!(progress.snapshot().current, 30, "progress counts heights, not this run's blocks");
+        assert_eq!(
+            got, expected,
+            "the continued reindex ends on the same UTXO set"
+        );
+        assert_eq!(
+            progress.snapshot().current,
+            30,
+            "progress counts heights, not this run's blocks"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -23870,7 +24717,8 @@ pub(crate) mod tests {
         let (cs, dir) = make_chain_state();
         let hashes = build_chain(&cs, 12, 1_701_400_000);
         let re = reindexing_chain_state_over(&dir);
-        re.reindex_from_flat_files(Some(8), None, None).expect("first run");
+        re.reindex_from_flat_files(Some(8), None, None)
+            .expect("first run");
         let mut entry = re.store.get_block_index(&hashes[2]).unwrap();
         entry.data_pos += 1;
         let mut batch = crate::storage::StoreBatch::default();
@@ -23905,7 +24753,9 @@ pub(crate) mod tests {
         };
 
         let planned = reindexing_chain_state_over(&dir);
-        planned.reindex_from_flat_files(Some(8), None, None).expect("first run");
+        planned
+            .reindex_from_flat_files(Some(8), None, None)
+            .expect("first run");
         row_above_tip(&planned, hashes[9]);
         let end = planned
             .resume_reindex_from_flat_files(None, None, None)
@@ -23915,7 +24765,8 @@ pub(crate) mod tests {
 
         let stray = BlockHash::from_byte_array([0x5a; 32]);
         let re = reindexing_chain_state_over(&dir);
-        re.reindex_from_flat_files(Some(8), None, None).expect("first run");
+        re.reindex_from_flat_files(Some(8), None, None)
+            .expect("first run");
         row_above_tip(&re, stray);
         let err = re
             .resume_reindex_from_flat_files(None, None, None)
@@ -23939,7 +24790,8 @@ pub(crate) mod tests {
         let (cs, dir) = make_chain_state();
         build_chain(&cs, 12, 1_701_900_000);
         let re = reindexing_chain_state_over(&dir);
-        re.reindex_from_flat_files(Some(8), None, None).expect("first run");
+        re.reindex_from_flat_files(Some(8), None, None)
+            .expect("first run");
         let stop = crate::shutdown::StartupStop::default();
         stop.request_on_poll(2);
         re.set_startup_stop(stop);
@@ -23982,20 +24834,28 @@ pub(crate) mod tests {
         assert!(on_disk > 12 * 32_000, "{on_disk}");
 
         let whole = reindexing_chain_state_over(&dir);
-        whole.reindex_from_flat_files(None, None, None).expect("uninterrupted reindex");
+        whole
+            .reindex_from_flat_files(None, None, None)
+            .expect("uninterrupted reindex");
         let fresh_read = whole.flat_files.lock().scan_bytes_read();
         let (expected, _) = crate::storage::compressed_coin::hash_utxo_set(&*whole.store).unwrap();
 
         let re = reindexing_chain_state_over(&dir);
-        re.reindex_from_flat_files(Some(8), None, None).expect("first run");
+        re.reindex_from_flat_files(Some(8), None, None)
+            .expect("first run");
         let before = re.flat_files.lock().scan_bytes_read();
-        let end = re.resume_reindex_from_flat_files(None, None, None).expect("continued run");
+        let end = re
+            .resume_reindex_from_flat_files(None, None, None)
+            .expect("continued run");
         let resume_read = re.flat_files.lock().scan_bytes_read() - before;
 
         assert_eq!(end, FlatFileReindexEnd::Finished);
         assert_eq!(re.tip_hash(), hashes[11]);
         let (got, _) = crate::storage::compressed_coin::hash_utxo_set(&*re.store).unwrap();
-        assert_eq!(got, expected, "the continued reindex ends on the same UTXO set");
+        assert_eq!(
+            got, expected,
+            "the continued reindex ends on the same UTXO set"
+        );
         for (run, read) in [("fresh", fresh_read), ("continued", resume_read)] {
             assert!(read > 0, "the {run} scan read nothing");
             assert!(
@@ -24037,9 +24897,14 @@ pub(crate) mod tests {
 
         let re = reindexing_chain_state_over(&dir);
         let genesis = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
-        let entry = re.store.get_block_index(&genesis).expect("genesis is indexed");
+        let entry = re
+            .store
+            .get_block_index(&genesis)
+            .expect("genesis is indexed");
         assert_eq!((entry.file_number, entry.data_pos), (0, 0));
-        let end = re.reindex_from_flat_files(None, None, None).expect("reindex");
+        let end = re
+            .reindex_from_flat_files(None, None, None)
+            .expect("reindex");
 
         assert_eq!(end, FlatFileReindexEnd::Finished);
         assert_eq!(re.tip_hash(), hashes[5]);
@@ -24124,9 +24989,12 @@ pub(crate) mod tests {
         let (cs, dir) = make_chain_state();
         build_chain(&cs, 6, 1_701_500_000);
         let re = reindexing_chain_state_over(&dir);
-        re.reindex_from_flat_files(Some(3), None, None).expect("first run");
+        re.reindex_from_flat_files(Some(3), None, None)
+            .expect("first run");
 
-        let err = re.reindex_from_flat_files(None, None, None).expect_err("must refuse");
+        let err = re
+            .reindex_from_flat_files(None, None, None)
+            .expect_err("must refuse");
 
         assert!(matches!(err, ChainError::InvalidArgument(_)), "{err}");
         assert_eq!(re.tip_height(), 3);
@@ -24143,9 +25011,12 @@ pub(crate) mod tests {
         let stale = build_test_block(hashes[1], 3, 1_701_600_103);
         let stale_hash = cs.accept_block(&stale).expect("store stale sibling").hash();
         let re = reindexing_chain_state_over(&dir);
-        re.reindex_from_flat_files(Some(4), None, None).expect("first run");
+        re.reindex_from_flat_files(Some(4), None, None)
+            .expect("first run");
 
-        let end = re.resume_reindex_from_flat_files(Some(2), None, None).expect("resume");
+        let end = re
+            .resume_reindex_from_flat_files(Some(2), None, None)
+            .expect("resume");
 
         assert_eq!(end, FlatFileReindexEnd::Finished);
         assert_eq!(re.tip_hash(), hashes[3]);
@@ -24170,8 +25041,7 @@ pub(crate) mod tests {
         }
         cs.store.flush().unwrap();
         let count_before = cs.coin_count();
-        let (hash_before, _) =
-            crate::storage::compressed_coin::hash_utxo_set(&*cs.store).unwrap();
+        let (hash_before, _) = crate::storage::compressed_coin::hash_utxo_set(&*cs.store).unwrap();
         assert_eq!(cs.tip_height(), 300);
 
         // Wipe chainstate (block index is preserved) and reset the in-memory
@@ -24192,8 +25062,7 @@ pub(crate) mod tests {
             count_before,
             "coin count must match after reindex"
         );
-        let (hash_after, _) =
-            crate::storage::compressed_coin::hash_utxo_set(&*cs.store).unwrap();
+        let (hash_after, _) = crate::storage::compressed_coin::hash_utxo_set(&*cs.store).unwrap();
         assert_eq!(
             hash_after, hash_before,
             "reindexed UTXO set must be byte-identical to the original"
@@ -24442,13 +25311,13 @@ pub(crate) mod tests {
         const EASY: u32 = 0x207fffff;
         let genesis = test_hash(0);
         let (a, first, second) = (test_hash(1), test_hash(3), test_hash(2));
-        assert!(second < first, "the fixture needs the first-seen sibling to hash higher");
+        assert!(
+            second < first,
+            "the fixture needs the first-seen sibling to hash higher"
+        );
 
-        let (children, headers) = synthetic_reindex_tree(&[
-            (genesis, a, EASY),
-            (a, first, EASY),
-            (a, second, EASY),
-        ]);
+        let (children, headers) =
+            synthetic_reindex_tree(&[(genesis, a, EASY), (a, first, EASY), (a, second, EASY)]);
 
         let plan = plan_permissively(&children, &headers, genesis);
         assert_eq!(plan.path, vec![a, first]);
@@ -24701,10 +25570,14 @@ pub(crate) mod tests {
             Default::default(),
         )
         .unwrap();
-        assert!(cs.signet_challenge.is_none(), "premise: no -signetchallenge");
+        assert!(
+            cs.signet_challenge.is_none(),
+            "premise: no -signetchallenge"
+        );
 
         let block1 = default_signet_block(1);
-        cs.accept_block(&block1).expect("real default-signet block 1 is accepted");
+        cs.accept_block(&block1)
+            .expect("real default-signet block 1 is accepted");
         assert_eq!(cs.tip_hash(), block1.block_hash());
 
         // Block 2 with one signature byte flipped: its merkle root and proof
@@ -24720,7 +25593,8 @@ pub(crate) mod tests {
         // The real block 2 still connects, so the refusal above was the
         // solution and not the block's position.
         let block2 = default_signet_block(2);
-        cs.accept_block(&block2).expect("real default-signet block 2 is accepted");
+        cs.accept_block(&block2)
+            .expect("real default-signet block 2 is accepted");
         assert_eq!(cs.tip_hash(), block2.block_hash());
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -24762,29 +25636,51 @@ pub(crate) mod tests {
         ));
         let _ = std::fs::remove_dir_all(&dir);
         let mut cs = signet_chain_state_over(&dir);
-        let other: BlockHash =
-            "0000000000000000000000000000000000000000000000000000000000000001".parse().unwrap();
+        let other: BlockHash = "0000000000000000000000000000000000000000000000000000000000000001"
+            .parse()
+            .unwrap();
 
         // The default signet keeps them: a different block at 50,000 fails.
-        assert!(!checkpoints::check_against_checkpoints(50_000, &other, &cs.checkpoints));
+        assert!(!checkpoints::check_against_checkpoints(
+            50_000,
+            &other,
+            &cs.checkpoints
+        ));
 
         cs.set_signet_challenge(Some(vec![0x51])); // OP_TRUE
         assert!(cs.checkpoints.is_empty());
-        assert!(checkpoints::check_against_checkpoints(50_000, &other, &cs.checkpoints));
+        assert!(checkpoints::check_against_checkpoints(
+            50_000,
+            &other,
+            &cs.checkpoints
+        ));
 
         // Back to the default challenge, back to its checkpoints.
         cs.set_signet_challenge(None);
-        assert!(!checkpoints::check_against_checkpoints(50_000, &other, &cs.checkpoints));
+        assert!(!checkpoints::check_against_checkpoints(
+            50_000,
+            &other,
+            &cs.checkpoints
+        ));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn a_custom_signet_has_no_default_assumevalid() {
-        assert!(matches!(default_assumevalid(Network::Signet, false), AssumeValid::Hash(_)));
-        assert!(matches!(default_assumevalid(Network::Signet, true), AssumeValid::Disabled));
+        assert!(matches!(
+            default_assumevalid(Network::Signet, false),
+            AssumeValid::Hash(_)
+        ));
+        assert!(matches!(
+            default_assumevalid(Network::Signet, true),
+            AssumeValid::Disabled
+        ));
         // Only signet has a challenge to customise.
-        assert!(matches!(default_assumevalid(Network::Bitcoin, true), AssumeValid::Hash(_)));
+        assert!(matches!(
+            default_assumevalid(Network::Bitcoin, true),
+            AssumeValid::Hash(_)
+        ));
     }
 
     /// Every network takes Bitcoin Core v32.1's `defaultAssumeValid`
@@ -24816,7 +25712,10 @@ pub(crate) mod tests {
             hash(Network::Signet),
             "00000002a5e0ba0498f1e9f4591af0b66b63c654665efe65206fd0ae7bbaf923"
         );
-        assert!(matches!(default_assumevalid(Network::Regtest, false), AssumeValid::Disabled));
+        assert!(matches!(
+            default_assumevalid(Network::Regtest, false),
+            AssumeValid::Disabled
+        ));
     }
 
     /// The message start of every record in `blocks/blk00000.dat`, in order,
@@ -24867,13 +25766,22 @@ pub(crate) mod tests {
             Some(vec![0x51]), // OP_TRUE: any solution satisfies it
         )
         .unwrap();
-        cs.accept_block(&default_signet_block(1)).expect("block 1 under OP_TRUE");
+        cs.accept_block(&default_signet_block(1))
+            .expect("block 1 under OP_TRUE");
         cs.flat_files.lock().sync_all().unwrap();
 
         let custom = crate::validation::signet::signet_magic(&[0x51]).to_bytes();
-        assert_ne!(custom, network_magic(Network::Signet), "premise: the magics differ");
+        assert_ne!(
+            custom,
+            network_magic(Network::Signet),
+            "premise: the magics differ"
+        );
         assert_eq!(cs.block_magic(), custom);
-        assert_eq!(record_magics(&blocks), vec![custom, custom], "genesis and block 1");
+        assert_eq!(
+            record_magics(&blocks),
+            vec![custom, custom],
+            "genesis and block 1"
+        );
 
         // A `dumptxoutset` snapshot is tagged with it too, as Core's
         // `SnapshotMetadata::m_network_magic` is `MessageStart()`.
@@ -24950,7 +25858,11 @@ pub(crate) mod tests {
         };
         let bad2 = default_signet_block_2_with_a_bad_solution();
         let (cs, dir) = signet_chain_stored_unchecked(&[default_signet_block(1), bad2.clone()]);
-        assert_eq!(cs.tip_hash(), bad2.block_hash(), "premise: stored and connected unchecked");
+        assert_eq!(
+            cs.tip_hash(),
+            bad2.block_hash(),
+            "premise: stored and connected unchecked"
+        );
 
         cs.store.clear_chainstate().unwrap();
         {
@@ -24987,7 +25899,12 @@ pub(crate) mod tests {
         assert_eq!(re.tip_height(), 1);
         assert_eq!(re.tip_hash(), default_signet_block(1).block_hash());
         assert!(re.store.get_block_index(&bad2.block_hash()).is_none());
-        assert!(re.warnings().list().iter().any(|w| w.id == "reindex.halted"));
+        assert!(
+            re.warnings()
+                .list()
+                .iter()
+                .any(|w| w.id == "reindex.halted")
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -25012,10 +25929,14 @@ pub(crate) mod tests {
             bad2.clone(),
         ]);
         assert_eq!(cs.tip_hash(), default_signet_block(3).block_hash());
-        assert!(cs.store.get_block_index(&bad2.block_hash()).is_some(), "premise: stored");
+        assert!(
+            cs.store.get_block_index(&bad2.block_hash()).is_some(),
+            "premise: stored"
+        );
 
         let re = signet_chain_state_over(&dir);
-        re.reindex_from_flat_files(None, None, None).expect("reindex");
+        re.reindex_from_flat_files(None, None, None)
+            .expect("reindex");
         assert_eq!(re.tip_hash(), default_signet_block(3).block_hash());
         assert!(
             re.store.get_block_index(&bad2.block_hash()).is_none(),

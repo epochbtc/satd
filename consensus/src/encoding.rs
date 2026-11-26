@@ -117,8 +117,7 @@ pub fn check_signature_encoding(sig: &[u8], script_flags: u32) -> Result<(), Scr
     if flags::has_flag(script_flags, flags::VERIFY_LOW_S) {
         is_low_der_signature(sig)?;
     }
-    if flags::has_flag(script_flags, flags::VERIFY_STRICTENC)
-        && !is_defined_hashtype_signature(sig)
+    if flags::has_flag(script_flags, flags::VERIFY_STRICTENC) && !is_defined_hashtype_signature(sig)
     {
         return Err(ScriptError::SigHashtype);
     }
@@ -290,9 +289,7 @@ mod tests {
     fn test_der_encoding_validation() {
         // Valid DER signature (minimal example)
         // 30 06 02 01 01 02 01 01 01 (hashtype)
-        let valid = vec![
-            0x30, 0x06, 0x02, 0x01, 0x01, 0x02, 0x01, 0x01, 0x01,
-        ];
+        let valid = vec![0x30, 0x06, 0x02, 0x01, 0x01, 0x02, 0x01, 0x01, 0x01];
         assert!(is_valid_signature_encoding(&valid));
 
         // Too short
@@ -374,7 +371,10 @@ mod tests {
         // Core's GetOp fails on a PUSHDATA2 with fewer than two length bytes
         // and FindAndDelete stops there, leaving the script as it was.
         let script = [0xac, 0x4d, 0x01];
-        assert_eq!(find_and_delete(&script, &[0x01, 0x07]), (script.to_vec(), 0));
+        assert_eq!(
+            find_and_delete(&script, &[0x01, 0x07]),
+            (script.to_vec(), 0)
+        );
     }
 
     #[test]
@@ -387,6 +387,9 @@ mod tests {
         // A length of 65536 (byte 2 set) runs past the end: the push takes the
         // rest of the script, pattern and all.
         let script = [0x4e, 0x00, 0x00, 0x01, 0x00, 0x01, 0x07];
-        assert_eq!(find_and_delete(&script, &[0x01, 0x07]), (script.to_vec(), 0));
+        assert_eq!(
+            find_and_delete(&script, &[0x01, 0x07]),
+            (script.to_vec(), 0)
+        );
     }
 }

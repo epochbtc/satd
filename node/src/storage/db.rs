@@ -374,7 +374,10 @@ impl Store for InMemoryStore {
         Ok(())
     }
 
-    fn for_each_opreturn_strip(&self, f: &mut dyn FnMut(&BlockHash, &[u8])) -> Result<(), StoreError> {
+    fn for_each_opreturn_strip(
+        &self,
+        f: &mut dyn FnMut(&BlockHash, &[u8]),
+    ) -> Result<(), StoreError> {
         for (hash, record) in self.opreturn_strip.read().iter() {
             f(hash, record);
         }
@@ -435,10 +438,8 @@ impl Store for InMemoryStore {
         // For deterministic iteration order (matching Core's key sort),
         // collect into a sorted vector before yielding. Tests use this
         // backend so consistency with the RocksDB path matters.
-        let mut entries: Vec<(OutPoint, Coin)> = coins
-            .iter()
-            .map(|(op, c)| (*op, c.clone()))
-            .collect();
+        let mut entries: Vec<(OutPoint, Coin)> =
+            coins.iter().map(|(op, c)| (*op, c.clone())).collect();
         drop(coins);
         entries.sort_by(|(a, _), (b, _)| {
             let ak = crate::storage::coinview::outpoint_to_key(a);
@@ -479,10 +480,7 @@ impl Store for InMemoryStore {
     /// it is always live. The window's top is the highest coin height.
     fn utxo_recent_heights(&self) -> Option<crate::storage::RecentHeightWindow> {
         use bitcoin::hashes::Hash as _;
-        let tip = self
-            .get_tip()
-            .map(|h| h.to_byte_array())
-            .unwrap_or([0; 32]);
+        let tip = self.get_tip().map(|h| h.to_byte_array()).unwrap_or([0; 32]);
         let mut window = crate::storage::RecentHeightWindow::empty(tip);
         for coin in self.coins.read().values() {
             window.add_one(coin.height);
@@ -615,9 +613,7 @@ impl Store for InMemoryStore {
                 ))
             })
             .collect();
-        rows.sort_by(|(a, _), (b, _)| {
-            (a.height, a.txid, a.vout).cmp(&(b.height, b.txid, b.vout))
-        });
+        rows.sort_by(|(a, _), (b, _)| (a.height, a.txid, a.vout).cmp(&(b.height, b.txid, b.vout)));
         rows
     }
 
@@ -700,9 +696,7 @@ impl Store for InMemoryStore {
                 },
             ));
         }
-        rows.sort_by(|(a, _), (b, _)| {
-            (a.height, a.txid, a.vin).cmp(&(b.height, b.txid, b.vin))
-        });
+        rows.sort_by(|(a, _), (b, _)| (a.height, a.txid, a.vin).cmp(&(b.height, b.txid, b.vin)));
         rows
     }
 
@@ -819,7 +813,6 @@ impl Store for InMemoryStore {
     fn get_filter(&self, filter_type: u8, height: u32) -> Option<Vec<u8>> {
         self.filter
             .read()
-            
             .get(&FilterKey {
                 filter_type,
                 height,
@@ -831,7 +824,6 @@ impl Store for InMemoryStore {
     fn get_filter_header(&self, filter_type: u8, height: u32) -> Option<[u8; 32]> {
         self.filter_header
             .read()
-            
             .get(&FilterKey {
                 filter_type,
                 height,
@@ -898,9 +890,7 @@ mod tests {
     fn write_batch_remove_wins_for_put_remove_pairs() {
         let store = InMemoryStore::new();
         let mk_op = |seed: u8| OutPoint {
-            txid: Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array(
-                [seed; 32],
-            )),
+            txid: Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array([seed; 32])),
             vout: 0,
         };
         let mk_coin = |amount: u64| Coin {

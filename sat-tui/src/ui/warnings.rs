@@ -38,7 +38,11 @@ pub fn draw(f: &mut Frame, state: &AppState) {
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(border_color).add_modifier(Modifier::BOLD))
+        .border_style(
+            Style::default()
+                .fg(border_color)
+                .add_modifier(Modifier::BOLD),
+        )
         .title(Span::styled(
             title.to_string(),
             Style::default()
@@ -51,12 +55,17 @@ pub fn draw(f: &mut Frame, state: &AppState) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(0), Constraint::Length(3)])
-        .split(inner.inner(Margin { horizontal: 1, vertical: 1 }));
+        .split(inner.inner(Margin {
+            horizontal: 1,
+            vertical: 1,
+        }));
 
     let mut lines: Vec<Line<'static>> = Vec::new();
     lines.push(Line::from(Span::styled(
         format!("  {} active operational issue(s):", visible.len()),
-        Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+        Style::default()
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD),
     )));
     lines.push(Line::from(""));
 
@@ -74,9 +83,22 @@ pub fn draw(f: &mut Frame, state: &AppState) {
     f.render_widget(para, chunks[0]);
 
     let footer = Line::from(vec![
-        Span::styled("a", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
-        Span::styled(": acknowledge + dismiss for this session    ", Style::default().fg(Color::Gray)),
-        Span::styled("w", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            "a",
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            ": acknowledge + dismiss for this session    ",
+            Style::default().fg(Color::Gray),
+        ),
+        Span::styled(
+            "w",
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::styled(": toggle this modal", Style::default().fg(Color::Gray)),
     ])
     .alignment(Alignment::Center);
@@ -100,7 +122,9 @@ fn warning_lines(w: &NodeWarning, now_unix: u64) -> Vec<Line<'static>> {
             Span::styled("] ", Style::default().fg(Color::DarkGray)),
             Span::styled(
                 w.id.clone(),
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
                 format!("   first seen {} ago · ×{}", age_str, w.count),

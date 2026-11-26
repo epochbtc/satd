@@ -33,7 +33,7 @@
 use serde_json::Value;
 
 use crate::nap::printable;
-use crate::rpc::{RpcError, JSONRPC_METHOD_NOT_FOUND};
+use crate::rpc::{JSONRPC_METHOD_NOT_FOUND, RpcError};
 
 /// The read-only RPC listener's code for a method it does not expose
 /// (satd `node/src/rpc/readonly.rs`, `READONLY_REJECT_CODE`).
@@ -78,12 +78,22 @@ impl FamilyBar {
 /// largest, the rest folded into `other`. The survey row's and the crawl
 /// row's.
 pub fn family_bars(families: &[(String, u64)], claimed: &[(String, u64)]) -> Vec<FamilyBar> {
-    let mut bars: Vec<FamilyBar> =
-        families.iter().map(|(name, n)| FamilyBar { name: name.clone(), observed: *n, claimed: 0 }).collect();
+    let mut bars: Vec<FamilyBar> = families
+        .iter()
+        .map(|(name, n)| FamilyBar {
+            name: name.clone(),
+            observed: *n,
+            claimed: 0,
+        })
+        .collect();
     for (name, n) in claimed {
         match bars.iter_mut().find(|b| b.name == *name) {
             Some(b) => b.claimed += n,
-            None => bars.push(FamilyBar { name: name.clone(), observed: 0, claimed: *n }),
+            None => bars.push(FamilyBar {
+                name: name.clone(),
+                observed: 0,
+                claimed: *n,
+            }),
         }
     }
     bars.sort_by(|a, b| b.total().cmp(&a.total()).then_with(|| a.name.cmp(&b.name)));
@@ -184,7 +194,9 @@ pub fn classify(res: Result<Value, RpcError>) -> Poll {
             }
         }
         Err(RpcError::Rpc { code, .. })
-            if code == JSONRPC_METHOD_NOT_FOUND || code == READONLY_REJECT_CODE || code == CAPABILITY_DENIED_CODE =>
+            if code == JSONRPC_METHOD_NOT_FOUND
+                || code == READONLY_REJECT_CODE
+                || code == CAPABILITY_DENIED_CODE =>
         {
             Poll::Hidden
         }
@@ -204,7 +216,12 @@ pub fn parse(v: &Value) -> Option<Survey> {
         let mut out: Vec<(String, u64)> = v
             .get(key)
             .and_then(Value::as_object)
-            .map(|o| o.iter().map(|(name, f)| (printable(name), count(f, "count"))).filter(|(_, n)| *n > 0).collect())
+            .map(|o| {
+                o.iter()
+                    .map(|(name, f)| (printable(name), count(f, "count")))
+                    .filter(|(_, n)| *n > 0)
+                    .collect()
+            })
             .unwrap_or_default();
         out.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         out
@@ -219,7 +236,11 @@ pub fn parse(v: &Value) -> Option<Survey> {
     let top_as = v
         .get("top_as")
         .and_then(Value::as_array)
-        .map(|a| a.iter().filter_map(|e| Some((e.get("asn")?.as_u64()?, count(e, "count")))).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|e| Some((e.get("asn")?.as_u64()?, count(e, "count"))))
+                .collect()
+        })
         .unwrap_or_default();
     let conns = v.get("connections");
     let last = conns.and_then(|c| c.get("last")).and_then(|l| {
@@ -249,7 +270,11 @@ pub fn parse(v: &Value) -> Option<Survey> {
 impl Survey {
     /// `n` as a percentage of the addresses; 0 with none.
     pub fn pct(&self, n: u64) -> f64 {
-        if self.addresses == 0 { 0.0 } else { n as f64 * 100.0 / self.addresses as f64 }
+        if self.addresses == 0 {
+            0.0
+        } else {
+            n as f64 * 100.0 / self.addresses as f64
+        }
     }
 
     /// The bars: each family's observed and claimed records together, the
@@ -271,7 +296,12 @@ impl Survey {
     /// about which implementation answered, and neither is a claimed
     /// family, which is the user agent's word alone.
     pub fn non_core_pct(&self) -> f64 {
-        let non_core = self.families.iter().filter(|(f, _)| f != "core" && f != "unknown").map(|(_, n)| n).sum();
+        let non_core = self
+            .families
+            .iter()
+            .filter(|(f, _)| f != "core" && f != "unknown")
+            .map(|(_, n)| n)
+            .sum();
         self.pct(non_core)
     }
 
@@ -287,7 +317,10 @@ impl Survey {
 
     /// The one line the row is while the crawl supersedes the survey.
     pub fn superseded_line(&self) -> String {
-        format!("survey: superseded by the crawl, {} addrs kept", crate::ui::format_num(self.addresses))
+        format!(
+            "survey: superseded by the crawl, {} addrs kept",
+            crate::ui::format_num(self.addresses)
+        )
     }
 
     /// The last connection as the panel states it, against `now` (Unix
@@ -356,15 +389,31 @@ pub(crate) mod tests {
         assert_eq!(s.families.len(), 9, "bitnodes has no record");
         assert_eq!(s.families[0], ("core".to_string(), 1080));
         assert_eq!(s.families[1], ("btcd".to_string(), 30));
-        assert!(s.families.contains(&("unknown".to_string(), 5)), "unknown as the node counts it");
-        assert_eq!(s.claimed, [("core".to_string(), 41), ("btcd".to_string(), 2)], "apart from families, zeros left out");
+        assert!(
+            s.families.contains(&("unknown".to_string(), 5)),
+            "unknown as the node counts it"
+        );
+        assert_eq!(
+            s.claimed,
+            [("core".to_string(), 41), ("btcd".to_string(), 2)],
+            "apart from families, zeros left out"
+        );
         assert_eq!(s.fake, [("core".to_string(), 4)]);
         assert_eq!(s.fake_total(), 4);
         assert_eq!(s.closed_early, Some(6));
         assert_eq!(s.v2, 494);
         assert_eq!(s.top_as, [(64496, 84), (64497, 61)]);
-        assert_eq!((s.completed, s.failed, s.probed, s.probes), (1300, 2100, 600, true));
-        assert_eq!(s.last, Some(LastConnection { time: 1_790_000_000, completed: true }));
+        assert_eq!(
+            (s.completed, s.failed, s.probed, s.probes),
+            (1300, 2100, 600, true)
+        );
+        assert_eq!(
+            s.last,
+            Some(LastConnection {
+                time: 1_790_000_000,
+                completed: true
+            })
+        );
 
         // Before any connection ends, and from a node without the field.
         let mut v = reply();
@@ -383,15 +432,33 @@ pub(crate) mod tests {
         let off = json!({"addresses": 0, "families": {}, "mismatches": 0, "v2": {"count": 0, "share": 0.0},
                          "top_as": [], "probed": 0, "enabled": false});
         assert!(matches!(classify(Ok(off)), Poll::Hidden));
-        for code in [JSONRPC_METHOD_NOT_FOUND, READONLY_REJECT_CODE, CAPABILITY_DENIED_CODE] {
-            let e = RpcError::Rpc { code, message: "no".into() };
+        for code in [
+            JSONRPC_METHOD_NOT_FOUND,
+            READONLY_REJECT_CODE,
+            CAPABILITY_DENIED_CODE,
+        ] {
+            let e = RpcError::Rpc {
+                code,
+                message: "no".into(),
+            };
             assert!(matches!(classify(Err(e)), Poll::Hidden), "{code}");
         }
         assert!(matches!(classify(Err(RpcError::Timeout)), Poll::Failed(_)));
-        assert!(matches!(classify(Err(RpcError::Rpc { code: -1, message: "x".into() })), Poll::Failed(_)));
-        assert!(matches!(classify(Ok(json!({"enabled": true}))), Poll::Failed(_)), "no counts");
+        assert!(matches!(
+            classify(Err(RpcError::Rpc {
+                code: -1,
+                message: "x".into()
+            })),
+            Poll::Failed(_)
+        ));
+        assert!(
+            matches!(classify(Ok(json!({"enabled": true}))), Poll::Failed(_)),
+            "no counts"
+        );
         assert!(matches!(classify(Ok(json!([]))), Poll::Failed(_)));
-        assert!(matches!(classify(Ok(reply())), Poll::On(s) if s.addresses == 1204 && !s.superseded));
+        assert!(
+            matches!(classify(Ok(reply())), Poll::On(s) if s.addresses == 1204 && !s.superseded)
+        );
     }
 
     /// With the crawl on the node says the survey is superseded, `enabled`
@@ -401,9 +468,14 @@ pub(crate) mod tests {
         let mut v = reply();
         v["enabled"] = json!(false);
         v["superseded_by_crawl"] = json!(true);
-        let Poll::On(s) = classify(Ok(v)) else { panic!("kept") };
+        let Poll::On(s) = classify(Ok(v)) else {
+            panic!("kept")
+        };
         assert!(s.superseded);
-        assert_eq!(s.superseded_line(), "survey: superseded by the crawl, 1,204 addrs kept");
+        assert_eq!(
+            s.superseded_line(),
+            "survey: superseded by the crawl, 1,204 addrs kept"
+        );
         let mut v = reply();
         v["superseded_by_crawl"] = json!(false);
         assert!(matches!(classify(Ok(v)), Poll::On(s) if !s.superseded));
@@ -423,11 +495,21 @@ pub(crate) mod tests {
         let s = parse(&v).unwrap();
         assert_eq!(s.closed_early, None);
         assert!(s.fake.is_empty());
-        assert!(s.families.contains(&("unknown".to_string(), 15)), "58 less the 43 claimed: {:?}", s.families);
+        assert!(
+            s.families.contains(&("unknown".to_string(), 15)),
+            "58 less the 43 claimed: {:?}",
+            s.families
+        );
         assert_eq!(s.families.iter().map(|(_, n)| n).sum::<u64>() + 43, 1204);
         // Every unknown one claimed: no unknown bar.
         v["families"]["unknown"]["count"] = json!(43);
-        assert!(!parse(&v).unwrap().families.iter().any(|(f, _)| f == "unknown"));
+        assert!(
+            !parse(&v)
+                .unwrap()
+                .families
+                .iter()
+                .any(|(f, _)| f == "unknown")
+        );
         // Before `claimed` as well.
         v.as_object_mut().unwrap().remove("claimed");
         v["families"]["unknown"]["count"] = json!(58);
@@ -444,16 +526,64 @@ pub(crate) mod tests {
         let s = parse(&reply()).unwrap();
         let bars = s.family_bars();
         assert_eq!(bars.len(), TOP_FAMILIES + 1);
-        assert_eq!(bars[0], FamilyBar { name: "core".into(), observed: 1080, claimed: 41 });
-        assert_eq!(bars[1], FamilyBar { name: "btcd".into(), observed: 30, claimed: 2 });
-        assert_eq!(bars[TOP_FAMILIES], FamilyBar { name: "other".into(), observed: 2, claimed: 0 }, "floresta's 2 folded");
-        assert_eq!(bars.iter().map(FamilyBar::total).sum::<u64>(), 1204 - 4 - 6, "all but the fake and closed-early");
-        let few = Survey { families: vec![("core".into(), 2)], addresses: 2, ..Default::default() };
-        assert_eq!(few.family_bars(), [FamilyBar { name: "core".into(), observed: 2, claimed: 0 }]);
+        assert_eq!(
+            bars[0],
+            FamilyBar {
+                name: "core".into(),
+                observed: 1080,
+                claimed: 41
+            }
+        );
+        assert_eq!(
+            bars[1],
+            FamilyBar {
+                name: "btcd".into(),
+                observed: 30,
+                claimed: 2
+            }
+        );
+        assert_eq!(
+            bars[TOP_FAMILIES],
+            FamilyBar {
+                name: "other".into(),
+                observed: 2,
+                claimed: 0
+            },
+            "floresta's 2 folded"
+        );
+        assert_eq!(
+            bars.iter().map(FamilyBar::total).sum::<u64>(),
+            1204 - 4 - 6,
+            "all but the fake and closed-early"
+        );
+        let few = Survey {
+            families: vec![("core".into(), 2)],
+            addresses: 2,
+            ..Default::default()
+        };
+        assert_eq!(
+            few.family_bars(),
+            [FamilyBar {
+                name: "core".into(),
+                observed: 2,
+                claimed: 0
+            }]
+        );
         // A family only claimed has a bar of its own.
-        let claimed_only =
-            Survey { families: vec![("core".into(), 2)], claimed: vec![("bcoin".into(), 3)], addresses: 5, ..Default::default() };
-        assert_eq!(claimed_only.family_bars()[0], FamilyBar { name: "bcoin".into(), observed: 0, claimed: 3 });
+        let claimed_only = Survey {
+            families: vec![("core".into(), 2)],
+            claimed: vec![("bcoin".into(), 3)],
+            addresses: 5,
+            ..Default::default()
+        };
+        assert_eq!(
+            claimed_only.family_bars()[0],
+            FamilyBar {
+                name: "bcoin".into(),
+                observed: 0,
+                claimed: 3
+            }
+        );
     }
 
     #[test]
@@ -461,23 +591,37 @@ pub(crate) mod tests {
         let s = parse(&reply()).unwrap();
         // 30 + 4 + 3 + 2 + 9 + 12 + 6 = 66 of 1204.
         assert!((s.non_core_pct() - 66.0 * 100.0 / 1204.0).abs() < 1e-9);
-        assert_eq!(Survey::default().non_core_pct(), 0.0, "no address, no division by zero");
+        assert_eq!(
+            Survey::default().non_core_pct(),
+            0.0,
+            "no address, no division by zero"
+        );
     }
 
     #[test]
     fn the_collapsed_line() {
         let s = parse(&reply()).unwrap();
         assert_eq!(s.summary(), "survey: 1,204 addrs, non-Core 5.5 %, v2 41 %");
-        assert_eq!(Survey::default().summary(), "survey: 0 addrs, non-Core 0.0 %, v2 0 %");
+        assert_eq!(
+            Survey::default().summary(),
+            "survey: 0 addrs, non-Core 0.0 %, v2 0 %"
+        );
     }
 
     #[test]
     fn last_connection_line() {
         let mut s = parse(&reply()).unwrap();
         assert_eq!(s.last_line(1_790_000_042), "42s ago, completed");
-        s.last = Some(LastConnection { time: 1_790_000_000, completed: false });
+        s.last = Some(LastConnection {
+            time: 1_790_000_000,
+            completed: false,
+        });
         assert_eq!(s.last_line(1_790_000_000), "0s ago, failed");
-        assert_eq!(s.last_line(1_789_999_000), "0s ago, failed", "a node clock ahead of ours");
+        assert_eq!(
+            s.last_line(1_789_999_000),
+            "0s ago, failed",
+            "a node clock ahead of ours"
+        );
         s.last = None;
         assert_eq!(s.last_line(1_790_000_000), "none yet");
     }

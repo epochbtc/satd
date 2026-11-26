@@ -6,9 +6,9 @@ use std::time::{Duration, Instant};
 
 mod common;
 use common::{
-    DeterministicWallet, TestNode, TokenSpec, find_available_port, fresh_test_datadir,
-    get_rpc_str, get_rpc_u64, poll_until, read_chainstate_schema, run_satd_until_exit,
-    run_satd_until_exit_on, stamp_chainstate_schema, test_timeout, write_authfile,
+    DeterministicWallet, TestNode, TokenSpec, find_available_port, fresh_test_datadir, get_rpc_str,
+    get_rpc_u64, poll_until, read_chainstate_schema, run_satd_until_exit, run_satd_until_exit_on,
+    stamp_chainstate_schema, test_timeout, write_authfile,
 };
 
 /// #550: test datadirs used to be named after the RPC port, which is redrawn
@@ -48,7 +48,10 @@ fn test_fresh_test_datadir_wipes_a_reused_path() {
 
     common::prepare_empty_dir(&dir);
 
-    assert!(dir.is_dir(), "the directory must still exist after the wipe");
+    assert!(
+        dir.is_dir(),
+        "the directory must still exist after the wipe"
+    );
     assert_eq!(
         std::fs::read_dir(&dir).unwrap().count(),
         0,
@@ -87,7 +90,11 @@ fn test_requested_esplora_port_only_waits_on_a_port_that_can_accept() {
     // Enabled, but satd skips the bind because Esplora reads through the
     // address index.
     assert_eq!(
-        requested_esplora_port(&["--esplora=1", "--addressindex=0", "--esplorabind=127.0.0.1:3002"]),
+        requested_esplora_port(&[
+            "--esplora=1",
+            "--addressindex=0",
+            "--esplorabind=127.0.0.1:3002"
+        ]),
         None
     );
     // Ephemeral bind: the kernel picks the port, so connecting to 0 refuses
@@ -132,7 +139,10 @@ fn test_requested_electrum_port_only_waits_on_a_port_that_can_accept() {
     );
     // Not enabled, or enabled with no bind of its own (the default port is
     // one this harness did not pick and may belong to something else).
-    assert_eq!(requested_electrum_port(&["--electrumbind=127.0.0.1:50011"]), None);
+    assert_eq!(
+        requested_electrum_port(&["--electrumbind=127.0.0.1:50011"]),
+        None
+    );
     assert_eq!(
         requested_electrum_port(&["--electrum=0", "--electrumbind=127.0.0.1:50011"]),
         None
@@ -225,7 +235,10 @@ fn test_rpc_accepts_jsonrpc_1_0_and_missing_version() {
     let r = node
         .rpc_call_raw_body(r#"{"id":2,"method":"getblockcount","params":[]}"#)
         .unwrap();
-    assert_eq!(r["result"], 0, "missing-version request should succeed: {r}");
+    assert_eq!(
+        r["result"], 0,
+        "missing-version request should succeed: {r}"
+    );
     assert_eq!(r["id"], 2);
 
     // 1.1 form.
@@ -233,8 +246,7 @@ fn test_rpc_accepts_jsonrpc_1_0_and_missing_version() {
         .rpc_call_raw_body(r#"{"jsonrpc":"1.1","id":"x","method":"getbestblockhash"}"#)
         .unwrap();
     assert_eq!(
-        r["result"],
-        "0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206",
+        r["result"], "0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206",
         "jsonrpc 1.1 request should succeed: {r}"
     );
 
@@ -283,9 +295,7 @@ fn test_rpc_oversized_body_rejected_413() {
     // body exceeds the 20 MiB cap, so it is rejected before the full
     // body is materialized for normalization.
     let big = "a".repeat(21 * 1024 * 1024);
-    let body = format!(
-        r#"{{"jsonrpc":"1.0","id":1,"method":"getblockcount","params":["{big}"]}}"#
-    );
+    let body = format!(r#"{{"jsonrpc":"1.0","id":1,"method":"getblockcount","params":["{big}"]}}"#);
     // Rejected either with 413 or by dropping the connection mid-upload
     // (the cap can fire on Content-Length before the body is drained).
     // The forbidden outcomes are a 2xx (body was accepted/buffered) or a
@@ -427,7 +437,10 @@ fn stopatheight_stops_initial_block_download_at_the_target() {
     };
     let text = std::fs::read_to_string(&log_path).unwrap_or_default();
     assert!(status.success(), "{status:?}\n{text}");
-    assert!(text.contains("IBD write mode"), "the blocks must come through the IBD connector:\n{text}");
+    assert!(
+        text.contains("IBD write mode"),
+        "the blocks must come through the IBD connector:\n{text}"
+    );
 
     // It stopped at the target, not past it. Asked through the marker, the
     // record of the tip the node flushed and shut down at: a restart would
@@ -475,8 +488,7 @@ fn test_stopatheight_zero_disabled() {
 fn blocknotify_runs_for_a_block_the_stored_tail_drain_connects() {
     let notify_dir = fresh_test_datadir("satd-blocknotify-drain");
     let notified = notify_dir.join("blocknotify.log");
-    let mut node =
-        TestNode::start(&[&format!("--blocknotify=echo %s >> {}", notified.display())]);
+    let mut node = TestNode::start(&[&format!("--blocknotify=echo %s >> {}", notified.display())]);
 
     let template = node.rpc_call("getblocktemplate").unwrap();
     let t = &template["result"];
@@ -493,12 +505,27 @@ fn blocknotify_runs_for_a_block_the_stored_tail_drain_connects() {
 
     // Both headers first, as a peer announces them before sending blocks;
     // then the child, which is stored to wait for its parent, then the parent.
-    submit("submitheader", hex::encode(bitcoin::consensus::serialize(&parent.header)));
-    submit("submitheader", hex::encode(bitcoin::consensus::serialize(&child.header)));
-    submit("submitblock", hex::encode(bitcoin::consensus::serialize(&child)));
+    submit(
+        "submitheader",
+        hex::encode(bitcoin::consensus::serialize(&parent.header)),
+    );
+    submit(
+        "submitheader",
+        hex::encode(bitcoin::consensus::serialize(&child.header)),
+    );
+    submit(
+        "submitblock",
+        hex::encode(bitcoin::consensus::serialize(&child)),
+    );
     let count = node.rpc_call("getblockcount").unwrap();
-    assert_eq!(count["result"], 0, "fixture: the child waits for its parent");
-    submit("submitblock", hex::encode(bitcoin::consensus::serialize(&parent)));
+    assert_eq!(
+        count["result"], 0,
+        "fixture: the child waits for its parent"
+    );
+    submit(
+        "submitblock",
+        hex::encode(bitcoin::consensus::serialize(&parent)),
+    );
 
     // The drain wakes every 500 ms, and the notifier runs each command in turn.
     let read = || -> Vec<String> {
@@ -519,7 +546,10 @@ fn blocknotify_runs_for_a_block_the_stored_tail_drain_connects() {
     assert_eq!(count["result"], 2, "the drain connects the child");
     assert_eq!(
         read(),
-        vec![parent.block_hash().to_string(), child.block_hash().to_string()],
+        vec![
+            parent.block_hash().to_string(),
+            child.block_hash().to_string()
+        ],
         "-blocknotify runs once for each block, parent then child"
     );
     node.stop();
@@ -638,7 +668,11 @@ fn assert_cli_ok(out: &std::process::Output, want_stdout: &str, what: &str) {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr),
     );
-    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), want_stdout, "{what}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        want_stdout,
+        "{what}"
+    );
 }
 
 /// A node whose `bitcoin.conf` carries `rpcuser`/`rpcpassword` writes no
@@ -675,7 +709,10 @@ fn test_sat_cli_reads_credentials_and_port_from_a_flat_conf() {
         .arg("getblockcount")
         .output()
         .unwrap();
-    assert!(!out.status.success(), "a wrong -rpcpassword must not authenticate");
+    assert!(
+        !out.status.success(),
+        "a wrong -rpcpassword must not authenticate"
+    );
     assert!(
         String::from_utf8_lossy(&out.stderr).contains("Authorization failed"),
         "stderr: {}",
@@ -774,8 +811,7 @@ fn test_rpc_bearer_token_capability_scoping() {
     // A read-only token: its sha256 goes in the auth file, the plaintext is
     // presented as the bearer credential.
     const TOKEN: &str = "satd-test-readonly-token-v1";
-    const TOKEN_SHA256: &str =
-        "710379ec62ddf04432c6c803b1679020abf2caf79a8c64c9dfb522c686a0cf3d";
+    const TOKEN_SHA256: &str = "710379ec62ddf04432c6c803b1679020abf2caf79a8c64c9dfb522c686a0cf3d";
     // A rate-limited read token: 1/s, so a rapid second request is shed (429).
     const TOKEN_RL: &str = "satd-test-ratelimited-token-v1";
     const TOKEN_RL_SHA256: &str =
@@ -845,7 +881,10 @@ fn test_rpc_bearer_token_capability_scoping() {
     // filter rejects before dispatch with a JSON-RPC error (HTTP 200), so this
     // proves the HTTP-layer principal reached the RPC-layer capability filter.
     let (status, json) = call(Some(TOKEN), "sendrawtransaction");
-    assert_eq!(status, 200, "capability denial is a JSON-RPC error, not HTTP");
+    assert_eq!(
+        status, 200,
+        "capability denial is a JSON-RPC error, not HTTP"
+    );
     assert_eq!(
         json["error"]["code"], -32004,
         "expected capability-denied code: {json}"
@@ -868,13 +907,22 @@ fn test_rpc_bearer_token_capability_scoping() {
             other => panic!("unexpected status {other} for rate-limited token"),
         }
     }
-    assert!(saw_ok, "rate-limited token should serve at least one request");
-    assert!(saw_429, "rate-limited token should be 429'd on a rapid burst");
+    assert!(
+        saw_ok,
+        "rate-limited token should serve at least one request"
+    );
+    assert!(
+        saw_429,
+        "rate-limited token should be 429'd on a rapid burst"
+    );
 
     // The operator cookie is unlimited — never 429'd by the same burst.
     for _ in 0..6 {
         let info = node.rpc_call("getblockcount").unwrap();
-        assert!(info.get("result").is_some(), "operator must not be rate-limited");
+        assert!(
+            info.get("result").is_some(),
+            "operator must not be rate-limited"
+        );
     }
 
     node.stop();
@@ -1009,15 +1057,24 @@ fn test_rpc_bearer_submit_capability() {
         "params": {"not_a_parameter": 1},
     });
     let json = named(bogus.clone());
-    assert_eq!(json["error"]["code"], DENIED, "denied before the params are read: {json}");
+    assert_eq!(
+        json["error"]["code"], DENIED,
+        "denied before the params are read: {json}"
+    );
     let json = named(serde_json::json!([bogus]));
-    assert_eq!(json[0]["error"]["code"], DENIED, "the same inside a batch: {json}");
+    assert_eq!(
+        json[0]["error"]["code"], DENIED,
+        "the same inside a batch: {json}"
+    );
     // A method the token may call still has its parameters checked.
     let json = named(serde_json::json!({
         "jsonrpc": "2.0", "id": "t", "method": "getblockhash",
         "params": {"not_a_parameter": 1},
     }));
-    assert_eq!(json["error"]["code"], -8, "named-parameter errors still apply: {json}");
+    assert_eq!(
+        json["error"]["code"], -8,
+        "named-parameter errors still apply: {json}"
+    );
 
     // A token minted with only `rpc:write` keeps broadcasting.
     let (status, json) = call("satd-test-submit-write-token-v1", "sendrawtransaction");
@@ -1076,13 +1133,24 @@ fn test_rpc_bearer_batch_charged_per_entry() {
     assert_eq!(resp.status().as_u16(), 200, "the batch itself is admitted");
     let replies: Vec<serde_json::Value> = resp.json().unwrap();
     assert_eq!(replies.len(), 10);
-    assert!(replies[0].get("result").is_some(), "entry 0 is free: {}", replies[0]);
-    assert!(replies[1].get("result").is_some(), "entry 1 within budget: {}", replies[1]);
+    assert!(
+        replies[0].get("result").is_some(),
+        "entry 0 is free: {}",
+        replies[0]
+    );
+    assert!(
+        replies[1].get("result").is_some(),
+        "entry 1 within budget: {}",
+        replies[1]
+    );
     let shed: Vec<&serde_json::Value> = replies
         .iter()
         .filter(|r| r["error"]["code"] == -32005)
         .collect();
-    assert!(!shed.is_empty(), "a 10-entry batch on a 2/s token must shed: {replies:?}");
+    assert!(
+        !shed.is_empty(),
+        "a 10-entry batch on a 2/s token must shed: {replies:?}"
+    );
     for r in &shed {
         assert!(
             r["error"]["data"]["retry_after_secs"].is_u64(),
@@ -1104,9 +1172,14 @@ fn test_rpc_bearer_batch_charged_per_entry() {
     let replies = node
         .rpc_call_raw_body(&serde_json::Value::Array(batch).to_string())
         .unwrap();
-    let replies = replies.as_array().expect("operator batch reply is an array");
+    let replies = replies
+        .as_array()
+        .expect("operator batch reply is an array");
     assert_eq!(replies.len(), 50);
-    assert!(replies.iter().all(|r| r.get("result").is_some()), "{replies:?}");
+    assert!(
+        replies.iter().all(|r| r.get("result").is_some()),
+        "{replies:?}"
+    );
 
     node.stop();
 }
@@ -1150,7 +1223,11 @@ fn test_rpc_bearer_batch_notifications_are_charged() {
         .unwrap();
     assert_eq!(resp.status().as_u16(), 200, "the batch itself is admitted");
     let replies: Vec<serde_json::Value> = resp.json().unwrap();
-    assert_eq!(replies.len(), 1, "notifications get no reply entry: {replies:?}");
+    assert_eq!(
+        replies.len(),
+        1,
+        "notifications get no reply entry: {replies:?}"
+    );
     assert_eq!(replies[0]["id"], "last", "{replies:?}");
     assert_eq!(
         replies[0]["error"]["code"], -32005,
@@ -1183,9 +1260,10 @@ fn test_rpc_bearer_websocket_frames_are_charged() {
         .build()
         .unwrap();
     let (ok, shed) = rt.block_on(async move {
-        let mut ws = common::ws_client::WsClient::connect_rpc(port, "satd-test-ws-ratelimit-token-v1")
-            .await
-            .expect("the upgrade is admitted");
+        let mut ws =
+            common::ws_client::WsClient::connect_rpc(port, "satd-test-ws-ratelimit-token-v1")
+                .await
+                .expect("the upgrade is admitted");
         for i in 0..10 {
             ws.send_control(serde_json::json!({
                 "jsonrpc": "2.0", "id": i, "method": "getblockcount", "params": []
@@ -1246,18 +1324,26 @@ fn test_rpc_bearer_websocket_frames_follow_revocation_and_expiry() {
     };
     let call = |id: u64| serde_json::json!({"jsonrpc": "2.0", "id": id, "method": "getblockcount", "params": []});
 
-    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
     rt.block_on(async {
-        let mut revoked = common::ws_client::WsClient::connect_rpc(port, "satd-test-ws-revoke-token-v1")
-            .await
-            .expect("the upgrade is admitted");
-        let mut expiring = common::ws_client::WsClient::connect_rpc(port, "satd-test-ws-expire-token-v1")
-            .await
-            .expect("the upgrade is admitted");
+        let mut revoked =
+            common::ws_client::WsClient::connect_rpc(port, "satd-test-ws-revoke-token-v1")
+                .await
+                .expect("the upgrade is admitted");
+        let mut expiring =
+            common::ws_client::WsClient::connect_rpc(port, "satd-test-ws-expire-token-v1")
+                .await
+                .expect("the upgrade is admitted");
         for ws in [&mut revoked, &mut expiring] {
             ws.send_control(call(0)).await;
             let reply = ws.next_json(10).await;
-            assert!(reply.get("result").is_some(), "served before the reload: {reply}");
+            assert!(
+                reply.get("result").is_some(),
+                "served before the reload: {reply}"
+            );
         }
 
         // Reload onto a file with only the second token, which now expires.
@@ -1285,7 +1371,10 @@ fn test_rpc_bearer_websocket_frames_follow_revocation_and_expiry() {
                 break;
             }
             assert!(reply.get("result").is_some(), "{reply}");
-            assert!(Instant::now() < deadline, "the revoked token's socket was still served");
+            assert!(
+                Instant::now() < deadline,
+                "the revoked token's socket was still served"
+            );
             id += 1;
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
@@ -1294,7 +1383,10 @@ fn test_rpc_bearer_websocket_frames_follow_revocation_and_expiry() {
         if now() < expires - 3 {
             expiring.send_control(call(100)).await;
             let reply = expiring.next_json(10).await;
-            assert!(reply.get("result").is_some(), "served before its expiry: {reply}");
+            assert!(
+                reply.get("result").is_some(),
+                "served before its expiry: {reply}"
+            );
         }
         let deadline = Instant::now() + Duration::from_secs(30);
         let mut id = 101;
@@ -1306,7 +1398,10 @@ fn test_rpc_bearer_websocket_frames_follow_revocation_and_expiry() {
                 break;
             }
             assert!(reply.get("result").is_some(), "{reply}");
-            assert!(Instant::now() < deadline, "the expired token's socket was still served");
+            assert!(
+                Instant::now() < deadline,
+                "the expired token's socket was still served"
+            );
             id += 1;
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
@@ -1353,14 +1448,27 @@ fn test_oversized_connection_caps_refuse_to_start_cleanly() {
         .stderr(std::process::Stdio::piped());
     // A fixed limit, so the outcome does not depend on the host's: 65,536,
     // or the host's hard limit if lower (a process cannot raise it).
-    let mut host = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+    let mut host = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
     // SAFETY: getrlimit only writes the struct passed.
-    assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut host) }, 0);
-    let limit = if host.rlim_max == libc::RLIM_INFINITY { 65_536 } else { host.rlim_max.min(65_536) };
+    assert_eq!(
+        unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut host) },
+        0
+    );
+    let limit = if host.rlim_max == libc::RLIM_INFINITY {
+        65_536
+    } else {
+        host.rlim_max.min(65_536)
+    };
     // SAFETY: setrlimit is async-signal-safe and touches only the child.
     unsafe {
         cmd.pre_exec(move || {
-            let lim = libc::rlimit { rlim_cur: limit, rlim_max: limit };
+            let lim = libc::rlimit {
+                rlim_cur: limit,
+                rlim_max: limit,
+            };
             if libc::setrlimit(libc::RLIMIT_NOFILE, &lim) != 0 {
                 return Err(std::io::Error::last_os_error());
             }
@@ -1388,7 +1496,9 @@ fn test_oversized_connection_caps_refuse_to_start_cleanly() {
     // addnode + 1 P2P listener + 2 x 101 RPC, and each surface's listener
     // plus its set cap, clamped to 100,000.
     assert!(
-        stderr.contains(&format!("Error: Not enough file descriptors available. {limit} available, 300429 required.")),
+        stderr.contains(&format!(
+            "Error: Not enough file descriptors available. {limit} available, 300429 required."
+        )),
         "{stderr}"
     );
     let _ = std::fs::remove_dir_all(&datadir);
@@ -1456,7 +1566,10 @@ fn test_esplora_broadcast_requires_submit_capability() {
 
     // The read token still reads.
     let resp = client
-        .get(format!("http://127.0.0.1:{}/blocks/tip/height", esplora_port))
+        .get(format!(
+            "http://127.0.0.1:{}/blocks/tip/height",
+            esplora_port
+        ))
         .bearer_auth("satd-test-esplora-bcast-ro-v1")
         .send()
         .unwrap();
@@ -1465,20 +1578,32 @@ fn test_esplora_broadcast_requires_submit_capability() {
     // ...but cannot broadcast, and the refusal names the capability.
     let (status, body) = post_tx(Some("satd-test-esplora-bcast-ro-v1"));
     assert_eq!(status, 403, "esplora:read alone must not broadcast: {body}");
-    assert!(body.contains("rpc:submit"), "refusal names rpc:submit: {body}");
+    assert!(
+        body.contains("rpc:submit"),
+        "refusal names rpc:submit: {body}"
+    );
 
     // Submit and write tokens reach the handler: a junk body is a 400 decode
     // error, not a capability refusal.
-    for tok in ["satd-test-esplora-bcast-sub-v1", "satd-test-esplora-bcast-rw-v1"] {
+    for tok in [
+        "satd-test-esplora-bcast-sub-v1",
+        "satd-test-esplora-bcast-rw-v1",
+    ] {
         let (status, body) = post_tx(Some(tok));
-        assert_eq!(status, 400, "{tok} must reach the broadcast handler: {body}");
+        assert_eq!(
+            status, 400,
+            "{tok} must reach the broadcast handler: {body}"
+        );
         assert!(!body.contains("rpc:submit"), "{tok}: {body}");
     }
 
     // The surface-wide gate is unchanged: no `esplora:read` means no
     // Esplora at all, even with `rpc:submit`; and no credential is 401.
     let (status, _) = post_tx(Some("satd-test-esplora-bcast-subonly-v1"));
-    assert_eq!(status, 401, "rpc:submit without esplora:read is refused at the surface");
+    assert_eq!(
+        status, 401,
+        "rpc:submit without esplora:read is refused at the surface"
+    );
     let (status, _) = post_tx(None);
     assert_eq!(status, 401);
 
@@ -1592,7 +1717,10 @@ fn test_submitblock_invalid() {
             .rpc_call_with_params("submitblock", vec![serde_json::json!(hex)])
             .unwrap();
         assert_eq!(response["error"]["code"], -22, "{hex}: {response}");
-        assert_eq!(response["error"]["message"], "Block decode failed", "{hex}: {response}");
+        assert_eq!(
+            response["error"]["message"], "Block decode failed",
+            "{hex}: {response}"
+        );
     }
 
     node.stop();
@@ -1749,7 +1877,8 @@ fn test_invalidateblock_and_reconsiderblock() {
     assert!(resp["error"].is_null(), "invalidateblock errored: {resp:?}");
     assert_eq!(node.rpc_call("getblockcount").unwrap()["result"], 4);
     assert_eq!(
-        node.rpc_call("getbestblockhash").unwrap()["result"], block4,
+        node.rpc_call("getbestblockhash").unwrap()["result"],
+        block4,
         "tip should be the parent of the invalidated block"
     );
 
@@ -1872,22 +2001,37 @@ fn test_gettxoutsetinfo_refuses_what_it_cannot_honour() {
     let ok = node.rpc_ok("gettxoutsetinfo", vec![json!("none"), tip.clone()]);
     assert_eq!(ok["bestblock"], tip, "{ok}");
 
-    let r = node.rpc_call_with_params("gettxoutsetinfo", vec![json!("none"), json!(1)]).unwrap();
+    let r = node
+        .rpc_call_with_params("gettxoutsetinfo", vec![json!("none"), json!(1)])
+        .unwrap();
     assert_eq!(r["error"]["code"], -8, "{r}");
-    assert_eq!(r["error"]["message"], "Querying specific block heights requires coinstatsindex");
+    assert_eq!(
+        r["error"]["message"],
+        "Querying specific block heights requires coinstatsindex"
+    );
     let r = node
         .rpc_call_with_named_params("gettxoutsetinfo", json!({"hash_or_height": 2}))
         .unwrap();
     assert_eq!(r["error"]["code"], -8, "{r}");
     for t in ["muhash", "hash_serialized_3"] {
-        let r = node.rpc_call_with_params("gettxoutsetinfo", vec![json!(t)]).unwrap();
+        let r = node
+            .rpc_call_with_params("gettxoutsetinfo", vec![json!(t)])
+            .unwrap();
         assert_eq!(r["error"]["code"], -8, "{t}: {r}");
     }
-    let r = node.rpc_call_with_params("gettxoutsetinfo", vec![json!("sha256")]).unwrap();
-    assert_eq!(r["error"]["message"], "'sha256' is not a valid hash_type", "{r}");
+    let r = node
+        .rpc_call_with_params("gettxoutsetinfo", vec![json!("sha256")])
+        .unwrap();
+    assert_eq!(
+        r["error"]["message"], "'sha256' is not a valid hash_type",
+        "{r}"
+    );
     // A mistyped `use_index` is Core's type error, not ignored.
     let r = node
-        .rpc_call_with_params("gettxoutsetinfo", vec![json!("none"), json!(null), json!("yes")])
+        .rpc_call_with_params(
+            "gettxoutsetinfo",
+            vec![json!("none"), json!(null), json!("yes")],
+        )
         .unwrap();
     assert_eq!(r["error"]["code"], -3, "{r}");
     node.stop();
@@ -1977,7 +2121,11 @@ fn test_gettxoutsetinfo() {
             .sum()
     };
     assert_eq!(counts[0], outputs_in(tip - 5..=tip), "<1h: ages 0..=5");
-    assert_eq!(counts[1], outputs_in(tip - 143..=tip - 6), "<1d: ages 6..=143");
+    assert_eq!(
+        counts[1],
+        outputs_in(tip - 143..=tip - 6),
+        "<1d: ages 6..=143"
+    );
     assert_eq!(
         counts.iter().sum::<u64>(),
         result["txouts"].as_u64().unwrap(),
@@ -2070,7 +2218,11 @@ fn test_estimatesmartfee() {
         .rpc_call_with_params("estimatesmartfee", vec![serde_json::json!(6)])
         .unwrap();
     let result = &response["result"];
-    assert_eq!(smartfee_keys(result), keyset(&["errors", "blocks"]), "{result}");
+    assert_eq!(
+        smartfee_keys(result),
+        keyset(&["errors", "blocks"]),
+        "{result}"
+    );
     assert_eq!(
         result["errors"],
         serde_json::json!(["Insufficient data or no feerate found"])
@@ -2090,7 +2242,9 @@ fn estimatesmartfee_has_cores_32_1_shape() {
     use serde_json::json;
     let mut node = TestNode::start(&[]);
     let call = |node: &mut TestNode, params: Vec<serde_json::Value>| {
-        let resp = node.rpc_call_with_params("estimatesmartfee", params).unwrap();
+        let resp = node
+            .rpc_call_with_params("estimatesmartfee", params)
+            .unwrap();
         assert!(resp["error"].is_null(), "{resp}");
         resp["result"].clone()
     };
@@ -2104,9 +2258,19 @@ fn estimatesmartfee_has_cores_32_1_shape() {
 
     // mempool_policy on a node that has connected no blocks: Core's refusal,
     // for 2 blocks.
-    let r = call(&mut node, vec![json!(6), json!("economical"), json!({"fee_rate_estimator": "mempool_policy"})]);
+    let r = call(
+        &mut node,
+        vec![
+            json!(6),
+            json!("economical"),
+            json!({"fee_rate_estimator": "mempool_policy"}),
+        ],
+    );
     assert_eq!(smartfee_keys(&r), keyset(&["errors", "blocks"]), "{r}");
-    assert_eq!(r["errors"], json!(["mempool_policy: Not enough recent block data for fee rate estimation"]));
+    assert_eq!(
+        r["errors"],
+        json!(["mempool_policy: Not enough recent block data for fee rate estimation"])
+    );
     assert_eq!(r["blocks"], 2, "{r}");
 
     // Six blocks fill the health window (empty blocks are low activity,
@@ -2114,45 +2278,105 @@ fn estimatesmartfee_has_cores_32_1_shape() {
     // blocks whatever the target; an empty pool leaves the floor to set it.
     node.mine_blocks(6, HEALTH_ADDR);
     for target in [1, 6, 1008] {
-        let r = call(&mut node, vec![json!(target), json!("economical"), json!({"fee_rate_estimator": "mempool_policy"})]);
-        assert_eq!(smartfee_keys(&r), keyset(&["feerate", "estimator", "blocks"]), "{r}");
+        let r = call(
+            &mut node,
+            vec![
+                json!(target),
+                json!("economical"),
+                json!({"fee_rate_estimator": "mempool_policy"}),
+            ],
+        );
+        assert_eq!(
+            smartfee_keys(&r),
+            keyset(&["feerate", "estimator", "blocks"]),
+            "{r}"
+        );
         assert_eq!(r["blocks"], 2, "{r}");
         assert_eq!(r["estimator"], "floor", "{r}");
-        assert!(r["feerate"].as_f64().unwrap() >= 0.000001, "floored at the 0.1 sat/vB relay minimum: {r}");
+        assert!(
+            r["feerate"].as_f64().unwrap() >= 0.000001,
+            "floored at the 0.1 sat/vB relay minimum: {r}"
+        );
     }
 
     // block_policy with no history: Core's no-data answer.
-    let r = call(&mut node, vec![json!(6), json!("conservative"), json!({"fee_rate_estimator": "block_policy"})]);
+    let r = call(
+        &mut node,
+        vec![
+            json!(6),
+            json!("conservative"),
+            json!({"fee_rate_estimator": "block_policy"}),
+        ],
+    );
     assert_eq!(smartfee_keys(&r), keyset(&["errors", "blocks"]), "{r}");
 
     // The default with a healthy mempool side and no history: the floor
     // answers a deeper target, where Core answers its block policy error.
     let r = call(&mut node, vec![json!(6), json!("economical")]);
-    assert_eq!(smartfee_keys(&r), keyset(&["feerate", "estimator", "blocks"]), "{r}");
+    assert_eq!(
+        smartfee_keys(&r),
+        keyset(&["feerate", "estimator", "blocks"]),
+        "{r}"
+    );
     assert_eq!(r["estimator"], "floor", "{r}");
 
     // verbosity 2 adds Core's health statistics, newest first, and satd's
     // verdict over them, on either kind of answer; verbosity 1 does not.
-    let r = call(&mut node, vec![json!(6), json!(null), json!({"verbosity": 2, "fee_rate_estimator": "block_policy"})]);
+    let r = call(
+        &mut node,
+        vec![
+            json!(6),
+            json!(null),
+            json!({"verbosity": 2, "fee_rate_estimator": "block_policy"}),
+        ],
+    );
     assert_eq!(
         smartfee_keys(&r),
-        keyset(&["errors", "blocks", "mempool_health_statistics", "mempool_health"])
+        keyset(&[
+            "errors",
+            "blocks",
+            "mempool_health_statistics",
+            "mempool_health"
+        ])
     );
     let stats = r["mempool_health_statistics"].as_array().unwrap();
     assert_eq!(stats.len(), 6, "{r}");
     assert_eq!(stats[0]["block_height"], 6, "newest first: {r}");
     assert_eq!(stats[5]["block_height"], 1, "{r}");
     for row in stats {
-        assert_eq!(smartfee_keys(row), keyset(&["block_height", "block_weight", "mempool_txs_weight"]));
+        assert_eq!(
+            smartfee_keys(row),
+            keyset(&["block_height", "block_weight", "mempool_txs_weight"])
+        );
         assert_eq!(row["block_weight"], 0, "coinbase-only blocks: {r}");
     }
     assert_eq!(r["mempool_health"], "healthy", "{r}");
-    let r = call(&mut node, vec![json!(6), json!(null), json!({"verbosity": 2, "fee_rate_estimator": "mempool_policy"})]);
+    let r = call(
+        &mut node,
+        vec![
+            json!(6),
+            json!(null),
+            json!({"verbosity": 2, "fee_rate_estimator": "mempool_policy"}),
+        ],
+    );
     assert_eq!(
         smartfee_keys(&r),
-        keyset(&["feerate", "estimator", "blocks", "mempool_health_statistics", "mempool_health"])
+        keyset(&[
+            "feerate",
+            "estimator",
+            "blocks",
+            "mempool_health_statistics",
+            "mempool_health"
+        ])
     );
-    let r = call(&mut node, vec![json!(6), json!(null), json!({"verbosity": 1, "fee_rate_estimator": "block_policy"})]);
+    let r = call(
+        &mut node,
+        vec![
+            json!(6),
+            json!(null),
+            json!({"verbosity": 1, "fee_rate_estimator": "block_policy"}),
+        ],
+    );
     assert_eq!(smartfee_keys(&r), keyset(&["errors", "blocks"]));
 
     // `options` by name, as Core's named-parameter table has it.
@@ -2182,16 +2406,26 @@ fn estimatesmartfee_unknown_fee_rate_estimator_means_auto() {
             )
             .unwrap();
         assert!(resp["error"].is_null(), "{v:?}: {resp}");
-        assert!(resp["result"]["feerate"].is_number(), "{v:?} answered as auto: {resp}");
+        assert!(
+            resp["result"]["feerate"].is_number(),
+            "{v:?} answered as auto: {resp}"
+        );
         assert_eq!(resp["result"]["blocks"], 6, "{v:?}: {resp}");
     }
     let resp = node
         .rpc_call_with_params(
             "estimatesmartfee",
-            vec![json!(6), json!("mempool"), json!({"fee_rate_estimator": "block_policy"})],
+            vec![
+                json!(6),
+                json!("mempool"),
+                json!({"fee_rate_estimator": "block_policy"}),
+            ],
         )
         .unwrap();
-    assert!(resp["result"]["feerate"].is_null(), "block_policy has no history: {resp}");
+    assert!(
+        resp["result"]["feerate"].is_null(),
+        "block_policy has no history: {resp}"
+    );
     node.stop();
 }
 
@@ -2203,24 +2437,56 @@ fn estimatesmartfee_checks_its_options_as_core_does() {
     use serde_json::json;
     let mut node = TestNode::start(&[]);
     for (params, code, msg) in [
-        (vec![json!(1), json!("ECONOMICAL"), json!(1)], -3, "JSON value of type number is not of expected type object"),
-        (vec![json!(1), json!("ECONOMICAL"), json!({"fee_rate_estimator": 1})], -3, "JSON value of type number for field fee_rate_estimator is not of expected type string"),
-        (vec![json!(1), json!("ECONOMICAL"), json!({"verbosity": "foo"})], -3, "JSON value of type string for field verbosity is not of expected type number"),
+        (
+            vec![json!(1), json!("ECONOMICAL"), json!(1)],
+            -3,
+            "JSON value of type number is not of expected type object",
+        ),
+        (
+            vec![
+                json!(1),
+                json!("ECONOMICAL"),
+                json!({"fee_rate_estimator": 1}),
+            ],
+            -3,
+            "JSON value of type number for field fee_rate_estimator is not of expected type string",
+        ),
+        (
+            vec![json!(1), json!("ECONOMICAL"), json!({"verbosity": "foo"})],
+            -3,
+            "JSON value of type string for field verbosity is not of expected type number",
+        ),
     ] {
-        let resp = node.rpc_call_with_params("estimatesmartfee", params.clone()).unwrap();
-        assert_eq!(resp["error"]["code"].as_i64(), Some(code), "{params:?}: {resp}");
-        assert_eq!(resp["error"]["message"].as_str(), Some(msg), "{params:?}: {resp}");
+        let resp = node
+            .rpc_call_with_params("estimatesmartfee", params.clone())
+            .unwrap();
+        assert_eq!(
+            resp["error"]["code"].as_i64(),
+            Some(code),
+            "{params:?}: {resp}"
+        );
+        assert_eq!(
+            resp["error"]["message"].as_str(),
+            Some(msg),
+            "{params:?}: {resp}"
+        );
     }
     // A fourth argument is surplus, and Core answers its help (-1).
     for extra in [json!({}), json!({"verbosity": 1})] {
         let resp = node
-            .rpc_call_with_params("estimatesmartfee", vec![json!(1), json!("ECONOMICAL"), extra, json!(1)])
+            .rpc_call_with_params(
+                "estimatesmartfee",
+                vec![json!(1), json!("ECONOMICAL"), extra, json!(1)],
+            )
             .unwrap();
         assert_eq!(resp["error"]["code"].as_i64(), Some(-1), "{resp}");
     }
     // The option keys are not top-level named parameters.
     let resp = node
-        .rpc_call_with_named_params("estimatesmartfee", json!({"conf_target": 1, "fee_rate_estimator": true}))
+        .rpc_call_with_named_params(
+            "estimatesmartfee",
+            json!({"conf_target": 1, "fee_rate_estimator": true}),
+        )
         .unwrap();
     assert_eq!(resp["error"]["code"].as_i64(), Some(-8), "{resp}");
     assert_eq!(
@@ -2233,11 +2499,25 @@ fn estimatesmartfee_checks_its_options_as_core_does() {
         vec![json!(1), json!("ECONOMICAL")],
         vec![json!(1), json!("unset")],
         vec![json!(1), json!("conservative")],
-        vec![json!(1), json!("ECONOMICAL"), json!({"fee_rate_estimator": "block_policy"})],
-        vec![json!(1), json!("ECONOMICAL"), json!({"fee_rate_estimator": "mempool_policy"})],
-        vec![json!(1), json!("ECONOMICAL"), json!({"verbosity": 1, "fee_rate_estimator": "auto"})],
+        vec![
+            json!(1),
+            json!("ECONOMICAL"),
+            json!({"fee_rate_estimator": "block_policy"}),
+        ],
+        vec![
+            json!(1),
+            json!("ECONOMICAL"),
+            json!({"fee_rate_estimator": "mempool_policy"}),
+        ],
+        vec![
+            json!(1),
+            json!("ECONOMICAL"),
+            json!({"verbosity": 1, "fee_rate_estimator": "auto"}),
+        ],
     ] {
-        let resp = node.rpc_call_with_params("estimatesmartfee", params.clone()).unwrap();
+        let resp = node
+            .rpc_call_with_params("estimatesmartfee", params.clone())
+            .unwrap();
         assert!(resp["error"].is_null(), "{params:?}: {resp}");
     }
     node.stop();
@@ -2262,10 +2542,16 @@ fn estimatesmartfee_ignores_an_unknown_options_key() {
             ],
         )
         .unwrap();
-    assert!(resp["error"].is_null(), "an unknown key must not refuse the call: {resp}");
+    assert!(
+        resp["error"].is_null(),
+        "an unknown key must not refuse the call: {resp}"
+    );
     let r = &resp["result"];
     assert!(r["feerate"].is_number(), "{r}");
-    assert_eq!(r["blocks"], 2, "fee_rate_estimator beside it still applies: {r}");
+    assert_eq!(
+        r["blocks"], 2,
+        "fee_rate_estimator beside it still applies: {r}"
+    );
     assert_eq!(
         r["mempool_health_statistics"].as_array().map(|a| a.len()),
         Some(6),
@@ -2274,10 +2560,17 @@ fn estimatesmartfee_ignores_an_unknown_options_key() {
     // On its own, an unknown key leaves the default answer: with a healthy
     // mempool side and no history, the floor.
     let resp = node
-        .rpc_call_with_params("estimatesmartfee", vec![json!(6), json!(null), json!({"foo": 1})])
+        .rpc_call_with_params(
+            "estimatesmartfee",
+            vec![json!(6), json!(null), json!({"foo": 1})],
+        )
         .unwrap();
     assert!(resp["error"].is_null(), "{resp}");
-    assert_eq!(smartfee_keys(&resp["result"]), keyset(&["feerate", "estimator", "blocks"]), "{resp}");
+    assert_eq!(
+        smartfee_keys(&resp["result"]),
+        keyset(&["feerate", "estimator", "blocks"]),
+        "{resp}"
+    );
     assert_eq!(resp["result"]["estimator"], "floor", "{resp}");
     node.stop();
 }
@@ -2294,7 +2587,11 @@ fn the_mempool_health_window_persists_and_clears_without_the_mempool() {
     let mempool_policy = |node: &mut TestNode| {
         node.rpc_call_with_params(
             "estimatesmartfee",
-            vec![json!(2), json!(null), json!({"fee_rate_estimator": "mempool_policy"})],
+            vec![
+                json!(2),
+                json!(null),
+                json!({"fee_rate_estimator": "mempool_policy"}),
+            ],
         )
         .unwrap()["result"]
             .clone()
@@ -2304,8 +2601,15 @@ fn the_mempool_health_window_persists_and_clears_without_the_mempool() {
 
     node.restart_preserving_datadir(&[]);
     let r = mempool_policy(&mut node);
-    assert!(r["feerate"].is_number(), "the window came back with the mempool: {r}");
-    assert!(node.datadir.join("regtest/fees/mempool_health.dat").exists());
+    assert!(
+        r["feerate"].is_number(),
+        "the window came back with the mempool: {r}"
+    );
+    assert!(
+        node.datadir
+            .join("regtest/fees/mempool_health.dat")
+            .exists()
+    );
 
     node.restart_preserving_datadir(&["--persistmempool=0"]);
     let r = mempool_policy(&mut node);
@@ -2332,7 +2636,10 @@ fn test_estimatesmartfee_accepts_mode_param() {
     assert!(result["feerate"].as_f64().unwrap() > 0.0);
     assert_eq!(result["blocks"], 6);
     assert_eq!(result["estimator"], "floor");
-    assert_eq!(smartfee_keys(result), keyset(&["feerate", "estimator", "blocks"]));
+    assert_eq!(
+        smartfee_keys(result),
+        keyset(&["feerate", "estimator", "blocks"])
+    );
     node.stop();
 }
 
@@ -2606,8 +2913,13 @@ fn fill_mempool_past_the_block_sigop_limit(node: &TestNode) -> (usize, u64) {
 /// The sigop cost of a template transaction, counted the way `connect_block`
 /// counts it. Every input in the fixture above spends a P2WPKH coinbase.
 fn template_tx_sigop_cost(tx: &bitcoin::Transaction) -> u64 {
-    let p2wpkh = DeterministicWallet::from_secret([0x5c; 32]).address.script_pubkey();
-    let prevout = bitcoin::TxOut { value: bitcoin::Amount::from_sat(50 * 100_000_000), script_pubkey: p2wpkh };
+    let p2wpkh = DeterministicWallet::from_secret([0x5c; 32])
+        .address
+        .script_pubkey();
+    let prevout = bitcoin::TxOut {
+        value: bitcoin::Amount::from_sat(50 * 100_000_000),
+        script_pubkey: p2wpkh,
+    };
     node::validation::sigops::transaction_sigop_cost(
         tx,
         &vec![prevout; tx.input.len()],
@@ -2627,10 +2939,16 @@ fn getblocktemplate_stays_under_the_block_sigop_limit() {
     let (txs, per_tx) = fill_mempool_past_the_block_sigop_limit(&node);
     let info = node.rpc_call("getmempoolinfo").unwrap();
     assert_eq!(info["result"]["size"], serde_json::json!(txs), "{info}");
-    assert!(txs as u64 * per_tx > 80_000, "the fixture must exceed the limit");
+    assert!(
+        txs as u64 * per_tx > 80_000,
+        "the fixture must exceed the limit"
+    );
 
     let gbt = node.rpc_call("getblocktemplate").unwrap();
-    let entries = gbt["result"]["transactions"].as_array().expect("transactions").clone();
+    let entries = gbt["result"]["transactions"]
+        .as_array()
+        .expect("transactions")
+        .clone();
     let costs: Vec<u64> = entries
         .iter()
         .map(|e| {
@@ -2644,21 +2962,41 @@ fn getblocktemplate_stays_under_the_block_sigop_limit() {
         "template carries {total} sigop cost in {} transactions; with the coinbase's 400 that must stay under 80,000",
         entries.len()
     );
-    assert_eq!(entries.len(), 5, "five of seven fit: 5 × {per_tx} + 400 < 80,000, a sixth would not");
+    assert_eq!(
+        entries.len(),
+        5,
+        "five of seven fit: 5 × {per_tx} + 400 < 80,000, a sixth would not"
+    );
     for (e, cost) in entries.iter().zip(&costs) {
-        assert_eq!(e["sigops"].as_u64(), Some(*cost), "per-transaction sigops, as Core reports them: {e}");
+        assert_eq!(
+            e["sigops"].as_u64(),
+            Some(*cost),
+            "per-transaction sigops, as Core reports them: {e}"
+        );
     }
 
     // And the block built from it connects.
     let before = get_rpc_u64(&node, "getblockcount").unwrap();
-    let addr = DeterministicWallet::from_secret([0x5d; 32]).address.to_string();
+    let addr = DeterministicWallet::from_secret([0x5d; 32])
+        .address
+        .to_string();
     let mined = node
-        .rpc_call_with_params("generatetoaddress", vec![serde_json::json!(1), serde_json::json!(addr)])
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![serde_json::json!(1), serde_json::json!(addr)],
+        )
         .expect("generatetoaddress");
-    assert!(mined["error"].is_null(), "the template's block must connect: {mined}");
+    assert!(
+        mined["error"].is_null(),
+        "the template's block must connect: {mined}"
+    );
     assert_eq!(get_rpc_u64(&node, "getblockcount").unwrap(), before + 1);
     let left = node.rpc_call("getmempoolinfo").unwrap();
-    assert_eq!(left["result"]["size"], serde_json::json!(txs - 5), "the two that did not fit wait: {left}");
+    assert_eq!(
+        left["result"]["size"],
+        serde_json::json!(txs - 5),
+        "the two that did not fit wait: {left}"
+    );
 
     node.stop();
 }
@@ -2683,28 +3021,52 @@ fn getblocktemplate_honours_blockmaxweight() {
     let outputs = vec![wallet.address.script_pubkey(); 150];
     let mut weights = std::collections::HashMap::new();
     for h in 1..=TXS {
-        let (raw, txid) =
-            common::build_signed_p2wpkh_spend_of_coinbases(&node, &[(h, &wallet)], &outputs, 100_000);
-        let tx: bitcoin::Transaction = bitcoin::consensus::deserialize(&hex::decode(&raw).unwrap()).unwrap();
+        let (raw, txid) = common::build_signed_p2wpkh_spend_of_coinbases(
+            &node,
+            &[(h, &wallet)],
+            &outputs,
+            100_000,
+        );
+        let tx: bitcoin::Transaction =
+            bitcoin::consensus::deserialize(&hex::decode(&raw).unwrap()).unwrap();
         weights.insert(txid, tx.weight().to_wu());
         sp_send_raw(&node, &raw);
     }
     let info = node.rpc_call("getmempoolinfo").unwrap();
     assert_eq!(info["result"]["size"], serde_json::json!(TXS), "{info}");
-    assert!(weights.values().sum::<u64>() > CAP, "the fixture must exceed the cap");
+    assert!(
+        weights.values().sum::<u64>() > CAP,
+        "the fixture must exceed the cap"
+    );
 
     let gbt = node.rpc_call("getblocktemplate").unwrap();
     assert!(gbt["error"].is_null(), "{gbt}");
-    assert_eq!(gbt["result"]["weightlimit"], serde_json::json!(4_000_000), "Core reports the consensus limit");
-    let entries = gbt["result"]["transactions"].as_array().expect("transactions").clone();
-    let chosen: Vec<String> = entries.iter().map(|e| e["txid"].as_str().unwrap().to_string()).collect();
-    let total: u64 = entries.iter().map(|e| e["weight"].as_u64().expect("weight")).sum();
+    assert_eq!(
+        gbt["result"]["weightlimit"],
+        serde_json::json!(4_000_000),
+        "Core reports the consensus limit"
+    );
+    let entries = gbt["result"]["transactions"]
+        .as_array()
+        .expect("transactions")
+        .clone();
+    let chosen: Vec<String> = entries
+        .iter()
+        .map(|e| e["txid"].as_str().unwrap().to_string())
+        .collect();
+    let total: u64 = entries
+        .iter()
+        .map(|e| e["weight"].as_u64().expect("weight"))
+        .sum();
     assert!(!chosen.is_empty(), "the cap leaves room for some: {gbt}");
     assert!(
         (chosen.len() as u64) < TXS,
         "the template took the whole mempool, {total} WU, under a {CAP} WU cap"
     );
-    assert!(total + RESERVE < CAP, "{total} WU plus the reserve must stay under {CAP}");
+    assert!(
+        total + RESERVE < CAP,
+        "{total} WU plus the reserve must stay under {CAP}"
+    );
     let lightest_left = weights
         .iter()
         .filter(|(txid, _)| !chosen.contains(txid))
@@ -2719,18 +3081,41 @@ fn getblocktemplate_honours_blockmaxweight() {
     // The block built on it connects and keeps to the cap, coinbase and all.
     let before = get_rpc_u64(&node, "getblockcount").unwrap();
     let mined = node
-        .rpc_call_with_params("generatetoaddress", vec![serde_json::json!(1), serde_json::json!(wallet.address.to_string())])
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![
+                serde_json::json!(1),
+                serde_json::json!(wallet.address.to_string()),
+            ],
+        )
         .expect("generatetoaddress");
-    assert!(mined["error"].is_null(), "the capped block must connect: {mined}");
+    assert!(
+        mined["error"].is_null(),
+        "the capped block must connect: {mined}"
+    );
     assert_eq!(get_rpc_u64(&node, "getblockcount").unwrap(), before + 1);
     let block = node
-        .rpc_call_with_params("getblock", vec![mined["result"][0].clone(), serde_json::json!(1)])
+        .rpc_call_with_params(
+            "getblock",
+            vec![mined["result"][0].clone(), serde_json::json!(1)],
+        )
         .unwrap();
     let block_weight = block["result"]["weight"].as_u64().expect("block weight");
-    assert!(block_weight < CAP, "the mined block weighs {block_weight} WU against a {CAP} WU cap");
-    assert_eq!(block["result"]["tx"].as_array().unwrap().len(), chosen.len() + 1, "{block}");
+    assert!(
+        block_weight < CAP,
+        "the mined block weighs {block_weight} WU against a {CAP} WU cap"
+    );
+    assert_eq!(
+        block["result"]["tx"].as_array().unwrap().len(),
+        chosen.len() + 1,
+        "{block}"
+    );
     let left = node.rpc_call("getmempoolinfo").unwrap();
-    assert_eq!(left["result"]["size"], serde_json::json!(TXS - chosen.len() as u64), "{left}");
+    assert_eq!(
+        left["result"]["size"],
+        serde_json::json!(TXS - chosen.len() as u64),
+        "{left}"
+    );
 
     node.stop();
 }
@@ -2742,13 +3127,22 @@ fn getblocktemplate_honours_blockmaxweight() {
 fn blockmaxweight_above_the_consensus_limit_is_refused_at_startup() {
     let dir = tempfile::tempdir().expect("tempdir");
     let out = Command::new(env!("CARGO_BIN_EXE_satd"))
-        .args(["--regtest", &format!("--datadir={}", dir.path().display()), "--blockmaxweight=4000001"])
+        .args([
+            "--regtest",
+            &format!("--datadir={}", dir.path().display()),
+            "--blockmaxweight=4000001",
+        ])
         .output()
         .expect("spawn satd");
-    assert!(!out.status.success(), "satd must refuse -blockmaxweight=4000001");
+    assert!(
+        !out.status.success(),
+        "satd must refuse -blockmaxweight=4000001"
+    );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("Specified -blockmaxweight (4000001) exceeds consensus maximum block weight (4000000)"),
+        stderr.contains(
+            "Specified -blockmaxweight (4000001) exceeds consensus maximum block weight (4000000)"
+        ),
         "unexpected stderr: {stderr}"
     );
 }
@@ -2759,7 +3153,11 @@ fn blockmaxweight_above_the_consensus_limit_is_refused_at_startup() {
 #[test]
 fn a_malformed_blockmaxweight_in_the_config_file_is_refused() {
     let dir = tempfile::tempdir().expect("tempdir");
-    std::fs::write(dir.path().join("bitcoin.conf"), "regtest=1\nblockmaxweight=abc\n").unwrap();
+    std::fs::write(
+        dir.path().join("bitcoin.conf"),
+        "regtest=1\nblockmaxweight=abc\n",
+    )
+    .unwrap();
     let out = Command::new(env!("CARGO_BIN_EXE_satd"))
         .arg(format!("--datadir={}", dir.path().display()))
         .output()
@@ -2773,10 +3171,17 @@ fn a_malformed_blockmaxweight_in_the_config_file_is_refused() {
 
     let clean = tempfile::tempdir().expect("tempdir");
     let out = Command::new(env!("CARGO_BIN_EXE_satd"))
-        .args(["--regtest", &format!("--datadir={}", clean.path().display()), "--blockmaxweight=abc"])
+        .args([
+            "--regtest",
+            &format!("--datadir={}", clean.path().display()),
+            "--blockmaxweight=abc",
+        ])
         .output()
         .expect("spawn satd");
-    assert!(!out.status.success(), "satd must refuse --blockmaxweight=abc");
+    assert!(
+        !out.status.success(),
+        "satd must refuse --blockmaxweight=abc"
+    );
     assert!(String::from_utf8_lossy(&out.stderr).contains("blockmaxweight"));
 }
 
@@ -2788,7 +3193,10 @@ fn a_malformed_blockmaxweight_in_the_config_file_is_refused() {
 #[test]
 fn template_checks_pass_a_valid_template_under_cpp_shadow() {
     let metrics_port = find_available_port();
-    let mut node = TestNode::start(&["--consensus=cpp-shadow", &format!("--metricsport={metrics_port}")]);
+    let mut node = TestNode::start(&[
+        "--consensus=cpp-shadow",
+        &format!("--metricsport={metrics_port}"),
+    ]);
     let wallet = DeterministicWallet::from_secret([0x5e; 32]);
     sp_generate_to(&node, 101, &wallet.address.to_string());
     let (raw, txid) = common::build_signed_p2wpkh_spend_of_coinbase(
@@ -2805,7 +3213,10 @@ fn template_checks_pass_a_valid_template_under_cpp_shadow() {
     let txs = gbt["result"]["transactions"].as_array().unwrap();
     assert!(txs.iter().any(|t| t["txid"] == txid.as_str()), "{gbt}");
 
-    let client = reqwest::blocking::Client::builder().timeout(Duration::from_secs(5)).build().unwrap();
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
     let metrics = || {
         client
             .get(format!("http://127.0.0.1:{metrics_port}/metrics"))
@@ -2824,22 +3235,49 @@ fn template_checks_pass_a_valid_template_under_cpp_shadow() {
     );
     let text = metrics();
     for check in ["structural", "full"] {
-        assert!(text.contains(&format!("{} 0", line(check, "invalid"))), "{text}");
+        assert!(
+            text.contains(&format!("{} 0", line(check, "invalid"))),
+            "{text}"
+        );
     }
-    assert!(text.contains("satd_alert_active{kind=\"template_invalid\"} 0"), "{text}");
+    assert!(
+        text.contains("satd_alert_active{kind=\"template_invalid\"} 0"),
+        "{text}"
+    );
 
     let mined = node
-        .rpc_call_with_params("generatetoaddress", vec![serde_json::json!(1), serde_json::json!(wallet.address.to_string())])
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![
+                serde_json::json!(1),
+                serde_json::json!(wallet.address.to_string()),
+            ],
+        )
         .unwrap();
     assert!(mined["error"].is_null(), "{mined}");
-    let block = node.rpc_call_with_params("getblock", vec![mined["result"][0].clone(), serde_json::json!(1)]).unwrap();
-    assert!(block["result"]["tx"].as_array().unwrap().iter().any(|t| t == txid.as_str()), "{block}");
+    let block = node
+        .rpc_call_with_params(
+            "getblock",
+            vec![mined["result"][0].clone(), serde_json::json!(1)],
+        )
+        .unwrap();
+    assert!(
+        block["result"]["tx"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t == txid.as_str()),
+        "{block}"
+    );
     assert!(
         metrics().contains(&format!("{} 0", line("structural", "invalid"))),
         "generate's check passed too"
     );
     let warnings = node.rpc_call("getwarnings").unwrap_or_default();
-    assert!(!warnings.to_string().contains("template_invalid"), "{warnings}");
+    assert!(
+        !warnings.to_string().contains("template_invalid"),
+        "{warnings}"
+    );
 
     node.stop();
 }
@@ -2875,9 +3313,8 @@ fn a_jsonrpc_2_0_notification_gets_no_response() {
     );
 
     // …and an explicit null id is an id, echoed as one.
-    let (_, body) = node.rpc_post_raw_status(
-        r#"{"jsonrpc":"1.0","id":null,"method":"getblockcount","params":[]}"#,
-    );
+    let (_, body) = node
+        .rpc_post_raw_status(r#"{"jsonrpc":"1.0","id":null,"method":"getblockcount","params":[]}"#);
     let v: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
     assert_eq!(
         v.get("id"),
@@ -2900,7 +3337,11 @@ fn a_notification_in_a_batch_produces_no_entry() {
     assert_eq!(status, 200, "{body}");
     let v: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
     let items = v.as_array().unwrap_or_else(|| panic!("{body}"));
-    assert_eq!(items.len(), 1, "only the request with an id answers: {body}");
+    assert_eq!(
+        items.len(),
+        1,
+        "only the request with an id answers: {body}"
+    );
     assert_eq!(items[0]["id"], serde_json::json!(7), "{body}");
 
     // A batch of nothing but notifications is 204 whole.
@@ -2937,8 +3378,7 @@ fn the_http_status_carries_the_jsonrpc_error_class() {
     assert_eq!(status, 500, "a parse error is 500: {body}");
 
     // Legacy request, unknown method → -32601 → 404.
-    let (status, body) =
-        node.rpc_post_raw_status(r#"{"id":1,"method":"nosuchmethod"}"#);
+    let (status, body) = node.rpc_post_raw_status(r#"{"id":1,"method":"nosuchmethod"}"#);
     assert_eq!(status, 404, "a 1.0 unknown method is 404: {body}");
     assert!(body.contains("-32601"), "{body}");
     let (status, _) =
@@ -2950,11 +3390,15 @@ fn the_http_status_carries_the_jsonrpc_error_class() {
     let (status, body) =
         node.rpc_post_raw_status(r#"{"jsonrpc":"2.0","id":1,"method":"nosuchmethod"}"#);
     assert_eq!(status, 200, "a 2.0 unknown method stays 200: {body}");
-    assert!(body.contains("-32601"), "the code is still reported: {body}");
+    assert!(
+        body.contains("-32601"),
+        "the code is still reported: {body}"
+    );
 
     // A well-formed 2.0 call to a real method is 200, error or not.
-    let (status, body) =
-        node.rpc_post_raw_status(r#"{"jsonrpc":"2.0","id":1,"method":"getblockhash","params":[99999999]}"#);
+    let (status, body) = node.rpc_post_raw_status(
+        r#"{"jsonrpc":"2.0","id":1,"method":"getblockhash","params":[99999999]}"#,
+    );
     assert_eq!(status, 200, "an application error keeps 200: {body}");
     // …but the same error on the legacy path is 500: `JSONErrorReply` starts
     // from `HTTP_INTERNAL_SERVER_ERROR` and overrides only -32600 and
@@ -3013,7 +3457,11 @@ fn generatetodescriptor_takes_the_descriptors_core_takes() {
         resp["error"].is_null(),
         "a key-based descriptor must be accepted: {resp}"
     );
-    assert_eq!(resp["result"].as_array().map(|a| a.len()), Some(1), "{resp}");
+    assert_eq!(
+        resp["result"].as_array().map(|a| a.len()),
+        Some(1),
+        "{resp}"
+    );
 
     // …and a bad one is -5, Core's RPC_INVALID_ADDRESS_OR_KEY, with a message
     // that does not name a different RPC.
@@ -3098,15 +3546,18 @@ fn the_package_rpcs_bound_their_array_and_check_topology() {
 
     for method in ["submitpackage", "testmempoolaccept"] {
         let empty = node.rpc_call_with_params(method, vec![json!([])]).unwrap();
-        assert_eq!(empty["error"]["code"].as_i64(), Some(-8), "{method}: {empty}");
+        assert_eq!(
+            empty["error"]["code"].as_i64(),
+            Some(-8),
+            "{method}: {empty}"
+        );
         assert_eq!(
             empty["error"]["message"].as_str(),
             Some("Array must contain between 1 and 25 transactions."),
             "{method}"
         );
 
-        let too_many: Vec<serde_json::Value> =
-            (0..26).map(|_| json!(TX_WITHOUT_SIGDATA)).collect();
+        let too_many: Vec<serde_json::Value> = (0..26).map(|_| json!(TX_WITHOUT_SIGDATA)).collect();
         let over = node
             .rpc_call_with_params(method, vec![json!(too_many)])
             .unwrap();
@@ -3120,7 +3571,11 @@ fn the_package_rpcs_bound_their_array_and_check_topology() {
             vec![json!([TX_WITHOUT_SIGDATA, TX_WITH_SIGDATA])],
         )
         .unwrap();
-    assert_eq!(unrelated["error"]["code"].as_i64(), Some(-25), "{unrelated}");
+    assert_eq!(
+        unrelated["error"]["code"].as_i64(),
+        Some(-25),
+        "{unrelated}"
+    );
     assert!(
         unrelated["error"]["message"]
             .as_str()
@@ -3146,7 +3601,11 @@ fn maxfeerate_is_bounded_rather_than_silently_defaulted() {
         let negative = node
             .rpc_call_with_params(method, vec![json!([TX_WITHOUT_SIGDATA]), json!(-0.01)])
             .unwrap();
-        assert_eq!(negative["error"]["code"].as_i64(), Some(-3), "{method}: {negative}");
+        assert_eq!(
+            negative["error"]["code"].as_i64(),
+            Some(-3),
+            "{method}: {negative}"
+        );
         assert_eq!(
             negative["error"]["message"].as_str(),
             Some("Amount out of range"),
@@ -3156,7 +3615,11 @@ fn maxfeerate_is_bounded_rather_than_silently_defaulted() {
         let too_high = node
             .rpc_call_with_params(method, vec![json!([TX_WITHOUT_SIGDATA]), json!(1)])
             .unwrap();
-        assert_eq!(too_high["error"]["code"].as_i64(), Some(-8), "{method}: {too_high}");
+        assert_eq!(
+            too_high["error"]["code"].as_i64(),
+            Some(-8),
+            "{method}: {too_high}"
+        );
         assert_eq!(
             too_high["error"]["message"].as_str(),
             Some("Fee rates larger than or equal to 1BTC/kvB are not accepted"),
@@ -3289,7 +3752,12 @@ fn build_regtest_block(
 fn getblocktemplate_rejects_a_mode_it_does_not_understand() {
     let mut node = TestNode::start(&[]);
 
-    for bad_mode in [serde_json::json!(1), serde_json::json!(true), serde_json::json!(["proposal"]), serde_json::json!("submit")] {
+    for bad_mode in [
+        serde_json::json!(1),
+        serde_json::json!(true),
+        serde_json::json!(["proposal"]),
+        serde_json::json!("submit"),
+    ] {
         let resp = node
             .rpc_call_with_params(
                 "getblocktemplate",
@@ -3306,9 +3774,15 @@ fn getblocktemplate_rejects_a_mode_it_does_not_understand() {
 
     // An explicit null `mode` is Core's "do nothing" case: a template.
     let resp = node
-        .rpc_call_with_params("getblocktemplate", vec![serde_json::json!({ "mode": null })])
+        .rpc_call_with_params(
+            "getblocktemplate",
+            vec![serde_json::json!({ "mode": null })],
+        )
         .expect("rpc");
-    assert!(resp["error"].is_null(), "an explicit null mode is a template request: {resp}");
+    assert!(
+        resp["error"].is_null(),
+        "an explicit null mode is a template request: {resp}"
+    );
     assert!(resp["result"]["height"].is_number());
 
     node.stop();
@@ -3364,12 +3838,7 @@ fn a_proposal_agrees_with_submitblock() {
     let prev: bitcoin::BlockHash = t["previousblockhash"].as_str().unwrap().parse().unwrap();
     let time = t["curtime"].as_u64().unwrap() as u32;
 
-    let bad_block = build_regtest_block(
-        prev,
-        height,
-        time,
-        vec![spend_of_a_nonexistent_output()],
-    );
+    let bad_block = build_regtest_block(prev, height, time, vec![spend_of_a_nonexistent_output()]);
     let hex = hex::encode(bitcoin::consensus::serialize(&bad_block));
 
     let proposal = node
@@ -3430,7 +3899,11 @@ fn a_proposal_agrees_with_submitblock() {
 fn blockversion_overrides_the_template_version() {
     let mut node = TestNode::start(&["--blockversion=1337"]);
     let response = node.rpc_call("getblocktemplate").unwrap();
-    assert_eq!(response["result"]["version"].as_i64(), Some(1337), "{response}");
+    assert_eq!(
+        response["result"]["version"].as_i64(),
+        Some(1337),
+        "{response}"
+    );
     node.stop();
 
     let mut node = TestNode::start(&[]);
@@ -3579,10 +4052,7 @@ fn disconnectnode_takes_a_nodeid_and_enforces_exactly_one_selector() {
     // The form Core's own framework uses: named `nodeid` with no address at
     // all, which the named-parameter layer turns into [null, id].
     let named = node_a
-        .rpc_call_with_named_params(
-            "disconnectnode",
-            serde_json::json!({"nodeid": 9999}),
-        )
+        .rpc_call_with_named_params("disconnectnode", serde_json::json!({"nodeid": 9999}))
         .unwrap();
     assert_eq!(
         named["error"]["code"], -29,
@@ -3632,10 +4102,15 @@ fn an_unsafe_uacomment_is_refused_at_startup() {
             .args(["--regtest", &format!("--uacomment={unsafe_char}")])
             .output()
             .expect("spawn satd");
-        assert!(!out.status.success(), "satd should refuse -uacomment={unsafe_char}");
+        assert!(
+            !out.status.success(),
+            "satd should refuse -uacomment={unsafe_char}"
+        );
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(
-            stderr.contains(&format!("User Agent comment ({unsafe_char}) contains unsafe characters.")),
+            stderr.contains(&format!(
+                "User Agent comment ({unsafe_char}) contains unsafe characters."
+            )),
             "unexpected stderr for -uacomment={unsafe_char}: {stderr}"
         );
     }
@@ -3801,7 +4276,9 @@ fn test_block_sync_between_nodes() {
 fn manual_pruning_deletes_only_what_pruneblockchain_asks_for() {
     use serde_json::json;
     let node = TestNode::start(&["--fastprune=1", "--prune=1"]);
-    let addr = DeterministicWallet::from_secret([0x6d; 32]).address.to_string();
+    let addr = DeterministicWallet::from_secret([0x6d; 32])
+        .address
+        .to_string();
 
     // Prune mode is on, and it is the manual kind: no budget, so no
     // `prune_target_size` for an operator to size a disk against.
@@ -3826,7 +4303,10 @@ fn manual_pruning_deletes_only_what_pruneblockchain_asks_for() {
         .rpc_call_with_params("pruneblockchain", vec![json!(-1)])
         .unwrap();
     assert_eq!(negative["error"]["code"].as_i64(), Some(-8), "{negative}");
-    assert_eq!(negative["error"]["message"], "Negative block height.", "{negative}");
+    assert_eq!(
+        negative["error"]["message"], "Negative block height.",
+        "{negative}"
+    );
 
     // In batches: one `generatetoaddress` for a thousand blocks outruns the
     // test client's request timeout.
@@ -3859,7 +4339,10 @@ fn manual_pruning_deletes_only_what_pruneblockchain_asks_for() {
     let last_pruned = node.rpc_ok("pruneblockchain", vec![json!(500)]);
     let last_pruned = last_pruned.as_i64().expect("a height");
     assert!(last_pruned > 0, "the prune deleted nothing: {last_pruned}");
-    assert!(last_pruned <= 500, "it pruned past what was asked: {last_pruned}");
+    assert!(
+        last_pruned <= 500,
+        "it pruned past what was asked: {last_pruned}"
+    );
     let info = node.rpc_ok("getblockchaininfo", vec![]);
     assert_eq!(
         info["pruneheight"].as_i64(),
@@ -3927,7 +4410,10 @@ fn test_rpc_submitted_tx_relays_to_peer() {
     node_a
         .rpc_call_with_params(
             "generatetoaddress",
-            vec![serde_json::json!(101), serde_json::json!(src_addr.to_string())],
+            vec![
+                serde_json::json!(101),
+                serde_json::json!(src_addr.to_string()),
+            ],
         )
         .unwrap();
 
@@ -3964,7 +4450,10 @@ fn test_rpc_submitted_tx_relays_to_peer() {
         version: bitcoin::transaction::Version::TWO,
         lock_time: LockTime::ZERO,
         input: vec![TxIn {
-            previous_output: OutPoint { txid: cb_txid, vout: 0 },
+            previous_output: OutPoint {
+                txid: cb_txid,
+                vout: 0,
+            },
             script_sig: ScriptBuf::new(),
             sequence: Sequence::MAX,
             witness: Witness::new(),
@@ -3976,7 +4465,12 @@ fn test_rpc_submitted_tx_relays_to_peer() {
     };
     let src_script = src_addr.script_pubkey();
     let sighash = SighashCache::new(&spend)
-        .p2wpkh_signature_hash(0, &src_script, Amount::from_sat(cb_value), EcdsaSighashType::All)
+        .p2wpkh_signature_hash(
+            0,
+            &src_script,
+            Amount::from_sat(cb_value),
+            EcdsaSighashType::All,
+        )
         .unwrap();
     let sig = secp.sign_ecdsa(&Message::from_digest(sighash.to_byte_array()), &sk);
     let mut sig_bytes = sig.serialize_der().to_vec();
@@ -4031,7 +4525,10 @@ fn test_node_that_mined_its_own_chain_accepts_relayed_tx() {
     node_a
         .rpc_call_with_params(
             "generatetoaddress",
-            vec![serde_json::json!(101), serde_json::json!(wallet.address.to_string())],
+            vec![
+                serde_json::json!(101),
+                serde_json::json!(wallet.address.to_string()),
+            ],
         )
         .unwrap();
 
@@ -4043,7 +4540,8 @@ fn test_node_that_mined_its_own_chain_accepts_relayed_tx() {
     );
 
     let dest = wallet.address.script_pubkey();
-    let (raw_hex, txid) = common::build_signed_p2wpkh_spend_from_block1_coinbase(&node_b, &wallet, dest, 1_000);
+    let (raw_hex, txid) =
+        common::build_signed_p2wpkh_spend_from_block1_coinbase(&node_b, &wallet, dest, 1_000);
     node_b
         .rpc_call_with_params("sendrawtransaction", vec![serde_json::json!(raw_hex)])
         .unwrap();
@@ -4081,7 +4579,10 @@ fn wtxid_relay_is_negotiated_and_announces_by_wtxid() {
     let wallet = DeterministicWallet::from_secret([0x76u8; 32]);
     node.rpc_call_with_params(
         "generatetoaddress",
-        vec![serde_json::json!(101), serde_json::json!(wallet.address.to_string())],
+        vec![
+            serde_json::json!(101),
+            serde_json::json!(wallet.address.to_string()),
+        ],
     )
     .unwrap();
 
@@ -4092,27 +4593,45 @@ fn wtxid_relay_is_negotiated_and_announces_by_wtxid() {
         let at = |cmd: &str| peer.handshake.iter().position(|c| c == cmd);
         for negotiation in ["wtxidrelay", "sendaddrv2"] {
             match (sent, at("version"), at(negotiation)) {
-                (true, Some(v), Some(n)) => assert!(v < n, "{negotiation} before version: {:?}", peer.handshake),
+                (true, Some(v), Some(n)) => {
+                    assert!(v < n, "{negotiation} before version: {:?}", peer.handshake)
+                }
                 (false, Some(_), None) => {}
-                _ => panic!("expected {negotiation}: {sent}, the node sent {:?}", peer.handshake),
+                _ => panic!(
+                    "expected {negotiation}: {sent}, the node sent {:?}",
+                    peer.handshake
+                ),
             }
         }
     }
 
     let dest = wallet.address.script_pubkey();
-    let (raw_hex, _) = common::build_signed_p2wpkh_spend_from_block1_coinbase(&node, &wallet, dest, 1_000);
+    let (raw_hex, _) =
+        common::build_signed_p2wpkh_spend_from_block1_coinbase(&node, &wallet, dest, 1_000);
     let tx: bitcoin::Transaction =
         bitcoin::consensus::deserialize(&hex::decode(&raw_hex).unwrap()).unwrap();
     let (txid, wtxid) = (tx.compute_txid(), node::validation::decode::wtxid(&tx));
-    assert_ne!(txid.to_raw_hash(), wtxid.to_raw_hash(), "fixture: a segwit spend");
+    assert_ne!(
+        txid.to_raw_hash(),
+        wtxid.to_raw_hash(),
+        "fixture: a segwit spend"
+    );
     node.rpc_call_with_params("sendrawtransaction", vec![serde_json::json!(raw_hex)])
         .unwrap();
 
     let announced = |peer: &mut raw_p2p::ScriptedPeer| {
         peer.recv_until(Duration::from_secs(30), |m| match m {
-            NetworkMessage::Inv(inv) => inv.iter().find(|i| {
-                matches!(i, Inventory::WTx(_) | Inventory::WitnessTransaction(_) | Inventory::Transaction(_))
-            }).cloned(),
+            NetworkMessage::Inv(inv) => inv
+                .iter()
+                .find(|i| {
+                    matches!(
+                        i,
+                        Inventory::WTx(_)
+                            | Inventory::WitnessTransaction(_)
+                            | Inventory::Transaction(_)
+                    )
+                })
+                .cloned(),
             _ => None,
         })
     };
@@ -4155,10 +4674,8 @@ fn test_parallel_ibd() {
     // node B's stderr so the wedge dump below can include satd-side
     // logs when the test fails (without paying the I/O cost in every
     // other regtest test).
-    let mut node_b = TestNode::start_capturing_stderr(&[&format!(
-        "--connect=127.0.0.1:{}",
-        p2p_port_a
-    )]);
+    let mut node_b =
+        TestNode::start_capturing_stderr(&[&format!("--connect=127.0.0.1:{}", p2p_port_a)]);
 
     // Wait for B to sync all 200 blocks. The timeout has headroom for slow
     // CI runners: per-peer in-flight is capped at 16 (Bitcoin Core's
@@ -4201,7 +4718,15 @@ fn test_parallel_ibd() {
         let b_stderr = std::fs::read_to_string(&node_b.stderr_log)
             .unwrap_or_else(|e| format!("(read err: {e})"));
         // Last 200 log lines are usually enough to see the wedge state.
-        let tail: String = b_stderr.lines().rev().take(200).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n");
+        let tail: String = b_stderr
+            .lines()
+            .rev()
+            .take(200)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect::<Vec<_>>()
+            .join("\n");
         eprintln!(
             "test_parallel_ibd wedge dump:\n  node_a.getblockcount={a_count}\n  node_b.getblockchaininfo={chaininfo}\n  node_b.getpeerinfo={peerinfo}\n  node_b.stderr (last 200 lines):\n{tail}",
         );
@@ -4246,7 +4771,9 @@ fn test_listener_pulls_competing_chain_from_inbound_peer() {
 
     // Node B: an INDEPENDENT, longer competing chain (height 3), mined to a
     // different address so its blocks differ from A's.
-    let addr_b = DeterministicWallet::from_secret([0x4b; 32]).address.to_string();
+    let addr_b = DeterministicWallet::from_secret([0x4b; 32])
+        .address
+        .to_string();
     let mut node_b = TestNode::start(&[]);
     node_b
         .rpc_call_with_params(
@@ -4445,7 +4972,10 @@ fn test_getchaintxstats() {
     assert_eq!(result["window_block_count"], 0, "{response}");
     assert_eq!(result["txcount"], 6, "{response}");
     for key in ["window_interval", "window_tx_count", "txrate"] {
-        assert!(result.get(key).is_none(), "{key} with nblocks=0: {response}");
+        assert!(
+            result.get(key).is_none(),
+            "{key} with nblocks=0: {response}"
+        );
     }
 
     // Core's optional `blockhash` arg selects the window's final block.
@@ -4549,7 +5079,9 @@ fn test_getmininginfo() {
     assert_eq!(result["next"]["target"], regtest_target);
     assert!(result.get("signet_challenge").is_none());
     let tip = result_hash(&mut node);
-    let header = node.rpc_call_with_params("getblockheader", vec![tip]).unwrap();
+    let header = node
+        .rpc_call_with_params("getblockheader", vec![tip])
+        .unwrap();
     assert_eq!(header["result"]["target"], regtest_target);
     node.stop();
 }
@@ -4641,7 +5173,10 @@ fn test_banlist_survives_restart_even_after_an_unreadable_file() {
             .is_empty(),
         "an unreadable list starts empty"
     );
-    assert_eq!(set_and_restart(&mut node, "192.168.0.0/16"), ["192.168.0.0/16"]);
+    assert_eq!(
+        set_and_restart(&mut node, "192.168.0.0/16"),
+        ["192.168.0.0/16"]
+    );
     node.stop();
 }
 
@@ -4692,8 +5227,19 @@ fn test_getmemoryinfo() {
     // numbers are zero — not the process RSS with a `free` invented around it
     // to keep `used + free == total` true.
     let locked = &result["locked"];
-    for field in ["used", "free", "total", "locked", "chunks_used", "chunks_free"] {
-        assert_eq!(locked[field], serde_json::json!(0), "locked.{field}: {result}");
+    for field in [
+        "used",
+        "free",
+        "total",
+        "locked",
+        "chunks_used",
+        "chunks_free",
+    ] {
+        assert_eq!(
+            locked[field],
+            serde_json::json!(0),
+            "locked.{field}: {result}"
+        );
     }
     // Core's two argument errors.
     let r = node
@@ -4743,7 +5289,10 @@ fn test_estimaterawfee_reports_only_what_it_has() {
     );
     // And the fields satd has no data for are absent, not zero.
     for field in ["decay", "scale", "pass", "fail"] {
-        assert!(long[field].is_null(), "long.{field} must be omitted: {long}");
+        assert!(
+            long[field].is_null(),
+            "long.{field} must be omitted: {long}"
+        );
     }
 
     // The threshold is validated rather than discarded.
@@ -4796,9 +5345,7 @@ fn test_getpeerinfo_reports_real_permissions() {
     // Polled, not skipped-if-absent: an `if let Some(..)` here passed while
     // asserting nothing whenever the outbound peer had not been recorded yet.
     poll_until(
-        || {
-            get_rpc_u64(&peer, "getconnectioncount").unwrap_or(0) >= 1
-        },
+        || get_rpc_u64(&peer, "getconnectioncount").unwrap_or(0) >= 1,
         test_timeout(30),
         "the dialling node never recorded its peer",
     );
@@ -4831,7 +5378,10 @@ fn test_logging_reports_and_changes_the_real_filter() {
     // A node with no -debug is logging no categories. The old map said all.
     let r = logging(&mut node, vec![]);
     let obj = r.as_object().expect("logging object");
-    assert!(!obj.is_empty(), "satd must name the categories it can act on");
+    assert!(
+        !obj.is_empty(),
+        "satd must name the categories it can act on"
+    );
     assert!(
         obj.values().all(|v| v == &serde_json::json!(false)),
         "no -debug means no category is being logged: {r}"
@@ -4842,9 +5392,15 @@ fn test_logging_reports_and_changes_the_real_filter() {
     let mut sorted = keys.clone();
     sorted.sort();
     assert_eq!(keys, sorted, "categories must be alphabetical: {r}");
-    assert!(obj.contains_key("net") && obj.contains_key("mempool"), "{r}");
+    assert!(
+        obj.contains_key("net") && obj.contains_key("mempool"),
+        "{r}"
+    );
     // Categories satd has no subsystem for are not advertised.
-    assert!(!obj.contains_key("qt"), "satd must not claim a category it cannot enable: {r}");
+    assert!(
+        !obj.contains_key("qt"),
+        "satd must not claim a category it cannot enable: {r}"
+    );
 
     // Include turns one on, and only it.
     let r = logging(&mut node, vec![serde_json::json!(["net"])]);
@@ -4865,7 +5421,10 @@ fn test_logging_reports_and_changes_the_real_filter() {
     // "all" is Core's wildcard.
     let r = logging(&mut node, vec![serde_json::json!(["all"])]);
     assert!(
-        r.as_object().unwrap().values().all(|v| v == &serde_json::json!(true)),
+        r.as_object()
+            .unwrap()
+            .values()
+            .all(|v| v == &serde_json::json!(true)),
         "{r}"
     );
     // Core evaluates include then exclude, so a category in both is excluded.
@@ -4882,8 +5441,15 @@ fn test_logging_reports_and_changes_the_real_filter() {
         .rpc_call_with_params("logging", vec![serde_json::json!(["nosuchcategory"])])
         .unwrap();
     assert_eq!(r["error"]["code"], -8, "{r}");
-    assert_eq!(r["error"]["message"], "unknown logging category nosuchcategory");
-    assert_eq!(logging(&mut node, vec![]), before, "a rejected call must apply nothing");
+    assert_eq!(
+        r["error"]["message"],
+        "unknown logging category nosuchcategory"
+    );
+    assert_eq!(
+        logging(&mut node, vec![]),
+        before,
+        "a rejected call must apply nothing"
+    );
 
     // Core's wildcard set is `GetLogCategory`'s: "", "1" and "all" all mean
     // everything. The empty string is the one that is easy to miss, and it is
@@ -4891,7 +5457,10 @@ fn test_logging_reports_and_changes_the_real_filter() {
     for wildcard in ["", "1", "all"] {
         let r = logging(&mut node, vec![serde_json::json!([wildcard])]);
         assert!(
-            r.as_object().unwrap().values().all(|v| v == &serde_json::json!(true)),
+            r.as_object()
+                .unwrap()
+                .values()
+                .all(|v| v == &serde_json::json!(true)),
             "{wildcard:?} must enable every category: {r}"
         );
     }
@@ -4907,7 +5476,10 @@ fn test_logging_reports_and_changes_the_real_filter() {
             .rpc_call_with_params("logging", vec![serde_json::json!([name])])
             .unwrap();
         assert_eq!(r["error"]["code"], -8, "{name}: {r}");
-        assert_eq!(r["error"]["message"], format!("unknown logging category {name}"));
+        assert_eq!(
+            r["error"]["message"],
+            format!("unknown logging category {name}")
+        );
         assert_eq!(
             logging(&mut node, vec![]),
             before,
@@ -4980,8 +5552,14 @@ fn test_node_facts_are_derived_not_constants() {
         .iter()
         .filter_map(|v| v.as_str())
         .collect();
-    assert!(names.contains(&"NETWORK") && names.contains(&"WITNESS"), "{net}");
-    assert!(names.contains(&"NETWORK_LIMITED"), "Core always sets NODE_NETWORK_LIMITED: {net}");
+    assert!(
+        names.contains(&"NETWORK") && names.contains(&"WITNESS"),
+        "{net}"
+    );
+    assert!(
+        names.contains(&"NETWORK_LIMITED"),
+        "Core always sets NODE_NETWORK_LIMITED: {net}"
+    );
     let services = net["localservices"].as_str().expect("localservices");
     assert_eq!(services.len(), 16, "Core's 16-hex-digit form: {services}");
     assert_eq!(
@@ -4996,12 +5574,17 @@ fn test_node_facts_are_derived_not_constants() {
     // `pruned` was hardcoded false.
     let chain = node.rpc_call("getblockchaininfo").unwrap()["result"].clone();
     assert_eq!(chain["pruned"], serde_json::json!(false), "{chain}");
-    assert!(chain["prune_target_size"].is_null(), "absent when not pruning: {chain}");
+    assert!(
+        chain["prune_target_size"].is_null(),
+        "absent when not pruning: {chain}"
+    );
 
     // `savemempool` returned Core's success value while writing nothing.
     let r = node.rpc_call("savemempool").unwrap();
     assert!(r["error"].is_null(), "savemempool: {r}");
-    let filename = r["result"]["filename"].as_str().expect("Core returns a filename");
+    let filename = r["result"]["filename"]
+        .as_str()
+        .expect("Core returns a filename");
     assert!(
         std::path::Path::new(filename).exists(),
         "savemempool must actually write {filename}"
@@ -5040,7 +5623,11 @@ fn test_blocksonly_and_prune_are_reported() {
         serde_json::json!(576_716_800u64),
         "{chain}"
     );
-    assert_eq!(chain["automatic_pruning"], serde_json::json!(true), "{chain}");
+    assert_eq!(
+        chain["automatic_pruning"],
+        serde_json::json!(true),
+        "{chain}"
+    );
     // Emitted whenever prune mode is on, and `0` until something has been
     // deleted — `GetPruneHeight` is `nullopt` then and Core writes 0.
     assert_eq!(chain["pruneheight"], serde_json::json!(0), "{chain}");
@@ -5190,20 +5777,59 @@ fn an_unresolvable_added_node_is_kept_listed_and_removable() {
         "the config entry must survive a failed lookup"
     );
 
-    node.rpc_ok("addnode", vec![serde_json::json!("tank-0001.invalid"), serde_json::json!("add")]);
+    node.rpc_ok(
+        "addnode",
+        vec![
+            serde_json::json!("tank-0001.invalid"),
+            serde_json::json!("add"),
+        ],
+    );
     let dup = node
-        .rpc_call_with_params("addnode", vec![serde_json::json!("tank-0001.invalid"), serde_json::json!("add")])
+        .rpc_call_with_params(
+            "addnode",
+            vec![
+                serde_json::json!("tank-0001.invalid"),
+                serde_json::json!("add"),
+            ],
+        )
         .unwrap();
     assert_eq!(dup["error"]["code"], -23, "{dup}");
-    assert_eq!(dup["error"]["message"], "Error: Node already added", "{dup}");
-    let one = node.rpc_ok("getaddednodeinfo", vec![serde_json::json!("tank-0001.invalid")]);
+    assert_eq!(
+        dup["error"]["message"], "Error: Node already added",
+        "{dup}"
+    );
+    let one = node.rpc_ok(
+        "getaddednodeinfo",
+        vec![serde_json::json!("tank-0001.invalid")],
+    );
     assert_eq!(one[0]["connected"], false, "{one}");
 
-    node.rpc_ok("addnode", vec![serde_json::json!("tank-0001.invalid"), serde_json::json!("remove")]);
-    node.rpc_ok("addnode", vec![serde_json::json!("tank-0000.invalid:18444"), serde_json::json!("remove")]);
-    assert_eq!(node.rpc_ok("getaddednodeinfo", vec![]), serde_json::json!([]));
+    node.rpc_ok(
+        "addnode",
+        vec![
+            serde_json::json!("tank-0001.invalid"),
+            serde_json::json!("remove"),
+        ],
+    );
+    node.rpc_ok(
+        "addnode",
+        vec![
+            serde_json::json!("tank-0000.invalid:18444"),
+            serde_json::json!("remove"),
+        ],
+    );
+    assert_eq!(
+        node.rpc_ok("getaddednodeinfo", vec![]),
+        serde_json::json!([])
+    );
     let gone = node
-        .rpc_call_with_params("addnode", vec![serde_json::json!("tank-0001.invalid"), serde_json::json!("remove")])
+        .rpc_call_with_params(
+            "addnode",
+            vec![
+                serde_json::json!("tank-0001.invalid"),
+                serde_json::json!("remove"),
+            ],
+        )
         .unwrap();
     assert_eq!(gone["error"]["code"], -24, "{gone}");
     node.stop();
@@ -5218,12 +5844,19 @@ fn an_unresolvable_added_node_is_kept_listed_and_removable() {
 #[test]
 fn a_reload_registers_new_addnode_entries_as_added_nodes() {
     let mut node = TestNode::start(&[]);
-    assert_eq!(node.rpc_ok("getaddednodeinfo", vec![]), serde_json::json!([]));
+    assert_eq!(
+        node.rpc_ok("getaddednodeinfo", vec![]),
+        serde_json::json!([])
+    );
 
     // Nothing listens on `closed`: an added node all the same.
     let closed = format!("127.0.0.1:{}", find_available_port());
     let conf = node.datadir.join("bitcoin.conf");
-    std::fs::write(&conf, format!("[regtest]\naddnode=tank-0000.invalid:18444\naddnode={closed}\n")).unwrap();
+    std::fs::write(
+        &conf,
+        format!("[regtest]\naddnode=tank-0000.invalid:18444\naddnode={closed}\n"),
+    )
+    .unwrap();
     send_sighup(&node);
 
     let added = |node: &TestNode| -> Vec<String> {
@@ -5245,9 +5878,15 @@ fn a_reload_registers_new_addnode_entries_as_added_nodes() {
     );
 
     for entry in ["tank-0000.invalid:18444", closed.as_str()] {
-        node.rpc_ok("addnode", vec![serde_json::json!(entry), serde_json::json!("remove")]);
+        node.rpc_ok(
+            "addnode",
+            vec![serde_json::json!(entry), serde_json::json!("remove")],
+        );
     }
-    assert_eq!(node.rpc_ok("getaddednodeinfo", vec![]), serde_json::json!([]));
+    assert_eq!(
+        node.rpc_ok("getaddednodeinfo", vec![]),
+        serde_json::json!([])
+    );
     node.stop();
 }
 
@@ -5267,7 +5906,9 @@ fn a_reload_keeps_a_new_connect_name_that_does_not_resolve_yet() {
         std::fs::read_to_string(&node.stderr_log)
             .unwrap_or_default()
             .lines()
-            .any(|l| l.contains("Peer name does not resolve yet") && l.contains("tank-0001.invalid"))
+            .any(|l| {
+                l.contains("Peer name does not resolve yet") && l.contains("tank-0001.invalid")
+            })
     };
     let deadline = Instant::now() + test_timeout(30);
     while !retried(&node) && Instant::now() < deadline {
@@ -5278,7 +5919,10 @@ fn a_reload_keeps_a_new_connect_name_that_does_not_resolve_yet() {
         "the reloaded -connect name must be looked up again\n{}",
         std::fs::read_to_string(&node.stderr_log).unwrap_or_default()
     );
-    assert_eq!(node.rpc_ok("getaddednodeinfo", vec![]), serde_json::json!([]));
+    assert_eq!(
+        node.rpc_ok("getaddednodeinfo", vec![]),
+        serde_json::json!([])
+    );
     node.stop();
 }
 
@@ -5288,10 +5932,19 @@ fn a_reload_keeps_a_new_connect_name_that_does_not_resolve_yet() {
 fn addnode_refuses_a_name_under_dns_off() {
     let mut node = TestNode::start(&["-dns=0"]);
     let r = node
-        .rpc_call_with_params("addnode", vec![serde_json::json!("tank-0001.invalid"), serde_json::json!("add")])
+        .rpc_call_with_params(
+            "addnode",
+            vec![
+                serde_json::json!("tank-0001.invalid"),
+                serde_json::json!("add"),
+            ],
+        )
         .unwrap();
     assert_eq!(r["error"]["code"], -1, "{r}");
-    assert_eq!(node.rpc_ok("getaddednodeinfo", vec![]), serde_json::json!([]));
+    assert_eq!(
+        node.rpc_ok("getaddednodeinfo", vec![]),
+        serde_json::json!([])
+    );
     node.stop();
 }
 
@@ -5306,17 +5959,32 @@ fn addnode_refuses_an_empty_node() {
     let mut node = TestNode::start(&[]);
     for command in ["add", "remove", "onetry"] {
         for blank in ["", " "] {
-            let r = node.rpc_call_with_params("addnode", vec![json!(blank), json!(command)]).unwrap();
+            let r = node
+                .rpc_call_with_params("addnode", vec![json!(blank), json!(command)])
+                .unwrap();
             assert_eq!(r["error"]["code"], -8, "{command} {blank:?}: {r}");
-            assert_eq!(r["error"]["message"], "Error: Node address cannot be empty", "{r}");
+            assert_eq!(
+                r["error"]["message"], "Error: Node address cannot be empty",
+                "{r}"
+            );
         }
     }
-    let r = node.rpc_call_with_params("addnode", vec![json!(""), json!("abc")]).unwrap();
-    assert_ne!(r["error"]["code"], -8, "an unknown command is refused as one: {r}");
+    let r = node
+        .rpc_call_with_params("addnode", vec![json!(""), json!("abc")])
+        .unwrap();
+    assert_ne!(
+        r["error"]["code"], -8,
+        "an unknown command is refused as one: {r}"
+    );
     assert_eq!(node.rpc_ok("getaddednodeinfo", vec![]), json!([]));
 
     node.rpc_ok("addnode", vec![json!("127.0.0.1:18444"), json!("add")]);
-    assert_eq!(node.rpc_ok("getaddednodeinfo", vec![]).as_array().map(Vec::len), Some(1));
+    assert_eq!(
+        node.rpc_ok("getaddednodeinfo", vec![])
+            .as_array()
+            .map(Vec::len),
+        Some(1)
+    );
     node.stop();
 }
 
@@ -5381,13 +6049,22 @@ fn test_dumptxoutset_writes_core_format_snapshot() {
     assert_eq!(result["coins_written"].as_u64().unwrap(), 10);
     assert_eq!(result["base_height"].as_u64().unwrap(), 10);
     assert!(result["base_hash"].as_str().unwrap().len() == 64);
-    assert!(result["path"].as_str().unwrap().contains("satd-dumptxoutset-"));
+    assert!(
+        result["path"]
+            .as_str()
+            .unwrap()
+            .contains("satd-dumptxoutset-")
+    );
     let reported_hash = result["txoutset_hash"].as_str().unwrap().to_string();
     assert_eq!(reported_hash.len(), 64);
 
     // File exists on disk.
     let raw = std::fs::read(&dump_path).expect("read snapshot file");
-    assert!(raw.len() > 51, "snapshot smaller than header: {} bytes", raw.len());
+    assert!(
+        raw.len() > 51,
+        "snapshot smaller than header: {} bytes",
+        raw.len()
+    );
 
     // First 5 bytes: snapshot magic "utxo\xff".
     assert_eq!(&raw[..5], &[b'u', b't', b'x', b'o', 0xff]);
@@ -5468,7 +6145,10 @@ fn test_create_transaction_rejects_foreign_network_address() {
         "vout": 0,
     }]);
     // A mainnet P2SH address, and a mainnet bech32 one.
-    for addr in ["3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy", "bc1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq9e75rs"] {
+    for addr in [
+        "3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy",
+        "bc1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq9e75rs",
+    ] {
         let outputs = serde_json::json!({ addr: 0.001 });
         for method in ["createrawtransaction", "createpsbt"] {
             let response = node
@@ -5525,13 +6205,24 @@ fn test_create_transaction_output_checks_follow_core_order() {
     for method in ["createrawtransaction", "createpsbt"] {
         // A repeated *invalid* address is an address error: Core's validity
         // check runs before its duplicate check.
-        let r = call(&mut node, method, &format!(r#"{{"{MAINNET}":0.01,"{MAINNET}":0.02}}"#));
+        let r = call(
+            &mut node,
+            method,
+            &format!(r#"{{"{MAINNET}":0.01,"{MAINNET}":0.02}}"#),
+        );
         assert_eq!(r["error"]["code"], -5, "{method}: {r}");
-        assert_eq!(r["error"]["message"], format!("Invalid Bitcoin address: {MAINNET}"));
+        assert_eq!(
+            r["error"]["message"],
+            format!("Invalid Bitcoin address: {MAINNET}")
+        );
 
         // A repeated *valid* address is the duplicate error — and on
         // `createpsbt`, which had no detection, it used to succeed.
-        let r = call(&mut node, method, &format!(r#"{{"{ADDR}":0.01,"{ADDR}":0.02}}"#));
+        let r = call(
+            &mut node,
+            method,
+            &format!(r#"{{"{ADDR}":0.01,"{ADDR}":0.02}}"#),
+        );
         assert_eq!(r["error"]["code"], -8, "{method}: {r}");
         assert_eq!(
             r["error"]["message"],
@@ -5541,7 +6232,10 @@ fn test_create_transaction_output_checks_follow_core_order() {
         // A duplicate `data` key, likewise.
         let r = call(&mut node, method, r#"{"data":"aa","data":"bb"}"#);
         assert_eq!(r["error"]["code"], -8, "{method}: {r}");
-        assert_eq!(r["error"]["message"], "Invalid parameter, duplicate key: data");
+        assert_eq!(
+            r["error"]["message"],
+            "Invalid parameter, duplicate key: data"
+        );
 
         // A bad amount on a bad address reports the amount: Core runs
         // `AmountFromValue` before `IsValidDestination`.
@@ -5560,15 +6254,18 @@ fn test_create_transaction_output_checks_follow_core_order() {
         let r = call(&mut node, method, "null");
         assert_eq!(r["error"]["code"], -8, "{method}: {r}");
         assert_eq!(
-            r["error"]["message"],
-            "Invalid parameter, output argument must be non-null",
+            r["error"]["message"], "Invalid parameter, output argument must be non-null",
             "{method}: {r}"
         );
 
         // A repeated key is read with its *first* value, as Core's
         // `outputs[name_]` is: the unparseable second value is never reached,
         // so the answer names the duplicate rather than the amount.
-        let r = call(&mut node, method, &format!(r#"{{"{ADDR}":0.01,"{ADDR}":"wat"}}"#));
+        let r = call(
+            &mut node,
+            method,
+            &format!(r#"{{"{ADDR}":0.01,"{ADDR}":"wat"}}"#),
+        );
         assert_eq!(r["error"]["code"], -8, "{method}: {r}");
         assert_eq!(
             r["error"]["message"],
@@ -5638,7 +6335,11 @@ fn test_decodepsbt() {
         .unwrap();
     let result = &response["result"];
     // Core's `TxToUniv`, addresses spelled for the node's own network.
-    assert_eq!(result["tx"]["vin"].as_array().map(Vec::len), Some(1), "{response}");
+    assert_eq!(
+        result["tx"]["vin"].as_array().map(Vec::len),
+        Some(1),
+        "{response}"
+    );
     assert_eq!(
         result["tx"]["vout"][0]["scriptPubKey"]["address"],
         "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202",
@@ -5726,10 +6427,17 @@ fn converttopsbt_refuses_a_psbt_version_it_cannot_produce() {
         .unwrap();
     let hex_tx = raw_resp["result"].as_str().unwrap().to_string();
     let call = |node: &mut TestNode, v: serde_json::Value| {
-        node.rpc_call_with_params("converttopsbt", vec![json!(hex_tx), json!(false), json!(null), v]).unwrap()
+        node.rpc_call_with_params(
+            "converttopsbt",
+            vec![json!(hex_tx), json!(false), json!(null), v],
+        )
+        .unwrap()
     };
     let ok = call(&mut node, json!(0));
-    assert!(ok["result"].as_str().unwrap().starts_with("cHNidP8"), "{ok}");
+    assert!(
+        ok["result"].as_str().unwrap().starts_with("cHNidP8"),
+        "{ok}"
+    );
     let two = call(&mut node, json!(2));
     assert_eq!(two["error"]["code"], -8, "{two}");
     assert_eq!(
@@ -5737,10 +6445,16 @@ fn converttopsbt_refuses_a_psbt_version_it_cannot_produce() {
         "converttopsbt does not create version 2 PSBTs; use createpsbt psbt_version=2"
     );
     let named = node
-        .rpc_call_with_named_params("converttopsbt", json!({"hexstring": hex_tx, "psbt_version": 3}))
+        .rpc_call_with_named_params(
+            "converttopsbt",
+            json!({"hexstring": hex_tx, "psbt_version": 3}),
+        )
         .unwrap();
     assert_eq!(named["error"]["code"], -8, "{named}");
-    assert_eq!(named["error"]["message"], "psbt_version must be 0 or 2, not 3");
+    assert_eq!(
+        named["error"]["message"],
+        "psbt_version must be 0 or 2, not 3"
+    );
     node.stop();
 }
 
@@ -5780,7 +6494,10 @@ fn test_signmessagewithprivkey_and_verifymessage() {
         "INbVnW4e6PeRmsv2Qgu8NuopvrVjkcxob+sX8OcZG0SALhWybUjzMLPdAsXI46YZGb0KQTRii+wWIQzRpG/U+S0=";
     let error_of = |r: serde_json::Value| -> (i64, String) {
         let e = &r["error"];
-        (e["code"].as_i64().unwrap(), e["message"].as_str().unwrap().to_string())
+        (
+            e["code"].as_i64().unwrap(),
+            e["message"].as_str().unwrap().to_string(),
+        )
     };
 
     let r = node
@@ -5795,18 +6512,29 @@ fn test_signmessagewithprivkey_and_verifymessage() {
         .unwrap();
     assert_eq!(r["result"], true);
     let r = node
-        .rpc_call_with_params("verifymessage", vec![j(p2pkh), j(expected), j("other message")])
+        .rpc_call_with_params(
+            "verifymessage",
+            vec![j(p2pkh), j(expected), j("other message")],
+        )
         .unwrap();
     assert_eq!(r["result"], false);
     for desc in [format!("sh(wpkh({priv_key}))"), format!("wpkh({priv_key})")] {
-        let info = node.rpc_call_with_params("getdescriptorinfo", vec![j(&desc)]).unwrap();
+        let info = node
+            .rpc_call_with_params("getdescriptorinfo", vec![j(&desc)])
+            .unwrap();
         let desc = format!("{desc}#{}", info["result"]["checksum"].as_str().unwrap());
-        let addr = node.rpc_call_with_params("deriveaddresses", vec![j(&desc)]).unwrap();
+        let addr = node
+            .rpc_call_with_params("deriveaddresses", vec![j(&desc)])
+            .unwrap();
         let addr = addr["result"][0].as_str().unwrap().to_string();
         let r = node
             .rpc_call_with_params("verifymessage", vec![j(&addr), j(expected), j(message)])
             .unwrap();
-        assert_eq!(error_of(r), (-3, "Address does not refer to key".to_string()), "{addr}");
+        assert_eq!(
+            error_of(r),
+            (-3, "Address does not refer to key".to_string()),
+            "{addr}"
+        );
     }
 
     // Wrong argument counts: -1, naming the method.
@@ -5819,7 +6547,9 @@ fn test_signmessagewithprivkey_and_verifymessage() {
         assert!(msg.contains("signmessagewithprivkey"), "{n} params: {msg}");
     }
     for n in [0, 1, 2, 4, 5] {
-        let r = node.rpc_call_with_params("verifymessage", vec![j("dummy"); n]).unwrap();
+        let r = node
+            .rpc_call_with_params("verifymessage", vec![j("dummy"); n])
+            .unwrap();
         let (code, msg) = error_of(r);
         assert_eq!(code, -1, "{n} params");
         assert!(msg.contains("verifymessage"), "{n} params: {msg}");
@@ -5833,16 +6563,25 @@ fn test_signmessagewithprivkey_and_verifymessage() {
     let r = node
         .rpc_call_with_params(
             "signmessagewithprivkey",
-            vec![j("L3VFeEujGtevx9w18HD1fhRbCH67Az2dpCymeRE1SoPK6XQtaN2k"), j(message)],
+            vec![
+                j("L3VFeEujGtevx9w18HD1fhRbCH67Az2dpCymeRE1SoPK6XQtaN2k"),
+                j(message),
+            ],
         )
         .unwrap();
     assert_eq!(error_of(r), (-5, "Invalid private key".to_string()));
     let r = node
-        .rpc_call_with_params("verifymessage", vec![j("invalid_addr"), j(expected), j(message)])
+        .rpc_call_with_params(
+            "verifymessage",
+            vec![j("invalid_addr"), j(expected), j(message)],
+        )
         .unwrap();
     assert_eq!(error_of(r), (-5, "Invalid address".to_string()));
     let r = node
-        .rpc_call_with_params("verifymessage", vec![j(p2pkh), j("invalid_sig"), j(message)])
+        .rpc_call_with_params(
+            "verifymessage",
+            vec![j(p2pkh), j("invalid_sig"), j(message)],
+        )
         .unwrap();
     assert_eq!(error_of(r), (-3, "Malformed base64 encoding".to_string()));
     node.stop();
@@ -5856,19 +6595,31 @@ fn test_verifybip322() {
     let mut node = TestNode::start(&[]);
     let j = |v: &str| serde_json::json!(v);
     let addr = "mpLQjfK79b7CCV4VMJWEWAj5Mpx8Up5zxB";
-    let sig = "INbVnW4e6PeRmsv2Qgu8NuopvrVjkcxob+sX8OcZG0SALhWybUjzMLPdAsXI46YZGb0KQTRii+wWIQzRpG/U+S0=";
+    let sig =
+        "INbVnW4e6PeRmsv2Qgu8NuopvrVjkcxob+sX8OcZG0SALhWybUjzMLPdAsXI46YZGb0KQTRii+wWIQzRpG/U+S0=";
     let msg = "This is just a test message";
-    let call = |a: &str, s: &str, m: &str| node.rpc_call_with_params("verifybip322", vec![j(a), j(s), j(m)]).unwrap();
+    let call = |a: &str, s: &str, m: &str| {
+        node.rpc_call_with_params("verifybip322", vec![j(a), j(s), j(m)])
+            .unwrap()
+    };
 
-    assert_eq!(call(addr, sig, msg)["result"], serde_json::json!({"result": "valid", "format": "legacy"}));
+    assert_eq!(
+        call(addr, sig, msg)["result"],
+        serde_json::json!({"result": "valid", "format": "legacy"})
+    );
     let r = call(addr, sig, "other message");
     assert_eq!(r["result"]["result"], "invalid");
     assert_eq!(r["result"]["format"], "legacy");
     // A mainnet address is not a regtest address.
-    assert_eq!(call("bc1q9vza2e8x573nczrlzms0wvx3gsqjx7vavgkx0l", sig, msg)["error"]["code"], -5);
+    assert_eq!(
+        call("bc1q9vza2e8x573nczrlzms0wvx3gsqjx7vavgkx0l", sig, msg)["error"]["code"],
+        -5
+    );
     assert_eq!(call(addr, "pofAAAA", msg)["error"]["code"], -8);
     // Three arguments, no more.
-    let r = node.rpc_call_with_params("verifybip322", vec![j(addr), j(sig), j(msg), j("x")]).unwrap();
+    let r = node
+        .rpc_call_with_params("verifybip322", vec![j(addr), j(sig), j(msg), j("x")])
+        .unwrap();
     assert_eq!(r["error"]["code"], -1);
     node.stop();
 }
@@ -6351,9 +7102,7 @@ fn test_getblockfilter_header_is_display_byte_order() {
     let response = node
         .rpc_call_with_params("getblockfilter", vec![serde_json::json!(genesis_hash_hex)])
         .unwrap();
-    let actual_header = response["result"]["header"]
-        .as_str()
-        .expect("header field");
+    let actual_header = response["result"]["header"].as_str().expect("header field");
     assert_eq!(
         actual_header, expected_display,
         "getblockfilter must return header in display byte order; \
@@ -6465,7 +7214,11 @@ fn test_rpc_warnings_field_is_an_array_unless_deprecated() {
     let mut node = TestNode::start(&["--deprecatedrpc=warnings"]);
     for m in methods {
         let r = node.rpc_ok(m, vec![]);
-        assert_eq!(r["warnings"], serde_json::json!(""), "{m} under -deprecatedrpc=warnings: {r}");
+        assert_eq!(
+            r["warnings"],
+            serde_json::json!(""),
+            "{m} under -deprecatedrpc=warnings: {r}"
+        );
     }
     node.stop();
 }
@@ -6493,7 +7246,11 @@ fn test_rpc_accepts_any_request_content_type() {
         let resp = req.send().unwrap();
         assert_eq!(resp.status().as_u16(), 200, "content-type {ct:?}");
         let json: serde_json::Value = resp.json().unwrap();
-        assert_eq!(json["result"], serde_json::json!(0), "content-type {ct:?}: {json}");
+        assert_eq!(
+            json["result"],
+            serde_json::json!(0),
+            "content-type {ct:?}: {json}"
+        );
     }
     node.stop();
 }
@@ -6691,7 +7448,8 @@ fn test_reindex_chainstate_rebuilds_ordinal_cfs() {
     let txid5 = block5["result"]["tx"][0].as_str().unwrap().to_string();
     node.stop();
 
-    let mut node = TestNode::start_with_datadir(&datadir, rpcport, &["--txindex=1", "--reindex-chainstate"]);
+    let mut node =
+        TestNode::start_with_datadir(&datadir, rpcport, &["--txindex=1", "--reindex-chainstate"]);
     assert_eq!(node.rpc_call("getblockcount").unwrap()["result"], 10);
 
     let footprint = node.rpc_call("getstoragefootprint").unwrap();
@@ -6857,7 +7615,10 @@ fn test_reindex_chainstate_stopatheight_exits() {
     // never advance: blocks 6..10 read as connected in the block index, so
     // no connect path would take them (#839). A plain start now refuses.
     assert!(
-        datadir.join("regtest").join(node::rebuild_marker::MARKER_FILENAME).exists(),
+        datadir
+            .join("regtest")
+            .join(node::rebuild_marker::MARKER_FILENAME)
+            .exists(),
         "a replay cut short by -stopatheight leaves the rebuild marker"
     );
     let (status, stderr) = run_satd_until_exit(&datadir, &[], test_timeout(60));
@@ -6904,11 +7665,24 @@ fn datadir_with_an_unfinished_chainstate_rebuild(
     let (datadir, rpcport, utxos) = stopped_indexed_datadir(tag);
     let (status, stderr) = run_satd_until_exit(
         &datadir,
-        &["--txindex=1", "--addressindex=1", "--reindex-chainstate", "--stopatheight=5"],
+        &[
+            "--txindex=1",
+            "--addressindex=1",
+            "--reindex-chainstate",
+            "--stopatheight=5",
+        ],
         test_timeout(60),
     );
-    assert!(status.success(), "the stopped rebuild exits cleanly: {stderr}");
-    assert!(datadir.join("regtest").join(node::rebuild_marker::MARKER_FILENAME).exists());
+    assert!(
+        status.success(),
+        "the stopped rebuild exits cleanly: {stderr}"
+    );
+    assert!(
+        datadir
+            .join("regtest")
+            .join(node::rebuild_marker::MARKER_FILENAME)
+            .exists()
+    );
     (datadir, rpcport, utxos)
 }
 
@@ -6928,13 +7702,18 @@ fn upgradechainstate_rebuilds_an_older_schema_datadir_and_is_then_a_no_op() {
     let (datadir, rpcport, before) = stopped_indexed_datadir("satd-upgradecs");
     let prior = node::storage::rocksdb_store::CURRENT_SCHEMA_VERSION - 1;
     stamp_chainstate_schema(&datadir, prior);
-    let marker = datadir.join("regtest").join(node::rebuild_marker::MARKER_FILENAME);
+    let marker = datadir
+        .join("regtest")
+        .join(node::rebuild_marker::MARKER_FILENAME);
     let flags = ["--txindex=1", "--addressindex=1", "--upgradechainstate=1"];
 
     // Without the flag: the refusal an operator has always seen, and nothing
     // on disk changes.
-    let (status, stderr) =
-        run_satd_until_exit(&datadir, &["--txindex=1", "--addressindex=1"], test_timeout(60));
+    let (status, stderr) = run_satd_until_exit(
+        &datadir,
+        &["--txindex=1", "--addressindex=1"],
+        test_timeout(60),
+    );
     assert!(!status.success(), "{stderr}");
     assert!(stderr.contains(&format!("DB has v{prior}")), "{stderr}");
     assert_eq!(read_chainstate_schema(&datadir), Some(prior));
@@ -6942,20 +7721,30 @@ fn upgradechainstate_rebuilds_an_older_schema_datadir_and_is_then_a_no_op() {
     // With it: rebuilt, unprompted, from the block files.
     let mut node = TestNode::start_with_datadir(&datadir, rpcport, &flags);
     let log = std::fs::read_to_string(&node.stderr_log).unwrap();
-    assert!(log.contains("rebuilding the UTXO set from the block files"), "{log}");
+    assert!(
+        log.contains("rebuilding the UTXO set from the block files"),
+        "{log}"
+    );
     assert!(log.contains(CHAINSTATE_REBUILD_LOG), "{log}");
     assert_eq!(node.rpc_call("getblockcount").unwrap()["result"], 10);
     let after = node.rpc_call("gettxoutsetinfo").unwrap()["result"].clone();
     assert_eq!(utxo_summary(&after), utxo_summary(&before));
     // The transaction index was rebuilt with it.
-    let hash5 = node.rpc_call_with_params("getblockhash", vec![serde_json::json!(5)]).unwrap()
-        ["result"]
+    let hash5 = node
+        .rpc_call_with_params("getblockhash", vec![serde_json::json!(5)])
+        .unwrap()["result"]
         .clone();
-    let block5 =
-        node.rpc_call_with_params("getblock", vec![hash5, serde_json::json!(1)]).unwrap();
+    let block5 = node
+        .rpc_call_with_params("getblock", vec![hash5, serde_json::json!(1)])
+        .unwrap();
     let coinbase5 = block5["result"]["tx"][0].clone();
-    let raw = node.rpc_call_with_params("getrawtransaction", vec![coinbase5]).unwrap();
-    assert!(raw["result"].is_string(), "txindex must answer after the rebuild: {raw}");
+    let raw = node
+        .rpc_call_with_params("getrawtransaction", vec![coinbase5])
+        .unwrap();
+    assert!(
+        raw["result"].is_string(),
+        "txindex must answer after the rebuild: {raw}"
+    );
     assert!(!marker.exists(), "a finished rebuild removes its marker");
     node.stop();
     assert_eq!(
@@ -6966,7 +7755,10 @@ fn upgradechainstate_rebuilds_an_older_schema_datadir_and_is_then_a_no_op() {
     // Again with the flag: current schema, no marker, nothing to do.
     let mut node = TestNode::start_with_datadir(&datadir, rpcport, &flags);
     let log = std::fs::read_to_string(&node.stderr_log).unwrap();
-    assert!(!log.contains(CHAINSTATE_REBUILD_LOG), "the flag must be a no-op now: {log}");
+    assert!(
+        !log.contains(CHAINSTATE_REBUILD_LOG),
+        "the flag must be a no-op now: {log}"
+    );
     let again = node.rpc_call("gettxoutsetinfo").unwrap()["result"].clone();
     assert_eq!(utxo_summary(&again), utxo_summary(&before));
     node.stop();
@@ -6998,7 +7790,12 @@ fn upgradechainstate_restarts_an_interrupted_chainstate_rebuild() {
     assert_eq!(node.rpc_call("getblockcount").unwrap()["result"], 10);
     let after = node.rpc_call("gettxoutsetinfo").unwrap()["result"].clone();
     assert_eq!(utxo_summary(&after), utxo_summary(&before));
-    assert!(!datadir.join("regtest").join(node::rebuild_marker::MARKER_FILENAME).exists());
+    assert!(
+        !datadir
+            .join("regtest")
+            .join(node::rebuild_marker::MARKER_FILENAME)
+            .exists()
+    );
     node.stop();
     let _ = std::fs::remove_dir_all(&datadir);
 }
@@ -7017,7 +7814,12 @@ fn reindex_chainstate_itself_restarts_an_interrupted_rebuild() {
     assert_eq!(node.rpc_call("getblockcount").unwrap()["result"], 10);
     let after = node.rpc_call("gettxoutsetinfo").unwrap()["result"].clone();
     assert_eq!(utxo_summary(&after), utxo_summary(&before));
-    assert!(!datadir.join("regtest").join(node::rebuild_marker::MARKER_FILENAME).exists());
+    assert!(
+        !datadir
+            .join("regtest")
+            .join(node::rebuild_marker::MARKER_FILENAME)
+            .exists()
+    );
     node.stop();
     let _ = std::fs::remove_dir_all(&datadir);
 }
@@ -7053,9 +7855,17 @@ fn upgradechainstate_refuses_to_rebuild_a_pruned_datadir() {
     assert!(!status.success(), "{stderr}");
     assert!(stderr.contains("pruned"), "{stderr}");
     assert!(stderr.contains("must resync"), "{stderr}");
-    assert!(stderr.contains("The chainstate was not changed"), "{stderr}");
+    assert!(
+        stderr.contains("The chainstate was not changed"),
+        "{stderr}"
+    );
     assert_eq!(read_chainstate_schema(&datadir), Some(prior));
-    assert!(!datadir.join("regtest").join(node::rebuild_marker::MARKER_FILENAME).exists());
+    assert!(
+        !datadir
+            .join("regtest")
+            .join(node::rebuild_marker::MARKER_FILENAME)
+            .exists()
+    );
     let _ = std::fs::remove_dir_all(&datadir);
 }
 
@@ -7089,7 +7899,9 @@ fn a_datadir_from_another_network_is_refused() {
             "{extra:?}: the refused start wrote a cookie"
         );
         assert!(
-            !testnet4.join(node::rebuild_marker::MARKER_FILENAME).exists(),
+            !testnet4
+                .join(node::rebuild_marker::MARKER_FILENAME)
+                .exists(),
             "{extra:?}: the refused start began a rebuild"
         );
     }
@@ -7212,7 +8024,10 @@ fn replay_fixture(tag: &str) -> (std::path::PathBuf, serde_json::Value) {
         let deadline = Instant::now() + test_timeout(900);
         let mut height = 0;
         while height < REPLAY_FIXTURE_BLOCKS {
-            assert!(Instant::now() < deadline, "mining the replay fixture stalled at {height}");
+            assert!(
+                Instant::now() < deadline,
+                "mining the replay fixture stalled at {height}"
+            );
             let _ = node.rpc_call_with_params(
                 "generatetoaddress",
                 vec![
@@ -7304,9 +8119,16 @@ impl StartupRun {
                 return;
             }
             if let Some(status) = self.child.try_wait().unwrap() {
-                panic!("satd exited ({status}) before logging {needle:?}:\n{}", self.log());
+                panic!(
+                    "satd exited ({status}) before logging {needle:?}:\n{}",
+                    self.log()
+                );
             }
-            assert!(Instant::now() < deadline, "no {needle:?} within {timeout:?}:\n{}", self.log());
+            assert!(
+                Instant::now() < deadline,
+                "no {needle:?} within {timeout:?}:\n{}",
+                self.log()
+            );
             std::thread::sleep(Duration::from_millis(5));
         }
     }
@@ -7357,14 +8179,21 @@ fn sigterm_a_replay(run: &mut StartupRun, starts: &str, stopped: &str, datadir: 
         );
         panic!("the signal never reached satd's startup handler ({status}):\n{log}");
     }
-    assert_eq!(status.code(), Some(0), "a stopped replay exits 0 ({status}):\n{log}");
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "a stopped replay exits 0 ({status}):\n{log}"
+    );
     assert!(log.contains(stopped), "no {stopped:?} in the log:\n{log}");
     assert!(
         took < test_timeout(10),
         "the stop took {took:?}, longer than Docker's default grace period:\n{log}"
     );
     assert!(
-        datadir.join("regtest").join(node::rebuild_marker::MARKER_FILENAME).exists(),
+        datadir
+            .join("regtest")
+            .join(node::rebuild_marker::MARKER_FILENAME)
+            .exists(),
         "a stopped replay is not finished, so its marker stays"
     );
 }
@@ -7478,8 +8307,9 @@ fn sigterm_stops_a_full_reindex_with_satd_as_pid_1() {
                 .split(|b| *b == 0)
                 .next()
                 .is_some_and(|exe| exe.ends_with(b"/satd"));
-            let names_datadir =
-                cmdline.split(|b| *b == 0).any(|arg| arg == datadir_arg.as_bytes());
+            let names_datadir = cmdline
+                .split(|b| *b == 0)
+                .any(|arg| arg == datadir_arg.as_bytes());
             let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
             let pid_1 = status
                 .lines()
@@ -7490,7 +8320,11 @@ fn sigterm_stops_a_full_reindex_with_satd_as_pid_1() {
         if let Some(pid) = found.into_iter().next() {
             break pid;
         }
-        assert!(Instant::now() < deadline, "satd never started as PID 1:\n{}", run.log());
+        assert!(
+            Instant::now() < deadline,
+            "satd never started as PID 1:\n{}",
+            run.log()
+        );
         std::thread::sleep(Duration::from_millis(20));
     };
     sigterm_a_replay(
@@ -7523,10 +8357,7 @@ fn blk_files(datadir: &std::path::Path) -> Vec<(String, u64)> {
 /// `-reindex` left, and check that it continued that reindex (#906): it says
 /// so, wipes nothing, writes no block file, finishes the rebuild, and ends
 /// on the UTXO set `before` describes. Returns the height it continued from.
-fn plain_start_continues_the_reindex(
-    datadir: &std::path::Path,
-    before: &serde_json::Value,
-) -> u64 {
+fn plain_start_continues_the_reindex(datadir: &std::path::Path, before: &serde_json::Value) -> u64 {
     let files = blk_files(datadir);
     let mut node =
         TestNode::start_with_datadir(datadir, find_available_port(), &["--loglevel=info"]);
@@ -7548,9 +8379,16 @@ fn plain_start_continues_the_reindex(
     let after = node.rpc_call("gettxoutsetinfo").unwrap()["result"].clone();
     assert_eq!(utxo_summary(&after), utxo_summary(before));
     node.stop();
-    assert_eq!(blk_files(datadir), files, "a continued reindex writes no block file");
+    assert_eq!(
+        blk_files(datadir),
+        files,
+        "a continued reindex writes no block file"
+    );
     assert!(
-        !datadir.join("regtest").join(node::rebuild_marker::MARKER_FILENAME).exists(),
+        !datadir
+            .join("regtest")
+            .join(node::rebuild_marker::MARKER_FILENAME)
+            .exists(),
         "the continued reindex finished, so its marker is gone"
     );
     height
@@ -7576,21 +8414,37 @@ fn a_killed_full_reindex_continues_from_the_block_files() {
     loop {
         let log = run.log();
         let connect = log.find(REINDEX_CONNECT_STARTS).unwrap();
-        if log[connect..].matches("Flushing write cache to disk").count() >= 2 {
+        if log[connect..]
+            .matches("Flushing write cache to disk")
+            .count()
+            >= 2
+        {
             break;
         }
-        assert!(!log.contains("Reindex from flat files complete"), "lengthen the fixture:\n{log}");
+        assert!(
+            !log.contains("Reindex from flat files complete"),
+            "lengthen the fixture:\n{log}"
+        );
         assert!(Instant::now() < deadline, "no second flush:\n{log}");
         std::thread::sleep(Duration::from_millis(2));
     }
     run.signal("-KILL");
     run.wait_exit(test_timeout(30));
     let log = run.log();
-    assert!(!log.contains("Reindex from flat files complete"), "lengthen the fixture:\n{log}");
+    assert!(
+        !log.contains("Reindex from flat files complete"),
+        "lengthen the fixture:\n{log}"
+    );
 
     let height = plain_start_continues_the_reindex(&datadir, &before);
-    assert!(height >= 1000, "it continued from height {height}, below the durable flush at 1000");
-    assert!(height < REPLAY_FIXTURE_BLOCKS, "it continued from height {height}");
+    assert!(
+        height >= 1000,
+        "it continued from height {height}, below the durable flush at 1000"
+    );
+    assert!(
+        height < REPLAY_FIXTURE_BLOCKS,
+        "it continued from height {height}"
+    );
     let _ = std::fs::remove_dir_all(&datadir);
 }
 
@@ -7667,7 +8521,11 @@ fn sigterm_during_ibd_of_large_blocks_stops_within_the_bound() {
         // burns half the coinbase: allow it.
         a.rpc_ok(
             "sendrawtransaction",
-            vec![serde_json::json!(raw), serde_json::json!(0.1), serde_json::json!(50)],
+            vec![
+                serde_json::json!(raw),
+                serde_json::json!(0.1),
+                serde_json::json!(50),
+            ],
         );
     }
     let mempool_size = || a.rpc_ok("getmempoolinfo", vec![])["size"].as_u64().unwrap();
@@ -7675,7 +8533,10 @@ fn sigterm_during_ibd_of_large_blocks_stops_within_the_bound() {
         sp_generate_to(&a, 1, &addr);
     }
     let tip = get_rpc_u64(&a, "getblockcount").unwrap();
-    assert!(tip >= 249 + 14, "149 transactions of ~380 kWU take 15 blocks, tip {tip}");
+    assert!(
+        tip >= 249 + 14,
+        "149 transactions of ~380 kWU take 15 blocks, tip {tip}"
+    );
 
     let mut b = TestNode::start(&[&format!("--connect=127.0.0.1:{p2p_a}"), "--loglevel=info"]);
     // Into the large blocks, and not through them.
@@ -7683,28 +8544,50 @@ fn sigterm_during_ibd_of_large_blocks_stops_within_the_bound() {
     loop {
         let h = get_rpc_u64(&b, "getblockcount").unwrap_or(0);
         if h >= 251 {
-            assert!(h < tip, "node B synced the whole chain before the signal; reached {h}");
+            assert!(
+                h < tip,
+                "node B synced the whole chain before the signal; reached {h}"
+            );
             break;
         }
-        assert!(Instant::now() < deadline, "node B never reached the large blocks");
+        assert!(
+            Instant::now() < deadline,
+            "node B never reached the large blocks"
+        );
         std::thread::sleep(Duration::from_millis(5));
     }
     let sent = Instant::now();
     let pid = b.process.id().to_string();
-    assert!(Command::new("kill").args(["-TERM", &pid]).status().unwrap().success());
+    assert!(
+        Command::new("kill")
+            .args(["-TERM", &pid])
+            .status()
+            .unwrap()
+            .success()
+    );
     let deadline = Instant::now() + test_timeout(60);
     let status = loop {
         if let Some(status) = b.process.try_wait().unwrap() {
             break status;
         }
-        assert!(Instant::now() < deadline, "node B did not exit within 60s of SIGTERM");
+        assert!(
+            Instant::now() < deadline,
+            "node B did not exit within 60s of SIGTERM"
+        );
         std::thread::sleep(Duration::from_millis(10));
     };
     let took = sent.elapsed();
     let log = std::fs::read_to_string(&b.stderr_log).unwrap_or_default();
-    assert_eq!(status.code(), Some(0), "SIGTERM during IBD exits 0 ({status}):\n{log}");
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "SIGTERM during IBD exits 0 ({status}):\n{log}"
+    );
     assert!(took < test_timeout(10), "the stop took {took:?}:\n{log}");
-    let at = |line: &str| log.find(line).unwrap_or_else(|| panic!("no {line:?} in the log:\n{log}"));
+    let at = |line: &str| {
+        log.find(line)
+            .unwrap_or_else(|| panic!("no {line:?} in the log:\n{log}"))
+    };
     let order = [
         at("SIGTERM received, shutting down"),
         at("Shutdown: waiting for the block connector to finish the block in hand"),
@@ -7713,7 +8596,10 @@ fn sigterm_during_ibd_of_large_blocks_stops_within_the_bound() {
         at("UTXO cache flushed cleanly"),
         at("satd stopped"),
     ];
-    assert!(order.windows(2).all(|w| w[0] < w[1]), "shutdown steps out of order:\n{log}");
+    assert!(
+        order.windows(2).all(|w| w[0] < w[1]),
+        "shutdown steps out of order:\n{log}"
+    );
     let stopped_at: u64 = log[order[2]..]
         .lines()
         .next()
@@ -7881,19 +8767,34 @@ fn a_reload_sent_during_startup_is_applied_once_the_node_is_up() {
         .stderr(out)
         .spawn()
         .expect("spawn satd");
-    let mut node = Spawned { child, datadir: datadir.clone() };
+    let mut node = Spawned {
+        child,
+        datadir: datadir.clone(),
+    };
     let log_text = || std::fs::read_to_string(&log).unwrap_or_default();
 
     let cookie_path = datadir.join("regtest").join(".cookie");
     let deadline = Instant::now() + test_timeout(60);
     while !cookie_path.exists() {
-        assert!(node.child.try_wait().unwrap().is_none(), "satd exited during startup\n{}", log_text());
-        assert!(Instant::now() < deadline, "satd never wrote its cookie\n{}", log_text());
+        assert!(
+            node.child.try_wait().unwrap().is_none(),
+            "satd exited during startup\n{}",
+            log_text()
+        );
+        assert!(
+            Instant::now() < deadline,
+            "satd never wrote its cookie\n{}",
+            log_text()
+        );
         std::thread::sleep(Duration::from_millis(5));
     }
     // Startup has read the config file by now, so only the reload can turn
     // this on.
-    std::fs::write(datadir.join("bitcoin.conf"), "[regtest]\nrpcextendederrors=1\n").unwrap();
+    std::fs::write(
+        datadir.join("bitcoin.conf"),
+        "[regtest]\nrpcextendederrors=1\n",
+    )
+    .unwrap();
     for signal in ["-USR1", "-HUP"] {
         let status = Command::new("kill")
             .arg(signal)
@@ -7914,7 +8815,10 @@ fn a_reload_sent_during_startup_is_applied_once_the_node_is_up() {
             .post(format!("http://127.0.0.1:{rpcport}/"))
             .header("Authorization", format!("Basic {auth}"))
             .header("Content-Type", "application/json")
-            .body(serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}).to_string())
+            .body(
+                serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params})
+                    .to_string(),
+            )
             .send()
             .ok()?
             .json::<serde_json::Value>()
@@ -7930,7 +8834,10 @@ fn a_reload_sent_during_startup_is_applied_once_the_node_is_up() {
             log_text()
         );
         let resp = rpc("getblockhash", serde_json::json!([9999]));
-        if resp.as_ref().is_some_and(|r| r["error"]["data"]["category"] == "rpc.input.range") {
+        if resp
+            .as_ref()
+            .is_some_and(|r| r["error"]["data"]["category"] == "rpc.input.range")
+        {
             break;
         }
         assert!(
@@ -7947,7 +8854,11 @@ fn a_reload_sent_during_startup_is_applied_once_the_node_is_up() {
     rpc("stop", serde_json::json!([]));
     let deadline = Instant::now() + test_timeout(60);
     while node.child.try_wait().unwrap().is_none() {
-        assert!(Instant::now() < deadline, "satd did not stop\n{}", log_text());
+        assert!(
+            Instant::now() < deadline,
+            "satd did not stop\n{}",
+            log_text()
+        );
         std::thread::sleep(Duration::from_millis(100));
     }
 }
@@ -7967,7 +8878,10 @@ fn test_sighup_reload_applies_mempool_policy_live() {
     // Pick a target distinct from the startup value (bytes = MB * 1_000_000).
     let target_mb: u64 = 50;
     let target_bytes = target_mb * 1_000_000;
-    assert_ne!(before, target_bytes, "test target must differ from startup value");
+    assert_ne!(
+        before, target_bytes,
+        "test target must differ from startup value"
+    );
 
     let conf = node.datadir.join("bitcoin.conf");
     std::fs::write(&conf, format!("[regtest]\nmaxmempool={target_mb}\n")).unwrap();
@@ -8002,7 +8916,8 @@ fn test_sighup_reload_applies_mempool_policy_live() {
 fn a_new_datadir_and_its_files_are_private() {
     use std::os::unix::fs::PermissionsExt as _;
     let datadir = fresh_test_datadir("satd-umask");
-    let mut node = TestNode::start_with_datadir(&datadir, find_available_port(), &["--persistmempool=1"]);
+    let mut node =
+        TestNode::start_with_datadir(&datadir, find_available_port(), &["--persistmempool=1"]);
     node.stop();
     let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
     let net = datadir.join("regtest");
@@ -8021,9 +8936,14 @@ fn an_onion_externalip_is_advertised_as_a_local_address() {
     let host = "aaaqeayeaudaocajbifqydiob4ibceqtcqkrmfyydenbwha5dyp3kead.onion";
     let mut node = TestNode::start(&[&format!("--externalip={host}")]);
     let info = node.rpc_ok("getnetworkinfo", vec![]);
-    let local = info["localaddresses"].as_array().cloned().unwrap_or_default();
+    let local = info["localaddresses"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
     assert!(
-        local.iter().any(|a| a["address"] == host && a["port"] == 18444),
+        local
+            .iter()
+            .any(|a| a["address"] == host && a["port"] == 18444),
         "the onion is not among the local addresses: {info}"
     );
     node.stop();
@@ -8099,11 +9019,18 @@ fn test_sigterm_stop_joins_the_connector_and_closes_the_database() {
         if let Some(status) = node.process.try_wait().expect("wait for satd") {
             break status;
         }
-        assert!(Instant::now() < deadline, "satd did not exit within 60s of SIGTERM");
+        assert!(
+            Instant::now() < deadline,
+            "satd did not exit within 60s of SIGTERM"
+        );
         std::thread::sleep(Duration::from_millis(100));
     };
     let log = std::fs::read_to_string(&node.stderr_log).unwrap_or_default();
-    assert_eq!(status.code(), Some(0), "satd must exit 0 after SIGTERM ({status}); log:\n{log}");
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "satd must exit 0 after SIGTERM ({status}); log:\n{log}"
+    );
 
     let at = |line: &str| {
         log.find(line)
@@ -8132,12 +9059,24 @@ fn test_stop_waits_for_running_rpc_calls_before_the_flush() {
     let addr = "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080";
     let mined = std::thread::scope(|s| {
         let generate = s.spawn(|| {
-            node.rpc_call_with_params("generatetoaddress", vec![serde_json::json!(100_000), serde_json::json!(addr)])
+            node.rpc_call_with_params(
+                "generatetoaddress",
+                vec![serde_json::json!(100_000), serde_json::json!(addr)],
+            )
         });
         // Stop once mining is under way, far short of the 100000 asked for.
         let deadline = Instant::now() + test_timeout(60);
-        while node.rpc_call("getblockcount").ok().and_then(|r| r["result"].as_u64()).unwrap_or(0) < 20 {
-            assert!(Instant::now() < deadline, "generatetoaddress mined nothing in 60s");
+        while node
+            .rpc_call("getblockcount")
+            .ok()
+            .and_then(|r| r["result"].as_u64())
+            .unwrap_or(0)
+            < 20
+        {
+            assert!(
+                Instant::now() < deadline,
+                "generatetoaddress mined nothing in 60s"
+            );
             std::thread::sleep(Duration::from_millis(20));
         }
         node.rpc_ok("stop", vec![]);
@@ -8149,11 +9088,17 @@ fn test_stop_waits_for_running_rpc_calls_before_the_flush() {
             .unwrap_or_else(|| panic!("generatetoaddress answered without blocks: {resp}"))
             .len() as u64
     });
-    assert!(mined < 100_000, "generatetoaddress mined all {mined} blocks despite the stop");
+    assert!(
+        mined < 100_000,
+        "generatetoaddress mined all {mined} blocks despite the stop"
+    );
 
     let deadline = Instant::now() + test_timeout(60);
     while node.process.try_wait().expect("wait for satd").is_none() {
-        assert!(Instant::now() < deadline, "satd did not exit within 60s of stop");
+        assert!(
+            Instant::now() < deadline,
+            "satd did not exit within 60s of stop"
+        );
         std::thread::sleep(Duration::from_millis(100));
     }
     let log = std::fs::read_to_string(&node.stderr_log).unwrap_or_default();
@@ -8186,14 +9131,20 @@ fn test_stop_answers_a_waitfornewblock_still_waiting() {
     let mut node = TestNode::start(&[]);
     let tip = node.rpc_ok("getbestblockhash", vec![]);
     let resp = std::thread::scope(|s| {
-        let wait = s.spawn(|| node.rpc_call_with_params("waitfornewblock", vec![serde_json::json!(60_000)]));
+        let wait = s.spawn(|| {
+            node.rpc_call_with_params("waitfornewblock", vec![serde_json::json!(60_000)])
+        });
         // Let the call reach its wait before the stop.
         std::thread::sleep(Duration::from_millis(300));
         node.rpc_ok("stop", vec![]);
         wait.join().unwrap()
     });
-    let resp = resp.unwrap_or_else(|e| panic!("the waitfornewblock running at stop was never answered: {e}"));
-    assert_eq!(resp["result"]["hash"], tip, "waitfornewblock must answer with the tip at shutdown: {resp}");
+    let resp = resp
+        .unwrap_or_else(|e| panic!("the waitfornewblock running at stop was never answered: {e}"));
+    assert_eq!(
+        resp["result"]["hash"], tip,
+        "waitfornewblock must answer with the tip at shutdown: {resp}"
+    );
     node.stop();
 }
 
@@ -8638,7 +9589,10 @@ fn test_reindex() {
     );
     // Block files that reach the previous tip are a complete reindex (#504).
     let warnings = node.rpc_ok("getwarnings", vec![]);
-    assert!(!warnings.to_string().contains("reindex.short"), "{warnings}");
+    assert!(
+        !warnings.to_string().contains("reindex.short"),
+        "{warnings}"
+    );
     node.stop();
     let _ = std::fs::remove_dir_all(&datadir);
 }
@@ -9023,20 +9977,25 @@ fn a_heavier_branch_submitted_tip_first_is_activated_when_complete() {
     let addr_b = Address::from_witness_program(prog_b, Network::Regtest).to_string();
 
     let mut node_a = TestNode::start(&[]);
-    let a_hashes: Vec<String> = serde_json::from_value(
-        node_a.rpc_ok("generatetoaddress", vec![serde_json::json!(2), serde_json::json!(addr_a)]),
-    )
+    let a_hashes: Vec<String> = serde_json::from_value(node_a.rpc_ok(
+        "generatetoaddress",
+        vec![serde_json::json!(2), serde_json::json!(addr_a)],
+    ))
     .unwrap();
 
     let mut node_b = TestNode::start(&[]);
-    let b_hashes: Vec<String> = serde_json::from_value(
-        node_b.rpc_ok("generatetoaddress", vec![serde_json::json!(3), serde_json::json!(addr_b)]),
-    )
+    let b_hashes: Vec<String> = serde_json::from_value(node_b.rpc_ok(
+        "generatetoaddress",
+        vec![serde_json::json!(3), serde_json::json!(addr_b)],
+    ))
     .unwrap();
     let mut b_headers = Vec::new();
     let mut b_blocks = Vec::new();
     for h in &b_hashes {
-        b_headers.push(node_b.rpc_ok("getblockheader", vec![serde_json::json!(h), serde_json::json!(false)]));
+        b_headers.push(node_b.rpc_ok(
+            "getblockheader",
+            vec![serde_json::json!(h), serde_json::json!(false)],
+        ));
         b_blocks.push(node_b.rpc_ok("getblock", vec![serde_json::json!(h), serde_json::json!(0)]));
     }
     node_b.stop();
@@ -9050,7 +10009,10 @@ fn a_heavier_branch_submitted_tip_first_is_activated_when_complete() {
         node_a.rpc_ok("submitblock", vec![block.clone()]);
         let tip = node_a.rpc_ok("getbestblockhash", vec![]);
         if i > 0 {
-            assert_eq!(tip, a_hashes[1], "the branch is incomplete until B1 arrives");
+            assert_eq!(
+                tip, a_hashes[1],
+                "the branch is incomplete until B1 arrives"
+            );
         }
     }
     assert_eq!(
@@ -9869,8 +10831,12 @@ mod raw_p2p {
                     Err(e) => panic!("p2p connect to {addr} failed: {e}"),
                 }
             };
-            stream.set_read_timeout(Some(Duration::from_secs(90))).unwrap();
-            stream.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(90)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
             stream.set_nodelay(true).unwrap();
             let mut client = OrderedP2pClient { stream, magic };
             client.handshake();
@@ -9938,10 +10904,17 @@ mod raw_p2p {
                     Err(e) => panic!("p2p connect to {addr} failed: {e}"),
                 }
             };
-            stream.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
-            stream.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(30)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
             stream.set_nodelay(true).unwrap();
-            let mut peer = ScriptedPeer { stream, handshake: Vec::new() };
+            let mut peer = ScriptedPeer {
+                stream,
+                handshake: Vec::new(),
+            };
 
             let mut ours = build_version();
             ours.version = version;
@@ -10002,7 +10975,10 @@ mod raw_p2p {
                 match recv_msg(&mut self.stream) {
                     Ok(NetworkMessage::Ping(n)) => self.send(NetworkMessage::Pong(n)),
                     Ok(_) => {}
-                    Err(e) if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut => {
+                    Err(e)
+                        if e.kind() == io::ErrorKind::WouldBlock
+                            || e.kind() == io::ErrorKind::TimedOut =>
+                    {
                         return false;
                     }
                     Err(_) => return true,
@@ -10033,13 +11009,14 @@ fn a_pong_answers_for_the_block_that_arrived_before_the_ping() {
 
     // One node mines the block; the node under test has never seen it.
     let source = TestNode::start(&[]);
-    let addr = DeterministicWallet::from_secret([0x7e; 32]).address.to_string();
+    let addr = DeterministicWallet::from_secret([0x7e; 32])
+        .address
+        .to_string();
     let hashes = source.rpc_ok("generatetoaddress", vec![json!(1), json!(addr)]);
     let hash = hashes[0].as_str().unwrap().to_string();
     let raw = source.rpc_ok("getblock", vec![json!(hash), json!(0)]);
     let block: bitcoin::Block =
         deserialize(&hex::decode(raw.as_str().unwrap()).unwrap()).expect("block decodes");
-
 
     let node = TestNode::start(&[]);
     assert_eq!(get_rpc_u64(&node, "getblockcount").unwrap(), 0);
@@ -10350,7 +11327,10 @@ fn test_address_index_rpc_getaddressbalance() {
 
     // Mine 101 blocks so the first coinbase is matured + spendable
     // visibility doesn't matter — we just want a confirmed balance.
-    node.rpc_ok("generatetoaddress", vec![serde_json::json!(101), serde_json::json!(addr)]);
+    node.rpc_ok(
+        "generatetoaddress",
+        vec![serde_json::json!(101), serde_json::json!(addr)],
+    );
 
     let resp = node
         .rpc_call_with_params("getaddressbalance", vec![serde_json::json!(addr)])
@@ -10375,7 +11355,10 @@ fn test_address_index_rpc_getaddresshistory() {
     let mut node = TestNode::start(&[]);
     let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
 
-    node.rpc_ok("generatetoaddress", vec![serde_json::json!(5), serde_json::json!(addr)]);
+    node.rpc_ok(
+        "generatetoaddress",
+        vec![serde_json::json!(5), serde_json::json!(addr)],
+    );
 
     let resp = node
         .rpc_call_with_params("getaddresshistory", vec![serde_json::json!(addr)])
@@ -10407,7 +11390,10 @@ fn test_address_index_rpc_getaddressutxos() {
     let mut node = TestNode::start(&[]);
     let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
 
-    node.rpc_ok("generatetoaddress", vec![serde_json::json!(3), serde_json::json!(addr)]);
+    node.rpc_ok(
+        "generatetoaddress",
+        vec![serde_json::json!(3), serde_json::json!(addr)],
+    );
 
     let resp = node
         .rpc_call_with_params("getaddressutxos", vec![serde_json::json!(addr)])
@@ -10455,7 +11441,10 @@ fn test_address_index_scripthash_param_form() {
     let mut node = TestNode::start(&[]);
     let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
 
-    node.rpc_ok("generatetoaddress", vec![serde_json::json!(2), serde_json::json!(addr)]);
+    node.rpc_ok(
+        "generatetoaddress",
+        vec![serde_json::json!(2), serde_json::json!(addr)],
+    );
 
     // Resolve scripthash by computing sha256 of the bech32-decoded spk.
     // Easier: use the bare-address form, observe history, then probe
@@ -10510,7 +11499,10 @@ fn test_address_index_mempool_quiet_when_empty() {
     let mut node = TestNode::start(&[]);
     let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
 
-    node.rpc_ok("generatetoaddress", vec![serde_json::json!(5), serde_json::json!(addr)]);
+    node.rpc_ok(
+        "generatetoaddress",
+        vec![serde_json::json!(5), serde_json::json!(addr)],
+    );
 
     let resp = node
         .rpc_call_with_params("getaddressbalance", vec![serde_json::json!(addr)])
@@ -10752,7 +11744,10 @@ fn poll_sp_backfill_state(
 fn test_sp_index_from_genesis_reports_synced() {
     let mut node = TestNode::start(&["--silentpaymentindex=1"]);
     let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
-    node.rpc_ok("generatetoaddress", vec![serde_json::json!(10), serde_json::json!(addr)]);
+    node.rpc_ok(
+        "generatetoaddress",
+        vec![serde_json::json!(10), serde_json::json!(addr)],
+    );
 
     let r = node.rpc_call("getsatdindexinfo").expect("rpc");
     let spi = &r["result"]["silentpayments"];
@@ -10798,19 +11793,24 @@ fn test_getsilentpaymentblockdata_rpc() {
 
     // Enabled: mine some blocks and serve the tip's row.
     let mut node = TestNode::start(&["--silentpaymentindex=1"]);
-    node.rpc_ok("generatetoaddress", vec![serde_json::json!(5), serde_json::json!(addr)]);
+    node.rpc_ok(
+        "generatetoaddress",
+        vec![serde_json::json!(5), serde_json::json!(addr)],
+    );
     let best = node.rpc_call("getbestblockhash").expect("rpc");
     let hash = best["result"].as_str().expect("blockhash").to_string();
 
     // verbosity 0 (default): { block_hash, height, tweaks: [...] }.
     let r = node
-        .rpc_call_with_params(
-            "getsilentpaymentblockdata",
-            vec![serde_json::json!(hash)],
-        )
+        .rpc_call_with_params("getsilentpaymentblockdata", vec![serde_json::json!(hash)])
         .expect("rpc");
     let res = &r["result"];
-    assert_eq!(res["block_hash"].as_str(), Some(hash.as_str()), "echoes hash: {}", r);
+    assert_eq!(
+        res["block_hash"].as_str(),
+        Some(hash.as_str()),
+        "echoes hash: {}",
+        r
+    );
     assert_eq!(res["height"].as_u64(), Some(5), "tip height: {}", r);
     assert!(res["tweaks"].is_array(), "tweaks is an array: {}", r);
     // A coinbase-only block has no eligible transactions.
@@ -10828,7 +11828,11 @@ fn test_getsilentpaymentblockdata_rpc() {
             vec![serde_json::json!(hash), serde_json::json!(1)],
         )
         .expect("rpc");
-    assert!(r1["result"]["tweaks"].is_array(), "verbosity 1 tweaks array: {}", r1);
+    assert!(
+        r1["result"]["tweaks"].is_array(),
+        "verbosity 1 tweaks array: {}",
+        r1
+    );
 
     // Unknown block hash → -5.
     let unknown = "00".repeat(32);
@@ -10838,7 +11842,12 @@ fn test_getsilentpaymentblockdata_rpc() {
             vec![serde_json::json!(unknown)],
         )
         .expect("rpc");
-    assert_eq!(r5["error"]["code"].as_i64(), Some(-5), "unknown block → -5: {}", r5);
+    assert_eq!(
+        r5["error"]["code"].as_i64(),
+        Some(-5),
+        "unknown block → -5: {}",
+        r5
+    );
 
     node.stop();
 }
@@ -10854,7 +11863,10 @@ fn test_sp_index_enable_on_existing_datadir_backfills() {
     // Phase 1: sync with the SP index OFF (the default). Connecting blocks
     // with the index disabled clears the completeness marker.
     let mut node = TestNode::start(&[]);
-    node.rpc_ok("generatetoaddress", vec![serde_json::json!(20), serde_json::json!(addr)]);
+    node.rpc_ok(
+        "generatetoaddress",
+        vec![serde_json::json!(20), serde_json::json!(addr)],
+    );
 
     // Phase 2: restart with the index ON, same datadir. The marker stays
     // false (open-time stamp only touches a never-set marker), so the
@@ -10962,7 +11974,10 @@ fn test_sp_index_backfill_pause_resume() {
     // the resume comfortably exceeds `MIN_STINT`, which is what the ETA
     // assertion below needs; the old 30-block walk finished in under a second
     // and so could never produce one.
-    node.rpc_ok("generatetoaddress", vec![serde_json::json!(300), serde_json::json!(addr)]);
+    node.rpc_ok(
+        "generatetoaddress",
+        vec![serde_json::json!(300), serde_json::json!(addr)],
+    );
 
     let started = node
         .rpc_call_with_params("backfillindex", vec![serde_json::json!("silentpayment")])
@@ -11112,21 +12127,24 @@ fn sp_build_mixed_input_spend(node: &TestNode, spec: &SpMixedSpend<'_>) -> Strin
     use bitcoin::secp256k1::{Message, Secp256k1};
     use bitcoin::sighash::{EcdsaSighashType, Prevouts, SighashCache, TapSighashType};
     use bitcoin::{
-        absolute::LockTime, Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut,
-        Witness,
+        Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness,
+        absolute::LockTime,
     };
     use std::str::FromStr;
 
     const CB_VALUE_SAT: u64 = 50 * 100_000_000;
-    let cb_txid = bitcoin::Txid::from_str(&common::coinbase_txid_at(node, cb_height))
-        .expect("txid parse");
+    let cb_txid =
+        bitcoin::Txid::from_str(&common::coinbase_txid_at(node, cb_height)).expect("txid parse");
 
     let mut spend = Transaction {
         version: bitcoin::transaction::Version::TWO,
         lock_time: LockTime::ZERO,
         input: vec![
             TxIn {
-                previous_output: OutPoint { txid: cb_txid, vout: 0 },
+                previous_output: OutPoint {
+                    txid: cb_txid,
+                    vout: 0,
+                },
                 script_sig: ScriptBuf::new(),
                 sequence: Sequence(0xffff_ffff),
                 witness: Witness::new(),
@@ -11167,11 +12185,7 @@ fn sp_build_mixed_input_spend(node: &TestNode, spec: &SpMixedSpend<'_>) -> Strin
             )
             .expect("p2wpkh sighash");
         let t = cache
-            .taproot_key_spend_signature_hash(
-                1,
-                &Prevouts::All(&prevouts),
-                TapSighashType::Default,
-            )
+            .taproot_key_spend_signature_hash(1, &Prevouts::All(&prevouts), TapSighashType::Default)
             .expect("taproot sighash");
         (e, t)
     };
@@ -11261,7 +12275,10 @@ fn sp_build_eligible_fixture(
         &SpMixedSpend {
             cb_height: 2,
             cb_wallet: alt,
-            p2tr_outpoint: bitcoin::OutPoint { txid: txid_a, vout: 0 },
+            p2tr_outpoint: bitcoin::OutPoint {
+                txid: txid_a,
+                vout: 0,
+            },
             p2tr_value_sat: 50 * 100_000_000 - 10_000,
             p2tr_seed: seed_base,
             dest: sp_p2tr_script(seed_base.wrapping_add(2)),
@@ -11424,7 +12441,10 @@ fn test_sp_index_backfill_rebuilds_live_rows_byte_identically() {
     sp_generate_to(&node_a, 3, &alt_a.address.to_string());
     sp_generate_to(&node_a, 102, &addr_a);
     let tip_a = sp_build_eligible_fixture(&node_a, &wallet_a, &alt_a, &addr_a, &[], 0x40);
-    assert_eq!(tip_a, 108, "105 empty blocks plus 3 carrying eligible transactions");
+    assert_eq!(
+        tip_a, 108,
+        "105 empty blocks plus 3 carrying eligible transactions"
+    );
 
     // Fail loudly if the fixture stopped producing eligible transactions: two
     // empty indexes would otherwise compare equal and prove nothing.
@@ -11636,7 +12656,10 @@ fn test_address_index_backfillindex_starts_and_completes() {
     let mut node = TestNode::start(&[]);
     let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
     // Mine a small chain so there's something to walk over.
-    node.rpc_ok("generatetoaddress", vec![serde_json::json!(20), serde_json::json!(addr)]);
+    node.rpc_ok(
+        "generatetoaddress",
+        vec![serde_json::json!(20), serde_json::json!(addr)],
+    );
 
     let r = node
         .rpc_call_with_params("backfillindex", vec![serde_json::json!("address")])
@@ -11670,7 +12693,10 @@ fn test_address_index_backfillindex_starts_and_completes() {
 fn test_address_index_backfill_idempotent_after_completion() {
     let mut node = TestNode::start(&[]);
     let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
-    node.rpc_ok("generatetoaddress", vec![serde_json::json!(15), serde_json::json!(addr)]);
+    node.rpc_ok(
+        "generatetoaddress",
+        vec![serde_json::json!(15), serde_json::json!(addr)],
+    );
 
     node.rpc_ok("backfillindex", vec![serde_json::json!("address")]);
     poll_backfill_state(&node, &["completed"], Duration::from_secs(30));
@@ -11718,7 +12744,10 @@ fn test_address_index_backfill_pause_resume() {
     // process only — parent's env stays clean across parallel tests.
     let mut node = TestNode::start_with_env(&[], &[("SATD_BACKFILL_DEBUG_DELAY_MS", "30")]);
     let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
-    node.rpc_ok("generatetoaddress", vec![serde_json::json!(30), serde_json::json!(addr)]);
+    node.rpc_ok(
+        "generatetoaddress",
+        vec![serde_json::json!(30), serde_json::json!(addr)],
+    );
 
     node.rpc_ok("backfillindex", vec![serde_json::json!("address")]);
 
@@ -11759,7 +12788,10 @@ fn test_address_index_backfill_pause_resume() {
 fn test_address_index_backfill_cancel_then_restart_succeeds() {
     let mut node = TestNode::start_with_env(&[], &[("SATD_BACKFILL_DEBUG_DELAY_MS", "30")]);
     let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
-    node.rpc_ok("generatetoaddress", vec![serde_json::json!(30), serde_json::json!(addr)]);
+    node.rpc_ok(
+        "generatetoaddress",
+        vec![serde_json::json!(30), serde_json::json!(addr)],
+    );
 
     node.rpc_ok("backfillindex", vec![serde_json::json!("address")]);
 
@@ -11818,7 +12850,10 @@ fn test_address_index_backfill_resumable_after_kill() {
     // Phase 1: mine 40 blocks, graceful-stop to flush tip durably.
     let mut node = TestNode::start_with_datadir(&datadir, rpcport, &[&port_arg]);
     let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
-    node.rpc_ok("generatetoaddress", vec![serde_json::json!(40), serde_json::json!(addr)]);
+    node.rpc_ok(
+        "generatetoaddress",
+        vec![serde_json::json!(40), serde_json::json!(addr)],
+    );
     node.stop();
 
     // Phase 2: restart with the debug delay, kick off backfill,
@@ -11861,7 +12896,10 @@ fn test_address_index_backfill_persists_completed_across_restart() {
 
     let mut node = TestNode::start_with_datadir(&datadir, rpcport, &[&port_arg]);
     let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
-    node.rpc_ok("generatetoaddress", vec![serde_json::json!(15), serde_json::json!(addr)]);
+    node.rpc_ok(
+        "generatetoaddress",
+        vec![serde_json::json!(15), serde_json::json!(addr)],
+    );
     node.rpc_ok("backfillindex", vec![serde_json::json!("address")]);
     poll_backfill_state(&node, &["completed"], Duration::from_secs(30));
     node.stop();
@@ -12009,7 +13047,10 @@ fn test_address_index_backfill_data_parity_after_disabled_mining() {
 
     // ── Control: run with --addressindex=1 from the start ──
     let mut control = TestNode::start(&[]);
-    control.rpc_ok("generatetoaddress", vec![serde_json::json!(blocks), serde_json::json!(addr)]);
+    control.rpc_ok(
+        "generatetoaddress",
+        vec![serde_json::json!(blocks), serde_json::json!(addr)],
+    );
     let control_balance = control
         .rpc_call_with_params("getaddressbalance", vec![serde_json::json!(addr)])
         .expect("rpc");
@@ -12031,7 +13072,10 @@ fn test_address_index_backfill_data_parity_after_disabled_mining() {
 
     let mut subject =
         TestNode::start_with_datadir(&datadir, rpcport, &["--addressindex=0", &port_arg]);
-    subject.rpc_ok("generatetoaddress", vec![serde_json::json!(blocks), serde_json::json!(addr)]);
+    subject.rpc_ok(
+        "generatetoaddress",
+        vec![serde_json::json!(blocks), serde_json::json!(addr)],
+    );
     // Sanity: with the index disabled, lookups return an explicit
     // error (not zero/empty silently) so operators can tell the
     // difference between "no activity" and "index off".
@@ -12170,7 +13214,10 @@ fn test_address_index_backfill_spending_row_with_real_spend() {
         TestNode::start_with_datadir(&datadir, rpcport, &["--addressindex=0", &port_arg]);
 
     // Mine 101 blocks so the first coinbase is matured (subsidy spendable).
-    node.rpc_ok("generatetoaddress", vec![serde_json::json!(101), serde_json::json!(src_str)]);
+    node.rpc_ok(
+        "generatetoaddress",
+        vec![serde_json::json!(101), serde_json::json!(src_str)],
+    );
 
     // Pull block 1's coinbase txid. satd's `getblock` verbosity 1
     // returns the tx-id list; verbosity 2 (full tx detail) is not
@@ -12247,7 +13294,10 @@ fn test_address_index_backfill_spending_row_with_real_spend() {
     );
 
     // Mine one more block to confirm the spend.
-    node.rpc_ok("generatetoaddress", vec![serde_json::json!(1), serde_json::json!(src_str)]);
+    node.rpc_ok(
+        "generatetoaddress",
+        vec![serde_json::json!(1), serde_json::json!(src_str)],
+    );
 
     let spend_txid = spend.compute_txid().to_string();
 
@@ -12383,7 +13433,10 @@ fn test_address_index_backfill_reorg_invalidates_to_failed() {
     // 4 batches × 1 s = ~4 s of runtime; pauseindex from the test
     // reliably lands during the first batch's sleep.
     let mut node_a = TestNode::start_with_env(&[], &[("SATD_BACKFILL_DEBUG_DELAY_MS", "1000")]);
-    node_a.rpc_ok("generatetoaddress", vec![serde_json::json!(2), serde_json::json!(addr_a)]);
+    node_a.rpc_ok(
+        "generatetoaddress",
+        vec![serde_json::json!(2), serde_json::json!(addr_a)],
+    );
     let a_tip_height = node_a.rpc_call("getblockcount").expect("rpc")["result"]
         .as_u64()
         .unwrap_or(0) as u32;
@@ -12557,7 +13610,10 @@ fn test_address_index_backfill_reorg_invalidates_to_failed() {
 fn test_address_index_backfill_duplicate_rpc_race_rejected() {
     let mut node = TestNode::start_with_env(&[], &[("SATD_BACKFILL_DEBUG_DELAY_MS", "50")]);
     let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
-    node.rpc_ok("generatetoaddress", vec![serde_json::json!(20), serde_json::json!(addr)]);
+    node.rpc_ok(
+        "generatetoaddress",
+        vec![serde_json::json!(20), serde_json::json!(addr)],
+    );
 
     let r1 = node
         .rpc_call_with_params("backfillindex", vec![serde_json::json!("address")])
@@ -12721,7 +13777,10 @@ fn test_esplora_tip_hash_and_height_match_chain_state() {
     let bind = format!("--esplorabind=127.0.0.1:{}", esplora_port);
     let mut node = TestNode::start(&["--esplora=1", &bind]);
     let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
-    node.rpc_ok("generatetoaddress", vec![serde_json::json!(3), serde_json::json!(addr)]);
+    node.rpc_ok(
+        "generatetoaddress",
+        vec![serde_json::json!(3), serde_json::json!(addr)],
+    );
 
     let h_resp = esplora_get(esplora_port, "/blocks/tip/height");
     assert_eq!(h_resp.status(), 200);
@@ -12753,7 +13812,10 @@ fn test_esplora_deep_page_resolves_the_right_blocks_past_the_walk_limit() {
     let bind = format!("--esplorabind=127.0.0.1:{}", esplora_port);
     let mut node = TestNode::start(&["--esplora=1", &bind]);
     let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
-    node.rpc_ok("generatetoaddress", vec![serde_json::json!(210), serde_json::json!(addr)]);
+    node.rpc_ok(
+        "generatetoaddress",
+        vec![serde_json::json!(210), serde_json::json!(addr)],
+    );
 
     let r = esplora_get(esplora_port, "/blocks/5");
     assert_eq!(r.status(), 200);
@@ -12799,7 +13861,10 @@ fn test_esplora_blocks_recent_returns_descending_summaries() {
     let bind = format!("--esplorabind=127.0.0.1:{}", esplora_port);
     let mut node = TestNode::start(&["--esplora=1", &bind]);
     let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
-    node.rpc_ok("generatetoaddress", vec![serde_json::json!(5), serde_json::json!(addr)]);
+    node.rpc_ok(
+        "generatetoaddress",
+        vec![serde_json::json!(5), serde_json::json!(addr)],
+    );
 
     let r = esplora_get(esplora_port, "/blocks");
     assert_eq!(r.status(), 200);
@@ -12985,7 +14050,10 @@ fn test_esplora_block_detail_populated() {
     let bind = format!("--esplorabind=127.0.0.1:{}", esplora_port);
     let mut node = TestNode::start(&["--esplora=1", &bind]);
     let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
-    node.rpc_ok("generatetoaddress", vec![serde_json::json!(2), serde_json::json!(addr)]);
+    node.rpc_ok(
+        "generatetoaddress",
+        vec![serde_json::json!(2), serde_json::json!(addr)],
+    );
 
     let tip = esplora_get(esplora_port, "/blocks/tip/hash")
         .text()
@@ -13014,7 +14082,10 @@ fn test_esplora_block_header_hex() {
     let bind = format!("--esplorabind=127.0.0.1:{}", esplora_port);
     let mut node = TestNode::start(&["--esplora=1", &bind]);
     let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
-    node.rpc_ok("generatetoaddress", vec![serde_json::json!(1), serde_json::json!(addr)]);
+    node.rpc_ok(
+        "generatetoaddress",
+        vec![serde_json::json!(1), serde_json::json!(addr)],
+    );
     let tip = esplora_get(esplora_port, "/blocks/tip/hash")
         .text()
         .unwrap()
@@ -13033,7 +14104,10 @@ fn test_esplora_block_raw_bytes() {
     let bind = format!("--esplorabind=127.0.0.1:{}", esplora_port);
     let mut node = TestNode::start(&["--esplora=1", &bind]);
     let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
-    node.rpc_ok("generatetoaddress", vec![serde_json::json!(1), serde_json::json!(addr)]);
+    node.rpc_ok(
+        "generatetoaddress",
+        vec![serde_json::json!(1), serde_json::json!(addr)],
+    );
     let tip = esplora_get(esplora_port, "/blocks/tip/hash")
         .text()
         .unwrap()
@@ -13058,7 +14132,10 @@ fn test_esplora_block_status_in_best_chain() {
     let bind = format!("--esplorabind=127.0.0.1:{}", esplora_port);
     let mut node = TestNode::start(&["--esplora=1", &bind]);
     let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
-    node.rpc_ok("generatetoaddress", vec![serde_json::json!(2), serde_json::json!(addr)]);
+    node.rpc_ok(
+        "generatetoaddress",
+        vec![serde_json::json!(2), serde_json::json!(addr)],
+    );
 
     let h1 = esplora_get(esplora_port, "/block-height/1")
         .text()
@@ -13091,7 +14168,10 @@ fn test_esplora_block_txids_and_paging() {
     let bind = format!("--esplorabind=127.0.0.1:{}", esplora_port);
     let mut node = TestNode::start(&["--esplora=1", &bind]);
     let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
-    node.rpc_ok("generatetoaddress", vec![serde_json::json!(1), serde_json::json!(addr)]);
+    node.rpc_ok(
+        "generatetoaddress",
+        vec![serde_json::json!(1), serde_json::json!(addr)],
+    );
     let tip = esplora_get(esplora_port, "/blocks/tip/hash")
         .text()
         .unwrap()
@@ -13125,7 +14205,10 @@ fn test_esplora_block_txs_pagination_past_end_is_404() {
     let bind = format!("--esplorabind=127.0.0.1:{}", esplora_port);
     let mut node = TestNode::start(&["--esplora=1", &bind]);
     let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
-    node.rpc_ok("generatetoaddress", vec![serde_json::json!(1), serde_json::json!(addr)]);
+    node.rpc_ok(
+        "generatetoaddress",
+        vec![serde_json::json!(1), serde_json::json!(addr)],
+    );
     let tip = esplora_get(esplora_port, "/blocks/tip/hash")
         .text()
         .unwrap()
@@ -13162,7 +14245,10 @@ fn test_esplora_block_mediantime_includes_target_block() {
     let bind = format!("--esplorabind=127.0.0.1:{}", esplora_port);
     let mut node = TestNode::start(&["--esplora=1", &bind]);
     let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
-    node.rpc_ok("generatetoaddress", vec![serde_json::json!(1), serde_json::json!(addr)]);
+    node.rpc_ok(
+        "generatetoaddress",
+        vec![serde_json::json!(1), serde_json::json!(addr)],
+    );
     let tip = esplora_get(esplora_port, "/blocks/tip/hash")
         .text()
         .unwrap()
@@ -13193,7 +14279,10 @@ fn test_esplora_blocks_recent_reports_real_size_weight() {
     let bind = format!("--esplorabind=127.0.0.1:{}", esplora_port);
     let mut node = TestNode::start(&["--esplora=1", &bind]);
     let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
-    node.rpc_ok("generatetoaddress", vec![serde_json::json!(2), serde_json::json!(addr)]);
+    node.rpc_ok(
+        "generatetoaddress",
+        vec![serde_json::json!(2), serde_json::json!(addr)],
+    );
     let r = esplora_get(esplora_port, "/blocks");
     let arr: Vec<serde_json::Value> = r.json().unwrap();
     // Inspect the most recent (non-genesis) entries — genesis is
@@ -13280,7 +14369,10 @@ fn test_esplora_tx_detail_confirmed_coinbase() {
     let bind = format!("--esplorabind=127.0.0.1:{}", esplora_port);
     let mut node = TestNode::start(&["--esplora=1", &bind, "--txindex"]);
     let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
-    node.rpc_ok("generatetoaddress", vec![serde_json::json!(1), serde_json::json!(addr)]);
+    node.rpc_ok(
+        "generatetoaddress",
+        vec![serde_json::json!(1), serde_json::json!(addr)],
+    );
 
     let txids: Vec<String> = {
         let tip = esplora_get(esplora_port, "/blocks/tip/hash")
@@ -13338,7 +14430,10 @@ fn test_esplora_tx_status_confirmed() {
     let bind = format!("--esplorabind=127.0.0.1:{}", esplora_port);
     let mut node = TestNode::start(&["--esplora=1", &bind, "--txindex"]);
     let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
-    node.rpc_ok("generatetoaddress", vec![serde_json::json!(1), serde_json::json!(addr)]);
+    node.rpc_ok(
+        "generatetoaddress",
+        vec![serde_json::json!(1), serde_json::json!(addr)],
+    );
     let tip = esplora_get(esplora_port, "/blocks/tip/hash")
         .text()
         .unwrap()
@@ -13364,7 +14459,10 @@ fn test_esplora_tx_hex_roundtrip() {
     let bind = format!("--esplorabind=127.0.0.1:{}", esplora_port);
     let mut node = TestNode::start(&["--esplora=1", &bind, "--txindex"]);
     let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
-    node.rpc_ok("generatetoaddress", vec![serde_json::json!(1), serde_json::json!(addr)]);
+    node.rpc_ok(
+        "generatetoaddress",
+        vec![serde_json::json!(1), serde_json::json!(addr)],
+    );
     let tip = esplora_get(esplora_port, "/blocks/tip/hash")
         .text()
         .unwrap()
@@ -13520,7 +14618,10 @@ fn test_esplora_refuses_legacy_txindex_incomplete_datadir() {
         ],
     );
     let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
-    node1.rpc_ok("generatetoaddress", vec![serde_json::json!(2), serde_json::json!(addr)]);
+    node1.rpc_ok(
+        "generatetoaddress",
+        vec![serde_json::json!(2), serde_json::json!(addr)],
+    );
     node1.stop();
 
     // Phase 2: restart with default settings — esplora auto-enables
@@ -13581,7 +14682,10 @@ fn test_esplora_refuses_partial_txindex_history() {
         ],
     );
     let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
-    node1.rpc_ok("generatetoaddress", vec![serde_json::json!(2), serde_json::json!(addr)]);
+    node1.rpc_ok(
+        "generatetoaddress",
+        vec![serde_json::json!(2), serde_json::json!(addr)],
+    );
     node1.stop();
 
     // Phase 2: enable --txindex=1 (still --esplora=0). This writes ONE
@@ -13599,7 +14703,10 @@ fn test_esplora_refuses_partial_txindex_history() {
             &format!("--port={}", p2p_port2),
         ],
     );
-    node2.rpc_ok("generatetoaddress", vec![serde_json::json!(1), serde_json::json!(addr)]);
+    node2.rpc_ok(
+        "generatetoaddress",
+        vec![serde_json::json!(1), serde_json::json!(addr)],
+    );
     node2.stop();
 
     // Phase 3: default startup (esplora on). Marker is still false
@@ -13654,7 +14761,10 @@ fn test_esplora_refuses_after_txindex_disabled_gap() {
         ],
     );
     let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
-    node1.rpc_ok("generatetoaddress", vec![serde_json::json!(2), serde_json::json!(addr)]);
+    node1.rpc_ok(
+        "generatetoaddress",
+        vec![serde_json::json!(2), serde_json::json!(addr)],
+    );
     node1.stop();
 
     // Phase 2: connect ONE more block with both transaction-index
@@ -13673,7 +14783,10 @@ fn test_esplora_refuses_after_txindex_disabled_gap() {
             &format!("--port={}", p2p_port2),
         ],
     );
-    node2.rpc_ok("generatetoaddress", vec![serde_json::json!(1), serde_json::json!(addr)]);
+    node2.rpc_ok(
+        "generatetoaddress",
+        vec![serde_json::json!(1), serde_json::json!(addr)],
+    );
     node2.stop();
 
     // Phase 3: default startup must hard-fail now.
@@ -13804,7 +14917,10 @@ fn test_esplora_block_txs_returns_full_tx_shape() {
     let bind = format!("--esplorabind=127.0.0.1:{}", esplora_port);
     let mut node = TestNode::start(&["--esplora=1", &bind, "--txindex"]);
     let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
-    node.rpc_ok("generatetoaddress", vec![serde_json::json!(1), serde_json::json!(addr)]);
+    node.rpc_ok(
+        "generatetoaddress",
+        vec![serde_json::json!(1), serde_json::json!(addr)],
+    );
     let tip = esplora_get(esplora_port, "/blocks/tip/hash")
         .text()
         .unwrap()
@@ -13873,7 +14989,10 @@ fn test_esplora_address_info_funded_chain_stats() {
     let bind = format!("--esplorabind=127.0.0.1:{}", esplora_port);
     let mut node = TestNode::start(&["--esplora=1", &bind]);
     let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
-    node.rpc_ok("generatetoaddress", vec![serde_json::json!(3), serde_json::json!(addr)]);
+    node.rpc_ok(
+        "generatetoaddress",
+        vec![serde_json::json!(3), serde_json::json!(addr)],
+    );
 
     let r = esplora_get(esplora_port, &format!("/address/{}", addr));
     assert_eq!(r.status(), 200);
@@ -13897,7 +15016,10 @@ fn test_esplora_scripthash_endpoint_matches_address() {
     let bind = format!("--esplorabind=127.0.0.1:{}", esplora_port);
     let mut node = TestNode::start(&["--esplora=1", &bind]);
     let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
-    node.rpc_ok("generatetoaddress", vec![serde_json::json!(2), serde_json::json!(addr)]);
+    node.rpc_ok(
+        "generatetoaddress",
+        vec![serde_json::json!(2), serde_json::json!(addr)],
+    );
 
     let sh = esplora_scripthash_of(addr);
     let by_addr: serde_json::Value = esplora_get(esplora_port, &format!("/address/{}", addr))
@@ -13922,7 +15044,10 @@ fn test_esplora_address_utxo_lists_coinbases() {
     let bind = format!("--esplorabind=127.0.0.1:{}", esplora_port);
     let mut node = TestNode::start(&["--esplora=1", &bind]);
     let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
-    node.rpc_ok("generatetoaddress", vec![serde_json::json!(2), serde_json::json!(addr)]);
+    node.rpc_ok(
+        "generatetoaddress",
+        vec![serde_json::json!(2), serde_json::json!(addr)],
+    );
 
     let r = esplora_get(esplora_port, &format!("/address/{}/utxo", addr));
     assert_eq!(r.status(), 200);
@@ -13948,7 +15073,10 @@ fn test_esplora_address_txs_chain_pagination() {
     let mut node = TestNode::start(&["--esplora=1", &bind]);
     let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
     // 30 distinct coinbases → 25 on page 1, 5 on page 2, empty on page 3.
-    node.rpc_ok("generatetoaddress", vec![serde_json::json!(30), serde_json::json!(addr)]);
+    node.rpc_ok(
+        "generatetoaddress",
+        vec![serde_json::json!(30), serde_json::json!(addr)],
+    );
 
     let page1: Vec<serde_json::Value> =
         esplora_get(esplora_port, &format!("/address/{}/txs/chain", addr))
@@ -13991,7 +15119,10 @@ fn test_esplora_address_txs_chain_unknown_cursor_returns_empty() {
     let bind = format!("--esplorabind=127.0.0.1:{}", esplora_port);
     let mut node = TestNode::start(&["--esplora=1", &bind]);
     let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
-    node.rpc_ok("generatetoaddress", vec![serde_json::json!(2), serde_json::json!(addr)]);
+    node.rpc_ok(
+        "generatetoaddress",
+        vec![serde_json::json!(2), serde_json::json!(addr)],
+    );
 
     // 32-byte zero txid is never a real tx; cursor lookup fails.
     let zero = "0000000000000000000000000000000000000000000000000000000000000000";
@@ -14523,7 +15654,10 @@ fn esplora_pr6_make_spend(node: &mut TestNode) -> (String, String, String, &'sta
 
     let raw_hex = hex::encode(bitcoin::consensus::serialize(&spend));
     let spend_txid = spend.compute_txid().to_string();
-    node.rpc_ok("sendrawtransaction", vec![serde_json::json!(raw_hex.clone())]);
+    node.rpc_ok(
+        "sendrawtransaction",
+        vec![serde_json::json!(raw_hex.clone())],
+    );
     (raw_hex, spend_txid, src_str, dest_addr, cb_value)
 }
 
@@ -14535,7 +15669,10 @@ fn test_esplora_outspend_unspent_returns_spent_false() {
     let bind = format!("--esplorabind=127.0.0.1:{}", esplora_port);
     let mut node = TestNode::start(&["--esplora=1", &bind]);
     let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
-    node.rpc_ok("generatetoaddress", vec![serde_json::json!(1), serde_json::json!(addr)]);
+    node.rpc_ok(
+        "generatetoaddress",
+        vec![serde_json::json!(1), serde_json::json!(addr)],
+    );
     let tip = esplora_get(esplora_port, "/blocks/tip/hash")
         .text()
         .unwrap()
@@ -14563,7 +15700,10 @@ fn test_esplora_outspend_confirmed_spend_reports_spender() {
     let (_raw_hex, spend_txid, src_str, _dest, cb_value) = esplora_pr6_make_spend(&mut node);
 
     // Mine 1 to confirm the spend.
-    node.rpc_ok("generatetoaddress", vec![serde_json::json!(1), serde_json::json!(src_str)]);
+    node.rpc_ok(
+        "generatetoaddress",
+        vec![serde_json::json!(1), serde_json::json!(src_str)],
+    );
 
     // Find the cb txid for block 1 (the one being spent).
     let block1_hash = node
@@ -14626,7 +15766,10 @@ fn test_esplora_outspends_array_matches_output_count() {
     let bind = format!("--esplorabind=127.0.0.1:{}", esplora_port);
     let mut node = TestNode::start(&["--esplora=1", &bind]);
     let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
-    node.rpc_ok("generatetoaddress", vec![serde_json::json!(2), serde_json::json!(addr)]);
+    node.rpc_ok(
+        "generatetoaddress",
+        vec![serde_json::json!(2), serde_json::json!(addr)],
+    );
 
     // Pull tip's coinbase.
     let tip = esplora_get(esplora_port, "/blocks/tip/hash")
@@ -14655,7 +15798,10 @@ fn test_esplora_merkle_proof_single_tx_block_is_empty() {
     let bind = format!("--esplorabind=127.0.0.1:{}", esplora_port);
     let mut node = TestNode::start(&["--esplora=1", &bind]);
     let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
-    node.rpc_ok("generatetoaddress", vec![serde_json::json!(1), serde_json::json!(addr)]);
+    node.rpc_ok(
+        "generatetoaddress",
+        vec![serde_json::json!(1), serde_json::json!(addr)],
+    );
 
     let tip = esplora_get(esplora_port, "/blocks/tip/hash")
         .text()
@@ -14691,7 +15837,10 @@ fn test_esplora_merkle_proof_two_tx_block_proves_inclusion() {
     let mut node = TestNode::start(&["--esplora=1", &bind]);
     let (_raw, spend_txid, src_str, _dest, _) = esplora_pr6_make_spend(&mut node);
     // Mine to confirm spend → block 102 has 2 txs (coinbase + spend).
-    node.rpc_ok("generatetoaddress", vec![serde_json::json!(1), serde_json::json!(src_str)]);
+    node.rpc_ok(
+        "generatetoaddress",
+        vec![serde_json::json!(1), serde_json::json!(src_str)],
+    );
 
     let tip = esplora_get(esplora_port, "/blocks/tip/hash")
         .text()
@@ -14765,7 +15914,10 @@ fn test_esplora_merkleblock_proof_decodes_with_target_txid() {
     let bind = format!("--esplorabind=127.0.0.1:{}", esplora_port);
     let mut node = TestNode::start(&["--esplora=1", &bind]);
     let (_raw, spend_txid, src_str, _dest, _) = esplora_pr6_make_spend(&mut node);
-    node.rpc_ok("generatetoaddress", vec![serde_json::json!(1), serde_json::json!(src_str)]);
+    node.rpc_ok(
+        "generatetoaddress",
+        vec![serde_json::json!(1), serde_json::json!(src_str)],
+    );
 
     let r = esplora_get(
         esplora_port,
@@ -14817,7 +15969,10 @@ fn test_esplora_outspend_out_of_range_vout_returns_404() {
     let bind = format!("--esplorabind=127.0.0.1:{}", esplora_port);
     let mut node = TestNode::start(&["--esplora=1", &bind]);
     let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
-    node.rpc_ok("generatetoaddress", vec![serde_json::json!(1), serde_json::json!(addr)]);
+    node.rpc_ok(
+        "generatetoaddress",
+        vec![serde_json::json!(1), serde_json::json!(addr)],
+    );
     let tip = esplora_get(esplora_port, "/blocks/tip/hash")
         .text()
         .unwrap()
@@ -14853,7 +16008,10 @@ fn test_esplora_root_returns_chain_tip_and_mempool_count() {
     let bind = format!("--esplorabind=127.0.0.1:{}", esplora_port);
     let mut node = TestNode::start(&["--esplora=1", &bind]);
     let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
-    node.rpc_ok("generatetoaddress", vec![serde_json::json!(2), serde_json::json!(addr)]);
+    node.rpc_ok(
+        "generatetoaddress",
+        vec![serde_json::json!(2), serde_json::json!(addr)],
+    );
 
     let r = esplora_get(esplora_port, "/");
     assert_eq!(r.status(), 200);
@@ -15133,7 +16291,10 @@ fn test_esplora_blocks_sse_emits_on_new_block() {
 
     // Mine in a separate thread so we don't deadlock on the SSE read.
     let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
-    node.rpc_ok("generatetoaddress", vec![serde_json::json!(1), serde_json::json!(addr)]);
+    node.rpc_ok(
+        "generatetoaddress",
+        vec![serde_json::json!(1), serde_json::json!(addr)],
+    );
 
     let (event_type, data) = client.next_event();
     assert_eq!(event_type, "block");
@@ -15156,7 +16317,10 @@ fn test_esplora_address_sse_emits_status_on_touch() {
     let mut client = SseClient::connect(esplora_port, &format!("/address/{}/sse", addr));
 
     // Mine to the address so the status_hash updates.
-    node.rpc_ok("generatetoaddress", vec![serde_json::json!(1), serde_json::json!(addr)]);
+    node.rpc_ok(
+        "generatetoaddress",
+        vec![serde_json::json!(1), serde_json::json!(addr)],
+    );
 
     let (event_type, data) = client.next_event();
     assert_eq!(event_type, "status");
@@ -15181,7 +16345,10 @@ fn test_esplora_scripthash_sse_emits_status_on_touch() {
     let sh = esplora_scripthash_of(addr);
     let mut client = SseClient::connect(esplora_port, &format!("/scripthash/{}/sse", sh));
 
-    node.rpc_ok("generatetoaddress", vec![serde_json::json!(1), serde_json::json!(addr)]);
+    node.rpc_ok(
+        "generatetoaddress",
+        vec![serde_json::json!(1), serde_json::json!(addr)],
+    );
 
     let (event_type, data) = client.next_event();
     assert_eq!(event_type, "status");
@@ -15356,7 +16523,10 @@ fn test_esplora_sse_watch_quota_enforced() {
 
     // (b) Second concurrent watch by the SAME token exceeds quota → 429.
     let (code2, _conn2) = sse_open_raw(esplora_port, &path_b, Some(TOKEN_WQ));
-    assert_eq!(code2, 429, "second concurrent watch over quota=1 should be 429");
+    assert_eq!(
+        code2, 429,
+        "second concurrent watch over quota=1 should be 429"
+    );
 
     // (c) A token without stream:watch is refused at the capability gate → 403.
     let (code_ro, _conn_ro) = sse_open_raw(esplora_port, &path_a, Some(TOKEN_RO));
@@ -15708,40 +16878,71 @@ fn test_electrum_server_version_negotiates_once_per_connection() {
 
     let connect = || {
         let sock = TcpStream::connect(format!("127.0.0.1:{electrum_port}")).expect("connect");
-        sock.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        sock.set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
         let reader = BufReader::new(sock.try_clone().unwrap());
         (sock, reader)
     };
     let call = |sock: &mut TcpStream, reader: &mut BufReader<TcpStream>, req: serde_json::Value| {
         writeln!(sock, "{req}").unwrap();
         let mut line = String::new();
-        assert!(reader.read_line(&mut line).unwrap() > 0, "EOF before the response");
+        assert!(
+            reader.read_line(&mut line).unwrap() > 0,
+            "EOF before the response"
+        );
         serde_json::from_str::<serde_json::Value>(&line).unwrap()
     };
 
     // Electrum's and BDK's range, extra arguments ignored; then a second
     // `server.version` is refused and the connection still answers.
     let (mut sock, mut reader) = connect();
-    let v = call(&mut sock, &mut reader, serde_json::json!({
-        "id": 1, "method": "server.version", "params": ["test", ["1.4", "1.6"], "extra"]}));
+    let v = call(
+        &mut sock,
+        &mut reader,
+        serde_json::json!({
+        "id": 1, "method": "server.version", "params": ["test", ["1.4", "1.6"], "extra"]}),
+    );
     assert_eq!(v["result"][1], "1.6", "{v}");
-    let v = call(&mut sock, &mut reader, serde_json::json!({
-        "id": 2, "method": "server.version", "params": ["test", "1.4"]}));
+    let v = call(
+        &mut sock,
+        &mut reader,
+        serde_json::json!({
+        "id": 2, "method": "server.version", "params": ["test", "1.4"]}),
+    );
     assert_eq!(v["error"]["message"], "server.version already sent", "{v}");
-    let v = call(&mut sock, &mut reader, serde_json::json!({"id": 3, "method": "server.ping"}));
+    let v = call(
+        &mut sock,
+        &mut reader,
+        serde_json::json!({"id": 3, "method": "server.ping"}),
+    );
     assert!(v.get("error").is_none(), "{v}");
 
     // No version in common: the error, then the server closes.
     let (mut sock, mut reader) = connect();
-    let v = call(&mut sock, &mut reader, serde_json::json!({
-        "id": 1, "method": "server.version", "params": ["test", "1.3"]}));
-    assert_eq!(v["error"]["message"], "unsupported protocol version; server speaks 1.4 to 1.6", "{v}");
+    let v = call(
+        &mut sock,
+        &mut reader,
+        serde_json::json!({
+        "id": 1, "method": "server.version", "params": ["test", "1.3"]}),
+    );
+    assert_eq!(
+        v["error"]["message"], "unsupported protocol version; server speaks 1.4 to 1.6",
+        "{v}"
+    );
     let mut rest = String::new();
-    assert_eq!(reader.read_line(&mut rest).unwrap_or(0), 0, "the connection closes: {rest:?}");
+    assert_eq!(
+        reader.read_line(&mut rest).unwrap_or(0),
+        0,
+        "the connection closes: {rest:?}"
+    );
 
     // No `server.version` at all: served at 1.4.
     let (mut sock, mut reader) = connect();
-    let v = call(&mut sock, &mut reader, serde_json::json!({"id": 1, "method": "server.features"}));
+    let v = call(
+        &mut sock,
+        &mut reader,
+        serde_json::json!({"id": 1, "method": "server.features"}),
+    );
     assert_eq!(v["result"]["protocol_min"], "1.4", "{v}");
     assert_eq!(v["result"]["protocol_max"], "1.6", "{v}");
 
@@ -15757,7 +16958,10 @@ fn test_electrum_headers_subscribe_returns_tip_after_mining() {
     let mut node = TestNode::start(&["--electrum=1", &bind]);
 
     let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
-    node.rpc_ok("generatetoaddress", vec![serde_json::json!(7), serde_json::json!(addr)]);
+    node.rpc_ok(
+        "generatetoaddress",
+        vec![serde_json::json!(7), serde_json::json!(addr)],
+    );
 
     let v = electrum_round_trip(
         electrum_port,
@@ -15993,7 +17197,10 @@ fn test_filter_backfill_starts_and_completes() {
     let mut node = TestNode::start(&["--blockfilterindex=basic"]);
     let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
     // Mine a small chain.
-    node.rpc_ok("generatetoaddress", vec![serde_json::json!(15), serde_json::json!(addr)]);
+    node.rpc_ok(
+        "generatetoaddress",
+        vec![serde_json::json!(15), serde_json::json!(addr)],
+    );
 
     let r = node
         .rpc_call_with_params("backfillindex", vec![serde_json::json!("blockfilter")])
@@ -16026,7 +17233,10 @@ fn test_filter_backfill_starts_and_completes() {
 fn test_filter_backfill_idempotent_after_completion() {
     let mut node = TestNode::start(&["--blockfilterindex=basic"]);
     let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
-    node.rpc_ok("generatetoaddress", vec![serde_json::json!(10), serde_json::json!(addr)]);
+    node.rpc_ok(
+        "generatetoaddress",
+        vec![serde_json::json!(10), serde_json::json!(addr)],
+    );
 
     node.rpc_ok("backfillindex", vec![serde_json::json!("blockfilter")]);
     poll_filter_backfill_state(&node, &["completed"], Duration::from_secs(30));
@@ -16060,7 +17270,10 @@ fn test_filter_backfill_pause_resume() {
     let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
     // Mine a chain long enough that 100ms/block dwarfs the test's
     // pause-observe window.
-    node.rpc_ok("generatetoaddress", vec![serde_json::json!(40), serde_json::json!(addr)]);
+    node.rpc_ok(
+        "generatetoaddress",
+        vec![serde_json::json!(40), serde_json::json!(addr)],
+    );
 
     node.rpc_ok("backfillindex", vec![serde_json::json!("blockfilter")]);
     poll_filter_backfill_state(&node, &["running"], Duration::from_secs(15));
@@ -16105,7 +17318,10 @@ fn test_filter_backfill_cancel_drops_progress() {
         &[("SATD_FILTER_BACKFILL_DEBUG_DELAY_MS", "100")],
     );
     let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
-    node.rpc_ok("generatetoaddress", vec![serde_json::json!(40), serde_json::json!(addr)]);
+    node.rpc_ok(
+        "generatetoaddress",
+        vec![serde_json::json!(40), serde_json::json!(addr)],
+    );
 
     node.rpc_ok("backfillindex", vec![serde_json::json!("blockfilter")]);
     poll_filter_backfill_state(&node, &["running"], Duration::from_secs(15));
@@ -16165,7 +17381,10 @@ fn test_filter_backfill_resume_after_restart() {
         &[("SATD_FILTER_BACKFILL_DEBUG_DELAY_MS", "100")],
     );
     let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
-    node.rpc_ok("generatetoaddress", vec![serde_json::json!(40), serde_json::json!(addr)]);
+    node.rpc_ok(
+        "generatetoaddress",
+        vec![serde_json::json!(40), serde_json::json!(addr)],
+    );
 
     node.rpc_ok("backfillindex", vec![serde_json::json!("blockfilter")]);
     poll_filter_backfill_state(&node, &["running"], Duration::from_secs(15));
@@ -16566,7 +17785,12 @@ mod cf_client {
                         panic!("assert_disconnected: peer sent a filter response unexpectedly");
                     }
                     Ok(_) => continue,
-                    Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                        ) =>
+                    {
                         panic!("assert_disconnected: still connected after {window:?}");
                     }
                     Err(_) => return,
@@ -16668,8 +17892,8 @@ fn test_p2p_getcfheaders_returns_chain() {
         .as_str()
         .expect("bestblockhash")
         .to_string();
-    let tip_bytes = <[u8; 32]>::try_from(hex::decode(&tip_hex).expect("hex").as_slice())
-        .expect("32 bytes");
+    let tip_bytes =
+        <[u8; 32]>::try_from(hex::decode(&tip_hex).expect("hex").as_slice()).expect("32 bytes");
     // RPC returns display form; reverse for consensus-byte stop_hash.
     let mut consensus = tip_bytes;
     consensus.reverse();
@@ -16960,8 +18184,7 @@ fn test_p2p_getcfilters_max_size_response_not_truncated() {
         .expect("bestblockhash")
         .to_string();
     let mut consensus =
-        <[u8; 32]>::try_from(hex::decode(&stop_hex).expect("hex").as_slice())
-            .expect("32 bytes");
+        <[u8; 32]>::try_from(hex::decode(&stop_hex).expect("hex").as_slice()).expect("32 bytes");
     consensus.reverse();
     let stop_hash = bitcoin::BlockHash::from_raw_hash(
         bitcoin::hashes::sha256d::Hash::from_byte_array(consensus),
@@ -17016,8 +18239,7 @@ fn test_p2p_getcfheaders_accepts_2000_headers() {
         .expect("bestblockhash")
         .to_string();
     let mut consensus =
-        <[u8; 32]>::try_from(hex::decode(&tip_hex).expect("hex").as_slice())
-            .expect("32 bytes");
+        <[u8; 32]>::try_from(hex::decode(&tip_hex).expect("hex").as_slice()).expect("32 bytes");
     consensus.reverse();
     let tip_hash = bitcoin::BlockHash::from_raw_hash(
         bitcoin::hashes::sha256d::Hash::from_byte_array(consensus),
@@ -17150,9 +18372,8 @@ fn test_p2p_disconnect_unknown_stop_hash() {
     let mut client = cf_client::CFilterClient::connect(p2p_port);
     // A made-up stop_hash that doesn't exist in the block index.
     let fake = [0xab; 32];
-    let stop_hash = bitcoin::BlockHash::from_raw_hash(
-        bitcoin::hashes::sha256d::Hash::from_byte_array(fake),
-    );
+    let stop_hash =
+        bitcoin::BlockHash::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array(fake));
     client.send_get_cfheaders(GetCFHeaders {
         filter_type: 0,
         start_height: 0,
@@ -17228,9 +18449,7 @@ fn test_rpc_tls_round_trip() {
     ]);
 
     // Plain HTTP still works.
-    let info = node
-        .rpc_call("getblockchaininfo")
-        .expect("plain HTTP rpc");
+    let info = node.rpc_call("getblockchaininfo").expect("plain HTTP rpc");
     assert_eq!(info["result"]["chain"].as_str(), Some("regtest"));
 
     // HTTPS round-trip. Trust our self-signed cert via
@@ -17613,13 +18832,14 @@ fn mint_mtls_pki(dir: &std::path::Path, client_cn: &str) -> RpcMtlsPki {
     let ca_cert = ca_params.self_signed(&ca_kp).unwrap();
 
     // Server leaf signed by the CA — what the RPC TLS server presents.
-    let mut server_params =
-        rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+    let mut server_params = rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
     server_params
         .distinguished_name
         .push(rcgen::DnType::CommonName, "localhost");
     let server_kp = rcgen::KeyPair::generate().unwrap();
-    let server_cert = server_params.signed_by(&server_kp, &ca_cert, &ca_kp).unwrap();
+    let server_cert = server_params
+        .signed_by(&server_kp, &ca_cert, &ca_kp)
+        .unwrap();
 
     // Client leaf signed by the CA — what reqwest presents during the
     // mTLS handshake. Two DNS SANs so allowlist tests can target
@@ -17630,7 +18850,9 @@ fn mint_mtls_pki(dir: &std::path::Path, client_cn: &str) -> RpcMtlsPki {
         .distinguished_name
         .push(rcgen::DnType::CommonName, client_cn);
     let client_kp = rcgen::KeyPair::generate().unwrap();
-    let client_cert = client_params.signed_by(&client_kp, &ca_cert, &ca_kp).unwrap();
+    let client_cert = client_params
+        .signed_by(&client_kp, &ca_cert, &ca_kp)
+        .unwrap();
 
     let server_cert_path = dir.join("server.pem");
     let server_key_path = dir.join("server.key.pem");
@@ -17642,7 +18864,9 @@ fn mint_mtls_pki(dir: &std::path::Path, client_cn: &str) -> RpcMtlsPki {
     std::fs::write(&ca_path, ca_cert.pem()).unwrap();
     let mut id_file = std::fs::File::create(&client_id_path).unwrap();
     id_file.write_all(client_cert.pem().as_bytes()).unwrap();
-    id_file.write_all(client_kp.serialize_pem().as_bytes()).unwrap();
+    id_file
+        .write_all(client_kp.serialize_pem().as_bytes())
+        .unwrap();
 
     RpcMtlsPki {
         server_cert_path,
@@ -18078,7 +19302,10 @@ fn test_readonly_rpc_listener_filters_methods() {
 
     // The mined block is visible through the read-only listener too.
     let r = call(ro_port, "getblockcount", serde_json::json!([]));
-    assert_eq!(r["result"], 1, "RO listener should see the mined block: {r}");
+    assert_eq!(
+        r["result"], 1,
+        "RO listener should see the mined block: {r}"
+    );
 }
 
 /// The read-only listener supports TLS like every other API surface:
@@ -18117,9 +19344,7 @@ fn test_readonly_rpc_tls_round_trip() {
             .post(&url)
             .header("Authorization", format!("Basic {}", basic))
             .header("Content-Type", "application/json")
-            .body(format!(
-                r#"{{"jsonrpc":"2.0","id":1,"method":"{method}"}}"#
-            ))
+            .body(format!(r#"{{"jsonrpc":"2.0","id":1,"method":"{method}"}}"#))
             .send()
             .expect("HTTPS request")
             .json()
@@ -18174,7 +19399,11 @@ fn named_rpc_params_are_accepted_like_core() {
     let hashes = resp["result"]
         .as_array()
         .unwrap_or_else(|| panic!("expected block hashes, got {resp}"));
-    assert_eq!(hashes.len(), 3, "nblocks must bind to the count, not the address");
+    assert_eq!(
+        hashes.len(),
+        3,
+        "nblocks must bind to the count, not the address"
+    );
     assert_eq!(
         node.rpc_call("getblockcount").unwrap()["result"]
             .as_u64()
@@ -18184,7 +19413,9 @@ fn named_rpc_params_are_accepted_like_core() {
 
     // `verbosity|verbose`: Core renamed this argument and kept the old
     // spelling working, so both must reach the same position.
-    let hash = node.rpc_call_with_params("getblockhash", vec![serde_json::json!(1)]).unwrap()["result"]
+    let hash = node
+        .rpc_call_with_params("getblockhash", vec![serde_json::json!(1)])
+        .unwrap()["result"]
         .as_str()
         .unwrap()
         .to_string();
@@ -18219,15 +19450,17 @@ fn named_rpc_params_are_accepted_like_core() {
 
     // Positional calls must be entirely unaffected.
     let resp = node
-        .rpc_call_with_params("getblock", vec![serde_json::json!(hash), serde_json::json!(0)])
+        .rpc_call_with_params(
+            "getblock",
+            vec![serde_json::json!(hash), serde_json::json!(0)],
+        )
         .unwrap();
     assert!(resp["result"].is_string(), "positional still works: {resp}");
 
     // A satd-only RPC must be callable by name. Seven of them shipped with an
     // empty row in the table, so every named form was rejected and no name
     // worked at all.
-    let body =
-        r#"{"jsonrpc":"2.0","id":1,"method":"getaddressbalance","params":{"address":"bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080"}}"#;
+    let body = r#"{"jsonrpc":"2.0","id":1,"method":"getaddressbalance","params":{"address":"bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080"}}"#;
     let resp = node.rpc_call_raw_body(body).unwrap();
     assert!(
         resp["error"]["message"].as_str() != Some("Unknown named parameter address"),
@@ -18238,13 +19471,26 @@ fn named_rpc_params_are_accepted_like_core() {
     let body = format!(
         r#"{{"jsonrpc":"2.0","id":1,"method":"generateblock","params":{{"output":"{addr}","transactions":[],"submit":false}}}}"#
     );
-    let before = node.rpc_call("getblockcount").unwrap()["result"].as_u64().unwrap();
+    let before = node.rpc_call("getblockcount").unwrap()["result"]
+        .as_u64()
+        .unwrap();
     let resp = node.rpc_call_raw_body(&body).unwrap();
-    assert!(resp["error"].is_null(), "submit=false should succeed, got {resp}");
-    assert!(resp["result"]["hex"].is_string(), "submit=false must return hex");
-    assert!(resp["result"]["hash"].is_string(), "submit=false must return hash");
+    assert!(
+        resp["error"].is_null(),
+        "submit=false should succeed, got {resp}"
+    );
+    assert!(
+        resp["result"]["hex"].is_string(),
+        "submit=false must return hex"
+    );
+    assert!(
+        resp["result"]["hash"].is_string(),
+        "submit=false must return hash"
+    );
     assert_eq!(
-        node.rpc_call("getblockcount").unwrap()["result"].as_u64().unwrap(),
+        node.rpc_call("getblockcount").unwrap()["result"]
+            .as_u64()
+            .unwrap(),
         before,
         "submit=false must not advance the chain"
     );
@@ -18396,8 +19642,7 @@ fn setmocktime_moves_the_node_clock_and_is_capability_gated() {
 
     // A token with full *write* capability — but not `test:clock`.
     const TOKEN: &str = "satd-test-writeclock-token-v1";
-    const TOKEN_SHA256: &str =
-        "8c98a1aa21c891f07ed6b8eac4c1931d880b0dc8921ded96c80d6986f62feef6";
+    const TOKEN_SHA256: &str = "8c98a1aa21c891f07ed6b8eac4c1931d880b0dc8921ded96c80d6986f62feef6";
 
     let dir = fresh_test_datadir("satd-mocktime-it");
     let authfile = dir.join("auth.toml");
@@ -18431,8 +19676,8 @@ fn setmocktime_moves_the_node_clock_and_is_capability_gated() {
         .unwrap()
     };
     let block_time = |hash: &str| -> u64 {
-        node.rpc_call_with_params("getblock", vec![serde_json::json!(hash)]).unwrap()["result"]
-            ["time"]
+        node.rpc_call_with_params("getblock", vec![serde_json::json!(hash)])
+            .unwrap()["result"]["time"]
             .as_u64()
             .unwrap()
     };
@@ -18471,8 +19716,14 @@ fn setmocktime_moves_the_node_clock_and_is_capability_gated() {
     // `time::tests::only_regtest_has_a_mockable_clock` — this harness only
     // ever starts regtest nodes.)
     for bad in [serde_json::json!(-1), serde_json::json!(9_223_372_037i64)] {
-        let resp = node.rpc_call_with_params("setmocktime", vec![bad.clone()]).unwrap();
-        assert_eq!(resp["error"]["code"].as_i64(), Some(-8), "for {bad}: got {resp}");
+        let resp = node
+            .rpc_call_with_params("setmocktime", vec![bad.clone()])
+            .unwrap();
+        assert_eq!(
+            resp["error"]["code"].as_i64(),
+            Some(-8),
+            "for {bad}: got {resp}"
+        );
     }
 
     // The largest in-range value is accepted, so the bound is inclusive as
@@ -18480,7 +19731,8 @@ fn setmocktime_moves_the_node_clock_and_is_capability_gated() {
     // mock cannot be un-mined, and every later template would be time-too-new.
     node.rpc_call_with_params("setmocktime", vec![serde_json::json!(9_223_372_036i64)])
         .unwrap();
-    node.rpc_call_with_params("setmocktime", vec![serde_json::json!(0)]).unwrap();
+    node.rpc_call_with_params("setmocktime", vec![serde_json::json!(0)])
+        .unwrap();
 
     // The carve-out: a token that may send transactions and manage the node
     // still may not move the clock, because `test:clock` is not implied by
@@ -18550,10 +19802,7 @@ fn scantxoutset_scans_the_utxo_set_for_a_descriptor() {
     let scan = |desc: &str| -> serde_json::Value {
         node.rpc_call_with_params(
             "scantxoutset",
-            vec![
-                serde_json::json!("start"),
-                serde_json::json!([desc]),
-            ],
+            vec![serde_json::json!("start"), serde_json::json!([desc])],
         )
         .unwrap()["result"]
             .clone()
@@ -18613,7 +19862,11 @@ fn scantxoutset_scans_the_utxo_set_for_a_descriptor() {
     assert_eq!(empty["success"], serde_json::json!(true));
     assert_eq!(empty["unspents"].as_array().unwrap().len(), 0);
     assert_eq!(empty["total_amount"].as_f64().unwrap(), 0.0);
-    assert_eq!(empty["txouts"], serde_json::json!(10), "txouts counts the set, not the matches");
+    assert_eq!(
+        empty["txouts"],
+        serde_json::json!(10),
+        "txouts counts the set, not the matches"
+    );
 
     // Core's framework calls this with keyword arguments.
     let named = node
@@ -18622,18 +19875,22 @@ fn scantxoutset_scans_the_utxo_set_for_a_descriptor() {
                 "params":{{"action":"start","scanobjects":["raw({spk_hex})"]}}}}"#
         ))
         .unwrap();
-    assert_eq!(named["result"]["unspents"].as_array().unwrap().len(), 10, "{named}");
+    assert_eq!(
+        named["result"]["unspents"].as_array().unwrap().len(),
+        10,
+        "{named}"
+    );
 
     // Idle status and abort, which is all that is observable when a scan
     // over ten coins finishes before another request can be issued.
     assert_eq!(
-        node.rpc_call_with_params("scantxoutset", vec![serde_json::json!("status")]).unwrap()
-            ["result"],
+        node.rpc_call_with_params("scantxoutset", vec![serde_json::json!("status")])
+            .unwrap()["result"],
         serde_json::Value::Null
     );
     assert_eq!(
-        node.rpc_call_with_params("scantxoutset", vec![serde_json::json!("abort")]).unwrap()
-            ["result"],
+        node.rpc_call_with_params("scantxoutset", vec![serde_json::json!("abort")])
+            .unwrap()["result"],
         serde_json::json!(false)
     );
 
@@ -18642,14 +19899,19 @@ fn scantxoutset_scans_the_utxo_set_for_a_descriptor() {
         .rpc_call_with_params("scantxoutset", vec![serde_json::json!("bogus")])
         .unwrap();
     assert_eq!(bad["error"]["code"], serde_json::json!(-8));
-    assert_eq!(bad["error"]["message"], serde_json::json!("Invalid action 'bogus'"));
+    assert_eq!(
+        bad["error"]["message"],
+        serde_json::json!("Invalid action 'bogus'")
+    );
 
     let unsupported = node
         .rpc_call_with_params(
             "scantxoutset",
             vec![
                 serde_json::json!("start"),
-                serde_json::json!(["wpkh(0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798)"]),
+                serde_json::json!([
+                    "wpkh(0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798)"
+                ]),
             ],
         )
         .unwrap();
@@ -18752,7 +20014,10 @@ fn mistyped_argument_errors_instead_of_discarding_later_arguments() {
         r#"{{"jsonrpc":"2.0","id":1,"method":"generateblock","params":["{addr}",[],false]}}"#
     );
     let resp = node.rpc_call_raw_body(&body).unwrap();
-    assert!(resp["error"].is_null(), "the valid call must succeed: {resp}");
+    assert!(
+        resp["error"].is_null(),
+        "the valid call must succeed: {resp}"
+    );
     assert_eq!(
         node.rpc_call("getblockcount").unwrap()["result"]
             .as_u64()
@@ -18816,7 +20081,10 @@ fn getblockstats_takes_a_height_and_a_stats_filter_like_core() {
     let filtered = node
         .rpc_call_with_params(
             "getblockstats",
-            vec![serde_json::json!(3), serde_json::json!(["height", "total_size"])],
+            vec![
+                serde_json::json!(3),
+                serde_json::json!(["height", "total_size"]),
+            ],
         )
         .unwrap();
     assert!(filtered["error"].is_null(), "{filtered}");
@@ -18871,7 +20139,8 @@ fn getnetworkhashps_takes_core_s_signed_arguments() {
     )
     .unwrap();
 
-    let call = |p: Vec<serde_json::Value>| node.rpc_call_with_params("getnetworkhashps", p).unwrap();
+    let call =
+        |p: Vec<serde_json::Value>| node.rpc_call_with_params("getnetworkhashps", p).unwrap();
 
     // Spelling out Core's own defaults must work.
     let explicit = call(vec![serde_json::json!(120), serde_json::json!(-1)]);
@@ -18882,7 +20151,11 @@ fn getnetworkhashps_takes_core_s_signed_arguments() {
     // `nblocks` out of domain.
     for bad in [-100, 0] {
         let r = call(vec![serde_json::json!(bad)]);
-        assert_eq!(r["error"]["code"], serde_json::json!(-8), "nblocks={bad}: {r}");
+        assert_eq!(
+            r["error"]["code"],
+            serde_json::json!(-8),
+            "nblocks={bad}: {r}"
+        );
         assert_eq!(
             r["error"]["message"],
             serde_json::json!("Invalid nblocks. Must be a positive number or -1.")
@@ -18892,7 +20165,11 @@ fn getnetworkhashps_takes_core_s_signed_arguments() {
     // `height` out of range, in both directions.
     for bad in [-10i64, 21] {
         let r = call(vec![serde_json::json!(100), serde_json::json!(bad)]);
-        assert_eq!(r["error"]["code"], serde_json::json!(-8), "height={bad}: {r}");
+        assert_eq!(
+            r["error"]["code"],
+            serde_json::json!(-8),
+            "height={bad}: {r}"
+        );
         assert_eq!(
             r["error"]["message"],
             serde_json::json!("Block does not exist at specified height")
@@ -18908,7 +20185,9 @@ fn getnetworkhashps_takes_core_s_signed_arguments() {
     // `height % DifficultyAdjustmentInterval() + 1`, and the interval is 144
     // on regtest. Asking for that window by number must give the identical
     // answer.
-    let height = node.rpc_call("getblockcount").unwrap()["result"].as_i64().unwrap();
+    let height = node.rpc_call("getblockcount").unwrap()["result"]
+        .as_i64()
+        .unwrap();
     let since_change = call(vec![serde_json::json!(-1)]);
     let by_number = call(vec![serde_json::json!(height % 144 + 1)]);
     assert!(since_change["error"].is_null(), "{since_change}");
@@ -18993,7 +20272,9 @@ fn rpc_handlers_do_not_reintroduce_the_params_poisoning_idiom() {
         // they are gone.
         .filter(|(_, l)| {
             let code = l.split("//").next().unwrap_or("");
-            code.contains("optional_next") || code.contains(".sequence()") || code.contains(".one()")
+            code.contains("optional_next")
+                || code.contains(".sequence()")
+                || code.contains(".one()")
         })
         .map(|(i, l)| (i + 1, l.trim()))
         .collect();
@@ -19155,7 +20436,8 @@ fn a_replacement_must_beat_the_conflicts_whole_chunk_not_just_the_parent() {
         "more total fee at a worse feerate is worse for a miner: {accept}"
     );
     assert_eq!(
-        entry["reject-reason"], json!("replacement-failed"),
+        entry["reject-reason"],
+        json!("replacement-failed"),
         "Core's reason for a diagram failure — not `insufficient fee`, which \
          is what Rules 3 and 4 would have said: {accept}"
     );
@@ -19307,7 +20589,15 @@ fn getdeploymentinfo_reports_cores_deployment_set_and_honours_blockhash() {
     got.sort_unstable();
     assert_eq!(
         got,
-        ["bip34", "bip65", "bip66", "csv", "segwit", "taproot", "testdummy"],
+        [
+            "bip34",
+            "bip65",
+            "bip66",
+            "csv",
+            "segwit",
+            "taproot",
+            "testdummy"
+        ],
         "must be Core v31.1's DeploymentInfo set: {info}"
     );
     for gone in ["dersig", "cltv"] {
@@ -19330,13 +20620,20 @@ fn getdeploymentinfo_reports_cores_deployment_set_and_honours_blockhash() {
     assert_eq!(taproot["type"], "bip9", "{info}");
     assert_eq!(taproot["active"], serde_json::json!(true), "{info}");
     assert_eq!(taproot["height"], serde_json::json!(0), "{info}");
-    assert_eq!(taproot["bip9"]["start_time"], serde_json::json!(-1), "{info}");
+    assert_eq!(
+        taproot["bip9"]["start_time"],
+        serde_json::json!(-1),
+        "{info}"
+    );
     assert_eq!(
         taproot["bip9"]["timeout"],
         serde_json::json!(9_223_372_036_854_775_807i64),
         "{info}"
     );
-    assert_eq!(taproot["bip9"]["min_activation_height"], serde_json::json!(0));
+    assert_eq!(
+        taproot["bip9"]["min_activation_height"],
+        serde_json::json!(0)
+    );
     assert_eq!(taproot["bip9"]["status"], "active", "{info}");
     assert_eq!(taproot["bip9"]["status_next"], "active", "{info}");
     assert_eq!(taproot["bip9"]["since"], serde_json::json!(0), "{info}");
@@ -19351,7 +20648,10 @@ fn getdeploymentinfo_reports_cores_deployment_set_and_honours_blockhash() {
     let td = &deployments["testdummy"];
     assert_eq!(td["type"], "bip9", "{info}");
     assert_eq!(td["active"], serde_json::json!(false), "{info}");
-    assert!(td.get("height").is_none(), "not active, so no height: {info}");
+    assert!(
+        td.get("height").is_none(),
+        "not active, so no height: {info}"
+    );
     assert_eq!(td["bip9"]["start_time"], serde_json::json!(0), "{info}");
     assert_eq!(td["bip9"]["min_activation_height"], serde_json::json!(0));
     assert_eq!(td["bip9"]["status"], "defined", "{info}");
@@ -19388,8 +20688,9 @@ fn getdeploymentinfo_reports_cores_deployment_set_and_honours_blockhash() {
         vec![serde_json::json!(3), serde_json::json!(addr)],
     )
     .unwrap();
-    let genesis = node.rpc_call_with_params("getblockhash", vec![serde_json::json!(0)]).unwrap()
-        ["result"]
+    let genesis = node
+        .rpc_call_with_params("getblockhash", vec![serde_json::json!(0)])
+        .unwrap()["result"]
         .as_str()
         .unwrap()
         .to_string();
@@ -19397,7 +20698,11 @@ fn getdeploymentinfo_reports_cores_deployment_set_and_honours_blockhash() {
         .rpc_call_with_params("getdeploymentinfo", vec![serde_json::json!(genesis)])
         .unwrap();
     assert_eq!(at_genesis["result"]["height"], 0, "{at_genesis}");
-    assert_eq!(at_genesis["result"]["hash"], serde_json::json!(genesis), "{at_genesis}");
+    assert_eq!(
+        at_genesis["result"]["hash"],
+        serde_json::json!(genesis),
+        "{at_genesis}"
+    );
 
     // No argument still means the tip.
     let at_tip = node.rpc_call("getdeploymentinfo").unwrap();
@@ -19429,8 +20734,11 @@ fn test_bip94_refuses_a_timewarp_block_on_regtest_only_when_asked() {
     let submit_timewarp = |args: &[&str]| -> serde_json::Value {
         let mut node = TestNode::start(args);
         node.mine_blocks(142, addr);
-        let tip: bitcoin::BlockHash =
-            node.rpc_call("getbestblockhash").unwrap()["result"].as_str().unwrap().parse().unwrap();
+        let tip: bitcoin::BlockHash = node.rpc_call("getbestblockhash").unwrap()["result"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap();
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -19440,21 +20748,33 @@ fn test_bip94_refuses_a_timewarp_block_on_regtest_only_when_asked() {
         let last = build_regtest_block(tip, 143, now + 3600, vec![]);
         let submit = |block: &bitcoin::Block| {
             let hex = hex::encode(bitcoin::consensus::serialize(block));
-            node.rpc_call_with_params("submitblock", vec![serde_json::json!(hex)]).unwrap()
+            node.rpc_call_with_params("submitblock", vec![serde_json::json!(hex)])
+                .unwrap()
         };
         let res = submit(&last);
         assert!(res["result"].is_null() && res["error"].is_null(), "{res}");
         let gbt = node
-            .rpc_call_with_params("getblocktemplate", vec![serde_json::json!({"rules": ["segwit"]})])
+            .rpc_call_with_params(
+                "getblocktemplate",
+                vec![serde_json::json!({"rules": ["segwit"]})],
+            )
             .unwrap();
         assert_eq!(gbt["result"]["height"], serde_json::json!(144), "{gbt}");
-        assert_eq!(gbt["result"]["mintime"], serde_json::json!(now + 3600 - 600), "{gbt}");
+        assert_eq!(
+            gbt["result"]["mintime"],
+            serde_json::json!(now + 3600 - 600),
+            "{gbt}"
+        );
         let first = build_regtest_block(last.block_hash(), 144, now + 3600 - 601, vec![]);
         submit(&first)
     };
 
     let res = submit_timewarp(&["-test=bip94"]);
-    assert_eq!(res["result"], serde_json::json!("time-timewarp-attack"), "{res}");
+    assert_eq!(
+        res["result"],
+        serde_json::json!("time-timewarp-attack"),
+        "{res}"
+    );
     let res = submit_timewarp(&[]);
     assert!(res["result"].is_null() && res["error"].is_null(), "{res}");
 
@@ -19462,9 +20782,15 @@ fn test_bip94_refuses_a_timewarp_block_on_regtest_only_when_asked() {
         .args(["--signet", "-test=bip94"])
         .output()
         .expect("spawn satd");
-    assert!(!out.status.success(), "satd should refuse -test off regtest");
+    assert!(
+        !out.status.success(),
+        "satd should refuse -test off regtest"
+    );
     let err = String::from_utf8_lossy(&out.stderr);
-    assert!(err.contains("-test=<option> can only be used with regtest"), "{err}");
+    assert!(
+        err.contains("-test=<option> can only be used with regtest"),
+        "{err}"
+    );
 }
 
 /// Core's `-vbparams=deployment:start:end[:min_activation_height]` moves the
@@ -19520,7 +20846,10 @@ fn validateaddress_is_network_scoped_and_explains_failures() {
     // Core's own pair from `wallet_disable.py`: a mainnet P2SH address and a
     // regtest P2PKH one.
     let mainnet = check("3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy");
-    assert_eq!(mainnet["isvalid"], false, "mainnet P2SH on regtest: {mainnet}");
+    assert_eq!(
+        mainnet["isvalid"], false,
+        "mainnet P2SH on regtest: {mainnet}"
+    );
     assert_eq!(check("mneYUmWYsuk7kySiURxCi3AGxrAqZxLgPZ")["isvalid"], true);
     // A mainnet bech32 string: the HRP does not match, so Core reports an
     // encoding error rather than a network one.
@@ -19544,8 +20873,7 @@ fn validateaddress_is_network_scoped_and_explains_failures() {
     let base58 = check("mipcBbFg9gMiCh81Kj8tqqdgoZub1ZJJfn");
     assert_eq!(base58["isvalid"], false, "{base58}");
     assert_eq!(
-        base58["error"],
-        "Invalid checksum or length of Base58 address (P2PKH or P2SH)",
+        base58["error"], "Invalid checksum or length of Base58 address (P2PKH or P2SH)",
         "{base58}"
     );
     assert_eq!(base58["error_locations"], serde_json::json!([]), "{base58}");
@@ -19567,16 +20895,25 @@ fn dumptxoutset_takes_core_s_type_argument_and_resolves_paths_like_core() {
     let out = node
         .rpc_call_with_params(
             "dumptxoutset",
-            vec![serde_json::json!("txoutset.dat"), serde_json::json!("latest")],
+            vec![
+                serde_json::json!("txoutset.dat"),
+                serde_json::json!("latest"),
+            ],
         )
         .unwrap();
-    assert!(out["error"].is_null(), "Core's two-argument form must work: {out}");
+    assert!(
+        out["error"].is_null(),
+        "Core's two-argument form must work: {out}"
+    );
     let path = out["result"]["path"].as_str().expect("path");
     // Core: a relative path is joined onto the *network* datadir and reported
     // absolute -- not resolved against the process's working directory.
     assert!(std::path::Path::new(path).is_absolute(), "{out}");
     assert!(path.ends_with("regtest/txoutset.dat"), "{out}");
-    assert!(std::path::Path::new(path).is_file(), "the file must be where it says: {out}");
+    assert!(
+        std::path::Path::new(path).is_file(),
+        "the file must be where it says: {out}"
+    );
 
     // `nchaintx` was missing entirely. It is one of the three numbers an
     // AssumeUTXO anchor is made of (base hash, nchaintx, hash_serialized_3),
@@ -19593,13 +20930,19 @@ fn dumptxoutset_takes_core_s_type_argument_and_resolves_paths_like_core() {
     let legacy = node
         .rpc_call_with_params("dumptxoutset", vec![serde_json::json!("legacy.dat")])
         .unwrap();
-    assert!(legacy["error"].is_null(), "the one-argument form must still work: {legacy}");
+    assert!(
+        legacy["error"].is_null(),
+        "the one-argument form must still work: {legacy}"
+    );
 
     // An unknown type is Core's message, not a silently-ignored argument.
     let bad = node
         .rpc_call_with_params(
             "dumptxoutset",
-            vec![serde_json::json!("other.dat"), serde_json::json!("sideways")],
+            vec![
+                serde_json::json!("other.dat"),
+                serde_json::json!("sideways"),
+            ],
         )
         .unwrap();
     assert_eq!(bad["error"]["code"], serde_json::json!(-8), "{bad}");
@@ -19619,9 +20962,16 @@ fn dumptxoutset_takes_core_s_type_argument_and_resolves_paths_like_core() {
             vec![serde_json::json!("rb.dat"), serde_json::json!("rollback")],
         )
         .unwrap();
-    assert_eq!(rollback["error"]["code"], serde_json::json!(-8), "{rollback}");
+    assert_eq!(
+        rollback["error"]["code"],
+        serde_json::json!(-8),
+        "{rollback}"
+    );
     assert!(
-        rollback["error"]["message"].as_str().unwrap().contains("rollback"),
+        rollback["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("rollback"),
         "{rollback}"
     );
 }
@@ -19712,16 +21062,24 @@ mod addconn_listener {
 
         /// [`Self::complete_handshake`] for a node on another chain.
         pub fn complete_handshake_on(&self, stream: &mut TcpStream, magic: Magic) {
-            send_on(stream, magic, NetworkMessage::Version(our_version(self.addr)));
+            send_on(
+                stream,
+                magic,
+                NetworkMessage::Version(our_version(self.addr)),
+            );
             send_on(stream, magic, NetworkMessage::Verack);
         }
 
         /// Whether the node has dialled this listener: a connection waiting
         /// to be accepted, taken without blocking.
         pub fn was_dialled(&self) -> bool {
-            self.listener.set_nonblocking(true).expect("non-blocking listener");
+            self.listener
+                .set_nonblocking(true)
+                .expect("non-blocking listener");
             let dialled = self.listener.accept().is_ok();
-            self.listener.set_nonblocking(false).expect("blocking listener");
+            self.listener
+                .set_nonblocking(false)
+                .expect("blocking listener");
             dialled
         }
     }
@@ -19814,8 +21172,14 @@ fn addconnection_opens_the_connection_type_it_is_asked_for() {
         )
         .unwrap();
     assert!(out["error"].is_null(), "addconnection must exist: {out}");
-    assert_eq!(out["result"]["address"], serde_json::json!(peer.addr.to_string()));
-    assert_eq!(out["result"]["connection_type"], serde_json::json!("block-relay-only"));
+    assert_eq!(
+        out["result"]["address"],
+        serde_json::json!(peer.addr.to_string())
+    );
+    assert_eq!(
+        out["result"]["connection_type"],
+        serde_json::json!("block-relay-only")
+    );
 
     let (mut stream, version) = peer.accept_version(test_timeout(20));
     // The whole point of the connection type: Core does not ask a
@@ -19881,8 +21245,7 @@ fn a_peers_last_block_and_last_tx_only_move_on_acceptance() {
         dest.address.script_pubkey(),
         1_000,
     );
-    let good_tx: bitcoin::Transaction =
-        deserialize(&hex::decode(&good_tx_hex).unwrap()).unwrap();
+    let good_tx: bitcoin::Transaction = deserialize(&hex::decode(&good_tx_hex).unwrap()).unwrap();
 
     let peer = Inbound::bind();
     let out = node
@@ -19969,7 +21332,10 @@ fn a_peers_last_block_and_last_tx_only_move_on_acceptance() {
 
     // Now the real thing: a block the node does not have, and a transaction
     // it accepts.
-    send(&mut stream, bitcoin::p2p::message::NetworkMessage::Block(fresh));
+    send(
+        &mut stream,
+        bitcoin::p2p::message::NetworkMessage::Block(fresh),
+    );
     poll_until(
         || stamps().0 > 0,
         test_timeout(20),
@@ -19977,7 +21343,10 @@ fn a_peers_last_block_and_last_tx_only_move_on_acceptance() {
     );
     assert_eq!(stamps().1, 0, "the block must not stamp last_transaction");
 
-    send(&mut stream, bitcoin::p2p::message::NetworkMessage::Tx(good_tx));
+    send(
+        &mut stream,
+        bitcoin::p2p::message::NetworkMessage::Tx(good_tx),
+    );
     poll_until(
         || stamps().1 > 0,
         test_timeout(20),
@@ -20150,7 +21519,10 @@ fn addconnection_reports_success_when_the_target_does_not_resolve() {
         json!("peer.example:18444"),
         "the string is echoed back unresolved, as Core echoes it: {out}"
     );
-    assert_eq!(out["result"]["connection_type"], json!("outbound-full-relay"));
+    assert_eq!(
+        out["result"]["connection_type"],
+        json!("outbound-full-relay")
+    );
     assert!(
         started.elapsed() < test_timeout(3),
         "the lookup must not be awaited (took {:?})",
@@ -20311,25 +21683,31 @@ fn addconnection_drops_a_feeler_as_soon_as_it_has_a_version() {
     assert!(out["error"].is_null(), "{out}");
 
     let (mut stream, version) = peer.accept_version(test_timeout(20));
-    assert!(!version.relay, "a feeler must clear fRelay too: {version:?}");
+    assert!(
+        !version.relay,
+        "a feeler must clear fRelay too: {version:?}"
+    );
     // Answer with a version and nothing else, exactly as Core's
     // `P2PFeelerReceiver` does.
-    addconn_listener::send(&mut stream, bitcoin::p2p::message::NetworkMessage::Version(
-        bitcoin::p2p::message_network::VersionMessage {
-            version: 70016,
-            services: bitcoin::p2p::ServiceFlags::NETWORK | bitcoin::p2p::ServiceFlags::WITNESS,
-            timestamp: std::time::SystemTime::now()
-                .duration_since(std::time::SystemTime::UNIX_EPOCH)
-                .unwrap()
-                .as_secs() as i64,
-            receiver: bitcoin::p2p::Address::new(&peer.addr, bitcoin::p2p::ServiceFlags::NONE),
-            sender: bitcoin::p2p::Address::new(&peer.addr, bitcoin::p2p::ServiceFlags::NONE),
-            nonce: 0x5a7d_0000_0000_0002,
-            user_agent: "/addconn-feeler:0.1/".to_string(),
-            start_height: 0,
-            relay: true,
-        },
-    ));
+    addconn_listener::send(
+        &mut stream,
+        bitcoin::p2p::message::NetworkMessage::Version(
+            bitcoin::p2p::message_network::VersionMessage {
+                version: 70016,
+                services: bitcoin::p2p::ServiceFlags::NETWORK | bitcoin::p2p::ServiceFlags::WITNESS,
+                timestamp: std::time::SystemTime::now()
+                    .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs() as i64,
+                receiver: bitcoin::p2p::Address::new(&peer.addr, bitcoin::p2p::ServiceFlags::NONE),
+                sender: bitcoin::p2p::Address::new(&peer.addr, bitcoin::p2p::ServiceFlags::NONE),
+                nonce: 0x5a7d_0000_0000_0002,
+                user_agent: "/addconn-feeler:0.1/".to_string(),
+                start_height: 0,
+                relay: true,
+            },
+        ),
+    );
 
     assert!(
         addconn_listener::wait_for_close(&mut stream, test_timeout(20)),
@@ -20344,7 +21722,10 @@ fn addconnection_drops_a_feeler_as_soon_as_it_has_a_version() {
         .iter()
         .filter(|p| p["inbound"] == serde_json::json!(false))
         .collect();
-    assert!(outbound.is_empty(), "a feeler must not linger in getpeerinfo: {info}");
+    assert!(
+        outbound.is_empty(),
+        "a feeler must not linger in getpeerinfo: {info}"
+    );
 }
 
 /// Core's `CConnman::AddConnection` returns false for `inbound` and `manual`,
@@ -20418,7 +21799,10 @@ fn an_addrfetch_connection_ends_on_an_addrv2_answer() {
     // An addr-fetch peer is asked for addresses, not headers.
     let deadline = std::time::Instant::now() + test_timeout(20);
     loop {
-        assert!(std::time::Instant::now() < deadline, "satd never sent getaddr");
+        assert!(
+            std::time::Instant::now() < deadline,
+            "satd never sent getaddr"
+        );
         if matches!(recv(&mut stream), NetworkMessage::GetAddr) {
             break;
         }
@@ -20438,7 +21822,10 @@ fn an_addrfetch_connection_ends_on_an_addrv2_answer() {
     };
     send(
         &mut stream,
-        NetworkMessage::AddrV2(vec![entry([203, 0, 113, 7], 8333), entry([198, 51, 100, 9], 8333)]),
+        NetworkMessage::AddrV2(vec![
+            entry([203, 0, 113, 7], 8333),
+            entry([198, 51, 100, 9], 8333),
+        ]),
     );
 
     assert!(
@@ -20486,10 +21873,16 @@ fn a_block_relay_only_connection_relays_no_addresses() {
         let msg = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| recv(&mut stream)));
         match msg {
             Ok(NetworkMessage::Addr(a)) => {
-                panic!("block-relay-only link answered getaddr with {} addresses", a.len())
+                panic!(
+                    "block-relay-only link answered getaddr with {} addresses",
+                    a.len()
+                )
             }
             Ok(NetworkMessage::AddrV2(a)) => {
-                panic!("block-relay-only link answered getaddr with {} addrv2 entries", a.len())
+                panic!(
+                    "block-relay-only link answered getaddr with {} addrv2 entries",
+                    a.len()
+                )
             }
             // A read timeout surfaces as a panic from `read_exact`; that is
             // the expected quiet.
@@ -20521,13 +21914,16 @@ fn a_block_relay_only_connection_relays_no_addresses() {
 /// kept off the network entirely.
 #[test]
 fn addconnection_is_refused_off_regtest() {
-    let node =
-        TestNode::start_on_chain("--signet", &["--connect=0", "--dnsseed=0", "--listen=0"]);
+    let node = TestNode::start_on_chain("--signet", &["--connect=0", "--dnsseed=0", "--listen=0"]);
 
     // Sanity: this really is a signet node, not a regtest one that ignored the
     // flag -- otherwise the assertion below would pass for the wrong reason.
     let info = node.rpc_call("getblockchaininfo").unwrap();
-    assert_eq!(info["result"]["chain"], serde_json::json!("signet"), "{info}");
+    assert_eq!(
+        info["result"]["chain"],
+        serde_json::json!("signet"),
+        "{info}"
+    );
 
     let out = node
         .rpc_call_with_params(
@@ -20592,17 +21988,29 @@ fn a_custom_signet_in_the_old_signet_directory_is_refused_with_the_moves() {
     // Spelled with a `.` component: the printed commands use the canonical
     // path, so they work from any directory.
     let blocksdir = format!("--blocksdir={}/./blocksroot", datadir.display());
-    let args = ["--connect=0", "--dnsseed=0", "--listen=0", "--signetchallenge=51", &blocksdir];
+    let args = [
+        "--connect=0",
+        "--dnsseed=0",
+        "--listen=0",
+        "--signetchallenge=51",
+        &blocksdir,
+    ];
     let own = "signet_54d26fbd";
 
     // A fresh custom signet starts in its own directory.
     let rpcport = find_available_port();
-    let mut node =
-        TestNode::start_with_datadir_on("--signet", own, &datadir, rpcport, &args, &[]);
+    let mut node = TestNode::start_with_datadir_on("--signet", own, &datadir, rpcport, &args, &[]);
     let submitted = node
-        .rpc_call_with_params("submitblock", vec![serde_json::json!(OP_TRUE_SIGNET_BLOCK_1)])
+        .rpc_call_with_params(
+            "submitblock",
+            vec![serde_json::json!(OP_TRUE_SIGNET_BLOCK_1)],
+        )
         .unwrap();
-    assert_eq!(node.rpc_call("getblockcount").unwrap()["result"], 1, "{submitted}");
+    assert_eq!(
+        node.rpc_call("getblockcount").unwrap()["result"],
+        1,
+        "{submitted}"
+    );
     node.stop();
     node.datadir = PathBuf::new();
     assert!(!datadir.join("signet").exists());
@@ -20631,7 +22039,11 @@ fn a_custom_signet_in_the_old_signet_directory_is_refused_with_the_moves() {
         datadir.join(own).display(),
         datadir.join(own).display()
     );
-    assert!(stderr.contains(&aside), "no `{}` in:\n{stderr}", aside.trim());
+    assert!(
+        stderr.contains(&aside),
+        "no `{}` in:\n{stderr}",
+        aside.trim()
+    );
     for root in [&datadir, &blocks_root] {
         let mv = format!(
             "  mv {} {}\n",
@@ -20639,9 +22051,16 @@ fn a_custom_signet_in_the_old_signet_directory_is_refused_with_the_moves() {
             root.join(own).display()
         );
         assert!(stderr.contains(&mv), "no `{}` in:\n{stderr}", mv.trim());
-        assert!(root.join("signet").exists(), "the refused start moved {}", root.display());
+        assert!(
+            root.join("signet").exists(),
+            "the refused start moved {}",
+            root.display()
+        );
     }
-    assert!(!blocks_root.join(own).exists(), "the refused start created {own}");
+    assert!(
+        !blocks_root.join(own).exists(),
+        "the refused start created {own}"
+    );
     assert!(stderr.contains("Nothing was changed."), "{stderr}");
 
     // Run the printed commands as printed.
@@ -20652,8 +22071,7 @@ fn a_custom_signet_in_the_old_signet_directory_is_refused_with_the_moves() {
         .collect();
     let ran = Command::new("sh").arg("-ec").arg(&script).status().unwrap();
     assert!(ran.success(), "{script}");
-    let mut node =
-        TestNode::start_with_datadir_on("--signet", own, &datadir, rpcport, &args, &[]);
+    let mut node = TestNode::start_with_datadir_on("--signet", own, &datadir, rpcport, &args, &[]);
     assert_eq!(node.rpc_call("getblockcount").unwrap()["result"], 1);
     node.stop();
     drop(node);
@@ -20718,10 +22136,13 @@ fn submitblock_on_the_default_signet_checks_the_solution() {
         include_str!("../../node/src/validation/testdata/default_signet_block_2_bad_solution.hex");
     let block = |height: usize| BLOCKS.lines().nth(height - 1).unwrap().trim().to_string();
 
-    let node =
-        TestNode::start_on_chain("--signet", &["--connect=0", "--dnsseed=0", "--listen=0"]);
+    let node = TestNode::start_on_chain("--signet", &["--connect=0", "--dnsseed=0", "--listen=0"]);
     let info = node.rpc_call("getblockchaininfo").unwrap();
-    assert_eq!(info["result"]["chain"], serde_json::json!("signet"), "{info}");
+    assert_eq!(
+        info["result"]["chain"],
+        serde_json::json!("signet"),
+        "{info}"
+    );
 
     let submit = |hex: &str| {
         node.rpc_call_with_params("submitblock", vec![serde_json::json!(hex)])
@@ -20729,7 +22150,11 @@ fn submitblock_on_the_default_signet_checks_the_solution() {
             .clone()
     };
 
-    assert_eq!(submit(&block(1)), serde_json::Value::Null, "real block 1 is accepted");
+    assert_eq!(
+        submit(&block(1)),
+        serde_json::Value::Null,
+        "real block 1 is accepted"
+    );
     assert_eq!(node.rpc_call("getblockcount").unwrap()["result"], 1);
 
     assert_eq!(
@@ -20739,7 +22164,11 @@ fn submitblock_on_the_default_signet_checks_the_solution() {
     );
     assert_eq!(node.rpc_call("getblockcount").unwrap()["result"], 1);
 
-    assert_eq!(submit(&block(2)), serde_json::Value::Null, "real block 2 is accepted");
+    assert_eq!(
+        submit(&block(2)),
+        serde_json::Value::Null,
+        "real block 2 is accepted"
+    );
     assert_eq!(node.rpc_call("getblockcount").unwrap()["result"], 2);
 }
 
@@ -20818,7 +22247,10 @@ fn methods_accept_the_optional_arguments_core_declares_for_them() {
     let with_maxfeerate = node
         .rpc_call_with_params(
             "submitpackage",
-            vec![serde_json::json!([TX_WITHOUT_SIGDATA]), serde_json::json!(0.10)],
+            vec![
+                serde_json::json!([TX_WITHOUT_SIGDATA]),
+                serde_json::json!(0.10),
+            ],
         )
         .unwrap();
     let msg = with_maxfeerate["error"]["message"].as_str().unwrap_or("");
@@ -20836,7 +22268,11 @@ fn methods_accept_the_optional_arguments_core_declares_for_them() {
     let refused = node
         .rpc_call_with_params("converttopsbt", vec![serde_json::json!(TX_WITH_SIGDATA)])
         .unwrap();
-    assert_eq!(refused["error"]["code"], serde_json::json!(-22), "{refused}");
+    assert_eq!(
+        refused["error"]["code"],
+        serde_json::json!(-22),
+        "{refused}"
+    );
     assert_eq!(
         refused["error"]["message"],
         serde_json::json!("Inputs must not have scriptSigs and scriptWitnesses")
@@ -20851,7 +22287,10 @@ fn methods_accept_the_optional_arguments_core_declares_for_them() {
         )
         .unwrap();
     assert!(permitted["error"].is_null(), "{permitted}");
-    let psbt = permitted["result"].as_str().expect("a base64 PSBT").to_string();
+    let psbt = permitted["result"]
+        .as_str()
+        .expect("a base64 PSBT")
+        .to_string();
 
     // An unsigned transaction needs no permission.
     let plain = node
@@ -20897,7 +22336,10 @@ fn hash_arguments_separate_the_length_error_from_the_hex_error() {
         "a 64-char non-hex string is a hex error, not a length error: {non_hex}"
     );
     // Core names this argument `blockhash`, not `hash`.
-    assert!(msg.starts_with("blockhash "), "must use Core's argument name: {msg}");
+    assert!(
+        msg.starts_with("blockhash "),
+        "must use Core's argument name: {msg}"
+    );
 
     // Too short: still a length error, and it reports the real length.
     let short = node
@@ -20939,13 +22381,21 @@ fn a_surplus_positional_argument_is_refused_before_the_handler_runs() {
         // Two declared arguments, four given.
         (
             "getblockheader",
-            vec![json!(genesis.clone()), json!(true), json!("EXTRA"), json!(99)],
+            vec![
+                json!(genesis.clone()),
+                json!(true),
+                json!("EXTRA"),
+                json!(99),
+            ],
         ),
         // None declared: every argument is surplus.
         ("getblockcount", vec![json!(1), json!(2), json!(3)]),
         // Core's own suite asserts this one: rpc_estimatefee.py (v32.1)
         // drives `estimatesmartfee(1, 'ECONOMICAL', {}, 1)` and expects -1.
-        ("estimatesmartfee", vec![json!(1), json!("ECONOMICAL"), json!({}), json!(1)]),
+        (
+            "estimatesmartfee",
+            vec![json!(1), json!("ECONOMICAL"), json!({}), json!(1)],
+        ),
         // ... and rpc_blockchain.py drives this one.
         ("getchaintxstats", vec![json!(0), json!(""), json!(0)]),
     ] {
@@ -20970,7 +22420,10 @@ fn a_surplus_positional_argument_is_refused_before_the_handler_runs() {
     let ok = node
         .rpc_call_with_params("getblockheader", vec![json!(genesis), json!(true)])
         .unwrap();
-    assert!(ok["result"].is_object(), "a full-arity call must still work: {ok}");
+    assert!(
+        ok["result"].is_object(),
+        "a full-arity call must still work: {ok}"
+    );
 }
 
 /// Core's `hidden` category suppresses a command from the *listing* only --
@@ -21000,9 +22453,7 @@ fn help_answers_for_a_registered_command_that_the_listing_omits() {
             !listing.contains(&cmd),
             "{cmd} is hidden and must stay out of the listing"
         );
-        let help = node
-            .rpc_call_with_params("help", vec![json!(cmd)])
-            .unwrap();
+        let help = node.rpc_call_with_params("help", vec![json!(cmd)]).unwrap();
         let text = help["result"].as_str().unwrap_or("");
         assert!(
             !text.contains("unknown command"),
@@ -21015,13 +22466,17 @@ fn help_answers_for_a_registered_command_that_the_listing_omits() {
     let unknown = node
         .rpc_call_with_params("help", vec![json!("nosuchrpc")])
         .unwrap();
-    assert_eq!(unknown["result"].as_str(), Some("help: unknown command: nosuchrpc"));
+    assert_eq!(
+        unknown["result"].as_str(),
+        Some("help: unknown command: nosuchrpc")
+    );
 
     // Everything registered is listed except the deliberately hidden ones:
     // a method an operator cannot find in `help` may as well not exist.
     // `dump_all_command_conversions` is `help`'s own escape hatch for
     // rpc_help.py, not a method.
-    let registered: Vec<String> = node.rpc_call_with_params("help", vec![json!("dump_all_command_conversions")])
+    let registered: Vec<String> = node
+        .rpc_call_with_params("help", vec![json!("dump_all_command_conversions")])
         .unwrap()["result"]
         .as_array()
         .unwrap()
@@ -21045,12 +22500,24 @@ fn help_answers_for_a_registered_command_that_the_listing_omits() {
         .collect();
     missing.sort_unstable();
     missing.dedup();
-    assert!(missing.is_empty(), "registered but absent from the help listing: {missing:?}");
+    assert!(
+        missing.is_empty(),
+        "registered but absent from the help listing: {missing:?}"
+    );
 
     // Named explicitly, because the check above would also pass if the
     // listing and the registry drifted together.
-    for cmd in ["createrawtransaction", "decodepsbt", "getblockfilter", "waitforblock", "listquarantine"] {
-        assert!(listing.contains(&cmd), "{cmd} must appear in the help listing");
+    for cmd in [
+        "createrawtransaction",
+        "decodepsbt",
+        "getblockfilter",
+        "waitforblock",
+        "listquarantine",
+    ] {
+        assert!(
+            listing.contains(&cmd),
+            "{cmd} must appear in the help listing"
+        );
     }
 }
 
@@ -21063,17 +22530,18 @@ fn generatetoaddress_honours_the_maxtries_budget() {
 
     let node = TestNode::start(&[]);
     let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
-    let height = |n: &TestNode| n.rpc_call("getblockcount").unwrap()["result"].as_u64().unwrap();
+    let height = |n: &TestNode| {
+        n.rpc_call("getblockcount").unwrap()["result"]
+            .as_u64()
+            .unwrap()
+    };
     let before = height(&node);
 
     // Core's `GenerateBlock` returns false the moment the budget is spent,
     // and `generateBlocks` then breaks and hands back what it mined -- so a
     // budget of zero mines nothing and is not an error.
     let none = node
-        .rpc_call_with_params(
-            "generatetoaddress",
-            vec![json!(1), json!(addr), json!(0)],
-        )
+        .rpc_call_with_params("generatetoaddress", vec![json!(1), json!(addr), json!(0)])
         .unwrap();
     assert_eq!(
         none["result"].as_array().map(Vec::len),
@@ -21090,7 +22558,11 @@ fn generatetoaddress_honours_the_maxtries_budget() {
         )
         .unwrap();
     assert_eq!(mistyped["error"]["code"].as_i64(), Some(-3), "{mistyped}");
-    assert_eq!(height(&node), before, "a rejected call must not mine: {mistyped}");
+    assert_eq!(
+        height(&node),
+        before,
+        "a rejected call must not mine: {mistyped}"
+    );
 
     // With a real budget it mines, as before.
     let mined = node
@@ -21137,10 +22609,15 @@ fn generatetodescriptor_confirms_mempool_transactions() {
         "generatetodescriptor",
         vec![json!(1), json!(format!("addr({addr})"))],
     );
-    let hash = mined.as_array().and_then(|a| a.first()).and_then(|v| v.as_str());
+    let hash = mined
+        .as_array()
+        .and_then(|a| a.first())
+        .and_then(|v| v.as_str());
     let hash = hash.unwrap_or_else(|| panic!("no block hash returned: {mined}"));
 
-    let block = node.rpc_call_with_params("getblock", vec![json!(hash), json!(1)]).unwrap();
+    let block = node
+        .rpc_call_with_params("getblock", vec![json!(hash), json!(1)])
+        .unwrap();
     let txs: Vec<&str> = block["result"]["tx"]
         .as_array()
         .unwrap_or_else(|| panic!("no tx list: {block}"))
@@ -21175,7 +22652,10 @@ fn getchaintips_reports_a_stale_branch_alongside_the_active_one() {
     // Two independent chains from the same genesis: A of 2 blocks, B of 3.
     let mut node_a = TestNode::start(&[]);
     let a_hashes: Vec<String> = node_a
-        .rpc_ok("generatetoaddress", vec![json!(2), json!(wallet_a.address.to_string())])
+        .rpc_ok(
+            "generatetoaddress",
+            vec![json!(2), json!(wallet_a.address.to_string())],
+        )
         .as_array()
         .unwrap()
         .iter()
@@ -21184,7 +22664,10 @@ fn getchaintips_reports_a_stale_branch_alongside_the_active_one() {
 
     let mut node_b = TestNode::start(&[]);
     let b_hashes: Vec<String> = node_b
-        .rpc_ok("generatetoaddress", vec![json!(3), json!(wallet_b.address.to_string())])
+        .rpc_ok(
+            "generatetoaddress",
+            vec![json!(3), json!(wallet_b.address.to_string())],
+        )
         .as_array()
         .unwrap()
         .iter()
@@ -21219,8 +22702,14 @@ fn getchaintips_reports_a_stale_branch_alongside_the_active_one() {
     }
 
     let tips = node_a.rpc_call("getchaintips").unwrap();
-    let tips = tips["result"].as_array().unwrap_or_else(|| panic!("{tips}"));
-    assert_eq!(tips.len(), 2, "expected an active tip and one stale branch: {tips:?}");
+    let tips = tips["result"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{tips}"));
+    assert_eq!(
+        tips.len(),
+        2,
+        "expected an active tip and one stale branch: {tips:?}"
+    );
 
     let active = tips
         .iter()
@@ -21228,7 +22717,11 @@ fn getchaintips_reports_a_stale_branch_alongside_the_active_one() {
         .unwrap_or_else(|| panic!("no active tip: {tips:?}"));
     assert_eq!(active["hash"], json!(b_hashes[2]));
     assert_eq!(active["height"], json!(3));
-    assert_eq!(active["branchlen"], json!(0), "the active tip forks from itself");
+    assert_eq!(
+        active["branchlen"],
+        json!(0),
+        "the active tip forks from itself"
+    );
 
     let stale = tips
         .iter()
@@ -21237,7 +22730,11 @@ fn getchaintips_reports_a_stale_branch_alongside_the_active_one() {
     assert_eq!(stale["hash"], json!(a_hashes[1]), "wrong branch tip");
     assert_eq!(stale["height"], json!(2));
     // A's two blocks both descend from genesis, which is the fork point.
-    assert_eq!(stale["branchlen"], json!(2), "branchlen must count back to the fork point");
+    assert_eq!(
+        stale["branchlen"],
+        json!(2),
+        "branchlen must count back to the fork point"
+    );
     // Core keys the status on how far validation got, not on whether the
     // branch reaches the active chain. A's blocks were connected and then
     // reorged away, so they are validated: `valid-fork`. A branch that was
@@ -21249,7 +22746,8 @@ fn getchaintips_reports_a_stale_branch_alongside_the_active_one() {
     // two calls on an unchanged chain must agree exactly — including order.
     let again = node_a.rpc_call("getchaintips").unwrap();
     assert_eq!(
-        again["result"], json!(tips),
+        again["result"],
+        json!(tips),
         "getchaintips is not deterministic across calls"
     );
 
@@ -21261,7 +22759,8 @@ fn getchaintips_reports_a_stale_branch_alongside_the_active_one() {
     let mut node_a = TestNode::start_with_datadir(&datadir, rpcport, &[]);
     let after_restart = node_a.rpc_call("getchaintips").unwrap();
     assert_eq!(
-        after_restart["result"], json!(tips),
+        after_restart["result"],
+        json!(tips),
         "the leaf set seeded at startup disagrees with the one maintained live"
     );
     node_a.stop();
@@ -21283,7 +22782,10 @@ fn getchaintips_distinguishes_a_stored_branch_from_a_validated_one() {
     // *headers*, so A knows the branch exists and has none of its data.
     let mut node_b = TestNode::start(&[]);
     let b_hashes: Vec<String> = node_b
-        .rpc_ok("generatetoaddress", vec![json!(2), json!(wallet_b.address.to_string())])
+        .rpc_ok(
+            "generatetoaddress",
+            vec![json!(2), json!(wallet_b.address.to_string())],
+        )
         .as_array()
         .unwrap()
         .iter()
@@ -21303,19 +22805,26 @@ fn getchaintips_distinguishes_a_stored_branch_from_a_validated_one() {
 
     // Node A has a heavier chain, so B's branch stays a branch.
     let mut node_a = TestNode::start(&[]);
-    node_a.rpc_ok("generatetoaddress", vec![json!(4), json!(wallet_a.address.to_string())]);
+    node_a.rpc_ok(
+        "generatetoaddress",
+        vec![json!(4), json!(wallet_a.address.to_string())],
+    );
     for hdr in &b_headers {
         node_a.rpc_ok("submitheader", vec![json!(hdr)]);
     }
 
     let tips = node_a.rpc_call("getchaintips").unwrap();
-    let tips = tips["result"].as_array().unwrap_or_else(|| panic!("{tips}")).clone();
+    let tips = tips["result"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{tips}"))
+        .clone();
     let branch = tips
         .iter()
         .find(|t| t["hash"] == json!(b_hashes[1]))
         .unwrap_or_else(|| panic!("the header-only branch is missing: {tips:?}"));
     assert_eq!(
-        branch["status"], json!("headers-only"),
+        branch["status"],
+        json!("headers-only"),
         "a branch with no block data is headers-only: {tips:?}"
     );
     assert_eq!(branch["branchlen"], json!(2));
@@ -21364,7 +22873,10 @@ fn gettxoutproof_round_trips_and_refuses_what_it_cannot_prove() {
     // Naming the containing block explicitly must work too, and is the form
     // that makes the proof unambiguous.
     let with_block = node.rpc_ok("gettxoutproof", vec![json!([txid]), json!(block_hash)]);
-    assert_eq!(with_block, proof, "the same proof must come back for the block that holds it");
+    assert_eq!(
+        with_block, proof,
+        "the same proof must come back for the block that holds it"
+    );
 
     // A transaction that is not in the named block cannot be proven from it.
     let coinbase_of_101 = {
@@ -21414,11 +22926,19 @@ fn gettxoutproof_round_trips_and_refuses_what_it_cannot_prove() {
     // checks out and the transaction is still "in" it -- but the header is not
     // one this node has ever seen. A proof is only a proof against a block on
     // our chain; without that check this is a proof of nothing.
-    proves_nothing(&node, flip(proof_hex, 2), "a proof against an unknown header");
+    proves_nothing(
+        &node,
+        flip(proof_hex, 2),
+        "a proof against an unknown header",
+    );
 
     // (2) The hash list is altered, so the path no longer reconstructs the
     // root the header commits to.
-    proves_nothing(&node, flip(proof_hex, 180), "a proof with a corrupted merkle path");
+    proves_nothing(
+        &node,
+        flip(proof_hex, 180),
+        "a proof with a corrupted merkle path",
+    );
     node.stop();
 }
 
@@ -21448,7 +22968,10 @@ fn signrawtransactionwithkey_produces_a_signature_the_node_accepts() {
             json!({ dest.address.to_string(): (send as f64) / 100_000_000.0 }),
         ],
     );
-    let unsigned = unsigned.as_str().expect("createrawtransaction returns hex").to_string();
+    let unsigned = unsigned
+        .as_str()
+        .expect("createrawtransaction returns hex")
+        .to_string();
 
     let wif = PrivateKey::new(wallet.sk, Network::Regtest).to_wif();
     let prevtxs = json!([{
@@ -21462,14 +22985,25 @@ fn signrawtransactionwithkey_produces_a_signature_the_node_accepts() {
         "signrawtransactionwithkey",
         vec![json!(unsigned), json!([wif]), prevtxs.clone()],
     );
-    assert_eq!(signed["complete"], json!(true), "signing reported incomplete: {signed}");
+    assert_eq!(
+        signed["complete"],
+        json!(true),
+        "signing reported incomplete: {signed}"
+    );
     let signed_hex = signed["hex"].as_str().expect("signed hex").to_string();
-    assert_ne!(signed_hex, unsigned, "the returned transaction carries no signature");
+    assert_ne!(
+        signed_hex, unsigned,
+        "the returned transaction carries no signature"
+    );
 
     // Consensus is the assertion: a bad signature is rejected here.
     let txid = node.rpc_ok("sendrawtransaction", vec![json!(signed_hex)]);
     let mempool = node.rpc_ok("getrawmempool", vec![]);
-    assert_eq!(mempool, json!([txid]), "the signed transaction was not accepted");
+    assert_eq!(
+        mempool,
+        json!([txid]),
+        "the signed transaction was not accepted"
+    );
 
     // A key that does not match the prevout cannot sign it. Core reports this
     // as `complete: false` with a per-input error, not as an RPC failure.
@@ -21485,7 +23019,11 @@ fn signrawtransactionwithkey_produces_a_signature_the_node_accepts() {
         "signrawtransactionwithkey",
         vec![unsigned2, json!([wrong]), prevtxs],
     );
-    assert_eq!(bad["complete"], json!(false), "the wrong key signed the input: {bad}");
+    assert_eq!(
+        bad["complete"],
+        json!(false),
+        "the wrong key signed the input: {bad}"
+    );
     node.stop();
 }
 
@@ -21504,9 +23042,18 @@ fn combinerawtransaction_merges_two_partial_signatures() {
     // one of the two.
     let a = DeterministicWallet::from_secret([0x83; 32]);
     let b = DeterministicWallet::from_secret([0x84; 32]);
-    node.rpc_ok("generatetoaddress", vec![json!(1), json!(a.address.to_string())]);
-    node.rpc_ok("generatetoaddress", vec![json!(1), json!(b.address.to_string())]);
-    node.rpc_ok("generatetoaddress", vec![json!(100), json!(a.address.to_string())]);
+    node.rpc_ok(
+        "generatetoaddress",
+        vec![json!(1), json!(a.address.to_string())],
+    );
+    node.rpc_ok(
+        "generatetoaddress",
+        vec![json!(1), json!(b.address.to_string())],
+    );
+    node.rpc_ok(
+        "generatetoaddress",
+        vec![json!(100), json!(a.address.to_string())],
+    );
 
     let coinbase_at = |h: u64| -> String {
         let hash = node.rpc_ok("getblockhash", vec![json!(h)]);
@@ -21551,11 +23098,22 @@ fn combinerawtransaction_merges_two_partial_signatures() {
     let half_b = sign_with(&b);
     // Each signer completes only its own input, which is what makes the
     // combine meaningful rather than a copy of either half.
-    assert_eq!(half_a["complete"], json!(false), "signer A completed both inputs: {half_a}");
-    assert_eq!(half_b["complete"], json!(false), "signer B completed both inputs: {half_b}");
+    assert_eq!(
+        half_a["complete"],
+        json!(false),
+        "signer A completed both inputs: {half_a}"
+    );
+    assert_eq!(
+        half_b["complete"],
+        json!(false),
+        "signer B completed both inputs: {half_b}"
+    );
     let hex_a = half_a["hex"].as_str().expect("hex").to_string();
     let hex_b = half_b["hex"].as_str().expect("hex").to_string();
-    assert_ne!(hex_a, hex_b, "the two signers produced identical transactions");
+    assert_ne!(
+        hex_a, hex_b,
+        "the two signers produced identical transactions"
+    );
 
     let combined = node.rpc_ok("combinerawtransaction", vec![json!([hex_a, hex_b])]);
     let combined = combined.as_str().expect("combined hex").to_string();
@@ -21564,7 +23122,11 @@ fn combinerawtransaction_merges_two_partial_signatures() {
     // the other input fails script verification here.
     let txid = node.rpc_ok("sendrawtransaction", vec![json!(combined)]);
     let mempool = node.rpc_ok("getrawmempool", vec![]);
-    assert_eq!(mempool, json!([txid]), "the combined transaction was not accepted");
+    assert_eq!(
+        mempool,
+        json!([txid]),
+        "the combined transaction was not accepted"
+    );
     node.stop();
 }
 
@@ -21663,7 +23225,9 @@ fn rpcservertimeout_cuts_a_request_that_never_sends_its_body() {
     );
 
     // The node itself is unharmed: a fresh connection is served normally.
-    let info = node.rpc_call("getblockchaininfo").expect("rpc after the cut");
+    let info = node
+        .rpc_call("getblockchaininfo")
+        .expect("rpc after the cut");
     assert_eq!(info["result"]["chain"].as_str(), Some("regtest"));
     node.stop();
 }
@@ -21784,7 +23348,11 @@ fn verificationprogress_matches_bitcoin_core() {
     let block = node.rpc_ok("generateblock", vec![json!(ADDR), json!([]), json!(false)]);
     let header = &block["hex"].as_str().unwrap()[..160];
     node.rpc_ok("submitheader", vec![json!(header)]);
-    for (offset, core) in [(60, 0.996042216358839), (7200, 0.996042216358839), (7201, 0.9544819564983786)] {
+    for (offset, core) in [
+        (60, 0.996042216358839),
+        (7200, 0.996042216358839),
+        (7201, 0.9544819564983786),
+    ] {
         check(offset, core, "a header above the tip");
     }
 }
@@ -21835,7 +23403,9 @@ fn test_metrics_tls_round_trip() {
         .timeout(Duration::from_secs(5))
         .build()
         .unwrap();
-    let r = plain.get(format!("http://127.0.0.1:{tls_port}/healthz")).send();
+    let r = plain
+        .get(format!("http://127.0.0.1:{tls_port}/healthz"))
+        .send();
     assert!(
         !matches!(&r, Ok(resp) if resp.status().is_success()),
         "the TLS port answered plain HTTP: {r:?}"
@@ -21880,7 +23450,10 @@ fn test_metrics_mtls_requires_listed_client_cert() {
 
     let no_cert = https_mtls_client(&pki.ca_pem, None);
     let r = no_cert.get(&url).send();
-    assert!(r.is_err(), "a client without a certificate was served: {r:?}");
+    assert!(
+        r.is_err(),
+        "a client without a certificate was served: {r:?}"
+    );
     node.stop();
 
     // Same CA, a name that is not on the allowlist.
@@ -21905,7 +23478,10 @@ fn test_metrics_mtls_requires_listed_client_cert() {
     // A no-cert handshake failing proves the listener is up and doing TLS;
     // wait until the port accepts connections at all.
     while std::net::TcpStream::connect(("127.0.0.1", tls_port)).is_err() {
-        assert!(Instant::now() < deadline, "metrics TLS listener did not come up");
+        assert!(
+            Instant::now() < deadline,
+            "metrics TLS listener did not come up"
+        );
         std::thread::sleep(Duration::from_millis(100));
     }
     assert!(no_cert.get(&url).send().is_err());
@@ -21964,7 +23540,10 @@ fn test_metrics_tls_bind_failure_aborts_startup() {
     drop(taken);
 
     let combined = std::fs::read_to_string(&log_path).unwrap_or_default();
-    assert!(!status.success(), "satd exited cleanly without its metrics TLS listener: {combined}");
+    assert!(
+        !status.success(),
+        "satd exited cleanly without its metrics TLS listener: {combined}"
+    );
     assert!(
         combined.contains("metrics TLS listener could not bind"),
         "error should name the metrics TLS listener; got: {combined}"
@@ -22002,8 +23581,24 @@ fn status_page_is_404_when_disabled() {
     }
     // The same listener still serves what it always has, so the 404s above
     // are the routes being off rather than the listener refusing everything.
-    assert_eq!(client.get(format!("{base}/metrics")).send().unwrap().status().as_u16(), 200);
-    assert_eq!(client.get(format!("{base}/readyz")).send().unwrap().status().as_u16(), 200);
+    assert_eq!(
+        client
+            .get(format!("{base}/metrics"))
+            .send()
+            .unwrap()
+            .status()
+            .as_u16(),
+        200
+    );
+    assert_eq!(
+        client
+            .get(format!("{base}/readyz"))
+            .send()
+            .unwrap()
+            .status()
+            .as_u16(),
+        200
+    );
     drop(node);
 }
 
@@ -22018,24 +23613,47 @@ fn status_page_serves_html_with_csp() {
     let (client, base) = metrics_client(port);
 
     let expect_headers = |r: &reqwest::blocking::Response, ct: &str| {
-        let h = |name: &str| r.headers().get(name).and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+        let h = |name: &str| {
+            r.headers()
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .to_string()
+        };
         assert_eq!(r.status().as_u16(), 200);
-        assert!(h("content-type").starts_with(ct), "content-type {}", h("content-type"));
+        assert!(
+            h("content-type").starts_with(ct),
+            "content-type {}",
+            h("content-type")
+        );
         assert_eq!(h("x-content-type-options"), "nosniff");
         let csp = h("content-security-policy");
-        for directive in ["default-src 'none'", "script-src 'self'", "connect-src 'self'"] {
+        for directive in [
+            "default-src 'none'",
+            "script-src 'self'",
+            "connect-src 'self'",
+        ] {
             assert!(csp.contains(directive), "CSP lacks {directive}: {csp}");
         }
-        assert!(!csp.contains("unsafe-eval") && !csp.contains("script-src 'unsafe-inline'"), "{csp}");
+        assert!(
+            !csp.contains("unsafe-eval") && !csp.contains("script-src 'unsafe-inline'"),
+            "{csp}"
+        );
         assert_eq!(h("cache-control"), "no-store");
     };
 
     let r = client.get(format!("{base}/status")).send().unwrap();
     expect_headers(&r, "text/html");
     let page = r.text().unwrap();
-    assert!(page.contains("<script src=\"status.js\""), "the page loads its script");
+    assert!(
+        page.contains("<script src=\"status.js\""),
+        "the page loads its script"
+    );
     assert!(!page.contains("<script>"), "no inline script");
-    assert!(page.contains("ssl://node.local:50002"), "the advertised connection string is shown");
+    assert!(
+        page.contains("ssl://node.local:50002"),
+        "the advertised connection string is shown"
+    );
     assert!(page.contains("data-t=\"sync.blocks\""));
 
     let r = client.get(format!("{base}/status.json")).send().unwrap();
@@ -22071,7 +23689,11 @@ fn status_never_contains_credentials() {
         "the peer did not connect",
     );
     let (client, base) = metrics_client(port);
-    let secret = node.cookie.split_once(':').map(|(_, p)| p.to_string()).unwrap();
+    let secret = node
+        .cookie
+        .split_once(':')
+        .map(|(_, p)| p.to_string())
+        .unwrap();
     assert!(secret.len() >= 32, "cookie secret {secret:?}");
     let peer_port = node.rpc_ok("getpeerinfo", vec![])[0]["addr"]
         .as_str()
@@ -22085,8 +23707,12 @@ fn status_never_contains_credentials() {
     // proves the page read the peer table at all.
     poll_until(
         || {
-            let body: serde_json::Value =
-                client.get(format!("{base}/status.json")).send().unwrap().json().unwrap();
+            let body: serde_json::Value = client
+                .get(format!("{base}/status.json"))
+                .send()
+                .unwrap()
+                .json()
+                .unwrap();
             let peers = &body["snapshot"]["peers"];
             peers["inbound"].as_u64().unwrap_or(0) + peers["outbound"].as_u64().unwrap_or(0) == 1
         },
@@ -22095,12 +23721,29 @@ fn status_never_contains_credentials() {
     );
 
     for path in ["/status", "/status.json"] {
-        let text = client.get(format!("{base}{path}")).send().unwrap().text().unwrap();
+        let text = client
+            .get(format!("{base}{path}"))
+            .send()
+            .unwrap()
+            .text()
+            .unwrap();
         assert!(!text.contains(&secret), "{path} contains the RPC cookie");
-        assert!(!text.contains("127.0.0.1"), "{path} contains a peer or listen address");
-        assert!(!text.contains(&format!(":{peer_port}")), "{path} contains the peer's port");
-        assert!(!text.contains(&format!(":{p2p}")), "{path} contains the P2P listen port");
-        assert!(!text.contains(&node.datadir.display().to_string()), "{path} contains the datadir");
+        assert!(
+            !text.contains("127.0.0.1"),
+            "{path} contains a peer or listen address"
+        );
+        assert!(
+            !text.contains(&format!(":{peer_port}")),
+            "{path} contains the peer's port"
+        );
+        assert!(
+            !text.contains(&format!(":{p2p}")),
+            "{path} contains the P2P listen port"
+        );
+        assert!(
+            !text.contains(&node.datadir.display().to_string()),
+            "{path} contains the datadir"
+        );
     }
     drop(peer);
     drop(node);
@@ -22110,10 +23753,17 @@ fn status_never_contains_credentials() {
 fn statuspage_without_metricsport_is_a_startup_error() {
     let datadir = fresh_test_datadir("satd-statuspage-nometrics");
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_satd"))
-        .args(["--regtest", &format!("--datadir={}", datadir.display()), "--statuspage=1"])
+        .args([
+            "--regtest",
+            &format!("--datadir={}", datadir.display()),
+            "--statuspage=1",
+        ])
         .output()
         .expect("spawn satd");
-    assert!(!out.status.success(), "satd started with a status page and no listener");
+    assert!(
+        !out.status.success(),
+        "satd started with a status page and no listener"
+    );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         stderr.contains("statuspage") && stderr.contains("metricsport"),
@@ -22135,7 +23785,10 @@ fn statuspage_without_metricsport_is_a_startup_error() {
 fn the_metrics_listener_answers_while_the_node_is_still_starting() {
     let tmp = tempfile::tempdir().unwrap();
     let fifo = tmp.path().join("snapshot.fifo");
-    let made = Command::new("mkfifo").arg(&fifo).status().expect("run mkfifo");
+    let made = Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .expect("run mkfifo");
     assert!(made.success(), "mkfifo failed");
     let datadir = fresh_test_datadir("satd-startup-listener");
     let log_path = tmp.path().join("satd.log");
@@ -22182,7 +23835,10 @@ fn the_metrics_listener_answers_while_the_node_is_still_starting() {
     let metrics = get("/metrics").unwrap().text().unwrap();
     assert!(metrics.contains("satd_startup_phase{phase=\""), "{metrics}");
     assert!(metrics.contains("satd_build_info{"), "{metrics}");
-    assert!(!metrics.contains("satd_tip_height"), "no chain metrics before there is a chain: {metrics}");
+    assert!(
+        !metrics.contains("satd_tip_height"),
+        "no chain metrics before there is a chain: {metrics}"
+    );
 
     let body: serde_json::Value = get("/status.json").unwrap().json().unwrap();
     assert!(body.get("snapshot").is_none(), "{body}");
@@ -22190,7 +23846,10 @@ fn the_metrics_listener_answers_while_the_node_is_still_starting() {
     assert_eq!(body["view"]["text"]["phase.label"], "starting", "{body}");
     assert_eq!(body["view"]["show"]["chain"], false, "{body}");
     let page = get("/status").unwrap().text().unwrap();
-    assert!(page.contains(">starting<"), "the page's top line says starting");
+    assert!(
+        page.contains(">starting<"),
+        "the page's top line says starting"
+    );
     assert!(page.contains("<script src=\"status.js\""));
     assert_eq!(get("/status.js").unwrap().status().as_u16(), 200);
 
@@ -22211,7 +23870,10 @@ fn the_metrics_listener_answers_while_the_node_is_still_starting() {
     };
     let combined = std::fs::read_to_string(&log_path).unwrap_or_default();
     assert!(!status.success(), "{combined}");
-    assert!(combined.contains("--fast-start-sha256 mismatch"), "the node was held in startup: {combined}");
+    assert!(
+        combined.contains("--fast-start-sha256 mismatch"),
+        "the node was held in startup: {combined}"
+    );
     let _ = std::fs::remove_dir_all(&datadir);
 }
 
@@ -22243,19 +23905,37 @@ fn the_status_page_is_served_after_a_chainstate_rebuild() {
     // startup server stops before the full RPC starts: every request from
     // here on reaches the running node's listener.
     for _ in 0..3 {
-        let body: serde_json::Value =
-            client.get(format!("{base}/status.json")).send().unwrap().json().unwrap();
-        assert!(body.get("startup").is_none(), "the startup server is still answering: {body}");
+        let body: serde_json::Value = client
+            .get(format!("{base}/status.json"))
+            .send()
+            .unwrap()
+            .json()
+            .unwrap();
+        assert!(
+            body.get("startup").is_none(),
+            "the startup server is still answering: {body}"
+        );
         assert_eq!(body["snapshot"]["sync"]["blocks"], 10, "{body}");
         assert_eq!(body["snapshot"]["ready"], true, "{body}");
         let label = body["view"]["text"]["phase.label"].as_str().unwrap();
-        assert!(!["starting", "rebuilding chainstate"].contains(&label), "{body}");
+        assert!(
+            !["starting", "rebuilding chainstate"].contains(&label),
+            "{body}"
+        );
         assert_eq!(body["view"]["show"]["startup"], false, "{body}");
     }
     let r = client.get(format!("{base}/readyz")).send().unwrap();
     assert_eq!(r.status().as_u16(), 200);
-    let metrics = client.get(format!("{base}/metrics")).send().unwrap().text().unwrap();
-    assert!(metrics.lines().any(|l| l == "satd_tip_height 10"), "{metrics}");
+    let metrics = client
+        .get(format!("{base}/metrics"))
+        .send()
+        .unwrap()
+        .text()
+        .unwrap();
+    assert!(
+        metrics.lines().any(|l| l == "satd_tip_height 10"),
+        "{metrics}"
+    );
     assert!(!metrics.contains("satd_startup_phase"), "{metrics}");
     node.stop();
     let _ = std::fs::remove_dir_all(&datadir);
@@ -22265,11 +23945,18 @@ fn the_status_page_is_served_after_a_chainstate_rebuild() {
 fn statusadvertise_rejects_unknown_surface_at_startup() {
     let datadir = fresh_test_datadir("satd-statusadvertise-bad");
     for (arg, needle) in [
-        ("--statusadvertise=lightning=ssl://node:9735", "unknown surface `lightning`"),
+        (
+            "--statusadvertise=lightning=ssl://node:9735",
+            "unknown surface `lightning`",
+        ),
         ("--statusadvertise=electrum=node.local:50002", "no scheme"),
     ] {
         let out = std::process::Command::new(env!("CARGO_BIN_EXE_satd"))
-            .args(["--regtest", &format!("--datadir={}", datadir.display()), arg])
+            .args([
+                "--regtest",
+                &format!("--datadir={}", datadir.display()),
+                arg,
+            ])
             .output()
             .expect("spawn satd");
         assert!(!out.status.success(), "satd accepted {arg}");
@@ -22307,7 +23994,9 @@ impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> StratumClient<S> {
         use tokio::io::AsyncBufReadExt;
         let mut line = String::new();
         match tokio::time::timeout(timeout, self.reader.read_line(&mut line)).await {
-            Ok(Ok(n)) if n > 0 => Some(serde_json::from_str(line.trim_end()).expect("server sent JSON")),
+            Ok(Ok(n)) if n > 0 => {
+                Some(serde_json::from_str(line.trim_end()).expect("server sent JSON"))
+            }
             _ => None,
         }
     }
@@ -22316,8 +24005,12 @@ impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> StratumClient<S> {
         use tokio::io::AsyncWriteExt;
         let id = self.next_id;
         self.next_id += 1;
-        let line = serde_json::json!({"id": id, "method": method, "params": params}).to_string() + "\n";
-        self.writer.write_all(line.as_bytes()).await.expect("write request");
+        let line =
+            serde_json::json!({"id": id, "method": method, "params": params}).to_string() + "\n";
+        self.writer
+            .write_all(line.as_bytes())
+            .await
+            .expect("write request");
         loop {
             let msg = self
                 .read_message(Duration::from_secs(10))
@@ -22353,10 +24046,18 @@ impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> StratumClient<S> {
     async fn handshake(&mut self, username: &str) -> (Vec<u8>, serde_json::Value) {
         use serde_json::json;
         let configure = self
-            .call("mining.configure", json!([["version-rolling"], {"version-rolling.mask": "ffffffff"}]))
+            .call(
+                "mining.configure",
+                json!([["version-rolling"], {"version-rolling.mask": "ffffffff"}]),
+            )
             .await;
-        assert_eq!(configure["result"]["version-rolling.mask"], "1fffe000", "{configure}");
-        let sub = self.call("mining.subscribe", json!(["test-miner/1.0"])).await;
+        assert_eq!(
+            configure["result"]["version-rolling.mask"], "1fffe000",
+            "{configure}"
+        );
+        let sub = self
+            .call("mining.subscribe", json!(["test-miner/1.0"]))
+            .await;
         let result = &sub["result"];
         assert_eq!(result[0][1][0], "mining.notify", "{sub}");
         assert_eq!(result[2], 4, "extranonce2 size: {sub}");
@@ -22364,9 +24065,13 @@ impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> StratumClient<S> {
         assert_eq!(extranonce1.len(), 4);
         let auth = self.call("mining.authorize", json!([username, "x"])).await;
         assert_eq!(auth["result"], true, "{auth}");
-        let diff = self.notification("mining.set_difficulty", Duration::from_secs(10)).await;
+        let diff = self
+            .notification("mining.set_difficulty", Duration::from_secs(10))
+            .await;
         assert_eq!(diff["params"][0], 1, "regtest initial difficulty: {diff}");
-        let notify = self.notification("mining.notify", Duration::from_secs(10)).await;
+        let notify = self
+            .notification("mining.notify", Duration::from_secs(10))
+            .await;
         (extranonce1, notify["params"].clone())
     }
 }
@@ -22429,7 +24134,11 @@ fn grind_stratum_block(extranonce1: &[u8], params: &serde_json::Value) -> ([u8; 
 
 /// As [`grind_stratum_block`], but stopping at the first nonce whose header
 /// meets the block target (`meets`) or misses it (`!meets`).
-fn grind_stratum_header(extranonce1: &[u8], params: &serde_json::Value, meets: bool) -> ([u8; 4], u32, u32) {
+fn grind_stratum_header(
+    extranonce1: &[u8],
+    params: &serde_json::Value,
+    meets: bool,
+) -> ([u8; 4], u32, u32) {
     use bitcoin::hashes::{Hash, sha256d};
     let extranonce2 = [0xde, 0xad, 0xbe, 0xef];
     let mut coinbase = hex::decode(params[2].as_str().unwrap()).unwrap();
@@ -22468,7 +24177,9 @@ fn stratum_v1_subscribe_authorize_notify() {
     use serde_json::json;
     let port = find_available_port();
     let node = TestNode::start(&["--stratum=1", &format!("--stratumbind=127.0.0.1:{port}")]);
-    let addr = DeterministicWallet::from_secret(STRATUM_MINER_SECRET).address.to_string();
+    let addr = DeterministicWallet::from_secret(STRATUM_MINER_SECRET)
+        .address
+        .to_string();
     node.rpc_ok("generatetoaddress", vec![json!(20), json!(addr)]);
 
     let rt = tokio::runtime::Runtime::new().unwrap();
@@ -22479,9 +24190,15 @@ fn stratum_v1_subscribe_authorize_notify() {
         // connected; the one after it is current.
         let best = tokio::task::block_in_place(|| get_rpc_str(&node, "getbestblockhash")).unwrap();
         while notify_prevhash(&params) != best {
-            params = client.notification("mining.notify", Duration::from_secs(10)).await["params"].clone();
+            params = client
+                .notification("mining.notify", Duration::from_secs(10))
+                .await["params"]
+                .clone();
         }
-        assert_eq!(notify_height(&params), tokio::task::block_in_place(|| get_rpc_u64(&node, "getblockcount")).unwrap() + 1);
+        assert_eq!(
+            notify_height(&params),
+            tokio::task::block_in_place(|| get_rpc_u64(&node, "getblockcount")).unwrap() + 1
+        );
         assert_eq!(params[6], "207fffff", "regtest nbits");
         assert_eq!(params[5], "20000000", "version");
 
@@ -22490,16 +24207,31 @@ fn stratum_v1_subscribe_authorize_notify() {
         let mainnet = "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq";
         let refused = other.call("mining.authorize", json!([mainnet, "x"])).await;
         assert_eq!(refused["error"][0], 24, "{refused}");
-        assert!(refused["error"][1].as_str().unwrap().contains("not a valid address"), "{refused}");
+        assert!(
+            refused["error"][1]
+                .as_str()
+                .unwrap()
+                .contains("not a valid address"),
+            "{refused}"
+        );
         // A submit before authorizing is refused too.
-        let submit = other.call("mining.submit", json!(["x", "1", "00000000", "00000000", "00000000"])).await;
+        let submit = other
+            .call(
+                "mining.submit",
+                json!(["x", "1", "00000000", "00000000", "00000000"]),
+            )
+            .await;
         assert_eq!(submit["error"][0], 24, "{submit}");
         assert_eq!(other.call("mining.ping", json!([])).await["result"], "pong");
     });
 
     // getserverstatus reports the bound listener.
     let status = node.rpc_ok("getserverstatus", vec![]);
-    assert_eq!(status["stratum"]["bind"], format!("127.0.0.1:{port}"), "{status}");
+    assert_eq!(
+        status["stratum"]["bind"],
+        format!("127.0.0.1:{port}"),
+        "{status}"
+    );
     assert!(status["stratum_tls"].is_null(), "{status}");
 }
 
@@ -22512,8 +24244,14 @@ fn stratum_v1_subscribe_authorize_notify() {
 fn stratum_debug_category_logs_miner_diagnostics() {
     use serde_json::json;
     let port = find_available_port();
-    let node = TestNode::start(&["--stratum=1", &format!("--stratumbind=127.0.0.1:{port}"), "--loglevel=info"]);
-    let addr = DeterministicWallet::from_secret(STRATUM_MINER_SECRET).address.to_string();
+    let node = TestNode::start(&[
+        "--stratum=1",
+        &format!("--stratumbind=127.0.0.1:{port}"),
+        "--loglevel=info",
+    ]);
+    let addr = DeterministicWallet::from_secret(STRATUM_MINER_SECRET)
+        .address
+        .to_string();
     node.rpc_ok("generatetoaddress", vec![json!(20), json!(addr)]);
     let log = || std::fs::read_to_string(&node.stderr_log).unwrap_or_default();
     let disconnects = |log: &str| log.matches("Stratum miner disconnected").count();
@@ -22522,7 +24260,12 @@ fn stratum_debug_category_logs_miner_diagnostics() {
     let early_submit = |rt: &tokio::runtime::Runtime| {
         rt.block_on(async {
             let mut early = plain_stratum_client(port);
-            let refused = early.call("mining.submit", json!(["x", "1", "00000000", "00000000", "00000000"])).await;
+            let refused = early
+                .call(
+                    "mining.submit",
+                    json!(["x", "1", "00000000", "00000000", "00000000"]),
+                )
+                .await;
             assert_eq!(refused["error"][0], 24, "{refused}");
         })
     };
@@ -22534,11 +24277,21 @@ fn stratum_debug_category_logs_miner_diagnostics() {
         client.handshake(&format!("{addr}.quiet")).await;
     });
     early_submit(&rt);
-    poll_until(|| disconnects(&log()) == 1, test_timeout(10), "the quiet miner's disconnect line");
+    poll_until(
+        || disconnects(&log()) == 1,
+        test_timeout(10),
+        "the quiet miner's disconnect line",
+    );
     let quiet = log();
     assert!(quiet.contains("Stratum miner authorized"), "{quiet}");
-    assert!(!quiet.contains("Stratum miner subscribed"), "debug lines must be off by default: {quiet}");
-    assert!(!quiet.contains("Stratum version rolling negotiated"), "{quiet}");
+    assert!(
+        !quiet.contains("Stratum miner subscribed"),
+        "debug lines must be off by default: {quiet}"
+    );
+    assert!(
+        !quiet.contains("Stratum version rolling negotiated"),
+        "{quiet}"
+    );
     assert!(!quiet.contains("submit before authorize"), "{quiet}");
 
     // A worker name is the miner's to choose. One carrying a line break and
@@ -22546,24 +24299,39 @@ fn stratum_debug_category_logs_miner_diagnostics() {
     // refusal or disconnect lines that name the worker.
     rt.block_on(async {
         let mut client = plain_stratum_client(port);
-        let forged = format!("{addr}.x\n2026-01-01T00:00:00.000000Z ERROR node::stratum: FORGED\u{1b}[31m");
+        let forged =
+            format!("{addr}.x\n2026-01-01T00:00:00.000000Z ERROR node::stratum: FORGED\u{1b}[31m");
         let auth = client.call("mining.authorize", json!([forged, "x"])).await;
         assert_eq!(auth["result"], true, "{auth}");
-        let bad = client.call("mining.submit", json!([forged, "zz", "00", "0", "0"])).await;
+        let bad = client
+            .call("mining.submit", json!([forged, "zz", "00", "0", "0"]))
+            .await;
         assert!(!bad["error"].is_null(), "{bad}");
     });
-    poll_until(|| disconnects(&log()) == 2, test_timeout(10), "the forging miner's disconnect line");
+    poll_until(
+        || disconnects(&log()) == 2,
+        test_timeout(10),
+        "the forging miner's disconnect line",
+    );
     let forging = log();
     assert!(
-        !forging.lines().any(|l| l.starts_with("2026-01-01") || l.contains('\u{1b}')),
+        !forging
+            .lines()
+            .any(|l| l.starts_with("2026-01-01") || l.contains('\u{1b}')),
         "a worker name wrote a line or an escape of its own:\n{forging}"
     );
     // Nor is it carried at all: the worker is kept as printable ASCII, so the
     // escaped forms tracing would print do not appear either.
     let forged_lines: Vec<&str> = forging.lines().filter(|l| l.contains("FORGED")).collect();
-    assert_eq!(forged_lines.len(), 3, "authorized, rejected, disconnected: {forged_lines:?}");
+    assert_eq!(
+        forged_lines.len(),
+        3,
+        "authorized, rejected, disconnected: {forged_lines:?}"
+    );
     assert!(
-        forged_lines.iter().all(|l| !l.contains("\\n2026") && !l.contains("\\u{1b}")),
+        forged_lines
+            .iter()
+            .all(|l| !l.contains("\\n2026") && !l.contains("\\u{1b}")),
         "{forged_lines:?}"
     );
 
@@ -22571,7 +24339,11 @@ fn stratum_debug_category_logs_miner_diagnostics() {
     assert_eq!(on["stratum"], true, "{on}");
     early_submit(&rt);
     poll_until(
-        || log().lines().any(|l| l.contains("DEBUG") && l.contains("submit before authorize")),
+        || {
+            log()
+                .lines()
+                .any(|l| l.contains("DEBUG") && l.contains("submit before authorize"))
+        },
         test_timeout(10),
         "the early submit, at debug",
     );
@@ -22582,23 +24354,41 @@ fn stratum_debug_category_logs_miner_diagnostics() {
         let suggested = client.call("mining.suggest_difficulty", json!([1])).await;
         assert_eq!(suggested["result"], true, "{suggested}");
         // The suggestion comes with a job at the adopted difficulty.
-        let params = client.notification("mining.notify", Duration::from_secs(10)).await["params"].clone();
+        let params = client
+            .notification("mining.notify", Duration::from_secs(10))
+            .await["params"]
+            .clone();
         // A header that misses regtest's block target, which is also the
         // share target there: a low-difficulty share.
         let (extranonce2, ntime, nonce) = grind_stratum_header(&extranonce1, &params, false);
         let low = client
             .call(
                 "mining.submit",
-                json!([format!("{addr}.rig7"), params[0], hex::encode(extranonce2), format!("{ntime:08x}"), format!("{nonce:08x}")]),
+                json!([
+                    format!("{addr}.rig7"),
+                    params[0],
+                    hex::encode(extranonce2),
+                    format!("{ntime:08x}"),
+                    format!("{nonce:08x}")
+                ]),
             )
             .await;
         assert_eq!(low["error"][0], 23, "{low}");
         // A malformed submit is refused before any job is looked at. It was
         // counted, but never logged.
-        let bad = client.call("mining.submit", json!([format!("{addr}.rig7"), "zz", "00", "0", "0"])).await;
+        let bad = client
+            .call(
+                "mining.submit",
+                json!([format!("{addr}.rig7"), "zz", "00", "0", "0"]),
+            )
+            .await;
         assert!(!bad["error"].is_null(), "{bad}");
     });
-    poll_until(|| disconnects(&log()) == 3, test_timeout(10), "rig7's disconnect line");
+    poll_until(
+        || disconnects(&log()) == 3,
+        test_timeout(10),
+        "rig7's disconnect line",
+    );
     let log = log();
     // The line containing both strings; the quiet miner logged none of these
     // at debug, so a match is rig7's.
@@ -22611,10 +24401,18 @@ fn stratum_debug_category_logs_miner_diagnostics() {
     line("Stratum version rolling negotiated", "1fffe000");
     line("Stratum miner suggested a difficulty", "adopted=1");
     let authorized = line("Stratum miner authorized", "rig7");
-    assert!(authorized.contains("test-miner/1.0"), "authorize names the user agent: {authorized}");
-    let rejected: Vec<&str> = log.lines().filter(|l| l.contains("Stratum share rejected") && l.contains("rig7")).collect();
     assert!(
-        rejected.iter().any(|l| l.contains("low difficulty") && l.contains("share_difficulty=")),
+        authorized.contains("test-miner/1.0"),
+        "authorize names the user agent: {authorized}"
+    );
+    let rejected: Vec<&str> = log
+        .lines()
+        .filter(|l| l.contains("Stratum share rejected") && l.contains("rig7"))
+        .collect();
+    assert!(
+        rejected
+            .iter()
+            .any(|l| l.contains("low difficulty") && l.contains("share_difficulty=")),
         "a low-difficulty refusal names what the header achieved: {rejected:?}"
     );
     assert!(
@@ -22622,7 +24420,10 @@ fn stratum_debug_category_logs_miner_diagnostics() {
         "a malformed submit is logged: {rejected:?}"
     );
     let closed = line("Stratum miner disconnected", "rig7");
-    assert!(closed.contains("accepted=0") && closed.contains("rejected=2"), "{closed}");
+    assert!(
+        closed.contains("accepted=0") && closed.contains("rejected=2"),
+        "{closed}"
+    );
 }
 
 #[test]
@@ -22631,7 +24432,10 @@ fn stratum_v1_mined_share_connects_block() {
     let port = find_available_port();
     let node = TestNode::start(&["--stratum=1", &format!("--stratumbind=127.0.0.1:{port}")]);
     let funder = DeterministicWallet::from_secret([0x5b; 32]);
-    node.rpc_ok("generatetoaddress", vec![json!(101), json!(funder.address.to_string())]);
+    node.rpc_ok(
+        "generatetoaddress",
+        vec![json!(101), json!(funder.address.to_string())],
+    );
     // A segwit spend in the mempool, so the template carries a witness and the
     // coinbase's witness commitment has something to commit to.
     let dest = DeterministicWallet::from_secret([0x5c; 32]);
@@ -22642,7 +24446,9 @@ fn stratum_v1_mined_share_connects_block() {
         2_000,
     );
     node.rpc_ok("sendrawtransaction", vec![json!(raw_hex)]);
-    let miner = DeterministicWallet::from_secret(STRATUM_MINER_SECRET).address.to_string();
+    let miner = DeterministicWallet::from_secret(STRATUM_MINER_SECRET)
+        .address
+        .to_string();
 
     let rt = tokio::runtime::Runtime::new().unwrap();
     let submitted_height = rt.block_on(async {
@@ -22650,16 +24456,27 @@ fn stratum_v1_mined_share_connects_block() {
         let (extranonce1, _) = client.handshake(&format!("{miner}.rig1")).await;
         // Move the tip without mining the mempool transaction, so the work
         // rebuilt for the new tip includes it.
-        tokio::task::block_in_place(|| node.rpc_ok("generateblock", vec![json!(funder.address.to_string()), json!([])]));
+        tokio::task::block_in_place(|| {
+            node.rpc_ok(
+                "generateblock",
+                vec![json!(funder.address.to_string()), json!([])],
+            )
+        });
         let best = tokio::task::block_in_place(|| get_rpc_str(&node, "getbestblockhash")).unwrap();
         let params = loop {
-            let n = client.notification("mining.notify", Duration::from_secs(10)).await;
+            let n = client
+                .notification("mining.notify", Duration::from_secs(10))
+                .await;
             if notify_prevhash(&n["params"]) == best {
                 assert_eq!(n["params"][8], true, "a new tip is a clean job: {n}");
                 break n["params"].clone();
             }
         };
-        assert_eq!(params[4].as_array().unwrap().len(), 1, "one transaction beside the coinbase");
+        assert_eq!(
+            params[4].as_array().unwrap().len(),
+            1,
+            "one transaction beside the coinbase"
+        );
         let (extranonce2, ntime, nonce) = grind_stratum_block(&extranonce1, &params);
         let submit = json!([
             format!("{miner}.rig1"),
@@ -22674,13 +24491,18 @@ fn stratum_v1_mined_share_connects_block() {
         // longer exists if after. It must never be accepted twice.
         {
             use tokio::io::AsyncWriteExt;
-            let line = |id: u64| json!({"id": id, "method": "mining.submit", "params": submit}).to_string() + "\n";
+            let line = |id: u64| {
+                json!({"id": id, "method": "mining.submit", "params": submit}).to_string() + "\n"
+            };
             let both = line(100) + &line(101);
             client.writer.write_all(both.as_bytes()).await.unwrap();
         }
         let mut replies = std::collections::HashMap::new();
         while replies.len() < 2 {
-            let msg = client.read_message(Duration::from_secs(10)).await.expect("submit replies");
+            let msg = client
+                .read_message(Duration::from_secs(10))
+                .await
+                .expect("submit replies");
             match msg["id"].as_u64() {
                 Some(id @ (100 | 101)) => {
                     replies.insert(id, msg);
@@ -22689,9 +24511,18 @@ fn stratum_v1_mined_share_connects_block() {
             }
         }
         assert_eq!(replies[&100]["result"], true, "{:?}", replies[&100]);
-        assert_eq!(replies[&101]["result"], serde_json::Value::Null, "{:?}", replies[&101]);
+        assert_eq!(
+            replies[&101]["result"],
+            serde_json::Value::Null,
+            "{:?}",
+            replies[&101]
+        );
         let code = &replies[&101]["error"][0];
-        assert!(*code == 22 || *code == 21, "a repeated solution is a duplicate or stale: {:?}", replies[&101]);
+        assert!(
+            *code == 22 || *code == 21,
+            "a repeated solution is a duplicate or stale: {:?}",
+            replies[&101]
+        );
         // The block's own connect event reaches the server, which moves every
         // miner to the new tip at once rather than at the next 30 s refresh.
         // A submission that failed part way — the block stored but its chain
@@ -22719,7 +24550,10 @@ fn stratum_v1_mined_share_connects_block() {
     let txs = block["tx"].as_array().unwrap();
     assert_eq!(txs.len(), 2, "{block}");
     assert_eq!(txs[1]["txid"], txid, "the mempool transaction was mined");
-    assert_eq!(txs[0]["vout"][0]["scriptPubKey"]["address"], miner, "coinbase pays the username");
+    assert_eq!(
+        txs[0]["vout"][0]["scriptPubKey"]["address"], miner,
+        "coinbase pays the username"
+    );
     let mempool = node.rpc_ok("getrawmempool", vec![]);
     assert_eq!(mempool, json!([]), "the mined transaction left the mempool");
     // The block was saved before it was submitted, byte for byte what the
@@ -22747,7 +24581,9 @@ fn stratum_v1_mined_share_connects_block() {
 fn stratum_work_follows_a_tip_reached_by_block_download() {
     use serde_json::json;
     let source = TestNode::start(&[]);
-    let addr = DeterministicWallet::from_secret(STRATUM_MINER_SECRET).address.to_string();
+    let addr = DeterministicWallet::from_secret(STRATUM_MINER_SECRET)
+        .address
+        .to_string();
     source.rpc_ok("generatetoaddress", vec![json!(101), json!(addr)]);
 
     let port = find_available_port();
@@ -22781,15 +24617,24 @@ fn stratum_found_block_reaches_a_high_bandwidth_peer_as_cmpctblock() {
     let port = find_available_port();
     let node = TestNode::start(&["--stratum=1", &format!("--stratumbind=127.0.0.1:{port}")]);
     let funder = DeterministicWallet::from_secret([0x5b; 32]);
-    node.rpc_ok("generatetoaddress", vec![json!(101), json!(funder.address.to_string())]);
-    let miner = DeterministicWallet::from_secret(STRATUM_MINER_SECRET).address.to_string();
+    node.rpc_ok(
+        "generatetoaddress",
+        vec![json!(101), json!(funder.address.to_string())],
+    );
+    let miner = DeterministicWallet::from_secret(STRATUM_MINER_SECRET)
+        .address
+        .to_string();
 
     // A P2P peer the node dialled, asking for high-bandwidth relay.
     let peer = Inbound::bind();
     let out = node
         .rpc_call_with_params(
             "addconnection",
-            vec![json!(peer.addr.to_string()), json!("outbound-full-relay"), json!(false)],
+            vec![
+                json!(peer.addr.to_string()),
+                json!("outbound-full-relay"),
+                json!(false),
+            ],
         )
         .unwrap();
     assert!(out["error"].is_null(), "addconnection: {out}");
@@ -22828,10 +24673,16 @@ fn stratum_found_block_reaches_a_high_bandwidth_peer_as_cmpctblock() {
         assert_eq!(reply["result"], true, "{reply}");
     });
 
-    let tip: bitcoin::BlockHash = get_rpc_str(&node, "getbestblockhash").unwrap().parse().unwrap();
+    let tip: bitcoin::BlockHash = get_rpc_str(&node, "getbestblockhash")
+        .unwrap()
+        .parse()
+        .unwrap();
     let deadline = Instant::now() + test_timeout(20);
     loop {
-        assert!(Instant::now() < deadline, "no cmpctblock for the Stratum-found block");
+        assert!(
+            Instant::now() < deadline,
+            "no cmpctblock for the Stratum-found block"
+        );
         if let NetworkMessage::CmpctBlock(c) = recv(&mut stream)
             && c.compact_block.header.block_hash() == tip
         {
@@ -22847,14 +24698,18 @@ fn stratum_v1_new_block_pushes_clean_job() {
     use serde_json::json;
     let port = find_available_port();
     let node = TestNode::start(&["--stratum=1", &format!("--stratumbind=127.0.0.1:{port}")]);
-    let addr = DeterministicWallet::from_secret(STRATUM_MINER_SECRET).address.to_string();
+    let addr = DeterministicWallet::from_secret(STRATUM_MINER_SECRET)
+        .address
+        .to_string();
 
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
         let mut client = plain_stratum_client(port);
         let (_, first) = client.handshake(&addr).await;
         assert_eq!(first[8], true, "the first job is clean");
-        let hashes = tokio::task::block_in_place(|| node.rpc_ok("generatetoaddress", vec![json!(1), json!(addr)]));
+        let hashes = tokio::task::block_in_place(|| {
+            node.rpc_ok("generatetoaddress", vec![json!(1), json!(addr)])
+        });
         let new_tip = hashes[0].as_str().unwrap().to_string();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
@@ -22865,7 +24720,10 @@ fn stratum_v1_new_block_pushes_clean_job() {
                 assert_eq!(notify_height(&n["params"]), 2);
                 // A share for the job on the old tip is now stale.
                 let stale = client
-                    .call("mining.submit", json!([addr, first[0], "00000000", first[7], "00000000"]))
+                    .call(
+                        "mining.submit",
+                        json!([addr, first[0], "00000000", first[7], "00000000"]),
+                    )
                     .await;
                 assert_eq!(stale["error"][0], 21, "{stale}");
                 break;
@@ -22888,7 +24746,9 @@ fn stratum_work_follows_a_tip_that_caught_up_over_p2p() {
     use serde_json::json;
     let mut node_a = TestNode::start(&[]);
     let p2p_port_a = node_a.p2p_port.expect("node A p2p port");
-    let addr = DeterministicWallet::from_secret(STRATUM_MINER_SECRET).address.to_string();
+    let addr = DeterministicWallet::from_secret(STRATUM_MINER_SECRET)
+        .address
+        .to_string();
     // Far enough ahead that the catch-up goes through the IBD connect loop
     // rather than block-by-block acceptance.
     node_a.rpc_ok("generatetoaddress", vec![json!(120), json!(addr.clone())]);
@@ -22932,7 +24792,6 @@ fn stratum_work_follows_a_tip_that_caught_up_over_p2p() {
     node_a.stop();
 }
 
-
 /// A miner that never stops submitting still gets the job for a new tip. On
 /// regtest every share a CPU miner finds is a block, so it submits without
 /// pause; a session that served the miner's lines ahead of new work never
@@ -22943,13 +24802,19 @@ fn stratum_v1_new_work_reaches_a_miner_that_never_stops_submitting() {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
     let port = find_available_port();
     let node = TestNode::start(&["--stratum=1", &format!("--stratumbind=127.0.0.1:{port}")]);
-    let addr = DeterministicWallet::from_secret(STRATUM_MINER_SECRET).address.to_string();
+    let addr = DeterministicWallet::from_secret(STRATUM_MINER_SECRET)
+        .address
+        .to_string();
 
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
         let mut client = plain_stratum_client(port);
         let (_, first) = client.handshake(&addr).await;
-        let StratumClient { mut reader, mut writer, .. } = client;
+        let StratumClient {
+            mut reader,
+            mut writer,
+            ..
+        } = client;
 
         // Submits for a job the server never issued, as fast as the socket
         // takes them: each is refused, and there is always another queued.
@@ -22978,7 +24843,9 @@ fn stratum_v1_new_work_reaches_a_miner_that_never_stops_submitting() {
         tokio::time::sleep(Duration::from_secs(1)).await;
         let mut line = String::new();
 
-        let hashes = tokio::task::block_in_place(|| node.rpc_ok("generatetoaddress", vec![json!(1), json!(addr)]));
+        let hashes = tokio::task::block_in_place(|| {
+            node.rpc_ok("generatetoaddress", vec![json!(1), json!(addr)])
+        });
         let new_tip = hashes[0].as_str().unwrap().to_string();
         assert_ne!(notify_prevhash(&first), new_tip);
         let found = tokio::time::timeout(Duration::from_secs(10), async {
@@ -22996,7 +24863,11 @@ fn stratum_v1_new_work_reaches_a_miner_that_never_stops_submitting() {
         .await;
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
         flood.abort();
-        assert_eq!(found, Ok(true), "no job for the new tip while the miner was submitting");
+        assert_eq!(
+            found,
+            Ok(true),
+            "no job for the new tip while the miner was submitting"
+        );
     });
 }
 
@@ -23005,7 +24876,10 @@ fn stratum_v1_new_work_reaches_a_miner_that_never_stops_submitting() {
 struct StratumPki {
     dir: tempfile::TempDir,
     ca: tokio_rustls::rustls::pki_types::CertificateDer<'static>,
-    clients: Vec<(tokio_rustls::rustls::pki_types::CertificateDer<'static>, Vec<u8>)>,
+    clients: Vec<(
+        tokio_rustls::rustls::pki_types::CertificateDer<'static>,
+        Vec<u8>,
+    )>,
 }
 
 fn mint_stratum_pki() -> StratumPki {
@@ -23013,14 +24887,22 @@ fn mint_stratum_pki() -> StratumPki {
     let mut ca_params = rcgen::CertificateParams::new(vec![]).unwrap();
     ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
     ca_params.key_usages = vec![rcgen::KeyUsagePurpose::KeyCertSign];
-    ca_params.distinguished_name.push(rcgen::DnType::CommonName, "stratum-test-ca");
+    ca_params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "stratum-test-ca");
     let ca_kp = rcgen::KeyPair::generate().unwrap();
     let ca_cert = ca_params.self_signed(&ca_kp).unwrap();
 
     let server_params = rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
     let server_kp = rcgen::KeyPair::generate().unwrap();
-    let server_cert = server_params.signed_by(&server_kp, &ca_cert, &ca_kp).unwrap();
-    std::fs::write(dir.path().join("server.pem"), server_cert.pem() + &ca_cert.pem()).unwrap();
+    let server_cert = server_params
+        .signed_by(&server_kp, &ca_cert, &ca_kp)
+        .unwrap();
+    std::fs::write(
+        dir.path().join("server.pem"),
+        server_cert.pem() + &ca_cert.pem(),
+    )
+    .unwrap();
     std::fs::write(dir.path().join("server.key"), server_kp.serialize_pem()).unwrap();
     std::fs::write(dir.path().join("ca.pem"), ca_cert.pem()).unwrap();
 
@@ -23034,7 +24916,11 @@ fn mint_stratum_pki() -> StratumPki {
             (cert.der().clone(), kp.serialize_der())
         })
         .collect();
-    StratumPki { ca: ca_cert.der().clone(), dir, clients }
+    StratumPki {
+        ca: ca_cert.der().clone(),
+        dir,
+        clients,
+    }
 }
 
 impl StratumPki {
@@ -23060,7 +24946,9 @@ impl StratumPki {
             Some(i) => {
                 let (cert, key) = &self.clients[i];
                 let key = rustls::pki_types::PrivateKeyDer::Pkcs8(key.clone().into());
-                builder.with_client_auth_cert(vec![cert.clone()], key).unwrap()
+                builder
+                    .with_client_auth_cert(vec![cert.clone()], key)
+                    .unwrap()
             }
         };
         tokio_rustls::TlsConnector::from(std::sync::Arc::new(config))
@@ -23090,15 +24978,23 @@ fn stratum_v1_tls_listener_serves_same_protocol() {
         &format!("--stratumtlscert={}", pki.path("server.pem")),
         &format!("--stratumtlskey={}", pki.path("server.key")),
     ]);
-    let addr = DeterministicWallet::from_secret(STRATUM_MINER_SECRET).address.to_string();
+    let addr = DeterministicWallet::from_secret(STRATUM_MINER_SECRET)
+        .address
+        .to_string();
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
-        let mut client = tls_stratum_client(&pki, tls_port, None).await.expect("TLS handshake");
+        let mut client = tls_stratum_client(&pki, tls_port, None)
+            .await
+            .expect("TLS handshake");
         let (_, params) = client.handshake(&addr).await;
         assert_eq!(notify_height(&params), 1);
     });
     let status = node.rpc_ok("getserverstatus", vec![]);
-    assert_eq!(status["stratum_tls"]["bind"], format!("127.0.0.1:{tls_port}"), "{status}");
+    assert_eq!(
+        status["stratum_tls"]["bind"],
+        format!("127.0.0.1:{tls_port}"),
+        "{status}"
+    );
 }
 
 #[test]
@@ -23117,12 +25013,16 @@ fn stratum_v1_mtls_rejects_unlisted_client() {
         &format!("--stratummtlsclientca={}", pki.path("ca.pem")),
         "--stratummtlsclientallow=alice",
     ]);
-    let addr = DeterministicWallet::from_secret(STRATUM_MINER_SECRET).address.to_string();
+    let addr = DeterministicWallet::from_secret(STRATUM_MINER_SECRET)
+        .address
+        .to_string();
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
         // The listed client is served — without this the refusal below would
         // pass against a listener that refuses everyone.
-        let mut alice = tls_stratum_client(&pki, tls_port, Some(0)).await.expect("alice handshake");
+        let mut alice = tls_stratum_client(&pki, tls_port, Some(0))
+            .await
+            .expect("alice handshake");
         let (_, params) = alice.handshake(&addr).await;
         assert_eq!(notify_height(&params), 1);
 
@@ -23130,7 +25030,8 @@ fn stratum_v1_mtls_rejects_unlisted_client() {
         // closes after the handshake, before any reply.
         if let Ok(mut mallory) = tls_stratum_client(&pki, tls_port, Some(1)).await {
             use tokio::io::AsyncWriteExt;
-            let line = json!({"id": 1, "method": "mining.subscribe", "params": []}).to_string() + "\n";
+            let line =
+                json!({"id": 1, "method": "mining.subscribe", "params": []}).to_string() + "\n";
             let _ = mallory.writer.write_all(line.as_bytes()).await;
             assert!(
                 mallory.read_message(Duration::from_secs(5)).await.is_none(),
@@ -23140,7 +25041,8 @@ fn stratum_v1_mtls_rejects_unlisted_client() {
         // No certificate at all fails the handshake or is dropped unanswered.
         if let Ok(mut anon) = tls_stratum_client(&pki, tls_port, None).await {
             use tokio::io::AsyncWriteExt;
-            let line = json!({"id": 1, "method": "mining.subscribe", "params": []}).to_string() + "\n";
+            let line =
+                json!({"id": 1, "method": "mining.subscribe", "params": []}).to_string() + "\n";
             let _ = anon.writer.write_all(line.as_bytes()).await;
             assert!(anon.read_message(Duration::from_secs(5)).await.is_none());
         }
@@ -23157,8 +25059,8 @@ mod sv2 {
     use std::collections::VecDeque;
     use std::time::Duration;
 
-    use stratum_core::binary_sv2::{self, Serialize, Str0255, U256};
     use stratum_core::binary_sv2::GetSize;
+    use stratum_core::binary_sv2::{self, Serialize, Str0255, U256};
     use stratum_core::noise_sv2::{Initiator, NoiseCodec};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -23185,8 +25087,14 @@ mod sv2 {
                 .await
                 .map_err(|_| "handshake reply timed out".to_string())?
                 .map_err(|e| e.to_string())?;
-            let codec = initiator.step_2(reply).map_err(|e| format!("handshake: {e:?}"))?;
-            Ok(Self { stream, codec, pending: VecDeque::new() })
+            let codec = initiator
+                .step_2(reply)
+                .map_err(|e| format!("handshake: {e:?}"))?;
+            Ok(Self {
+                stream,
+                codec,
+                pending: VecDeque::new(),
+            })
         }
 
         pub async fn send<T: Serialize + GetSize>(&mut self, msg_type: u8, msg: T) {
@@ -23201,7 +25109,10 @@ mod sv2 {
         }
 
         async fn read(&mut self, timeout: Duration) -> Option<(u8, Vec<u8>)> {
-            tokio::time::timeout(timeout, read_frame(&mut self.stream, &mut self.codec)).await.ok().flatten()
+            tokio::time::timeout(timeout, read_frame(&mut self.stream, &mut self.codec))
+                .await
+                .ok()
+                .flatten()
         }
 
         /// Send `msgs` one after another, as fast as the socket takes them.
@@ -23214,7 +25125,10 @@ mod sv2 {
         ) -> (FloodReader, tokio::task::JoinHandle<()>) {
             let (read, mut write) = self.stream.into_split();
             let mut codec = self.codec.clone();
-            let reader = FloodReader { stream: read, codec: self.codec };
+            let reader = FloodReader {
+                stream: read,
+                codec: self.codec,
+            };
             let task = tokio::spawn(async move {
                 // A thousand frames a write, so the server always has a
                 // backlog rather than one frame at a time.
@@ -23258,16 +25172,28 @@ mod sv2 {
         }
 
         pub async fn setup(&mut self) {
-            self.setup_with(stratum_core::common_messages_sv2::Protocol::MiningProtocol, 0b100).await;
+            self.setup_with(
+                stratum_core::common_messages_sv2::Protocol::MiningProtocol,
+                0b100,
+            )
+            .await;
         }
 
-        pub async fn setup_with(&mut self, protocol: stratum_core::common_messages_sv2::Protocol, flags: u32) {
+        pub async fn setup_with(
+            &mut self,
+            protocol: stratum_core::common_messages_sv2::Protocol,
+            flags: u32,
+        ) {
             self.send_setup(protocol, flags).await;
             self.expect(0x01, Duration::from_secs(10)).await;
         }
 
         /// Send a `SetupConnection` without waiting for the answer.
-        pub async fn send_setup(&mut self, protocol: stratum_core::common_messages_sv2::Protocol, flags: u32) {
+        pub async fn send_setup(
+            &mut self,
+            protocol: stratum_core::common_messages_sv2::Protocol,
+            flags: u32,
+        ) {
             use stratum_core::common_messages_sv2::SetupConnection;
             let s = |v: &str| Str0255::try_from(v.to_string()).unwrap();
             let msg = SetupConnection {
@@ -23287,7 +25213,9 @@ mod sv2 {
 
         /// Open a standard channel: `(channel_id, target_le)`.
         pub async fn open_standard(&mut self, user: &str) -> (u32, [u8; 32]) {
-            use stratum_core::mining_sv2::{OpenStandardMiningChannel, OpenStandardMiningChannelSuccess};
+            use stratum_core::mining_sv2::{
+                OpenStandardMiningChannel, OpenStandardMiningChannelSuccess,
+            };
             let msg = OpenStandardMiningChannel {
                 request_id: 7u32.into(),
                 user_identity: Str0255::try_from(user.to_string()).unwrap(),
@@ -23296,14 +25224,21 @@ mod sv2 {
             };
             self.send(0x10, msg).await;
             let mut payload = self.expect(0x11, Duration::from_secs(10)).await;
-            let ok: OpenStandardMiningChannelSuccess = binary_sv2::from_bytes(&mut payload).unwrap();
+            let ok: OpenStandardMiningChannelSuccess =
+                binary_sv2::from_bytes(&mut payload).unwrap();
             assert_eq!(ok.get_request_id_as_u32(), 7);
             (ok.channel_id, ok.target.inner_as_ref().try_into().unwrap())
         }
 
         /// Open an extended channel: `(channel_id, extranonce_prefix, extranonce_size)`.
-        pub async fn open_extended(&mut self, user: &str, min_extranonce: u16) -> (u32, Vec<u8>, u16) {
-            use stratum_core::mining_sv2::{OpenExtendedMiningChannel, OpenExtendedMiningChannelSuccess};
+        pub async fn open_extended(
+            &mut self,
+            user: &str,
+            min_extranonce: u16,
+        ) -> (u32, Vec<u8>, u16) {
+            use stratum_core::mining_sv2::{
+                OpenExtendedMiningChannel, OpenExtendedMiningChannelSuccess,
+            };
             let msg = OpenExtendedMiningChannel {
                 request_id: 9,
                 user_identity: Str0255::try_from(user.to_string()).unwrap(),
@@ -23313,9 +25248,14 @@ mod sv2 {
             };
             self.send(0x13, msg).await;
             let mut payload = self.expect(0x14, Duration::from_secs(10)).await;
-            let ok: OpenExtendedMiningChannelSuccess = binary_sv2::from_bytes(&mut payload).unwrap();
+            let ok: OpenExtendedMiningChannelSuccess =
+                binary_sv2::from_bytes(&mut payload).unwrap();
             assert_eq!(ok.request_id, 9);
-            (ok.channel_id, ok.extranonce_prefix.inner_as_ref().to_vec(), ok.extranonce_size)
+            (
+                ok.channel_id,
+                ok.extranonce_prefix.inner_as_ref().to_vec(),
+                ok.extranonce_size,
+            )
         }
 
         /// The next `SetNewPrevHash`: `(job_id, prev_hash display hex, min_ntime, nbits)`.
@@ -23355,7 +25295,10 @@ mod sv2 {
         }
     }
 
-    async fn read_frame<R: tokio::io::AsyncRead + Unpin>(stream: &mut R, codec: &mut NoiseCodec) -> Option<(u8, Vec<u8>)> {
+    async fn read_frame<R: tokio::io::AsyncRead + Unpin>(
+        stream: &mut R,
+        codec: &mut NoiseCodec,
+    ) -> Option<(u8, Vec<u8>)> {
         let mut header = vec![0u8; 22];
         stream.read_exact(&mut header).await.ok()?;
         codec.decrypt(&mut header).ok()?;
@@ -23374,7 +25317,13 @@ mod sv2 {
     }
 
     /// Grind a nonce until the header meets its own `nbits`.
-    pub fn grind(version: u32, prev_internal: [u8; 32], merkle_root: [u8; 32], ntime: u32, nbits: u32) -> u32 {
+    pub fn grind(
+        version: u32,
+        prev_internal: [u8; 32],
+        merkle_root: [u8; 32],
+        ntime: u32,
+        nbits: u32,
+    ) -> u32 {
         use bitcoin::hashes::Hash;
         let mut header = bitcoin::block::Header {
             version: bitcoin::block::Version::from_consensus(version as i32),
@@ -23418,13 +25367,17 @@ fn stratum_v2_handshake_and_standard_channel() {
     use stratum_core::binary_sv2;
     use stratum_core::mining_sv2::{NewMiningJob, SubmitSharesStandard, SubmitSharesSuccess};
     let (node, _, v2_port) = start_stratum_v2_node(&[]);
-    let addr = DeterministicWallet::from_secret(STRATUM_MINER_SECRET).address.to_string();
+    let addr = DeterministicWallet::from_secret(STRATUM_MINER_SECRET)
+        .address
+        .to_string();
     node.rpc_ok("generatetoaddress", vec![json!(5), json!(addr)]);
     let best = get_rpc_str(&node, "getbestblockhash").unwrap();
 
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
-        let mut miner = sv2::Client::connect(v2_port, None).await.expect("handshake");
+        let mut miner = sv2::Client::connect(v2_port, None)
+            .await
+            .expect("handshake");
         miner.setup().await;
         let (channel_id, target_le) = miner.open_standard(&format!("{addr}.rig")).await;
         assert_ne!(target_le, [0u8; 32]);
@@ -23433,10 +25386,17 @@ fn stratum_v2_handshake_and_standard_channel() {
         let (job_id, prev, min_ntime, nbits, merkle_root, version) = loop {
             let mut payload = miner.expect(0x15, Duration::from_secs(10)).await;
             let job: NewMiningJob = binary_sv2::from_bytes(&mut payload).unwrap();
-            assert!(job.is_future(), "a channel's first job on a tip is a future job");
-            let (job_id, root, version) =
-                (job.job_id, job.merkle_root.inner_as_ref().to_vec(), job.version);
-            let (activated, prev, min_ntime, nbits) = miner.set_new_prev_hash(Duration::from_secs(10)).await;
+            assert!(
+                job.is_future(),
+                "a channel's first job on a tip is a future job"
+            );
+            let (job_id, root, version) = (
+                job.job_id,
+                job.merkle_root.inner_as_ref().to_vec(),
+                job.version,
+            );
+            let (activated, prev, min_ntime, nbits) =
+                miner.set_new_prev_hash(Duration::from_secs(10)).await;
             assert_eq!(activated, job_id);
             assert_eq!(nbits, 0x207fffff);
             if prev == best {
@@ -23478,7 +25438,11 @@ fn stratum_v2_handshake_and_standard_channel() {
         "the standard-channel block connects",
     );
     let status = node.rpc_ok("getserverstatus", vec![]);
-    assert_eq!(status["stratum_v2"]["bind"], format!("127.0.0.1:{v2_port}"), "{status}");
+    assert_eq!(
+        status["stratum_v2"]["bind"],
+        format!("127.0.0.1:{v2_port}"),
+        "{status}"
+    );
 }
 
 /// A channel whose miner never stops submitting still gets the new tip, as on
@@ -23489,27 +25453,43 @@ fn stratum_v2_handshake_and_standard_channel() {
 #[cfg(feature = "stratum-v2")]
 #[test]
 fn stratum_v2_new_work_reaches_a_miner_that_never_stops_submitting() {
+    use bitcoin::hashes::Hash as _;
     use serde_json::json;
     use stratum_core::binary_sv2;
-    use bitcoin::hashes::Hash as _;
     use stratum_core::mining_sv2::{NewMiningJob, SetNewPrevHash, SubmitSharesStandard};
     let (node, _, v2_port) = start_stratum_v2_node(&[]);
-    let addr = DeterministicWallet::from_secret(STRATUM_MINER_SECRET).address.to_string();
+    let addr = DeterministicWallet::from_secret(STRATUM_MINER_SECRET)
+        .address
+        .to_string();
     node.rpc_ok("generatetoaddress", vec![json!(1), json!(addr)]);
     let best = get_rpc_str(&node, "getbestblockhash").unwrap();
 
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
-        let mut miner = sv2::Client::connect(v2_port, None).await.expect("handshake");
+        let mut miner = sv2::Client::connect(v2_port, None)
+            .await
+            .expect("handshake");
         miner.setup().await;
         let (channel_id, _) = miner.open_standard(&addr).await;
         let (job_id, prev, min_ntime, nbits, root, version) = loop {
             let mut payload = miner.expect(0x15, Duration::from_secs(10)).await;
             let job: NewMiningJob = binary_sv2::from_bytes(&mut payload).unwrap();
-            let (job_id, root, version) = (job.job_id, job.merkle_root.inner_as_ref().to_vec(), job.version);
-            let (_, prev, min_ntime, nbits) = miner.set_new_prev_hash(Duration::from_secs(10)).await;
+            let (job_id, root, version) = (
+                job.job_id,
+                job.merkle_root.inner_as_ref().to_vec(),
+                job.version,
+            );
+            let (_, prev, min_ntime, nbits) =
+                miner.set_new_prev_hash(Duration::from_secs(10)).await;
             if prev == best {
-                break (job_id, prev, min_ntime, nbits, <[u8; 32]>::try_from(root).unwrap(), version);
+                break (
+                    job_id,
+                    prev,
+                    min_ntime,
+                    nbits,
+                    <[u8; 32]>::try_from(root).unwrap(),
+                    version,
+                );
             }
         };
 
@@ -23524,11 +25504,20 @@ fn stratum_v2_new_work_reaches_a_miner_that_never_stops_submitting() {
             nonce: 0,
         };
         let mut sequence_number = 0u32;
-        let shares = std::iter::from_fn(move || loop {
-            header.nonce = header.nonce.wrapping_add(1);
-            if header.validate_pow(header.target()).is_ok() {
-                sequence_number += 1;
-                return Some(SubmitSharesStandard { channel_id, sequence_number, job_id, nonce: header.nonce, ntime: min_ntime, version });
+        let shares = std::iter::from_fn(move || {
+            loop {
+                header.nonce = header.nonce.wrapping_add(1);
+                if header.validate_pow(header.target()).is_ok() {
+                    sequence_number += 1;
+                    return Some(SubmitSharesStandard {
+                        channel_id,
+                        sequence_number,
+                        job_id,
+                        nonce: header.nonce,
+                        ntime: min_ntime,
+                        version,
+                    });
+                }
             }
         });
         let (mut reader, flood) = miner.flood(0x1a, shares);
@@ -23542,7 +25531,10 @@ fn stratum_v2_new_work_reaches_a_miner_that_never_stops_submitting() {
             })
             .await;
         flood.abort();
-        assert!(found.is_some(), "no SetNewPrevHash for the tip the miner's own block made");
+        assert!(
+            found.is_some(),
+            "no SetNewPrevHash for the tip the miner's own block made"
+        );
     });
 }
 
@@ -23553,14 +25545,23 @@ fn stratum_v2_new_work_reaches_a_miner_that_never_stops_submitting() {
 #[test]
 fn stratum_v2_channel_close_names_why() {
     let (node, _, v2_port) = start_stratum_v2_node(&["--loglevel=info"]);
-    let addr = DeterministicWallet::from_secret(STRATUM_MINER_SECRET).address.to_string();
+    let addr = DeterministicWallet::from_secret(STRATUM_MINER_SECRET)
+        .address
+        .to_string();
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
-        let mut miner = sv2::Client::connect(v2_port, None).await.expect("handshake");
+        let mut miner = sv2::Client::connect(v2_port, None)
+            .await
+            .expect("handshake");
         miner.setup().await;
         miner.open_standard(&format!("{addr}.rig")).await;
         // A second SetupConnection is a protocol violation; the server closes.
-        miner.send_setup(stratum_core::common_messages_sv2::Protocol::MiningProtocol, 0b100).await;
+        miner
+            .send_setup(
+                stratum_core::common_messages_sv2::Protocol::MiningProtocol,
+                0b100,
+            )
+            .await;
         tokio::time::sleep(Duration::from_millis(500)).await;
     });
     let closed = || {
@@ -23570,7 +25571,11 @@ fn stratum_v2_channel_close_names_why() {
             .find(|l| l.contains("Stratum V2 channel closed"))
             .map(str::to_string)
     };
-    poll_until(|| closed().is_some(), test_timeout(10), "the channel's close line");
+    poll_until(
+        || closed().is_some(),
+        test_timeout(10),
+        "the channel's close line",
+    );
     let line = closed().unwrap();
     assert!(line.contains("reason=\"protocol violation\""), "{line}");
 }
@@ -23581,11 +25586,16 @@ fn stratum_v2_extended_share_connects_block() {
     use bitcoin::hashes::{Hash, sha256d};
     use serde_json::json;
     use stratum_core::binary_sv2::{self, B032};
-    use stratum_core::mining_sv2::{NewExtendedMiningJob, SubmitSharesExtended, SubmitSharesSuccess};
+    use stratum_core::mining_sv2::{
+        NewExtendedMiningJob, SubmitSharesExtended, SubmitSharesSuccess,
+    };
     // `-debug=stratum` too, for the channel's device and close lines below.
     let (node, _, v2_port) = start_stratum_v2_node(&["--debug=stratum"]);
     let funder = DeterministicWallet::from_secret([0x6b; 32]);
-    node.rpc_ok("generatetoaddress", vec![json!(101), json!(funder.address.to_string())]);
+    node.rpc_ok(
+        "generatetoaddress",
+        vec![json!(101), json!(funder.address.to_string())],
+    );
     let dest = DeterministicWallet::from_secret([0x6c; 32]);
     let (raw_hex, txid) = common::build_signed_p2wpkh_spend_from_block1_coinbase(
         &node,
@@ -23594,32 +25604,45 @@ fn stratum_v2_extended_share_connects_block() {
         2_000,
     );
     node.rpc_ok("sendrawtransaction", vec![json!(raw_hex)]);
-    let miner_addr = DeterministicWallet::from_secret(STRATUM_MINER_SECRET).address.to_string();
+    let miner_addr = DeterministicWallet::from_secret(STRATUM_MINER_SECRET)
+        .address
+        .to_string();
 
     let rt = tokio::runtime::Runtime::new().unwrap();
     let height = rt.block_on(async {
-        let mut miner = sv2::Client::connect(v2_port, None).await.expect("handshake");
+        let mut miner = sv2::Client::connect(v2_port, None)
+            .await
+            .expect("handshake");
         miner.setup().await;
         let (channel_id, prefix, size) = miner.open_extended(&miner_addr, 2).await;
         assert_eq!(size, 2, "the requested extranonce range is granted");
         assert_eq!(prefix.len(), 8);
         // A new tip whose block leaves the mempool transaction for the next.
         tokio::task::block_in_place(|| {
-            node.rpc_ok("generateblock", vec![json!(funder.address.to_string()), json!([])])
+            node.rpc_ok(
+                "generateblock",
+                vec![json!(funder.address.to_string()), json!([])],
+            )
         });
         let best = tokio::task::block_in_place(|| get_rpc_str(&node, "getbestblockhash")).unwrap();
-        let next_height = tokio::task::block_in_place(|| get_rpc_u64(&node, "getblockcount")).unwrap() + 1;
+        let next_height =
+            tokio::task::block_in_place(|| get_rpc_u64(&node, "getblockcount")).unwrap() + 1;
         let (job, prev, min_ntime, nbits) = loop {
             let mut payload = miner.expect(0x1f, Duration::from_secs(10)).await;
             let job: NewExtendedMiningJob = binary_sv2::from_bytes(&mut payload).unwrap();
             let job = (
                 job.job_id,
                 job.version,
-                job.merkle_path.inner_as_ref().iter().map(|p| p.to_vec()).collect::<Vec<_>>(),
+                job.merkle_path
+                    .inner_as_ref()
+                    .iter()
+                    .map(|p| p.to_vec())
+                    .collect::<Vec<_>>(),
                 job.coinbase_tx_prefix.inner_as_ref().to_vec(),
                 job.coinbase_tx_suffix.inner_as_ref().to_vec(),
             );
-            let (activated, prev, min_ntime, nbits) = miner.set_new_prev_hash(Duration::from_secs(10)).await;
+            let (activated, prev, min_ntime, nbits) =
+                miner.set_new_prev_hash(Duration::from_secs(10)).await;
             assert_eq!(activated, job.0);
             if prev == best {
                 break (job, prev, min_ntime, nbits);
@@ -23678,19 +25701,42 @@ fn stratum_v2_extended_share_connects_block() {
     // The channel's lines: the device it set up with, and on disconnect the
     // share it had accepted — the block.
     poll_until(
-        || std::fs::read_to_string(&node.stderr_log).unwrap_or_default().contains("Stratum V2 channel closed"),
+        || {
+            std::fs::read_to_string(&node.stderr_log)
+                .unwrap_or_default()
+                .contains("Stratum V2 channel closed")
+        },
         test_timeout(10),
         "the channel's close line",
     );
     let log = std::fs::read_to_string(&node.stderr_log).unwrap();
-    let find = |needle: &str| log.lines().find(|l| l.contains(needle)).unwrap_or_else(|| panic!("no {needle:?}:\n{log}"));
-    assert!(find("Stratum V2 SetupConnection").contains("device=test-miner"), "{log}");
+    let find = |needle: &str| {
+        log.lines()
+            .find(|l| l.contains(needle))
+            .unwrap_or_else(|| panic!("no {needle:?}:\n{log}"))
+    };
+    assert!(
+        find("Stratum V2 SetupConnection").contains("device=test-miner"),
+        "{log}"
+    );
     let opened = find("Stratum V2 channel opened");
-    assert!(opened.contains("kind=\"extended\"") && opened.contains("device=test-miner"), "{opened}");
+    assert!(
+        opened.contains("kind=\"extended\"") && opened.contains("device=test-miner"),
+        "{opened}"
+    );
     let closed = find("Stratum V2 channel closed");
-    assert!(closed.contains("accepted=1") && closed.contains("rejected=0"), "{closed}");
-    assert!(closed.contains("reason=\"end of stream\""), "a miner hanging up is not a read failure: {closed}");
-    assert!(!closed.contains("best_share=0.000"), "the block is the best share: {closed}");
+    assert!(
+        closed.contains("accepted=1") && closed.contains("rejected=0"),
+        "{closed}"
+    );
+    assert!(
+        closed.contains("reason=\"end of stream\""),
+        "a miner hanging up is not a read failure: {closed}"
+    );
+    assert!(
+        !closed.contains("best_share=0.000"),
+        "the block is the best share: {closed}"
+    );
 }
 
 #[cfg(feature = "stratum-v2")]
@@ -23700,17 +25746,24 @@ fn stratum_v2_authority_key_persists_across_restart() {
     let key_path = node.datadir.join("regtest").join("stratum_v2.key");
     let read_pubkey = || {
         let hex_key = std::fs::read_to_string(&key_path).expect("the key file was created");
-        let secret = bitcoin::secp256k1::SecretKey::from_slice(&hex::decode(hex_key.trim()).unwrap()).unwrap();
+        let secret =
+            bitcoin::secp256k1::SecretKey::from_slice(&hex::decode(hex_key.trim()).unwrap())
+                .unwrap();
         let secp = bitcoin::secp256k1::Secp256k1::signing_only();
         secret.x_only_public_key(&secp).0.serialize()
     };
     let pubkey = read_pubkey();
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
-        sv2::Client::connect(v2_port, Some(pubkey)).await.expect("the pinned key verifies");
+        sv2::Client::connect(v2_port, Some(pubkey))
+            .await
+            .expect("the pinned key verifies");
         let other = {
             let secret = bitcoin::secp256k1::SecretKey::from_slice(&[0x42; 32]).unwrap();
-            secret.x_only_public_key(&bitcoin::secp256k1::Secp256k1::signing_only()).0.serialize()
+            secret
+                .x_only_public_key(&bitcoin::secp256k1::Secp256k1::signing_only())
+                .0
+                .serialize()
         };
         assert!(
             sv2::Client::connect(v2_port, Some(other)).await.is_err(),
@@ -23723,7 +25776,11 @@ fn stratum_v2_authority_key_persists_across_restart() {
         &format!("--stratumbind=127.0.0.1:{v1_port}"),
         &format!("--stratumv2bind=127.0.0.1:{v2_port}"),
     ]);
-    assert_eq!(read_pubkey(), pubkey, "the key file is reused, not regenerated");
+    assert_eq!(
+        read_pubkey(),
+        pubkey,
+        "the key file is reused, not regenerated"
+    );
     rt.block_on(async {
         sv2::Client::connect(v2_port, Some(pubkey))
             .await
@@ -23736,12 +25793,16 @@ fn stratum_v2_authority_key_persists_across_restart() {
 fn stratum_v1_and_v2_share_one_job_stream() {
     use serde_json::json;
     let (node, v1_port, v2_port) = start_stratum_v2_node(&[]);
-    let addr = DeterministicWallet::from_secret(STRATUM_MINER_SECRET).address.to_string();
+    let addr = DeterministicWallet::from_secret(STRATUM_MINER_SECRET)
+        .address
+        .to_string();
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
         let mut v1 = plain_stratum_client(v1_port);
         v1.handshake(&addr).await;
-        let mut v2 = sv2::Client::connect(v2_port, None).await.expect("handshake");
+        let mut v2 = sv2::Client::connect(v2_port, None)
+            .await
+            .expect("handshake");
         v2.setup().await;
         v2.open_standard(&addr).await;
         v2.set_new_prev_hash(Duration::from_secs(10)).await;
@@ -23753,13 +25814,17 @@ fn stratum_v1_and_v2_share_one_job_stream() {
         let deadline = Duration::from_secs(5);
         let start = tokio::time::Instant::now();
         loop {
-            let n = v1.notification("mining.notify", deadline.saturating_sub(start.elapsed())).await;
+            let n = v1
+                .notification("mining.notify", deadline.saturating_sub(start.elapsed()))
+                .await;
             if notify_prevhash(&n["params"]) == tip {
                 break;
             }
         }
         loop {
-            let (_, prev, _, _) = v2.set_new_prev_hash(deadline.saturating_sub(start.elapsed())).await;
+            let (_, prev, _, _) = v2
+                .set_new_prev_hash(deadline.saturating_sub(start.elapsed()))
+                .await;
             if prev == tip {
                 break;
             }
@@ -23780,7 +25845,11 @@ fn sv2_declared_coinbase(
 ) -> (Vec<u8>, Vec<u8>, Vec<bitcoin::TxOut>) {
     use bitcoin::hashes::{Hash, sha256d};
     let mut leaves = vec![[0u8; 32]];
-    leaves.extend(txs.iter().map(|t| node::validation::decode::wtxid(t).to_raw_hash().to_byte_array()));
+    leaves.extend(txs.iter().map(|t| {
+        node::validation::decode::wtxid(t)
+            .to_raw_hash()
+            .to_byte_array()
+    }));
     while leaves.len() > 1 {
         if leaves.len() % 2 == 1 {
             leaves.push(*leaves.last().unwrap());
@@ -23799,10 +25868,19 @@ fn sv2_declared_coinbase(
     let mut commitment = vec![0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed];
     commitment.extend_from_slice(&sha256d::Hash::hash(&preimage).to_byte_array());
     let outputs = vec![
-        bitcoin::TxOut { value: bitcoin::Amount::from_sat(value), script_pubkey: payout.clone() },
-        bitcoin::TxOut { value: bitcoin::Amount::ZERO, script_pubkey: bitcoin::ScriptBuf::from_bytes(commitment) },
+        bitcoin::TxOut {
+            value: bitcoin::Amount::from_sat(value),
+            script_pubkey: payout.clone(),
+        },
+        bitcoin::TxOut {
+            value: bitcoin::Amount::ZERO,
+            script_pubkey: bitcoin::ScriptBuf::from_bytes(commitment),
+        },
     ];
-    let height_push = bitcoin::script::Builder::new().push_int(i64::from(height)).into_script().into_bytes();
+    let height_push = bitcoin::script::Builder::new()
+        .push_int(i64::from(height))
+        .into_script()
+        .into_bytes();
     let mut prefix = 2u32.to_le_bytes().to_vec();
     prefix.push(1);
     prefix.extend_from_slice(&[0u8; 32]);
@@ -23820,17 +25898,21 @@ fn sv2_declared_coinbase(
 fn stratum_v2_jd_declared_job_mines_a_block() {
     use bitcoin::hashes::{Hash, sha256d};
     use serde_json::json;
-    use stratum_core::binary_sv2::{self, B0255, B032, B064K, Seq0255, Seq064K, Str0255, U256};
+    use stratum_core::binary_sv2::{self, B032, B064K, B0255, Seq064K, Seq0255, Str0255, U256};
     use stratum_core::common_messages_sv2::Protocol;
     use stratum_core::job_declaration_sv2::{
-        AllocateMiningJobToken, AllocateMiningJobTokenSuccess, DeclareMiningJob, DeclareMiningJobSuccess,
+        AllocateMiningJobToken, AllocateMiningJobTokenSuccess, DeclareMiningJob,
+        DeclareMiningJobSuccess,
     };
     use stratum_core::mining_sv2::{
         SetCustomMiningJob, SetCustomMiningJobSuccess, SubmitSharesExtended, SubmitSharesSuccess,
     };
     let (node, _, v2_port) = start_stratum_v2_node(&["--stratumv2jd=1"]);
     let funder = DeterministicWallet::from_secret([0x7b; 32]);
-    node.rpc_ok("generatetoaddress", vec![json!(101), json!(funder.address.to_string())]);
+    node.rpc_ok(
+        "generatetoaddress",
+        vec![json!(101), json!(funder.address.to_string())],
+    );
     let dest = DeterministicWallet::from_secret([0x7c; 32]);
     let (raw_hex, txid) = common::build_signed_p2wpkh_spend_from_block1_coinbase(
         &node,
@@ -23839,7 +25921,8 @@ fn stratum_v2_jd_declared_job_mines_a_block() {
         2_000,
     );
     node.rpc_ok("sendrawtransaction", vec![json!(raw_hex.clone())]);
-    let tx: bitcoin::Transaction = bitcoin::consensus::deserialize(&hex::decode(&raw_hex).unwrap()).unwrap();
+    let tx: bitcoin::Transaction =
+        bitcoin::consensus::deserialize(&hex::decode(&raw_hex).unwrap()).unwrap();
     let miner = DeterministicWallet::from_secret(STRATUM_MINER_SECRET);
     let height = 102u32;
     let reward = 50 * 100_000_000 + 2_000;
@@ -23847,12 +25930,16 @@ fn stratum_v2_jd_declared_job_mines_a_block() {
     // Blocks generated faster than one a second carry timestamps ahead of the
     // wall clock, so the median time past can be too; the tip's timestamp is
     // safely above it.
-    let tip_time = node.rpc_ok("getblockheader", vec![json!(best)])["time"].as_u64().unwrap() as u32;
+    let tip_time = node.rpc_ok("getblockheader", vec![json!(best)])["time"]
+        .as_u64()
+        .unwrap() as u32;
 
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
         // Job Declaration connection: a token, then the declared job.
-        let mut jdc = sv2::Client::connect(v2_port, None).await.expect("handshake");
+        let mut jdc = sv2::Client::connect(v2_port, None)
+            .await
+            .expect("handshake");
         jdc.setup_with(Protocol::JobDeclarationProtocol, 0).await;
         jdc.send(
             0x50,
@@ -23863,14 +25950,20 @@ fn stratum_v2_jd_declared_job_mines_a_block() {
         )
         .await;
         let mut payload = jdc.expect(0x51, Duration::from_secs(10)).await;
-        let allocated: AllocateMiningJobTokenSuccess = binary_sv2::from_bytes(&mut payload).unwrap();
+        let allocated: AllocateMiningJobTokenSuccess =
+            binary_sv2::from_bytes(&mut payload).unwrap();
         let token = allocated.mining_job_token.inner_as_ref().to_vec();
         let required: Vec<bitcoin::TxOut> =
             bitcoin::consensus::deserialize(allocated.coinbase_outputs.inner_as_ref()).unwrap();
         assert_eq!(required[0].script_pubkey, miner.address.script_pubkey());
 
-        let (prefix, suffix, outputs) =
-            sv2_declared_coinbase(height, &miner.address.script_pubkey(), reward, std::slice::from_ref(&tx), 8);
+        let (prefix, suffix, outputs) = sv2_declared_coinbase(
+            height,
+            &miner.address.script_pubkey(),
+            reward,
+            std::slice::from_ref(&tx),
+            8,
+        );
         jdc.send(
             0x57,
             DeclareMiningJob {
@@ -23879,7 +25972,12 @@ fn stratum_v2_jd_declared_job_mines_a_block() {
                 version: 0x2000_0000,
                 coinbase_tx_prefix: B064K::try_from(prefix).unwrap(),
                 coinbase_tx_suffix: B064K::try_from(suffix).unwrap(),
-                wtxid_list: Seq064K::new(vec![U256::from(node::validation::decode::wtxid(&tx).to_raw_hash().to_byte_array())]).unwrap(),
+                wtxid_list: Seq064K::new(vec![U256::from(
+                    node::validation::decode::wtxid(&tx)
+                        .to_raw_hash()
+                        .to_byte_array(),
+                )])
+                .unwrap(),
                 excess_data: B064K::try_from(Vec::new()).unwrap(),
             },
         )
@@ -23890,12 +25988,19 @@ fn stratum_v2_jd_declared_job_mines_a_block() {
 
         // Mining connection with work selection: an extended channel and a
         // custom job on the declared set.
-        let mut miner_conn = sv2::Client::connect(v2_port, None).await.expect("handshake");
+        let mut miner_conn = sv2::Client::connect(v2_port, None)
+            .await
+            .expect("handshake");
         miner_conn.setup_with(Protocol::MiningProtocol, 0b110).await;
-        let (channel_id, extranonce_prefix, size) = miner_conn.open_extended(&miner.address.to_string(), 4).await;
+        let (channel_id, extranonce_prefix, size) = miner_conn
+            .open_extended(&miner.address.to_string(), 4)
+            .await;
         let min_ntime = tip_time + 1;
         let prev = sv2::internal(&best);
-        let height_push = bitcoin::script::Builder::new().push_int(i64::from(height)).into_script().into_bytes();
+        let height_push = bitcoin::script::Builder::new()
+            .push_int(i64::from(height))
+            .into_script()
+            .into_bytes();
         let outputs_bytes = bitcoin::consensus::serialize(&outputs);
         let txid_bytes = tx.compute_txid().to_raw_hash().to_byte_array();
         miner_conn
@@ -23963,28 +26068,43 @@ fn stratum_v2_jd_declared_job_mines_a_block() {
         test_timeout(10),
         "the block mined on the declared job connects",
     );
-    let block = node.rpc_ok("getblock", vec![json!(get_rpc_str(&node, "getbestblockhash").unwrap()), json!(2)]);
+    let block = node.rpc_ok(
+        "getblock",
+        vec![
+            json!(get_rpc_str(&node, "getbestblockhash").unwrap()),
+            json!(2),
+        ],
+    );
     let txs = block["tx"].as_array().unwrap();
     assert_eq!(txs.len(), 2, "{block}");
     assert_eq!(txs[1]["txid"], txid);
-    assert_eq!(txs[0]["vout"][0]["scriptPubKey"]["address"], miner.address.to_string());
+    assert_eq!(
+        txs[0]["vout"][0]["scriptPubKey"]["address"],
+        miner.address.to_string()
+    );
 }
 
 #[cfg(feature = "stratum-v2")]
 #[test]
 fn stratum_v2_jd_refuses_a_transaction_not_in_the_mempool() {
     use serde_json::json;
-    use stratum_core::binary_sv2::{self, B0255, B064K, Seq064K, Str0255, U256};
+    use stratum_core::binary_sv2::{self, B064K, B0255, Seq064K, Str0255, U256};
     use stratum_core::common_messages_sv2::Protocol;
     use stratum_core::job_declaration_sv2::{
-        AllocateMiningJobToken, AllocateMiningJobTokenSuccess, DeclareMiningJob, DeclareMiningJobError,
+        AllocateMiningJobToken, AllocateMiningJobTokenSuccess, DeclareMiningJob,
+        DeclareMiningJobError,
     };
     let (node, _, v2_port) = start_stratum_v2_node(&["--stratumv2jd=1"]);
     let miner = DeterministicWallet::from_secret(STRATUM_MINER_SECRET);
-    node.rpc_ok("generatetoaddress", vec![json!(1), json!(miner.address.to_string())]);
+    node.rpc_ok(
+        "generatetoaddress",
+        vec![json!(1), json!(miner.address.to_string())],
+    );
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
-        let mut jdc = sv2::Client::connect(v2_port, None).await.expect("handshake");
+        let mut jdc = sv2::Client::connect(v2_port, None)
+            .await
+            .expect("handshake");
         jdc.setup_with(Protocol::JobDeclarationProtocol, 0).await;
         jdc.send(
             0x50,
@@ -23995,9 +26115,11 @@ fn stratum_v2_jd_refuses_a_transaction_not_in_the_mempool() {
         )
         .await;
         let mut payload = jdc.expect(0x51, Duration::from_secs(10)).await;
-        let allocated: AllocateMiningJobTokenSuccess = binary_sv2::from_bytes(&mut payload).unwrap();
+        let allocated: AllocateMiningJobTokenSuccess =
+            binary_sv2::from_bytes(&mut payload).unwrap();
         let token = allocated.mining_job_token.inner_as_ref().to_vec();
-        let (prefix, suffix, _) = sv2_declared_coinbase(2, &miner.address.script_pubkey(), 50 * 100_000_000, &[], 8);
+        let (prefix, suffix, _) =
+            sv2_declared_coinbase(2, &miner.address.script_pubkey(), 50 * 100_000_000, &[], 8);
         jdc.send(
             0x57,
             DeclareMiningJob {
@@ -24013,15 +26135,23 @@ fn stratum_v2_jd_refuses_a_transaction_not_in_the_mempool() {
         .await;
         let mut payload = jdc.expect(0x59, Duration::from_secs(10)).await;
         let refused: DeclareMiningJobError = binary_sv2::from_bytes(&mut payload).unwrap();
-        assert_eq!(refused.error_code.inner_as_ref(), b"invalid-job-param-value-wtxid_list");
-        assert!(String::from_utf8_lossy(refused.error_details.inner_as_ref()).contains("not in this node's mempool"));
+        assert_eq!(
+            refused.error_code.inner_as_ref(),
+            b"invalid-job-param-value-wtxid_list"
+        );
+        assert!(
+            String::from_utf8_lossy(refused.error_details.inner_as_ref())
+                .contains("not in this node's mempool")
+        );
     });
 
     // Job Declaration is off unless asked for.
     let (_plain, _, v2_plain) = start_stratum_v2_node(&[]);
     rt.block_on(async {
         use stratum_core::common_messages_sv2::SetupConnection;
-        let mut jdc = sv2::Client::connect(v2_plain, None).await.expect("handshake");
+        let mut jdc = sv2::Client::connect(v2_plain, None)
+            .await
+            .expect("handshake");
         let s = |v: &str| Str0255::try_from(v.to_string()).unwrap();
         jdc.send(
             0x00,
@@ -24054,17 +26184,27 @@ fn getstratuminfo_reports_live_counters() {
         &format!("--metricsport={metrics_port}"),
     ]);
     let metrics = |port: u16| -> String {
-        let client = reqwest::blocking::Client::builder().timeout(Duration::from_secs(5)).build().unwrap();
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
-            match client.get(format!("http://127.0.0.1:{port}/metrics")).send() {
+            match client
+                .get(format!("http://127.0.0.1:{port}/metrics"))
+                .send()
+            {
                 Ok(r) => return r.text().unwrap(),
-                Err(_) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(100)),
+                Err(_) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(100))
+                }
                 Err(e) => panic!("metrics on {port}: {e}"),
             }
         }
     };
-    let addr = DeterministicWallet::from_secret(STRATUM_MINER_SECRET).address.to_string();
+    let addr = DeterministicWallet::from_secret(STRATUM_MINER_SECRET)
+        .address
+        .to_string();
     let before = node.rpc_ok("getstratuminfo", vec![]);
     assert_eq!(before["enabled"], true, "{before}");
     assert_eq!(before["listeners"]["v1"], format!("127.0.0.1:{port}"));
@@ -24083,11 +26223,22 @@ fn getstratuminfo_reports_live_counters() {
         let reply = client
             .call(
                 "mining.submit",
-                json!([worker, params[0], hex::encode(extranonce2), format!("{ntime:08x}"), format!("{nonce:08x}")]),
+                json!([
+                    worker,
+                    params[0],
+                    hex::encode(extranonce2),
+                    format!("{ntime:08x}"),
+                    format!("{nonce:08x}")
+                ]),
             )
             .await;
         assert_eq!(reply["result"], true, "{reply}");
-        let stale = client.call("mining.submit", json!([worker, "ffff", "00000000", "00000000", "00000000"])).await;
+        let stale = client
+            .call(
+                "mining.submit",
+                json!([worker, "ffff", "00000000", "00000000", "00000000"]),
+            )
+            .await;
         assert_eq!(stale["error"][0], 21);
 
         let info = tokio::task::block_in_place(|| node.rpc_ok("getstratuminfo", vec![]));
@@ -24109,18 +26260,31 @@ fn getstratuminfo_reports_live_counters() {
         assert_eq!(m["device"], "test-miner/1.0", "{m}");
         assert!(m["channel_id"].is_null(), "{m}");
         assert_eq!(m["difficulty"], 1, "{m}");
-        assert_eq!(m["shares"], json!({"accepted": 1, "rejected": 0, "stale": 1}), "{m}");
+        assert_eq!(
+            m["shares"],
+            json!({"accepted": 1, "rejected": 0, "stale": 1}),
+            "{m}"
+        );
         assert!(m["best_share_difficulty"].as_f64().unwrap() > 0.0, "{m}");
-        assert!(m["last_share_time"].as_u64().unwrap() >= m["connected_time"].as_u64().unwrap(), "{m}");
+        assert!(
+            m["last_share_time"].as_u64().unwrap() >= m["connected_time"].as_u64().unwrap(),
+            "{m}"
+        );
         assert!(m["peer"].as_str().unwrap().starts_with("127.0.0.1:"), "{m}");
         assert!(m["hashrate"].as_f64().is_some(), "{m}");
         assert_eq!(info["hashrate"], m["hashrate"], "{info}");
 
         let body = tokio::task::block_in_place(|| metrics(metrics_port));
         assert!(body.contains("satd_stratum_miners 1"), "{body}");
-        assert!(body.contains("satd_stratum_shares_total{result=\"accepted\"} 1"), "{body}");
+        assert!(
+            body.contains("satd_stratum_shares_total{result=\"accepted\"} 1"),
+            "{body}"
+        );
         assert!(body.contains("satd_stratum_blocks_found_total 1"), "{body}");
-        assert!(body.contains("satd_stratum_hashrate_hashes_per_second "), "{body}");
+        assert!(
+            body.contains("satd_stratum_hashrate_hashes_per_second "),
+            "{body}"
+        );
     });
     // The runtime, and the client with it, are gone: the miner leaves the list.
     drop(rt);
@@ -24137,7 +26301,10 @@ fn getstratuminfo_reports_live_counters() {
     assert_eq!(info["enabled"], false, "{info}");
     assert!(info["listeners"]["v1"].is_null());
     assert_eq!(info["miners"], json!([]), "{info}");
-    assert!(!metrics(off_metrics).contains("satd_stratum_"), "no Stratum families without the server");
+    assert!(
+        !metrics(off_metrics).contains("satd_stratum_"),
+        "no Stratum families without the server"
+    );
 }
 
 /// `getmempoolsummary` must agree, field for field, with the
@@ -24189,7 +26356,11 @@ fn getmempoolsummary_agrees_with_getrawmempool_verbose() {
         .rpc_call_with_params("getrawmempool", vec![json!(true)])
         .unwrap();
     let verbose = verbose["result"].as_object().expect("verbose map");
-    assert_eq!(verbose.len(), 2, "parent and child are both in: {verbose:?}");
+    assert_eq!(
+        verbose.len(),
+        2,
+        "parent and child are both in: {verbose:?}"
+    );
 
     let summary = node.rpc_call("getmempoolsummary").unwrap();
     let summary = &summary["result"];
@@ -24198,7 +26369,10 @@ fn getmempoolsummary_agrees_with_getrawmempool_verbose() {
     // today.
     let info = node.rpc_call("getmempoolinfo").unwrap();
     assert_eq!(summary["size"], info["result"]["size"], "size: {summary}");
-    assert_eq!(summary["bytes"], info["result"]["bytes"], "bytes: {summary}");
+    assert_eq!(
+        summary["bytes"], info["result"]["bytes"],
+        "bytes: {summary}"
+    );
 
     // The histogram covers every transaction exactly once.
     let buckets = summary["vsize_histogram"].as_array().expect("histogram");
@@ -24220,10 +26394,16 @@ fn getmempoolsummary_agrees_with_getrawmempool_verbose() {
 
     // Every row must match the verbose entry for the same txid.
     let top = summary["top"].as_array().expect("top array");
-    assert_eq!(top.len(), 2, "both txs fit under the default top_n: {summary}");
+    assert_eq!(
+        top.len(),
+        2,
+        "both txs fit under the default top_n: {summary}"
+    );
     for row in top {
         let txid = row["txid"].as_str().expect("txid");
-        let v = verbose.get(txid).unwrap_or_else(|| panic!("{txid} absent from verbose"));
+        let v = verbose
+            .get(txid)
+            .unwrap_or_else(|| panic!("{txid} absent from verbose"));
         for field in [
             "vsize",
             "time",
@@ -24263,7 +26443,11 @@ fn getmempoolsummary_agrees_with_getrawmempool_verbose() {
         feerate(&top[0]) >= feerate(&top[1]),
         "top is sorted by ancestor feerate: {summary}"
     );
-    assert_eq!(top[0]["txid"].as_str(), Some(child_txid.as_str()), "{summary}");
+    assert_eq!(
+        top[0]["txid"].as_str(),
+        Some(child_txid.as_str()),
+        "{summary}"
+    );
 
     node.stop();
 }
@@ -24352,10 +26536,11 @@ fn psbt_losses(
     may_change: &[(usize, u64)],
 ) -> Vec<String> {
     let mut out = Vec::new();
-    let check = |label: String, map_index: usize,
-                     b: &satd_psbt::RawMap,
-                     a: &satd_psbt::RawMap,
-                     out: &mut Vec<String>| {
+    let check = |label: String,
+                 map_index: usize,
+                 b: &satd_psbt::RawMap,
+                 a: &satd_psbt::RawMap,
+                 out: &mut Vec<String>| {
         let kept: Vec<_> = b
             .pairs()
             .iter()
@@ -24381,7 +26566,13 @@ fn psbt_losses(
         }
     };
 
-    check("global map".to_string(), usize::MAX, &before.global, &after.global, &mut out);
+    check(
+        "global map".to_string(),
+        usize::MAX,
+        &before.global,
+        &after.global,
+        &mut out,
+    );
     for (i, map) in before.inputs.iter().enumerate() {
         match after.inputs.get(i) {
             Some(a) => check(format!("input {i}"), i, map, a, &mut out),
@@ -24406,9 +26597,9 @@ fn psbt_losses(
 #[test]
 fn bip375_survives_utxoupdatepsbt() {
     use base64::Engine as _;
-    use serde_json::json;
-    use satd_psbt::raw::RawPair;
     use satd_psbt::keys;
+    use satd_psbt::raw::RawPair;
+    use serde_json::json;
     use std::str::FromStr;
 
     let mut node = TestNode::start(&[]);
@@ -24416,7 +26607,8 @@ fn bip375_survives_utxoupdatepsbt() {
     node.mine_blocks(1, addr);
 
     let cb_txid = {
-        let hash = node.rpc_ok("getblockhash", vec![json!(1)])
+        let hash = node
+            .rpc_ok("getblockhash", vec![json!(1)])
             .as_str()
             .expect("a hash")
             .to_string();
@@ -24458,7 +26650,8 @@ fn bip375_survives_utxoupdatepsbt() {
     let before = psbt.clone();
     let b64 = base64::engine::general_purpose::STANDARD.encode(psbt.serialize());
 
-    let updated = node.rpc_ok("utxoupdatepsbt", vec![json!(b64)])
+    let updated = node
+        .rpc_ok("utxoupdatepsbt", vec![json!(b64)])
         .as_str()
         .expect("a base64 PSBT")
         .to_string();
@@ -24480,7 +26673,10 @@ fn bip375_survives_utxoupdatepsbt() {
     // Input 1 already had one, so it must be untouched, and nothing else in
     // the PSBT may have moved.
     let losses = psbt_losses(&before, &after, &[(0, keys::input::WITNESS_UTXO)]);
-    assert!(losses.is_empty(), "utxoupdatepsbt lost something: {losses:?}");
+    assert!(
+        losses.is_empty(),
+        "utxoupdatepsbt lost something: {losses:?}"
+    );
 
     // And the BIP 375 fields specifically, named rather than merely counted.
     for (i, map) in before.inputs.iter().enumerate() {
@@ -24513,7 +26709,8 @@ fn utxoupdatepsbt_is_a_byte_exact_noop_when_there_is_nothing_to_add() {
     let psbt = bip375_vector("can finalize: two inputs single-signer using global");
     let b64 = base64::engine::general_purpose::STANDARD.encode(psbt.serialize());
 
-    let updated = node.rpc_ok("utxoupdatepsbt", vec![json!(b64.clone())])
+    let updated = node
+        .rpc_ok("utxoupdatepsbt", vec![json!(b64.clone())])
         .as_str()
         .expect("a base64 PSBT")
         .to_string();
@@ -24607,7 +26804,10 @@ fn bip375_end_to_end_send_verify_and_scan() {
     node.mine_blocks(101, &wallet.address.to_string());
 
     let cb_txid = bitcoin::Txid::from_str(&common::block1_coinbase_txid(&node)).expect("a txid");
-    let outpoint = bitcoin::OutPoint { txid: cb_txid, vout: 0 };
+    let outpoint = bitcoin::OutPoint {
+        txid: cb_txid,
+        vout: 0,
+    };
     const SUBSIDY: u64 = 50 * 100_000_000;
     const FEE: u64 = 10_000;
     let sp_amount = SUBSIDY / 2;
@@ -24671,7 +26871,11 @@ fn bip375_end_to_end_send_verify_and_scan() {
 
     // The Signer: shares, proofs, output scripts, frozen transaction, then
     // signatures — in that order, because a signature commits to the outputs.
-    let inputs = [SpInput { outpoint, secret: wallet.sk, is_taproot: false }];
+    let inputs = [SpInput {
+        outpoint,
+        secret: wallet.sk,
+        is_taproot: false,
+    }];
     common::sp_send::fill_bip375(&secp, &mut psbt, &inputs, [0x7fu8; 32]).expect("fills");
     let signed = common::sp_send::sign_p2wpkh_inputs(&secp, &mut psbt, &wallet.sk).expect("signs");
     assert_eq!(signed, 1);
@@ -24690,7 +26894,10 @@ fn bip375_end_to_end_send_verify_and_scan() {
     // The Extractor.
     let finalized = node.rpc_ok("finalizepsbt", vec![json!(b64(&psbt))]);
     assert_eq!(finalized["complete"], true, "{finalized}");
-    let raw_tx = finalized["hex"].as_str().expect("a transaction").to_string();
+    let raw_tx = finalized["hex"]
+        .as_str()
+        .expect("a transaction")
+        .to_string();
 
     let txid = node.rpc_ok("sendrawtransaction", vec![json!(raw_tx)]);
     let txid = txid.as_str().expect("a txid").to_string();
@@ -24700,10 +26907,7 @@ fn bip375_end_to_end_send_verify_and_scan() {
     // sender and the index share no code, so this is the two halves agreeing.
     let tip = node.rpc_ok("getbestblockhash", vec![]);
     let tip = tip.as_str().expect("a hash").to_string();
-    let data = node.rpc_ok(
-        "getsilentpaymentblockdata",
-        vec![json!(tip), json!(1)],
-    );
+    let data = node.rpc_ok("getsilentpaymentblockdata", vec![json!(tip), json!(1)]);
     let tweaks = data["tweaks"].as_array().expect("an array");
     assert!(
         tweaks.iter().any(|t| t["txid"] == json!(txid)),
@@ -24751,7 +26955,10 @@ fn bip375_end_to_end_catches_a_tampered_share() {
     let mut node = TestNode::start(&["--silentpaymentindex=1"]);
     node.mine_blocks(101, &wallet.address.to_string());
     let cb_txid = bitcoin::Txid::from_str(&common::block1_coinbase_txid(&node)).expect("a txid");
-    let outpoint = bitcoin::OutPoint { txid: cb_txid, vout: 0 };
+    let outpoint = bitcoin::OutPoint {
+        txid: cb_txid,
+        vout: 0,
+    };
     const SUBSIDY: u64 = 50 * 100_000_000;
 
     let psbt = common::sp_send::build_psbt(
@@ -24773,14 +26980,21 @@ fn bip375_end_to_end_catches_a_tampered_share() {
     )
     .expect("a PSBT");
 
-    let inputs = [SpInput { outpoint, secret: wallet.sk, is_taproot: false }];
+    let inputs = [SpInput {
+        outpoint,
+        secret: wallet.sk,
+        is_taproot: false,
+    }];
     common::sp_send::fill_bip375(&secp, &mut psbt, &inputs, [0x7fu8; 32]).expect("fills");
     common::sp_send::sign_p2wpkh_inputs(&secp, &mut psbt, &wallet.sk).expect("signs");
 
     // Sanity: the untampered PSBT does verify, so what follows is about the
     // tampering and not about the fixture.
     let good = node.rpc_ok("analyzepsbt", vec![json!(b64(&psbt))]);
-    assert_eq!(good["silent_payments"]["outputs"][0]["status"], "ready", "{good}");
+    assert_eq!(
+        good["silent_payments"]["outputs"][0]["status"], "ready",
+        "{good}"
+    );
 
     // Replace the global ECDH share with another valid point. Its DLEQ proof
     // no longer covers it, and the output script no longer derives from it.
@@ -24800,10 +27014,7 @@ fn bip375_end_to_end_catches_a_tampered_share() {
 
     for extract in [true, false] {
         let refused = node
-            .rpc_call_with_params(
-                "finalizepsbt",
-                vec![json!(b64(&psbt)), json!(extract)],
-            )
+            .rpc_call_with_params("finalizepsbt", vec![json!(b64(&psbt)), json!(extract)])
             .expect("a response");
         assert_eq!(refused["error"]["code"], -22, "{refused}");
         let message = refused["error"]["message"].as_str().unwrap_or_default();
@@ -24842,7 +27053,10 @@ fn bip375_catches_a_prevout_that_disagrees_with_the_utxo_set() {
     let mut node = TestNode::start(&["--silentpaymentindex=1"]);
     node.mine_blocks(101, &wallet.address.to_string());
     let cb_txid = bitcoin::Txid::from_str(&common::block1_coinbase_txid(&node)).expect("a txid");
-    let outpoint = bitcoin::OutPoint { txid: cb_txid, vout: 0 };
+    let outpoint = bitcoin::OutPoint {
+        txid: cb_txid,
+        vout: 0,
+    };
     const SUBSIDY: u64 = 50 * 100_000_000;
 
     let psbt = common::sp_send::build_psbt(
@@ -24864,11 +27078,18 @@ fn bip375_catches_a_prevout_that_disagrees_with_the_utxo_set() {
     )
     .expect("a PSBT");
 
-    let inputs = [SpInput { outpoint, secret: wallet.sk, is_taproot: false }];
+    let inputs = [SpInput {
+        outpoint,
+        secret: wallet.sk,
+        is_taproot: false,
+    }];
     common::sp_send::fill_bip375(&secp, &mut psbt, &inputs, [0x7fu8; 32]).expect("fills");
     common::sp_send::sign_p2wpkh_inputs(&secp, &mut psbt, &wallet.sk).expect("signs");
     let good = node.rpc_ok("analyzepsbt", vec![json!(b64(&psbt))]);
-    assert_eq!(good["silent_payments"]["outputs"][0]["status"], "ready", "{good}");
+    assert_eq!(
+        good["silent_payments"]["outputs"][0]["status"], "ready",
+        "{good}"
+    );
 
     // Understate the previous output's amount. Everything the PSBT says about
     // itself still hangs together; only the chain disagrees.
@@ -24883,7 +27104,10 @@ fn bip375_catches_a_prevout_that_disagrees_with_the_utxo_set() {
     ));
 
     let bad = node.rpc_ok("analyzepsbt", vec![json!(b64(&psbt))]);
-    assert_eq!(bad["silent_payments"]["inputs"][0]["prevout"], "mismatch", "{bad}");
+    assert_eq!(
+        bad["silent_payments"]["inputs"][0]["prevout"], "mismatch",
+        "{bad}"
+    );
     assert_eq!(
         bad["silent_payments"]["outputs"][0]["status"], "invalid_prevout",
         "{bad}"
@@ -24923,14 +27147,23 @@ fn createpsbt_builds_a_silent_payment_psbt_that_verifies_and_sends() {
     let wallet = common::DeterministicWallet::from_secret([0x45u8; 32]);
     let scan_secret = SecretKey::from_slice(&[0x27u8; 32]).expect("a scan secret");
     let spend_secret = SecretKey::from_slice(&[0x28u8; 32]).expect("a spend secret");
-    let address = SpAddress::new(scan_secret.public_key(&secp), spend_secret.public_key(&secp));
+    let address = SpAddress::new(
+        scan_secret.public_key(&secp),
+        spend_secret.public_key(&secp),
+    );
     let sp1 = address.encode(bitcoin::Network::Regtest);
-    assert!(sp1.starts_with("tsp1"), "regtest uses the test prefix: {sp1}");
+    assert!(
+        sp1.starts_with("tsp1"),
+        "regtest uses the test prefix: {sp1}"
+    );
 
     let mut node = TestNode::start(&["--silentpaymentindex=1"]);
     node.mine_blocks(101, &wallet.address.to_string());
     let cb_txid = bitcoin::Txid::from_str(&common::block1_coinbase_txid(&node)).expect("a txid");
-    let outpoint = bitcoin::OutPoint { txid: cb_txid, vout: 0 };
+    let outpoint = bitcoin::OutPoint {
+        txid: cb_txid,
+        vout: 0,
+    };
 
     let inputs = json!([{ "txid": cb_txid.to_string(), "vout": 0 }]);
     // The array form, not the object form: a JSON object's key order is the
@@ -24957,7 +27190,10 @@ fn createpsbt_builds_a_silent_payment_psbt_that_verifies_and_sends() {
 
     // And `createrawtransaction` says why a raw transaction cannot pay one.
     let refused = node
-        .rpc_call_with_params("createrawtransaction", vec![inputs.clone(), outputs.clone()])
+        .rpc_call_with_params(
+            "createrawtransaction",
+            vec![inputs.clone(), outputs.clone()],
+        )
         .expect("a response");
     assert_eq!(refused["error"]["code"], -5, "{refused}");
     assert!(
@@ -24970,7 +27206,14 @@ fn createpsbt_builds_a_silent_payment_psbt_that_verifies_and_sends() {
 
     let created = node.rpc_ok(
         "createpsbt",
-        vec![inputs, outputs, json!(0), json!(null), json!(null), json!(2)],
+        vec![
+            inputs,
+            outputs,
+            json!(0),
+            json!(null),
+            json!(null),
+            json!(2),
+        ],
     );
     let b64 = created.as_str().expect("a base64 PSBT").to_string();
 
@@ -24979,7 +27222,11 @@ fn createpsbt_builds_a_silent_payment_psbt_that_verifies_and_sends() {
     // given: the PSBT itself carries only the two keys.
     let decoded = node.rpc_ok("decodepsbt", vec![json!(b64.clone())]);
     assert_eq!(decoded["psbt_version"], 2, "{decoded}");
-    assert_eq!(decoded["outputs"][0]["silent_payment"]["address"], json!(sp1), "{decoded}");
+    assert_eq!(
+        decoded["outputs"][0]["silent_payment"]["address"],
+        json!(sp1),
+        "{decoded}"
+    );
     assert!(
         decoded["outputs"][0]["script"].is_null(),
         "a silent payment output has no script until a Signer computes one: {decoded}"
@@ -24996,15 +27243,29 @@ fn createpsbt_builds_a_silent_payment_psbt_that_verifies_and_sends() {
     )
     .expect("a PSBT");
 
-    let sp_inputs = [SpInput { outpoint, secret: wallet.sk, is_taproot: false }];
+    let sp_inputs = [SpInput {
+        outpoint,
+        secret: wallet.sk,
+        is_taproot: false,
+    }];
     common::sp_send::fill_bip375(&secp, &mut psbt, &sp_inputs, [0x3au8; 32]).expect("fills");
     common::sp_send::sign_p2wpkh_inputs(&secp, &mut psbt, &wallet.sk).expect("signs");
     let signed = base64::engine::general_purpose::STANDARD.encode(psbt.serialize());
 
     let analyzed = node.rpc_ok("analyzepsbt", vec![json!(signed.clone())]);
-    assert_eq!(analyzed["silent_payments"]["outputs"][0]["status"], "ready", "{analyzed}");
-    assert_eq!(analyzed["silent_payments"]["outputs"][0]["script"], "matches", "{analyzed}");
-    assert_eq!(analyzed["silent_payments"]["outputs"][0]["address"], json!(sp1), "{analyzed}");
+    assert_eq!(
+        analyzed["silent_payments"]["outputs"][0]["status"], "ready",
+        "{analyzed}"
+    );
+    assert_eq!(
+        analyzed["silent_payments"]["outputs"][0]["script"], "matches",
+        "{analyzed}"
+    );
+    assert_eq!(
+        analyzed["silent_payments"]["outputs"][0]["address"],
+        json!(sp1),
+        "{analyzed}"
+    );
 
     let finalized = node.rpc_ok("finalizepsbt", vec![json!(signed)]);
     assert_eq!(finalized["complete"], true, "{finalized}");
@@ -25043,8 +27304,12 @@ fn createpsbt_allows_a_repeated_silent_payment_address() {
 
     let secp = Secp256k1::new();
     let address = SpAddress::new(
-        SecretKey::from_slice(&[0x29u8; 32]).unwrap().public_key(&secp),
-        SecretKey::from_slice(&[0x2au8; 32]).unwrap().public_key(&secp),
+        SecretKey::from_slice(&[0x29u8; 32])
+            .unwrap()
+            .public_key(&secp),
+        SecretKey::from_slice(&[0x2au8; 32])
+            .unwrap()
+            .public_key(&secp),
     );
     let sp1 = address.encode(bitcoin::Network::Regtest);
     let ordinary = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
@@ -25059,25 +27324,29 @@ fn createpsbt_allows_a_repeated_silent_payment_address() {
     );
     let created = node.rpc_call_raw_body(&body).expect("a response");
     assert!(created["error"].is_null(), "{created}");
-    let raw = satd_psbt::RawPsbt::parse(
-        &{
-            use base64::Engine as _;
-            base64::engine::general_purpose::STANDARD
-                .decode(created["result"].as_str().expect("a base64 PSBT"))
-                .expect("base64")
-        },
-    )
+    let raw = satd_psbt::RawPsbt::parse(&{
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD
+            .decode(created["result"].as_str().expect("a base64 PSBT"))
+            .expect("base64")
+    })
     .expect("a PSBT");
     assert_eq!(raw.outputs.len(), 2, "both payments are present");
     let amounts: Vec<i64> = raw
         .outputs
         .iter()
         .map(|o| {
-            let raw = o.get_single(satd_psbt::keys::output::AMOUNT).expect("an amount");
+            let raw = o
+                .get_single(satd_psbt::keys::output::AMOUNT)
+                .expect("an amount");
             i64::from_le_bytes(raw.try_into().expect("8 bytes"))
         })
         .collect();
-    assert_eq!(amounts, vec![1_000_000, 2_000_000], "each keeps its own amount");
+    assert_eq!(
+        amounts,
+        vec![1_000_000, 2_000_000],
+        "each keeps its own amount"
+    );
 
     // An ordinary address repeated is still Core's "duplicated address".
     let body = format!(
@@ -25109,7 +27378,14 @@ fn createpsbt_without_psbt_version_is_unchanged() {
     let bare = node.rpc_ok("createpsbt", vec![inputs.clone(), outputs.clone()]);
     let explicit_zero = node.rpc_ok(
         "createpsbt",
-        vec![inputs.clone(), outputs.clone(), json!(0), json!(null), json!(null), json!(0)],
+        vec![
+            inputs.clone(),
+            outputs.clone(),
+            json!(0),
+            json!(null),
+            json!(null),
+            json!(0),
+        ],
     );
     assert_eq!(bare, explicit_zero, "psbt_version=0 is the default");
 
@@ -25117,7 +27393,13 @@ fn createpsbt_without_psbt_version_is_unchanged() {
     // positional `replaceable` must not be read as the satd extension.
     let with_core_args = node.rpc_ok(
         "createpsbt",
-        vec![inputs.clone(), outputs.clone(), json!(0), json!(true), json!(2)],
+        vec![
+            inputs.clone(),
+            outputs.clone(),
+            json!(0),
+            json!(true),
+            json!(2),
+        ],
     );
     assert_eq!(with_core_args, bare, "{with_core_args}");
 
@@ -25132,7 +27414,9 @@ fn createpsbt_without_psbt_version_is_unchanged() {
     assert_eq!(
         satd_psbt::version_of_bytes(&{
             use base64::Engine as _;
-            base64::engine::general_purpose::STANDARD.decode(v2).expect("base64")
+            base64::engine::general_purpose::STANDARD
+                .decode(v2)
+                .expect("base64")
         })
         .expect("a version"),
         satd_psbt::PsbtVersion::V2
@@ -25155,8 +27439,12 @@ fn createpsbt_refuses_a_segwit_v2_input_with_a_silent_payment_recipient() {
     let secp = Secp256k1::new();
     let wallet = common::DeterministicWallet::from_secret([0x46u8; 32]);
     let address = SpAddress::new(
-        SecretKey::from_slice(&[0x2bu8; 32]).unwrap().public_key(&secp),
-        SecretKey::from_slice(&[0x2cu8; 32]).unwrap().public_key(&secp),
+        SecretKey::from_slice(&[0x2bu8; 32])
+            .unwrap()
+            .public_key(&secp),
+        SecretKey::from_slice(&[0x2cu8; 32])
+            .unwrap()
+            .public_key(&secp),
     );
     let sp1 = address.encode(bitcoin::Network::Regtest);
 
@@ -25164,15 +27452,12 @@ fn createpsbt_refuses_a_segwit_v2_input_with_a_silent_payment_recipient() {
     node.mine_blocks(101, &wallet.address.to_string());
 
     // Create a segwit v2 output and mine it, so the node has one to look up.
-    let v2_script = bitcoin::ScriptBuf::from_hex("5220000000000000000000000000000000000000000000000000000000000000dead")
-        .expect("a segwit v2 script");
-    let (raw, txid) = common::build_signed_p2wpkh_spend_of_coinbase(
-        &node,
-        &wallet,
-        1,
-        v2_script,
-        10_000,
-    );
+    let v2_script = bitcoin::ScriptBuf::from_hex(
+        "5220000000000000000000000000000000000000000000000000000000000000dead",
+    )
+    .expect("a segwit v2 script");
+    let (raw, txid) =
+        common::build_signed_p2wpkh_spend_of_coinbase(&node, &wallet, 1, v2_script, 10_000);
     node.rpc_ok("sendrawtransaction", vec![json!(raw)]);
     node.mine_blocks(1, &wallet.address.to_string());
 
@@ -25181,7 +27466,14 @@ fn createpsbt_refuses_a_segwit_v2_input_with_a_silent_payment_recipient() {
     let refused = node
         .rpc_call_with_params(
             "createpsbt",
-            vec![inputs.clone(), outputs.clone(), json!(0), json!(null), json!(null), json!(2)],
+            vec![
+                inputs.clone(),
+                outputs.clone(),
+                json!(0),
+                json!(null),
+                json!(null),
+                json!(2),
+            ],
         )
         .expect("a response");
     assert_eq!(refused["error"]["code"], -8, "{refused}");
@@ -25199,7 +27491,14 @@ fn createpsbt_refuses_a_segwit_v2_input_with_a_silent_payment_recipient() {
     let created = node
         .rpc_call_with_params(
             "createpsbt",
-            vec![inputs, ordinary, json!(0), json!(null), json!(null), json!(2)],
+            vec![
+                inputs,
+                ordinary,
+                json!(0),
+                json!(null),
+                json!(null),
+                json!(2),
+            ],
         )
         .expect("a response");
     assert!(created["error"].is_null(), "{created}");
@@ -25217,8 +27516,12 @@ fn createpsbt_refuses_an_address_it_cannot_pay() {
 
     let secp = Secp256k1::new();
     let address = SpAddress::new(
-        SecretKey::from_slice(&[0x2du8; 32]).unwrap().public_key(&secp),
-        SecretKey::from_slice(&[0x2eu8; 32]).unwrap().public_key(&secp),
+        SecretKey::from_slice(&[0x2du8; 32])
+            .unwrap()
+            .public_key(&secp),
+        SecretKey::from_slice(&[0x2eu8; 32])
+            .unwrap()
+            .public_key(&secp),
     );
 
     let mut node = TestNode::start(&[]);
@@ -25244,7 +27547,11 @@ fn createpsbt_refuses_an_address_it_cannot_pay() {
 
     // A future address version: the prefix matches, so this node recognises it
     // and says what it cannot do rather than calling it invalid.
-    let future = SpAddress { version: 1, ..address }.encode(bitcoin::Network::Regtest);
+    let future = SpAddress {
+        version: 1,
+        ..address
+    }
+    .encode(bitcoin::Network::Regtest);
     let refused = node
         .rpc_call_with_params(
             "createpsbt",
@@ -25294,13 +27601,19 @@ fn bip375_end_to_end_with_the_sat_cli_signer() {
     let wallet = common::DeterministicWallet::from_secret([0x47u8; 32]);
     let scan_secret = SecretKey::from_slice(&[0x2fu8; 32]).expect("a scan secret");
     let spend_secret = SecretKey::from_slice(&[0x30u8; 32]).expect("a spend secret");
-    let address = SpAddress::new(scan_secret.public_key(&secp), spend_secret.public_key(&secp));
+    let address = SpAddress::new(
+        scan_secret.public_key(&secp),
+        spend_secret.public_key(&secp),
+    );
     let sp1 = address.encode(bitcoin::Network::Regtest);
 
     let mut node = TestNode::start(&["--silentpaymentindex=1"]);
     node.mine_blocks(101, &wallet.address.to_string());
     let cb_txid = bitcoin::Txid::from_str(&common::block1_coinbase_txid(&node)).expect("a txid");
-    let outpoint = bitcoin::OutPoint { txid: cb_txid, vout: 0 };
+    let outpoint = bitcoin::OutPoint {
+        txid: cb_txid,
+        vout: 0,
+    };
 
     let sat_cli = {
         let satd_bin = env!("CARGO_BIN_EXE_satd");
@@ -25359,16 +27672,28 @@ fn bip375_end_to_end_with_the_sat_cli_signer() {
     let out = child.wait_with_output().expect("completes");
     let stderr = String::from_utf8_lossy(&out.stderr).to_string();
     assert_eq!(out.status.code(), Some(0), "signing failed: {stderr}");
-    assert!(stderr.contains("every output script computed and verified"), "{stderr}");
+    assert!(
+        stderr.contains("every output script computed and verified"),
+        "{stderr}"
+    );
     let signed = String::from_utf8_lossy(&out.stdout).trim().to_string();
 
     let analyzed = node.rpc_ok("analyzepsbt", vec![json!(signed.clone())]);
-    assert_eq!(analyzed["silent_payments"]["outputs"][0]["status"], "ready", "{analyzed}");
-    assert_eq!(analyzed["silent_payments"]["outputs"][0]["script"], "matches", "{analyzed}");
+    assert_eq!(
+        analyzed["silent_payments"]["outputs"][0]["status"], "ready",
+        "{analyzed}"
+    );
+    assert_eq!(
+        analyzed["silent_payments"]["outputs"][0]["script"], "matches",
+        "{analyzed}"
+    );
 
     let finalized = node.rpc_ok("finalizepsbt", vec![json!(signed.clone())]);
     assert_eq!(finalized["complete"], true, "{finalized}");
-    let raw_tx = finalized["hex"].as_str().expect("a transaction").to_string();
+    let raw_tx = finalized["hex"]
+        .as_str()
+        .expect("a transaction")
+        .to_string();
     let txid = node.rpc_ok("sendrawtransaction", vec![json!(raw_tx.clone())]);
     let txid = txid.as_str().expect("a txid").to_string();
     node.mine_blocks(1, &wallet.address.to_string());
@@ -25396,9 +27721,12 @@ fn bip375_end_to_end_with_the_sat_cli_signer() {
             .expect("base64"),
     )
     .expect("a PSBT");
-    let sp_inputs = [SpInput { outpoint, secret: wallet.sk, is_taproot: false }];
-    common::sp_send::fill_bip375(&secp, &mut independent, &sp_inputs, [0x6bu8; 32])
-        .expect("fills");
+    let sp_inputs = [SpInput {
+        outpoint,
+        secret: wallet.sk,
+        is_taproot: false,
+    }];
+    common::sp_send::fill_bip375(&secp, &mut independent, &sp_inputs, [0x6bu8; 32]).expect("fills");
 
     let by_sat_cli = satd_psbt::RawPsbt::parse(
         &base64::engine::general_purpose::STANDARD
@@ -25422,12 +27750,20 @@ fn bip375_end_to_end_with_the_sat_cli_signer() {
     // DLEQ proof must not, since its auxiliary randomness is fresh per proof.
     let scan = address.scan_key.serialize();
     assert_eq!(
-        independent.global.get(satd_psbt::keys::global::SP_ECDH_SHARE, &scan),
-        by_sat_cli.global.get(satd_psbt::keys::global::SP_ECDH_SHARE, &scan),
+        independent
+            .global
+            .get(satd_psbt::keys::global::SP_ECDH_SHARE, &scan),
+        by_sat_cli
+            .global
+            .get(satd_psbt::keys::global::SP_ECDH_SHARE, &scan),
     );
     assert_ne!(
-        independent.global.get(satd_psbt::keys::global::SP_DLEQ, &scan),
-        by_sat_cli.global.get(satd_psbt::keys::global::SP_DLEQ, &scan),
+        independent
+            .global
+            .get(satd_psbt::keys::global::SP_DLEQ, &scan),
+        by_sat_cli
+            .global
+            .get(satd_psbt::keys::global::SP_DLEQ, &scan),
         "two proofs of the same statement must not be identical"
     );
 
@@ -25468,16 +27804,30 @@ impl BlockFiller {
     fn new() -> Self {
         let secp = bitcoin::secp256k1::Secp256k1::new();
         let (tr, tr_spk) = common::p2tr_keypath_output(&secp, [0x72; 32]);
-        Self { secp, wpkh: DeterministicWallet::from_secret([0x71; 32]), tr, tr_spk, coins: Default::default() }
+        Self {
+            secp,
+            wpkh: DeterministicWallet::from_secret([0x71; 32]),
+            tr,
+            tr_spk,
+            coins: Default::default(),
+        }
     }
 
     fn spk(&self, taproot: bool) -> bitcoin::ScriptBuf {
-        if taproot { self.tr_spk.clone() } else { self.wpkh.address.script_pubkey() }
+        if taproot {
+            self.tr_spk.clone()
+        } else {
+            self.wpkh.address.script_pubkey()
+        }
     }
 
     /// Sign and build a transaction spending `inputs` into `outputs`
     /// (`(taproot, value)`); returns it and its new coins.
-    fn build(&self, inputs: &[FillerCoin], outputs: &[(bool, u64)]) -> (bitcoin::Transaction, Vec<FillerCoin>) {
+    fn build(
+        &self,
+        inputs: &[FillerCoin],
+        outputs: &[(bool, u64)],
+    ) -> (bitcoin::Transaction, Vec<FillerCoin>) {
         use bitcoin::hashes::Hash as _;
         use bitcoin::key::TapTweak;
         use bitcoin::sighash::{EcdsaSighashType, Prevouts, SighashCache, TapSighashType};
@@ -25503,7 +27853,10 @@ impl BlockFiller {
         };
         let prevouts: Vec<bitcoin::TxOut> = inputs
             .iter()
-            .map(|c| bitcoin::TxOut { value: bitcoin::Amount::from_sat(c.value), script_pubkey: self.spk(c.taproot) })
+            .map(|c| bitcoin::TxOut {
+                value: bitcoin::Amount::from_sat(c.value),
+                script_pubkey: self.spk(c.taproot),
+            })
             .collect();
         let mut witnesses = Vec::with_capacity(inputs.len());
         {
@@ -25512,7 +27865,11 @@ impl BlockFiller {
                 let mut witness = bitcoin::Witness::new();
                 if coin.taproot {
                     let sighash = cache
-                        .taproot_key_spend_signature_hash(i, &Prevouts::All(&prevouts), TapSighashType::Default)
+                        .taproot_key_spend_signature_hash(
+                            i,
+                            &Prevouts::All(&prevouts),
+                            TapSighashType::Default,
+                        )
                         .unwrap();
                     let sig = self.secp.sign_schnorr_no_aux_rand(
                         &bitcoin::secp256k1::Message::from_digest(sighash.to_byte_array()),
@@ -25521,11 +27878,17 @@ impl BlockFiller {
                     witness.push(sig.as_ref());
                 } else {
                     let sighash = cache
-                        .p2wpkh_signature_hash(i, &self.spk(false), bitcoin::Amount::from_sat(coin.value), EcdsaSighashType::All)
+                        .p2wpkh_signature_hash(
+                            i,
+                            &self.spk(false),
+                            bitcoin::Amount::from_sat(coin.value),
+                            EcdsaSighashType::All,
+                        )
                         .unwrap();
-                    let sig = self
-                        .secp
-                        .sign_ecdsa(&bitcoin::secp256k1::Message::from_digest(sighash.to_byte_array()), &self.wpkh.sk);
+                    let sig = self.secp.sign_ecdsa(
+                        &bitcoin::secp256k1::Message::from_digest(sighash.to_byte_array()),
+                        &self.wpkh.sk,
+                    );
                     let mut der = sig.serialize_der().to_vec();
                     der.push(EcdsaSighashType::All as u8);
                     witness.push(der);
@@ -25560,7 +27923,10 @@ impl BlockFiller {
     /// taproot, and confirm the fan-outs.
     fn fund(&mut self, node: &TestNode, coinbases: u64, per_coinbase: u64) {
         use serde_json::json;
-        node.rpc_ok("generatetoaddress", vec![json!(coinbases + 100), json!(self.wpkh.address.to_string())]);
+        node.rpc_ok(
+            "generatetoaddress",
+            vec![json!(coinbases + 100), json!(self.wpkh.address.to_string())],
+        );
         for height in 1..=coinbases {
             let txid: bitcoin::Txid = common::coinbase_txid_at(node, height).parse().unwrap();
             let coinbase = FillerCoin {
@@ -25571,11 +27937,21 @@ impl BlockFiller {
             let each = (coinbase.value - 100_000) / per_coinbase;
             let outputs: Vec<(bool, u64)> = (0..per_coinbase).map(|i| (i % 2 == 1, each)).collect();
             let (tx, coins) = self.build(&[coinbase], &outputs);
-            node.rpc_ok("sendrawtransaction", vec![json!(hex::encode(bitcoin::consensus::serialize(&tx)))]);
+            node.rpc_ok(
+                "sendrawtransaction",
+                vec![json!(hex::encode(bitcoin::consensus::serialize(&tx)))],
+            );
             self.coins.extend(coins);
         }
-        node.rpc_ok("generatetoaddress", vec![json!(1), json!(self.wpkh.address.to_string())]);
-        assert_eq!(node.rpc_ok("getrawmempool", vec![]), json!([]), "the fan-outs confirmed");
+        node.rpc_ok(
+            "generatetoaddress",
+            vec![json!(1), json!(self.wpkh.address.to_string())],
+        );
+        assert_eq!(
+            node.rpc_ok("getrawmempool", vec![]),
+            json!([]),
+            "the fan-outs confirmed"
+        );
     }
 
     /// Broadcast more transactions than one block holds, in every shape a
@@ -25587,7 +27963,10 @@ impl BlockFiller {
     fn fill(&mut self, node: &TestNode) -> FillMarkers {
         use serde_json::json;
         let send = |tx: &bitcoin::Transaction| {
-            node.rpc_ok("sendrawtransaction", vec![json!(hex::encode(bitcoin::consensus::serialize(tx)))]);
+            node.rpc_ok(
+                "sendrawtransaction",
+                vec![json!(hex::encode(bitcoin::consensus::serialize(tx)))],
+            );
             tx.compute_txid().to_string()
         };
         // Wide fan-outs, about 32,000 WU each: 130 of them are over a block.
@@ -25606,8 +27985,15 @@ impl BlockFiller {
         }
         // Taproot key-path spends, one output to each type.
         let mut taproot = None;
-        let tr_coins: Vec<FillerCoin> = self.coins.iter().copied().filter(|c| c.taproot).take(200).collect();
-        self.coins.retain(|c| !tr_coins.iter().any(|t| t.outpoint == c.outpoint));
+        let tr_coins: Vec<FillerCoin> = self
+            .coins
+            .iter()
+            .copied()
+            .filter(|c| c.taproot)
+            .take(200)
+            .collect();
+        self.coins
+            .retain(|c| !tr_coins.iter().any(|t| t.outpoint == c.outpoint));
         for coin in tr_coins {
             let half = (coin.value - 3_000) / 2;
             let id = send(&self.build(&[coin], &[(true, half), (false, half)]).0);
@@ -25629,7 +28015,11 @@ impl BlockFiller {
                 coins = out;
             }
         }
-        FillMarkers { cpfp: cpfp.unwrap(), taproot: taproot.unwrap(), multi: multi.unwrap() }
+        FillMarkers {
+            cpfp: cpfp.unwrap(),
+            taproot: taproot.unwrap(),
+            multi: multi.unwrap(),
+        }
     }
 }
 
@@ -25651,7 +28041,9 @@ fn stratum_found_blocks_on_a_full_mempool_reach_a_second_node() {
     use bitcoin::hashes::{Hash, sha256d};
     use serde_json::json;
     use stratum_core::binary_sv2::{self, B032};
-    use stratum_core::mining_sv2::{NewExtendedMiningJob, SubmitSharesExtended, SubmitSharesSuccess};
+    use stratum_core::mining_sv2::{
+        NewExtendedMiningJob, SubmitSharesExtended, SubmitSharesSuccess,
+    };
 
     let p2p = find_available_port();
     let (node, v1_port, v2_port) = start_stratum_v2_node(&[&format!("--port={p2p}")]);
@@ -25663,7 +28055,9 @@ fn stratum_found_blocks_on_a_full_mempool_reach_a_second_node() {
     );
     let mut filler = BlockFiller::new();
     filler.fund(&node, 25, 100);
-    let miner = DeterministicWallet::from_secret(STRATUM_MINER_SECRET).address.to_string();
+    let miner = DeterministicWallet::from_secret(STRATUM_MINER_SECRET)
+        .address
+        .to_string();
 
     // After each found block: the block is full, holds each kind of
     // transaction, pays the miner, was saved byte for byte, and the second
@@ -25671,28 +28065,51 @@ fn stratum_found_blocks_on_a_full_mempool_reach_a_second_node() {
     let check = |hash: &str, markers: &FillMarkers, what: &str| {
         let block = node.rpc_ok("getblock", vec![json!(hash), json!(1)]);
         let weight = block["weight"].as_u64().unwrap();
-        assert!(weight > 3_900_000, "{what}: the template should be full, weight {weight}");
-        let txids: std::collections::HashSet<&str> =
-            block["tx"].as_array().unwrap().iter().map(|t| t.as_str().unwrap()).collect();
+        assert!(
+            weight > 3_900_000,
+            "{what}: the template should be full, weight {weight}"
+        );
+        let txids: std::collections::HashSet<&str> = block["tx"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t.as_str().unwrap())
+            .collect();
         for (kind, txid) in [
             ("CPFP parent", markers.cpfp.0.as_str()),
             ("CPFP child", markers.cpfp.1.as_str()),
             ("taproot spend", markers.taproot.as_str()),
             ("multi-input spend", markers.multi.as_str()),
         ] {
-            assert!(txids.contains(txid), "{what}: the block does not carry the {kind} {txid}");
+            assert!(
+                txids.contains(txid),
+                "{what}: the block does not carry the {kind} {txid}"
+            );
         }
         assert!(
-            !node.rpc_ok("getrawmempool", vec![]).as_array().unwrap().is_empty(),
+            !node
+                .rpc_ok("getrawmempool", vec![])
+                .as_array()
+                .unwrap()
+                .is_empty(),
             "{what}: the mempool held more than the block"
         );
         let full = node.rpc_ok("getblock", vec![json!(hash), json!(2)]);
-        assert_eq!(full["tx"][0]["vout"][0]["scriptPubKey"]["address"], miner, "{what}");
+        assert_eq!(
+            full["tx"][0]["vout"][0]["scriptPubKey"]["address"], miner,
+            "{what}"
+        );
         let height = block["height"].as_u64().unwrap();
-        let saved = node.datadir.join("regtest").join("stratum").join("found").join(format!("{height}-{hash}.hex"));
+        let saved = node
+            .datadir
+            .join("regtest")
+            .join("stratum")
+            .join("found")
+            .join(format!("{height}-{hash}.hex"));
         let raw = node.rpc_ok("getblock", vec![json!(hash), json!(0)]);
         assert_eq!(
-            std::fs::read_to_string(&saved).unwrap_or_else(|e| panic!("{what}: {}: {e}", saved.display())),
+            std::fs::read_to_string(&saved)
+                .unwrap_or_else(|e| panic!("{what}: {}: {e}", saved.display())),
             format!("{}\n", raw.as_str().unwrap()),
             "{what}: the saved copy is the block"
         );
@@ -25715,12 +28132,17 @@ fn stratum_found_blocks_on_a_full_mempool_reach_a_second_node() {
         tokio::task::block_in_place(|| node.rpc_ok("generateblock", vec![json!(miner), json!([])]));
         let best = tokio::task::block_in_place(|| get_rpc_str(&node, "getbestblockhash")).unwrap();
         let params = loop {
-            let n = client.notification("mining.notify", Duration::from_secs(30)).await;
+            let n = client
+                .notification("mining.notify", Duration::from_secs(30))
+                .await;
             if notify_prevhash(&n["params"]) == best {
                 break n["params"].clone();
             }
         };
-        assert!(params[4].as_array().unwrap().len() >= 10, "a full block's merkle branch: {params}");
+        assert!(
+            params[4].as_array().unwrap().len() >= 10,
+            "a full block's merkle branch: {params}"
+        );
         let (extranonce2, ntime, nonce) = grind_stratum_block(&extranonce1, &params);
         let reply = client
             .call(
@@ -25737,13 +28159,23 @@ fn stratum_found_blocks_on_a_full_mempool_reach_a_second_node() {
         assert_eq!(reply["result"], true, "{reply}");
         notify_height(&params)
     });
-    poll_until(|| get_rpc_u64(&node, "getblockcount") == Some(found_v1), test_timeout(20), "the V1 block connects");
-    check(&get_rpc_str(&node, "getbestblockhash").unwrap(), &markers, "Stratum V1");
+    poll_until(
+        || get_rpc_u64(&node, "getblockcount") == Some(found_v1),
+        test_timeout(20),
+        "the V1 block connects",
+    );
+    check(
+        &get_rpc_str(&node, "getbestblockhash").unwrap(),
+        &markers,
+        "Stratum V1",
+    );
 
     // Stratum V2, extended channel, on a mempool filled again.
     let markers = filler.fill(&node);
     let found_v2 = rt.block_on(async {
-        let mut miner_conn = sv2::Client::connect(v2_port, None).await.expect("handshake");
+        let mut miner_conn = sv2::Client::connect(v2_port, None)
+            .await
+            .expect("handshake");
         miner_conn.setup().await;
         let (channel_id, prefix, size) = miner_conn.open_extended(&miner, 8).await;
         tokio::task::block_in_place(|| node.rpc_ok("generateblock", vec![json!(miner), json!([])]));
@@ -25755,11 +28187,16 @@ fn stratum_found_blocks_on_a_full_mempool_reach_a_second_node() {
             let job = (
                 job.job_id,
                 job.version,
-                job.merkle_path.inner_as_ref().iter().map(|p| p.to_vec()).collect::<Vec<_>>(),
+                job.merkle_path
+                    .inner_as_ref()
+                    .iter()
+                    .map(|p| p.to_vec())
+                    .collect::<Vec<_>>(),
                 job.coinbase_tx_prefix.inner_as_ref().to_vec(),
                 job.coinbase_tx_suffix.inner_as_ref().to_vec(),
             );
-            let (activated, prev, min_ntime, nbits) = miner_conn.set_new_prev_hash(Duration::from_secs(30)).await;
+            let (activated, prev, min_ntime, nbits) =
+                miner_conn.set_new_prev_hash(Duration::from_secs(30)).await;
             assert_eq!(activated, job.0);
             if prev == best {
                 break (job, prev, min_ntime, nbits);
@@ -25798,8 +28235,16 @@ fn stratum_found_blocks_on_a_full_mempool_reach_a_second_node() {
         assert_eq!(ok.last_sequence_number, 1);
         next
     });
-    poll_until(|| get_rpc_u64(&node, "getblockcount") == Some(found_v2), test_timeout(20), "the V2 block connects");
-    check(&get_rpc_str(&node, "getbestblockhash").unwrap(), &markers, "Stratum V2 extended");
+    poll_until(
+        || get_rpc_u64(&node, "getblockcount") == Some(found_v2),
+        test_timeout(20),
+        "the V2 block connects",
+    );
+    check(
+        &get_rpc_str(&node, "getbestblockhash").unwrap(),
+        &markers,
+        "Stratum V2 extended",
+    );
 }
 
 /// Blocks found through Stratum V1 at the heights where the BIP 34 push
@@ -25811,12 +28256,17 @@ fn stratum_v1_found_blocks_cross_bip34_push_boundaries() {
     use serde_json::json;
     let port = find_available_port();
     let node = TestNode::start(&["--stratum=1", &format!("--stratumbind=127.0.0.1:{port}")]);
-    let miner = DeterministicWallet::from_secret(STRATUM_MINER_SECRET).address.to_string();
+    let miner = DeterministicWallet::from_secret(STRATUM_MINER_SECRET)
+        .address
+        .to_string();
     let rt = tokio::runtime::Runtime::new().unwrap();
     for (height, push) in [(16u64, "60"), (17, "0111"), (127, "017f"), (128, "028000")] {
         let tip = get_rpc_u64(&node, "getblockcount").unwrap();
         if tip + 1 < height {
-            node.rpc_ok("generatetoaddress", vec![json!(height - 1 - tip), json!(miner)]);
+            node.rpc_ok(
+                "generatetoaddress",
+                vec![json!(height - 1 - tip), json!(miner)],
+            );
         }
         rt.block_on(async {
             let mut client = plain_stratum_client(port);
@@ -25829,7 +28279,9 @@ fn stratum_v1_found_blocks_cross_bip34_push_boundaries() {
                 first
             } else {
                 loop {
-                    let n = client.notification("mining.notify", Duration::from_secs(30)).await;
+                    let n = client
+                        .notification("mining.notify", Duration::from_secs(30))
+                        .await;
                     if notify_height(&n["params"]) == height {
                         break n["params"].clone();
                     }
@@ -25858,7 +28310,10 @@ fn stratum_v1_found_blocks_cross_bip34_push_boundaries() {
         let hash = get_rpc_str(&node, "getbestblockhash").unwrap();
         let block = node.rpc_ok("getblock", vec![json!(hash), json!(2)]);
         let script_sig = block["tx"][0]["vin"][0]["coinbase"].as_str().unwrap();
-        assert!(script_sig.starts_with(push), "height {height}: scriptSig {script_sig} must start with {push}");
+        assert!(
+            script_sig.starts_with(push),
+            "height {height}: scriptSig {script_sig} must start with {push}"
+        );
     }
 }
 
@@ -25872,45 +28327,75 @@ fn stratum_v2_jd_push_solution_connects_block() {
     use stratum_core::binary_sv2::{self, B032, B064K, B0255, Seq064K, Str0255, U256};
     use stratum_core::common_messages_sv2::Protocol;
     use stratum_core::job_declaration_sv2::{
-        AllocateMiningJobToken, AllocateMiningJobTokenSuccess, DeclareMiningJob, DeclareMiningJobSuccess, PushSolution,
+        AllocateMiningJobToken, AllocateMiningJobTokenSuccess, DeclareMiningJob,
+        DeclareMiningJobSuccess, PushSolution,
     };
     let (node, _, v2_port) = start_stratum_v2_node(&["--stratumv2jd=1"]);
     let funder = DeterministicWallet::from_secret([0x8b; 32]);
-    node.rpc_ok("generatetoaddress", vec![json!(101), json!(funder.address.to_string())]);
+    node.rpc_ok(
+        "generatetoaddress",
+        vec![json!(101), json!(funder.address.to_string())],
+    );
     let dest = DeterministicWallet::from_secret([0x8c; 32]);
-    let (raw_hex, txid) =
-        common::build_signed_p2wpkh_spend_from_block1_coinbase(&node, &funder, dest.address.script_pubkey(), 2_000);
+    let (raw_hex, txid) = common::build_signed_p2wpkh_spend_from_block1_coinbase(
+        &node,
+        &funder,
+        dest.address.script_pubkey(),
+        2_000,
+    );
     node.rpc_ok("sendrawtransaction", vec![json!(raw_hex.clone())]);
-    let tx: bitcoin::Transaction = bitcoin::consensus::deserialize(&hex::decode(&raw_hex).unwrap()).unwrap();
+    let tx: bitcoin::Transaction =
+        bitcoin::consensus::deserialize(&hex::decode(&raw_hex).unwrap()).unwrap();
     let miner = DeterministicWallet::from_secret(STRATUM_MINER_SECRET);
     let height = 102u32;
     let reward = 50 * 100_000_000 + 2_000;
     let best = get_rpc_str(&node, "getbestblockhash").unwrap();
-    let tip_time = node.rpc_ok("getblockheader", vec![json!(best)])["time"].as_u64().unwrap() as u32;
+    let tip_time = node.rpc_ok("getblockheader", vec![json!(best)])["time"]
+        .as_u64()
+        .unwrap() as u32;
     let hole = 8;
 
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
-        let mut jdc = sv2::Client::connect(v2_port, None).await.expect("handshake");
+        let mut jdc = sv2::Client::connect(v2_port, None)
+            .await
+            .expect("handshake");
         jdc.setup_with(Protocol::JobDeclarationProtocol, 0).await;
         jdc.send(
             0x50,
-            AllocateMiningJobToken { user_identifier: Str0255::try_from(miner.address.to_string()).unwrap(), request_id: 1 },
+            AllocateMiningJobToken {
+                user_identifier: Str0255::try_from(miner.address.to_string()).unwrap(),
+                request_id: 1,
+            },
         )
         .await;
         let mut payload = jdc.expect(0x51, Duration::from_secs(10)).await;
-        let allocated: AllocateMiningJobTokenSuccess = binary_sv2::from_bytes(&mut payload).unwrap();
-        let (prefix, suffix, _) =
-            sv2_declared_coinbase(height, &miner.address.script_pubkey(), reward, std::slice::from_ref(&tx), hole);
+        let allocated: AllocateMiningJobTokenSuccess =
+            binary_sv2::from_bytes(&mut payload).unwrap();
+        let (prefix, suffix, _) = sv2_declared_coinbase(
+            height,
+            &miner.address.script_pubkey(),
+            reward,
+            std::slice::from_ref(&tx),
+            hole,
+        );
         jdc.send(
             0x57,
             DeclareMiningJob {
                 request_id: 2,
-                mining_job_token: B0255::try_from(allocated.mining_job_token.inner_as_ref().to_vec()).unwrap(),
+                mining_job_token: B0255::try_from(
+                    allocated.mining_job_token.inner_as_ref().to_vec(),
+                )
+                .unwrap(),
                 version: 0x2000_0000,
                 coinbase_tx_prefix: B064K::try_from(prefix.clone()).unwrap(),
                 coinbase_tx_suffix: B064K::try_from(suffix.clone()).unwrap(),
-                wtxid_list: Seq064K::new(vec![U256::from(node::validation::decode::wtxid(&tx).to_raw_hash().to_byte_array())]).unwrap(),
+                wtxid_list: Seq064K::new(vec![U256::from(
+                    node::validation::decode::wtxid(&tx)
+                        .to_raw_hash()
+                        .to_byte_array(),
+                )])
+                .unwrap(),
                 excess_data: B064K::try_from(Vec::new()).unwrap(),
             },
         )
@@ -25953,10 +28438,21 @@ fn stratum_v2_jd_push_solution_connects_block() {
     let txs = block["tx"].as_array().unwrap();
     assert_eq!(txs.len(), 2, "{block}");
     assert_eq!(txs[1]["txid"], txid);
-    assert_eq!(txs[0]["vout"][0]["scriptPubKey"]["address"], miner.address.to_string());
-    let saved = node.datadir.join("regtest").join("stratum").join("found").join(format!("{height}-{hash}.hex"));
+    assert_eq!(
+        txs[0]["vout"][0]["scriptPubKey"]["address"],
+        miner.address.to_string()
+    );
+    let saved = node
+        .datadir
+        .join("regtest")
+        .join("stratum")
+        .join("found")
+        .join(format!("{height}-{hash}.hex"));
     let raw = node.rpc_ok("getblock", vec![json!(hash), json!(0)]);
-    assert_eq!(std::fs::read_to_string(&saved).unwrap(), format!("{}\n", raw.as_str().unwrap()));
+    assert_eq!(
+        std::fs::read_to_string(&saved).unwrap(),
+        format!("{}\n", raw.as_str().unwrap())
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -25978,7 +28474,10 @@ fn addrman_rpcs_report_a_hand_added_address_everywhere() {
     let mut node = TestNode::start_with_datadir(&datadir, rpcport, &[]);
 
     assert_eq!(
-        node.rpc_ok("addpeeraddress", vec![json!("1.2.3.4"), json!(8333), json!(true)]),
+        node.rpc_ok(
+            "addpeeraddress",
+            vec![json!("1.2.3.4"), json!(8333), json!(true)]
+        ),
         json!({"success": true})
     );
     // Named form, as Core's test framework sends it.
@@ -25993,7 +28492,10 @@ fn addrman_rpcs_report_a_hand_added_address_everywhere() {
     // Already present: Core's `Add` refuses before `Good`, whichever table.
     for tried in [true, false] {
         assert_eq!(
-            node.rpc_ok("addpeeraddress", vec![json!("1.2.3.4"), json!(8333), json!(tried)]),
+            node.rpc_ok(
+                "addpeeraddress",
+                vec![json!("1.2.3.4"), json!(8333), json!(tried)]
+            ),
             json!({"success": false, "error": "failed-adding-to-new"})
         );
     }
@@ -26026,30 +28528,52 @@ fn addrman_rpcs_report_a_hand_added_address_everywhere() {
         assert_eq!(info["ipv4"], json!({"new": 0, "tried": 1, "total": 1}));
         assert_eq!(info["ipv6"], json!({"new": 1, "tried": 0, "total": 1}));
         for net in ["onion", "i2p", "cjdns"] {
-            assert_eq!(info[net], json!({"new": 0, "tried": 0, "total": 0}), "{net}");
+            assert_eq!(
+                info[net],
+                json!({"new": 0, "tried": 0, "total": 0}),
+                "{net}"
+            );
         }
-        assert_eq!(info["all_networks"], json!({"new": 1, "tried": 1, "total": 2}));
+        assert_eq!(
+            info["all_networks"],
+            json!({"new": 1, "tried": 1, "total": 2})
+        );
 
         let all = node.rpc_ok("getnodeaddresses", vec![json!(0)]);
         assert_eq!(all.as_array().unwrap().len(), 2, "{all}");
         // Default count is 1.
-        assert_eq!(node.rpc_ok("getnodeaddresses", vec![]).as_array().unwrap().len(), 1);
+        assert_eq!(
+            node.rpc_ok("getnodeaddresses", vec![])
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
         let v4 = node.rpc_ok("getnodeaddresses", vec![json!(0), json!("IPv4")]);
         assert_eq!(
             v4,
             json!([{"time": v4[0]["time"], "services": 9, "address": "1.2.3.4",
                     "port": 8333, "network": "ipv4"}])
         );
-        assert_eq!(node.rpc_ok("getnodeaddresses", vec![json!(0), json!("onion")]), json!([]));
+        assert_eq!(
+            node.rpc_ok("getnodeaddresses", vec![json!(0), json!("onion")]),
+            json!([])
+        );
     };
     check(&node);
 
     // Errors, with Core's codes and messages.
     let err = |method: &str, params: Vec<serde_json::Value>| {
         let out = node.rpc_call_with_params(method, params).unwrap();
-        (out["error"]["code"].as_i64().unwrap_or(0), out["error"]["message"].as_str().unwrap_or("").to_string())
+        (
+            out["error"]["code"].as_i64().unwrap_or(0),
+            out["error"]["message"].as_str().unwrap_or("").to_string(),
+        )
     };
-    assert_eq!(err("getnodeaddresses", vec![json!(-1)]), (-8, "Address count out of range".into()));
+    assert_eq!(
+        err("getnodeaddresses", vec![json!(-1)]),
+        (-8, "Address count out of range".into())
+    );
     assert_eq!(
         err("getnodeaddresses", vec![json!(1), json!("Foo")]),
         (-8, "Network not recognized: Foo".into())
@@ -26072,9 +28596,15 @@ fn addrman_rpcs_report_a_hand_added_address_everywhere() {
             (-1, "JSON integer out of range".into())
         );
     }
-    let (code, msg) = err("addpeeraddress", vec![json!("1.2.3.4"), json!(1234), json!("True")]);
+    let (code, msg) = err(
+        "addpeeraddress",
+        vec![json!("1.2.3.4"), json!(1234), json!("True")],
+    );
     assert_eq!(code, -3);
-    assert!(msg.contains("JSON value of type string is not of expected type bool"), "{msg}");
+    assert!(
+        msg.contains("JSON value of type string is not of expected type bool"),
+        "{msg}"
+    );
 
     // Hidden from the listing, answered by name.
     let listing = node.rpc_ok("help", vec![]);
@@ -26082,7 +28612,10 @@ fn addrman_rpcs_report_a_hand_added_address_everywhere() {
     for hidden in ["addpeeraddress", "getrawaddrman"] {
         assert!(!listing.contains(hidden), "{hidden} must be hidden");
         let one = node.rpc_ok("help", vec![json!(hidden)]);
-        assert!(!one.as_str().unwrap().contains("unknown command"), "{hidden}: {one}");
+        assert!(
+            !one.as_str().unwrap().contains("unknown command"),
+            "{hidden}: {one}"
+        );
     }
     for listed in ["getnodeaddresses", "getaddrmaninfo"] {
         assert!(listing.contains(listed), "{listed} must be listed");
@@ -26183,7 +28716,10 @@ fn rpcwhitelist_restricts_listed_users_to_their_methods() {
     assert_eq!(wl_call(&node, WL_STRANGE6, "getbestblockhash"), 200);
     assert_eq!(wl_call(&node, WL_STRANGE6, "getblockchaininfo"), 200);
     // The cookie user has no entry either.
-    assert_eq!(node.rpc_post_raw_status(r#"{"method":"getnetworkinfo"}"#).0, 200);
+    assert_eq!(
+        node.rpc_post_raw_status(r#"{"method":"getnetworkinfo"}"#).0,
+        200
+    );
 
     // The refusal is Core's: 403, no body.
     let (status, body) = wl_post(&node, WL_USER2, r#"{"method": "getnetworkinfo"}"#);
@@ -26209,7 +28745,11 @@ fn rpcwhitelist_restricts_listed_users_to_their_methods() {
     assert_eq!((status, body.as_str()), (403, ""));
     let (status, _) = wl_post(&node, WL_USER1, r#"{"jsonrpc":"2.0","method":"stop"}"#);
     assert_eq!(status, 403);
-    assert_eq!(wl_call(&node, WL_USER1, "getblockcount"), 200, "the node is still up");
+    assert_eq!(
+        wl_call(&node, WL_USER1, "getblockcount"),
+        200,
+        "the node is still up"
+    );
 
     // A body that is not JSON keeps Core's parse error ahead of the 403.
     let (status, body) = wl_post(&node, WL_USER2, "{not json");
@@ -26239,8 +28779,14 @@ fn rpcwhitelist_default_denies_unlisted_users_once_any_list_is_set() {
     assert_eq!(wl_call(&node, WL_USER2, "getblockchaininfo"), 403);
 
     // The cookie user is `__cookie__`, restricted by its own entry.
-    assert_eq!(node.rpc_post_raw_status(r#"{"method":"getmempoolinfo"}"#).0, 200);
-    assert_eq!(node.rpc_post_raw_status(r#"{"method":"getnetworkinfo"}"#).0, 403);
+    assert_eq!(
+        node.rpc_post_raw_status(r#"{"method":"getmempoolinfo"}"#).0,
+        200
+    );
+    assert_eq!(
+        node.rpc_post_raw_status(r#"{"method":"getnetworkinfo"}"#).0,
+        403
+    );
 
     // `rpcwhitelistdefault=1` with no list at all denies everyone, the cookie
     // included; covered by the config unit tests, since a node started that
@@ -26273,7 +28819,11 @@ fn rpcwhitelist_refuses_a_websocket_upgrade_to_a_restricted_user() {
         .unwrap();
         let mut buf = [0u8; 256];
         let n = s.read(&mut buf).unwrap();
-        String::from_utf8_lossy(&buf[..n]).lines().next().unwrap_or("").to_string()
+        String::from_utf8_lossy(&buf[..n])
+            .lines()
+            .next()
+            .unwrap_or("")
+            .to_string()
     };
     let restricted = upgrade_status(WL_USER2);
     assert!(restricted.contains(" 403"), "restricted user: {restricted}");
@@ -26288,7 +28838,10 @@ fn rpcwhitelist_absent_restricts_nobody() {
     let node = TestNode::start(&[&wl_rpcauth(WL_USER2)]);
     assert_eq!(wl_call(&node, WL_USER2, "getnetworkinfo"), 200);
     assert_eq!(wl_call(&node, WL_USER2, "getblockchaininfo"), 200);
-    assert_eq!(node.rpc_post_raw_status(r#"{"method":"getnetworkinfo"}"#).0, 200);
+    assert_eq!(
+        node.rpc_post_raw_status(r#"{"method":"getnetworkinfo"}"#).0,
+        200
+    );
 }
 
 /// Bearer tokens are not RPC users: `-rpcwhitelist` names users, and a token
@@ -26299,8 +28852,7 @@ fn rpcwhitelist_absent_restricts_nobody() {
 fn rpcwhitelist_leaves_bearer_tokens_to_their_capabilities() {
     use std::io::Write;
     const TOKEN: &str = "satd-test-readonly-token-v1";
-    const TOKEN_SHA256: &str =
-        "710379ec62ddf04432c6c803b1679020abf2caf79a8c64c9dfb522c686a0cf3d";
+    const TOKEN_SHA256: &str = "710379ec62ddf04432c6c803b1679020abf2caf79a8c64c9dfb522c686a0cf3d";
     let dir = fresh_test_datadir("satd-whitelist-bearer");
     let authfile = dir.join("auth.toml");
     {
@@ -26334,7 +28886,10 @@ fn rpcwhitelist_leaves_bearer_tokens_to_their_capabilities() {
             .json(&serde_json::json!({"jsonrpc":"2.0","id":1,"method":method,"params":[]}))
             .send()
             .unwrap();
-        (resp.status().as_u16(), resp.json().unwrap_or(serde_json::Value::Null))
+        (
+            resp.status().as_u16(),
+            resp.json().unwrap_or(serde_json::Value::Null),
+        )
     };
     // The Basic user with no entry is denied everything...
     assert_eq!(wl_call(&node, WL_STRANGE6, "getblockcount"), 403);
@@ -26391,7 +28946,10 @@ fn rpcwhitelist_applies_on_the_tls_and_read_only_listeners() {
     let ro = format!("http://127.0.0.1:{ro_port}/");
     let deadline = Instant::now() + Duration::from_secs(10);
     while client.post(&ro).body("").send().is_err() {
-        assert!(Instant::now() < deadline, "read-only listener never accepted");
+        assert!(
+            Instant::now() < deadline,
+            "read-only listener never accepted"
+        );
         std::thread::sleep(Duration::from_millis(100));
     }
     assert_eq!(post(&ro, "getblockcount").0, 200);
@@ -26399,7 +28957,10 @@ fn rpcwhitelist_applies_on_the_tls_and_read_only_listeners() {
     // `stop` is on the user's list but is not a read: the read-only filter
     // still refuses it, and the node keeps answering.
     let (_, body) = post(&ro, "stop");
-    assert!(body.contains("error") && !body.contains("stopping"), "{body}");
+    assert!(
+        body.contains("error") && !body.contains("stopping"),
+        "{body}"
+    );
     assert_eq!(post(&tls, "getblockcount").0, 200, "the node is still up");
 }
 
@@ -26409,9 +28970,9 @@ mod gossip {
     use super::addconn_listener::Inbound;
     use super::raw_p2p::OrderedP2pClient;
     use super::*;
+    use bitcoin::p2p::ServiceFlags;
     use bitcoin::p2p::address::{AddrV2, AddrV2Message, Address};
     use bitcoin::p2p::message::NetworkMessage;
-    use bitcoin::p2p::ServiceFlags;
     use std::net::SocketAddr;
 
     fn now() -> u32 {
@@ -26424,7 +28985,12 @@ mod gossip {
     /// A legacy `addr` announcing `addrs` as full nodes.
     pub fn addr(addrs: &[SocketAddr]) -> NetworkMessage {
         let services = ServiceFlags::NETWORK | ServiceFlags::WITNESS;
-        NetworkMessage::Addr(addrs.iter().map(|a| (now(), Address::new(a, services))).collect())
+        NetworkMessage::Addr(
+            addrs
+                .iter()
+                .map(|a| (now(), Address::new(a, services)))
+                .collect(),
+        )
     }
 
     /// An `addrv2` announcing `entries` as full nodes.
@@ -26474,7 +29040,11 @@ mod gossip {
                 .find(|p| p["addr"] == serde_json::json!(addr.to_string()))
                 .cloned()
         };
-        poll_until(|| find().is_some(), test_timeout(20), &format!("{addr} never showed up in getpeerinfo"));
+        poll_until(
+            || find().is_some(),
+            test_timeout(20),
+            &format!("{addr} never showed up in getpeerinfo"),
+        );
         find().unwrap()
     }
 
@@ -26490,7 +29060,11 @@ mod gossip {
     /// dial it again. Every candidate on the dial lists at that moment was
     /// offered in the same tick, so a short grace after it covers their
     /// dials too.
-    pub fn await_reconnect_tick(named: &Inbound, stream: std::net::TcpStream, magic: bitcoin::p2p::Magic) -> std::net::TcpStream {
+    pub fn await_reconnect_tick(
+        named: &Inbound,
+        stream: std::net::TcpStream,
+        magic: bitcoin::p2p::Magic,
+    ) -> std::net::TcpStream {
         drop(stream);
         let again = take_dial(named, magic);
         std::thread::sleep(Duration::from_secs(2));
@@ -26525,8 +29099,16 @@ fn a_peer_reached_through_gossip_is_outbound_full_relay_not_manual() {
     let _learned_stream = gossip::take_dial(&learned, Magic::REGTEST);
 
     let peer = gossip::peer_at(&node, learned.addr);
-    assert_eq!(peer["connection_type"], json!("outbound-full-relay"), "{peer}");
-    assert_eq!(peer["permissions"], json!([]), "an automatic connection takes no outgoing whitelist: {peer}");
+    assert_eq!(
+        peer["connection_type"],
+        json!("outbound-full-relay"),
+        "{peer}"
+    );
+    assert_eq!(
+        peer["permissions"],
+        json!([]),
+        "an automatic connection takes no outgoing whitelist: {peer}"
+    );
 
     let peer = gossip::peer_at(&node, named.addr);
     assert_eq!(peer["connection_type"], json!("manual"), "{peer}");
@@ -26546,8 +29128,8 @@ fn a_peer_reached_through_gossip_is_outbound_full_relay_not_manual() {
 #[test]
 fn an_address_that_names_no_host_is_neither_learned_nor_dialled() {
     use addconn_listener::Inbound;
-    use bitcoin::p2p::address::AddrV2;
     use bitcoin::p2p::Magic;
+    use bitcoin::p2p::address::AddrV2;
     use raw_p2p::OrderedP2pClient;
     use serde_json::json;
     use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -26579,14 +29161,24 @@ fn an_address_that_names_no_host_is_neither_learned_nor_dialled() {
     );
 
     let book = gossip::book(&node);
-    assert!(book.contains(&control.addr.to_string()), "the control is learned: {book:?}");
-    for bad in [format!("0.0.0.0:{port}"), format!("255.255.255.255:{port}"), format!("[::]:{port}")] {
+    assert!(
+        book.contains(&control.addr.to_string()),
+        "the control is learned: {book:?}"
+    );
+    for bad in [
+        format!("0.0.0.0:{port}"),
+        format!("255.255.255.255:{port}"),
+        format!("[::]:{port}"),
+    ] {
         assert!(!book.contains(&bad), "{bad} must not be learned: {book:?}");
     }
 
     let _control_stream = gossip::take_dial(&control, Magic::REGTEST);
     std::thread::sleep(Duration::from_secs(2));
-    assert!(!local.was_dialled(), "0.0.0.0:{port} was dialled, reaching the local host");
+    assert!(
+        !local.was_dialled(),
+        "0.0.0.0:{port} was dialled, reaching the local host"
+    );
 
     // Core's `addpeeraddress` answer for such an address: the book refuses it.
     assert_eq!(
@@ -26615,12 +29207,19 @@ fn an_address_that_names_no_host_is_not_dialled_even_when_named() {
     let out = node
         .rpc_call_with_params("addnode", vec![json!(zero), json!("onetry")])
         .unwrap();
-    assert!(!out["error"].is_null(), "an onetry to {zero} must fail: {out}");
+    assert!(
+        !out["error"].is_null(),
+        "an onetry to {zero} must fail: {out}"
+    );
 
     node.rpc_ok("addnode", vec![json!(zero), json!("add")]);
     let added = node.rpc_ok("getaddednodeinfo", vec![]);
     assert!(
-        added.as_array().unwrap().iter().any(|e| e["addednode"] == json!(zero)),
+        added
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["addednode"] == json!(zero)),
         "the entry is listed: {added}"
     );
 
@@ -26628,10 +29227,16 @@ fn an_address_that_names_no_host_is_not_dialled_even_when_named() {
     node.rpc_ok("addnode", vec![json!(named.addr.to_string()), json!("add")]);
     let stream = gossip::take_dial(&named, Magic::REGTEST);
     let _stream = gossip::await_reconnect_tick(&named, stream, Magic::REGTEST);
-    assert!(!local.was_dialled(), "{zero} was dialled, reaching the local host");
+    assert!(
+        !local.was_dialled(),
+        "{zero} was dialled, reaching the local host"
+    );
 
     // The listener is reachable at an address that names it.
-    node.rpc_ok("addnode", vec![json!(local.addr.to_string()), json!("onetry")]);
+    node.rpc_ok(
+        "addnode",
+        vec![json!(local.addr.to_string()), json!("onetry")],
+    );
     assert!(local.was_dialled(), "a valid onetry must dial");
 }
 
@@ -26669,7 +29274,9 @@ fn an_address_that_names_no_host_in_peers_dat_is_dropped_on_load() {
     dat.extend_from_slice(&2u32.to_le_bytes());
     dat.extend_from_slice(&2u32.to_le_bytes());
     entry(&mut dat, Ipv4Addr::UNSPECIFIED, local.addr.port());
-    let IpAddr::V4(loopback) = control.addr.ip() else { unreachable!() };
+    let IpAddr::V4(loopback) = control.addr.ip() else {
+        unreachable!()
+    };
     entry(&mut dat, loopback, control.addr.port());
 
     let datadir = fresh_test_datadir("satd-peersdat-invalid");
@@ -26679,7 +29286,10 @@ fn an_address_that_names_no_host_in_peers_dat_is_dropped_on_load() {
 
     let _control_stream = gossip::take_dial(&control, Magic::REGTEST);
     std::thread::sleep(Duration::from_secs(2));
-    assert!(!local.was_dialled(), "0.0.0.0 from peers.dat was dialled, reaching the local host");
+    assert!(
+        !local.was_dialled(),
+        "0.0.0.0 from peers.dat was dialled, reaching the local host"
+    );
     let book = gossip::book(&node);
     assert!(book.contains(&control.addr.to_string()), "{book:?}");
     assert!(!book.iter().any(|a| a.starts_with("0.0.0.0:")), "{book:?}");
@@ -26716,15 +29326,25 @@ fn off_regtest_a_gossiped_private_address_is_neither_learned_nor_dialled() {
     // RFC 7600's dummy address: routable by Core's rules, going nowhere.
     // Core's functional tests announce it for the same reason.
     let routable: SocketAddr = "192.0.0.8:38333".parse().unwrap();
-    let mut gossiper = OrderedP2pClient::connect_on(node.p2p_port.expect("p2p port"), Magic::SIGNET);
+    let mut gossiper =
+        OrderedP2pClient::connect_on(node.p2p_port.expect("p2p port"), Magic::SIGNET);
     gossip::announce(&mut gossiper, gossip::addr(&[private.addr, routable]));
 
     let _stream = gossip::await_reconnect_tick(&named, stream, Magic::SIGNET);
-    assert!(!private.was_dialled(), "a gossiped loopback address was dialled on signet");
+    assert!(
+        !private.was_dialled(),
+        "a gossiped loopback address was dialled on signet"
+    );
 
     let book = gossip::book(&node);
-    assert!(book.contains(&routable.to_string()), "a routable address is learned: {book:?}");
-    assert!(!book.contains(&private.addr.to_string()), "a loopback address is not: {book:?}");
+    assert!(
+        book.contains(&routable.to_string()),
+        "a routable address is learned: {book:?}"
+    );
+    assert!(
+        !book.contains(&private.addr.to_string()),
+        "a loopback address is not: {book:?}"
+    );
     // Nor does connecting to the operator's private peer, twice now, put it
     // in the book: Core's `Good` promotes only an entry `Add` took.
     assert!(!book.contains(&named.addr.to_string()), "{book:?}");
@@ -26744,16 +29364,26 @@ fn under_connect_a_gossiped_address_is_learned_but_never_dialled() {
 
     let pinned = Inbound::bind();
     let learned = Inbound::bind();
-    let node = TestNode::start(&["--v2transport=0", "--listen=1", &format!("--connect={}", pinned.addr)]);
+    let node = TestNode::start(&[
+        "--v2transport=0",
+        "--listen=1",
+        &format!("--connect={}", pinned.addr),
+    ]);
     let stream = gossip::take_dial(&pinned, Magic::REGTEST);
 
     let mut gossiper = OrderedP2pClient::connect(node.p2p_port.expect("p2p port"));
     gossip::announce(&mut gossiper, gossip::addr(&[learned.addr]));
     let book = gossip::book(&node);
-    assert!(book.contains(&learned.addr.to_string()), "still learned under -connect: {book:?}");
+    assert!(
+        book.contains(&learned.addr.to_string()),
+        "still learned under -connect: {book:?}"
+    );
 
     let _stream = gossip::await_reconnect_tick(&pinned, stream, Magic::REGTEST);
-    assert!(!learned.was_dialled(), "a gossiped address was dialled under -connect");
+    assert!(
+        !learned.was_dialled(),
+        "a gossiped address was dialled under -connect"
+    );
     let peer = gossip::peer_at(&node, pinned.addr);
     assert_eq!(peer["connection_type"], json!("manual"), "{peer}");
 }
@@ -26768,9 +29398,13 @@ fn rpc_tx_fields_come_from_undo_data_without_a_txindex() {
     use serde_json::json;
     let wallet = common::DeterministicWallet::from_secret([0x42; 32]);
     let mut node = TestNode::start(&["--txindex=0"]);
-    node.rpc_ok("generatetoaddress", vec![json!(101), json!(wallet.address.to_string())]);
+    node.rpc_ok(
+        "generatetoaddress",
+        vec![json!(101), json!(wallet.address.to_string())],
+    );
     let dest = wallet.address.script_pubkey();
-    let (raw_hex, txid) = common::build_signed_p2wpkh_spend_from_block1_coinbase(&node, &wallet, dest, 1_000);
+    let (raw_hex, txid) =
+        common::build_signed_p2wpkh_spend_from_block1_coinbase(&node, &wallet, dest, 1_000);
     node.rpc_ok("sendrawtransaction", vec![json!(raw_hex)]);
 
     let pending = node.rpc_ok("getrawtransaction", vec![json!(txid), json!(2)]);
@@ -26778,21 +29412,47 @@ fn rpc_tx_fields_come_from_undo_data_without_a_txindex() {
         assert_eq!(pending.get(f), None, "{f} on a mempool tx: {pending}");
     }
 
-    let hash = node.rpc_ok("generatetoaddress", vec![json!(1), json!(wallet.address.to_string())])[0].clone();
-    let confirmed = node.rpc_ok("getrawtransaction", vec![json!(txid), json!(2), hash.clone()]);
+    let hash = node.rpc_ok(
+        "generatetoaddress",
+        vec![json!(1), json!(wallet.address.to_string())],
+    )[0]
+    .clone();
+    let confirmed = node.rpc_ok(
+        "getrawtransaction",
+        vec![json!(txid), json!(2), hash.clone()],
+    );
     assert_eq!(confirmed["fee"].as_f64(), Some(0.00001), "{confirmed}");
-    assert_eq!(confirmed["vin"][0]["prevout"]["height"], json!(1), "{confirmed}");
-    assert_eq!(confirmed["vin"][0]["prevout"]["generated"], json!(true), "{confirmed}");
+    assert_eq!(
+        confirmed["vin"][0]["prevout"]["height"],
+        json!(1),
+        "{confirmed}"
+    );
+    assert_eq!(
+        confirmed["vin"][0]["prevout"]["generated"],
+        json!(true),
+        "{confirmed}"
+    );
     assert_eq!(confirmed["confirmations"], json!(1), "{confirmed}");
     assert_eq!(confirmed.get("blockheight"), None, "{confirmed}");
 
     let block = node.rpc_ok("getblock", vec![hash, json!(3)]);
     let reserved = "00".repeat(32);
     assert_eq!(block["coinbase_tx"]["witness"], json!(reserved), "{block}");
-    assert_eq!(block["tx"][0]["vin"][0]["txinwitness"], json!([reserved]), "{block}");
+    assert_eq!(
+        block["tx"][0]["vin"][0]["txinwitness"],
+        json!([reserved]),
+        "{block}"
+    );
     assert_eq!(block["tx"][1]["fee"].as_f64(), Some(0.00001), "{block}");
-    assert_eq!(block["tx"][1]["vin"][0]["prevout"]["height"], json!(1), "{block}");
-    assert!(block["strippedsize"].as_u64().unwrap() < block["size"].as_u64().unwrap(), "{block}");
+    assert_eq!(
+        block["tx"][1]["vin"][0]["prevout"]["height"],
+        json!(1),
+        "{block}"
+    );
+    assert!(
+        block["strippedsize"].as_u64().unwrap() < block["size"].as_u64().unwrap(),
+        "{block}"
+    );
     node.stop();
 }
 
@@ -26810,12 +29470,17 @@ fn submitpackage_lets_a_child_pay_for_a_parent_below_the_relay_floor() {
 
     let wallet = common::DeterministicWallet::from_secret([0x43; 32]);
     let mut node = TestNode::start(&[]);
-    node.rpc_ok("generatetoaddress", vec![json!(101), json!(wallet.address.to_string())]);
+    node.rpc_ok(
+        "generatetoaddress",
+        vec![json!(101), json!(wallet.address.to_string())],
+    );
     let spk = wallet.address.script_pubkey();
     let (parent_hex, parent_txid) =
         common::build_signed_p2wpkh_spend_from_block1_coinbase(&node, &wallet, spk.clone(), 0);
 
-    let alone = node.rpc_call_with_params("sendrawtransaction", vec![json!(parent_hex)]).unwrap();
+    let alone = node
+        .rpc_call_with_params("sendrawtransaction", vec![json!(parent_hex)])
+        .unwrap();
     let msg = alone["error"]["message"].as_str().unwrap_or_default();
     assert!(msg.starts_with("min relay fee not met"), "{alone}");
 
@@ -26824,17 +29489,24 @@ fn submitpackage_lets_a_child_pay_for_a_parent_below_the_relay_floor() {
         version: bitcoin::transaction::Version::TWO,
         lock_time: bitcoin::absolute::LockTime::ZERO,
         input: vec![TxIn {
-            previous_output: OutPoint { txid: parent_txid.parse().unwrap(), vout: 0 },
+            previous_output: OutPoint {
+                txid: parent_txid.parse().unwrap(),
+                vout: 0,
+            },
             script_sig: bitcoin::ScriptBuf::new(),
             sequence: Sequence::MAX,
             witness: Witness::new(),
         }],
-        output: vec![TxOut { value: Amount::from_sat(value - 10_000), script_pubkey: spk.clone() }],
+        output: vec![TxOut {
+            value: Amount::from_sat(value - 10_000),
+            script_pubkey: spk.clone(),
+        }],
     };
     let sighash = SighashCache::new(&child)
         .p2wpkh_signature_hash(0, &spk, Amount::from_sat(value), EcdsaSighashType::All)
         .unwrap();
-    let sig = Secp256k1::new().sign_ecdsa(&Message::from_digest(sighash.to_byte_array()), &wallet.sk);
+    let sig =
+        Secp256k1::new().sign_ecdsa(&Message::from_digest(sighash.to_byte_array()), &wallet.sk);
     let mut sig_bytes = sig.serialize_der().to_vec();
     sig_bytes.push(EcdsaSighashType::All as u8);
     child.input[0].witness = Witness::from_slice(&[sig_bytes, wallet.pk.to_bytes()]);
@@ -26848,8 +29520,15 @@ fn submitpackage_lets_a_child_pay_for_a_parent_below_the_relay_floor() {
         assert!(pool.as_array().unwrap().contains(&json!(txid)), "{pool}");
     }
 
-    node.rpc_ok("generatetoaddress", vec![json!(1), json!(wallet.address.to_string())]);
-    assert_eq!(node.rpc_ok("getrawmempool", vec![]), json!([]), "the template left the pair out");
+    node.rpc_ok(
+        "generatetoaddress",
+        vec![json!(1), json!(wallet.address.to_string())],
+    );
+    assert_eq!(
+        node.rpc_ok("getrawmempool", vec![]),
+        json!([]),
+        "the template left the pair out"
+    );
     node.stop();
 }
 
@@ -26867,7 +29546,10 @@ fn truc_limits_hold_over_rpc_and_a_second_child_evicts_the_first() {
 
     let wallet = common::DeterministicWallet::from_secret([0x44; 32]);
     let mut node = TestNode::start(&[]);
-    node.rpc_ok("generatetoaddress", vec![json!(101), json!(wallet.address.to_string())]);
+    node.rpc_ok(
+        "generatetoaddress",
+        vec![json!(101), json!(wallet.address.to_string())],
+    );
     let spk = wallet.address.script_pubkey();
 
     // Spend `prevouts` (outpoint, value) to `outputs` at `version`, signed.
@@ -26884,13 +29566,20 @@ fn truc_limits_hold_over_rpc_and_a_second_child_evicts_the_first() {
                     witness: Witness::new(),
                 })
                 .collect(),
-            output: outputs.iter().map(|v| TxOut { value: Amount::from_sat(*v), script_pubkey: spk.clone() }).collect(),
+            output: outputs
+                .iter()
+                .map(|v| TxOut {
+                    value: Amount::from_sat(*v),
+                    script_pubkey: spk.clone(),
+                })
+                .collect(),
         };
         for (i, (_, value)) in prevouts.iter().enumerate() {
             let sighash = SighashCache::new(&tx)
                 .p2wpkh_signature_hash(i, &spk, Amount::from_sat(*value), EcdsaSighashType::All)
                 .unwrap();
-            let sig = Secp256k1::new().sign_ecdsa(&Message::from_digest(sighash.to_byte_array()), &wallet.sk);
+            let sig = Secp256k1::new()
+                .sign_ecdsa(&Message::from_digest(sighash.to_byte_array()), &wallet.sk);
             let mut sig_bytes = sig.serialize_der().to_vec();
             sig_bytes.push(EcdsaSighashType::All as u8);
             tx.input[i].witness = Witness::from_slice(&[sig_bytes, wallet.pk.to_bytes()]);
@@ -26898,46 +29587,134 @@ fn truc_limits_hold_over_rpc_and_a_second_child_evicts_the_first() {
         tx
     };
     let hex = |tx: &Transaction| hex::encode(bitcoin::consensus::serialize(tx));
-    let send = |node: &TestNode, tx: &Transaction| node.rpc_call_with_params("sendrawtransaction", vec![json!(hex(tx))]).unwrap();
-    let id = |tx: &Transaction| format!("{} (wtxid={})", tx.compute_txid(), node::validation::decode::wtxid(tx));
+    let send = |node: &TestNode, tx: &Transaction| {
+        node.rpc_call_with_params("sendrawtransaction", vec![json!(hex(tx))])
+            .unwrap()
+    };
+    let id = |tx: &Transaction| {
+        format!(
+            "{} (wtxid={})",
+            tx.compute_txid(),
+            node::validation::decode::wtxid(tx)
+        )
+    };
     let pool = |node: &TestNode| -> std::collections::HashSet<String> {
-        node.rpc_ok("getrawmempool", vec![]).as_array().unwrap().iter().map(|t| t.as_str().unwrap().to_string()).collect()
+        node.rpc_ok("getrawmempool", vec![])
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t.as_str().unwrap().to_string())
+            .collect()
     };
 
     let block1 = node.rpc_ok("getblockhash", vec![json!(1)]);
-    let coinbase: Txid =
-        node.rpc_ok("getblock", vec![block1, json!(1)])["tx"][0].as_str().unwrap().parse().unwrap();
+    let coinbase: Txid = node.rpc_ok("getblock", vec![block1, json!(1)])["tx"][0]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
     let coin = 50 * 100_000_000u64;
     let half = (coin - 10_000) / 2;
 
-    let parent = signed(3, &[(OutPoint { txid: coinbase, vout: 0 }, coin)], &[half, half]);
-    assert_eq!(send(&node, &parent)["result"], json!(parent.compute_txid().to_string()));
-    let first = signed(3, &[(OutPoint { txid: parent.compute_txid(), vout: 0 }, half)], &[half - 10_000]);
-    assert_eq!(send(&node, &first)["result"], json!(first.compute_txid().to_string()));
+    let parent = signed(
+        3,
+        &[(
+            OutPoint {
+                txid: coinbase,
+                vout: 0,
+            },
+            coin,
+        )],
+        &[half, half],
+    );
+    assert_eq!(
+        send(&node, &parent)["result"],
+        json!(parent.compute_txid().to_string())
+    );
+    let first = signed(
+        3,
+        &[(
+            OutPoint {
+                txid: parent.compute_txid(),
+                vout: 0,
+            },
+            half,
+        )],
+        &[half - 10_000],
+    );
+    assert_eq!(
+        send(&node, &first)["result"],
+        json!(first.compute_txid().to_string())
+    );
 
-    let grandchild = signed(3, &[(OutPoint { txid: first.compute_txid(), vout: 0 }, half - 10_000)], &[half - 20_000]);
+    let grandchild = signed(
+        3,
+        &[(
+            OutPoint {
+                txid: first.compute_txid(),
+                vout: 0,
+            },
+            half - 10_000,
+        )],
+        &[half - 20_000],
+    );
     let r = send(&node, &grandchild);
     assert_eq!(r["error"]["code"], json!(-26), "{r}");
     assert_eq!(
         r["error"]["message"],
-        json!(format!("TRUC-violation, tx {} would have too many ancestors", id(&grandchild)))
+        json!(format!(
+            "TRUC-violation, tx {} would have too many ancestors",
+            id(&grandchild)
+        ))
     );
-    let plain = signed(2, &[(OutPoint { txid: parent.compute_txid(), vout: 1 }, half)], &[half - 50_000]);
+    let plain = signed(
+        2,
+        &[(
+            OutPoint {
+                txid: parent.compute_txid(),
+                vout: 1,
+            },
+            half,
+        )],
+        &[half - 50_000],
+    );
     let r = send(&node, &plain);
     assert_eq!(
         r["error"]["message"],
-        json!(format!("TRUC-violation, non-version=3 tx {} cannot spend from version=3 tx {}", id(&plain), id(&parent))),
+        json!(format!(
+            "TRUC-violation, non-version=3 tx {} cannot spend from version=3 tx {}",
+            id(&plain),
+            id(&parent)
+        )),
         "{r}"
     );
 
     // No input in common with `first`, and pays for its eviction.
-    let second = signed(3, &[(OutPoint { txid: parent.compute_txid(), vout: 1 }, half)], &[half - 50_000]);
-    assert_eq!(send(&node, &second)["result"], json!(second.compute_txid().to_string()));
-    let expected: std::collections::HashSet<String> =
-        [&parent, &second].iter().map(|t| t.compute_txid().to_string()).collect();
+    let second = signed(
+        3,
+        &[(
+            OutPoint {
+                txid: parent.compute_txid(),
+                vout: 1,
+            },
+            half,
+        )],
+        &[half - 50_000],
+    );
+    assert_eq!(
+        send(&node, &second)["result"],
+        json!(second.compute_txid().to_string())
+    );
+    let expected: std::collections::HashSet<String> = [&parent, &second]
+        .iter()
+        .map(|t| t.compute_txid().to_string())
+        .collect();
     assert_eq!(pool(&node), expected);
 
-    node.rpc_ok("generatetoaddress", vec![json!(1), json!(wallet.address.to_string())]);
+    node.rpc_ok(
+        "generatetoaddress",
+        vec![json!(1), json!(wallet.address.to_string())],
+    );
     assert!(pool(&node).is_empty(), "the template left the pair out");
 
     node.stop();
@@ -26965,13 +29742,22 @@ fn test_addrindexmaxhistory_sets_the_served_history_cap() {
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     let mut node = TestNode::start(&args);
 
-    let spk = bitcoin::Address::from_str(ADDR).unwrap().assume_checked().script_pubkey();
+    let spk = bitcoin::Address::from_str(ADDR)
+        .unwrap()
+        .assume_checked()
+        .script_pubkey();
     let mut electrum_sh = bitcoin::hashes::sha256::Hash::hash(spk.as_bytes()).to_byte_array();
     electrum_sh.reverse();
     let electrum_sh = hex::encode(electrum_sh);
-    let http = reqwest::blocking::Client::builder().timeout(Duration::from_secs(10)).build().unwrap();
+    let http = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .unwrap();
     let esplora = || {
-        let r = http.get(format!("http://127.0.0.1:{esplora_port}/address/{ADDR}")).send().unwrap();
+        let r = http
+            .get(format!("http://127.0.0.1:{esplora_port}/address/{ADDR}"))
+            .send()
+            .unwrap();
         (r.status().as_u16(), r.text().unwrap())
     };
     let electrum = || -> serde_json::Value {
@@ -26989,7 +29775,9 @@ fn test_addrindexmaxhistory_sets_the_served_history_cap() {
             || {
                 let (status, body) = esplora();
                 status == 200
-                    && serde_json::from_str::<serde_json::Value>(&body).ok().and_then(|v| v["chain_stats"]["tx_count"].as_u64())
+                    && serde_json::from_str::<serde_json::Value>(&body)
+                        .ok()
+                        .and_then(|v| v["chain_stats"]["tx_count"].as_u64())
                         == Some(n)
             },
             test_timeout(30),
@@ -27000,15 +29788,28 @@ fn test_addrindexmaxhistory_sets_the_served_history_cap() {
     node.mine_blocks(2, ADDR);
     indexed(2);
     let served = electrum();
-    assert_eq!(served["result"].as_array().map(Vec::len), Some(2), "two transactions are within the cap: {served}");
+    assert_eq!(
+        served["result"].as_array().map(Vec::len),
+        Some(2),
+        "two transactions are within the cap: {served}"
+    );
 
     node.mine_blocks(1, ADDR);
-    poll_until(|| esplora().0 == 400, test_timeout(30), "Esplora never refused the third transaction");
+    poll_until(
+        || esplora().0 == 400,
+        test_timeout(30),
+        "Esplora never refused the third transaction",
+    );
     let (_, body) = esplora();
-    assert!(body.contains("Too many history entries"), "Esplora refusal: {body}");
+    assert!(
+        body.contains("Too many history entries"),
+        "Esplora refusal: {body}"
+    );
     let refused = electrum();
     assert!(
-        refused["error"]["message"].as_str().is_some_and(|m| m.contains("history too large")),
+        refused["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("history too large")),
         "Electrum refusal: {refused}"
     );
 

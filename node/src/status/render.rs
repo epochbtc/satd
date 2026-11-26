@@ -157,8 +157,13 @@ fn index_item(name: &str, state: &IndexState) -> Item {
             ..
         } => {
             let pass = pass.map(|p| format!("pass {p} of 2, ")).unwrap_or_default();
-            let eta = eta_secs.map(|s| format!(", about {} left", duration(s))).unwrap_or_default();
-            (format!("backfilling, {pass}{}{eta}", percent(*progress)), WAIT)
+            let eta = eta_secs
+                .map(|s| format!(", about {} left", duration(s)))
+                .unwrap_or_default();
+            (
+                format!("backfilling, {pass}{}{eta}", percent(*progress)),
+                WAIT,
+            )
         }
         IndexState::Paused { progress, .. } => {
             (format!("backfill paused at {}", percent(*progress)), WAIT)
@@ -238,34 +243,70 @@ pub fn view(s: &StatusSnapshot, now: u64) -> View {
     text("sync.rates", rates);
     text(
         "sync.eta",
-        s.sync.eta_secs.map(|e| format!("about {} left", duration(e))).unwrap_or_default(),
+        s.sync
+            .eta_secs
+            .map(|e| format!("about {} left", duration(e)))
+            .unwrap_or_default(),
     );
 
     // Sections that are absent still carry every key, empty, so a section
     // that appears on a later refresh has every element filled.
     let au = s.assumeutxo.as_ref();
-    text("au.height", au.map(|a| thousands(u64::from(a.background_height))).unwrap_or_default());
-    text("au.snapshot", au.map(|a| thousands(u64::from(a.snapshot_height))).unwrap_or_default());
-    text("au.percent", au.map(|a| percent(a.background_progress)).unwrap_or_default());
+    text(
+        "au.height",
+        au.map(|a| thousands(u64::from(a.background_height)))
+            .unwrap_or_default(),
+    );
+    text(
+        "au.snapshot",
+        au.map(|a| thousands(u64::from(a.snapshot_height)))
+            .unwrap_or_default(),
+    );
+    text(
+        "au.percent",
+        au.map(|a| percent(a.background_progress))
+            .unwrap_or_default(),
+    );
 
     let wallets = if s.services.wallets_ready {
         ("Wallets can connect and get complete answers.", OK)
-    } else if matches!(s.phase, Phase::Stalled | Phase::SyncingHeaders | Phase::SyncingBlocks) {
-        ("Wallets can connect, but balances are incomplete until the sync finishes.", WAIT)
+    } else if matches!(
+        s.phase,
+        Phase::Stalled | Phase::SyncingHeaders | Phase::SyncingBlocks
+    ) {
+        (
+            "Wallets can connect, but balances are incomplete until the sync finishes.",
+            WAIT,
+        )
     } else {
-        ("Wallet answers are incomplete until the address index is complete and a wallet server is serving.", WAIT)
+        (
+            "Wallet answers are incomplete until the address index is complete and a wallet server is serving.",
+            WAIT,
+        )
     };
     text("wallets", wallets.0.to_string());
 
     let b = s.latest_block.as_ref();
-    text("block.height", b.map(|b| thousands(u64::from(b.height))).unwrap_or_default());
+    text(
+        "block.height",
+        b.map(|b| thousands(u64::from(b.height)))
+            .unwrap_or_default(),
+    );
     text(
         "block.age",
         b.map(|b| format!("{} ago", duration(now.saturating_sub(u64::from(b.time)))))
             .unwrap_or_default(),
     );
-    text("block.txs", b.map(|b| thousands(b.transactions as u64)).unwrap_or_default());
-    text("block.fees", b.map(|b| format!("{} sat", thousands(b.fees_sat))).unwrap_or_default());
+    text(
+        "block.txs",
+        b.map(|b| thousands(b.transactions as u64))
+            .unwrap_or_default(),
+    );
+    text(
+        "block.fees",
+        b.map(|b| format!("{} sat", thousands(b.fees_sat)))
+            .unwrap_or_default(),
+    );
     text(
         "block.hash",
         b.map(|b| {
@@ -279,23 +320,43 @@ pub fn view(s: &StatusSnapshot, now: u64) -> View {
     text("mempool.size", bytes(s.mempool.bytes));
     text("mempool.minfee", fee_rate(s.mempool.min_fee_rate_sat_vb));
     let f = s.fees.as_ref();
-    text("fees.1", f.map(|f| fee_rate(f.next_block)).unwrap_or_default());
-    text("fees.3", f.map(|f| fee_rate(f.three_blocks)).unwrap_or_default());
-    text("fees.6", f.map(|f| fee_rate(f.six_blocks)).unwrap_or_default());
+    text(
+        "fees.1",
+        f.map(|f| fee_rate(f.next_block)).unwrap_or_default(),
+    );
+    text(
+        "fees.3",
+        f.map(|f| fee_rate(f.three_blocks)).unwrap_or_default(),
+    );
+    text(
+        "fees.6",
+        f.map(|f| fee_rate(f.six_blocks)).unwrap_or_default(),
+    );
 
     let total = s.peers.inbound + s.peers.outbound;
     text(
         "peers.total",
-        format!("{total} ({} outbound, {} inbound)", s.peers.outbound, s.peers.inbound),
+        format!(
+            "{total} ({} outbound, {} inbound)",
+            s.peers.outbound, s.peers.inbound
+        ),
     );
 
     v.width.insert("sync.bar", percent(s.sync.progress));
     v.width.insert(
         "au.bar",
-        percent(s.assumeutxo.as_ref().map(|a| a.background_progress).unwrap_or(0.0)),
+        percent(
+            s.assumeutxo
+                .as_ref()
+                .map(|a| a.background_progress)
+                .unwrap_or(0.0),
+        ),
     );
 
-    let syncing = matches!(s.phase, Phase::Stalled | Phase::SyncingHeaders | Phase::SyncingBlocks);
+    let syncing = matches!(
+        s.phase,
+        Phase::Stalled | Phase::SyncingHeaders | Phase::SyncingBlocks
+    );
     v.show.insert("sync", syncing);
     v.show.insert("synced", !syncing);
     v.show.insert("au", s.assumeutxo.is_some());
@@ -305,7 +366,8 @@ pub fn view(s: &StatusSnapshot, now: u64) -> View {
     );
     v.show.insert("block", s.latest_block.is_some());
     v.show.insert("fees", s.fees.is_some());
-    v.show.insert("warnings", !s.warnings.is_empty() || s.unclean_shutdown);
+    v.show
+        .insert("warnings", !s.warnings.is_empty() || s.unclean_shutdown);
     v.show.insert("connect", !s.connect.is_empty());
     v.show.insert("eta", s.sync.eta_secs.is_some());
     // The cards that are always on for a running node. They carry `data-s`
@@ -380,20 +442,31 @@ pub fn view(s: &StatusSnapshot, now: u64) -> View {
             })
             .collect(),
     );
-    v.lists.insert("crawl", s.crawl.as_ref().map(crawl_items).unwrap_or_default());
+    v.lists.insert(
+        "crawl",
+        s.crawl.as_ref().map(crawl_items).unwrap_or_default(),
+    );
     v
 }
 
 /// The crawl card's rows: counts only.
 fn crawl_items(c: &super::CrawlStatus) -> Vec<Item> {
-    let n = |label: &str, value: usize| Item { label: label.to_string(), value: thousands(value as u64), state: OK };
+    let n = |label: &str, value: usize| Item {
+        label: label.to_string(),
+        value: thousands(value as u64),
+        state: OK,
+    };
     let state = match c.state {
         "running" => OK,
         "stopped" => BAD,
         _ => WAIT,
     };
     vec![
-        Item { label: "State".to_string(), value: c.state.to_string(), state },
+        Item {
+            label: "State".to_string(),
+            value: c.state.to_string(),
+            state,
+        },
         n("Addresses in the book", c.book_entries),
         n("Reachable over IPv4", c.reachable_ipv4),
         n("Reachable over IPv6", c.reachable_ipv6),
@@ -440,8 +513,15 @@ impl Page<'_> {
     }
     /// The opening tag of a section shown or hidden by `data-s`.
     fn section(&mut self, tag: &str, key: &'static str, class: &str) {
-        let hidden = if self.v.show.get(key).copied().unwrap_or(false) { "" } else { " hidden" };
-        let _ = write!(self.out, "<{tag} class=\"{class}\" data-s=\"{key}\"{hidden}>");
+        let hidden = if self.v.show.get(key).copied().unwrap_or(false) {
+            ""
+        } else {
+            " hidden"
+        };
+        let _ = write!(
+            self.out,
+            "<{tag} class=\"{class}\" data-s=\"{key}\"{hidden}>"
+        );
     }
     fn bar(&mut self, key: &'static str) {
         let w = self.v.width.get(key).map(String::as_str).unwrap_or("0.0%");
@@ -507,7 +587,10 @@ pub fn html(v: &View) -> String {
     // Header.
     p.raw("<header><h1>satd</h1>");
     let tone = v.state.get("phase").copied().unwrap_or(WAIT);
-    let _ = write!(p.out, "<span class=\"phase\" data-state=\"{tone}\" data-st=\"phase\" id=\"phase\">");
+    let _ = write!(
+        p.out,
+        "<span class=\"phase\" data-state=\"{tone}\" data-st=\"phase\" id=\"phase\">"
+    );
     p.t("span", "phase.dot");
     p.raw(" ");
     p.t("span", "phase.label");
@@ -613,8 +696,10 @@ pub fn html(v: &View) -> String {
     p.raw(")</span></div>");
     p.bar("au.bar");
     p.section("p", "au.rejected", "");
-    p.raw("<strong data-state=\"bad\">Background validation proved this snapshot invalid. \
-           Do not trust this node's answers; reindex without the snapshot.</strong></p></div>");
+    p.raw(
+        "<strong data-state=\"bad\">Background validation proved this snapshot invalid. \
+           Do not trust this node's answers; reindex without the snapshot.</strong></p></div>",
+    );
     p.raw("</section>");
 
     // What a wallet can use.

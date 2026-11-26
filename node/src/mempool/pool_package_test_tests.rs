@@ -46,8 +46,20 @@ fn judged(r: &PackageTestResult, tx: &Transaction) -> bool {
 fn a_member_may_spend_an_earlier_one() {
     let (cs, mp, dir) = env(&[1]);
     let parent = spend(&[prev(1)], COIN_VALUE, 1_000, 1, 1);
-    let child = spend(&[out(parent.compute_txid(), 0)], parent.output[0].value.to_sat(), 1_000, 1, 2);
-    let grandchild = spend(&[out(child.compute_txid(), 0)], child.output[0].value.to_sat(), 1_000, 1, 3);
+    let child = spend(
+        &[out(parent.compute_txid(), 0)],
+        parent.output[0].value.to_sat(),
+        1_000,
+        1,
+        2,
+    );
+    let grandchild = spend(
+        &[out(child.compute_txid(), 0)],
+        child.output[0].value.to_sat(),
+        1_000,
+        1,
+        3,
+    );
 
     let r = test(&mp, &cs, &[&parent, &child, &grandchild]);
     assert_eq!(r.package_error, None);
@@ -65,7 +77,13 @@ fn a_member_may_spend_an_earlier_one() {
 fn a_truc_violation_is_a_package_error() {
     let (cs, mp, dir) = env(&[1, 2]);
     let plain = spend(&[prev(1)], COIN_VALUE, 1_000, 1, 1);
-    let truc_from_plain = v3(spend(&[out(plain.compute_txid(), 0)], plain.output[0].value.to_sat(), 1_000, 1, 2));
+    let truc_from_plain = v3(spend(
+        &[out(plain.compute_txid(), 0)],
+        plain.output[0].value.to_sat(),
+        1_000,
+        1,
+        2,
+    ));
     let r = test(&mp, &cs, &[&plain, &truc_from_plain]);
     assert_eq!(
         r.package_error,
@@ -81,11 +99,23 @@ fn a_truc_violation_is_a_package_error() {
     // counts as a child nor hides one.
     let parent = v3(spend(&[prev(1)], COIN_VALUE, 1_000, 2, 3));
     let share = parent.output[1].value.to_sat();
-    let first = v3(spend(&[out(parent.compute_txid(), 0)], parent.output[0].value.to_sat(), 1_000, 1, 4));
+    let first = v3(spend(
+        &[out(parent.compute_txid(), 0)],
+        parent.output[0].value.to_sat(),
+        1_000,
+        1,
+        4,
+    ));
     let second = v3(spend(&[out(parent.compute_txid(), 1)], share, 1_000, 1, 5));
     let unrelated = v3(spend(&[prev(2)], COIN_VALUE, 1_000, 1, 6));
-    let exceeds = Some(format!("TRUC-violation, tx {} would exceed descendant count limit", id(&parent)));
-    assert_eq!(test(&mp, &cs, &[&parent, &first, &second, &unrelated]).package_error, exceeds);
+    let exceeds = Some(format!(
+        "TRUC-violation, tx {} would exceed descendant count limit",
+        id(&parent)
+    ));
+    assert_eq!(
+        test(&mp, &cs, &[&parent, &first, &second, &unrelated]).package_error,
+        exceeds
+    );
     let r = test(&mp, &cs, &[&parent, &first, &unrelated]);
     assert_eq!(r.package_error, None);
     assert!(allowed(&r, &unrelated));
@@ -99,10 +129,24 @@ fn a_truc_violation_is_a_package_error() {
 fn a_member_may_not_evict_a_sibling() {
     let (cs, mp, dir) = env(&[1, 2]);
     let parent = v3(spend(&[prev(1)], COIN_VALUE, 1_000, 2, 1));
-    let p = mp.accept_transaction(parent.clone(), &cs, &NoopVerifier, TxSource::Rpc, false).expect("parent");
+    let p = mp
+        .accept_transaction(parent.clone(), &cs, &NoopVerifier, TxSource::Rpc, false)
+        .expect("parent");
     let share = parent.output[1].value.to_sat();
-    mp.accept_transaction(v3(spend(&[out(p, 0)], parent.output[0].value.to_sat(), 1_000, 1, 2)), &cs, &NoopVerifier, TxSource::Rpc, false)
-        .expect("resident child");
+    mp.accept_transaction(
+        v3(spend(
+            &[out(p, 0)],
+            parent.output[0].value.to_sat(),
+            1_000,
+            1,
+            2,
+        )),
+        &cs,
+        &NoopVerifier,
+        TxSource::Rpc,
+        false,
+    )
+    .expect("resident child");
 
     let sibling = v3(spend(&[out(p, 1)], share, 20_000, 1, 3));
     let unrelated = v3(spend(&[prev(2)], COIN_VALUE, 1_000, 1, 4));
@@ -110,11 +154,15 @@ fn a_member_may_not_evict_a_sibling() {
     assert_eq!(r.package_error, None);
     assert_eq!(
         refusal(&r, &sibling),
-        Some(format!("TRUC-violation, tx {} would exceed descendant count limit", id(&parent)))
+        Some(format!(
+            "TRUC-violation, tx {} would exceed descendant count limit",
+            id(&parent)
+        ))
     );
     assert!(!judged(&r, &unrelated), "the rest are not judged");
     // Alone, the same transaction may evict its sibling.
-    mp.test_accept(&sibling, &cs, &NoopVerifier).expect("single testmempoolaccept allows sibling eviction");
+    mp.test_accept(&sibling, &cs, &NoopVerifier)
+        .expect("single testmempoolaccept allows sibling eviction");
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -124,15 +172,25 @@ fn a_member_may_not_evict_a_sibling() {
 #[test]
 fn a_member_may_not_replace() {
     let (cs, mp, dir) = env(&[1, 2]);
-    mp.accept_transaction(spend(&[prev(1)], COIN_VALUE, 1_000, 1, 1), &cs, &NoopVerifier, TxSource::Rpc, false)
-        .expect("resident");
+    mp.accept_transaction(
+        spend(&[prev(1)], COIN_VALUE, 1_000, 1, 1),
+        &cs,
+        &NoopVerifier,
+        TxSource::Rpc,
+        false,
+    )
+    .expect("resident");
     let other = spend(&[prev(2)], COIN_VALUE, 1_000, 1, 2);
     let conflict = spend(&[prev(1)], COIN_VALUE, 50_000, 1, 3);
     let r = test(&mp, &cs, &[&other, &conflict]);
-    assert_eq!(refusal(&r, &conflict).as_deref(), Some("bip125-replacement-disallowed"));
+    assert_eq!(
+        refusal(&r, &conflict).as_deref(),
+        Some("bip125-replacement-disallowed")
+    );
     // Core records a success only after the scripts, which nothing reached.
     assert!(!judged(&r, &other));
-    mp.test_accept(&conflict, &cs, &NoopVerifier).expect("alone it replaces");
+    mp.test_accept(&conflict, &cs, &NoopVerifier)
+        .expect("alone it replaces");
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -144,17 +202,36 @@ fn the_cluster_limits_cover_the_package() {
     let (cs, mp, dir) = env(&[1, 2]);
     mp.config.write().max_cluster_count = 2;
     let parent = spend(&[prev(1)], COIN_VALUE, 1_000, 1, 1);
-    let child = spend(&[out(parent.compute_txid(), 0)], parent.output[0].value.to_sat(), 1_000, 1, 2);
-    let grandchild = spend(&[out(child.compute_txid(), 0)], child.output[0].value.to_sat(), 1_000, 1, 3);
+    let child = spend(
+        &[out(parent.compute_txid(), 0)],
+        parent.output[0].value.to_sat(),
+        1_000,
+        1,
+        2,
+    );
+    let grandchild = spend(
+        &[out(child.compute_txid(), 0)],
+        child.output[0].value.to_sat(),
+        1_000,
+        1,
+        3,
+    );
     let r = test(&mp, &cs, &[&parent, &child, &grandchild]);
     assert_eq!(r.package_error.as_deref(), Some("too-large-cluster"));
     assert!(r.results.is_empty());
     assert_eq!(test(&mp, &cs, &[&parent, &child]).package_error, None);
 
     // With the parent in the mempool, the package's two make three.
-    let p = mp.accept_transaction(parent.clone(), &cs, &NoopVerifier, TxSource::Rpc, false).expect("parent");
+    let p = mp
+        .accept_transaction(parent.clone(), &cs, &NoopVerifier, TxSource::Rpc, false)
+        .expect("parent");
     assert_eq!(p, parent.compute_txid());
-    assert_eq!(test(&mp, &cs, &[&child, &grandchild]).package_error.as_deref(), Some("too-large-cluster"));
+    assert_eq!(
+        test(&mp, &cs, &[&child, &grandchild])
+            .package_error
+            .as_deref(),
+        Some("too-large-cluster")
+    );
     // Unrelated members are clusters of their own.
     let lone = spend(&[prev(2)], COIN_VALUE, 1_000, 1, 4);
     assert_eq!(test(&mp, &cs, &[&child, &lone]).package_error, None);
@@ -168,12 +245,24 @@ fn the_cluster_limits_cover_the_package() {
 fn the_cluster_vsize_limit_covers_the_package() {
     let (cs, mp, dir) = env(&[1]);
     let parent = spend(&[prev(1)], COIN_VALUE, 1_000, 1, 1);
-    let child = spend(&[out(parent.compute_txid(), 0)], parent.output[0].value.to_sat(), 1_000, 1, 2);
+    let child = spend(
+        &[out(parent.compute_txid(), 0)],
+        parent.output[0].value.to_sat(),
+        1_000,
+        1,
+        2,
+    );
     let vsize = |tx: &Transaction| policy::weight_to_vsize(tx.weight().to_wu());
-    let (each, both) = (vsize(&parent).max(vsize(&child)), vsize(&parent) + vsize(&child));
+    let (each, both) = (
+        vsize(&parent).max(vsize(&child)),
+        vsize(&parent) + vsize(&child),
+    );
     mp.config.write().max_cluster_vsize = both - 1;
     assert!(each < both - 1, "fixture: each member fits alone");
-    assert_eq!(test(&mp, &cs, &[&parent, &child]).package_error.as_deref(), Some("too-large-cluster"));
+    assert_eq!(
+        test(&mp, &cs, &[&parent, &child]).package_error.as_deref(),
+        Some("too-large-cluster")
+    );
     mp.config.write().max_cluster_vsize = both;
     assert_eq!(test(&mp, &cs, &[&parent, &child]).package_error, None);
 
@@ -187,7 +276,10 @@ fn a_child_must_spend_its_parents_dust() {
     // Zero fee and one dust output: Core's ephemeral dust parent.
     let mut parent = spend(&[prev(1)], COIN_VALUE, 0, 1, 1);
     parent.output[0].value = bitcoin::Amount::from_sat(COIN_VALUE - 100);
-    parent.output.push(TxOut { value: bitcoin::Amount::from_sat(100), script_pubkey: parent.output[0].script_pubkey.clone() });
+    parent.output.push(TxOut {
+        value: bitcoin::Amount::from_sat(100),
+        script_pubkey: parent.output[0].script_pubkey.clone(),
+    });
     let p = parent.compute_txid();
     let around = spend(&[out(p, 0)], COIN_VALUE - 100, 1_000, 1, 2);
     let sweeps = spend(&[out(p, 0), out(p, 1)], COIN_VALUE, 1_000, 1, 3);
@@ -196,11 +288,21 @@ fn a_child_must_spend_its_parents_dust() {
     assert_eq!(r.package_error, None);
     assert_eq!(
         refusal(&r, &around),
-        Some(format!("missing-ephemeral-spends, tx {} did not spend parent's ephemeral dust", id(&around)))
+        Some(format!(
+            "missing-ephemeral-spends, tx {} did not spend parent's ephemeral dust",
+            id(&around)
+        ))
     );
-    assert!(!judged(&r, &parent), "a dust failure leaves the rest unjudged");
+    assert!(
+        !judged(&r, &parent),
+        "a dust failure leaves the rest unjudged"
+    );
     let r = test(&mp, &cs, &[&parent, &sweeps]);
-    assert!(allowed(&r, &parent) && allowed(&r, &sweeps), "{:?}", refusal(&r, &sweeps));
+    assert!(
+        allowed(&r, &parent) && allowed(&r, &sweeps),
+        "{:?}",
+        refusal(&r, &sweeps)
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -214,7 +316,11 @@ fn members_are_judged_by_their_own_feerates() {
     let parent = spend(&[prev(1)], COIN_VALUE, 0, 1, 1);
     let child = spend(&[out(parent.compute_txid(), 0)], COIN_VALUE, 20_000, 1, 2);
     let r = test(&mp, &cs, &[&parent, &child]);
-    assert!(refusal(&r, &parent).unwrap().starts_with("min relay fee not met"));
+    assert!(
+        refusal(&r, &parent)
+            .unwrap()
+            .starts_with("min relay fee not met")
+    );
     assert!(!judged(&r, &child));
 
     let _ = std::fs::remove_dir_all(&dir);
@@ -227,7 +333,9 @@ fn an_already_known_member_ends_the_evaluation() {
     let a = spend(&[prev(1)], COIN_VALUE, 1_000, 1, 1);
     let b = spend(&[prev(2)], COIN_VALUE, 1_000, 1, 2);
     let a_wtxid = a.compute_wtxid();
-    let r = mp.test_accept_package(&[a.clone(), b.clone()], &cs, &NoopVerifier, &|t| t.compute_wtxid() == a_wtxid);
+    let r = mp.test_accept_package(&[a.clone(), b.clone()], &cs, &NoopVerifier, &|t| {
+        t.compute_wtxid() == a_wtxid
+    });
     assert_eq!(refusal(&r, &a).as_deref(), Some("txn-already-known"));
     assert!(!judged(&r, &b));
 
@@ -240,13 +348,25 @@ fn an_already_known_member_ends_the_evaluation() {
 #[test]
 fn the_first_refusal_ends_the_evaluation() {
     let (cs, mp, dir) = env(&[1]);
-    mp.accept_transaction(spend(&[prev(1)], COIN_VALUE, 1_000, 1, 1), &cs, &NoopVerifier, TxSource::Rpc, false)
-        .expect("resident");
+    mp.accept_transaction(
+        spend(&[prev(1)], COIN_VALUE, 1_000, 1, 1),
+        &cs,
+        &NoopVerifier,
+        TxSource::Rpc,
+        false,
+    )
+    .expect("resident");
     let orphan = spend(&[prev(9)], COIN_VALUE, 1_000, 1, 2);
     let conflict = spend(&[prev(1)], COIN_VALUE, 50_000, 1, 3);
     let r = test(&mp, &cs, &[&orphan, &conflict]);
-    assert!(matches!(r.results.get(&orphan.compute_wtxid()), Some(Err(MempoolError::MissingInputs))));
-    assert!(!judged(&r, &conflict), "the second refusal is never reached");
+    assert!(matches!(
+        r.results.get(&orphan.compute_wtxid()),
+        Some(Err(MempoolError::MissingInputs))
+    ));
+    assert!(
+        !judged(&r, &conflict),
+        "the second refusal is never reached"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }

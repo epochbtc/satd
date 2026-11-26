@@ -81,7 +81,11 @@ pub enum Rejection {
     #[error(
         "coin confirmed at height {coin_height}, less than {min_age} blocks before the anchor at {anchor_height}"
     )]
-    CoinTooYoung { coin_height: u32, anchor_height: u32, min_age: u32 },
+    CoinTooYoung {
+        coin_height: u32,
+        anchor_height: u32,
+        min_age: u32,
+    },
     #[error("signature format does not apply to this output: {0}")]
     WrongFormat(&'static str),
     #[error("signature is invalid: {0}")]
@@ -163,7 +167,10 @@ pub fn check_chain(att: &Attestation, view: &dyn ChainView) -> Result<Coin, Reje
 /// outpoint's value never changes, so this holds or fails at every tip.
 pub fn check_coin_value(coin: &Coin) -> Result<(), Rejection> {
     if coin.value < MIN_COIN_VALUE {
-        return Err(Rejection::CoinTooSmall { value: coin.value.to_sat(), min: MIN_COIN_VALUE.to_sat() });
+        return Err(Rejection::CoinTooSmall {
+            value: coin.value.to_sat(),
+            min: MIN_COIN_VALUE.to_sat(),
+        });
     }
     Ok(())
 }
@@ -174,9 +181,15 @@ pub fn min_coin_age(network: Network, coin: &Coin) -> u32 {
     // not given the short age by default.
     let age = match network {
         Network::Bitcoin => MIN_COIN_AGE,
-        Network::Testnet | Network::Testnet4 | Network::Signet | Network::Regtest => TEST_MIN_COIN_AGE,
+        Network::Testnet | Network::Testnet4 | Network::Signet | Network::Regtest => {
+            TEST_MIN_COIN_AGE
+        }
     };
-    if coin.coinbase { age.max(COINBASE_MATURITY) } else { age }
+    if coin.coinbase {
+        age.max(COINBASE_MATURITY)
+    } else {
+        age
+    }
 }
 
 /// Rule 4 alone: `coin` confirmed at least [`min_coin_age`] blocks below
@@ -184,7 +197,11 @@ pub fn min_coin_age(network: Network, coin: &Coin) -> u32 {
 pub fn check_coin_age(network: Network, coin: &Coin, anchor_height: u32) -> Result<(), Rejection> {
     let min_age = min_coin_age(network, coin);
     if u64::from(coin.height) + u64::from(min_age) > u64::from(anchor_height) {
-        return Err(Rejection::CoinTooYoung { coin_height: coin.height, anchor_height, min_age });
+        return Err(Rejection::CoinTooYoung {
+            coin_height: coin.height,
+            anchor_height,
+            min_age,
+        });
     }
     Ok(())
 }
@@ -207,9 +224,15 @@ pub fn verify_signature(att: &Attestation, script: &ScriptBuf) -> Result<Timeloc
         NapSignature::Full(tx) => Proof::Full(tx.clone()),
     };
     match bip322::verify(script, message.as_bytes(), &proof) {
-        Verification::Valid { version, lock_time, sequence } => {
-            Ok(Timelocks { version, lock_time, sequence })
-        }
+        Verification::Valid {
+            version,
+            lock_time,
+            sequence,
+        } => Ok(Timelocks {
+            version,
+            lock_time,
+            sequence,
+        }),
         Verification::Inconclusive(reason) => Err(Rejection::SignatureInconclusive(reason)),
         Verification::Invalid(reason) => Err(Rejection::SignatureInvalid(reason)),
     }
@@ -218,7 +241,9 @@ pub fn verify_signature(att: &Attestation, script: &ScriptBuf) -> Result<Timeloc
 /// Format 2: Core's `verifymessage` against a P2PKH coin.
 fn verify_legacy(script: &ScriptBuf, message: &str, sig: &[u8]) -> Result<(), Rejection> {
     if !script.is_p2pkh() {
-        return Err(Rejection::WrongFormat("a legacy signature is for a P2PKH output only"));
+        return Err(Rejection::WrongFormat(
+            "a legacy signature is for a P2PKH output only",
+        ));
     }
     let key = signmessage::recover_compact(&signmessage::message_hash(message), sig)
         .ok_or_else(|| Rejection::SignatureInvalid("no public key recovers from it".into()))?;
@@ -232,8 +257,16 @@ fn verify_legacy(script: &ScriptBuf, message: &str, sig: &[u8]) -> Result<(), Re
 /// the block after `view`'s tip. The arithmetic is consensus's
 /// (`IsFinalTx`, `SequenceLocks`), with `coin` standing for `to_sign`'s
 /// prevout.
-pub fn check_timelocks(view: &dyn ChainView, coin: &Coin, locks: &Timelocks) -> Result<(), Rejection> {
-    let Timelocks { version, lock_time, sequence } = *locks;
+pub fn check_timelocks(
+    view: &dyn ChainView,
+    coin: &Coin,
+    locks: &Timelocks,
+) -> Result<(), Rejection> {
+    let Timelocks {
+        version,
+        lock_time,
+        sequence,
+    } = *locks;
     let next = view.tip_height() + 1;
     let tip_mtp = view.median_time_past(next);
 
@@ -261,10 +294,14 @@ pub fn check_timelocks(view: &dyn ChainView, coin: &Coin, locks: &Timelocks) -> 
         let required = u64::from(sequence & MASK) << 9;
         let coin_mtp = u64::from(view.median_time_past(coin.height));
         if u64::from(tip_mtp).saturating_sub(coin_mtp) < required {
-            return Err(Rejection::NotYetValid("its relative time lock is not reached"));
+            return Err(Rejection::NotYetValid(
+                "its relative time lock is not reached",
+            ));
         }
     } else if next.saturating_sub(coin.height) < sequence & MASK {
-        return Err(Rejection::NotYetValid("its relative height lock is not reached"));
+        return Err(Rejection::NotYetValid(
+            "its relative height lock is not reached",
+        ));
     }
     Ok(())
 }
@@ -293,4 +330,3 @@ pub fn select<'a>(
     }
     out
 }
-

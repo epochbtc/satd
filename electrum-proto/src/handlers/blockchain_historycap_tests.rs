@@ -60,7 +60,10 @@ fn history() -> Vec<HistoryEntry> {
             height: 5,
             txid: txid(2),
             vin: 0,
-            prev_outpoint: OutPoint { txid: txid(1), vout: 0 },
+            prev_outpoint: OutPoint {
+                txid: txid(1),
+                vout: 0,
+            },
         },
         fund(5, 3, 1, 3_000),
         fund(8, 4, 0, 4_000),
@@ -69,7 +72,10 @@ fn history() -> Vec<HistoryEntry> {
             height: 9,
             txid: txid(5),
             vin: 0,
-            prev_outpoint: OutPoint { txid: txid(2), vout: 0 },
+            prev_outpoint: OutPoint {
+                txid: txid(2),
+                vout: 0,
+            },
         },
     ]
 }
@@ -100,9 +106,16 @@ impl AddressIndex for FixedIndex {
             height,
             amount_sat,
         };
-        Ok(vec![utxo(5, 3, 1, 3_000), utxo(8, 4, 0, 4_000), utxo(8, 4, 1, 5_000)])
+        Ok(vec![
+            utxo(5, 3, 1, 3_000),
+            utxo(8, 4, 0, 4_000),
+            utxo(8, 4, 1, 5_000),
+        ])
     }
-    fn subscribe(&self, _sh: Scripthash) -> Result<broadcast::Receiver<StatusUpdate>, SubscribeError> {
+    fn subscribe(
+        &self,
+        _sh: Scripthash,
+    ) -> Result<broadcast::Receiver<StatusUpdate>, SubscribeError> {
         let (tx, rx) = broadcast::channel(4);
         self.senders.lock().push(tx);
         Ok(rx)
@@ -193,9 +206,15 @@ fn call(cap: usize, method: &str) -> Response {
 }
 
 fn assert_refused(resp: &Response, cap: usize) {
-    let err = resp.error.as_ref().unwrap_or_else(|| panic!("expected a refusal, got {resp:?}"));
+    let err = resp
+        .error
+        .as_ref()
+        .unwrap_or_else(|| panic!("expected a refusal, got {resp:?}"));
     assert_eq!(err.code, 2, "{err:?}");
-    assert_eq!(err.message, format!("history too large (cap = {cap} entries)"));
+    assert_eq!(
+        err.message,
+        format!("history too large (cap = {cap} entries)")
+    );
 }
 
 pub(super) fn result(resp: Response) -> Value {
@@ -272,7 +291,11 @@ async fn subscribe_is_refused_over_the_cap_and_not_kept() {
         request("blockchain.scripthash.subscribe"),
     );
     assert_refused(&resp, 4);
-    assert_eq!(subs.scripthash_count(), 0, "a refused subscription must not be kept");
+    assert_eq!(
+        subs.scripthash_count(),
+        0,
+        "a refused subscription must not be kept"
+    );
 
     let (state, _dir) = electrum_state(5);
     let resp = dispatch_with_subscriptions(
@@ -282,8 +305,8 @@ async fn subscribe_is_refused_over_the_cap_and_not_kept() {
         state.electrum_extras.clone(),
         request("blockchain.scripthash.subscribe"),
     );
-    let rows = node_index::history_rows(state.address_index.as_ref(), &SH, usize::MAX, |_| None)
-        .unwrap();
+    let rows =
+        node_index::history_rows(state.address_index.as_ref(), &SH, usize::MAX, |_| None).unwrap();
     assert_eq!(rows.len(), 5);
     assert_eq!(
         result(resp),

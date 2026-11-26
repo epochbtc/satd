@@ -92,7 +92,9 @@ fn decode_cursor(r: &mut &[u8]) -> Result<Option<OutPoint>, FormatError> {
 fn count(r: &mut &[u8], max: usize, what: &str) -> Result<usize, FormatError> {
     let n = encode::VarInt::consensus_decode(r)?.0;
     if n > max as u64 {
-        return Err(FormatError::Decode(format!("{n} {what}, over the limit of {max}")));
+        return Err(FormatError::Decode(format!(
+            "{n} {what}, over the limit of {max}"
+        )));
     }
     Ok(n as usize)
 }
@@ -135,7 +137,11 @@ impl GetNapAtt {
             keys.push(String::from_utf8(key.to_vec()).expect("checked printable"));
         }
         let cursor = decode_cursor(&mut r)?;
-        Ok(GetNapAtt { anchor_height_min, keys, cursor })
+        Ok(GetNapAtt {
+            anchor_height_min,
+            keys,
+            cursor,
+        })
     }
 
     fn wants(&self, att: &Attestation) -> bool {
@@ -181,7 +187,10 @@ impl NapAtt {
             attestations.push(Attestation::decode_from(&mut r)?);
         }
         let next_cursor = decode_cursor(&mut r)?;
-        Ok(NapAtt { attestations, next_cursor })
+        Ok(NapAtt {
+            attestations,
+            next_cursor,
+        })
     }
 }
 
@@ -192,7 +201,11 @@ impl NapAtt {
 /// attestations of [`super::MAX_ATTESTATION_SIZE`] bytes, it is well within
 /// [`MAX_NAPATT_SIZE`]. Ends with a cursor when wanted attestations remain
 /// past the page.
-pub fn page<'a>(atts: impl IntoIterator<Item = &'a Attestation>, req: &GetNapAtt, max_size: usize) -> NapAtt {
+pub fn page<'a>(
+    atts: impl IntoIterator<Item = &'a Attestation>,
+    req: &GetNapAtt,
+    max_size: usize,
+) -> NapAtt {
     // The count's compact size and a present cursor, at their largest.
     const OVERHEAD: usize = 9 + 1 + 36;
     let mut out: Vec<Attestation> = Vec::new();
@@ -205,7 +218,10 @@ pub fn page<'a>(atts: impl IntoIterator<Item = &'a Attestation>, req: &GetNapAtt
         .filter(|a| req.cursor.is_none_or(|c| a.outpoint() > c))
         .filter(|a| req.wants(a));
     for att in wanted {
-        if group.first().is_some_and(|g| g.outpoint() != att.outpoint()) {
+        if group
+            .first()
+            .is_some_and(|g| g.outpoint() != att.outpoint())
+        {
             if !out.is_empty() && size + group_size > max_size {
                 more = true;
                 group.clear();
@@ -225,8 +241,15 @@ pub fn page<'a>(atts: impl IntoIterator<Item = &'a Attestation>, req: &GetNapAtt
             more = true;
         }
     }
-    let next_cursor = if more { out.last().map(|a| a.outpoint()) } else { None };
-    NapAtt { attestations: out, next_cursor }
+    let next_cursor = if more {
+        out.last().map(|a| a.outpoint())
+    } else {
+        None
+    };
+    NapAtt {
+        attestations: out,
+        next_cursor,
+    }
 }
 
 /// Why a request was not served.
@@ -252,13 +275,22 @@ struct Window {
 
 impl Window {
     fn used(&self, now: Instant) -> u64 {
-        if now.saturating_duration_since(self.start) >= BUDGET_WINDOW { 0 } else { self.used }
+        if now.saturating_duration_since(self.start) >= BUDGET_WINDOW {
+            0
+        } else {
+            self.used
+        }
     }
 
     fn add(window: &mut Option<Window>, bytes: u64, now: Instant) {
         match window {
             Some(w) if now.saturating_duration_since(w.start) < BUDGET_WINDOW => w.used += bytes,
-            _ => *window = Some(Window { start: now, used: bytes }),
+            _ => {
+                *window = Some(Window {
+                    start: now,
+                    used: bytes,
+                })
+            }
         }
     }
 }
@@ -325,12 +357,19 @@ impl ServeLimits {
             expected: None,
         });
         let grp = self.groups.entry(group.to_vec()).or_default();
-        while grp.pulls.front().is_some_and(|t| now.saturating_duration_since(*t) >= PULL_INTERVAL) {
+        while grp
+            .pulls
+            .front()
+            .is_some_and(|t| now.saturating_duration_since(*t) >= PULL_INTERVAL)
+        {
             grp.pulls.pop_front();
         }
         let pull = cursor.is_none() || cursor != conn.expected;
         if pull {
-            if conn.last_pull.is_some_and(|t| now.saturating_duration_since(t) < PULL_INTERVAL) {
+            if conn
+                .last_pull
+                .is_some_and(|t| now.saturating_duration_since(t) < PULL_INTERVAL)
+            {
                 return Err(Refused::ConnPull);
             }
             if grp.pulls.len() as u64 >= GROUP_MULTIPLE {
@@ -385,17 +424,26 @@ impl ServeLimits {
 
     /// Drop the groups with nothing left to count, once a minute.
     fn prune(&mut self, now: Instant) {
-        if self.last_prune.is_some_and(|t| now.saturating_duration_since(t) < Duration::from_secs(60)) {
+        if self
+            .last_prune
+            .is_some_and(|t| now.saturating_duration_since(t) < Duration::from_secs(60))
+        {
             return;
         }
         self.last_prune = Some(now);
         for grp in self.groups.values_mut() {
-            while grp.pulls.front().is_some_and(|t| now.saturating_duration_since(*t) >= PULL_INTERVAL) {
+            while grp
+                .pulls
+                .front()
+                .is_some_and(|t| now.saturating_duration_since(*t) >= PULL_INTERVAL)
+            {
                 grp.pulls.pop_front();
             }
         }
-        let live: std::collections::HashSet<&Vec<u8>> = self.conns.values().map(|c| &c.group).collect();
-        self.groups.retain(|g, grp| live.contains(g) || !grp.idle(now));
+        let live: std::collections::HashSet<&Vec<u8>> =
+            self.conns.values().map(|c| &c.group).collect();
+        self.groups
+            .retain(|g, grp| live.contains(g) || !grp.idle(now));
     }
 
     #[cfg(test)]

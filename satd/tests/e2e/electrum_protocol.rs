@@ -21,8 +21,13 @@ fn mine_to(e2e: &E2eNode, n: u64, address: &bitcoin::Address) {
 }
 
 fn in_mempool(e2e: &E2eNode, txid: &str) -> bool {
-    let pool = e2e.node.rpc_call_with_params("getrawmempool", vec![]).expect("getrawmempool");
-    pool["result"].as_array().is_some_and(|a| a.iter().any(|t| t == txid))
+    let pool = e2e
+        .node
+        .rpc_call_with_params("getrawmempool", vec![])
+        .expect("getrawmempool");
+    pool["result"]
+        .as_array()
+        .is_some_and(|a| a.iter().any(|t| t == txid))
 }
 
 /// A zero-fee parent and a child paying for both: the parent alone is below
@@ -45,7 +50,10 @@ fn test_e2e_electrum_broadcast_package_carries_a_parent_below_the_floor() {
         let parent_txid: bitcoin::Txid = parent_txid.parse().expect("txid");
         let child = sign_p2wpkh_spend(
             &wallet,
-            bitcoin::OutPoint { txid: parent_txid, vout: 0 },
+            bitcoin::OutPoint {
+                txid: parent_txid,
+                vout: 0,
+            },
             COINBASE_SAT,
             spk.clone(),
             50_000,
@@ -59,7 +67,10 @@ fn test_e2e_electrum_broadcast_package_carries_a_parent_below_the_floor() {
         .node
         .rpc_call_with_params("sendrawtransaction", vec![json!(parent)])
         .expect("sendrawtransaction");
-    assert!(alone["error"].is_object(), "a zero-fee parent alone is refused: {alone}");
+    assert!(
+        alone["error"].is_object(),
+        "a zero-fee parent alone is refused: {alone}"
+    );
     let parent_bytes = hex::decode(&parent).unwrap();
     assert!(
         client.transaction_broadcast_raw(&parent_bytes).is_err(),
@@ -70,7 +81,10 @@ fn test_e2e_electrum_broadcast_package_carries_a_parent_below_the_floor() {
         .expect("broadcast_package");
     assert!(res.success, "the package is accepted: {:?}", res.errors);
     assert!(res.errors.is_empty(), "{:?}", res.errors);
-    assert!(in_mempool(&e2e, &parent_txid), "the parent is in the mempool");
+    assert!(
+        in_mempool(&e2e, &parent_txid),
+        "the parent is in the mempool"
+    );
 
     // Verbose, raw: the `submitpackage` answer.
     let (parent, parent_txid, child) = package(2);
@@ -85,7 +99,11 @@ fn test_e2e_electrum_broadcast_package_carries_a_parent_below_the_floor() {
     let verbose = cli.recv();
     let result = &verbose["result"];
     assert_eq!(result["package_msg"], "success", "{verbose}");
-    assert_eq!(result["tx-results"].as_object().map(|m| m.len()), Some(2), "{verbose}");
+    assert_eq!(
+        result["tx-results"].as_object().map(|m| m.len()),
+        Some(2),
+        "{verbose}"
+    );
     assert_eq!(result["replaced-transactions"], json!([]), "{verbose}");
     assert!(in_mempool(&e2e, &parent_txid));
 
@@ -103,17 +121,22 @@ fn test_e2e_electrum_get_mempool_is_in_canonical_order() {
     mine_to(&e2e, 101, &wallet.address);
 
     let fee = 1_000u64;
-    let (raw_a, _) = build_signed_p2wpkh_spend_of_coinbase(&e2e.node, &wallet, 1, script.clone(), fee);
+    let (raw_a, _) =
+        build_signed_p2wpkh_spend_of_coinbase(&e2e.node, &wallet, 1, script.clone(), fee);
     let txid_a = send(&e2e, &raw_a);
     let raw_b = sign_p2wpkh_spend(
         &wallet,
-        bitcoin::OutPoint { txid: txid_a, vout: 0 },
+        bitcoin::OutPoint {
+            txid: txid_a,
+            vout: 0,
+        },
         COINBASE_SAT - fee,
         script.clone(),
         fee,
     );
     let txid_b = send(&e2e, &raw_b);
-    let (raw_c, _) = build_signed_p2wpkh_spend_of_coinbase(&e2e.node, &wallet, 2, script.clone(), fee);
+    let (raw_c, _) =
+        build_signed_p2wpkh_spend_of_coinbase(&e2e.node, &wallet, 2, script.clone(), fee);
     let txid_c = send(&e2e, &raw_c);
 
     let mut sh = bitcoin::hashes::sha256::Hash::hash(script.as_bytes()).to_byte_array();
@@ -133,18 +156,30 @@ fn test_e2e_electrum_get_mempool_is_in_canonical_order() {
         if rows.len() == 3 {
             break rows;
         }
-        assert!(std::time::Instant::now() < deadline, "mempool never held all three: {resp}");
+        assert!(
+            std::time::Instant::now() < deadline,
+            "mempool never held all three: {resp}"
+        );
         std::thread::sleep(std::time::Duration::from_millis(200));
     };
     let got: Vec<(i64, String)> = rows
         .iter()
-        .map(|r| (r["height"].as_i64().unwrap(), r["tx_hash"].as_str().unwrap().to_string()))
+        .map(|r| {
+            (
+                r["height"].as_i64().unwrap(),
+                r["tx_hash"].as_str().unwrap().to_string(),
+            )
+        })
         .collect();
     let mut zero = [txid_a.to_string(), txid_c.to_string()];
     zero.sort();
     assert_eq!(
         got,
-        vec![(0, zero[0].clone()), (0, zero[1].clone()), (-1, txid_b.to_string())],
+        vec![
+            (0, zero[0].clone()),
+            (0, zero[1].clone()),
+            (-1, txid_b.to_string())
+        ],
         "(-height, tx_hash) order"
     );
 

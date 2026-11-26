@@ -42,7 +42,12 @@ fn mtp_at(cs: &ChainState, height: u32) -> u32 {
 }
 
 /// `build_test_block` with its header rewritten by `edit`, then re-solved.
-fn block_with_header(parent: BlockHash, height: u32, time: u32, edit: impl FnOnce(&mut bitcoin::block::Header)) -> Block {
+fn block_with_header(
+    parent: BlockHash,
+    height: u32,
+    time: u32,
+    edit: impl FnOnce(&mut bitcoin::block::Header),
+) -> Block {
     let mut b = build_test_block(parent, height, time);
     edit(&mut b.header);
     grind_test_pow(&mut b);
@@ -93,12 +98,19 @@ fn accept_header_refuses_a_header_at_the_parents_mtp() {
 
     let stale = block_with_header(tip, 12, mtp, |_| {});
     let err = cs.accept_header(&stale.header).expect_err("time-too-old");
-    assert!(is_validation(&err, validation::ValidationError::TimeTooOld), "got {err:?}");
-    assert!(cs.get_block_index(&stale.block_hash()).is_none(), "refused header was indexed");
+    assert!(
+        is_validation(&err, validation::ValidationError::TimeTooOld),
+        "got {err:?}"
+    );
+    assert!(
+        cs.get_block_index(&stale.block_hash()).is_none(),
+        "refused header was indexed"
+    );
 
     // One second later is fine: the refusal is the rule, not the fixture.
     let ok = block_with_header(tip, 12, mtp + 1, |_| {});
-    cs.accept_header(&ok.header).expect("a header above the MTP is accepted");
+    cs.accept_header(&ok.header)
+        .expect("a header above the MTP is accepted");
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -117,7 +129,10 @@ fn accept_headers_judges_time_against_the_batchs_own_ancestors() {
     let (accepted, err) = cs.accept_headers(&[h1.header, h2.header, h3.header]);
     assert_eq!(accepted, 2, "the first two headers are fine");
     let err = err.expect("the third is time-too-old");
-    assert!(is_validation(&err, validation::ValidationError::TimeTooOld), "got {err:?}");
+    assert!(
+        is_validation(&err, validation::ValidationError::TimeTooOld),
+        "got {err:?}"
+    );
     assert!(cs.get_block_index(&h3.block_hash()).is_none());
     // The two accepted before it are committed, not dropped with the batch.
     // Perturbation: return on the refusal without committing, and this fails.
@@ -145,7 +160,10 @@ fn accept_headers_keeps_the_prefix_of_a_batch_ending_ahead_of_the_clock() {
     let (accepted, err) = cs.accept_headers(&[h1.header, h2.header]);
     assert_eq!(accepted, 1);
     assert!(err.is_some_and(|e| is_validation(&e, validation::ValidationError::TimeTooNew)));
-    assert!(cs.get_block_index(&h1.block_hash()).is_some(), "h1 must be committed");
+    assert!(
+        cs.get_block_index(&h1.block_hash()).is_some(),
+        "h1 must be committed"
+    );
     assert!(cs.get_block_index(&h2.block_hash()).is_none());
 
     let _ = std::fs::remove_dir_all(&dir);
@@ -178,7 +196,10 @@ fn accept_header_refuses_a_header_two_hours_ahead() {
     let ahead = crate::time::now_secs() as u32 + 2 * 60 * 60 + 60;
     let b = block_with_header(blocks[0].block_hash(), 2, ahead, |_| {});
     let err = cs.accept_header(&b.header).expect_err("time-too-new");
-    assert!(is_validation(&err, validation::ValidationError::TimeTooNew), "got {err:?}");
+    assert!(
+        is_validation(&err, validation::ValidationError::TimeTooNew),
+        "got {err:?}"
+    );
 
     let (accepted, err) = cs.accept_headers(&[b.header]);
     assert_eq!(accepted, 0);
@@ -197,7 +218,10 @@ fn header_paths_refuse_a_version_below_the_buried_minimum() {
         h.version = bitcoin::block::Version::from_consensus(1);
     });
     let err = cs.accept_header(&v1.header).expect_err("bad-version");
-    assert!(is_validation(&err, validation::ValidationError::BadVersion(1)), "got {err:?}");
+    assert!(
+        is_validation(&err, validation::ValidationError::BadVersion(1)),
+        "got {err:?}"
+    );
     assert_eq!(err.to_string(), "bad-version(0x00000001)");
 
     let (accepted, err) = cs.accept_headers(&[v1.header]);
@@ -218,7 +242,10 @@ fn store_block_refuses_a_time_too_old_block_with_no_header() {
     let blocks = connect_chain(&cs, 11);
     let b = block_with_header(blocks[10].block_hash(), 12, mtp_at(&cs, 11), |_| {});
     let err = cs.store_block(&b).expect_err("time-too-old");
-    assert!(is_validation(&err, validation::ValidationError::TimeTooOld), "got {err:?}");
+    assert!(
+        is_validation(&err, validation::ValidationError::TimeTooOld),
+        "got {err:?}"
+    );
     assert!(cs.get_block_index(&b.block_hash()).is_none());
 
     let _ = std::fs::remove_dir_all(&dir);
@@ -236,10 +263,14 @@ fn store_block_refuses_a_nonfinal_block_and_marks_its_header() {
     let blocks = connect_chain(&cs, 3);
     let b = nonfinal_block(blocks[2].block_hash(), 4, BASE + 600 * 4);
 
-    cs.accept_header(&b.header).expect("the header itself is fine");
+    cs.accept_header(&b.header)
+        .expect("the header itself is fine");
     let err = cs.store_block(&b).expect_err("bad-txns-nonfinal");
     assert!(
-        matches!(err, ChainError::Connect(connect::ConnectError::LocktimeNotFinal)),
+        matches!(
+            err,
+            ChainError::Connect(connect::ConnectError::LocktimeNotFinal)
+        ),
         "got {err:?}"
     );
     assert_eq!(err.to_string(), "bad-txns-nonfinal");
@@ -279,13 +310,19 @@ fn accept_block_refuses_a_nonfinal_side_block_before_storing_it() {
     let side = nonfinal_block(blocks[1].block_hash(), 3, BASE + 600 * 3 + 7);
     let err = cs.accept_block(&side).expect_err("bad-txns-nonfinal");
     assert_eq!(err.to_string(), "bad-txns-nonfinal");
-    assert!(cs.get_block_index(&side.block_hash()).is_none(), "refused side block was indexed");
+    assert!(
+        cs.get_block_index(&side.block_hash()).is_none(),
+        "refused side block was indexed"
+    );
     assert_eq!(cs.tip_height(), 4);
 
     // The same block without the locktime is stored as a side block: the
     // refusal is the rule, not the fixture.
     let ok = build_test_block(blocks[1].block_hash(), 3, BASE + 600 * 3 + 7);
-    assert!(matches!(cs.accept_block(&ok), Ok(BlockAcceptance::Stored(_))));
+    assert!(matches!(
+        cs.accept_block(&ok),
+        Ok(BlockAcceptance::Stored(_))
+    ));
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -300,7 +337,10 @@ fn accept_block_marks_an_announced_header_whose_block_has_a_bad_coinbase_height(
     cs.accept_header(&b.header).expect("header is fine");
     let err = cs.accept_block(&b).expect_err("bad-cb-height");
     assert_eq!(err.to_string(), "bad-cb-height");
-    assert_eq!(cs.get_block_index(&b.block_hash()).map(|e| e.status), Some(BlockStatus::Invalid));
+    assert_eq!(
+        cs.get_block_index(&b.block_hash()).map(|e| e.status),
+        Some(BlockStatus::Invalid)
+    );
     assert_eq!(cs.tip_height(), 2);
 
     let _ = std::fs::remove_dir_all(&dir);
@@ -321,10 +361,15 @@ fn connect_refuses_a_stored_block_that_is_time_too_old() {
     let b = block_with_header(blocks[10].block_hash(), 12, mtp_at(&cs, 11), |_| {});
     super::tests::store_block_without_connecting(&cs, &b, 12);
 
-    let err = cs.connect_stored_block(&b.block_hash()).expect_err("time-too-old at connect");
+    let err = cs
+        .connect_stored_block(&b.block_hash())
+        .expect_err("time-too-old at connect");
     assert_eq!(err.to_string(), "time-too-old");
     assert_eq!(cs.tip_height(), 11);
-    assert_eq!(cs.get_block_index(&b.block_hash()).map(|e| e.status), Some(BlockStatus::Invalid));
+    assert_eq!(
+        cs.get_block_index(&b.block_hash()).map(|e| e.status),
+        Some(BlockStatus::Invalid)
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -339,7 +384,9 @@ fn connect_refuses_a_stored_block_with_a_stale_version() {
     });
     super::tests::store_block_without_connecting(&cs, &b, 3);
 
-    let err = cs.connect_stored_block(&b.block_hash()).expect_err("bad-version at connect");
+    let err = cs
+        .connect_stored_block(&b.block_hash())
+        .expect_err("bad-version at connect");
     assert_eq!(err.to_string(), "bad-version(0x00000003)");
     assert_eq!(cs.tip_height(), 2);
 
@@ -370,14 +417,25 @@ fn a_nonfinal_block_extending_the_tip_is_not_announced() {
     let bad = nonfinal_block(blocks[2].block_hash(), 4, BASE + 600 * 4);
     let err = cs.accept_block(&bad).expect_err("bad-txns-nonfinal");
     assert!(
-        matches!(err, ChainError::Connect(connect::ConnectError::LocktimeNotFinal)),
+        matches!(
+            err,
+            ChainError::Connect(connect::ConnectError::LocktimeNotFinal)
+        ),
         "got {err:?}"
     );
-    assert_eq!(fired.load(Ordering::SeqCst), 0, "a non-final block must not be announced");
+    assert_eq!(
+        fired.load(Ordering::SeqCst),
+        0,
+        "a non-final block must not be announced"
+    );
 
     let good = build_test_block(blocks[2].block_hash(), 4, BASE + 600 * 4);
     cs.accept_block(&good).expect("a valid block connects");
-    assert_eq!(fired.load(Ordering::SeqCst), 1, "a valid tip-extending block is announced once");
+    assert_eq!(
+        fired.load(Ordering::SeqCst),
+        1,
+        "a valid tip-extending block is announced once"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }

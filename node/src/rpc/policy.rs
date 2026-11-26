@@ -7,12 +7,12 @@
 //! quarantined transactions. A consumer that wants the quarantine view asks for
 //! it by name, here. All four are read-only.
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::chain::state::ChainState;
+use crate::mempool::policy as mpolicy;
 use crate::mempool::policy_engine::{self, PolicyCtx};
 use crate::mempool::pool::{Mempool, QuarantineScope, TxSource};
-use crate::mempool::policy as mpolicy;
 
 /// `getpolicyinfo` — ruleset source/load metadata, the per-rule match counters
 /// and fuel-backstop counter accumulated since load, and quarantine-class
@@ -145,12 +145,7 @@ pub fn get_quarantine_info(mempool: &Mempool) -> Value {
 
 /// `listquarantine [rule] [count] [skip]` — the quarantine class as a paged
 /// list, optionally filtered to one rule. Newest-first.
-pub fn list_quarantine(
-    mempool: &Mempool,
-    rule: Option<&str>,
-    count: usize,
-    skip: usize,
-) -> Value {
+pub fn list_quarantine(mempool: &Mempool, rule: Option<&str>, count: usize, skip: usize) -> Value {
     let entries = mempool.list_quarantine(rule, count, skip);
     let arr: Vec<Value> = entries
         .into_iter()
@@ -245,7 +240,10 @@ pub fn policy_test(
                 .output
                 .get(input.previous_output.vout as usize)
                 .ok_or_else(|| {
-                    format!("prevout {} not found (vout out of range)", input.previous_output)
+                    format!(
+                        "prevout {} not found (vout out of range)",
+                        input.previous_output
+                    )
                 })?;
             input_total = input_total.saturating_add(o.value.to_sat());
             prev_outputs.push(o.clone());

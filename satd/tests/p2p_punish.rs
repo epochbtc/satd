@@ -4,12 +4,12 @@
 
 mod common;
 
+use bitcoin::BlockHash;
 use bitcoin::consensus::{deserialize, serialize};
 use bitcoin::p2p::message::{NetworkMessage, RawNetworkMessage};
 use bitcoin::p2p::message_blockdata::Inventory;
 use bitcoin::p2p::message_network::VersionMessage;
 use bitcoin::p2p::{Address, Magic, ServiceFlags};
-use bitcoin::BlockHash;
 use common::{TestNode, find_available_port, poll_until, test_timeout};
 use serde_json::json;
 use std::io::{self, Read, Write};
@@ -31,7 +31,9 @@ impl Peer {
         let stream = loop {
             match TcpStream::connect_timeout(&addr, Duration::from_secs(2)) {
                 Ok(s) => break s,
-                Err(_) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(100)),
+                Err(_) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(100))
+                }
                 Err(e) => return Err(e),
             }
         };
@@ -58,7 +60,9 @@ impl Peer {
 
     fn handshake(stream: TcpStream) -> io::Result<Self> {
         stream.set_nodelay(true).unwrap();
-        stream.set_write_timeout(Some(Duration::from_secs(30))).unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(30)))
+            .unwrap();
         let mut peer = Peer { stream };
         peer.send(NetworkMessage::Version(version()));
         let (mut got_version, mut got_verack) = (false, false);
@@ -77,7 +81,9 @@ impl Peer {
 
     fn send(&mut self, msg: NetworkMessage) {
         // The node may close the socket part way through.
-        let _ = self.stream.write_all(&serialize(&RawNetworkMessage::new(Magic::REGTEST, msg)));
+        let _ = self
+            .stream
+            .write_all(&serialize(&RawNetworkMessage::new(Magic::REGTEST, msg)));
     }
 
     fn recv(&mut self, timeout: Duration) -> io::Result<NetworkMessage> {
@@ -88,17 +94,23 @@ impl Peer {
         let mut buf = header.to_vec();
         buf.resize(24 + len, 0);
         self.stream.read_exact(&mut buf[24..])?;
-        let raw: RawNetworkMessage =
-            deserialize(&buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+        let raw: RawNetworkMessage = deserialize(&buf)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
         Ok(raw.into_payload())
     }
 
     /// Answer pings until the node sends a message `pred` accepts; `None` if
     /// the connection ends or nothing arrives in time.
-    fn recv_until(&mut self, timeout: Duration, pred: impl Fn(&NetworkMessage) -> bool) -> Option<NetworkMessage> {
+    fn recv_until(
+        &mut self,
+        timeout: Duration,
+        pred: impl Fn(&NetworkMessage) -> bool,
+    ) -> Option<NetworkMessage> {
         let deadline = Instant::now() + timeout;
         loop {
-            let left = deadline.saturating_duration_since(Instant::now()).max(Duration::from_millis(1));
+            let left = deadline
+                .saturating_duration_since(Instant::now())
+                .max(Duration::from_millis(1));
             match self.recv(left) {
                 Ok(NetworkMessage::Ping(n)) => self.send(NetworkMessage::Pong(n)),
                 Ok(m) if pred(&m) => return Some(m),
@@ -119,7 +131,14 @@ impl Peer {
             match self.recv(left) {
                 Ok(NetworkMessage::Ping(n)) => self.send(NetworkMessage::Pong(n)),
                 Ok(_) => {}
-                Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => return false,
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    return false;
+                }
                 Err(_) => return true,
             }
         }
@@ -130,9 +149,14 @@ impl Peer {
     /// peer's messages in order, so the answer also shows that nothing sent
     /// earlier ended the connection.
     fn served(&mut self, block: BlockHash) -> bool {
-        self.send(NetworkMessage::GetData(vec![Inventory::WitnessBlock(block)]));
-        self.recv_until(Duration::from_secs(30), |m| matches!(m, NetworkMessage::Block(b) if b.block_hash() == block))
-            .is_some()
+        self.send(NetworkMessage::GetData(vec![Inventory::WitnessBlock(
+            block,
+        )]));
+        self.recv_until(
+            Duration::from_secs(30),
+            |m| matches!(m, NetworkMessage::Block(b) if b.block_hash() == block),
+        )
+        .is_some()
     }
 }
 
@@ -163,19 +187,29 @@ fn rand_nonce() -> u64 {
 }
 
 fn best_hash(node: &TestNode) -> BlockHash {
-    node.rpc_ok("getbestblockhash", vec![]).as_str().unwrap().parse().unwrap()
+    node.rpc_ok("getbestblockhash", vec![])
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap()
 }
 
 /// `getblocktxn` for an index past the end of `block`: Core's
 /// "getblocktxn with out-of-bounds tx indices", `Misbehaving`.
 fn out_of_range_getblocktxn(block: BlockHash) -> NetworkMessage {
     NetworkMessage::GetBlockTxn(bitcoin::p2p::message_compact_blocks::GetBlockTxn {
-        txs_request: bitcoin::bip152::BlockTransactionsRequest { block_hash: block, indexes: vec![5] },
+        txs_request: bitcoin::bip152::BlockTransactionsRequest {
+            block_hash: block,
+            indexes: vec![5],
+        },
     })
 }
 
 fn banned(node: &TestNode) -> Vec<serde_json::Value> {
-    node.rpc_ok("listbanned", vec![]).as_array().unwrap().clone()
+    node.rpc_ok("listbanned", vec![])
+        .as_array()
+        .unwrap()
+        .clone()
 }
 
 /// `getpeerinfo` entries for peers that reached the node on `port`.
@@ -210,19 +244,39 @@ fn a_misbehaving_onion_or_local_peer_is_disconnected_without_a_ban() {
     node.mine_blocks(1, ADDR);
     let tip = best_hash(&node);
 
-    for (listener, port, network) in [("onion", onion, "onion"), ("clearnet", p2p, "not_publicly_routable")] {
-        let mut peer = Peer::connect(port).unwrap_or_else(|e| panic!("{listener}: first peer: {e}"));
-        poll_until(|| peers_on(&node, port).len() == 1, test_timeout(20), "the peer is listed");
+    for (listener, port, network) in [
+        ("onion", onion, "onion"),
+        ("clearnet", p2p, "not_publicly_routable"),
+    ] {
+        let mut peer =
+            Peer::connect(port).unwrap_or_else(|e| panic!("{listener}: first peer: {e}"));
+        poll_until(
+            || peers_on(&node, port).len() == 1,
+            test_timeout(20),
+            "the peer is listed",
+        );
         // Core's `ConnectedThroughNetwork`: an inbound onion peer is on the
         // onion network whatever its socket address.
-        assert_eq!(peers_on(&node, port)[0]["network"], json!(network), "{listener}: getpeerinfo.network");
+        assert_eq!(
+            peers_on(&node, port)[0]["network"],
+            json!(network),
+            "{listener}: getpeerinfo.network"
+        );
 
         peer.send(out_of_range_getblocktxn(tip));
-        assert!(peer.closed_within(test_timeout(30)), "{listener}: the misbehaving peer is disconnected");
-        assert_eq!(banned(&node), Vec::<serde_json::Value>::new(), "{listener}: nothing is banned");
+        assert!(
+            peer.closed_within(test_timeout(30)),
+            "{listener}: the misbehaving peer is disconnected"
+        );
+        assert_eq!(
+            banned(&node),
+            Vec::<serde_json::Value>::new(),
+            "{listener}: nothing is banned"
+        );
 
-        let mut next = Peer::connect(port)
-            .unwrap_or_else(|e| panic!("{listener}: a second peer on the same listener is refused: {e}"));
+        let mut next = Peer::connect(port).unwrap_or_else(|e| {
+            panic!("{listener}: a second peer on the same listener is refused: {e}")
+        });
         assert!(next.served(tip), "{listener}: the second peer is served");
     }
     node.stop();
@@ -255,8 +309,15 @@ fn a_misbehaving_manual_peer_stays_connected() {
     );
 
     peer.send(out_of_range_getblocktxn(tip));
-    assert!(peer.served(tip), "the manual peer is still connected and served");
-    assert_eq!(banned(&node), Vec::<serde_json::Value>::new(), "nothing is banned");
+    assert!(
+        peer.served(tip),
+        "the manual peer is still connected and served"
+    );
+    assert_eq!(
+        banned(&node),
+        Vec::<serde_json::Value>::new(),
+        "nothing is banned"
+    );
     node.stop();
 }
 
@@ -275,14 +336,21 @@ fn a_peer_relaying_invalid_transactions_is_not_punished() {
     node.mine_blocks(101, ADDR);
     let tip = best_hash(&node);
     let block1 = node.rpc_ok("getblockhash", vec![json!(1)]);
-    let coinbase: bitcoin::Txid =
-        node.rpc_ok("getblock", vec![block1])["tx"][0].as_str().unwrap().parse().unwrap();
+    let coinbase: bitcoin::Txid = node.rpc_ok("getblock", vec![block1])["tx"][0]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
     // ADDR's script: a P2WPKH program of twenty zero bytes, which no key
     // can spend.
     let spk = bitcoin::ScriptBuf::from_bytes([&[0x00, 0x14][..], &[0u8; 20]].concat());
 
     let mut peer = Peer::connect(p2p).expect("handshake");
-    poll_until(|| peers_on(&node, p2p).len() == 1, test_timeout(20), "the peer is listed");
+    poll_until(
+        || peers_on(&node, p2p).len() == 1,
+        test_timeout(20),
+        "the peer is listed",
+    );
     for i in 0..12u64 {
         // Odd: outputs above the 50 BTC input (`bad-txns-in-belowout`).
         // Even: a witness that does not match the program (a script
@@ -290,23 +358,40 @@ fn a_peer_relaying_invalid_transactions_is_not_punished() {
         let (value, witness) = if i % 2 == 1 {
             (5_000_000_000 + i, bitcoin::Witness::new())
         } else {
-            (4_999_000_000 - i, bitcoin::Witness::from_slice(&[vec![0x30; 72], vec![0x02; 33]]))
+            (
+                4_999_000_000 - i,
+                bitcoin::Witness::from_slice(&[vec![0x30; 72], vec![0x02; 33]]),
+            )
         };
         let tx = bitcoin::Transaction {
             version: bitcoin::transaction::Version::TWO,
             lock_time: bitcoin::absolute::LockTime::ZERO,
             input: vec![bitcoin::TxIn {
-                previous_output: bitcoin::OutPoint { txid: coinbase, vout: 0 },
+                previous_output: bitcoin::OutPoint {
+                    txid: coinbase,
+                    vout: 0,
+                },
                 script_sig: bitcoin::ScriptBuf::new(),
                 sequence: bitcoin::Sequence::MAX,
                 witness,
             }],
-            output: vec![bitcoin::TxOut { value: bitcoin::Amount::from_sat(value), script_pubkey: spk.clone() }],
+            output: vec![bitcoin::TxOut {
+                value: bitcoin::Amount::from_sat(value),
+                script_pubkey: spk.clone(),
+            }],
         };
         peer.send(NetworkMessage::Tx(tx));
     }
     assert!(peer.served(tip), "the peer is still connected and served");
-    assert_eq!(banned(&node), Vec::<serde_json::Value>::new(), "nothing is banned");
-    assert_eq!(node.rpc_ok("getmempoolinfo", vec![])["size"], json!(0), "every transaction was refused");
+    assert_eq!(
+        banned(&node),
+        Vec::<serde_json::Value>::new(),
+        "nothing is banned"
+    );
+    assert_eq!(
+        node.rpc_ok("getmempoolinfo", vec![])["size"],
+        json!(0),
+        "every transaction was refused"
+    );
     node.stop();
 }

@@ -64,14 +64,19 @@ fn hex_of<T: bitcoin::consensus::Encodable>(t: &T) -> String {
 
 /// The `result` of a call that must succeed.
 fn call(node: &TestNode, method: &str, params: Vec<Value>) -> Value {
-    let r = node.rpc_call_with_params(method, params).expect("node reachable");
+    let r = node
+        .rpc_call_with_params(method, params)
+        .expect("node reachable");
     assert!(r["error"].is_null(), "{method}: {r}");
     r["result"].clone()
 }
 
 fn counts(node: &TestNode) -> (u64, u64) {
     let info = call(node, "getblockchaininfo", vec![]);
-    (info["blocks"].as_u64().unwrap(), info["headers"].as_u64().unwrap())
+    (
+        info["blocks"].as_u64().unwrap(),
+        info["headers"].as_u64().unwrap(),
+    )
 }
 
 fn tip_status(node: &TestNode, hash: &bitcoin::BlockHash) -> Option<String> {
@@ -86,8 +91,11 @@ fn tip_status(node: &TestNode, hash: &bitcoin::BlockHash) -> Option<String> {
 /// The parent and child of a two-block chain on the node's genesis.
 fn two_blocks(node: &TestNode, child_overpay: u64) -> (bitcoin::Block, bitcoin::Block) {
     let template = call(node, "getblocktemplate", vec![json!({"rules": ["segwit"]})]);
-    let genesis: bitcoin::BlockHash =
-        template["previousblockhash"].as_str().unwrap().parse().unwrap();
+    let genesis: bitcoin::BlockHash = template["previousblockhash"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
     let time = template["curtime"].as_u64().unwrap() as u32;
     let parent = build_block(genesis, 1, time, 0);
     let child = build_block(parent.block_hash(), 2, time + 1, child_overpay);
@@ -110,7 +118,11 @@ fn submitblock_child_before_parent_connects_both() {
 
     let r = call(&node, "submitblock", vec![json!(hex_of(&child))]);
     assert_eq!(r, json!("inconclusive"), "the child waits for its parent");
-    assert_eq!(counts(&node), (0, 2), "the stored child's header is the best header");
+    assert_eq!(
+        counts(&node),
+        (0, 2),
+        "the stored child's header is the best header"
+    );
 
     assert!(call(&node, "submitblock", vec![json!(hex_of(&parent))]).is_null());
     poll_until(
@@ -120,7 +132,10 @@ fn submitblock_child_before_parent_connects_both() {
     );
     let best = call(&node, "getbestblockhash", vec![]);
     assert_eq!(best, json!(child.block_hash().to_string()));
-    assert_eq!(tip_status(&node, &child.block_hash()).as_deref(), Some("active"));
+    assert_eq!(
+        tip_status(&node, &child.block_hash()).as_deref(),
+        Some("active")
+    );
     node.stop();
 }
 

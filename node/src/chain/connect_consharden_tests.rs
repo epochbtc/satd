@@ -39,10 +39,16 @@ fn entry_at(height: u32, time: u32) -> BlockIndexEntry {
 
 /// Index a block at each height in `heights`, stamped `time_of(height)`, with
 /// its height row.
-fn index_blocks(store: &InMemoryStore, heights: impl IntoIterator<Item = u32>, time_of: impl Fn(u32) -> u32) {
+fn index_blocks(
+    store: &InMemoryStore,
+    heights: impl IntoIterator<Item = u32>,
+    time_of: impl Fn(u32) -> u32,
+) {
     let mut batch = StoreBatch::default();
     for h in heights {
-        batch.block_index_puts.push((hash_for(h), entry_at(h, time_of(h))));
+        batch
+            .block_index_puts
+            .push((hash_for(h), entry_at(h, time_of(h))));
         batch.height_hash_puts.push((h, hash_for(h)));
     }
     store.write_batch(batch).unwrap();
@@ -82,13 +88,28 @@ fn a_missing_height_row_is_an_error_not_a_shorter_median() {
     index_blocks(&store, (0..30).filter(|&h| h != 14), scrambled);
     let err = get_median_time_past(&store, 20).unwrap_err();
     assert!(
-        matches!(err, ConnectError::MedianTimeWindowGap { height: 20, missing: 14 }),
+        matches!(
+            err,
+            ConnectError::MedianTimeWindowGap {
+                height: 20,
+                missing: 14
+            }
+        ),
         "got {err:?}"
     );
-    assert!(!err.is_verdict_on_block(), "damage to the index is not a verdict on the block");
+    assert!(
+        !err.is_verdict_on_block(),
+        "damage to the index is not a verdict on the block"
+    );
     // Windows that do not reach the hole are unaffected.
-    assert_eq!(get_median_time_past(&store, 14).unwrap(), core_median(scrambled, 14));
-    assert_eq!(get_median_time_past(&store, 26).unwrap(), core_median(scrambled, 26));
+    assert_eq!(
+        get_median_time_past(&store, 14).unwrap(),
+        core_median(scrambled, 14)
+    );
+    assert_eq!(
+        get_median_time_past(&store, 26).unwrap(),
+        core_median(scrambled, 26)
+    );
 }
 
 #[test]
@@ -96,11 +117,16 @@ fn a_height_row_without_its_index_entry_is_an_error() {
     let store = test_store();
     index_blocks(&store, 0..30, scrambled);
     let mut batch = StoreBatch::default();
-    batch.height_hash_puts.push((17, BlockHash::from_byte_array([0xEE; 32])));
+    batch
+        .height_hash_puts
+        .push((17, BlockHash::from_byte_array([0xEE; 32])));
     store.write_batch(batch).unwrap();
     assert!(matches!(
         get_median_time_past(&store, 20),
-        Err(ConnectError::MedianTimeWindowGap { height: 20, missing: 17 })
+        Err(ConnectError::MedianTimeWindowGap {
+            height: 20,
+            missing: 17
+        })
     ));
 }
 
@@ -115,13 +141,20 @@ fn a_replay_plan_that_does_not_reach_the_window_is_an_error() {
     );
     assert!(matches!(
         median_time_past_with_plan(&store, Some(&plan), 20),
-        Err(ConnectError::MedianTimeWindowGap { height: 20, missing: 15 })
+        Err(ConnectError::MedianTimeWindowGap {
+            height: 20,
+            missing: 15
+        })
     ));
 }
 
 /// Connect a block at `BLOCK_HEIGHT` spending a coin from `COIN_HEIGHT` with a
 /// one-unit (512 s) BIP 68 time lock, against `store`.
-fn connect_time_locked_spend(store: &InMemoryStore, outpoint: OutPoint, block_mtp: u32) -> Result<StoreBatch, ConnectError> {
+fn connect_time_locked_spend(
+    store: &InMemoryStore,
+    outpoint: OutPoint,
+    block_mtp: u32,
+) -> Result<StoreBatch, ConnectError> {
     const BLOCK_HEIGHT: u32 = 40;
     let mut block = make_block_spending(outpoint, BLOCK_HEIGHT, 2, (1 << 22) | 1, 0);
     // Above the parent's MTP, or the block is `time-too-old`.
@@ -171,8 +204,13 @@ fn bip68_takes_the_coins_median_over_its_whole_window() {
     // Exactly 512 s past the coin's MTP: the lock is met.
     assert!(connect_time_locked_spend(&store, outpoint, coin_mtp + 512).is_ok());
     // One second short: not met, a verdict on the block.
-    let err = connect_time_locked_spend(&store, outpoint, coin_mtp + 511).err().expect("lock not met");
-    assert!(matches!(err, ConnectError::SequenceLockNotMet), "got {err:?}");
+    let err = connect_time_locked_spend(&store, outpoint, coin_mtp + 511)
+        .err()
+        .expect("lock not met");
+    assert!(
+        matches!(err, ConnectError::SequenceLockNotMet),
+        "got {err:?}"
+    );
     assert!(err.is_verdict_on_block());
 }
 
@@ -187,7 +225,13 @@ fn bip68_with_a_hole_in_the_coins_window_is_not_a_verdict() {
         .err()
         .expect("the window has a hole");
     assert!(
-        matches!(err, ConnectError::MedianTimeWindowGap { height: COIN_HEIGHT, missing: 21 }),
+        matches!(
+            err,
+            ConnectError::MedianTimeWindowGap {
+                height: COIN_HEIGHT,
+                missing: 21
+            }
+        ),
         "got {err:?}"
     );
     assert!(!err.is_verdict_on_block());
@@ -199,9 +243,17 @@ fn bip68_with_a_hole_in_the_coins_window_is_not_a_verdict() {
 fn an_empty_coin_window_no_longer_meets_every_time_lock() {
     let (store, outpoint, _) = make_test_store_with_coin(COIN_HEIGHT, false);
     index_blocks(&store, 0..19, spaced);
-    let err = connect_time_locked_spend(&store, outpoint, BASE).err().expect("the window is empty");
+    let err = connect_time_locked_spend(&store, outpoint, BASE)
+        .err()
+        .expect("the window is empty");
     assert!(
-        matches!(err, ConnectError::MedianTimeWindowGap { height: COIN_HEIGHT, missing: 19 }),
+        matches!(
+            err,
+            ConnectError::MedianTimeWindowGap {
+                height: COIN_HEIGHT,
+                missing: 19
+            }
+        ),
         "got {err:?}"
     );
     assert!(!err.is_verdict_on_block());

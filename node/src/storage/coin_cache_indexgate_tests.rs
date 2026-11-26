@@ -114,7 +114,10 @@ impl Store for GatedStore {
     fn opreturn_strip_meta(&self) -> Result<Option<Vec<u8>>, StoreError> {
         self.inner.opreturn_strip_meta()
     }
-    fn for_each_opreturn_strip(&self, f: &mut dyn FnMut(&BlockHash, &[u8])) -> Result<(), StoreError> {
+    fn for_each_opreturn_strip(
+        &self,
+        f: &mut dyn FnMut(&BlockHash, &[u8]),
+    ) -> Result<(), StoreError> {
         self.inner.for_each_opreturn_strip(f)
     }
     fn drop_opreturn_strip_cf(&self) -> Result<(), StoreError> {
@@ -186,7 +189,9 @@ fn coin(amount: u64, height: u32) -> Coin {
 /// The coin is what routes it into the pending batch.
 fn connect_batch(seq: u64, tx: Txid) -> StoreBatch {
     let mut batch = StoreBatch::default();
-    batch.coin_puts.push((OutPoint { txid: tx, vout: 0 }, coin(1_000, 1)));
+    batch
+        .coin_puts
+        .push((OutPoint { txid: tx, vout: 0 }, coin(1_000, 1)));
     batch.tx_loc_puts.push((tx, seq));
     batch.txseq_txid_puts.push((seq, tx));
     batch
@@ -272,7 +277,11 @@ fn a_read_during_a_failed_flush_finds_the_restored_rows() {
         (Some(tx), Some(9)),
         "a read during a failed flush missed rows the failure was about to restore"
     );
-    assert_eq!(cache.inner_for_test().get_tx_seq(&tx), None, "the write failed");
+    assert_eq!(
+        cache.inner_for_test().get_tx_seq(&tx),
+        None,
+        "the write failed"
+    );
     // The next flush writes them.
     cache.flush().unwrap();
     assert_eq!(cache.inner_for_test().get_tx_seq(&tx), Some(9));
@@ -347,7 +356,10 @@ fn coin_free_connect(hash: BlockHash, header: [u8; 32]) -> StoreBatch {
         });
         batch
             .filter_header_puts
-            .push(node_filter_index::FilterHeaderRow { key: filter_key(), header });
+            .push(node_filter_index::FilterHeaderRow {
+                key: filter_key(),
+                header,
+            });
     }
     #[cfg(not(feature = "block-filter-index"))]
     let _ = header;
@@ -359,9 +371,13 @@ fn coin_free_connect(hash: BlockHash, header: [u8; 32]) -> StoreBatch {
 /// rows, moves the tip back.
 fn disconnect(parent: BlockHash) -> StoreBatch {
     let mut batch = StoreBatch::default();
-    batch
-        .coin_puts
-        .push((OutPoint { txid: txid(0x50), vout: 0 }, coin(5_000, 3)));
+    batch.coin_puts.push((
+        OutPoint {
+            txid: txid(0x50),
+            vout: 0,
+        },
+        coin(5_000, 3),
+    ));
     batch.height_hash_removes.push(H);
     #[cfg(feature = "block-filter-index")]
     batch.filter_removes.push(filter_key());
@@ -372,10 +388,15 @@ fn disconnect(parent: BlockHash) -> StoreBatch {
 /// A cache whose backing store holds block `old` at height `H`.
 fn cache_with_old_block(old: BlockHash) -> CoinCache {
     let cache = CoinCache::new(Box::new(InMemoryStore::new()), 10);
-    cache.write_batch(coin_free_connect(old, [0xAA; 32])).unwrap();
+    cache
+        .write_batch(coin_free_connect(old, [0xAA; 32]))
+        .unwrap();
     cache.flush().unwrap();
     cache.drop_read_overlays();
-    assert_eq!(cache.inner_for_test().get_block_hash_by_height(H), Some(old));
+    assert_eq!(
+        cache.inner_for_test().get_block_hash_by_height(H),
+        Some(old)
+    );
     cache
 }
 
@@ -393,7 +414,9 @@ fn a_coin_free_block_after_a_disconnect_keeps_its_rows() {
     let cache = cache_with_old_block(old);
 
     cache.write_batch(disconnect(block_hash(0x01))).unwrap();
-    cache.write_batch(coin_free_connect(new, [0xBB; 32])).unwrap();
+    cache
+        .write_batch(coin_free_connect(new, [0xBB; 32]))
+        .unwrap();
 
     #[cfg(feature = "block-filter-index")]
     assert_eq!(
@@ -431,8 +454,12 @@ fn a_coin_free_block_in_an_aborted_reorg_is_retracted() {
     let excl = cache.lock_flush_exclusion();
     excl.flush().unwrap();
     cache.write_batch(disconnect(block_hash(0x02))).unwrap();
-    cache.write_batch(coin_free_connect(new, [0xBC; 32])).unwrap();
-    cache.discard_uncommitted(&excl).expect("own thread's writes only");
+    cache
+        .write_batch(coin_free_connect(new, [0xBC; 32]))
+        .unwrap();
+    cache
+        .discard_uncommitted(&excl)
+        .expect("own thread's writes only");
     drop(excl);
 
     assert_eq!(

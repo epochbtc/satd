@@ -93,7 +93,9 @@ impl SendQueue {
     pub fn sent(&self, n: usize) {
         let _ = self
             .queued_bytes
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| Some(v.saturating_sub(n)));
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| {
+                Some(v.saturating_sub(n))
+            });
     }
 
     /// Append a `getdata` request's entries to the unserved ones.
@@ -132,7 +134,9 @@ impl SendQueue {
     pub fn note_getdata_handled(&self) {
         let _ = self
             .getdata_unhandled
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| Some(v.saturating_sub(1)));
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| {
+                Some(v.saturating_sub(1))
+            });
         self.wake_reader();
     }
 
@@ -149,7 +153,9 @@ impl SendQueue {
     /// be asked to serve more of the backlog: there is some, the queue has
     /// room, and no request to serve is already waiting.
     pub fn take_resume(&self) -> bool {
-        self.getdata_backlog() > 0 && !self.over_limit() && !self.resume_queued.swap(true, Ordering::AcqRel)
+        self.getdata_backlog() > 0
+            && !self.over_limit()
+            && !self.resume_queued.swap(true, Ordering::AcqRel)
     }
 
     /// Called by the manager as it starts on a resume request, before it
@@ -186,7 +192,10 @@ pub struct PeerSender {
 
 impl From<mpsc::Sender<NetworkMessage>> for PeerSender {
     fn from(tx: mpsc::Sender<NetworkMessage>) -> Self {
-        Self { tx, queue: Arc::new(SendQueue::new()) }
+        Self {
+            tx,
+            queue: Arc::new(SendQueue::new()),
+        }
     }
 }
 
@@ -199,7 +208,10 @@ impl PeerSender {
     /// Queue a message if there is room, counting its bytes. The signature
     /// is the tokio sender's, which this replaces at every call site.
     #[allow(clippy::result_large_err)]
-    pub fn try_send(&self, msg: NetworkMessage) -> Result<(), mpsc::error::TrySendError<NetworkMessage>> {
+    pub fn try_send(
+        &self,
+        msg: NetworkMessage,
+    ) -> Result<(), mpsc::error::TrySendError<NetworkMessage>> {
         let n = queued_size(&msg);
         // Counted before the message is visible to the write loop, so the
         // loop can never take it off before it was put on.
@@ -209,7 +221,10 @@ impl PeerSender {
 
     /// Queue a message, waiting for room, counting its bytes.
     #[allow(clippy::result_large_err)]
-    pub async fn send(&self, msg: NetworkMessage) -> Result<(), mpsc::error::SendError<NetworkMessage>> {
+    pub async fn send(
+        &self,
+        msg: NetworkMessage,
+    ) -> Result<(), mpsc::error::SendError<NetworkMessage>> {
         let n = queued_size(&msg);
         self.queue.add(n);
         self.tx.send(msg).await.inspect_err(|_| self.queue.sent(n))

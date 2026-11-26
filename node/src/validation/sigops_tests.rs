@@ -101,7 +101,12 @@ fn txid(tag: u8) -> Txid {
 }
 
 fn input(prevout: OutPoint, script_sig: ScriptBuf, witness: Witness) -> TxIn {
-    TxIn { previous_output: prevout, script_sig, sequence: Sequence::MAX, witness }
+    TxIn {
+        previous_output: prevout,
+        script_sig,
+        sequence: Sequence::MAX,
+        witness,
+    }
 }
 
 fn tx(input: Vec<TxIn>, output: Vec<TxOut>) -> Transaction {
@@ -114,7 +119,10 @@ fn tx(input: Vec<TxIn>, output: Vec<TxOut>) -> Transaction {
 }
 
 fn out(script_pubkey: ScriptBuf) -> TxOut {
-    TxOut { value: Amount::from_sat(1), script_pubkey }
+    TxOut {
+        value: Amount::from_sat(1),
+        script_pubkey,
+    }
 }
 
 /// Core: src/test/sigopcount_tests.cpp, `GetSigOpCount`.
@@ -125,7 +133,12 @@ fn core_get_sig_op_count() {
     assert_eq!(script_sigop_count(&s1.script(), true), 0);
 
     let dummy = [0u8; 20];
-    let s1 = s1.op(OP_1).push(&dummy).push(&dummy).op(OP_2).op(OP_CHECKMULTISIG);
+    let s1 = s1
+        .op(OP_1)
+        .push(&dummy)
+        .push(&dummy)
+        .op(OP_2)
+        .op(OP_CHECKMULTISIG);
     assert_eq!(script_sigop_count(&s1.script(), true), 2);
     let s1 = s1.op(OP_IF).op(OP_CHECKSIG).op(OP_ENDIF);
     assert_eq!(script_sigop_count(&s1.script(), true), 3);
@@ -143,7 +156,12 @@ fn core_get_sig_op_count() {
     let p2sh = p2sh_of(&s2.script());
     assert_eq!(script_sigop_count(&p2sh, true), 0);
     assert_eq!(script_sigop_count(&p2sh, false), 0);
-    let script_sig2 = S::new().op(OP_1).push(&dummy).push(&dummy).push(&s2.0).script();
+    let script_sig2 = S::new()
+        .op(OP_1)
+        .push(&dummy)
+        .push(&dummy)
+        .push(&s2.0)
+        .script();
     assert_eq!(p2sh_sigop_count(&p2sh, &script_sig2), 3);
 }
 
@@ -185,11 +203,17 @@ fn a_count_stops_where_the_script_stops_parsing() {
     assert_eq!(accurate(&[0xac, OP_PUSHDATA1]), 1);
     assert_eq!(accurate(&[0xac, 0x03, 0x00, 0xac]), 1);
     assert_eq!(accurate(&[0xac, OP_PUSHDATA2, 0x01]), 1);
-    assert_eq!(accurate(&[0xac, OP_PUSHDATA4, 0xff, 0xff, 0xff, 0xff, 0xac]), 1);
+    assert_eq!(
+        accurate(&[0xac, OP_PUSHDATA4, 0xff, 0xff, 0xff, 0xff, 0xac]),
+        1
+    );
     // A push that fits, including a zero-length PUSHDATA, is skipped whole.
     assert_eq!(accurate(&[OP_PUSHDATA1, 0x00, 0xac]), 1);
     assert_eq!(accurate(&[OP_PUSHDATA2, 0x01, 0x00, 0xae, 0xac]), 1);
-    assert_eq!(accurate(&[OP_PUSHDATA4, 0x02, 0, 0, 0, 0xae, 0xae, 0xac]), 1);
+    assert_eq!(
+        accurate(&[OP_PUSHDATA4, 0x02, 0, 0, 0, 0xae, 0xae, 0xac]),
+        1
+    );
     assert_eq!(accurate(&[0x02, 0xac, 0xac]), 0);
 }
 
@@ -199,14 +223,24 @@ fn a_count_stops_where_the_script_stops_parsing() {
 fn p2sh_counts_the_last_push_of_a_push_only_script_sig() {
     let redeem = script(&[0x51, 0xac, 0xae]);
     let p2sh = p2sh_of(&redeem);
-    assert_eq!(p2sh_sigop_count(&p2sh, &S::new().push(redeem.as_bytes()).script()), 21);
+    assert_eq!(
+        p2sh_sigop_count(&p2sh, &S::new().push(redeem.as_bytes()).script()),
+        21
+    );
     // OP_RESERVED and OP_1NEGATE are at or below OP_16.
-    let sig = S::new().op(OP_RESERVED).op(OP_1NEGATE).push(redeem.as_bytes()).script();
+    let sig = S::new()
+        .op(OP_RESERVED)
+        .op(OP_1NEGATE)
+        .push(redeem.as_bytes())
+        .script();
     assert_eq!(p2sh_sigop_count(&p2sh, &sig), 21);
     // Any push form.
     let mut long_redeem = redeem.as_bytes().to_vec();
     long_redeem.extend([OP_NOP; 300]);
-    assert_eq!(p2sh_sigop_count(&p2sh, &S::new().push(&long_redeem).script()), 21);
+    assert_eq!(
+        p2sh_sigop_count(&p2sh, &S::new().push(&long_redeem).script()),
+        21
+    );
     // A NOP anywhere: 0.
     let sig = S::new().op(OP_NOP).push(redeem.as_bytes()).script();
     assert_eq!(p2sh_sigop_count(&p2sh, &sig), 0);
@@ -220,7 +254,10 @@ fn p2sh_counts_the_last_push_of_a_push_only_script_sig() {
     assert_eq!(p2sh_sigop_count(&p2sh, &script(&truncated)), 0);
     // A push that claims more bytes than follow is not a redeem script, even
     // when the bytes that do follow would count: 0, not 21.
-    assert_eq!(p2sh_sigop_count(&p2sh, &script(&[0x05, 0x51, 0xac, 0xae])), 0);
+    assert_eq!(
+        p2sh_sigop_count(&p2sh, &script(&[0x05, 0x51, 0xac, 0xae])),
+        0
+    );
     // A scriptPubKey that is not P2SH is counted itself, accurately.
     assert_eq!(p2sh_sigop_count(&redeem, &ScriptBuf::new()), 21);
 }
@@ -263,7 +300,9 @@ fn core_are_inputs_standard_p2sh_sig_op_counts() {
         out(p2sh_of(&twenty_sigops.script())),
     ];
     let from = txid(0xf0);
-    let spend = |vout: u32, script_sig: ScriptBuf| input(OutPoint { txid: from, vout }, script_sig, Witness::new());
+    let spend = |vout: u32, script_sig: ScriptBuf| {
+        input(OutPoint { txid: from, vout }, script_sig, Witness::new())
+    };
 
     // What SignSignature produces for vin[0..3], then Core's dummy
     // scriptSigs for vin[3] and vin[4].
@@ -272,7 +311,10 @@ fn core_are_inputs_standard_p2sh_sig_op_counts() {
             spend(0, S::new().push(&SIG).push(&pay1.0).script()),
             spend(1, S::new().push(&SIG).script()),
             spend(2, S::new().op(OP_0).push(&SIG).script()),
-            spend(3, S::new().op(OP_11).op(OP_11).push(&one_and_two.0).script()),
+            spend(
+                3,
+                S::new().op(OP_11).op(OP_11).push(&one_and_two.0).script(),
+            ),
             spend(4, S::new().push(&fifteen_sigops.0).script()),
         ],
         vec![out(ScriptBuf::new())],
@@ -280,15 +322,30 @@ fn core_are_inputs_standard_p2sh_sig_op_counts() {
     // 22 P2SH sigops for all inputs (1 for vin[0], 6 for vin[3], 15 for vin[4]).
     assert_eq!(transaction_p2sh_sigop_count(&tx_to, &tx_from[0..5]), 22);
 
-    let coinbase_tx = tx(vec![input(OutPoint::null(), ScriptBuf::new(), Witness::new())], vec![]);
+    let coinbase_tx = tx(
+        vec![input(OutPoint::null(), ScriptBuf::new(), Witness::new())],
+        vec![],
+    );
     assert!(coinbase_tx.is_coinbase());
     assert_eq!(transaction_p2sh_sigop_count(&coinbase_tx, &[]), 0);
 
-    let tx_to_non_std1 = tx(vec![spend(5, S::new().push(&sixteen_sigops.0).script())], vec![]);
-    assert_eq!(transaction_p2sh_sigop_count(&tx_to_non_std1, &tx_from[5..6]), 16);
+    let tx_to_non_std1 = tx(
+        vec![spend(5, S::new().push(&sixteen_sigops.0).script())],
+        vec![],
+    );
+    assert_eq!(
+        transaction_p2sh_sigop_count(&tx_to_non_std1, &tx_from[5..6]),
+        16
+    );
 
-    let tx_to_non_std2 = tx(vec![spend(6, S::new().push(&twenty_sigops.0).script())], vec![]);
-    assert_eq!(transaction_p2sh_sigop_count(&tx_to_non_std2, &tx_from[6..7]), 20);
+    let tx_to_non_std2 = tx(
+        vec![spend(6, S::new().push(&twenty_sigops.0).script())],
+        vec![],
+    );
+    assert_eq!(
+        transaction_p2sh_sigop_count(&tx_to_non_std2, &tx_from[6..7]),
+        20
+    );
 }
 
 /// Core: src/test/transaction_tests.cpp, `max_standard_legacy_sigops`, the
@@ -305,12 +362,24 @@ fn core_max_standard_legacy_sigops_p2sh_counts() {
     for (inputs, expected) in [(166u32, 2_490), (167, 2_505)] {
         let tx_max_sigops = tx(
             (0..inputs)
-                .map(|i| input(OutPoint { txid: txid(0xf1), vout: i }, S::new().push(&redeem.0).script(), Witness::new()))
+                .map(|i| {
+                    input(
+                        OutPoint {
+                            txid: txid(0xf1),
+                            vout: i,
+                        },
+                        S::new().push(&redeem.0).script(),
+                        Witness::new(),
+                    )
+                })
                 .collect(),
             vec![],
         );
         let prevouts = vec![out(p2sh.clone()); inputs as usize];
-        assert_eq!(transaction_p2sh_sigop_count(&tx_max_sigops, &prevouts), expected);
+        assert_eq!(
+            transaction_p2sh_sigop_count(&tx_max_sigops, &prevouts),
+            expected
+        );
     }
 }
 
@@ -320,16 +389,31 @@ fn core_get_tx_sig_op_cost() {
     let flags = SigOpFlags::P2shWitness;
     let pk = pubkey(9);
     let creation = |script_pubkey: ScriptBuf| {
-        tx(vec![input(OutPoint::null(), ScriptBuf::new(), Witness::new())], vec![out(script_pubkey)])
+        tx(
+            vec![input(OutPoint::null(), ScriptBuf::new(), Witness::new())],
+            vec![out(script_pubkey)],
+        )
     };
     let spending = |creation_tx: &Transaction, script_sig: ScriptBuf, witness: Witness| {
         tx(
-            vec![input(OutPoint { txid: creation_tx.compute_txid(), vout: 0 }, script_sig, witness)],
+            vec![input(
+                OutPoint {
+                    txid: creation_tx.compute_txid(),
+                    vout: 0,
+                },
+                script_sig,
+                witness,
+            )],
             vec![out(ScriptBuf::new())],
         )
     };
     let two_empty = || Witness::from_slice(&[&[][..], &[][..]]);
-    let multisig_1_of_2 = S::new().op(OP_1).push(&pk).push(&pk).op(OP_2).op(OP_CHECKMULTISIGVERIFY);
+    let multisig_1_of_2 = S::new()
+        .op(OP_1)
+        .push(&pk)
+        .push(&pk)
+        .op(OP_2)
+        .op(OP_CHECKMULTISIGVERIFY);
 
     // Multisig script (legacy counting).
     {
@@ -356,9 +440,15 @@ fn core_get_tx_sig_op_cost() {
         let script_sig = S::new().op(OP_0).op(OP_0).push(&redeem_script.0).script();
         let spending_tx = spending(&creation_tx, script_sig, Witness::new());
         let prevouts = creation_tx.output.clone();
-        assert_eq!(transaction_sigop_cost(&spending_tx, &prevouts, flags), 2 * WITNESS_SCALE_FACTOR);
+        assert_eq!(
+            transaction_sigop_cost(&spending_tx, &prevouts, flags),
+            2 * WITNESS_SCALE_FACTOR
+        );
         // P2SH sigops are not counted without SCRIPT_VERIFY_P2SH.
-        assert_eq!(transaction_sigop_cost(&spending_tx, &prevouts, SigOpFlags::Legacy), 0);
+        assert_eq!(
+            transaction_sigop_cost(&spending_tx, &prevouts, SigOpFlags::Legacy),
+            0
+        );
     }
 
     // P2WPKH witness program.
@@ -369,21 +459,30 @@ fn core_get_tx_sig_op_cost() {
         let prevouts = creation_tx.output.clone();
         assert_eq!(transaction_sigop_cost(&spending_tx, &prevouts, flags), 1);
         // No signature operations if we don't verify the witness.
-        assert_eq!(transaction_sigop_cost(&spending_tx, &prevouts, SigOpFlags::P2sh), 0);
+        assert_eq!(
+            transaction_sigop_cost(&spending_tx, &prevouts, SigOpFlags::P2sh),
+            0
+        );
 
         // The sig op cost for witness version != 0 is zero.
         assert_eq!(script_pubkey[0], 0x00);
         script_pubkey[0] = 0x51;
         let creation_tx = creation(script(&script_pubkey));
         let spending_tx = spending(&creation_tx, ScriptBuf::new(), two_empty());
-        assert_eq!(transaction_sigop_cost(&spending_tx, &creation_tx.output, flags), 0);
+        assert_eq!(
+            transaction_sigop_cost(&spending_tx, &creation_tx.output, flags),
+            0
+        );
         script_pubkey[0] = 0x00;
         let creation_tx = creation(script(&script_pubkey));
         let mut spending_tx = spending(&creation_tx, ScriptBuf::new(), two_empty());
 
         // The witness of a coinbase transaction is not taken into account.
         spending_tx.input[0].previous_output = OutPoint::null();
-        assert_eq!(transaction_sigop_cost(&spending_tx, &creation_tx.output, flags), 0);
+        assert_eq!(
+            transaction_sigop_cost(&spending_tx, &creation_tx.output, flags),
+            0
+        );
     }
 
     // P2WPKH nested in P2SH.
@@ -392,7 +491,10 @@ fn core_get_tx_sig_op_cost() {
         let creation_tx = creation(p2sh_of(&program.script()));
         let script_sig = S::new().push(&program.0).script();
         let spending_tx = spending(&creation_tx, script_sig, two_empty());
-        assert_eq!(transaction_sigop_cost(&spending_tx, &creation_tx.output, flags), 1);
+        assert_eq!(
+            transaction_sigop_cost(&spending_tx, &creation_tx.output, flags),
+            1
+        );
     }
 
     // P2WSH witness program.
@@ -401,8 +503,14 @@ fn core_get_tx_sig_op_cost() {
         let creation_tx = creation(ScriptBuf::new_p2wsh(&witness_script.wscript_hash()));
         let witness = Witness::from_slice(&[&[][..], &[][..], witness_script.as_bytes()]);
         let spending_tx = spending(&creation_tx, ScriptBuf::new(), witness);
-        assert_eq!(transaction_sigop_cost(&spending_tx, &creation_tx.output, flags), 2);
-        assert_eq!(transaction_sigop_cost(&spending_tx, &creation_tx.output, SigOpFlags::P2sh), 0);
+        assert_eq!(
+            transaction_sigop_cost(&spending_tx, &creation_tx.output, flags),
+            2
+        );
+        assert_eq!(
+            transaction_sigop_cost(&spending_tx, &creation_tx.output, SigOpFlags::P2sh),
+            0
+        );
     }
 
     // P2WSH nested in P2SH.
@@ -413,7 +521,10 @@ fn core_get_tx_sig_op_cost() {
         let script_sig = S::new().push(redeem_script.as_bytes()).script();
         let witness = Witness::from_slice(&[&[][..], &[][..], witness_script.as_bytes()]);
         let spending_tx = spending(&creation_tx, script_sig, witness);
-        assert_eq!(transaction_sigop_cost(&spending_tx, &creation_tx.output, flags), 2);
+        assert_eq!(
+            transaction_sigop_cost(&spending_tx, &creation_tx.output, flags),
+            2
+        );
     }
 }
 
@@ -426,9 +537,15 @@ fn witness_sigops_follow_cores_program_rules() {
     let p2wsh = ScriptBuf::new_p2wsh(&ws.wscript_hash());
     let with_ws = Witness::from_slice(&[ws.as_bytes()]);
     // The witness script is the last item, counted accurately: 21.
-    assert_eq!(witness_sigop_count(&ScriptBuf::new(), &p2wsh, &with_ws, flags), 21);
+    assert_eq!(
+        witness_sigop_count(&ScriptBuf::new(), &p2wsh, &with_ws, flags),
+        21
+    );
     // An empty witness has no script: 0.
-    assert_eq!(witness_sigop_count(&ScriptBuf::new(), &p2wsh, &Witness::new(), flags), 0);
+    assert_eq!(
+        witness_sigop_count(&ScriptBuf::new(), &p2wsh, &Witness::new(), flags),
+        0
+    );
     // P2SH-wrapped, but the scriptSig is not push-only: 0.
     let wrapped = p2sh_of(&p2wsh);
     let sig = S::new().op(OP_NOP).push(p2wsh.as_bytes()).script();
@@ -438,23 +555,38 @@ fn witness_sigops_follow_cores_program_rules() {
     // A scriptSig whose push runs one byte past the end is not push-only.
     let mut short = sig.as_bytes().to_vec();
     short[0] += 1;
-    assert_eq!(witness_sigop_count(&script(&short), &wrapped, &with_ws, flags), 0);
+    assert_eq!(
+        witness_sigop_count(&script(&short), &wrapped, &with_ws, flags),
+        0
+    );
     // A version 0 program of another length, a 41-byte program, and a
     // push that does not end the script are not counted.
     let v0_40 = S::new().op(OP_0).push(&[0x44; 40]).script();
-    assert_eq!(witness_sigop_count(&ScriptBuf::new(), &v0_40, &with_ws, flags), 0);
+    assert_eq!(
+        witness_sigop_count(&ScriptBuf::new(), &v0_40, &with_ws, flags),
+        0
+    );
     let v0_41 = S::new().op(OP_0).push(&[0x44; 41]).script();
     assert_eq!(witness_program(v0_41.as_bytes()), None);
     let mut trailing = S::new().op(OP_0).push(&[0x44; 20]).0;
     trailing.push(OP_NOP);
-    assert_eq!(witness_sigop_count(&ScriptBuf::new(), &script(&trailing), &with_ws, flags), 0);
+    assert_eq!(
+        witness_sigop_count(&ScriptBuf::new(), &script(&trailing), &with_ws, flags),
+        0
+    );
     // OP_1NEGATE is not a version opcode.
     let negate = S::new().op(OP_1NEGATE).push(&[0x44; 20]).script();
     assert_eq!(witness_program(negate.as_bytes()), None);
     // Version 16 is a program, of no sigops.
     let v16 = S::new().op(OP_16).push(&[0x44; 32]).script();
-    assert_eq!(witness_program(v16.as_bytes()).map(|(v, p)| (v, p.len())), Some((16, 32)));
-    assert_eq!(witness_sigop_count(&ScriptBuf::new(), &v16, &with_ws, flags), 0);
+    assert_eq!(
+        witness_program(v16.as_bytes()).map(|(v, p)| (v, p.len())),
+        Some((16, 32))
+    );
+    assert_eq!(
+        witness_sigop_count(&ScriptBuf::new(), &v16, &with_ws, flags),
+        0
+    );
 }
 
 /// Four P2WSH inputs of 3,941 each cost 15,764, unscaled.
@@ -467,13 +599,28 @@ fn four_heavy_p2wsh_inputs_cost_their_accurate_count() {
     let prevouts = vec![out(ScriptBuf::new_p2wsh(&ws.wscript_hash())); 4];
     let spend = tx(
         (0..4)
-            .map(|i| input(OutPoint { txid: txid(0xf2), vout: i }, ScriptBuf::new(), Witness::from_slice(&[ws.as_bytes()])))
+            .map(|i| {
+                input(
+                    OutPoint {
+                        txid: txid(0xf2),
+                        vout: i,
+                    },
+                    ScriptBuf::new(),
+                    Witness::from_slice(&[ws.as_bytes()]),
+                )
+            })
             .collect(),
         vec![out(ScriptBuf::new())],
     );
-    assert_eq!(transaction_sigop_cost(&spend, &prevouts, SigOpFlags::P2shWitness), 4 * 3_941);
+    assert_eq!(
+        transaction_sigop_cost(&spend, &prevouts, SigOpFlags::P2shWitness),
+        4 * 3_941
+    );
     // Without SCRIPT_VERIFY_WITNESS none of it counts.
-    assert_eq!(transaction_sigop_cost(&spend, &prevouts, SigOpFlags::P2sh), 0);
+    assert_eq!(
+        transaction_sigop_cost(&spend, &prevouts, SigOpFlags::P2sh),
+        0
+    );
 }
 
 /// Like Core's `assert(!coin.IsSpent())`, a missing prevout is a bug in the
@@ -481,6 +628,16 @@ fn four_heavy_p2wsh_inputs_cost_their_accurate_count() {
 #[test]
 #[should_panic(expected = "sigop counting needs the output each input spends")]
 fn a_missing_prevout_is_refused() {
-    let spend = tx(vec![input(OutPoint { txid: txid(0xf3), vout: 0 }, ScriptBuf::new(), Witness::new())], vec![]);
+    let spend = tx(
+        vec![input(
+            OutPoint {
+                txid: txid(0xf3),
+                vout: 0,
+            },
+            ScriptBuf::new(),
+            Witness::new(),
+        )],
+        vec![],
+    );
     transaction_sigop_cost(&spend, &[], SigOpFlags::P2shWitness);
 }

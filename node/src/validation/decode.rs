@@ -30,9 +30,11 @@
 //! [`wtxid`] do the same, for every RPC that prints or writes one.
 
 use bitcoin::bip152::{BlockTransactions, HeaderAndShortIds, PrefilledTransaction, ShortId};
-use bitcoin::consensus::encode::{self, Decodable, VarInt, MAX_VEC_SIZE};
+use bitcoin::consensus::encode::{self, Decodable, MAX_VEC_SIZE, VarInt};
 use bitcoin::io::Read;
-use bitcoin::{absolute, block, transaction, Block, BlockHash, Transaction, TxIn, TxOut, Witness, Wtxid};
+use bitcoin::{
+    Block, BlockHash, Transaction, TxIn, TxOut, Witness, Wtxid, absolute, block, transaction,
+};
 
 /// Core's `UnserializeTransaction` with witnesses allowed.
 pub fn read_transaction<R: Read + ?Sized>(r: &mut R) -> Result<Transaction, encode::Error> {
@@ -61,10 +63,17 @@ pub fn read_transaction<R: Read + ?Sized>(r: &mut R) -> Result<Transaction, enco
         }
     }
     if flags != 0 {
-        return Err(encode::Error::ParseFailed("Unknown transaction optional data"));
+        return Err(encode::Error::ParseFailed(
+            "Unknown transaction optional data",
+        ));
     }
     let lock_time = absolute::LockTime::consensus_decode_from_finite_reader(r)?;
-    Ok(Transaction { version, lock_time, input, output })
+    Ok(Transaction {
+        version,
+        lock_time,
+        input,
+        output,
+    })
 }
 
 /// A compact-size count of transactions, each read by [`read_transaction`].
@@ -88,7 +97,9 @@ pub fn read_block<R: Read + ?Sized>(r: &mut R) -> Result<Block, encode::Error> {
 
 /// A `cmpctblock` payload, its prefilled transactions read by
 /// [`read_transaction`] (Core reads them `TX_WITH_WITNESS`).
-pub fn read_header_and_short_ids<R: Read + ?Sized>(r: &mut R) -> Result<HeaderAndShortIds, encode::Error> {
+pub fn read_header_and_short_ids<R: Read + ?Sized>(
+    r: &mut R,
+) -> Result<HeaderAndShortIds, encode::Error> {
     let header = block::Header::consensus_decode_from_finite_reader(r)?;
     let nonce = u64::consensus_decode_from_finite_reader(r)?;
     let short_ids = Vec::<ShortId>::consensus_decode_from_finite_reader(r)?;
@@ -99,16 +110,29 @@ pub fn read_header_and_short_ids<R: Read + ?Sized>(r: &mut R) -> Result<HeaderAn
         let idx = VarInt::consensus_decode_from_finite_reader(r)?.0;
         let idx = u16::try_from(idx)
             .map_err(|_| encode::Error::ParseFailed("BIP152 prefilled tx index out of bounds"))?;
-        prefilled_txs.push(PrefilledTransaction { idx, tx: read_transaction(r)? });
+        prefilled_txs.push(PrefilledTransaction {
+            idx,
+            tx: read_transaction(r)?,
+        });
     }
-    Ok(HeaderAndShortIds { header, nonce, short_ids, prefilled_txs })
+    Ok(HeaderAndShortIds {
+        header,
+        nonce,
+        short_ids,
+        prefilled_txs,
+    })
 }
 
 /// A `blocktxn` payload, its transactions read by [`read_transaction`].
-pub fn read_block_transactions<R: Read + ?Sized>(r: &mut R) -> Result<BlockTransactions, encode::Error> {
+pub fn read_block_transactions<R: Read + ?Sized>(
+    r: &mut R,
+) -> Result<BlockTransactions, encode::Error> {
     let block_hash = BlockHash::consensus_decode_from_finite_reader(r)?;
     let transactions = read_transactions(r)?;
-    Ok(BlockTransactions { block_hash, transactions })
+    Ok(BlockTransactions {
+        block_hash,
+        transactions,
+    })
 }
 
 /// [`read_transaction`] over the whole of `bytes`, refusing any left over,
@@ -129,7 +153,9 @@ fn whole<T>(
     let mut r = bytes;
     let value = read(&mut r)?;
     if !r.is_empty() {
-        return Err(encode::Error::ParseFailed("data not consumed entirely when explicitly deserializing"));
+        return Err(encode::Error::ParseFailed(
+            "data not consumed entirely when explicitly deserializing",
+        ));
     }
     Ok(value)
 }
@@ -178,7 +204,11 @@ pub fn serialize_transaction(tx: &Transaction) -> Vec<u8> {
 /// The length of [`serialize_transaction`]'s bytes (Core's
 /// `GetSerializeSize(TX_WITH_WITNESS(tx))`, `size` in `decoderawtransaction`).
 pub fn total_size(tx: &Transaction) -> usize {
-    if tx.input.is_empty() { tx.base_size() } else { tx.total_size() }
+    if tx.input.is_empty() {
+        tx.base_size()
+    } else {
+        tx.total_size()
+    }
 }
 
 /// Core's `GetTransactionWeight`: three times the size without witnesses plus

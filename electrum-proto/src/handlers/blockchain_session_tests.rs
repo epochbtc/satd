@@ -79,7 +79,10 @@ async fn a_single_string_and_a_range_negotiate() {
         (json!(["w", "1.4.2-asof"]), "1.4.2-asof"),
         (json!(["w", ["1.4", "1.4.2-asof"]]), "1.4.2-asof"),
         // Extra arguments are ignored.
-        (json!(["w", ["1.4", "1.6"], "extra", 9999.9, {"dd": {}}]), "1.6"),
+        (
+            json!(["w", ["1.4", "1.6"], "extra", 9999.9, {"dd": {}}]),
+            "1.6",
+        ),
     ] {
         let mut conn = Conn::new();
         let resp = conn.version(params.clone());
@@ -99,7 +102,10 @@ async fn a_second_server_version_is_refused() {
     let again = conn.version(json!(["w", "1.4"]));
     assert_eq!(error_message(&again), "server.version already sent");
     assert_eq!(again.error.as_ref().unwrap().code, 1);
-    assert!(!again.close, "a second server.version is refused, not fatal");
+    assert!(
+        !again.close,
+        "a second server.version is refused, not fatal"
+    );
     assert_eq!(conn.session.version(), ProtocolVersion::parse("1.4.2"));
     assert_eq!(conn.session.negotiated().unwrap().answer, "1.4.2-asof");
 }
@@ -108,7 +114,11 @@ async fn a_second_server_version_is_refused() {
 /// "the server must close the connection"). Nothing is negotiated.
 #[tokio::test]
 async fn no_common_version_closes_the_connection() {
-    for params in [json!(["w", "1.3"]), json!(["w", ["1.7", "1.8"]]), json!(["w", ["1.0", "1.3"]])] {
+    for params in [
+        json!(["w", "1.3"]),
+        json!(["w", ["1.7", "1.8"]]),
+        json!(["w", ["1.0", "1.3"]]),
+    ] {
         let mut conn = Conn::new();
         let resp = conn.version(params.clone());
         assert_eq!(
@@ -198,7 +208,11 @@ async fn get_info_matches_getmempoolinfo() {
     let rpc = node::rpc::rawtx::get_mempool_info(&conn.state.mempool);
     for key in ["mempoolminfee", "minrelaytxfee", "incrementalrelayfee"] {
         let rpc_value: f64 = rpc[key].to_string().parse().unwrap();
-        assert_eq!(info[key].as_f64(), Some(rpc_value), "{key}: {info} vs {rpc}");
+        assert_eq!(
+            info[key].as_f64(),
+            Some(rpc_value),
+            "{key}: {info} vs {rpc}"
+        );
     }
     assert_eq!(info["minrelaytxfee"], relayfee);
     assert_eq!(info.as_object().unwrap().len(), 3, "{info}");
@@ -219,16 +233,26 @@ async fn block_headers_take_the_versions_shape() {
         assert_eq!(hex["count"], 3);
         assert_eq!(list["count"], 3);
         assert_eq!(hex["max"], list["max"]);
-        assert!(list.get("hex").is_none() && hex.get("headers").is_none(), "{list} {hex}");
-        let headers: Vec<&str> =
-            list["headers"].as_array().unwrap().iter().map(|h| h.as_str().unwrap()).collect();
+        assert!(
+            list.get("hex").is_none() && hex.get("headers").is_none(),
+            "{list} {hex}"
+        );
+        let headers: Vec<&str> = list["headers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|h| h.as_str().unwrap())
+            .collect();
         assert_eq!(headers.len(), 3);
         assert!(headers.iter().all(|h| h.len() == 160), "{headers:?}");
         assert_eq!(headers.concat(), hex["hex"].as_str().unwrap());
         assert_eq!(list.as_object().unwrap().len(), 3, "{list}");
     }
     // Past the tip: only the headers that exist.
-    let tail = result(new.call("blockchain.block.headers", json!([super::historycap_tests::TIP_HEIGHT, 5])));
+    let tail = result(new.call(
+        "blockchain.block.headers",
+        json!([super::historycap_tests::TIP_HEIGHT, 5]),
+    ));
     assert_eq!(tail["count"], 1);
     assert_eq!(tail["headers"].as_array().map(Vec::len), Some(1));
     for conn in [&mut old, &mut new] {
@@ -259,8 +283,15 @@ async fn estimatefee_takes_a_mode() {
 
     let mut conn = Conn::new();
     result(conn.version(json!(["w", "1.6"])));
-    for params in [json!([6]), json!([6, "ECONOMICAL"]), json!([6, "CONSERVATIVE"])] {
-        assert!(result(conn.call("blockchain.estimatefee", params.clone())).is_number(), "{params}");
+    for params in [
+        json!([6]),
+        json!([6, "ECONOMICAL"]),
+        json!([6, "CONSERVATIVE"]),
+    ] {
+        assert!(
+            result(conn.call("blockchain.estimatefee", params.clone())).is_number(),
+            "{params}"
+        );
     }
     let resp = conn.call("blockchain.estimatefee", json!([6, "UNSET"]));
     assert_eq!(error_message(&resp), "unknown estimatefee mode: UNSET");
@@ -281,10 +312,8 @@ async fn broadcast_package_refuses_a_malformed_package() {
         )
         .txdata
         .remove(0);
-        tx.input[0].previous_output = bitcoin::OutPoint::new(
-            bitcoin::Txid::from_byte_array([salt; 32]),
-            0,
-        );
+        tx.input[0].previous_output =
+            bitcoin::OutPoint::new(bitcoin::Txid::from_byte_array([salt; 32]), 0);
         hex::encode(serialize(&tx))
     };
     let mut conn = Conn::new();
@@ -295,7 +324,10 @@ async fn broadcast_package_refuses_a_malformed_package() {
         "the tx package was rejected by network rules.\n\nArray must contain between 1 and 25 transactions."
     );
     // Two transactions, neither spending the other.
-    let resp = conn.call("blockchain.transaction.broadcast_package", json!([[tx(1), tx(2)]]));
+    let resp = conn.call(
+        "blockchain.transaction.broadcast_package",
+        json!([[tx(1), tx(2)]]),
+    );
     assert_eq!(
         error_message(&resp),
         "the tx package was rejected by network rules.\n\npackage topology disallowed. \

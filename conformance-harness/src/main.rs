@@ -22,9 +22,9 @@ use std::io::{self, BufRead, Write};
 use std::panic::{self, AssertUnwindSafe};
 
 use bitcoin::consensus::deserialize;
-use bitcoin::secp256k1::{self, ffi, Secp256k1};
+use bitcoin::secp256k1::{self, Secp256k1, ffi};
 use bitcoin::{Amount, ScriptBuf, Transaction, TxOut};
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 
 /// The specification version these answers are checked against.
 const SPEC_VERSION: &str = "v32.1-1";
@@ -46,7 +46,10 @@ struct Fail {
 }
 
 fn bad_request(message: impl Into<String>) -> Fail {
-    Fail { code: "bad_request", message: message.into() }
+    Fail {
+        code: "bad_request",
+        message: message.into(),
+    }
 }
 
 type Fields = Map<String, Value>;
@@ -93,11 +96,18 @@ fn main() {
 /// everything else is answered here.
 fn route(line: &str, worker: &mut Option<chain::Worker>) -> Value {
     let request = serde_json::from_str::<Value>(line).ok();
-    let op = request.as_ref().and_then(|r| r.get("op")).and_then(Value::as_str);
+    let op = request
+        .as_ref()
+        .and_then(|r| r.get("op"))
+        .and_then(Value::as_str);
     let Some(op) = op.filter(|op| chain::OPS.contains(op)) else {
         return respond(line, dispatch);
     };
-    let id = request.as_ref().and_then(|r| r.get("id")).cloned().unwrap_or(Value::Null);
+    let id = request
+        .as_ref()
+        .and_then(|r| r.get("id"))
+        .cloned()
+        .unwrap_or(Value::Null);
     if op == "chain_reset" {
         *worker = None;
         match chain::Worker::spawn() {
@@ -124,8 +134,13 @@ fn respond(line: &str, mut dispatch: impl FnMut(&str, &Fields) -> Result<Fields,
     let Some(op) = request.get("op").and_then(Value::as_str) else {
         return failure(id, bad_request("missing op"));
     };
-    let outcome = panic::catch_unwind(AssertUnwindSafe(|| dispatch(op, &request)))
-        .unwrap_or_else(|_| Err(Fail { code: "internal", message: "panic".into() }));
+    let outcome =
+        panic::catch_unwind(AssertUnwindSafe(|| dispatch(op, &request))).unwrap_or_else(|_| {
+            Err(Fail {
+                code: "internal",
+                message: "panic".into(),
+            })
+        });
     match outcome {
         Ok(mut fields) => {
             fields.insert("id".into(), id);
@@ -149,7 +164,10 @@ fn dispatch(op: &str, req: &Fields) -> Result<Fields, Fail> {
         "sighash_taproot" => sighash_taproot(req),
         "taproot_commitment_verify" => taproot_commitment_verify(req),
         "schnorr_verify" => schnorr_verify(req),
-        _ => Err(Fail { code: "unsupported_op", message: format!("satd does not answer {op}") }),
+        _ => Err(Fail {
+            code: "unsupported_op",
+            message: format!("satd does not answer {op}"),
+        }),
     }
 }
 
@@ -179,7 +197,14 @@ fn script_verify(req: &Fields) -> Result<Fields, Fail> {
     let precomputed = consensus::PrecomputedTransactionData::new(&tx, &spent)
         .map_err(|e| bad_request(format!("spent outputs: {e}")))?;
     let prev = &spent[index];
-    let result = consensus::verify(&prev.script_pubkey, prev.value, &tx, index, flags, &precomputed);
+    let result = consensus::verify(
+        &prev.script_pubkey,
+        prev.value,
+        &tx,
+        index,
+        flags,
+        &precomputed,
+    );
     let mut fields = Fields::new();
     match result {
         Ok(()) => {
@@ -222,7 +247,8 @@ fn sighash_legacy(req: &Fields) -> Result<Fields, Fail> {
     let script_code = field_hex(req, "script_code")?;
     let index = field_index(req, "index")?;
     let hash_type = field_i64(req, "hash_type")?;
-    let hash_type = i32::try_from(hash_type).map_err(|_| bad_request("hash_type is not a 32-bit integer"))?;
+    let hash_type =
+        i32::try_from(hash_type).map_err(|_| bad_request("hash_type is not a 32-bit integer"))?;
     // Core hashes the signed hash type's bit pattern.
     let sighash = consensus::sighash::legacy_sighash(&tx, index, &script_code, hash_type as u32)
         .ok_or_else(|| bad_request("index past the last input"))?;
@@ -237,7 +263,8 @@ fn sighash_taproot(req: &Fields) -> Result<Fields, Fail> {
     let index = field_index(req, "index")?;
     let spent = field_spent_outputs(req)?;
     let hash_type = field_i64(req, "hash_type")?;
-    let hash_type = u8::try_from(hash_type).map_err(|_| bad_request("hash_type is not 0 to 255"))?;
+    let hash_type =
+        u8::try_from(hash_type).map_err(|_| bad_request("hash_type is not 0 to 255"))?;
     if index >= tx.input.len() {
         return Err(bad_request("index past the last input"));
     }
@@ -247,7 +274,9 @@ fn sighash_taproot(req: &Fields) -> Result<Fields, Fail> {
     let annex = optional_hex(req, "annex")?;
     let leaf_hash = match optional_hex(req, "leaf_hash")? {
         None => None,
-        Some(bytes) => Some(<[u8; 32]>::try_from(bytes).map_err(|_| bad_request("leaf_hash is not 32 bytes"))?),
+        Some(bytes) => Some(
+            <[u8; 32]>::try_from(bytes).map_err(|_| bad_request("leaf_hash is not 32 bytes"))?,
+        ),
     };
     let codesep_pos = match req.get("codesep_pos") {
         None => u32::MAX,
@@ -281,7 +310,8 @@ fn taproot_commitment_verify(req: &Fields) -> Result<Fields, Fail> {
     if output_key.len() != 32 {
         return Err(bad_request("output_key is not 32 bytes"));
     }
-    let valid = consensus::witness::check_taproot_commitment(&control, &script, &output_key).is_ok();
+    let valid =
+        consensus::witness::check_taproot_commitment(&control, &script, &output_key).is_ok();
     let mut fields = Fields::new();
     fields.insert("valid".into(), json!(valid));
     Ok(fields)
@@ -326,7 +356,8 @@ fn schnorr_verify(req: &Fields) -> Result<Fields, Fail> {
 }
 
 fn field<'a>(req: &'a Fields, name: &str) -> Result<&'a Value, Fail> {
-    req.get(name).ok_or_else(|| bad_request(format!("missing {name}")))
+    req.get(name)
+        .ok_or_else(|| bad_request(format!("missing {name}")))
 }
 
 fn field_hex(req: &Fields, name: &str) -> Result<Vec<u8>, Fail> {
@@ -338,7 +369,9 @@ fn optional_hex(req: &Fields, name: &str) -> Result<Option<Vec<u8>>, Fail> {
 }
 
 fn decode_hex(value: &Value, name: &str) -> Result<Vec<u8>, Fail> {
-    let text = value.as_str().ok_or_else(|| bad_request(format!("{name} is not a string")))?;
+    let text = value
+        .as_str()
+        .ok_or_else(|| bad_request(format!("{name} is not a string")))?;
     hex::decode(text).map_err(|e| bad_request(format!("{name}: {e}")))
 }
 
@@ -348,7 +381,9 @@ fn field_tx(req: &Fields, name: &str) -> Result<Transaction, Fail> {
 }
 
 fn field_i64(req: &Fields, name: &str) -> Result<i64, Fail> {
-    field(req, name)?.as_i64().ok_or_else(|| bad_request(format!("{name} is not an integer")))
+    field(req, name)?
+        .as_i64()
+        .ok_or_else(|| bad_request(format!("{name} is not an integer")))
 }
 
 fn field_index(req: &Fields, name: &str) -> Result<usize, Fail> {
@@ -367,17 +402,24 @@ fn field_spent_outputs(req: &Fields) -> Result<Vec<TxOut>, Fail> {
     entries
         .iter()
         .map(|entry| {
-            let entry = entry.as_object().ok_or_else(|| bad_request("spent output is not an object"))?;
+            let entry = entry
+                .as_object()
+                .ok_or_else(|| bad_request("spent output is not an object"))?;
             let amount = field_i64(entry, "amount")?;
             let script_pubkey = field_hex(entry, "script_pubkey")?;
-            Ok(TxOut { value: Amount::from_sat(amount as u64), script_pubkey: ScriptBuf::from_bytes(script_pubkey) })
+            Ok(TxOut {
+                value: Amount::from_sat(amount as u64),
+                script_pubkey: ScriptBuf::from_bytes(script_pubkey),
+            })
         })
         .collect()
 }
 
 /// PROTOCOL.md 3.1: the seven consensus flags, by name.
 fn field_flags(req: &Fields) -> Result<u32, Fail> {
-    let names = field(req, "flags")?.as_array().ok_or_else(|| bad_request("flags is not an array"))?;
+    let names = field(req, "flags")?
+        .as_array()
+        .ok_or_else(|| bad_request("flags is not an array"))?;
     let mut flags = consensus::VERIFY_NONE;
     for name in names {
         flags |= match name.as_str() {

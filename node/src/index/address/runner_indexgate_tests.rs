@@ -126,7 +126,11 @@ fn reorg_cleanup_keeps_the_rows_the_active_chain_owns() {
     let b102 = build_test_block_spending(parent, 102, BASE + 200_000, coinbase_1);
     let b103 = build_test_block(b102.block_hash(), 103, BASE + 200_600);
     let spend_tx = a102.txdata[1].compute_txid();
-    assert_eq!(spend_tx, b102.txdata[1].compute_txid(), "S is re-mined unchanged");
+    assert_eq!(
+        spend_tx,
+        b102.txdata[1].compute_txid(),
+        "S is re-mined unchanged"
+    );
     assert_ne!(a102.block_hash(), b102.block_hash());
 
     cs.accept_block(&a102).expect("A102 connects");
@@ -153,7 +157,9 @@ fn reorg_cleanup_keeps_the_rows_the_active_chain_owns() {
         vout: 1,
         amount_sat: 0,
     });
-    planted.addr_backfill_temp_puts.push((coinbase_1, sh_empty, 1));
+    planted
+        .addr_backfill_temp_puts
+        .push((coinbase_1, sh_empty, 1));
     store.write_batch(planted).unwrap();
     assert_eq!(funding_heights(&cs, &sh_op_return).len(), 1);
 
@@ -248,7 +254,10 @@ fn the_backfill_writes_rows_only_under_accept_lock() {
     let blocks = connect_chain(&cs, 5);
     cs.store_ref().flush().unwrap();
     let sh_empty = scripthash_of(&ScriptBuf::new());
-    assert!(funding_heights(&cs, &sh_empty).is_empty(), "the live path writes no rows here");
+    assert!(
+        funding_heights(&cs, &sh_empty).is_empty(),
+        "the live path writes no rows here"
+    );
 
     cs.store_ref().create_backfill_temp_cf().unwrap();
     let handle = Arc::new(BackfillHandle::new(BackfillCursor {
@@ -282,7 +291,11 @@ fn the_backfill_writes_rows_only_under_accept_lock() {
         written_while_held.is_empty(),
         "rows written while accept_lock was held: {written_while_held:?}"
     );
-    assert_eq!(funding_heights(&cs, &sh_empty).len(), 5, "every row written afterwards");
+    assert_eq!(
+        funding_heights(&cs, &sh_empty).len(),
+        5,
+        "every row written afterwards"
+    );
     assert_eq!(handle.cursor().state, BackfillState::Completed);
 }
 
@@ -337,7 +350,8 @@ fn the_backfill_skips_unspendable_outputs_as_the_live_path_does() {
         vout: 0,
     };
     let oversized = ScriptBuf::from_bytes(vec![0x51; 10_001]);
-    let mut b102 = build_test_block_spending(blocks[100].block_hash(), 102, BASE + 100_000, coinbase_1);
+    let mut b102 =
+        build_test_block_spending(blocks[100].block_hash(), 102, BASE + 100_000, coinbase_1);
     b102.txdata[1].output.push(TxOut {
         value: Amount::ZERO,
         script_pubkey: op_return_script(),
@@ -369,8 +383,15 @@ fn the_backfill_skips_unspendable_outputs_as_the_live_path_does() {
     assert!(funding_heights(&live, &sh_oversized).is_empty());
 
     // Everything spendable is indexed the same both ways.
-    assert_eq!(funding_heights(&backfilled, &sh_empty), funding_heights(&live, &sh_empty));
-    assert_eq!(funding_heights(&live, &sh_empty).len(), 103, "102 coinbases and S's output");
+    assert_eq!(
+        funding_heights(&backfilled, &sh_empty),
+        funding_heights(&live, &sh_empty)
+    );
+    assert_eq!(
+        funding_heights(&live, &sh_empty).len(),
+        103,
+        "102 coinbases and S's output"
+    );
     let spending = |cs: &ChainState| -> Vec<(u32, bitcoin::Txid, u32)> {
         cs.store_ref()
             .iter_addr_spending(&sh_empty)

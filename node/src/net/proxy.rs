@@ -134,7 +134,9 @@ mod tests {
         let mut req = [0u8; 10];
         sock.read_exact(&mut req).await.expect("request");
         tokio::time::sleep(delay).await;
-        let _ = sock.write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await;
+        let _ = sock
+            .write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+            .await;
         let _ = sock.flush().await;
         // Hold the socket so the client sees the reply, not an EOF.
         tokio::time::sleep(Duration::from_secs(5)).await;
@@ -148,7 +150,10 @@ mod tests {
     async fn slow_connect_reply_within_exchange_budget_succeeds() {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let proxy_addr = listener.local_addr().expect("addr").to_string();
-        let server = tokio::spawn(fake_socks5_slow_connect(listener, Duration::from_millis(600)));
+        let server = tokio::spawn(fake_socks5_slow_connect(
+            listener,
+            Duration::from_millis(600),
+        ));
 
         let target: SocketAddr = "203.0.113.7:8333".parse().unwrap();
         let timeouts = DialTimeouts {
@@ -156,7 +161,10 @@ mod tests {
             exchange: Duration::from_secs(5),
         };
         let dial = connect_socks5(&proxy_addr, target, None, timeouts).await;
-        assert!(dial.is_ok(), "a CONNECT reply inside the exchange budget must succeed: {dial:?}");
+        assert!(
+            dial.is_ok(),
+            "a CONNECT reply inside the exchange budget must succeed: {dial:?}"
+        );
         server.abort();
     }
 
@@ -176,8 +184,14 @@ mod tests {
         let started = std::time::Instant::now();
         let dial = connect_socks5(&proxy_addr, target, None, timeouts).await;
         let err = dial.expect_err("a CONNECT reply past the exchange budget must fail");
-        assert!(err.contains("exchange timed out"), "unexpected error: {err}");
-        assert!(started.elapsed() < Duration::from_secs(3), "the dial must not wait for the reply");
+        assert!(
+            err.contains("exchange timed out"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "the dial must not wait for the reply"
+        );
         server.abort();
     }
 
@@ -190,20 +204,22 @@ mod tests {
     /// A minimal SOCKS5 server that completes one no-auth CONNECT and reports
     /// back the address type, host bytes, and port the client requested. It
     /// does NOT resolve anything — it just records what the client sent.
-    async fn fake_socks5_capture(
-        listener: TcpListener,
-    ) -> (u8, Vec<u8>, u16) {
+    async fn fake_socks5_capture(listener: TcpListener) -> (u8, Vec<u8>, u16) {
         let (mut sock, _) = listener.accept().await.expect("accept");
 
         // Greeting: VER=0x05, NMETHODS, METHODS...
         let mut head = [0u8; 2];
-        sock.read_exact(&mut head).await.expect("read greeting head");
+        sock.read_exact(&mut head)
+            .await
+            .expect("read greeting head");
         assert_eq!(head[0], 0x05, "SOCKS version must be 5");
         let nmethods = head[1] as usize;
         let mut methods = vec![0u8; nmethods];
         sock.read_exact(&mut methods).await.expect("read methods");
         // Select "no authentication required".
-        sock.write_all(&[0x05, 0x00]).await.expect("write method choice");
+        sock.write_all(&[0x05, 0x00])
+            .await
+            .expect("write method choice");
 
         // Request: VER, CMD, RSV, ATYP
         let mut req = [0u8; 4];
@@ -268,7 +284,10 @@ mod tests {
                 .expect("server did not finish")
                 .expect("server task panicked");
 
-        assert_eq!(atyp, 0x03, "onion must use domain-name address type, not a resolved IP");
+        assert_eq!(
+            atyp, 0x03,
+            "onion must use domain-name address type, not a resolved IP"
+        );
         assert_eq!(
             host_bytes,
             onion.as_bytes(),
@@ -289,10 +308,11 @@ mod tests {
 
         let dial = connect_socks5_name(&proxy_addr, "seed.example.org", 8333, None, roomy()).await;
         assert!(dial.is_ok(), "name dial should succeed: {dial:?}");
-        let (atyp, host_bytes, port) = tokio::time::timeout(std::time::Duration::from_secs(5), server)
-            .await
-            .expect("server did not finish")
-            .expect("server task panicked");
+        let (atyp, host_bytes, port) =
+            tokio::time::timeout(std::time::Duration::from_secs(5), server)
+                .await
+                .expect("server did not finish")
+                .expect("server task panicked");
         assert_eq!(atyp, 0x03);
         assert_eq!(host_bytes, b"seed.example.org");
         assert_eq!(port, 8333);
@@ -310,8 +330,13 @@ mod tests {
         let nmethods = head[1] as usize;
         let mut methods = vec![0u8; nmethods];
         sock.read_exact(&mut methods).await.expect("methods");
-        assert!(methods.contains(&0x02), "client must offer username/password auth");
-        sock.write_all(&[0x05, 0x02]).await.expect("select userpass");
+        assert!(
+            methods.contains(&0x02),
+            "client must offer username/password auth"
+        );
+        sock.write_all(&[0x05, 0x02])
+            .await
+            .expect("select userpass");
 
         // RFC 1929: VER(0x01), ULEN, UNAME, PLEN, PASSWD.
         let mut v = [0u8; 1];
@@ -370,14 +395,26 @@ mod tests {
         let server = tokio::spawn(fake_socks5_userpass(listener));
 
         let target: SocketAddr = "203.0.113.7:8333".parse().unwrap();
-        let dial = connect_socks5(&proxy_addr, target, Some(("iso-tok-42", "iso-tok-42")), roomy()).await;
+        let dial = connect_socks5(
+            &proxy_addr,
+            target,
+            Some(("iso-tok-42", "iso-tok-42")),
+            roomy(),
+        )
+        .await;
         assert!(dial.is_ok(), "credentialed dial should succeed: {dial:?}");
 
         let (user, pass) = tokio::time::timeout(std::time::Duration::from_secs(5), server)
             .await
             .expect("server did not finish")
             .expect("server task panicked");
-        assert_eq!(user, "iso-tok-42", "isolation username must reach the proxy");
-        assert_eq!(pass, "iso-tok-42", "isolation password must reach the proxy");
+        assert_eq!(
+            user, "iso-tok-42",
+            "isolation username must reach the proxy"
+        );
+        assert_eq!(
+            pass, "iso-tok-42",
+            "isolation password must reach the proxy"
+        );
     }
 }

@@ -24,7 +24,13 @@ fn the_option_reaches_the_config_from_either_source() {
     assert_eq!(load("", &[]).unwrap().bytespersigop, 20, "Core's default");
     assert_eq!(load("bytespersigop=30\n", &[]).unwrap().bytespersigop, 30);
     assert_eq!(load("", &["-bytespersigop=0"]).unwrap().bytespersigop, 0);
-    assert_eq!(load("bytespersigop=30\n", &["-bytespersigop=40"]).unwrap().bytespersigop, 40, "the command line wins");
+    assert_eq!(
+        load("bytespersigop=30\n", &["-bytespersigop=40"])
+            .unwrap()
+            .bytespersigop,
+        40,
+        "the command line wins"
+    );
     for bad in ["bytespersigop=-1\n", "bytespersigop=lots\n"] {
         assert!(load(bad, &[]).is_err(), "{bad}");
     }

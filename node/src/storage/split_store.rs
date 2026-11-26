@@ -170,7 +170,10 @@ impl Store for SplitStore {
         self.block_store.opreturn_strip_meta()
     }
 
-    fn for_each_opreturn_strip(&self, f: &mut dyn FnMut(&BlockHash, &[u8])) -> Result<(), StoreError> {
+    fn for_each_opreturn_strip(
+        &self,
+        f: &mut dyn FnMut(&BlockHash, &[u8]),
+    ) -> Result<(), StoreError> {
         self.block_store.for_each_opreturn_strip(f)
     }
 
@@ -324,10 +327,7 @@ impl Store for SplitStore {
         // Block half first: nothing has been applied yet, so the two halves
         // can be reassembled and handed back whole.
         if let Err((returned, e)) = self.write_block_half(block_batch) {
-            return Err((
-                returned.map(|b| Box::new(Self::rejoin(*b, coins_batch))),
-                e,
-            ));
+            return Err((returned.map(|b| Box::new(Self::rejoin(*b, coins_batch))), e));
         }
         // Coins half: the block half is already in, and it must NOT come
         // back for replay — its rows are absolute index/height/txindex
@@ -454,7 +454,10 @@ mod tests {
             "an ordinal row in the private coins half would give the two \
              chainstates independent numbering"
         );
-        assert!(coins_store.has_coin(&outpoint(0x1a)), "coins still route private");
+        assert!(
+            coins_store.has_coin(&outpoint(0x1a)),
+            "coins still route private"
+        );
 
         // And the reads delegate the same way.
         assert_eq!(split.get_tx_seq(&txid), Some(0));
@@ -535,7 +538,10 @@ mod tests {
         assert_eq!(returned.block_index_puts.len(), 1, "block half returned");
         assert_eq!(returned.coin_puts.len(), 1, "coins half returned");
         assert_eq!(returned.tip, Some(hash), "tip returned");
-        assert!(split.get_block_index(&hash).is_none(), "block store untouched");
+        assert!(
+            split.get_block_index(&hash).is_none(),
+            "block store untouched"
+        );
         assert!(split.get_coin(&op).is_none(), "coins store untouched");
     }
 
@@ -573,14 +579,29 @@ mod tests {
             0,
             "the applied block half must NOT come back for replay"
         );
-        assert_eq!(returned.height_hash_puts.len(), 0, "height rows are block-half");
-        assert_eq!(returned.coin_puts.len(), 1, "the unapplied coins half comes back");
-        assert_eq!(returned.tip, Some(hash), "the tip rides with the coins half");
+        assert_eq!(
+            returned.height_hash_puts.len(),
+            0,
+            "height rows are block-half"
+        );
+        assert_eq!(
+            returned.coin_puts.len(),
+            1,
+            "the unapplied coins half comes back"
+        );
+        assert_eq!(
+            returned.tip,
+            Some(hash),
+            "the tip rides with the coins half"
+        );
         assert!(
             split.get_block_index(&hash).is_some(),
             "the block half landed durably before the fault"
         );
-        assert!(split.get_coin(&op).is_none(), "the coins store applied nothing");
+        assert!(
+            split.get_coin(&op).is_none(),
+            "the coins store applied nothing"
+        );
     }
 
     #[test]

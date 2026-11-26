@@ -23,8 +23,8 @@ pub mod types;
 pub use config::{AddressIndexConfig, DEFAULT_MAX_HISTORY_ENTRIES};
 pub use cursor::{BackfillCursor, BackfillState};
 pub use history::{
-    HistoryRow, MempoolTxFacts, capped_history_rows, history_rows, history_status_hash, mempool_history_rows,
-    sort_confirmed_rows, sort_mempool_rows,
+    HistoryRow, MempoolTxFacts, capped_history_rows, history_rows, history_status_hash,
+    mempool_history_rows, sort_confirmed_rows, sort_mempool_rows,
 };
 pub use keys::{
     AddrFundingKey, AddrFundingKeyV3, AddrFundingKeyV3Payload, AddrFundingRow, AddrFundingRowV3,

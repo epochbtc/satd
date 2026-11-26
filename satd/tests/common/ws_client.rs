@@ -12,8 +12,8 @@
 use futures_util::{SinkExt as _, StreamExt as _};
 use std::time::Duration;
 use tokio::net::TcpStream;
-use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 pub struct WsClient {
@@ -23,7 +23,9 @@ pub struct WsClient {
 impl WsClient {
     /// Connect to `/ws` on a loopback streamws listener (no auth).
     pub async fn connect(port: u16) -> Self {
-        Self::connect_path(port, "/ws", None).await.expect("ws connect")
+        Self::connect_path(port, "/ws", None)
+            .await
+            .expect("ws connect")
     }
 
     /// Connect presenting a bearer token (for `--streamws-auth` nodes).
@@ -54,10 +56,9 @@ impl WsClient {
         let req = format!("ws://127.0.0.1:{port}/ws")
             .into_client_request()
             .expect("request");
-        let (ws, _resp) =
-            tokio_tungstenite::client_async(req, MaybeTlsStream::Plain(stream))
-                .await
-                .expect("ws handshake");
+        let (ws, _resp) = tokio_tungstenite::client_async(req, MaybeTlsStream::Plain(stream))
+            .await
+            .expect("ws handshake");
         Self { ws }
     }
 
@@ -76,17 +77,15 @@ impl WsClient {
         Self::connect_path(port, "/", Some(token)).await
     }
 
-    async fn connect_path(
-        port: u16,
-        path: &str,
-        token: Option<&str>,
-    ) -> Result<Self, String> {
+    async fn connect_path(port: u16, path: &str, token: Option<&str>) -> Result<Self, String> {
         let url = format!("ws://127.0.0.1:{port}{path}");
         let mut req = url.into_client_request().map_err(|e| e.to_string())?;
         if let Some(t) = token {
             req.headers_mut().insert(
                 "authorization",
-                format!("Bearer {t}").parse().map_err(|_| "bad header".to_string())?,
+                format!("Bearer {t}")
+                    .parse()
+                    .map_err(|_| "bad header".to_string())?,
             );
         }
         let (ws, _resp) = tokio_tungstenite::connect_async(req)
@@ -136,7 +135,10 @@ impl WsClient {
         let deadline = std::time::Instant::now() + Duration::from_secs(secs);
         loop {
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-            assert!(!remaining.is_zero(), "timed out waiting for matching ws message");
+            assert!(
+                !remaining.is_zero(),
+                "timed out waiting for matching ws message"
+            );
             let v = self.next_json(remaining.as_secs().max(1)).await;
             if pred(&v) {
                 return v;
@@ -169,8 +171,7 @@ impl StreamSseClient {
     pub fn connect(port: u16, path: &str) -> Self {
         use std::io::{BufRead as _, BufReader, Write as _};
         use std::net::TcpStream;
-        let mut stream =
-            TcpStream::connect(format!("127.0.0.1:{port}")).expect("sse connect");
+        let mut stream = TcpStream::connect(format!("127.0.0.1:{port}")).expect("sse connect");
         let req = format!(
             "GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nAccept: text/event-stream\r\nConnection: close\r\n\r\n"
         );

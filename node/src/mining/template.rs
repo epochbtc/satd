@@ -215,7 +215,13 @@ pub fn create_template(chain_state: &ChainState, mempool: &Mempool) -> BlockTemp
 /// there is nothing in it to be wrong. What the Stratum server hands out while
 /// the node's own templates are failing their validity check.
 pub fn create_coinbase_only_template(chain_state: &ChainState, mempool: &Mempool) -> BlockTemplate {
-    assemble_template(chain_state, mempool, false, block_min_tx_fee(), block_max_weight())
+    assemble_template(
+        chain_state,
+        mempool,
+        false,
+        block_min_tx_fee(),
+        block_max_weight(),
+    )
 }
 
 /// [`create_template`] with an explicit `-blockmintxfee` floor.
@@ -237,7 +243,13 @@ pub fn create_template_with_limits(
     block_max_weight: usize,
 ) -> BlockTemplate {
     if let Some(template) = chain_state.coherent_read(|| {
-        assemble_template(chain_state, mempool, true, block_min_tx_fee, block_max_weight)
+        assemble_template(
+            chain_state,
+            mempool,
+            true,
+            block_min_tx_fee,
+            block_max_weight,
+        )
     }) {
         return template;
     }
@@ -246,7 +258,13 @@ pub fn create_template_with_limits(
         "chain advanced during every template assembly attempt; \
          emitting a coinbase-only template rather than one assembled across two chains"
     );
-    assemble_template(chain_state, mempool, false, block_min_tx_fee, block_max_weight)
+    assemble_template(
+        chain_state,
+        mempool,
+        false,
+        block_min_tx_fee,
+        block_max_weight,
+    )
 }
 
 /// One assembly pass. `include_mempool` false yields a coinbase-only template.
@@ -270,8 +288,16 @@ fn assemble_template(
     // Template assembly is scope-filtered: transactions quarantined `on
     // template` are held but never mined by this node (design §2.4/§3), so
     // they are not candidates.
-    let entries = if include_mempool { mempool.get_template_entries() } else { Vec::new() };
-    let Selection { transactions, total_weight, total_fees } = select_transactions(
+    let entries = if include_mempool {
+        mempool.get_template_entries()
+    } else {
+        Vec::new()
+    };
+    let Selection {
+        transactions,
+        total_weight,
+        total_fees,
+    } = select_transactions(
         chain_state,
         entries,
         height,
@@ -317,30 +343,30 @@ fn assemble_template(
     // A failure means an ancestor the node should hold is missing. Reusing
     // the tip's bits keeps the template well-formed; the block it yields is
     // judged by `accept_block`, which fails closed on the same missing entry.
-    let bits = crate::validation::pow::next_bits(
-        chain_state.network,
-        &tip_entry,
-        cur_time,
-        |hash| chain_state.get_block_index(hash),
-    )
-    .unwrap_or_else(|e| {
-        tracing::warn!(
-            target: "mining::template",
-            height,
-            error = %e,
-            "cannot compute the difficulty for the next block; using the tip's bits"
-        );
-        tip_entry.header.bits
-    });
+    let bits =
+        crate::validation::pow::next_bits(chain_state.network, &tip_entry, cur_time, |hash| {
+            chain_state.get_block_index(hash)
+        })
+        .unwrap_or_else(|e| {
+            tracing::warn!(
+                target: "mining::template",
+                height,
+                error = %e,
+                "cannot compute the difficulty for the next block; using the tip's bits"
+            );
+            tip_entry.header.bits
+        });
 
     // Core sets these at the end of `CreateNewBlock`; `getmininginfo`
 
     // reads them instead of assembling a template of its own.
 
-    LAST_BLOCK_NUM_TXS.store(transactions.len() as u64, std::sync::atomic::Ordering::Relaxed);
+    LAST_BLOCK_NUM_TXS.store(
+        transactions.len() as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
 
     LAST_BLOCK_WEIGHT.store(total_weight as u64, std::sync::atomic::Ordering::Relaxed);
-
 
     // `-blockversion` overrides the computed version on regtest only, as
     // Core's `CreateNewBlock` does under `MineBlocksOnDemand()`.
@@ -425,7 +451,11 @@ pub fn compute_witness_commitment(txs: &[TemplateTx]) -> [u8; 32] {
     // Coinbase wtxid = 0x00...00, then wtxids of included transactions
     let mut hashes: Vec<[u8; 32]> = vec![[0u8; 32]];
     for ttx in txs {
-        hashes.push(crate::validation::decode::wtxid(&ttx.tx).to_raw_hash().to_byte_array());
+        hashes.push(
+            crate::validation::decode::wtxid(&ttx.tx)
+                .to_raw_hash()
+                .to_byte_array(),
+        );
     }
     let witness_root = merkle_root(&hashes);
 
@@ -556,8 +586,11 @@ fn select_transactions(
     use std::collections::{BinaryHeap, HashMap};
 
     let n = entries.len();
-    let index: HashMap<bitcoin::Txid, usize> =
-        entries.iter().enumerate().map(|(i, (txid, _))| (*txid, i)).collect();
+    let index: HashMap<bitcoin::Txid, usize> = entries
+        .iter()
+        .enumerate()
+        .map(|(i, (txid, _))| (*txid, i))
+        .collect();
 
     // Parents among the candidates, and whether each candidate can be mined
     // at all if its parents are.
@@ -599,7 +632,13 @@ fn select_transactions(
                 break;
             };
             if bip68_enforced
-                && !Mempool::bip68_satisfied(chain_state, input.sequence.0, prev_height, height, template_mtp)
+                && !Mempool::bip68_satisfied(
+                    chain_state,
+                    input.sequence.0,
+                    prev_height,
+                    height,
+                    template_mtp,
+                )
             {
                 minable[i] = false;
                 break;
@@ -678,7 +717,13 @@ fn select_transactions(
     let mut version = vec![0u32; n];
     let mut heap: BinaryHeap<Ranked> = (0..n)
         .filter(|&i| minable[i])
-        .map(|i| Ranked { fee: package[i].fee, weight: package[i].weight, txid: entries[i].0, idx: i, version: 0 })
+        .map(|i| Ranked {
+            fee: package[i].fee,
+            weight: package[i].weight,
+            txid: entries[i].0,
+            idx: i,
+            version: 0,
+        })
         .collect();
 
     let mut in_block = vec![false; n];
@@ -735,10 +780,17 @@ fn select_transactions(
         // ancestors than its descendant, so ordering by ancestor count is a
         // valid block order (Core's `SortForBlock`); the txid breaks ties so
         // the order is deterministic.
-        let mut members: Vec<usize> = ancestors[i].iter().copied().filter(|&a| !in_block[a]).collect();
+        let mut members: Vec<usize> = ancestors[i]
+            .iter()
+            .copied()
+            .filter(|&a| !in_block[a])
+            .collect();
         members.push(i);
         members.sort_by(|&a, &b| {
-            ancestors[a].len().cmp(&ancestors[b].len()).then_with(|| entries[a].0.cmp(&entries[b].0))
+            ancestors[a]
+                .len()
+                .cmp(&ancestors[b].len())
+                .then_with(|| entries[a].0.cmp(&entries[b].0))
         });
         for &m in &members {
             in_block[m] = true;
@@ -789,10 +841,19 @@ fn select_transactions(
         .map(|m| {
             let (_, e) = entries[m].take().expect("each candidate is selected once");
             total_fees += e.fee;
-            TemplateTx { tx: e.tx, fee: e.fee, weight: e.weight, sigop_cost: e.sigop_cost }
+            TemplateTx {
+                tx: e.tx,
+                fee: e.fee,
+                weight: e.weight,
+                sigop_cost: e.sigop_cost,
+            }
         })
         .collect();
-    Selection { transactions, total_weight, total_fees }
+    Selection {
+        transactions,
+        total_weight,
+        total_fees,
+    }
 }
 
 #[cfg(test)]
@@ -808,20 +869,29 @@ pub(crate) mod tests {
     fn minimum_time_is_one_past_the_median_off_a_retarget_height() {
         // Parent stamped far ahead of the median: only a retarget height
         // brings it into play.
-        assert_eq!(minimum_time(1_700_000_000, 2015, 1_700_010_000, 2016), 1_700_000_001);
-        assert_eq!(minimum_time(1_700_000_000, 2017, 1_700_010_000, 2016), 1_700_000_001);
+        assert_eq!(
+            minimum_time(1_700_000_000, 2015, 1_700_010_000, 2016),
+            1_700_000_001
+        );
+        assert_eq!(
+            minimum_time(1_700_000_000, 2017, 1_700_010_000, 2016),
+            1_700_000_001
+        );
     }
 
     #[test]
     fn minimum_time_at_a_retarget_height_is_at_most_600_s_before_the_parent() {
         use crate::storage::blockindex::{BlockIndexEntry, BlockStatus};
-        use crate::validation::pow::check_difficulty;
         use crate::validation::ValidationError;
+        use crate::validation::pow::check_difficulty;
 
         let mtp = 1_700_000_000;
         let parent_time = mtp + 10_000;
         for height in [2016, 4032] {
-            assert_eq!(minimum_time(mtp, height, parent_time, 2016), parent_time - 600);
+            assert_eq!(
+                minimum_time(mtp, height, parent_time, 2016),
+                parent_time - 600
+            );
         }
         // The median already above the floor wins.
         assert_eq!(minimum_time(mtp, 2016, mtp + 300, 2016), mtp + 1);
@@ -848,10 +918,16 @@ pub(crate) mod tests {
         let mut header = parent_header;
         header.time = minimum_time(mtp, 2016, parent_time, 2016);
         let res = check_difficulty(&header, &parent, Network::Testnet4, |_| None);
-        assert!(!matches!(res, Err(ValidationError::TimewarpAttack)), "got {res:?}");
+        assert!(
+            !matches!(res, Err(ValidationError::TimewarpAttack)),
+            "got {res:?}"
+        );
         header.time = mtp + 1;
         let res = check_difficulty(&header, &parent, Network::Testnet4, |_| None);
-        assert!(matches!(res, Err(ValidationError::TimewarpAttack)), "got {res:?}");
+        assert!(
+            matches!(res, Err(ValidationError::TimewarpAttack)),
+            "got {res:?}"
+        );
     }
 
     #[test]
@@ -859,7 +935,19 @@ pub(crate) mod tests {
         let dir = std::env::temp_dir().join(format!("satd-template-test-{}", std::process::id()));
         let store = Box::new(InMemoryStore::new());
         let flat_files = FlatFileManager::new(&dir.join("blocks")).unwrap();
-        let cs = ChainState::new(store, flat_files, Network::Regtest, Box::new(NoopVerifier), AssumeValid::Disabled, 450, 4, Default::default(), Default::default(), Default::default()).unwrap();
+        let cs = ChainState::new(
+            store,
+            flat_files,
+            Network::Regtest,
+            Box::new(NoopVerifier),
+            AssumeValid::Disabled,
+            450,
+            4,
+            Default::default(),
+            Default::default(),
+            Default::default(),
+        )
+        .unwrap();
         let mp = Mempool::new(1_000_000, 0);
 
         let template = create_template(&cs, &mp);
@@ -892,7 +980,11 @@ pub(crate) mod tests {
         // claims strictly more than the subsidy.
         let mined = crate::mining::miner::build_block_to_script(&cs, &mp, script.clone(), None)
             .expect("template block");
-        let normal_claim: u64 = mined.txdata[0].output.iter().map(|o| o.value.to_sat()).sum();
+        let normal_claim: u64 = mined.txdata[0]
+            .output
+            .iter()
+            .map(|o| o.value.to_sat())
+            .sum();
         assert!(
             normal_claim > subsidy,
             "fixture should have a fee-paying mempool tx: {normal_claim} vs {subsidy}"
@@ -902,7 +994,11 @@ pub(crate) mod tests {
         let generated =
             crate::mining::miner::build_block_to_script(&cs, &mp, script, Some(Vec::new()))
                 .expect("generateblock-style block");
-        let claim: u64 = generated.txdata[0].output.iter().map(|o| o.value.to_sat()).sum();
+        let claim: u64 = generated.txdata[0]
+            .output
+            .iter()
+            .map(|o| o.value.to_sat())
+            .sum();
         assert_eq!(
             claim, subsidy,
             "an explicit transaction list must claim the subsidy alone, not the \
@@ -927,7 +1023,8 @@ pub(crate) mod tests {
         mp.insert_tx_weighted_for_test(tx, 100, 400, QuarantineScope::acting());
 
         let full = assemble_template(&cs, &mp, true, DEFAULT_BLOCK_MIN_TX_FEE, MAX_BLOCK_WEIGHT);
-        let fallback = assemble_template(&cs, &mp, false, DEFAULT_BLOCK_MIN_TX_FEE, MAX_BLOCK_WEIGHT);
+        let fallback =
+            assemble_template(&cs, &mp, false, DEFAULT_BLOCK_MIN_TX_FEE, MAX_BLOCK_WEIGHT);
 
         // Without this the comparison below is vacuous: an empty mempool makes
         // both templates transaction-free and the fallback proves nothing.
@@ -1002,10 +1099,11 @@ pub(crate) mod tests {
             verifier,
             AssumeValid::Disabled,
             450,
-        4,
-        Default::default(),
-        Default::default(),
-            Default::default(),)
+            4,
+            Default::default(),
+            Default::default(),
+            Default::default(),
+        )
         .unwrap();
         let mp = Mempool::new(1_000_000, 0);
         (cs, mp, dir)
@@ -1033,12 +1131,18 @@ pub(crate) mod tests {
         let template = create_template(&cs, &mp);
         assert!(template.transactions.is_empty());
         let hex = compute_witness_commitment_hex(&template.transactions);
-        assert!(hex.starts_with("6a24aa21a9ed"), "commitment script header: {hex}");
+        assert!(
+            hex.starts_with("6a24aa21a9ed"),
+            "commitment script header: {hex}"
+        );
         assert_eq!(hex.len(), 38 * 2, "OP_RETURN + 36-byte push: {hex}");
 
         // getblocktemplate carries it (segwit is active from 0 on regtest).
         let gbt = crate::rpc::mining::get_block_template(&cs, &mp).unwrap();
-        assert_eq!(gbt["default_witness_commitment"].as_str(), Some(hex.as_str()));
+        assert_eq!(
+            gbt["default_witness_commitment"].as_str(),
+            Some(hex.as_str())
+        );
     }
 
     #[test]
@@ -1148,8 +1252,16 @@ pub(crate) mod tests {
         mp.set_sigop_cost_for_test(&under, MAX_BLOCK_SIGOPS_COST - COINBASE_SIGOPS_RESERVE - 1);
 
         let template = create_template(&cs, &mp);
-        let txids: Vec<_> = template.transactions.iter().map(|t| t.tx.compute_txid()).collect();
-        assert_eq!(txids, vec![under], "only the transaction that stays under 80,000 fits");
+        let txids: Vec<_> = template
+            .transactions
+            .iter()
+            .map(|t| t.tx.compute_txid())
+            .collect();
+        assert_eq!(
+            txids,
+            vec![under],
+            "only the transaction that stays under 80,000 fits"
+        );
         let total: u64 = template.transactions.iter().map(|t| t.sigop_cost).sum();
         assert!(total + COINBASE_SIGOPS_RESERVE < MAX_BLOCK_SIGOPS_COST);
 
@@ -1168,7 +1280,10 @@ pub(crate) mod tests {
         let parent_txid =
             mp.insert_tx_weighted_for_test(parent, 100, 400, QuarantineScope::acting());
         let child = tx_spending(
-            bitcoin::OutPoint { txid: parent_txid, vout: 0 },
+            bitcoin::OutPoint {
+                txid: parent_txid,
+                vout: 0,
+            },
             40_000,
             0x32,
             0xffff_ffff,
@@ -1183,8 +1298,14 @@ pub(crate) mod tests {
             .iter()
             .map(|t| t.tx.compute_txid())
             .collect();
-        let p = order.iter().position(|t| *t == parent_txid).expect("parent mined");
-        let c = order.iter().position(|t| *t == child_txid).expect("child mined");
+        let p = order
+            .iter()
+            .position(|t| *t == parent_txid)
+            .expect("parent mined");
+        let c = order
+            .iter()
+            .position(|t| *t == child_txid)
+            .expect("child mined");
         assert!(
             p < c,
             "parent must precede the child it funds (order: {order:?})"
@@ -1206,10 +1327,16 @@ pub(crate) mod tests {
             parent,
             100,
             400,
-            QuarantineScope { relay: false, template: true },
+            QuarantineScope {
+                relay: false,
+                template: true,
+            },
         );
         let child = tx_spending(
-            bitcoin::OutPoint { txid: parent_txid, vout: 0 },
+            bitcoin::OutPoint {
+                txid: parent_txid,
+                vout: 0,
+            },
             40_000,
             0x34,
             0xffff_ffff,
@@ -1224,7 +1351,10 @@ pub(crate) mod tests {
             .iter()
             .map(|t| t.tx.compute_txid())
             .collect();
-        assert!(!mined.contains(&parent_txid), "quarantined parent is not mined");
+        assert!(
+            !mined.contains(&parent_txid),
+            "quarantined parent is not mined"
+        );
         assert!(
             !mined.contains(&child_txid),
             "child of an unmined mempool parent must be dropped with it"
@@ -1248,8 +1378,7 @@ pub(crate) mod tests {
         let nonfinal_txid =
             mp.insert_tx_weighted_for_test(nonfinal, 50_000, 400, QuarantineScope::acting());
         let fine = tx_spending(confirmed_prev(0xA4), 50_000, 0x36, 0xffff_ffff, 0);
-        let fine_txid =
-            mp.insert_tx_weighted_for_test(fine, 100, 400, QuarantineScope::acting());
+        let fine_txid = mp.insert_tx_weighted_for_test(fine, 100, 400, QuarantineScope::acting());
 
         let template = create_template(&cs, &mp);
         let mined: std::collections::HashSet<_> = template
@@ -1292,7 +1421,10 @@ pub(crate) mod tests {
             !mined.contains(&orphan_txid),
             "a spend of a nonexistent coin must never be templated"
         );
-        assert!(mined.contains(&fine_txid), "the resolvable one is unaffected");
+        assert!(
+            mined.contains(&fine_txid),
+            "the resolvable one is unaffected"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1348,7 +1480,10 @@ pub(crate) mod tests {
         let parent_txid =
             mp.insert_tx_weighted_for_test(parent, 100, 400, QuarantineScope::acting());
         let child = tx_spending(
-            bitcoin::OutPoint { txid: parent_txid, vout: 0 },
+            bitcoin::OutPoint {
+                txid: parent_txid,
+                vout: 0,
+            },
             40_000,
             0x3C,
             1,
@@ -1380,18 +1515,36 @@ pub(crate) mod tests {
         let (cs, mp, dir) = make_template_env();
 
         let acting = mp.insert_scoped_for_test(1, 100, QuarantineScope::acting());
-        let relay_only =
-            mp.insert_scoped_for_test(2, 100, QuarantineScope { relay: true, template: false });
+        let relay_only = mp.insert_scoped_for_test(
+            2,
+            100,
+            QuarantineScope {
+                relay: true,
+                template: false,
+            },
+        );
         // High fee rate — if scope were ignored it would sort to the top.
-        let template_only =
-            mp.insert_scoped_for_test(3, 100_000, QuarantineScope { relay: false, template: true });
+        let template_only = mp.insert_scoped_for_test(
+            3,
+            100_000,
+            QuarantineScope {
+                relay: false,
+                template: true,
+            },
+        );
 
         let template = create_template(&cs, &mp);
-        let mined: std::collections::HashSet<_> =
-            template.transactions.iter().map(|t| t.tx.compute_txid()).collect();
+        let mined: std::collections::HashSet<_> = template
+            .transactions
+            .iter()
+            .map(|t| t.tx.compute_txid())
+            .collect();
 
         assert!(mined.contains(&acting), "acting tx is mined");
-        assert!(mined.contains(&relay_only), "on-relay tx is still mineable by us");
+        assert!(
+            mined.contains(&relay_only),
+            "on-relay tx is still mineable by us"
+        );
         assert!(
             !mined.contains(&template_only),
             "on-template tx is excluded even at a far higher fee rate"
@@ -1422,7 +1575,10 @@ pub(crate) mod tests {
 
         let template = create_template_with_floor(&cs, &mp, DEFAULT_BLOCK_MIN_TX_FEE);
         assert!(
-            !template.transactions.iter().any(|t| t.tx.compute_txid() == txid),
+            !template
+                .transactions
+                .iter()
+                .any(|t| t.tx.compute_txid() == txid),
             "a spend of an immature coinbase reached the template"
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -1448,7 +1604,10 @@ pub(crate) mod tests {
 
         let template = create_template_with_floor(&cs, &mp, DEFAULT_BLOCK_MIN_TX_FEE);
         assert!(
-            template.transactions.iter().any(|t| t.tx.compute_txid() == txid),
+            template
+                .transactions
+                .iter()
+                .any(|t| t.tx.compute_txid() == txid),
             "an ordinary confirmed spend was not selected"
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -1470,16 +1629,28 @@ pub(crate) mod tests {
         let at_txid = mp.insert_tx_weighted_for_test(at, 500, 400, QuarantineScope::acting());
 
         let template = create_template_with_floor(&cs, &mp, 5_000);
-        let mined: std::collections::HashSet<_> =
-            template.transactions.iter().map(|t| t.tx.compute_txid()).collect();
-        assert!(!mined.contains(&below_txid), "a transaction under the floor was mined");
-        assert!(mined.contains(&at_txid), "a transaction at the floor was not mined");
+        let mined: std::collections::HashSet<_> = template
+            .transactions
+            .iter()
+            .map(|t| t.tx.compute_txid())
+            .collect();
+        assert!(
+            !mined.contains(&below_txid),
+            "a transaction under the floor was mined"
+        );
+        assert!(
+            mined.contains(&at_txid),
+            "a transaction at the floor was not mined"
+        );
 
         // With the floor off, both are mined — the exclusion above is the
         // floor and not some other selection rule.
         let template = create_template_with_floor(&cs, &mp, 0);
-        let mined: std::collections::HashSet<_> =
-            template.transactions.iter().map(|t| t.tx.compute_txid()).collect();
+        let mined: std::collections::HashSet<_> = template
+            .transactions
+            .iter()
+            .map(|t| t.tx.compute_txid())
+            .collect();
         assert!(mined.contains(&below_txid) && mined.contains(&at_txid));
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -1507,7 +1678,10 @@ pub(crate) mod tests {
 
         let template = create_template_with_floor(&cs, &mp, DEFAULT_BLOCK_MIN_TX_FEE);
         assert!(
-            template.transactions.iter().any(|t| t.tx.compute_txid() == txid),
+            template
+                .transactions
+                .iter()
+                .any(|t| t.tx.compute_txid() == txid),
             "the default template floor stranded a transaction the mempool holds"
         );
 
@@ -1517,7 +1691,10 @@ pub(crate) mod tests {
         let free_txid = mp.insert_tx_weighted_for_test(free, 0, 400, QuarantineScope::acting());
         let template = create_template_with_floor(&cs, &mp, DEFAULT_BLOCK_MIN_TX_FEE);
         assert!(
-            !template.transactions.iter().any(|t| t.tx.compute_txid() == free_txid),
+            !template
+                .transactions
+                .iter()
+                .any(|t| t.tx.compute_txid() == free_txid),
             "a transaction paying nothing was mined"
         );
 
@@ -1537,7 +1714,10 @@ pub(crate) mod tests {
         let parent_txid = parent.compute_txid();
         mp.insert_tx_weighted_for_test(parent, 0, 400, QuarantineScope::acting());
         let child = tx_spending(
-            bitcoin::OutPoint { txid: parent_txid, vout: 0 },
+            bitcoin::OutPoint {
+                txid: parent_txid,
+                vout: 0,
+            },
             40_000,
             0x56,
             0xffff_ffff,
@@ -1549,9 +1729,15 @@ pub(crate) mod tests {
         // The package is 10_000 sats over 200 vbytes = 50_000 sat/kvB; the
         // parent alone is 0.
         let template = create_template_with_floor(&cs, &mp, 5_000);
-        let mined: std::collections::HashSet<_> =
-            template.transactions.iter().map(|t| t.tx.compute_txid()).collect();
-        assert!(mined.contains(&parent_txid), "the zero-fee parent was dropped");
+        let mined: std::collections::HashSet<_> = template
+            .transactions
+            .iter()
+            .map(|t| t.tx.compute_txid())
+            .collect();
+        assert!(
+            mined.contains(&parent_txid),
+            "the zero-fee parent was dropped"
+        );
         assert!(mined.contains(&child_txid), "the paying child was stranded");
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -1573,7 +1759,14 @@ pub(crate) mod tests {
 
     /// Insert a transaction spending `prev` with the given fee, weight and
     /// sigop cost; returns its txid.
-    fn put(mp: &Mempool, prev: bitcoin::OutPoint, tag: u8, fee: u64, weight: usize, sigops: u64) -> bitcoin::Txid {
+    fn put(
+        mp: &Mempool,
+        prev: bitcoin::OutPoint,
+        tag: u8,
+        fee: u64,
+        weight: usize,
+        sigops: u64,
+    ) -> bitcoin::Txid {
         use crate::mempool::pool::QuarantineScope;
         let tx = tx_spending(prev, 10_000, tag, 0xffff_ffff, 0);
         let txid = mp.insert_tx_weighted_for_test(tx, fee, weight, QuarantineScope::acting());
@@ -1588,7 +1781,11 @@ pub(crate) mod tests {
     }
 
     fn mined(template: &BlockTemplate) -> Vec<bitcoin::Txid> {
-        template.transactions.iter().map(|t| t.tx.compute_txid()).collect()
+        template
+            .transactions
+            .iter()
+            .map(|t| t.tx.compute_txid())
+            .collect()
     }
 
     /// Every transaction in the template comes after each of its parents that
@@ -1610,7 +1807,9 @@ pub(crate) mod tests {
     /// (62.5 sat/WU) beats the fillers (10 sat/WU) and goes in first.
     #[test]
     fn a_cpfp_child_lifts_its_parent_into_a_full_block() {
-        let fillers: Vec<_> = (0..4u8).map(|i| (confirmed_prev(0x60 + i), coin_at(0))).collect();
+        let fillers: Vec<_> = (0..4u8)
+            .map(|i| (confirmed_prev(0x60 + i), coin_at(0)))
+            .collect();
         let mut coins = fillers.clone();
         coins.push((confirmed_prev(0x6F), coin_at(0)));
         let (cs, mp, dir) = make_funded_template_env(&coins);
@@ -1638,7 +1837,9 @@ pub(crate) mod tests {
     /// brought in half a block of the parent and pushed three fillers out.
     #[test]
     fn a_rich_child_of_a_heavy_cheap_parent_ranks_by_its_package() {
-        let fillers: Vec<_> = (0..4u8).map(|i| (confirmed_prev(0x50 + i), coin_at(0))).collect();
+        let fillers: Vec<_> = (0..4u8)
+            .map(|i| (confirmed_prev(0x50 + i), coin_at(0)))
+            .collect();
         let mut coins = fillers.clone();
         coins.push((confirmed_prev(0x5F), coin_at(0)));
         let (cs, mp, dir) = make_funded_template_env(&coins);
@@ -1652,11 +1853,17 @@ pub(crate) mod tests {
 
         let template = create_template(&cs, &mp);
         let txs = mined(&template);
-        assert!(!txs.contains(&parent) && !txs.contains(&child), "the poor package displaced fillers");
+        assert!(
+            !txs.contains(&parent) && !txs.contains(&child),
+            "the poor package displaced fillers"
+        );
         for t in &filler_txids {
             assert!(txs.contains(t), "filler {t} left out");
         }
-        assert_eq!(template.coinbase_value - crate::chain::connect::block_subsidy(Network::Regtest, 1), 4 * 9_980_000);
+        assert_eq!(
+            template.coinbase_value - crate::chain::connect::block_subsidy(Network::Regtest, 1),
+            4 * 9_980_000
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1666,7 +1873,9 @@ pub(crate) mod tests {
     /// package clears `-blockmintxfee`; the parent alone would not.
     #[test]
     fn a_zero_fee_parent_and_its_paying_child_are_both_mined_in_a_full_block() {
-        let fillers: Vec<_> = (0..4u8).map(|i| (confirmed_prev(0x80 + i), coin_at(0))).collect();
+        let fillers: Vec<_> = (0..4u8)
+            .map(|i| (confirmed_prev(0x80 + i), coin_at(0)))
+            .collect();
         let mut coins = fillers.clone();
         coins.push((confirmed_prev(0x8F), coin_at(0)));
         let (cs, mp, dir) = make_funded_template_env(&coins);
@@ -1679,7 +1888,10 @@ pub(crate) mod tests {
 
         let template = create_template_with_floor(&cs, &mp, DEFAULT_BLOCK_MIN_TX_FEE);
         let txs = mined(&template);
-        assert!(txs.contains(&parent) && txs.contains(&child), "the anchor pair was left out: {txs:?}");
+        assert!(
+            txs.contains(&parent) && txs.contains(&child),
+            "the anchor pair was left out: {txs:?}"
+        );
         assert_topological(&template);
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -1690,7 +1902,9 @@ pub(crate) mod tests {
     /// With the block full it loses to the fillers.
     #[test]
     fn a_low_fee_child_is_not_dragged_in_by_its_parent() {
-        let fillers: Vec<_> = (0..4u8).map(|i| (confirmed_prev(0xA0 + i), coin_at(0))).collect();
+        let fillers: Vec<_> = (0..4u8)
+            .map(|i| (confirmed_prev(0xA0 + i), coin_at(0)))
+            .collect();
         let mut coins = fillers.clone();
         coins.push((confirmed_prev(0xAF), coin_at(0)));
         let (cs, mp, dir) = make_funded_template_env(&coins);
@@ -1704,7 +1918,10 @@ pub(crate) mod tests {
 
         let txs = mined(&create_template(&cs, &mp));
         assert!(txs.contains(&parent));
-        assert!(!txs.contains(&child), "the 0.01 sat/WU child displaced a filler");
+        assert!(
+            !txs.contains(&child),
+            "the 0.01 sat/WU child displaced a filler"
+        );
         assert_eq!(txs.len(), 5);
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -1732,8 +1949,14 @@ pub(crate) mod tests {
         for floor in [DEFAULT_BLOCK_MIN_TX_FEE, 0] {
             let template = create_template_with_floor(&cs, &mp, floor);
             let txs = mined(&template);
-            assert!(!txs.contains(&parent), "floor {floor}: the deprioritised parent was mined");
-            assert!(!txs.contains(&child), "floor {floor}: the child of an uncovered parent was mined");
+            assert!(
+                !txs.contains(&parent),
+                "floor {floor}: the deprioritised parent was mined"
+            );
+            assert!(
+                !txs.contains(&child),
+                "floor {floor}: the child of an uncovered parent was mined"
+            );
             assert_eq!(txs, vec![control], "floor {floor}");
             assert_eq!(template.coinbase_value, subsidy + 5_000, "floor {floor}");
         }
@@ -1758,7 +1981,10 @@ pub(crate) mod tests {
 
         let template = create_template_with_floor(&cs, &mp, 0);
         let txs = mined(&template);
-        assert!(txs.contains(&parent) && txs.contains(&child), "the covered pair was left out: {txs:?}");
+        assert!(
+            txs.contains(&parent) && txs.contains(&child),
+            "the covered pair was left out: {txs:?}"
+        );
         assert!(txs.contains(&control));
         assert_topological(&template);
         // The pair is (1_000 - 100_000 + 200_000) / 200 vB = 505 sat/vB, ahead
@@ -1787,8 +2013,14 @@ pub(crate) mod tests {
         mp.prioritise_transaction(&negative, -1_001).unwrap();
 
         let txs = mined(&create_template_with_floor(&cs, &mp, 0));
-        assert!(!txs.contains(&negative), "a negative modified fee was mined at floor 0");
-        assert!(txs.contains(&free), "a zero-fee transaction was left out at floor 0");
+        assert!(
+            !txs.contains(&negative),
+            "a negative modified fee was mined at floor 0"
+        );
+        assert!(
+            txs.contains(&free),
+            "a zero-fee transaction was left out at floor 0"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1824,13 +2056,26 @@ pub(crate) mod tests {
         ]);
         // Each half fits; the package does not.
         let heavy_parent = put(&mp, confirmed_prev(0xD0), 0xD3, 1, ROOM / 2 + 1_000, 0);
-        let heavy_child = put(&mp, out0(heavy_parent), 0xD4, 900_000_000, ROOM / 2 + 1_000, 0);
+        let heavy_child = put(
+            &mp,
+            out0(heavy_parent),
+            0xD4,
+            900_000_000,
+            ROOM / 2 + 1_000,
+            0,
+        );
         let light = put(&mp, confirmed_prev(0xD1), 0xD5, 1_000, 400, 0);
         let light2 = put(&mp, confirmed_prev(0xD2), 0xD6, 1_000, 400, 0);
 
         let txs = mined(&create_template(&cs, &mp));
-        assert!(!txs.contains(&heavy_child), "a package over the block weight was mined");
-        assert!(txs.contains(&light) && txs.contains(&light2), "selection stopped at the heavy package");
+        assert!(
+            !txs.contains(&heavy_child),
+            "a package over the block weight was mined"
+        );
+        assert!(
+            txs.contains(&light) && txs.contains(&light2),
+            "selection stopped at the heavy package"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1846,7 +2091,10 @@ pub(crate) mod tests {
 
         let template = create_template(&cs, &mp);
         let total: u64 = template.transactions.iter().map(|t| t.sigop_cost).sum();
-        assert!(total + COINBASE_SIGOPS_RESERVE < MAX_BLOCK_SIGOPS_COST, "template carries {total} sigop cost");
+        assert!(
+            total + COINBASE_SIGOPS_RESERVE < MAX_BLOCK_SIGOPS_COST,
+            "template carries {total} sigop cost"
+        );
         let txs = mined(&template);
         assert!(txs.contains(&parent));
         assert!(!txs.contains(&child));
@@ -1876,12 +2124,20 @@ pub(crate) mod tests {
             tx
         };
         let acting = crate::mempool::pool::QuarantineScope::acting;
-        let e = mp.insert_tx_weighted_for_test(two_outputs(confirmed_prev(0xF1), 0xF5), 1, 400, acting());
+        let e = mp.insert_tx_weighted_for_test(
+            two_outputs(confirmed_prev(0xF1), 0xF5),
+            1,
+            400,
+            acting(),
+        );
         let f = put(&mp, out0(e), 0xF6, 1, 400, 0);
         let g = put(&mp, bitcoin::OutPoint { txid: e, vout: 1 }, 0xF8, 1, 400, 0);
         let d_tx = {
             let mut tx = tx_spending(out0(f), 1_000, 0xF7, 0xffff_ffff, 0);
-            tx.input.push(bitcoin::TxIn { previous_output: out0(g), ..tx.input[0].clone() });
+            tx.input.push(bitcoin::TxIn {
+                previous_output: out0(g),
+                ..tx.input[0].clone()
+            });
             tx
         };
         let d = mp.insert_tx_weighted_for_test(d_tx, 80_000, 400, acting());
@@ -1920,22 +2176,42 @@ pub(crate) mod tests {
     /// (188,000); a fourth would make 248,000.
     #[test]
     fn a_template_keeps_to_a_configured_block_max_weight() {
-        let coins: Vec<_> = (0..4u8).map(|i| (confirmed_prev(0x20 + i), coin_at(0))).collect();
+        let coins: Vec<_> = (0..4u8)
+            .map(|i| (confirmed_prev(0x20 + i), coin_at(0)))
+            .collect();
         let (cs, mp, dir) = make_funded_template_env(&coins);
         for (i, (prev, _)) in coins.iter().enumerate() {
             // Distinct fees give a deterministic order; all well above the floor.
-            put(&mp, *prev, 0x30 + i as u8, 600_000 - i as u64 * 1_000, 60_000, 0);
+            put(
+                &mp,
+                *prev,
+                0x30 + i as u8,
+                600_000 - i as u64 * 1_000,
+                60_000,
+                0,
+            );
         }
 
         let capped = create_template_with_limits(&cs, &mp, DEFAULT_BLOCK_MIN_TX_FEE, 200_000);
-        assert_eq!(capped.transactions.len(), 3, "three fit under the cap, a fourth does not");
+        assert_eq!(
+            capped.transactions.len(),
+            3,
+            "three fit under the cap, a fourth does not"
+        );
         let weight: usize = capped.transactions.iter().map(|t| t.weight).sum();
-        assert!(weight + COINBASE_WEIGHT_RESERVE < 200_000, "template weighs {weight} + the reserve");
-        assert_eq!(select_with_cap(&cs, &mp, 200_000).total_weight, COINBASE_WEIGHT_RESERVE + 180_000);
+        assert!(
+            weight + COINBASE_WEIGHT_RESERVE < 200_000,
+            "template weighs {weight} + the reserve"
+        );
+        assert_eq!(
+            select_with_cap(&cs, &mp, 200_000).total_weight,
+            COINBASE_WEIGHT_RESERVE + 180_000
+        );
 
         // The same mempool at the default cap takes all four: the three above
         // are the cap's doing, not some other rule's.
-        let uncapped = create_template_with_limits(&cs, &mp, DEFAULT_BLOCK_MIN_TX_FEE, MAX_BLOCK_WEIGHT);
+        let uncapped =
+            create_template_with_limits(&cs, &mp, DEFAULT_BLOCK_MIN_TX_FEE, MAX_BLOCK_WEIGHT);
         assert_eq!(uncapped.transactions.len(), 4);
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -1953,11 +2229,34 @@ pub(crate) mod tests {
             (confirmed_prev(0x24), coin_at(0)),
             (confirmed_prev(0x25), coin_at(0)),
         ]);
-        let exact = put(&mp, confirmed_prev(0x24), 0x34, 920_000, CAP - COINBASE_WEIGHT_RESERVE, 0);
-        let under = put(&mp, confirmed_prev(0x25), 0x35, 900_000, CAP - COINBASE_WEIGHT_RESERVE - 1, 0);
+        let exact = put(
+            &mp,
+            confirmed_prev(0x24),
+            0x34,
+            920_000,
+            CAP - COINBASE_WEIGHT_RESERVE,
+            0,
+        );
+        let under = put(
+            &mp,
+            confirmed_prev(0x25),
+            0x35,
+            900_000,
+            CAP - COINBASE_WEIGHT_RESERVE - 1,
+            0,
+        );
 
-        let txs = mined(&create_template_with_limits(&cs, &mp, DEFAULT_BLOCK_MIN_TX_FEE, CAP));
-        assert_eq!(txs, vec![under], "only the transaction that stays under the cap fits, not {exact}");
+        let txs = mined(&create_template_with_limits(
+            &cs,
+            &mp,
+            DEFAULT_BLOCK_MIN_TX_FEE,
+            CAP,
+        ));
+        assert_eq!(
+            txs,
+            vec![under],
+            "only the transaction that stays under the cap fits, not {exact}"
+        );
         assert_eq!(select_with_cap(&cs, &mp, CAP).total_weight, CAP - 1);
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -1973,15 +2272,27 @@ pub(crate) mod tests {
         assert_eq!(clamp_block_max_weight(100), COINBASE_WEIGHT_RESERVE);
         assert_eq!(clamp_block_max_weight(0), COINBASE_WEIGHT_RESERVE);
         assert_eq!(clamp_block_max_weight(200_000), 200_000);
-        assert_eq!(clamp_block_max_weight(MAX_BLOCK_WEIGHT + 1), MAX_BLOCK_WEIGHT);
+        assert_eq!(
+            clamp_block_max_weight(MAX_BLOCK_WEIGHT + 1),
+            MAX_BLOCK_WEIGHT
+        );
 
         let (cs, mp, dir) = make_funded_template_env(&[(confirmed_prev(0x26), coin_at(0))]);
         put(&mp, confirmed_prev(0x26), 0x36, 50_000, 400, 0);
         let cap = clamp_block_max_weight(100);
         let template = create_template_with_limits(&cs, &mp, DEFAULT_BLOCK_MIN_TX_FEE, cap);
-        assert!(template.transactions.is_empty(), "a 400 WU transaction fit under a 100 WU cap");
-        assert_eq!(template.coinbase_value, crate::chain::connect::block_subsidy(Network::Regtest, 1));
-        assert_eq!(select_with_cap(&cs, &mp, cap).total_weight, COINBASE_WEIGHT_RESERVE);
+        assert!(
+            template.transactions.is_empty(),
+            "a 400 WU transaction fit under a 100 WU cap"
+        );
+        assert_eq!(
+            template.coinbase_value,
+            crate::chain::connect::block_subsidy(Network::Regtest, 1)
+        );
+        assert_eq!(
+            select_with_cap(&cs, &mp, cap).total_weight,
+            COINBASE_WEIGHT_RESERVE
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1997,8 +2308,14 @@ pub(crate) mod tests {
     fn selection_gives_up_after_1000_failures_at_cores_delta() {
         const CAP: usize = 100_000;
         const HEAVY: u32 = 1_001;
-        let outpoint = |tag: u8, vout: u32| bitcoin::OutPoint { txid: confirmed_prev(tag).txid, vout };
-        let mut coins = vec![(outpoint(0x27, 0), coin_at(0)), (outpoint(0x28, 0), coin_at(0))];
+        let outpoint = |tag: u8, vout: u32| bitcoin::OutPoint {
+            txid: confirmed_prev(tag).txid,
+            vout,
+        };
+        let mut coins = vec![
+            (outpoint(0x27, 0), coin_at(0)),
+            (outpoint(0x28, 0), coin_at(0)),
+        ];
         coins.extend((0..HEAVY).map(|v| (outpoint(0x29, v), coin_at(0))));
         let (cs, mp, dir) = make_funded_template_env(&coins);
 
@@ -2012,8 +2329,17 @@ pub(crate) mod tests {
         // 400 WU at 2.5 sat/WU: ranked last, and fits.
         let light = put(&mp, outpoint(0x28, 0), 0x38, 1_000, 400, 0);
 
-        let txs = mined(&create_template_with_limits(&cs, &mp, DEFAULT_BLOCK_MIN_TX_FEE, CAP));
-        assert_eq!(txs, vec![filler, light], "selection gave up before the package that fits");
+        let txs = mined(&create_template_with_limits(
+            &cs,
+            &mp,
+            DEFAULT_BLOCK_MIN_TX_FEE,
+            CAP,
+        ));
+        assert_eq!(
+            txs,
+            vec![filler, light],
+            "selection gave up before the package that fits"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -14,12 +14,10 @@ mod helpers;
 
 use bitcoin::absolute::LockTime;
 use bitcoin::consensus::Encodable;
-use bitcoin::hashes::{sha256, Hash, HashEngine};
-use bitcoin::secp256k1::{self, Keypair, Scalar, Secp256k1, SecretKey, XOnlyPublicKey, Parity};
+use bitcoin::hashes::{Hash, HashEngine, sha256};
+use bitcoin::secp256k1::{self, Keypair, Parity, Scalar, Secp256k1, SecretKey, XOnlyPublicKey};
 use bitcoin::transaction::Version;
-use bitcoin::{
-    Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid, Witness,
-};
+use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid, Witness};
 use consensus::error::ScriptError;
 use consensus::flags;
 use consensus::sighash::TxSignatureChecker;
@@ -63,9 +61,7 @@ fn credit_tx(script_pubkey: &[u8], value: u64) -> Transaction {
 fn spend_tx(credit: &Transaction, script_sig: &[u8], witness: &[Vec<u8>]) -> Transaction {
     let mut buf = Vec::new();
     credit.consensus_encode(&mut buf).unwrap();
-    let txid = Txid::from_byte_array(
-        bitcoin::hashes::sha256d::Hash::hash(&buf).to_byte_array(),
-    );
+    let txid = Txid::from_byte_array(bitcoin::hashes::sha256d::Hash::hash(&buf).to_byte_array());
     let mut w = Witness::new();
     for item in witness {
         w.push(item);
@@ -116,8 +112,13 @@ fn compute_tapbranch_hash(a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {
     let mut engine = sha256::Hash::engine();
     engine.input(tag_hash.as_byte_array());
     engine.input(tag_hash.as_byte_array());
-    if a < b { engine.input(a); engine.input(b); }
-    else { engine.input(b); engine.input(a); }
+    if a < b {
+        engine.input(a);
+        engine.input(b);
+    } else {
+        engine.input(b);
+        engine.input(a);
+    }
     sha256::Hash::from_engine(engine).to_byte_array()
 }
 
@@ -201,8 +202,7 @@ fn taproot_spend_tx(
     (tx, prev)
 }
 
-const TR_FLAGS: u32 =
-    flags::VERIFY_P2SH | flags::VERIFY_WITNESS | flags::VERIFY_TAPROOT;
+const TR_FLAGS: u32 = flags::VERIFY_P2SH | flags::VERIFY_WITNESS | flags::VERIFY_TAPROOT;
 
 fn verify_taproot_spend(
     tx: &Transaction,
@@ -224,7 +224,14 @@ fn verify_taproot_spend(
 fn api_verify(tx: &Transaction, spent: &[TxOut], index: usize, flags: u32) -> Result<(), Error> {
     let precomputed = PrecomputedTransactionData::new(tx, spent)?;
     let out = &spent[0];
-    consensus::verify(&out.script_pubkey, out.value, tx, index, flags, &precomputed)
+    consensus::verify(
+        &out.script_pubkey,
+        out.value,
+        tx,
+        index,
+        flags,
+        &precomputed,
+    )
 }
 
 #[test]
@@ -240,7 +247,10 @@ fn test_api_verify_invalid_flags() {
     let c = credit_tx(&[0x51], 0);
     let tx = spend_tx(&c, &[], &[]);
     // Set an unrecognized flag bit
-    assert_eq!(api_verify(&tx, &c.output, 0, 1 << 30), Err(Error::ErrInvalidFlags));
+    assert_eq!(
+        api_verify(&tx, &c.output, 0, 1 << 30),
+        Err(Error::ErrInvalidFlags)
+    );
 }
 
 #[test]
@@ -257,8 +267,12 @@ fn test_api_verify_taproot_needs_spent_outputs() {
     let tx = spend_tx(&c, &[], &[]);
     let precomputed = PrecomputedTransactionData::new(&tx, &[]).unwrap();
     let out = &c.output[0];
-    let verify = |flags| consensus::verify(&out.script_pubkey, out.value, &tx, 0, flags, &precomputed);
-    assert_eq!(verify(flags::VERIFY_TAPROOT), Err(Error::ErrSpentOutputsRequired));
+    let verify =
+        |flags| consensus::verify(&out.script_pubkey, out.value, &tx, 0, flags, &precomputed);
+    assert_eq!(
+        verify(flags::VERIFY_TAPROOT),
+        Err(Error::ErrSpentOutputsRequired)
+    );
     // Without taproot, no spent outputs are needed: the amount is passed.
     assert_eq!(verify(0), Ok(()));
 }
@@ -280,7 +294,12 @@ fn test_api_verify_with_spent_outputs() {
     // OP_1 script, verify with spent outputs (taproot flag enabled)
     let c = credit_tx(&[0x51], 50_000);
     let tx = spend_tx(&c, &[], &[]);
-    let result = api_verify(&tx, &c.output, 0, flags::VERIFY_P2SH | flags::VERIFY_WITNESS | flags::VERIFY_TAPROOT);
+    let result = api_verify(
+        &tx,
+        &c.output,
+        0,
+        flags::VERIFY_P2SH | flags::VERIFY_WITNESS | flags::VERIFY_TAPROOT,
+    );
     assert_eq!(result, Ok(()));
 }
 
@@ -294,8 +313,14 @@ fn test_api_verify_refuses_precomputed_data_of_another_tx() {
     let copy = tx.clone();
     let precomputed = PrecomputedTransactionData::new(&copy, &c.output).unwrap();
     let out = &c.output[0];
-    assert_eq!(consensus::verify(&out.script_pubkey, out.value, &tx, 0, 0, &precomputed), Err(Error::ErrTxMismatch));
-    assert_eq!(consensus::verify(&out.script_pubkey, out.value, &copy, 0, 0, &precomputed), Ok(()));
+    assert_eq!(
+        consensus::verify(&out.script_pubkey, out.value, &tx, 0, 0, &precomputed),
+        Err(Error::ErrTxMismatch)
+    );
+    assert_eq!(
+        consensus::verify(&out.script_pubkey, out.value, &copy, 0, 0, &precomputed),
+        Ok(())
+    );
 }
 
 #[test]
@@ -437,8 +462,12 @@ fn test_p2sh_p2wpkh_valid() {
         &checker,
     );
     // Should fail with EvalFalse (sig check fails), NOT a structural error
-    assert_eq!(result, Err(ScriptError::EvalFalse),
-        "P2SH-P2WPKH should reach sig verification, got: {:?}", result);
+    assert_eq!(
+        result,
+        Err(ScriptError::EvalFalse),
+        "P2SH-P2WPKH should reach sig verification, got: {:?}",
+        result
+    );
 }
 
 // =========================================================================
@@ -465,7 +494,11 @@ fn test_tapscript_with_annex() {
     // [stack_items..., script, control_block, annex]
     // Our code pops annex first if it starts with 0x50 and stack.len() >= 2.
     let result = verify_taproot_spend(&tx, &prev, &spk, 0);
-    assert!(result.is_ok(), "tapscript with annex failed: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "tapscript with annex failed: {:?}",
+        result.err()
+    );
 }
 
 #[test]
@@ -557,8 +590,12 @@ fn test_tapscript_validation_weight_exceeded() {
     let (tx, prev) = taproot_spend_tx(&spk, &leaf_script, &control, &stack_items);
 
     let result = verify_taproot_spend(&tx, &prev, &spk, 0);
-    assert_eq!(result, Err(ScriptError::TapscriptValidationWeight),
-        "Expected validation weight exhaustion, got: {:?}", result);
+    assert_eq!(
+        result,
+        Err(ScriptError::TapscriptValidationWeight),
+        "Expected validation weight exhaustion, got: {:?}",
+        result
+    );
 }
 
 // =========================================================================
@@ -574,7 +611,11 @@ fn test_taproot_two_leaf_spend_first() {
     let (spk, ctrl_a, _ctrl_b) = build_two_leaf_taproot(&internal_key, &leaf_a, &leaf_b);
     let (tx, prev) = taproot_spend_tx(&spk, &leaf_a, &ctrl_a, &[]);
     let result = verify_taproot_spend(&tx, &prev, &spk, 0);
-    assert!(result.is_ok(), "two-leaf spend A failed: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "two-leaf spend A failed: {:?}",
+        result.err()
+    );
 }
 
 #[test]
@@ -586,7 +627,11 @@ fn test_taproot_two_leaf_spend_second() {
     let (spk, _ctrl_a, ctrl_b) = build_two_leaf_taproot(&internal_key, &leaf_a, &leaf_b);
     let (tx, prev) = taproot_spend_tx(&spk, &leaf_b, &ctrl_b, &[]);
     let result = verify_taproot_spend(&tx, &prev, &spk, 0);
-    assert!(result.is_ok(), "two-leaf spend B failed: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "two-leaf spend B failed: {:?}",
+        result.err()
+    );
 }
 
 #[test]
@@ -746,7 +791,11 @@ fn test_minimalif_witness_v0_accepts_0x01() {
         flags::VERIFY_P2SH | flags::VERIFY_WITNESS | flags::VERIFY_MINIMALIF,
         &checker,
     );
-    assert!(result.is_ok(), "MINIMALIF with 0x01 should pass: {:?}", result);
+    assert!(
+        result.is_ok(),
+        "MINIMALIF with 0x01 should pass: {:?}",
+        result
+    );
 }
 
 #[test]

@@ -16,8 +16,8 @@ use serde_json::{Value, json};
 
 use crate::bip322;
 use crate::chain::state::ChainState;
-use crate::nap::publisher::{Published, encode_signature};
 use crate::nap::publisher::ChainSource as _;
+use crate::nap::publisher::{Published, encode_signature};
 use crate::nap::report;
 use crate::nap::validity::Timelocks;
 use crate::nap::{Attestation, NapSignature, PublishError, Publisher};
@@ -93,9 +93,13 @@ pub fn list_aggregate(p: &crate::nap::pull::Puller, chain: &ChainState) -> Value
 
 /// The tip moved through every read of a report or a snapshot.
 fn tip_kept_changing() -> ErrorObjectOwned {
-    RpcError::new(-1, "node.busy", "the chain tip kept changing while the NAP set was judged")
-        .with_suggestion("Ask again.")
-        .into_error_object()
+    RpcError::new(
+        -1,
+        "node.busy",
+        "the chain tip kept changing while the NAP set was judged",
+    )
+    .with_suggestion("Ask again.")
+    .into_error_object()
 }
 
 /// `getnapreport`: the report on the aggregator's own set, every
@@ -108,33 +112,50 @@ pub fn report(p: &crate::nap::pull::Puller, chain: &ChainState) -> Result<Value,
     let aggregate = p.collector().aggregate();
     // Read before the set is: a change meanwhile is computed again next time.
     let changes = aggregate.changes();
-    let tip = chain.read(&|v| v.block_hash(v.tip_height())).flatten().ok_or_else(tip_kept_changing)?;
-    p.report_cache().get_or(tip, changes, std::time::Instant::now(), || {
-        let held: Vec<(Attestation, Timelocks)> =
-            aggregate.all().into_iter().map(|h| (h.attestation, h.locks)).collect();
-        // The digest, hashed in order, while the chain rules are checked.
-        let ((len, digest), judged) = crate::nap::par::join(
-            || {
-                let set = report::canonical(held.iter().map(|(a, _)| a));
-                (set.len(), report::digest(set.iter().copied()))
-            },
-            || chain.read(&|v| report::counting_at(&held, v)),
-        );
-        let (tip, counting) = judged.ok_or_else(tip_kept_changing)?;
-        Ok((tip.hash, report::report(tip, digest, len, 0, &counting)))
-    })
+    let tip = chain
+        .read(&|v| v.block_hash(v.tip_height()))
+        .flatten()
+        .ok_or_else(tip_kept_changing)?;
+    p.report_cache()
+        .get_or(tip, changes, std::time::Instant::now(), || {
+            let held: Vec<(Attestation, Timelocks)> = aggregate
+                .all()
+                .into_iter()
+                .map(|h| (h.attestation, h.locks))
+                .collect();
+            // The digest, hashed in order, while the chain rules are checked.
+            let ((len, digest), judged) = crate::nap::par::join(
+                || {
+                    let set = report::canonical(held.iter().map(|(a, _)| a));
+                    (set.len(), report::digest(set.iter().copied()))
+                },
+                || chain.read(&|v| report::counting_at(&held, v)),
+            );
+            let (tip, counting) = judged.ok_or_else(tip_kept_changing)?;
+            Ok((tip.hash, report::report(tip, digest, len, 0, &counting)))
+        })
 }
 
 /// `replaynapsnapshot`: the report on a snapshot file. Each signature is
 /// verified against its coin, and the set judged at this node's tip, as the
 /// aggregator that exported it would at the same tip ([`report::replay`]). `max` bounds the
 /// attestations read (0 is no limit).
-pub fn report_snapshot(chain: &ChainState, path: &Path, max: usize) -> Result<Value, ErrorObjectOwned> {
+pub fn report_snapshot(
+    chain: &ChainState,
+    path: &Path,
+    max: usize,
+) -> Result<Value, ErrorObjectOwned> {
     let snapshot = report::read_snapshot(path, max)
         .map_err(|e| RpcError::new(-8, "rpc.input.parse", e).into_error_object())?;
     let replay = report::replay(chain, &snapshot.attestations).ok_or_else(tip_kept_changing)?;
     let digest = report::digest(&snapshot.attestations);
-    Ok(report::report(replay.tip, digest, snapshot.attestations.len(), replay.invalid, &replay.counting))
+    Ok(report::report(
+        replay.tip,
+        digest,
+        snapshot.attestations.len(),
+        replay.invalid,
+        &replay.counting,
+    ))
 }
 
 /// `exportnapsnapshot`: write every attestation the aggregator holds to
@@ -144,7 +165,13 @@ pub fn export_snapshot(
     chain: &ChainState,
     path: &Path,
 ) -> Result<Value, ErrorObjectOwned> {
-    let set = report::canonical(p.collector().aggregate().all().into_iter().map(|h| h.attestation));
+    let set = report::canonical(
+        p.collector()
+            .aggregate()
+            .all()
+            .into_iter()
+            .map(|h| h.attestation),
+    );
     let (height, hash) = chain
         .read(&|v| {
             let h = v.tip_height();
@@ -159,7 +186,11 @@ pub fn export_snapshot(
     })
     .map_err(|e| {
         if e.kind() == std::io::ErrorKind::AlreadyExists {
-            RpcError::new(-8, "storage.exists", format!("refusing to overwrite existing file: {}", path.display()))
+            RpcError::new(
+                -8,
+                "storage.exists",
+                format!("refusing to overwrite existing file: {}", path.display()),
+            )
         } else {
             RpcError::new(-1, "storage.io", format!("writing {}: {e}", path.display()))
         }
@@ -178,8 +209,12 @@ pub fn export_snapshot(
 /// take it.
 pub fn parse_outpoint(s: &str) -> Result<OutPoint, ErrorObjectOwned> {
     OutPoint::from_str(s).map_err(|_| {
-        RpcError::new(-8, "rpc.input.parse", format!("outpoint must be \"<txid>:<vout>\", not \"{s}\""))
-            .into_error_object()
+        RpcError::new(
+            -8,
+            "rpc.input.parse",
+            format!("outpoint must be \"<txid>:<vout>\", not \"{s}\""),
+        )
+        .into_error_object()
     })
 }
 
@@ -195,15 +230,15 @@ pub fn error(e: PublishError) -> ErrorObjectOwned {
         PublishError::Rejected(_)
         | PublishError::Superseded { .. }
         | PublishError::KeyLimit
-        | PublishError::StoreFull { .. } => {
-            (-26, "nap.rejected")
-        }
+        | PublishError::StoreFull { .. } => (-26, "nap.rejected"),
     };
     let message = match code {
         -26 => format!("rejected ({}): {e}", e.rule()),
         _ => e.to_string(),
     };
-    RpcError::new(code, category, message).with_debug(json!({ "rule": e.rule() })).into_error_object()
+    RpcError::new(code, category, message)
+        .with_debug(json!({ "rule": e.rule() }))
+        .into_error_object()
 }
 
 /// An unusable descriptor is -5, as Core reports one; one that does not

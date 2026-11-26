@@ -59,12 +59,19 @@ fn to_sign(spk: &ScriptBuf, message: &str) -> Transaction {
 
 fn ecdsa(sighash: [u8; 32], sk: &SecretKey) -> bitcoin::ecdsa::Signature {
     let signature = Secp256k1::new().sign_ecdsa(&Message::from_digest(sighash), sk);
-    bitcoin::ecdsa::Signature { signature, sighash_type: EcdsaSighashType::All }
+    bitcoin::ecdsa::Signature {
+        signature,
+        sighash_type: EcdsaSighashType::All,
+    }
 }
 
 fn schnorr(sighash: [u8; 32], keypair: &Keypair) -> bitcoin::taproot::Signature {
-    let signature = Secp256k1::new().sign_schnorr_no_aux_rand(&Message::from_digest(sighash), keypair);
-    bitcoin::taproot::Signature { signature, sighash_type: TapSighashType::Default }
+    let signature =
+        Secp256k1::new().sign_schnorr_no_aux_rand(&Message::from_digest(sighash), keypair);
+    bitcoin::taproot::Signature {
+        signature,
+        sighash_type: TapSighashType::Default,
+    }
 }
 
 /// Signs a `createnapattestation` draft, given the node (for
@@ -123,9 +130,16 @@ fn holders() -> Vec<Holder> {
         sign: Box::new(move |_, draft| {
             let message = message_of(draft);
             let tx = to_sign(&spk, message);
-            let prevout = [TxOut { value: Amount::ZERO, script_pubkey: spk.clone() }];
+            let prevout = [TxOut {
+                value: Amount::ZERO,
+                script_pubkey: spk.clone(),
+            }];
             let sighash = SighashCache::new(&tx)
-                .taproot_key_spend_signature_hash(0, &Prevouts::All(&prevout), TapSighashType::Default)
+                .taproot_key_spend_signature_hash(
+                    0,
+                    &Prevouts::All(&prevout),
+                    TapSighashType::Default,
+                )
                 .unwrap();
             let tweaked = keypair.tap_tweak(&Secp256k1::new(), None).to_keypair();
             let w = Witness::p2tr_key_spend(&schnorr(sighash.to_byte_array(), &tweaked));
@@ -139,9 +153,17 @@ fn holders() -> Vec<Holder> {
         .push_x_only_key(&leaf_key.x_only_public_key().0)
         .push_opcode(OP_CHECKSIG)
         .into_script();
-    let internal = Keypair::from_secret_key(&secp, &secret(4)).x_only_public_key().0;
-    let info = TaprootBuilder::new().add_leaf(0, leaf.clone()).unwrap().finalize(&secp, internal).unwrap();
-    let control = info.control_block(&(leaf.clone(), LeafVersion::TapScript)).unwrap();
+    let internal = Keypair::from_secret_key(&secp, &secret(4))
+        .x_only_public_key()
+        .0;
+    let info = TaprootBuilder::new()
+        .add_leaf(0, leaf.clone())
+        .unwrap()
+        .finalize(&secp, internal)
+        .unwrap();
+    let control = info
+        .control_block(&(leaf.clone(), LeafVersion::TapScript))
+        .unwrap();
     let address = Address::p2tr_tweaked(info.output_key(), net);
     let spk = address.script_pubkey();
     out.push(Holder {
@@ -152,7 +174,10 @@ fn holders() -> Vec<Holder> {
         sign: Box::new(move |_, draft| {
             let message = message_of(draft);
             let tx = to_sign(&spk, message);
-            let prevout = [TxOut { value: Amount::ZERO, script_pubkey: spk.clone() }];
+            let prevout = [TxOut {
+                value: Amount::ZERO,
+                script_pubkey: spk.clone(),
+            }];
             let sighash = SighashCache::new(&tx)
                 .taproot_script_spend_signature_hash(
                     0,
@@ -235,10 +260,13 @@ fn holders() -> Vec<Holder> {
         formats: json!(["legacy", "full"]),
         sign: Box::new(move |node, draft| {
             let message = message_of(draft);
-            node.rpc_ok("signmessagewithprivkey", vec![json!(key.to_wif()), json!(message)])
-                .as_str()
-                .unwrap()
-                .to_string()
+            node.rpc_ok(
+                "signmessagewithprivkey",
+                vec![json!(key.to_wif()), json!(message)],
+            )
+            .as_str()
+            .unwrap()
+            .to_string()
         }),
     });
 
@@ -251,7 +279,10 @@ fn holders() -> Vec<Holder> {
     for sk in &keys {
         ws = ws.push_key(&compressed(sk).into());
     }
-    let ws = ws.push_opcode(OP_PUSHNUM_3).push_opcode(OP_CHECKMULTISIG).into_script();
+    let ws = ws
+        .push_opcode(OP_PUSHNUM_3)
+        .push_opcode(OP_CHECKMULTISIG)
+        .into_script();
     let address = Address::p2wsh(&ws, net);
     let pks: Vec<String> = keys.iter().map(|sk| compressed(sk).to_string()).collect();
     out.push(Holder {
@@ -260,9 +291,15 @@ fn holders() -> Vec<Holder> {
         descriptor: Some(format!("wsh(multi(2,{}))", pks.join(","))),
         formats: json!(["simple", "full"]),
         sign: Box::new(move |node, draft| {
-            let psbt = base64::engine::general_purpose::STANDARD.decode(draft["psbt"].as_str().unwrap()).unwrap();
+            let psbt = base64::engine::general_purpose::STANDARD
+                .decode(draft["psbt"].as_str().unwrap())
+                .unwrap();
             let psbt = Psbt::deserialize(&psbt).unwrap();
-            assert_eq!(psbt.inputs[0].witness_script.as_ref(), Some(&ws), "the descriptor added it");
+            assert_eq!(
+                psbt.inputs[0].witness_script.as_ref(),
+                Some(&ws),
+                "the descriptor added it"
+            );
             let copies: Vec<Value> = [&keys[0], &keys[2]]
                 .iter()
                 .map(|sk| {
@@ -276,18 +313,27 @@ fn holders() -> Vec<Holder> {
                     json!(b64(&copy.serialize()))
                 })
                 .collect();
-            node.rpc_ok("combinepsbt", vec![json!(copies)]).as_str().unwrap().to_string()
+            node.rpc_ok("combinepsbt", vec![json!(copies)])
+                .as_str()
+                .unwrap()
+                .to_string()
         }),
     });
     out
 }
 
 fn list(node: &TestNode) -> Vec<Value> {
-    node.rpc_ok("listnapattestations", vec![]).as_array().unwrap().clone()
+    node.rpc_ok("listnapattestations", vec![])
+        .as_array()
+        .unwrap()
+        .clone()
 }
 
 fn error_of(r: Value) -> (i64, String) {
-    (r["error"]["code"].as_i64().unwrap(), r["error"]["message"].as_str().unwrap().to_string())
+    (
+        r["error"]["code"].as_i64().unwrap(),
+        r["error"]["message"].as_str().unwrap().to_string(),
+    )
 }
 
 #[test]
@@ -303,13 +349,21 @@ fn nap_publisher_signs_restarts_spends_and_reorgs() {
     // Coin `i` confirmed at height `i + 1`; the last is attestable once the
     // tip is `ATTESTABLE_AFTER` above it.
     node.mine_blocks(ATTESTABLE_AFTER, BURN);
-    let outpoints: Vec<String> =
-        (1..=holders.len() as u64).map(|h| format!("{}:0", coinbase_txid_at(&node, h))).collect();
+    let outpoints: Vec<String> = (1..=holders.len() as u64)
+        .map(|h| format!("{}:0", coinbase_txid_at(&node, h)))
+        .collect();
 
     // Not yet old enough: one block short, at the anchor.
     let young = node.rpc_call_with_params(
         "createnapattestation",
-        vec![json!(format!("{}:0", coinbase_txid_at(&node, holders.len() as u64 + 1))), json!("k"), json!("v")],
+        vec![
+            json!(format!(
+                "{}:0",
+                coinbase_txid_at(&node, holders.len() as u64 + 1)
+            )),
+            json!("k"),
+            json!("v"),
+        ],
     );
     let (code, msg) = error_of(young.unwrap());
     assert_eq!(code, -26);
@@ -322,9 +376,19 @@ fn nap_publisher_signs_restarts_spends_and_reorgs() {
             // A descriptor that does not parse is -5; one for another coin, -8.
             let mut bad = params.clone();
             bad[3] = json!("wsh(nonsense)");
-            assert_eq!(error_of(node.rpc_call_with_params("createnapattestation", bad.clone()).unwrap()).0, -5);
+            assert_eq!(
+                error_of(
+                    node.rpc_call_with_params("createnapattestation", bad.clone())
+                        .unwrap()
+                )
+                .0,
+                -5
+            );
             bad[3] = json!(d.replace("multi(2,", "multi(1,"));
-            let (code, msg) = error_of(node.rpc_call_with_params("createnapattestation", bad).unwrap());
+            let (code, msg) = error_of(
+                node.rpc_call_with_params("createnapattestation", bad)
+                    .unwrap(),
+            );
             assert_eq!(code, -8, "{msg}");
             assert!(msg.contains("does not derive"), "{msg}");
         }
@@ -337,7 +401,9 @@ fn nap_publisher_signs_restarts_spends_and_reorgs() {
 
         // A signature over other text is refused, naming the rule.
         let other = message.replace("value: yes", "value: no");
-        let r = node.rpc_call_with_params("submitnapattestation", vec![json!(other), json!(signature)]).unwrap();
+        let r = node
+            .rpc_call_with_params("submitnapattestation", vec![json!(other), json!(signature)])
+            .unwrap();
         let (code, msg) = error_of(r);
         if h.name.ends_with("psbt") {
             // A PSBT carries its message, so the mismatch is caught first.
@@ -348,19 +414,28 @@ fn nap_publisher_signs_restarts_spends_and_reorgs() {
             assert!(msg.contains("signature-invalid"), "{}: {msg}", h.name);
         }
 
-        let stored = node.rpc_ok("submitnapattestation", vec![json!(message), json!(signature)]);
+        let stored = node.rpc_ok(
+            "submitnapattestation",
+            vec![json!(message), json!(signature)],
+        );
         assert_eq!(stored["status"], "valid", "{}: {stored}", h.name);
         assert_eq!(stored["outpoint"], json!(op));
         assert_eq!(stored["amount"].as_f64(), Some(50.0), "{}", h.name);
         assert_eq!(stored["replaced"], Value::Null);
         if h.name.ends_with("psbt") {
-            assert_eq!(stored["format"], "simple", "a default to_sign finalizes to simple");
+            assert_eq!(
+                stored["format"], "simple",
+                "a default to_sign finalizes to simple"
+            );
         }
     }
     let before = list(&node);
     assert_eq!(before.len(), holders.len());
     assert!(before.iter().all(|a| a["status"] == "valid"), "{before:?}");
-    let formats: Vec<&str> = before.iter().map(|a| a["format"].as_str().unwrap()).collect();
+    let formats: Vec<&str> = before
+        .iter()
+        .map(|a| a["format"].as_str().unwrap())
+        .collect();
     for f in ["simple", "full", "legacy"] {
         assert!(formats.contains(&f), "{formats:?}");
     }
@@ -372,18 +447,32 @@ fn nap_publisher_signs_restarts_spends_and_reorgs() {
     // would load it, and the journal is left empty.
     let store = datadir.join("regtest").join("nap").join("attestations.dat");
     assert_eq!(node::nap::store::load(&store).unwrap().len(), holders.len());
-    assert_eq!(std::fs::metadata(node::nap::store::journal_path(&store)).unwrap().len(), 40, "an empty journal");
+    assert_eq!(
+        std::fs::metadata(node::nap::store::journal_path(&store))
+            .unwrap()
+            .len(),
+        40,
+        "an empty journal"
+    );
     let max = format!("--napmaxattestations={}", holders.len());
     let mut node = TestNode::start_with_datadir(&datadir, rpcport, &["--nap=1", &max]);
     assert_eq!(list(&node), before);
 
     // At the -napmaxattestations limit a new key is refused.
-    let draft = node.rpc_ok("createnapattestation", vec![json!(outpoints[1]), json!("another.key"), json!("v")]);
+    let draft = node.rpc_ok(
+        "createnapattestation",
+        vec![json!(outpoints[1]), json!("another.key"), json!("v")],
+    );
     let warnings = draft["warnings"].to_string();
     assert!(warnings.contains("-napmaxattestations"), "{warnings}");
     let message = message_of(&draft);
     let signature = (holders[1].sign)(&node, &draft);
-    let r = node.rpc_call_with_params("submitnapattestation", vec![json!(message), json!(signature)]).unwrap();
+    let r = node
+        .rpc_call_with_params(
+            "submitnapattestation",
+            vec![json!(message), json!(signature)],
+        )
+        .unwrap();
     let (code, msg) = error_of(r);
     assert_eq!(code, -26);
     assert!(msg.contains("store-full"), "{msg}");
@@ -391,18 +480,41 @@ fn nap_publisher_signs_restarts_spends_and_reorgs() {
     // Spending a coin drops its attestation.
     let wallet = DeterministicWallet::from_secret([1; 32]);
     assert_eq!(wallet.address, holders[0].address);
-    let (raw, _) = build_signed_p2wpkh_spend_of_coinbase(&node, &wallet, 1, wallet.address.script_pubkey(), 1_000);
+    let (raw, _) = build_signed_p2wpkh_spend_of_coinbase(
+        &node,
+        &wallet,
+        1,
+        wallet.address.script_pubkey(),
+        1_000,
+    );
     node.rpc_ok("sendrawtransaction", vec![json!(raw)]);
     node.mine_blocks(1, BURN);
-    poll_until(|| list(&node).len() == holders.len() - 1, test_timeout(60), "the spent coin's attestation is dropped");
-    assert!(list(&node).iter().all(|a| a["outpoint"] != json!(outpoints[0])));
+    poll_until(
+        || list(&node).len() == holders.len() - 1,
+        test_timeout(60),
+        "the spent coin's attestation is dropped",
+    );
+    assert!(
+        list(&node)
+            .iter()
+            .all(|a| a["outpoint"] != json!(outpoints[0]))
+    );
 
     // Removing one stops publishing it.
-    let removed = node.rpc_ok("removenapattestation", vec![json!(outpoints[5]), json!("bip_xyz.support")]);
-    let p2pkh = before.iter().find(|a| a["outpoint"] == json!(outpoints[5])).unwrap();
+    let removed = node.rpc_ok(
+        "removenapattestation",
+        vec![json!(outpoints[5]), json!("bip_xyz.support")],
+    );
+    let p2pkh = before
+        .iter()
+        .find(|a| a["outpoint"] == json!(outpoints[5]))
+        .unwrap();
     assert_eq!(p2pkh["format"], "legacy");
     assert_eq!(removed["id"], p2pkh["id"]);
-    let r = node.rpc_call_with_params("removenapattestation", vec![json!(outpoints[5]), json!("bip_xyz.support")]);
+    let r = node.rpc_call_with_params(
+        "removenapattestation",
+        vec![json!(outpoints[5]), json!("bip_xyz.support")],
+    );
     assert_eq!(error_of(r.unwrap()).0, -8);
     assert_eq!(list(&node).len(), holders.len() - 2);
 
@@ -412,15 +524,20 @@ fn nap_publisher_signs_restarts_spends_and_reorgs() {
     node.rpc_ok("invalidateblock", vec![json!(anchor)]);
     node.mine_blocks(12, &holders[1].address.to_string());
     poll_until(
-        || list(&node).iter().all(|a| a["status"] == "anchor-not-on-chain"),
+        || {
+            list(&node)
+                .iter()
+                .all(|a| a["status"] == "anchor-not-on-chain")
+        },
         test_timeout(60),
         "every attestation lost its anchor",
     );
     assert_eq!(list(&node).len(), holders.len() - 2);
     poll_until(
         || {
-            std::fs::read_to_string(&node.stderr_log)
-                .is_ok_and(|log| log.contains("a reorg removed the anchor block of a published attestation"))
+            std::fs::read_to_string(&node.stderr_log).is_ok_and(|log| {
+                log.contains("a reorg removed the anchor block of a published attestation")
+            })
         },
         test_timeout(60),
         "the operator is warned about the lost anchor",
@@ -433,8 +550,9 @@ fn nap_publisher_signs_restarts_spends_and_reorgs() {
     assert_eq!(list(&node).len(), holders.len() - 2);
     poll_until(
         || {
-            std::fs::read_to_string(&node.stderr_log)
-                .is_ok_and(|log| log.contains("a reorg removed the anchor block of a published attestation"))
+            std::fs::read_to_string(&node.stderr_log).is_ok_and(|log| {
+                log.contains("a reorg removed the anchor block of a published attestation")
+            })
         },
         test_timeout(60),
         "the restarted node warns about the lost anchors",
@@ -447,7 +565,9 @@ fn nap_publisher_signs_restarts_spends_and_reorgs() {
 #[test]
 fn nap_rpcs_need_the_flag() {
     let mut node = TestNode::start(&[]);
-    let r = node.rpc_call_with_params("listnapattestations", vec![]).unwrap();
+    let r = node
+        .rpc_call_with_params("listnapattestations", vec![])
+        .unwrap();
     let (code, msg) = error_of(r);
     assert_eq!(code, -1);
     assert!(msg.contains("NAP is disabled"), "{msg}");
@@ -490,27 +610,51 @@ fn a_damaged_store_stops_startup_unless_recovery_is_on() {
             None => {
                 let _ = child.kill();
                 let _ = child.wait();
-                panic!("satd started with a damaged NAP store:\n{}", std::fs::read_to_string(&log_path).unwrap_or_default());
+                panic!(
+                    "satd started with a damaged NAP store:\n{}",
+                    std::fs::read_to_string(&log_path).unwrap_or_default()
+                );
             }
         }
     };
     let text = std::fs::read_to_string(&log_path).unwrap_or_default();
     assert!(!status.success(), "{text}");
-    assert!(text.contains("Error loading the NAP attestation store"), "{text}");
+    assert!(
+        text.contains("Error loading the NAP attestation store"),
+        "{text}"
+    );
     assert!(text.contains("-napstorerecover=1"), "{text}");
-    assert_eq!(std::fs::read(&store).unwrap(), damaged, "a refused start leaves the file alone");
+    assert_eq!(
+        std::fs::read(&store).unwrap(),
+        damaged,
+        "a refused start leaves the file alone"
+    );
 
-    let mut node = TestNode::start_with_datadir(&datadir, rpcport, &["--nap=1", "--napstorerecover=1"]);
+    let mut node =
+        TestNode::start_with_datadir(&datadir, rpcport, &["--nap=1", "--napstorerecover=1"]);
     assert_eq!(list(&node), Vec::<Value>::new());
     let set_aside: Vec<_> = std::fs::read_dir(&store_dir)
         .unwrap()
         .map(|e| e.unwrap().path())
-        .filter(|p| p.file_name().unwrap().to_str().unwrap().starts_with("attestations.dat.bad-"))
+        .filter(|p| {
+            p.file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .starts_with("attestations.dat.bad-")
+        })
         .collect();
     assert_eq!(set_aside.len(), 1, "{set_aside:?}");
-    assert_eq!(std::fs::read(&set_aside[0]).unwrap(), damaged, "the damaged file is kept as it was");
+    assert_eq!(
+        std::fs::read(&set_aside[0]).unwrap(),
+        damaged,
+        "the damaged file is kept as it was"
+    );
     let log = std::fs::read_to_string(&node.stderr_log).unwrap_or_default();
-    assert!(log.contains("the attestation store did not read back"), "{log}");
+    assert!(
+        log.contains("the attestation store did not read back"),
+        "{log}"
+    );
     node.stop();
     let _ = std::fs::remove_dir_all(&datadir);
 }

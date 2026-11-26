@@ -34,7 +34,16 @@ fn mk_pm() -> (Arc<PeerManager>, tempfile::TempDir) {
     let mempool = Arc::new(Mempool::new(1_000_000, 0));
     let fee_estimator = Arc::new(FeeEstimator::new());
     let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    (PeerManager::new(chain_state, mempool, fee_estimator, Network::Regtest, shutdown_rx), dir)
+    (
+        PeerManager::new(
+            chain_state,
+            mempool,
+            fee_estimator,
+            Network::Regtest,
+            shutdown_rx,
+        ),
+        dir,
+    )
 }
 
 /// Out of IBD: a peer has announced a headers tip the node's tip is within
@@ -88,7 +97,9 @@ fn own_group(i: usize) -> SocketAddr {
 
 /// `n` addresses in the one /16 44.1.0.0/16.
 fn one_group(n: usize) -> Vec<SocketAddr> {
-    (0..n).map(|i| SocketAddr::from(([44, 1, (i / 250) as u8, (i % 250) as u8 + 1], 8333))).collect()
+    (0..n)
+        .map(|i| SocketAddr::from(([44, 1, (i / 250) as u8, (i % 250) as u8 + 1], 8333)))
+        .collect()
 }
 
 fn in_44_1(addr: &SocketAddr) -> bool {
@@ -109,12 +120,17 @@ fn learn(pm: &PeerManager, addrs: &[SocketAddr]) {
 
 /// The whole order [`PeerManager::automatic_dial_order`] draws.
 fn dial_order(pm: &PeerManager, rng: &mut impl rand::Rng) -> Vec<SocketAddr> {
-    pm.automatic_dial_order(rng).map(|c| socket(c.addr)).collect()
+    pm.automatic_dial_order(rng)
+        .map(|c| socket(c.addr))
+        .collect()
 }
 
 fn dialled(pm: &Arc<PeerManager>) -> Vec<SocketAddr> {
     // The slots go back when the reservations drop at the end of this call.
-    pm.reserve_automatic_dials(Instant::now(), &[]).into_iter().map(|(a, _slot)| socket(a)).collect()
+    pm.reserve_automatic_dials(Instant::now(), &[])
+        .into_iter()
+        .map(|(a, _slot)| socket(a))
+        .collect()
 }
 
 /// The socket of a clearnet entry: these tests put no onion in the book.
@@ -149,7 +165,11 @@ fn a_dial_pass_takes_one_address_per_network_group() {
 
     let dials = dialled(&pm);
     assert_eq!(dials.len(), MAX_OUTBOUND, "every slot is filled: {dials:?}");
-    assert_eq!(dials.iter().filter(|a| in_44_1(a)).count(), 1, "one dial in 44.1.0.0/16: {dials:?}");
+    assert_eq!(
+        dials.iter().filter(|a| in_44_1(a)).count(),
+        1,
+        "one dial in 44.1.0.0/16: {dials:?}"
+    );
     let groups: HashSet<[u8; 2]> = dials
         .iter()
         .map(|a| match a.ip() {
@@ -182,24 +202,47 @@ fn outbound_peers_hold_their_group_and_inbound_peers_and_feelers_do_not() {
     leave_ibd(&pm);
     let held = [
         (SocketAddr::from(([44, 1, 9, 9], 8333)), ConnType::Manual),
-        (SocketAddr::from(([45, 1, 9, 9], 8333)), ConnType::OutboundFullRelay),
-        (SocketAddr::from(([46, 1, 9, 9], 8333)), ConnType::BlockRelay),
+        (
+            SocketAddr::from(([45, 1, 9, 9], 8333)),
+            ConnType::OutboundFullRelay,
+        ),
+        (
+            SocketAddr::from(([46, 1, 9, 9], 8333)),
+            ConnType::BlockRelay,
+        ),
     ];
     for (i, (addr, conn_type)) in held.iter().enumerate() {
         add_peer(&pm, outbound(i as PeerId + 1, *addr, *conn_type));
     }
-    let mut inbound = PeerInfo::new(10, SocketAddr::from(([47, 1, 9, 9], 50000)), Direction::Inbound);
+    let mut inbound = PeerInfo::new(
+        10,
+        SocketAddr::from(([47, 1, 9, 9], 50000)),
+        Direction::Inbound,
+    );
     inbound.state = PeerState::Connected;
     add_peer(&pm, inbound);
-    add_peer(&pm, outbound(11, SocketAddr::from(([48, 1, 9, 9], 8333)), ConnType::Feeler));
+    add_peer(
+        &pm,
+        outbound(
+            11,
+            SocketAddr::from(([48, 1, 9, 9], 8333)),
+            ConnType::Feeler,
+        ),
+    );
 
-    let candidates: Vec<SocketAddr> =
-        [44u8, 45, 46, 47, 48].iter().map(|b| SocketAddr::from(([*b, 1, 1, 1], 8333))).collect();
+    let candidates: Vec<SocketAddr> = [44u8, 45, 46, 47, 48]
+        .iter()
+        .map(|b| SocketAddr::from(([*b, 1, 1, 1], 8333)))
+        .collect();
     learn(&pm, &candidates);
     // Automatic dials are drawn at random from the book, so compare sets.
     let mut dials = dialled(&pm);
     dials.sort();
-    assert_eq!(dials, candidates[3..].to_vec(), "only the inbound and feeler groups are free");
+    assert_eq!(
+        dials,
+        candidates[3..].to_vec(),
+        "only the inbound and feeler groups are free"
+    );
 }
 
 /// A dial still in flight holds its group: dials run in parallel, so a
@@ -208,7 +251,9 @@ fn outbound_peers_hold_their_group_and_inbound_peers_and_feelers_do_not() {
 fn a_dial_in_flight_holds_its_group() {
     let (pm, _dir) = mk_pm();
     leave_ibd(&pm);
-    pm.pending_connections.write().insert(SocketAddr::from(([44, 1, 200, 1], 8333)));
+    pm.pending_connections
+        .write()
+        .insert(SocketAddr::from(([44, 1, 200, 1], 8333)));
     learn(&pm, &one_group(5));
     learn(&pm, &[own_group(0)]);
     assert_eq!(dialled(&pm), vec![own_group(0)]);
@@ -234,14 +279,25 @@ fn the_rule_uses_the_address_books_groups() {
 fn local_and_private_addresses_are_outside_the_rule() {
     let (pm, _dir) = mk_pm();
     leave_ibd(&pm);
-    add_peer(&pm, outbound(1, SocketAddr::from(([127, 0, 0, 1], 18444)), ConnType::Manual));
-    let local: Vec<SocketAddr> = (0..20).map(|i| SocketAddr::from(([127, 0, 0, 1], 20000 + i))).collect();
+    add_peer(
+        &pm,
+        outbound(
+            1,
+            SocketAddr::from(([127, 0, 0, 1], 18444)),
+            ConnType::Manual,
+        ),
+    );
+    let local: Vec<SocketAddr> = (0..20)
+        .map(|i| SocketAddr::from(([127, 0, 0, 1], 20000 + i)))
+        .collect();
     learn(&pm, &local);
     assert_eq!(dialled(&pm).len(), MAX_OUTBOUND);
 
     let (pm, _dir) = mk_pm();
     leave_ibd(&pm);
-    let private: Vec<SocketAddr> = (0..20).map(|i| SocketAddr::from(([10, 0, 0, i as u8 + 1], 18444))).collect();
+    let private: Vec<SocketAddr> = (0..20)
+        .map(|i| SocketAddr::from(([10, 0, 0, i as u8 + 1], 18444)))
+        .collect();
     learn(&pm, &private);
     assert_eq!(dialled(&pm).len(), MAX_OUTBOUND);
 }
@@ -267,7 +323,11 @@ fn surplus_outbound_peers_are_trimmed_to_eight_after_ibd() {
     let (pm, _dir) = mk_pm();
     enter_ibd(&pm);
     full_relay_peers(&pm, 20);
-    assert_eq!(pm.evict_extra_outbound_peer(), None, "20 of 64 is no surplus");
+    assert_eq!(
+        pm.evict_extra_outbound_peer(),
+        None,
+        "20 of 64 is no surplus"
+    );
 
     leave_ibd(&pm);
     let mut evicted = Vec::new();
@@ -280,7 +340,11 @@ fn surplus_outbound_peers_are_trimmed_to_eight_after_ibd() {
         }
     }
     assert_eq!(full_relay_count(&pm), MAX_OUTBOUND, "back to the target");
-    assert_eq!(evicted, (100..112).collect::<Vec<PeerId>>(), "oldest announcement first, one per pass");
+    assert_eq!(
+        evicted,
+        (100..112).collect::<Vec<PeerId>>(),
+        "oldest announcement first, one per pass"
+    );
     assert_eq!(pm.evict_extra_outbound_peer(), None, "and no further");
 }
 
@@ -292,10 +356,16 @@ fn manual_and_block_relay_peers_are_not_trimmed() {
     leave_ibd(&pm);
     full_relay_peers(&pm, 10);
     for i in 0..5 {
-        add_peer(&pm, outbound(200 + i, own_group(50 + i as usize), ConnType::Manual));
+        add_peer(
+            &pm,
+            outbound(200 + i, own_group(50 + i as usize), ConnType::Manual),
+        );
     }
     for i in 0..2 {
-        add_peer(&pm, outbound(300 + i, own_group(60 + i as usize), ConnType::BlockRelay));
+        add_peer(
+            &pm,
+            outbound(300 + i, own_group(60 + i as usize), ConnType::BlockRelay),
+        );
     }
     for _ in 0..20 {
         pm.evict_extra_outbound_peer();
@@ -317,14 +387,27 @@ fn a_busy_young_or_protected_peer_is_kept() {
     full_relay_peers(&pm, MAX_OUTBOUND + 2);
     // Peer 100 is the worst; give it a block in flight.
     pm.record_block_requests(100, &[bitcoin::BlockHash::all_zeros()], false);
-    assert_eq!(pm.evict_extra_outbound_peer(), None, "a peer with a block in flight stays");
+    assert_eq!(
+        pm.evict_extra_outbound_peer(),
+        None,
+        "a peer with a block in flight stays"
+    );
     pm.in_flight_blocks.write().clear();
     // Now young.
-    pm.peers.write().get_mut(&100).unwrap().info.conn_time = std::time::UNIX_EPOCH
-        + Duration::from_secs(crate::time::now_secs());
-    assert_eq!(pm.evict_extra_outbound_peer(), None, "a peer connected under 30 s stays");
+    pm.peers.write().get_mut(&100).unwrap().info.conn_time =
+        std::time::UNIX_EPOCH + Duration::from_secs(crate::time::now_secs());
+    assert_eq!(
+        pm.evict_extra_outbound_peer(),
+        None,
+        "a peer connected under 30 s stays"
+    );
     // Protected: the next worst goes instead.
-    pm.peers.write().get_mut(&100).unwrap().info.chain_sync_protect = true;
+    pm.peers
+        .write()
+        .get_mut(&100)
+        .unwrap()
+        .info
+        .chain_sync_protect = true;
     assert_eq!(pm.evict_extra_outbound_peer(), Some(101));
     assert!(pm.peers.read().contains_key(&100));
 }
@@ -337,12 +420,20 @@ fn a_peer_sharing_its_group_goes_first() {
     leave_ibd(&pm);
     full_relay_peers(&pm, MAX_OUTBOUND);
     for (id, last) in [(150, 5000), (151, 6000)] {
-        let mut info = outbound(id, SocketAddr::from(([44, 1, id as u8, 1], 8333)), ConnType::OutboundFullRelay);
+        let mut info = outbound(
+            id,
+            SocketAddr::from(([44, 1, id as u8, 1], 8333)),
+            ConnType::OutboundFullRelay,
+        );
         info.last_block_announcement = last;
         add_peer(&pm, info);
     }
     assert_eq!(pm.evict_extra_outbound_peer(), Some(150));
-    assert_eq!(pm.evict_extra_outbound_peer(), Some(100), "then the oldest announcement");
+    assert_eq!(
+        pm.evict_extra_outbound_peer(),
+        Some(100),
+        "then the oldest announcement"
+    );
 }
 
 /// The only manual or full-relay connection on its network is kept, as
@@ -352,10 +443,18 @@ fn the_only_peer_on_its_network_is_kept() {
     let (pm, _dir) = mk_pm();
     leave_ibd(&pm);
     full_relay_peers(&pm, MAX_OUTBOUND);
-    let mut v6 = outbound(150, "[2001:4860::1]:8333".parse().unwrap(), ConnType::OutboundFullRelay);
+    let mut v6 = outbound(
+        150,
+        "[2001:4860::1]:8333".parse().unwrap(),
+        ConnType::OutboundFullRelay,
+    );
     v6.last_block_announcement = 0;
     add_peer(&pm, v6);
-    assert_eq!(pm.evict_extra_outbound_peer(), Some(100), "the lone IPv6 peer is passed over");
+    assert_eq!(
+        pm.evict_extra_outbound_peer(),
+        Some(100),
+        "the lone IPv6 peer is passed over"
+    );
     assert!(pm.peers.read().contains_key(&150));
 }
 
@@ -368,9 +467,16 @@ fn a_new_header_stamps_the_announcement_and_protects_four_peers() {
 
     let (pm, _dir) = mk_pm();
     for i in 0..6 {
-        add_peer(&pm, outbound(100 + i, own_group(i as usize), ConnType::OutboundFullRelay));
+        add_peer(
+            &pm,
+            outbound(100 + i, own_group(i as usize), ConnType::OutboundFullRelay),
+        );
     }
-    let mut inbound = PeerInfo::new(10, SocketAddr::from(([47, 1, 9, 9], 50000)), Direction::Inbound);
+    let mut inbound = PeerInfo::new(
+        10,
+        SocketAddr::from(([47, 1, 9, 9], 50000)),
+        Direction::Inbound,
+    );
     inbound.state = PeerState::Connected;
     add_peer(&pm, inbound);
 
@@ -382,10 +488,22 @@ fn a_new_header_stamps_the_announcement_and_protects_four_peers() {
     }
     let peers = pm.peers.read();
     let info = |id: PeerId| &peers.get(&id).unwrap().info;
-    assert!(info(10).last_block_announcement > 0, "the first to send it announced it");
-    assert!(!info(10).chain_sync_protect, "inbound peers are not protected");
-    assert_eq!(info(100).last_block_announcement, 0, "a header already known is no announcement");
-    let protected: Vec<PeerId> = (100..106).filter(|id| info(*id).chain_sync_protect).collect();
+    assert!(
+        info(10).last_block_announcement > 0,
+        "the first to send it announced it"
+    );
+    assert!(
+        !info(10).chain_sync_protect,
+        "inbound peers are not protected"
+    );
+    assert_eq!(
+        info(100).last_block_announcement,
+        0,
+        "a header already known is no announcement"
+    );
+    let protected: Vec<PeerId> = (100..106)
+        .filter(|id| info(*id).chain_sync_protect)
+        .collect();
     assert_eq!(protected, vec![100, 101, 102, 103], "the first four");
 }
 
@@ -404,7 +522,11 @@ async fn seeds_are_dialled_by_the_automatic_pass() {
 
     pm.set_network_active(false);
     pm.dial_learned_peers();
-    assert_eq!(pm.dials_in_flight.lock().automatic, 0, "nothing while networking is paused");
+    assert_eq!(
+        pm.dials_in_flight.lock().automatic,
+        0,
+        "nothing while networking is paused"
+    );
 
     pm.set_network_active(true);
     pm.dial_learned_peers();
@@ -412,7 +534,12 @@ async fn seeds_are_dialled_by_the_automatic_pass() {
     assert!(accepted.is_ok(), "the seed is dialled");
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        let conn_type = pm.peers.read().values().find(|h| h.info.addr == seed).map(|h| h.info.conn_type);
+        let conn_type = pm
+            .peers
+            .read()
+            .values()
+            .find(|h| h.info.addr == seed)
+            .map(|h| h.info.conn_type);
         if conn_type.is_some() {
             assert_eq!(conn_type, Some(ConnType::OutboundFullRelay));
             break;
@@ -428,7 +555,11 @@ fn tried_just_now(pm: &PeerManager, addrs: &[SocketAddr]) {
     for a in addrs {
         backoff.insert(
             *a,
-            ReconnectState { attempts: 0, next_attempt: Instant::now(), last_try: Some(Instant::now()) },
+            ReconnectState {
+                attempts: 0,
+                next_attempt: Instant::now(),
+                last_try: Some(Instant::now()),
+            },
         );
     }
 }
@@ -448,8 +579,16 @@ fn an_automatic_dial_passes_over_a_peer_it_just_tried() {
     tried_just_now(&pm, &addrs[1..]);
     for _ in 0..20 {
         let got = dialled(&pm);
-        assert_eq!(got.first(), Some(&addrs[0]), "the one not tried lately goes first: {got:?}");
-        assert_eq!(got.len(), MAX_OUTBOUND, "the passed-over ones fill the rest: {got:?}");
+        assert_eq!(
+            got.first(),
+            Some(&addrs[0]),
+            "the one not tried lately goes first: {got:?}"
+        );
+        assert_eq!(
+            got.len(),
+            MAX_OUTBOUND,
+            "the passed-over ones fill the rest: {got:?}"
+        );
     }
 }
 
@@ -500,7 +639,10 @@ fn automatic_dials_draw_tried_and_new_at_even_odds() {
             tried_first += 1;
         }
     }
-    assert!((140..=260).contains(&tried_first), "tried first in {tried_first} of 400");
+    assert!(
+        (140..=260).contains(&tried_first),
+        "tried first in {tried_first} of 400"
+    );
     let mut order = dial_order(&pm, &mut rng);
     order.sort();
     let mut all: Vec<SocketAddr> = tried.iter().chain(&new).copied().collect();
@@ -544,7 +686,10 @@ fn tried_dials_draw_a_bucket_before_an_entry() {
         }
     }
     // At most 8 of the ~58 buckets drawn belong to the big group.
-    assert!(big_first < 250, "the one group came first in {big_first} of 1000");
+    assert!(
+        big_first < 250,
+        "the one group came first in {big_first} of 1000"
+    );
 }
 
 /// Test-before-evict, end to end: a promotion into a taken tried slot puts
@@ -569,22 +714,33 @@ fn a_tried_collision_tests_the_incumbent() {
             .find(|c| book.tried_slot(&(*c).into()) == target)
             .expect("a colliding address");
         book.add(new, now);
-        assert!(!book.mark_good(new, now - 3600), "fixture: the slot is taken");
+        assert!(
+            !book.mark_good(new, now - 3600),
+            "fixture: the slot is taken"
+        );
         assert_eq!(book.select_tried_collision(), Some(PeerAddr::from(old)));
         (new, bucket)
     };
     learn(&pm, &[new]);
     let mut rng = rand::rngs::StdRng::seed_from_u64(3);
-    let feeler: Vec<SocketAddr> = pm.feeler_dial_order(&mut rng).map(|c| socket(c.addr)).collect();
+    let feeler: Vec<SocketAddr> = pm
+        .feeler_dial_order(&mut rng)
+        .map(|c| socket(c.addr))
+        .collect();
     assert_eq!(feeler[0], old, "the feeler tests the incumbent first");
-    let first = (0..64).filter(|_| dial_order(&pm, &mut rng)[0] == old).count();
+    let first = (0..64)
+        .filter(|_| dial_order(&pm, &mut rng)[0] == old)
+        .count();
     assert!(first < 64, "a full-relay dial draws it as any other entry");
 
     add_peer(&pm, outbound(1, old, ConnType::OutboundFullRelay));
     pm.resolve_tried_collisions();
     let book = pm.addrman.read();
     assert!(book.is_tried(&old.into()) && book.tried_bucket(&old.into()) == Some(slot));
-    assert!(!book.is_tried(&new.into()), "a connected incumbent keeps its slot");
+    assert!(
+        !book.is_tried(&new.into()),
+        "a connected incumbent keeps its slot"
+    );
     assert_eq!(book.select_tried_collision(), None);
 }
 
@@ -615,14 +771,21 @@ fn an_address_from_peers_dat_outside_the_old_top_256_is_a_dial_candidate() {
     let mut rng = rand::rngs::StdRng::seed_from_u64(5);
     let order = dial_order(&pm, &mut rng);
     assert_eq!(order.len(), 300, "every entry of the book is drawn");
-    assert!(order.contains(&oldest), "including the one the old preload left out");
+    assert!(
+        order.contains(&oldest),
+        "including the one the old preload left out"
+    );
 
     // And it is dialled: alone dialable, it takes a slot.
     leave_ibd(&pm);
     for a in &addrs[1..] {
         pm.reconnect_backoff.write().insert(
             *a,
-            ReconnectState { attempts: 1, next_attempt: Instant::now() + Duration::from_secs(600), last_try: None },
+            ReconnectState {
+                attempts: 1,
+                next_attempt: Instant::now() + Duration::from_secs(600),
+                last_try: None,
+            },
         );
     }
     assert_eq!(dialled(&pm), vec![oldest]);
@@ -654,7 +817,12 @@ fn an_address_with_eight_failed_attempts_is_drawn_about_a_28th_as_often() {
     let mut rng = rand::rngs::StdRng::seed_from_u64(9);
     let (mut fresh_first, mut failed_first) = (0u32, 0u32);
     for _ in 0..20_000 {
-        let first = socket(pm.automatic_dial_order(&mut rng).next().expect("a candidate").addr);
+        let first = socket(
+            pm.automatic_dial_order(&mut rng)
+                .next()
+                .expect("a candidate")
+                .addr,
+        );
         if failed.contains(&first) {
             failed_first += 1;
         } else {
@@ -662,7 +830,10 @@ fn an_address_with_eight_failed_attempts_is_drawn_about_a_28th_as_often() {
         }
     }
     let ratio = f64::from(failed_first) / f64::from(fresh_first);
-    assert!((1.0 / 40.0..1.0 / 18.0).contains(&ratio), "failed:fresh = {failed_first}:{fresh_first}");
+    assert!(
+        (1.0 / 40.0..1.0 / 18.0).contains(&ratio),
+        "failed:fresh = {failed_first}:{fresh_first}"
+    );
 }
 
 /// #1148: a candidate whose stored services lack the desirable ones is
@@ -695,8 +866,9 @@ fn a_candidate_on_a_bad_port_waits_for_fifty_tries() {
     let (pm, _dir) = mk_pm();
     leave_ibd(&pm);
     assert!(crate::net::is_bad_port(22) && !crate::net::is_bad_port(8333));
-    let ssh: Vec<SocketAddr> =
-        (0..BAD_PORT_SKIPS).map(|i| SocketAddr::new(own_group(i).ip(), 22)).collect();
+    let ssh: Vec<SocketAddr> = (0..BAD_PORT_SKIPS)
+        .map(|i| SocketAddr::new(own_group(i).ip(), 22))
+        .collect();
     learn(&pm, &ssh);
     assert_eq!(dialled(&pm).len(), 1, "one dial, at the fiftieth candidate");
 

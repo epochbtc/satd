@@ -189,15 +189,27 @@ struct MethodVersions {
 }
 
 const fn served(method: &'static str, since: &'static [u32]) -> MethodVersions {
-    MethodVersions { method, since, until: None }
+    MethodVersions {
+        method,
+        since,
+        until: None,
+    }
 }
 
 const V1_4: &[u32] = &[1, 4];
 const V1_6: &[u32] = &[1, 6];
 
 /// A method removed at `until`.
-const fn removed(method: &'static str, since: &'static [u32], until: &'static [u32]) -> MethodVersions {
-    MethodVersions { method, since, until: Some(until) }
+const fn removed(
+    method: &'static str,
+    since: &'static [u32],
+    until: &'static [u32],
+) -> MethodVersions {
+    MethodVersions {
+        method,
+        since,
+        until: Some(until),
+    }
 }
 
 /// Every method satd serves, with the versions it is served at. A method not
@@ -257,7 +269,9 @@ fn served_in(table: &[MethodVersions], method: &str, version: &ProtocolVersion) 
 /// tests that walk it.
 #[cfg(test)]
 pub(crate) fn all_methods() -> impl Iterator<Item = (&'static str, ProtocolVersion)> {
-    METHODS.iter().map(|m| (m.method, ProtocolVersion::new(m.since)))
+    METHODS
+        .iter()
+        .map(|m| (m.method, ProtocolVersion::new(m.since)))
 }
 
 #[cfg(test)]
@@ -288,7 +302,10 @@ mod tests {
         // 1.5 is a skipped number, served the 1.4 methods, as by ElectrumX.
         assert_eq!(answer(json!(["w", "1.5"])).as_deref(), Some("1.5"));
         // Sparrow.
-        assert_eq!(answer(json!(["w", ["1.3", "1.4.2"]])).as_deref(), Some("1.4.2"));
+        assert_eq!(
+            answer(json!(["w", ["1.3", "1.4.2"]])).as_deref(),
+            Some("1.4.2")
+        );
         // Electrum 4.7+, BDK.
         assert_eq!(answer(json!(["w", ["1.4", "1.6"]])).as_deref(), Some("1.6"));
         // Electrum's pending 1.7-only client, and a range reaching past 1.6.
@@ -326,8 +343,10 @@ mod tests {
     #[test]
     fn extra_arguments_are_ignored() {
         assert_eq!(
-            answer(json!(["electrum/4.6.2", ["1.4", "1.6"], "trailing_garbage1", 9999.9, {"dd": {}}]))
-                .as_deref(),
+            answer(
+                json!(["electrum/4.6.2", ["1.4", "1.6"], "trailing_garbage1", 9999.9, {"dd": {}}])
+            )
+            .as_deref(),
             Some("1.6")
         );
         assert_eq!(answer(json!(["w", "1.3", "1.6"])), None);
@@ -374,7 +393,11 @@ mod tests {
     fn a_method_outside_its_versions_is_not_served() {
         let table = [
             served("added.later", &[1, 6]),
-            MethodVersions { method: "removed.later", since: V1_4, until: Some(&[1, 6]) },
+            MethodVersions {
+                method: "removed.later",
+                since: V1_4,
+                until: Some(&[1, 6]),
+            },
         ];
         let v = ProtocolVersion::parse;
         assert!(!served_in(&table, "added.later", &v("1.4")));
@@ -405,14 +428,21 @@ mod tests {
             "blockchain.scripthash.unsubscribe",
             "blockchain.tweaks.subscribe",
         ] {
-            assert!(method_served(m, &v("1.4")) && method_served(m, &v("1.6")), "{m}");
+            assert!(
+                method_served(m, &v("1.4")) && method_served(m, &v("1.6")),
+                "{m}"
+            );
         }
     }
 
     #[test]
     fn every_method_is_served_at_its_first_version() {
         for m in METHODS {
-            assert!(method_served(m.method, &ProtocolVersion::new(m.since)), "{}", m.method);
+            assert!(
+                method_served(m.method, &ProtocolVersion::new(m.since)),
+                "{}",
+                m.method
+            );
         }
     }
 

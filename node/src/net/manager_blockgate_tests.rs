@@ -42,14 +42,24 @@ fn peer_manager_over(chain_state: Arc<ChainState>) -> Arc<PeerManager> {
     let fee_estimator = Arc::new(FeeEstimator::new());
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     std::mem::forget(shutdown_tx);
-    PeerManager::new(chain_state, mempool, fee_estimator, Network::Regtest, shutdown_rx)
+    PeerManager::new(
+        chain_state,
+        mempool,
+        fee_estimator,
+        Network::Regtest,
+        shutdown_rx,
+    )
 }
 
 /// Hand `block` to the manager as peer 7's and wait until the block
 /// processor is done with it.
 fn deliver(pm: &PeerManager, block: &bitcoin::Block) {
     let flow = Arc::new(PeerFlow::new());
-    pm.handle_message(7, NetworkMessage::Block(block.clone()), InFlight::new(Some(flow.clone())));
+    pm.handle_message(
+        7,
+        NetworkMessage::Block(block.clone()),
+        InFlight::new(Some(flow.clone())),
+    );
     let deadline = Instant::now() + Duration::from_secs(10);
     while !flow.is_idle() {
         assert!(Instant::now() < deadline, "the block was not processed");
@@ -68,28 +78,57 @@ fn the_gate_follows_cores_accept_block() {
     let (cs, dir, hashes) = chain(300);
     // A fork 200 blocks deep claims too little work: nothing is stored.
     let deep = fork(&hashes, 100, 1, 1_000_000);
-    assert_eq!(cs.peer_block_gate(&deep[0].header, false), PeerBlockGate::TooLittleChainwork);
-    assert_eq!(cs.peer_block_gate(&deep[0].header, true), PeerBlockGate::TooLittleChainwork, "asked for or not");
+    assert_eq!(
+        cs.peer_block_gate(&deep[0].header, false),
+        PeerBlockGate::TooLittleChainwork
+    );
+    assert_eq!(
+        cs.peer_block_gate(&deep[0].header, true),
+        PeerBlockGate::TooLittleChainwork,
+        "asked for or not"
+    );
     // A fork 50 deep passes the threshold but has less work than the tip:
     // its header is indexed, its block only if it was asked for.
     let near = fork(&hashes, 250, 1, 1_000_000);
-    assert_eq!(cs.peer_block_gate(&near[0].header, false), PeerBlockGate::HeaderOnly("less work than the tip"));
-    assert_eq!(cs.peer_block_gate(&near[0].header, true), PeerBlockGate::Process);
+    assert_eq!(
+        cs.peer_block_gate(&near[0].header, false),
+        PeerBlockGate::HeaderOnly("less work than the tip")
+    );
+    assert_eq!(
+        cs.peer_block_gate(&near[0].header, true),
+        PeerBlockGate::Process
+    );
     // As much work as the tip is enough (`fHasMoreOrSameWork`).
     let sibling = fork(&hashes, 299, 1, 1_000_000);
-    assert_eq!(cs.peer_block_gate(&sibling[0].header, false), PeerBlockGate::Process);
+    assert_eq!(
+        cs.peer_block_gate(&sibling[0].header, false),
+        PeerBlockGate::Process
+    );
     // The next block is processed.
     let next = build_test_block(hashes[300], 301, T0 + 301);
-    assert_eq!(cs.peer_block_gate(&next.header, false), PeerBlockGate::Process);
+    assert_eq!(
+        cs.peer_block_gate(&next.header, false),
+        PeerBlockGate::Process
+    );
 
     // `fTooFarAhead`: on a header chain running past the tip, a block more
     // than 288 above it is not stored unless asked for.
     let ahead = fork(&hashes, 300, 290, 0);
     let headers: Vec<_> = ahead.iter().map(|b| b.header).collect();
     assert_eq!(cs.accept_headers(&headers).0, 290);
-    assert_eq!(cs.peer_block_gate(&ahead[287].header, false), PeerBlockGate::Process, "288 above the tip");
-    assert_eq!(cs.peer_block_gate(&ahead[288].header, false), PeerBlockGate::HeaderOnly("too far ahead of the tip"));
-    assert_eq!(cs.peer_block_gate(&ahead[288].header, true), PeerBlockGate::Process);
+    assert_eq!(
+        cs.peer_block_gate(&ahead[287].header, false),
+        PeerBlockGate::Process,
+        "288 above the tip"
+    );
+    assert_eq!(
+        cs.peer_block_gate(&ahead[288].header, false),
+        PeerBlockGate::HeaderOnly("too far ahead of the tip")
+    );
+    assert_eq!(
+        cs.peer_block_gate(&ahead[288].header, true),
+        PeerBlockGate::Process
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -103,9 +142,15 @@ fn an_unrequested_block_below_the_minimum_chain_work_is_not_stored() {
     let b1 = build_test_block(genesis, 1, T0 + 1);
     // The threshold itself is the minimum chain work here, so the header is
     // refused outright; once indexed by a requested path, only the block is.
-    assert_eq!(cs.peer_block_gate(&b1.header, false), PeerBlockGate::TooLittleChainwork);
+    assert_eq!(
+        cs.peer_block_gate(&b1.header, false),
+        PeerBlockGate::TooLittleChainwork
+    );
     cs.accept_header(&b1.header).unwrap();
-    assert_eq!(cs.peer_block_gate(&b1.header, false), PeerBlockGate::HeaderOnly("below the minimum chain work"));
+    assert_eq!(
+        cs.peer_block_gate(&b1.header, false),
+        PeerBlockGate::HeaderOnly("below the minimum chain work")
+    );
     assert_eq!(cs.peer_block_gate(&b1.header, true), PeerBlockGate::Process);
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -121,11 +166,19 @@ fn unrequested_low_work_blocks_are_not_written() {
 
     let deep = fork(&hashes, 100, 1, 1_000_000);
     deliver(&pm, &deep[0]);
-    assert_eq!(status(&cs, &deep[0]), None, "the deep fork's block left an index entry");
+    assert_eq!(
+        status(&cs, &deep[0]),
+        None,
+        "the deep fork's block left an index entry"
+    );
 
     let near = fork(&hashes, 250, 1, 1_000_000);
     deliver(&pm, &near[0]);
-    assert_eq!(status(&cs, &near[0]), Some(BlockStatus::HeaderOnly), "the near fork's block was stored");
+    assert_eq!(
+        status(&cs, &near[0]),
+        Some(BlockStatus::HeaderOnly),
+        "the near fork's block was stored"
+    );
 
     // The same block, asked for, is stored.
     pm.note_blocks_requested(7, &[near[0].block_hash()]);
@@ -159,9 +212,15 @@ fn a_block_fetched_by_getblockfrompeer_passes_the_gate() {
     let pm = peer_manager_over(cs.clone());
     let near = fork(&hashes, 250, 1, 1_000_000);
     cs.accept_header(&near[0].header).unwrap();
-    pm.block_refetch.write().insert((near[0].block_hash(), 7), Instant::now());
+    pm.block_refetch
+        .write()
+        .insert((near[0].block_hash(), 7), Instant::now());
     deliver(&pm, &near[0]);
-    assert_eq!(status(&cs, &near[0]), Some(BlockStatus::DataStored), "the fetched block was dropped");
+    assert_eq!(
+        status(&cs, &near[0]),
+        Some(BlockStatus::DataStored),
+        "the fetched block was dropped"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -186,9 +245,21 @@ fn unrequested_low_work_blocks_are_not_written_during_ibd() {
     // A block on the best-header chain is still stored, unrequested.
     pm.handle_block_ibd(7, ahead[0].clone(), false, InFlight::new(None));
     pm.wait_for_ibd_stores();
-    assert_eq!(status(&cs, &deep[0]), None, "the deep fork's block left an index entry");
-    assert_eq!(status(&cs, &near[0]), Some(BlockStatus::HeaderOnly), "the near fork's block was stored");
-    assert_ne!(status(&cs, &ahead[0]), Some(BlockStatus::HeaderOnly), "the best-header chain's block was not stored");
+    assert_eq!(
+        status(&cs, &deep[0]),
+        None,
+        "the deep fork's block left an index entry"
+    );
+    assert_eq!(
+        status(&cs, &near[0]),
+        Some(BlockStatus::HeaderOnly),
+        "the near fork's block was stored"
+    );
+    assert_ne!(
+        status(&cs, &ahead[0]),
+        Some(BlockStatus::HeaderOnly),
+        "the best-header chain's block was not stored"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -204,11 +275,19 @@ fn the_ibd_gate_follows_the_best_header_branch_below_the_tip() {
     let branch = fork(&hashes, 290, 110, 3);
     let headers: Vec<_> = branch.iter().map(|b| b.header).collect();
     assert_eq!(cs.accept_headers(&headers).0, 110);
-    assert_eq!(cs.best_header_hash(), branch.last().unwrap().block_hash(), "fixture: the branch is the best header chain");
+    assert_eq!(
+        cs.best_header_hash(),
+        branch.last().unwrap().block_hash(),
+        "fixture: the branch is the best header chain"
+    );
     *pm.ibd.write() = Some(IbdScheduler::new(400, 300, &cs, 1024));
     // Height 295: below the tip, on the best-header branch.
     pm.handle_block_ibd(7, branch[4].clone(), false, InFlight::new(None));
     pm.wait_for_ibd_stores();
-    assert_eq!(status(&cs, &branch[4]), Some(BlockStatus::DataStored), "the best-header branch's block was not stored");
+    assert_eq!(
+        status(&cs, &branch[4]),
+        Some(BlockStatus::DataStored),
+        "the best-header branch's block was not stored"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -39,10 +39,10 @@ mod parity;
 mod electrum_status;
 // Esplora paging (`after_txid`, block page bounds) and tx JSON field omission
 // against upstream Esplora's rules.
-#[path = "e2e/esplora_paging.rs"]
-mod esplora_paging;
 #[path = "e2e/esplora_asof.rs"]
 mod esplora_asof;
+#[path = "e2e/esplora_paging.rs"]
+mod esplora_paging;
 // Esplora `/block/:hash/txs/summary` against figures computed from the
 // transactions themselves.
 #[path = "e2e/esplora_block_summary.rs"]
@@ -53,18 +53,17 @@ mod esplora_block_summary;
 mod esplora_address_summary;
 // Esplora `sigops` in the transaction JSON for each kind of spend, and
 // `GET /txs/outspends` against the single-transaction route.
-#[path = "e2e/esplora_sigops_outspends.rs"]
-mod esplora_sigops_outspends;
 #[path = "e2e/electrum_asof.rs"]
 mod electrum_asof;
+#[path = "e2e/esplora_sigops_outspends.rs"]
+mod esplora_sigops_outspends;
 // Electrum protocol 1.6: package broadcast (CPFP) and the canonical mempool
 // order, through a client that negotiates 1.6.
 #[path = "e2e/electrum_protocol.rs"]
 mod electrum_protocol;
 
 use common::{
-    DeterministicWallet, TestNode, build_signed_p2wpkh_spend_from_block1_coinbase,
-    e2e_test_timeout,
+    DeterministicWallet, TestNode, build_signed_p2wpkh_spend_from_block1_coinbase, e2e_test_timeout,
 };
 use std::path::PathBuf;
 use std::process::Command;
@@ -400,7 +399,10 @@ fn test_e2e_jsonrpc_tx_broadcast_and_mempool() {
         "tx should show 1 confirmation; got {}",
         raw
     );
-    assert_eq!(raw["result"]["blockhash"], serde_json::json!(confirming_hash));
+    assert_eq!(
+        raw["result"]["blockhash"],
+        serde_json::json!(confirming_hash)
+    );
     assert_eq!(raw["result"].get("blockheight"), None, "{raw}");
 
     e2e.node.stop();
@@ -1409,7 +1411,10 @@ impl RawElectrum {
             .set_read_timeout(Some(e2e_test_timeout(20)))
             .expect("read timeout");
         let reader = std::io::BufReader::new(stream.try_clone().expect("clone"));
-        RawElectrum { reader, writer: stream }
+        RawElectrum {
+            reader,
+            writer: stream,
+        }
     }
 
     fn send(&mut self, line: &str) {
@@ -1481,7 +1486,13 @@ fn fund_taproot_output(
     wallet: &DeterministicWallet,
     secp: &bitcoin::secp256k1::Secp256k1<bitcoin::secp256k1::All>,
     fee: u64,
-) -> (bitcoin::Txid, u32, u64, bitcoin::ScriptBuf, bitcoin::secp256k1::Keypair) {
+) -> (
+    bitcoin::Txid,
+    u32,
+    u64,
+    bitcoin::ScriptBuf,
+    bitcoin::secp256k1::Keypair,
+) {
     let (kp, spk) = common::p2tr_keypath_output(secp, [0x33; 32]);
     let rpc = e2e.node.rpc_handle();
     rpc.mine(101, &wallet.address.to_string());
@@ -1526,7 +1537,11 @@ fn test_e2e_electrum_tweaks_subscribe_streams_result_then_notifications_then_don
 
     // Result: exactly the first height, and it carries the eligible transaction.
     let first_obj = first.as_object().expect("height map");
-    assert_eq!(first_obj.len(), 1, "the result is ONE height, not the range");
+    assert_eq!(
+        first_obj.len(),
+        1,
+        "the result is ONE height, not the range"
+    );
     let txs = first[height.to_string()]
         .as_object()
         .expect("height object");
@@ -1548,7 +1563,13 @@ fn test_e2e_electrum_tweaks_subscribe_streams_result_then_notifications_then_don
     let heights: Vec<String> = notifications
         .iter()
         .filter(|m| m.get("message").is_none())
-        .flat_map(|m| m.as_object().expect("map").keys().cloned().collect::<Vec<_>>())
+        .flat_map(|m| {
+            m.as_object()
+                .expect("map")
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>()
+        })
         .collect();
     assert_eq!(heights, vec!["103".to_string(), "104".to_string()]);
     assert_eq!(
@@ -1587,10 +1608,15 @@ fn test_e2e_electrum_tweaks_subscribe_cut_through_follows_historical_mode() {
     let (raw, _txid) = common::build_signed_p2tr_keypath_spend(
         &secp,
         &kp,
-        bitcoin::OutPoint { txid: funding_txid, vout: 0 },
+        bitcoin::OutPoint {
+            txid: funding_txid,
+            vout: 0,
+        },
         spk,
         value,
-        DeterministicWallet::from_secret([0x44; 32]).address.script_pubkey(),
+        DeterministicWallet::from_secret([0x44; 32])
+            .address
+            .script_pubkey(),
         fee,
     );
     rpc.send_raw_tx(&raw);
@@ -1635,8 +1661,14 @@ fn test_e2e_electrum_tweaks_subscribe_keeps_every_output_of_a_surviving_entry() 
         &rpc,
         &wallet,
         vec![
-            TxOut { value: Amount::from_sat(each), script_pubkey: spk.clone() },
-            TxOut { value: Amount::from_sat(each), script_pubkey: spk.clone() },
+            TxOut {
+                value: Amount::from_sat(each),
+                script_pubkey: spk.clone(),
+            },
+            TxOut {
+                value: Amount::from_sat(each),
+                script_pubkey: spk.clone(),
+            },
         ],
     );
     rpc.send_raw_tx(&raw);
@@ -1670,10 +1702,15 @@ fn test_e2e_electrum_tweaks_subscribe_keeps_every_output_of_a_surviving_entry() 
     let (raw_spend, _) = common::build_signed_p2tr_keypath_spend(
         &secp,
         &kp,
-        OutPoint { txid: funding_txid, vout: 0 },
+        OutPoint {
+            txid: funding_txid,
+            vout: 0,
+        },
         spk.clone(),
         each,
-        DeterministicWallet::from_secret([0x44; 32]).address.script_pubkey(),
+        DeterministicWallet::from_secret([0x44; 32])
+            .address
+            .script_pubkey(),
         10_000,
     );
     rpc.send_raw_tx(&raw_spend);
@@ -1689,10 +1726,15 @@ fn test_e2e_electrum_tweaks_subscribe_keeps_every_output_of_a_surviving_entry() 
     let (raw_spend2, _) = common::build_signed_p2tr_keypath_spend(
         &secp,
         &kp,
-        OutPoint { txid: funding_txid, vout: 1 },
+        OutPoint {
+            txid: funding_txid,
+            vout: 1,
+        },
         spk,
         each,
-        DeterministicWallet::from_secret([0x55; 32]).address.script_pubkey(),
+        DeterministicWallet::from_secret([0x55; 32])
+            .address
+            .script_pubkey(),
         10_000,
     );
     rpc.send_raw_tx(&raw_spend2);
@@ -1781,7 +1823,10 @@ fn test_e2e_electrum_tweaks_subscribe_answers_above_the_tip_without_refusing() {
     let above = tip + 50;
     let (first, notifications) = cli.tweaks_subscribe(above as u32, 1, true);
     assert!(
-        first[above.to_string()].as_object().expect("height object").is_empty(),
+        first[above.to_string()]
+            .as_object()
+            .expect("height object")
+            .is_empty(),
         "a height above the tip is an empty answer, not an error"
     );
     assert_eq!(
@@ -1822,7 +1867,10 @@ fn test_e2e_electrum_request_pipelined_during_a_tweak_stream_is_answered() {
             break;
         }
     }
-    assert!(answered, "the pipelined request was swallowed by the stream");
+    assert!(
+        answered,
+        "the pipelined request was swallowed by the stream"
+    );
     e2e.node.stop();
 }
 
@@ -1881,8 +1929,11 @@ fn test_e2e_electrum_server_name_signals_compatibility_and_is_configurable() {
 
     // The P2P surface is a different name entirely and this must not touch it:
     // peers see satd's own user agent, not a compatibility claim.
-    let subver = e2e.node.rpc_handle().call("getnetworkinfo", vec![]).expect("getnetworkinfo")
-        ["result"]["subversion"]
+    let subver = e2e
+        .node
+        .rpc_handle()
+        .call("getnetworkinfo", vec![])
+        .expect("getnetworkinfo")["result"]["subversion"]
         .as_str()
         .expect("subversion")
         .to_string();
@@ -2498,20 +2549,31 @@ fn test_e2e_electrum_estimatefee_and_relayfee() {
     );
     assert!(info.mempoolminfee >= relay, "{info:?}");
     assert!(info.incrementalrelayfee > 0.0, "{info:?}");
-    assert!(client.relay_fee().is_err(), "blockchain.relayfee is removed at 1.6");
+    assert!(
+        client.relay_fee().is_err(),
+        "blockchain.relayfee is removed at 1.6"
+    );
 
     let mut cli = RawElectrum::connect(e2e.electrum_port.expect("electrum port"));
     cli.send(r#"{"id":1,"method":"server.version","params":["test","1.4"]}"#);
     assert_eq!(cli.recv()["result"][1], "1.4");
     cli.send(r#"{"id":2,"method":"blockchain.relayfee"}"#);
-    assert_eq!(cli.recv()["result"].as_f64(), Some(relay), "relayfee at 1.4 is minrelaytxfee");
+    assert_eq!(
+        cli.recv()["result"].as_f64(),
+        Some(relay),
+        "relayfee at 1.4 is minrelaytxfee"
+    );
 
     // estimate_fee on a fresh chain has no real estimator data;
     // satd returns -1.0 as a sentinel. Either a positive estimate
     // OR -1.0 is acceptable wire behavior — both are valid Electrum
     // responses (-1.0 mirrors what Electrum servers return when they
     // can't form an estimate). Both of Core's modes are taken.
-    for mode in [None, Some(EstimationMode::Economical), Some(EstimationMode::Conservative)] {
+    for mode in [
+        None,
+        Some(EstimationMode::Economical),
+        Some(EstimationMode::Conservative),
+    ] {
         let est = client.estimate_fee(6, mode).expect("estimate_fee");
         assert!(
             est == -1.0 || est > 0.0,
@@ -3542,14 +3604,10 @@ fn test_e2e_typed_esplora_height_and_tip_typed() {
     assert_eq!(h5, 5, "after mining 5, tip is 5");
 
     let tip = esplora.get_tip_hash().expect("typed tip hash");
-    let height_5_hash = esplora
-        .get_block_hash(5)
-        .expect("typed get_block_hash(5)");
+    let height_5_hash = esplora.get_block_hash(5).expect("typed get_block_hash(5)");
     assert_eq!(tip, height_5_hash, "tip hash must match height-5 hash");
 
-    let genesis = esplora
-        .get_block_hash(0)
-        .expect("typed get_block_hash(0)");
+    let genesis = esplora.get_block_hash(0).expect("typed get_block_hash(0)");
     assert_eq!(
         genesis.to_string(),
         bitcoin::constants::genesis_block(bitcoin::Network::Regtest)
@@ -3588,15 +3646,16 @@ fn test_e2e_typed_esplora_broadcast_and_tx_info() {
         1000,
     );
     let txid = bitcoin::Txid::from_str(&txid_hex).expect("valid txid");
-    let signed_tx: bitcoin::Transaction = bitcoin::consensus::deserialize(
-        &hex::decode(&raw_hex).expect("raw_hex is valid hex"),
-    )
-    .expect("decode signed tx");
+    let signed_tx: bitcoin::Transaction =
+        bitcoin::consensus::deserialize(&hex::decode(&raw_hex).expect("raw_hex is valid hex"))
+            .expect("decode signed tx");
 
     // `broadcast(&Transaction)` posts to `/tx` with the lowercase-hex
     // body the typed client encodes itself — exercises the same wire
     // shape mempool.space's frontend uses.
-    esplora.broadcast(&signed_tx).expect("typed esplora broadcast");
+    esplora
+        .broadcast(&signed_tx)
+        .expect("typed esplora broadcast");
 
     // `get_tx_info` deserializes the full `Tx` shape (txid, version,
     // locktime, vin, vout, size, weight, status, fee). Missing or
@@ -3689,7 +3748,10 @@ fn test_e2e_typed_esplora_fee_estimates_typed() {
     // On regtest the values are stub-y, so we only assert
     // shape-survival: every value must be a non-NaN finite f64.
     for (target, fee) in &estimates {
-        assert!(*target >= 1, "fee-estimate target must be a positive integer");
+        assert!(
+            *target >= 1,
+            "fee-estimate target must be a positive integer"
+        );
         assert!(
             fee.is_finite(),
             "fee-estimate value for target {} must be finite, got {}",
@@ -3762,10 +3824,9 @@ fn test_e2e_typed_esplora_tx_status_via_typed_client() {
         1000,
     );
     let txid = bitcoin::Txid::from_str(&txid_hex).expect("valid txid");
-    let signed_tx: bitcoin::Transaction = bitcoin::consensus::deserialize(
-        &hex::decode(&raw_hex).expect("raw_hex is valid hex"),
-    )
-    .expect("decode signed tx");
+    let signed_tx: bitcoin::Transaction =
+        bitcoin::consensus::deserialize(&hex::decode(&raw_hex).expect("raw_hex is valid hex"))
+            .expect("decode signed tx");
     esplora.broadcast(&signed_tx).expect("typed broadcast");
 
     // `get_tx_status` returns the lean `TxStatus` shape directly
@@ -3840,30 +3901,54 @@ fn test_e2e_signpsbtwithkey_p2wpkh_roundtrip() {
         .args(["generatetoaddress", "101", &src])
         .output()
         .expect("generatetoaddress");
-    assert!(g.status.success(), "generatetoaddress: {}", String::from_utf8_lossy(&g.stderr));
+    assert!(
+        g.status.success(),
+        "generatetoaddress: {}",
+        String::from_utf8_lossy(&g.stderr)
+    );
 
     // Resolve block-1 coinbase txid.
-    let h1 = e2e.node.rpc_call_with_params("getblockhash", vec![serde_json::json!(1)]).unwrap();
+    let h1 = e2e
+        .node
+        .rpc_call_with_params("getblockhash", vec![serde_json::json!(1)])
+        .unwrap();
     let block1_hash = h1["result"].as_str().expect("block1 hash");
     let b1 = e2e
         .node
-        .rpc_call_with_params("getblock", vec![serde_json::json!(block1_hash), serde_json::json!(1)])
+        .rpc_call_with_params(
+            "getblock",
+            vec![serde_json::json!(block1_hash), serde_json::json!(1)],
+        )
         .unwrap();
-    let cb_txid = b1["result"]["tx"][0].as_str().expect("coinbase txid").to_string();
+    let cb_txid = b1["result"]["tx"][0]
+        .as_str()
+        .expect("coinbase txid")
+        .to_string();
 
     // createpsbt spending the coinbase, sending most of it to a second address.
-    let dest = DeterministicWallet::from_secret([0x43u8; 32]).address.to_string();
+    let dest = DeterministicWallet::from_secret([0x43u8; 32])
+        .address
+        .to_string();
     let inputs = serde_json::json!([{ "txid": cb_txid, "vout": 0 }]);
     let outputs = serde_json::json!({ dest: 49.999 });
-    let created = e2e.node.rpc_call_with_params("createpsbt", vec![inputs, outputs]).unwrap();
-    let unsigned = created["result"].as_str().expect("createpsbt psbt").to_string();
+    let created = e2e
+        .node
+        .rpc_call_with_params("createpsbt", vec![inputs, outputs])
+        .unwrap();
+    let unsigned = created["result"]
+        .as_str()
+        .expect("createpsbt psbt")
+        .to_string();
 
     // utxoupdatepsbt populates witness_utxo from chainstate.
     let updated = e2e
         .node
         .rpc_call_with_params("utxoupdatepsbt", vec![serde_json::json!(unsigned)])
         .unwrap();
-    let updated_psbt = updated["result"].as_str().expect("utxoupdatepsbt psbt").to_string();
+    let updated_psbt = updated["result"]
+        .as_str()
+        .expect("utxoupdatepsbt psbt")
+        .to_string();
 
     // Sign locally: WIF goes in on stdin, signed PSBT comes out on stdout.
     let mut child = sat_cli_for(&e2e.node)
@@ -3887,16 +3972,32 @@ fn test_e2e_signpsbtwithkey_p2wpkh_roundtrip() {
         signed_out.status.code(),
         String::from_utf8_lossy(&signed_out.stderr)
     );
-    let signed_psbt = String::from_utf8(signed_out.stdout).unwrap().trim().to_string();
-    assert_ne!(signed_psbt, updated_psbt, "signed PSBT must differ from unsigned");
+    let signed_psbt = String::from_utf8(signed_out.stdout)
+        .unwrap()
+        .trim()
+        .to_string();
+    assert_ne!(
+        signed_psbt, updated_psbt,
+        "signed PSBT must differ from unsigned"
+    );
 
     // finalizepsbt assembles the witness from our partial_sig.
     let finalized = e2e
         .node
-        .rpc_call_with_params("finalizepsbt", vec![serde_json::json!(signed_psbt), serde_json::json!(true)])
+        .rpc_call_with_params(
+            "finalizepsbt",
+            vec![serde_json::json!(signed_psbt), serde_json::json!(true)],
+        )
         .unwrap();
-    assert_eq!(finalized["result"]["complete"], serde_json::json!(true), "finalize: {finalized}");
-    let raw_hex = finalized["result"]["hex"].as_str().expect("final tx hex").to_string();
+    assert_eq!(
+        finalized["result"]["complete"],
+        serde_json::json!(true),
+        "finalize: {finalized}"
+    );
+    let raw_hex = finalized["result"]["hex"]
+        .as_str()
+        .expect("final tx hex")
+        .to_string();
 
     // Broadcast — acceptance proves the client-side signature is consensus-valid.
     let sent = e2e
@@ -3911,7 +4012,10 @@ fn test_e2e_signpsbtwithkey_p2wpkh_roundtrip() {
     // Confirm it: mine one block, mempool should drain.
     let _ = e2e
         .node
-        .rpc_call_with_params("generatetoaddress", vec![serde_json::json!(1), serde_json::json!(src)])
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![serde_json::json!(1), serde_json::json!(src)],
+        )
         .unwrap();
     let mempool = e2e.node.rpc_call("getrawmempool").unwrap();
     assert_eq!(
@@ -3942,20 +4046,31 @@ fn test_e2e_signpsbtwithkey_missing_utxo_exits_2() {
         .expect("generatetoaddress");
     assert!(g.status.success());
 
-    let h1 = e2e.node.rpc_call_with_params("getblockhash", vec![serde_json::json!(1)]).unwrap();
+    let h1 = e2e
+        .node
+        .rpc_call_with_params("getblockhash", vec![serde_json::json!(1)])
+        .unwrap();
     let block1_hash = h1["result"].as_str().unwrap();
     let b1 = e2e
         .node
-        .rpc_call_with_params("getblock", vec![serde_json::json!(block1_hash), serde_json::json!(1)])
+        .rpc_call_with_params(
+            "getblock",
+            vec![serde_json::json!(block1_hash), serde_json::json!(1)],
+        )
         .unwrap();
     let cb_txid = b1["result"]["tx"][0].as_str().unwrap().to_string();
 
-    let dest = DeterministicWallet::from_secret([0x43u8; 32]).address.to_string();
+    let dest = DeterministicWallet::from_secret([0x43u8; 32])
+        .address
+        .to_string();
     let created = e2e
         .node
         .rpc_call_with_params(
             "createpsbt",
-            vec![serde_json::json!([{ "txid": cb_txid, "vout": 0 }]), serde_json::json!({ dest: 49.999 })],
+            vec![
+                serde_json::json!([{ "txid": cb_txid, "vout": 0 }]),
+                serde_json::json!({ dest: 49.999 }),
+            ],
         )
         .unwrap();
     // NOTE: deliberately skip utxoupdatepsbt, so witness_utxo is absent.
@@ -3969,10 +4084,19 @@ fn test_e2e_signpsbtwithkey_missing_utxo_exits_2() {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn");
-    child.stdin.take().unwrap().write_all(format!("{wif}\n").as_bytes()).unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(format!("{wif}\n").as_bytes())
+        .unwrap();
     let out = child.wait_with_output().unwrap();
 
-    assert_eq!(out.status.code(), Some(2), "missing witness_utxo must exit 2");
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "missing witness_utxo must exit 2"
+    );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         stderr.contains("missing witness_utxo"),
@@ -4013,20 +4137,31 @@ fn test_e2e_signpsbtwithkey_xpriv_roundtrip() {
         .expect("generatetoaddress");
     assert!(g.status.success());
 
-    let h1 = e2e.node.rpc_call_with_params("getblockhash", vec![serde_json::json!(1)]).unwrap();
+    let h1 = e2e
+        .node
+        .rpc_call_with_params("getblockhash", vec![serde_json::json!(1)])
+        .unwrap();
     let block1_hash = h1["result"].as_str().unwrap();
     let b1 = e2e
         .node
-        .rpc_call_with_params("getblock", vec![serde_json::json!(block1_hash), serde_json::json!(1)])
+        .rpc_call_with_params(
+            "getblock",
+            vec![serde_json::json!(block1_hash), serde_json::json!(1)],
+        )
         .unwrap();
     let cb_txid = b1["result"]["tx"][0].as_str().unwrap().to_string();
 
-    let dest = DeterministicWallet::from_secret([0x43u8; 32]).address.to_string();
+    let dest = DeterministicWallet::from_secret([0x43u8; 32])
+        .address
+        .to_string();
     let created = e2e
         .node
         .rpc_call_with_params(
             "createpsbt",
-            vec![serde_json::json!([{ "txid": cb_txid, "vout": 0 }]), serde_json::json!({ dest: 49.999 })],
+            vec![
+                serde_json::json!([{ "txid": cb_txid, "vout": 0 }]),
+                serde_json::json!({ dest: 49.999 }),
+            ],
         )
         .unwrap();
     let unsigned = created["result"].as_str().unwrap().to_string();
@@ -4063,9 +4198,16 @@ fn test_e2e_signpsbtwithkey_xpriv_roundtrip() {
 
     let finalized = e2e
         .node
-        .rpc_call_with_params("finalizepsbt", vec![serde_json::json!(signed_psbt), serde_json::json!(true)])
+        .rpc_call_with_params(
+            "finalizepsbt",
+            vec![serde_json::json!(signed_psbt), serde_json::json!(true)],
+        )
         .unwrap();
-    assert_eq!(finalized["result"]["complete"], serde_json::json!(true), "finalize: {finalized}");
+    assert_eq!(
+        finalized["result"]["complete"],
+        serde_json::json!(true),
+        "finalize: {finalized}"
+    );
     let raw_hex = finalized["result"]["hex"].as_str().unwrap().to_string();
 
     let sent = e2e
@@ -4120,20 +4262,31 @@ fn test_e2e_signpsbtwithsigner_p2wpkh_roundtrip() {
         .expect("generatetoaddress");
     assert!(g.status.success());
 
-    let h1 = e2e.node.rpc_call_with_params("getblockhash", vec![serde_json::json!(1)]).unwrap();
+    let h1 = e2e
+        .node
+        .rpc_call_with_params("getblockhash", vec![serde_json::json!(1)])
+        .unwrap();
     let block1_hash = h1["result"].as_str().unwrap();
     let b1 = e2e
         .node
-        .rpc_call_with_params("getblock", vec![serde_json::json!(block1_hash), serde_json::json!(1)])
+        .rpc_call_with_params(
+            "getblock",
+            vec![serde_json::json!(block1_hash), serde_json::json!(1)],
+        )
         .unwrap();
     let cb_txid = b1["result"]["tx"][0].as_str().unwrap().to_string();
 
-    let dest = DeterministicWallet::from_secret([0x43u8; 32]).address.to_string();
+    let dest = DeterministicWallet::from_secret([0x43u8; 32])
+        .address
+        .to_string();
     let created = e2e
         .node
         .rpc_call_with_params(
             "createpsbt",
-            vec![serde_json::json!([{ "txid": cb_txid, "vout": 0 }]), serde_json::json!({ dest: 49.999 })],
+            vec![
+                serde_json::json!([{ "txid": cb_txid, "vout": 0 }]),
+                serde_json::json!({ dest: 49.999 }),
+            ],
         )
         .unwrap();
     let unsigned = created["result"].as_str().unwrap().to_string();
@@ -4160,9 +4313,16 @@ fn test_e2e_signpsbtwithsigner_p2wpkh_roundtrip() {
 
     let finalized = e2e
         .node
-        .rpc_call_with_params("finalizepsbt", vec![serde_json::json!(signed_psbt), serde_json::json!(true)])
+        .rpc_call_with_params(
+            "finalizepsbt",
+            vec![serde_json::json!(signed_psbt), serde_json::json!(true)],
+        )
         .unwrap();
-    assert_eq!(finalized["result"]["complete"], serde_json::json!(true), "finalize: {finalized}");
+    assert_eq!(
+        finalized["result"]["complete"],
+        serde_json::json!(true),
+        "finalize: {finalized}"
+    );
     let raw_hex = finalized["result"]["hex"].as_str().unwrap().to_string();
 
     let sent = e2e
@@ -4185,7 +4345,9 @@ fn test_e2e_signpsbtwithsigner_rejects_tampered_psbt() {
     use std::os::unix::fs::PermissionsExt;
 
     let mut e2e = E2eNode::boot_with(&[]);
-    let dest = DeterministicWallet::from_secret([0x56u8; 32]).address.to_string();
+    let dest = DeterministicWallet::from_secret([0x56u8; 32])
+        .address
+        .to_string();
     let dummy_txid = "0000000000000000000000000000000000000000000000000000000000000000";
 
     // The PSBT we hand to the signer.
@@ -4193,7 +4355,10 @@ fn test_e2e_signpsbtwithsigner_rejects_tampered_psbt() {
         .node
         .rpc_call_with_params(
             "createpsbt",
-            vec![serde_json::json!([{ "txid": dummy_txid, "vout": 0 }]), serde_json::json!({ &dest: 1.0 })],
+            vec![
+                serde_json::json!([{ "txid": dummy_txid, "vout": 0 }]),
+                serde_json::json!({ &dest: 1.0 }),
+            ],
         )
         .unwrap();
     let psbt_a = a["result"].as_str().unwrap().to_string();
@@ -4204,7 +4369,10 @@ fn test_e2e_signpsbtwithsigner_rejects_tampered_psbt() {
         .node
         .rpc_call_with_params(
             "createpsbt",
-            vec![serde_json::json!([{ "txid": dummy_txid, "vout": 0 }]), serde_json::json!({ &dest: 2.0 })],
+            vec![
+                serde_json::json!([{ "txid": dummy_txid, "vout": 0 }]),
+                serde_json::json!({ &dest: 2.0 }),
+            ],
         )
         .unwrap();
     let psbt_b = b["result"].as_str().unwrap().to_string();

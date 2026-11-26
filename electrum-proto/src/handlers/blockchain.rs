@@ -30,12 +30,13 @@ use crate::error::JsonRpcError;
 use crate::extras::StoredTx;
 use crate::merkle::compute_merkle_branch;
 use crate::state::ElectrumState;
-use crate::version::ProtocolVersion;
 use crate::status::{compute_status_hash, mempool_facts, status_hash_to_json};
 use crate::types::{
     BalanceResponse, FeeHistogramEntry, GetMerkleResponse, HeadersListResponse, HeadersResponse,
-    HistoryEntry as WireHistoryEntry, ListUnspentEntry, ScripthashHex, TxidHex, merkle_node_to_hex, parse_wire_scripthash,
+    HistoryEntry as WireHistoryEntry, ListUnspentEntry, ScripthashHex, TxidHex, merkle_node_to_hex,
+    parse_wire_scripthash,
 };
+use crate::version::ProtocolVersion;
 
 // ── blockchain.headers.* ──────────────────────────────────────────
 
@@ -124,7 +125,12 @@ pub fn block_headers(
     let count = headers.len() as u32;
 
     if *version >= ProtocolVersion::new(&[1, 6]) {
-        return Ok(serde_json::to_value(HeadersListResponse { count, headers, max }).unwrap());
+        return Ok(serde_json::to_value(HeadersListResponse {
+            count,
+            headers,
+            max,
+        })
+        .unwrap());
     }
     let resp = HeadersResponse {
         count,
@@ -326,14 +332,21 @@ impl<'a> LateFacts<'a> {
             let prev = input.previous_output;
             let value = if let Some(entry) = self.state.mempool.get(&prev.txid) {
                 unconfirmed_parent = true;
-                entry.tx.output.get(prev.vout as usize).map(|o| o.value.to_sat())
+                entry
+                    .tx
+                    .output
+                    .get(prev.vout as usize)
+                    .map(|o| o.value.to_sat())
             } else {
                 let pin = *self.pin;
                 self.confirmed(&prev.txid).and_then(|(parent, height)| {
                     if !pin.covers(*height) {
                         unconfirmed_parent = true;
                     }
-                    parent.output.get(prev.vout as usize).map(|o| o.value.to_sat())
+                    parent
+                        .output
+                        .get(prev.vout as usize)
+                        .map(|o| o.value.to_sat())
                 })
             };
             input_sum = input_sum.zip(value).and_then(|(sum, v)| sum.checked_add(v));
@@ -365,7 +378,11 @@ fn spends_above_pin(state: &ElectrumState, tx: &Transaction, pin: &Pin) -> bool 
 
 /// Whether `sh` has a transaction confirmed above the pin: one read of the
 /// newest confirmed transaction.
-fn confirmed_above(state: &ElectrumState, sh: &node_index::Scripthash, pin: &Pin) -> Result<bool, JsonRpcError> {
+fn confirmed_above(
+    state: &ElectrumState,
+    sh: &node_index::Scripthash,
+    pin: &Pin,
+) -> Result<bool, JsonRpcError> {
     let newest = state
         .address_index
         .confirmed_txs_newest_first(sh, None, 1)
@@ -481,7 +498,9 @@ pub fn scripthash_get_balance(
             // under every attempt are a chain view that would not settle.
             attempt += 1;
             if attempt >= node::chain::pin::VIEW_ATTEMPTS {
-                return Err(JsonRpcError::bad_request(node::chain::pin::CHAIN_VIEW_MOVED));
+                return Err(JsonRpcError::bad_request(
+                    node::chain::pin::CHAIN_VIEW_MOVED,
+                ));
             }
         }
     };
@@ -561,7 +580,8 @@ pub fn scripthash_listunspent(
     // mempool height. One spent above the pin is gone from the coin set: as
     // of the pin it had an unconfirmed spend, and a confirmed output with a
     // mempool spend is not listed.
-    let (mut out, mut late): (Vec<ListUnspentEntry>, Vec<ListUnspentEntry>) = (Vec::new(), Vec::new());
+    let (mut out, mut late): (Vec<ListUnspentEntry>, Vec<ListUnspentEntry>) =
+        (Vec::new(), Vec::new());
     let mut facts = LateFacts::new(state, pin);
     for u in utxos {
         // Drop confirmed UTXOs whose outpoint is consumed by a
@@ -752,7 +772,11 @@ pub fn scripthash_unsubscribe(
 
 // ── blockchain.transaction.* ──────────────────────────────────────
 
-pub fn transaction_get(state: &ElectrumState, params: Value, pin: &Pin) -> Result<Value, JsonRpcError> {
+pub fn transaction_get(
+    state: &ElectrumState,
+    params: Value,
+    pin: &Pin,
+) -> Result<Value, JsonRpcError> {
     // `(txid, [verbose])` — `verbose=false` (default) returns the hex
     // string. `verbose=true` returns the full JSON shape Bitcoin Core
     // produces for `getrawtransaction <txid> 1`, which is what
@@ -804,7 +828,11 @@ pub fn transaction_get(state: &ElectrumState, params: Value, pin: &Pin) -> Resul
         };
 
     if verbose {
-        Ok(verbose_transaction_json(&stored, location.as_ref(), state.network))
+        Ok(verbose_transaction_json(
+            &stored,
+            location.as_ref(),
+            state.network,
+        ))
     } else if stored.stripped.is_some() {
         // The filled bytes are not the transaction: never serve them.
         Err(JsonRpcError::bad_request(TX_DATA_STRIPPED))
@@ -815,7 +843,8 @@ pub fn transaction_get(state: &ElectrumState, params: Value, pin: &Pin) -> Resul
 
 /// The error for a request that needs an OP_RETURN-stripped transaction's
 /// bytes.
-pub(crate) const TX_DATA_STRIPPED: &str = "transaction data not available (OP_RETURN data stripped)";
+pub(crate) const TX_DATA_STRIPPED: &str =
+    "transaction data not available (OP_RETURN data stripped)";
 
 /// Confirmation envelope used by [`verbose_transaction_json`].
 /// `height` is captured for symmetry with Core's verbose tx response
@@ -1404,7 +1433,11 @@ mod tests {
         assert!(buckets.is_empty());
     }
 
-    fn answer_for(near: Option<u64>, fee_estimator: &node::mempool::fee::FeeEstimator, target: u32) -> f64 {
+    fn answer_for(
+        near: Option<u64>,
+        fee_estimator: &node::mempool::fee::FeeEstimator,
+        target: u32,
+    ) -> f64 {
         use node::mempool::estimate::{
             EstimateMode, MAX_SIM_DEPTH, estimate_from_mempool, smart_fees_from_estimate,
         };
@@ -1426,7 +1459,11 @@ mod tests {
     fn estimatefee_is_minus_one_only_without_an_estimate() {
         let cold = node::mempool::fee::FeeEstimator::new();
         assert_eq!(answer_for(None, &cold, 2), -1.0);
-        assert_eq!(answer_for(Some(20_000), &cold, 25), -1.0, "no history at 25 blocks");
+        assert_eq!(
+            answer_for(Some(20_000), &cold, 25),
+            -1.0,
+            "no history at 25 blocks"
+        );
         assert!((answer_for(Some(20_000), &cold, 2) - 0.0002).abs() < 1e-12);
         let warm = node::mempool::fee::FeeEstimator::new();
         warm.record_block(&[5_000; 50]);

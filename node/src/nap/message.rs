@@ -51,12 +51,17 @@ pub fn parse(text: &str) -> Result<Message, FormatError> {
     let bad = |what: &'static str| FormatError::Message(what);
     let mut lines = text.split('\n');
     let mut field = |prefix: &'static str| {
-        lines.next().and_then(|l| l.strip_prefix(prefix)).ok_or(bad(prefix))
+        lines
+            .next()
+            .and_then(|l| l.strip_prefix(prefix))
+            .ok_or(bad(prefix))
     };
     if !field(HEADER)?.is_empty() {
         return Err(bad(HEADER));
     }
-    let (txid, vout) = field("outpoint: ")?.split_once(':').ok_or(bad("outpoint: "))?;
+    let (txid, vout) = field("outpoint: ")?
+        .split_once(':')
+        .ok_or(bad("outpoint: "))?;
     let outpoint = OutPoint {
         txid: txid.parse().map_err(|_| bad("outpoint: "))?,
         vout: vout.parse().map_err(|_| bad("outpoint: "))?,
@@ -68,9 +73,22 @@ pub fn parse(text: &str) -> Result<Message, FormatError> {
     let anchor_hash = hash.parse().map_err(|_| bad("anchor: "))?;
     check_key(key.as_bytes())?;
     check_value(value.as_bytes())?;
-    let m = Message { outpoint, key, value, anchor_height, anchor_hash };
+    let m = Message {
+        outpoint,
+        key,
+        value,
+        anchor_height,
+        anchor_hash,
+    };
     // Also refuses anything after the anchor line.
-    if render(&m.outpoint, &m.key, &m.value, m.anchor_height, &m.anchor_hash) != text {
+    if render(
+        &m.outpoint,
+        &m.key,
+        &m.value,
+        m.anchor_height,
+        &m.anchor_hash,
+    ) != text
+    {
         return Err(FormatError::Message("non-canonical text"));
     }
     Ok(m)

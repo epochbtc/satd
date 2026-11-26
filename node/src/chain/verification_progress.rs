@@ -170,7 +170,10 @@ mod tests {
         let data = chain_tx_data(Network::Regtest, false);
         let tip = at(200, 1_700_000_000, 201);
         // Two hours after the tip: still "recent", positioned by height.
-        assert_eq!(guess_verification_progress(data, tip, 200, 1_700_000_000 + 7200), 1.0);
+        assert_eq!(
+            guess_verification_progress(data, tip, 200, 1_700_000_000 + 7200),
+            1.0
+        );
         // One second later the timestamp is used, and the rate adds work.
         assert!(guess_verification_progress(data, tip, 200, 1_700_000_000 + 7201) < 1.0);
         // A header above the tip moves it back by one spacing.

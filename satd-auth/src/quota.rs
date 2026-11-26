@@ -23,10 +23,7 @@ impl RatePolicy {
     /// Parse the `auth.toml` form `"<n>/s"` (e.g. `"200/s"`). Burst is set equal
     /// to the per-second rate. Returns the original string on failure.
     pub fn parse(s: &str) -> Result<RatePolicy, String> {
-        let body = s
-            .trim()
-            .strip_suffix("/s")
-            .ok_or_else(|| s.to_string())?;
+        let body = s.trim().strip_suffix("/s").ok_or_else(|| s.to_string())?;
         let n: u32 = body.trim().parse().map_err(|_| s.to_string())?;
         if n == 0 {
             return Err(s.to_string());
@@ -99,11 +96,12 @@ pub trait QuotaStore: Send + Sync {
         max: u64,
     ) -> Result<(), QuotaExceeded> {
         self.release(principal_id, release);
-        self.try_acquire(principal_id, acquire, max).inspect_err(|_| {
-            // Restore what we released so the failure is a no-op (best effort;
-            // the default path is not atomic — override for the real guarantee).
-            let _ = self.try_acquire(principal_id, release, u64::MAX);
-        })
+        self.try_acquire(principal_id, acquire, max)
+            .inspect_err(|_| {
+                // Restore what we released so the failure is a no-op (best effort;
+                // the default path is not atomic — override for the real guarantee).
+                let _ = self.try_acquire(principal_id, release, u64::MAX);
+            })
     }
 }
 
@@ -252,7 +250,9 @@ impl Accounting for UnlimitedAccounting {
 pub(crate) fn unlimited() -> Arc<dyn Accounting> {
     use std::sync::OnceLock;
     static UNLIMITED: OnceLock<Arc<UnlimitedAccounting>> = OnceLock::new();
-    UNLIMITED.get_or_init(|| Arc::new(UnlimitedAccounting)).clone()
+    UNLIMITED
+        .get_or_init(|| Arc::new(UnlimitedAccounting))
+        .clone()
 }
 
 // ----------------------------------------------------------------------------
@@ -441,8 +441,20 @@ mod tests {
 
     #[test]
     fn rate_policy_parse() {
-        assert_eq!(RatePolicy::parse("200/s").unwrap(), RatePolicy { burst: 200, per_sec: 200 });
-        assert_eq!(RatePolicy::parse(" 5/s ").unwrap(), RatePolicy { burst: 5, per_sec: 5 });
+        assert_eq!(
+            RatePolicy::parse("200/s").unwrap(),
+            RatePolicy {
+                burst: 200,
+                per_sec: 200
+            }
+        );
+        assert_eq!(
+            RatePolicy::parse(" 5/s ").unwrap(),
+            RatePolicy {
+                burst: 5,
+                per_sec: 5
+            }
+        );
         assert_eq!(RatePolicy::parse("0/s").unwrap_err(), "0/s");
         assert_eq!(RatePolicy::parse("200").unwrap_err(), "200");
         assert_eq!(RatePolicy::parse("abc/s").unwrap_err(), "abc/s");
@@ -452,7 +464,13 @@ mod tests {
     fn unlimited_allows_everything() {
         let acct = unlimited();
         assert_eq!(
-            acct.rate().check("anyone", &RatePolicy { burst: 1, per_sec: 1 }),
+            acct.rate().check(
+                "anyone",
+                &RatePolicy {
+                    burst: 1,
+                    per_sec: 1
+                }
+            ),
             RateDecision::Allow
         );
         let q = acct.quota();
@@ -474,7 +492,10 @@ mod tests {
     fn token_bucket_bursts_then_throttles_then_refills() {
         set_clock(0);
         let rl = LocalRateLimiter::with_clock(test_clock);
-        let policy = RatePolicy { burst: 3, per_sec: 1 };
+        let policy = RatePolicy {
+            burst: 3,
+            per_sec: 1,
+        };
         // Burst of 3 allowed at t=0.
         for _ in 0..3 {
             assert_eq!(rl.check("p", &policy), RateDecision::Allow);
@@ -506,7 +527,14 @@ mod tests {
         assert_eq!(q.current("tenant"), 10);
         // Over the cap → rejected.
         let err = WatchLease::acquire(q.clone(), Arc::from("tenant"), 1, 10).unwrap_err();
-        assert_eq!(err, QuotaExceeded { current: 10, requested: 1, max: 10 });
+        assert_eq!(
+            err,
+            QuotaExceeded {
+                current: 10,
+                requested: 1,
+                max: 10
+            }
+        );
         // Dropping a lease releases its units (disconnect reconciliation).
         drop(l2);
         assert_eq!(q.current("tenant"), 6);
@@ -519,13 +547,21 @@ mod tests {
         let q: Arc<dyn QuotaStore> = Arc::new(LocalQuotaStore::new());
         // Reserve 3 units atomically, then split into per-item leases.
         let mut batch = WatchLease::acquire(q.clone(), Arc::from("tenant"), 3, 10).unwrap();
-        assert_eq!(q.current("tenant"), 3, "batch reservation charges 3 up front");
+        assert_eq!(
+            q.current("tenant"),
+            3,
+            "batch reservation charges 3 up front"
+        );
 
         let a = batch.split_off_one().unwrap();
         let b = batch.split_off_one().unwrap();
         let c = batch.split_off_one().unwrap();
         // Splitting moves units between leases — it never touches the store.
-        assert_eq!(q.current("tenant"), 3, "splitting does not re-charge or release");
+        assert_eq!(
+            q.current("tenant"),
+            3,
+            "splitting does not re-charge or release"
+        );
         assert_eq!(batch.units(), 0);
         assert!(batch.split_off_one().is_none(), "nothing left to split");
 
@@ -534,7 +570,11 @@ mod tests {
         drop(batch);
         assert_eq!(q.current("tenant"), 3);
         drop(b);
-        assert_eq!(q.current("tenant"), 2, "one per-item lease released one unit");
+        assert_eq!(
+            q.current("tenant"),
+            2,
+            "one per-item lease released one unit"
+        );
         drop(a);
         drop(c);
         assert_eq!(q.current("tenant"), 0, "all per-item leases released");
@@ -553,7 +593,11 @@ mod tests {
 
         // An over-quota swap (5 - 2 + 4 = 7 > 5) is rejected and changes nothing.
         assert!(store.try_replace("t", 2, 4, 5).is_err());
-        assert_eq!(store.current("t"), 5, "a rejected swap leaves the reservation intact");
+        assert_eq!(
+            store.current("t"),
+            5,
+            "a rejected swap leaves the reservation intact"
+        );
 
         // A shrink always fits.
         store.try_replace("t", 5, 2, 5).unwrap();
@@ -568,7 +612,11 @@ mod tests {
         let lease = WatchLease::from_reserved(store.clone(), Arc::from("p"), 3);
         assert_eq!(store.current("p"), 3);
         drop(lease);
-        assert_eq!(store.current("p"), 0, "from_reserved lease releases on drop");
+        assert_eq!(
+            store.current("p"),
+            0,
+            "from_reserved lease releases on drop"
+        );
 
         store.try_acquire("p", 3, 10).unwrap();
         let lease = WatchLease::from_reserved(store.clone(), Arc::from("p"), 3);
@@ -580,7 +628,13 @@ mod tests {
     fn local_accounting_bundles_rate_and_quota() {
         let acct = LocalAccounting::new();
         assert_eq!(
-            acct.rate().check("p", &RatePolicy { burst: 1, per_sec: 1 }),
+            acct.rate().check(
+                "p",
+                &RatePolicy {
+                    burst: 1,
+                    per_sec: 1
+                }
+            ),
             RateDecision::Allow
         );
         let q = acct.quota();

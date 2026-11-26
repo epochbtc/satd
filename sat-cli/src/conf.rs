@@ -148,9 +148,9 @@ impl ConfFile {
     /// unreadable or unparseable one is.
     pub fn read(path: &Path) -> Result<Option<Self>, String> {
         match std::fs::read_to_string(path) {
-            Ok(s) => Self::parse(&s).map(Some).map_err(|e| {
-                format!("Error reading configuration file {}: {e}", path.display())
-            }),
+            Ok(s) => Self::parse(&s)
+                .map(Some)
+                .map_err(|e| format!("Error reading configuration file {}: {e}", path.display())),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(format!("cannot read {}: {e}", path.display())),
         }
@@ -224,7 +224,11 @@ pub fn signet_data_dir(challenge_hex: Option<&str>) -> String {
     let Some(bytes) = challenge_hex.and_then(|h| Vec::<u8>::from_hex(h.trim()).ok()) else {
         return "signet".to_string();
     };
-    if Vec::<u8>::from_hex(DEFAULT_SIGNET_CHALLENGE).ok().as_deref() == Some(bytes.as_slice()) {
+    if Vec::<u8>::from_hex(DEFAULT_SIGNET_CHALLENGE)
+        .ok()
+        .as_deref()
+        == Some(bytes.as_slice())
+    {
         return "signet".to_string();
     }
     let digest = sha256d::Hash::hash(&bitcoin::consensus::serialize(&bytes));
@@ -310,7 +314,11 @@ pub fn resolve(
 ) -> Result<Conn, String> {
     let chain = match cli.chain()? {
         Some(c) => c,
-        None => conf.map(ConfFile::chain).transpose()?.flatten().unwrap_or(Chain::Main),
+        None => conf
+            .map(ConfFile::chain)
+            .transpose()?
+            .flatten()
+            .unwrap_or(Chain::Main),
     };
     let from_file = |key: &str| conf.and_then(|c| c.get(chain, key)).map(str::to_string);
 
@@ -334,7 +342,10 @@ pub fn resolve(
 
     let net_datadir = match chain.subdir() {
         Some(_) if chain == Chain::Signet => {
-            let challenge = cli.signetchallenge.clone().or_else(|| from_file("signetchallenge"));
+            let challenge = cli
+                .signetchallenge
+                .clone()
+                .or_else(|| from_file("signetchallenge"));
             base_datadir.join(signet_data_dir(challenge.as_deref()))
         }
         Some(sub) => base_datadir.join(sub),
@@ -392,7 +403,12 @@ mod tests {
 
     fn resolve_str(cli: &CliConn, body: &str) -> Result<Conn, String> {
         let conf = ConfFile::parse(body)?;
-        resolve(cli, Some(&conf), Path::new("/d"), PathBuf::from("/d/bitcoin.conf"))
+        resolve(
+            cli,
+            Some(&conf),
+            Path::new("/d"),
+            PathBuf::from("/d/bitcoin.conf"),
+        )
     }
 
     /// The flat file Warnet's chart renders for a node image whose version it
@@ -483,7 +499,10 @@ mod tests {
         let multisig = format!("512102{}51ae", "11".repeat(32));
         assert_eq!(signet_data_dir(Some(&multisig)), "signet_93abaa9b");
         assert_eq!(signet_data_dir(Some(&"6a".repeat(300))), "signet_a9503e92");
-        assert_eq!(signet_data_dir(Some(&"6a".repeat(70_000))), "signet_3c08542a");
+        assert_eq!(
+            signet_data_dir(Some(&"6a".repeat(70_000))),
+            "signet_3c08542a"
+        );
     }
 
     /// #1271: a custom signet's cookie is in its own directory, with the
@@ -493,15 +512,21 @@ mod tests {
     fn a_custom_signets_cookie_is_in_its_own_directory() {
         let cookie = |cli: &CliConn, body: &str| resolve_str(cli, body).unwrap().creds;
         assert_eq!(
-            cookie(&CliConn::default(), "signet=1
-"),
+            cookie(
+                &CliConn::default(),
+                "signet=1
+"
+            ),
             Creds::Cookie(PathBuf::from("/d/signet/.cookie"))
         );
         assert_eq!(
-            cookie(&CliConn::default(), "signet=1
+            cookie(
+                &CliConn::default(),
+                "signet=1
 [signet]
 signetchallenge=51
-"),
+"
+            ),
             Creds::Cookie(PathBuf::from("/d/signet_54d26fbd/.cookie"))
         );
         let cli = CliConn {
@@ -509,19 +534,28 @@ signetchallenge=51
             signetchallenge: Some("51".into()),
             ..Default::default()
         };
-        assert_eq!(cookie(&cli, ""), Creds::Cookie(PathBuf::from("/d/signet_54d26fbd/.cookie")));
+        assert_eq!(
+            cookie(&cli, ""),
+            Creds::Cookie(PathBuf::from("/d/signet_54d26fbd/.cookie"))
+        );
         // The command line beats the file.
         assert_eq!(
-            cookie(&cli, "[signet]
+            cookie(
+                &cli,
+                "[signet]
 signetchallenge=00
-"),
+"
+            ),
             Creds::Cookie(PathBuf::from("/d/signet_54d26fbd/.cookie"))
         );
         // Off signet the challenge names nothing.
         assert_eq!(
-            cookie(&CliConn::default(), "regtest=1
+            cookie(
+                &CliConn::default(),
+                "regtest=1
 signetchallenge=51
-"),
+"
+            ),
             Creds::Cookie(PathBuf::from("/d/regtest/.cookie"))
         );
     }
@@ -537,7 +571,11 @@ signetchallenge=51
             // A selector inside a section is not a selector.
             ("[regtest]\nregtest=1\n", Chain::Main),
         ] {
-            assert_eq!(resolve_str(&CliConn::default(), body).unwrap().chain, chain, "{body:?}");
+            assert_eq!(
+                resolve_str(&CliConn::default(), body).unwrap().chain,
+                chain,
+                "{body:?}"
+            );
         }
         assert!(resolve_str(&CliConn::default(), "regtest=1\nsignet=1\n").is_err());
         assert!(resolve_str(&CliConn::default(), "chain=main\nregtest=1\n").is_err());
@@ -567,14 +605,16 @@ signetchallenge=51
         };
         let e = resolve_str(&cli, "").unwrap_err();
         assert!(e.contains("Can use at most one"), "{e}");
-        assert!(resolve_str(
-            &CliConn {
-                chain: Some("nope".into()),
-                ..Default::default()
-            },
-            ""
-        )
-        .is_err());
+        assert!(
+            resolve_str(
+                &CliConn {
+                    chain: Some("nope".into()),
+                    ..Default::default()
+                },
+                ""
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -587,7 +627,10 @@ signetchallenge=51
     fn rpcconnect_from_the_file() {
         let c = resolve_str(&CliConn::default(), "rpcconnect=tank0\n").unwrap();
         assert_eq!(c.host, "tank0");
-        assert_eq!(resolve_str(&CliConn::default(), "").unwrap().host, "127.0.0.1");
+        assert_eq!(
+            resolve_str(&CliConn::default(), "").unwrap().host,
+            "127.0.0.1"
+        );
     }
 
     #[test]
@@ -613,7 +656,10 @@ signetchallenge=51
     /// Core refuses an `rpcpassword` line holding a `#`, as the daemon does.
     #[test]
     fn a_hash_on_an_rpcpassword_line_is_refused() {
-        for body in ["rpcpassword=a#b\n", "rpcuser=u\n[main]\nrpcpassword=p # old\n"] {
+        for body in [
+            "rpcpassword=a#b\n",
+            "rpcuser=u\n[main]\nrpcpassword=p # old\n",
+        ] {
             let err = resolve_str(&CliConn::default(), body).unwrap_err();
             assert!(
                 err.contains("using # in rpcpassword can be ambiguous and should be avoided"),
@@ -626,7 +672,13 @@ signetchallenge=51
     fn conf_path_rules() {
         let d = Path::new("/d");
         assert_eq!(conf_path(None, d), PathBuf::from("/d/bitcoin.conf"));
-        assert_eq!(conf_path(Some(Path::new("x.conf")), d), PathBuf::from("/d/x.conf"));
-        assert_eq!(conf_path(Some(Path::new("/e/x.conf")), d), PathBuf::from("/e/x.conf"));
+        assert_eq!(
+            conf_path(Some(Path::new("x.conf")), d),
+            PathBuf::from("/d/x.conf")
+        );
+        assert_eq!(
+            conf_path(Some(Path::new("/e/x.conf")), d),
+            PathBuf::from("/e/x.conf")
+        );
     }
 }

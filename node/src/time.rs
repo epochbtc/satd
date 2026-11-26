@@ -192,7 +192,12 @@ mod tests {
     fn only_regtest_has_a_mockable_clock() {
         use bitcoin::Network;
         assert!(clock_is_mockable(Network::Regtest));
-        for n in [Network::Bitcoin, Network::Testnet, Network::Testnet4, Network::Signet] {
+        for n in [
+            Network::Bitcoin,
+            Network::Testnet,
+            Network::Testnet4,
+            Network::Signet,
+        ] {
             assert!(!clock_is_mockable(n), "{n:?} must not accept setmocktime");
         }
     }

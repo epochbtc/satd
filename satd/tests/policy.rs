@@ -28,14 +28,14 @@
 
 mod common;
 
-use common::{get_rpc_u64, poll_until, test_timeout, DeterministicWallet, TestNode};
+use common::{DeterministicWallet, TestNode, get_rpc_u64, poll_until, test_timeout};
 
 use bitcoin::absolute::LockTime;
 use bitcoin::opcodes::all as op;
 use bitcoin::script::{Builder, PushBytesBuf};
 use bitcoin::transaction::Version;
 use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::path::PathBuf;
 use std::str::FromStr;
 
@@ -143,7 +143,10 @@ fn test_wallet() -> DeterministicWallet {
 /// Start a regtest node, optionally loading `policy_src`, and mine 110 blocks to
 /// the deterministic wallet so coinbases 1..=10 are mature (COINBASE_MATURITY =
 /// 100). Returns the node and the wallet. Extra args are appended verbatim.
-fn start_funded(policy_src: Option<&str>, extra_args: &[&str]) -> (TestNode, DeterministicWallet, Option<PolicyFile>) {
+fn start_funded(
+    policy_src: Option<&str>,
+    extra_args: &[&str],
+) -> (TestNode, DeterministicWallet, Option<PolicyFile>) {
     let wallet = test_wallet();
     let policy = policy_src.map(write_policy);
     let mut args: Vec<String> = Vec::new();
@@ -249,7 +252,12 @@ fn build_spend(
     let src_script = wallet.address.script_pubkey();
     let mut cache = SighashCache::new(&spend);
     let sighash = cache
-        .p2wpkh_signature_hash(0, &src_script, Amount::from_sat(CB_VALUE_SAT), EcdsaSighashType::All)
+        .p2wpkh_signature_hash(
+            0,
+            &src_script,
+            Amount::from_sat(CB_VALUE_SAT),
+            EcdsaSighashType::All,
+        )
         .expect("sighash");
     let msg = Message::from_digest(sighash.to_byte_array());
     let sig = secp.sign_ecdsa(&msg, &wallet.sk);
@@ -327,7 +335,11 @@ fn payment_output(wallet: &DeterministicWallet, value_sat: u64) -> TxOut {
 /// only deserializes and evaluates the structure, so this exercises the
 /// `tx.total_witness_size` view field for the `no-mine-big-witness` rule without
 /// the cost of a real 100kB-witness taproot spend. Returns `(raw_hex, txid)`.
-fn build_big_witness_tx(node: &TestNode, wallet: &DeterministicWallet, cb_height: u64) -> (String, String) {
+fn build_big_witness_tx(
+    node: &TestNode,
+    wallet: &DeterministicWallet,
+    cb_height: u64,
+) -> (String, String) {
     let cb_txid = coinbase_txid_at(node, cb_height);
     let mut witness = Witness::new();
     witness.push(vec![0u8; 110_000]);
@@ -382,7 +394,12 @@ fn build_child_spend(
     let src_script = wallet.address.script_pubkey();
     let mut cache = SighashCache::new(&spend);
     let sighash = cache
-        .p2wpkh_signature_hash(0, &src_script, Amount::from_sat(prev_value), EcdsaSighashType::All)
+        .p2wpkh_signature_hash(
+            0,
+            &src_script,
+            Amount::from_sat(prev_value),
+            EcdsaSighashType::All,
+        )
         .expect("sighash");
     let msg = Message::from_digest(sighash.to_byte_array());
     let sig = secp.sign_ecdsa(&msg, &wallet.sk);
@@ -433,9 +450,17 @@ fn policytest(node: &TestNode, raw_hex: &str) -> Value {
 
 /// Assert a `policytest` result quarantines under `rule` with the given scope.
 fn assert_quarantined(res: &Value, rule: &str, relay: bool, template: bool) {
-    assert_eq!(res["verdict"], json!("quarantine"), "verdict for {rule}: {res}");
+    assert_eq!(
+        res["verdict"],
+        json!("quarantine"),
+        "verdict for {rule}: {res}"
+    );
     assert_eq!(res["decisive_rule"], json!(rule), "decisive rule: {res}");
-    assert_eq!(res["placement"]["class"], json!("quarantine"), "class: {res}");
+    assert_eq!(
+        res["placement"]["class"],
+        json!("quarantine"),
+        "class: {res}"
+    );
     assert_eq!(
         res["placement"]["scope"]["relay"],
         json!(relay),
@@ -492,7 +517,11 @@ fn layer_a_cheap_bulk_opreturn_quarantined_but_high_fee_passes() {
     // clause fails ⇒ no rule matches ⇒ pass.
     let (raw_high, _) = build_spend(&node, &wallet, 2, vec![op_return_output(84)], 1_000_000);
     let res = policytest(&node, &raw_high);
-    assert_eq!(res["verdict"], json!("pass"), "high-fee bulk OP_RETURN: {res}");
+    assert_eq!(
+        res["verdict"],
+        json!("pass"),
+        "high-fee bulk OP_RETURN: {res}"
+    );
     assert_eq!(res["placement"]["class"], json!("acting"));
 
     node.stop();
@@ -524,16 +553,32 @@ fn layer_a_big_witness_quarantined_template_only() {
     assert_quarantined(&res, "no-mine-big-witness", false, true);
 
     // Control: a small-witness payment from the same shape passes.
-    let (raw_small, _) = build_spend(&node, &wallet, 2, vec![payment_output(&wallet, 1_000_000)], 1_000);
+    let (raw_small, _) = build_spend(
+        &node,
+        &wallet,
+        2,
+        vec![payment_output(&wallet, 1_000_000)],
+        1_000,
+    );
     let res = policytest(&node, &raw_small);
-    assert_eq!(res["verdict"], json!("pass"), "small-witness control: {res}");
+    assert_eq!(
+        res["verdict"],
+        json!("pass"),
+        "small-witness control: {res}"
+    );
     node.stop();
 }
 
 #[test]
 fn layer_a_plain_payment_passes() {
     let (mut node, wallet, _pf) = start_funded(Some(COOKBOOK_NO_ALLOW), &[]);
-    let (raw, _txid) = build_spend(&node, &wallet, 1, vec![payment_output(&wallet, 1_000_000)], 1_000);
+    let (raw, _txid) = build_spend(
+        &node,
+        &wallet,
+        1,
+        vec![payment_output(&wallet, 1_000_000)],
+        1_000,
+    );
     let res = policytest(&node, &raw);
     assert_eq!(res["verdict"], json!("pass"), "plain payment: {res}");
     assert_eq!(res["placement"]["class"], json!("acting"));
@@ -543,7 +588,13 @@ fn layer_a_plain_payment_passes() {
 #[test]
 fn layer_a_unloaded_node_reports_not_loaded() {
     let (mut node, wallet, _pf) = start_funded(None, &[]);
-    let (raw, _txid) = build_spend(&node, &wallet, 1, vec![payment_output(&wallet, 1_000_000)], 1_000);
+    let (raw, _txid) = build_spend(
+        &node,
+        &wallet,
+        1,
+        vec![payment_output(&wallet, 1_000_000)],
+        1_000,
+    );
     let res = policytest(&node, &raw);
     assert_eq!(res["loaded"], json!(false), "no policy loaded: {res}");
     node.stop();
@@ -742,13 +793,23 @@ fn layer_b_allowquarantined_holds_and_is_two_class_invisible() {
     let resp = node
         .rpc_call_with_params("sendrawtransaction", vec![json!(raw), json!(true)])
         .expect("sendrawtransaction rpc");
-    assert!(resp["error"].is_null(), "allowquarantined should accept: {resp}");
+    assert!(
+        resp["error"].is_null(),
+        "allowquarantined should accept: {resp}"
+    );
     assert_eq!(resp["result"], json!(txid));
 
     // Invisible to standard surfaces.
-    assert!(!mempool_has(&node, &txid), "quarantined tx leaked into getrawmempool");
+    assert!(
+        !mempool_has(&node, &txid),
+        "quarantined tx leaked into getrawmempool"
+    );
     let mi = node.rpc_call("getmempoolinfo").expect("getmempoolinfo");
-    assert_eq!(mi["result"]["size"], json!(0), "acting mempool not empty: {mi}");
+    assert_eq!(
+        mi["result"]["size"],
+        json!(0),
+        "acting mempool not empty: {mi}"
+    );
 
     // Visible via the quarantine surface, with the rule + scope.
     let qe = node
@@ -858,15 +919,29 @@ fn layer_b_template_only_excluded_from_block_template() {
 
     // An ordinary acting payment — the positive control: it must appear in the
     // block template.
-    let (raw_ok, txid_ok) = build_spend(&node, &wallet, 1, vec![payment_output(&wallet, 1_000_000)], 1_000);
+    let (raw_ok, txid_ok) = build_spend(
+        &node,
+        &wallet,
+        1,
+        vec![payment_output(&wallet, 1_000_000)],
+        1_000,
+    );
     send_ok(&node, &raw_ok);
-    poll_until(|| mempool_has(&node, &txid_ok), test_timeout(10), "acting tx not in mempool");
+    poll_until(
+        || mempool_has(&node, &txid_ok),
+        test_timeout(10),
+        "acting tx not in mempool",
+    );
 
     // A template-withheld runestone (template-only quarantine still relays, so
     // §6.1 does not refuse local submission) — must be excluded from the template.
     let (raw_q, txid_q) = build_spend(&node, &wallet, 2, vec![runestone_output()], 1_000);
     send_ok(&node, &raw_q);
-    poll_until(|| quarantine_has(&node, &txid_q), test_timeout(10), "runestone not quarantined");
+    poll_until(
+        || quarantine_has(&node, &txid_q),
+        test_timeout(10),
+        "runestone not quarantined",
+    );
 
     let gbt = node.rpc_call("getblocktemplate").expect("getblocktemplate");
     let txids: Vec<String> = gbt["result"]["transactions"]
@@ -934,7 +1009,11 @@ fn layer_c_gossiped_spam_is_quarantined_on_policy_node() {
     // Spam submitted to the policy-free node A ⇒ acting there.
     let (raw, txid) = build_spend(&node_a, &wallet, 1, vec![runestone_output()], 1_000);
     send_ok(&node_a, &raw);
-    poll_until(|| mempool_has(&node_a, &txid), test_timeout(20), "tx not acting on A");
+    poll_until(
+        || mempool_has(&node_a, &txid),
+        test_timeout(20),
+        "tx not acting on A",
+    );
 
     // Gossiped to B, the policy node ⇒ quarantined, hidden from standard surfaces.
     poll_until(
@@ -942,7 +1021,10 @@ fn layer_c_gossiped_spam_is_quarantined_on_policy_node() {
         test_timeout(30),
         "tx not quarantined on B",
     );
-    assert!(!mempool_has(&node_b, &txid), "quarantined tx leaked into B getrawmempool");
+    assert!(
+        !mempool_has(&node_b, &txid),
+        "quarantined tx leaked into B getrawmempool"
+    );
 
     node_a.stop();
     node_b.stop();
@@ -971,8 +1053,15 @@ fn layer_c_allow_own_submission_but_quarantine_when_gossiped() {
     // matches (source == rpc) ⇒ acting on B.
     let (raw1, txid1) = build_spend(&node_b, &wallet, 1, vec![runestone_output()], 1_000);
     send_ok(&node_b, &raw1);
-    poll_until(|| mempool_has(&node_b, &txid1), test_timeout(20), "own submission not acting on B");
-    assert!(!quarantine_has(&node_b, &txid1), "own submission wrongly quarantined");
+    poll_until(
+        || mempool_has(&node_b, &txid1),
+        test_timeout(20),
+        "own submission not acting on B",
+    );
+    assert!(
+        !quarantine_has(&node_b, &txid1),
+        "own submission wrongly quarantined"
+    );
 
     // (2) An identical-shape runestone submitted to A and *gossiped* to B
     // arrives with source == p2p ⇒ the allow rule does not match ⇒ quarantined.
@@ -983,7 +1072,10 @@ fn layer_c_allow_own_submission_but_quarantine_when_gossiped() {
         test_timeout(30),
         "gossiped runestone not quarantined on B",
     );
-    assert!(!mempool_has(&node_b, &txid2), "gossiped runestone leaked into B mempool");
+    assert!(
+        !mempool_has(&node_b, &txid2),
+        "gossiped runestone leaked into B mempool"
+    );
 
     node_a.stop();
     node_b.stop();
@@ -1010,9 +1102,14 @@ fn layer_c_infectious_descendant_inherits_quarantine_when_gossiped() {
 
     // Parent: a runestone — quarantined on B (relay+template). Its change output
     // (vout 1) is a spendable P2WPKH output.
-    let (parent_raw, parent_txid) = build_spend(&node_a, &wallet, 1, vec![runestone_output()], 1_000);
+    let (parent_raw, parent_txid) =
+        build_spend(&node_a, &wallet, 1, vec![runestone_output()], 1_000);
     send_ok(&node_a, &parent_raw);
-    poll_until(|| quarantine_has(&node_b, &parent_txid), test_timeout(30), "parent not quarantined on B");
+    poll_until(
+        || quarantine_has(&node_b, &parent_txid),
+        test_timeout(30),
+        "parent not quarantined on B",
+    );
 
     // Child: a plain payment spending the parent's change. It matches no rule on
     // its own, but its parent is quarantined in B's mempool ⇒ it inherits the
@@ -1020,13 +1117,25 @@ fn layer_c_infectious_descendant_inherits_quarantine_when_gossiped() {
     let parent_change = CB_VALUE_SAT - 1_000; // outputs[0]=runestone(0); change at vout 1
     let (child_raw, child_txid) = build_child_spend(&wallet, &parent_txid, 1, parent_change, 1_000);
     send_ok(&node_a, &child_raw);
-    poll_until(|| quarantine_has(&node_b, &child_txid), test_timeout(30), "child not quarantined on B");
+    poll_until(
+        || quarantine_has(&node_b, &child_txid),
+        test_timeout(30),
+        "child not quarantined on B",
+    );
 
     let qe = node_b
         .rpc_call_with_params("getquarantineentry", vec![json!(child_txid)])
         .expect("getquarantineentry");
-    assert_eq!(qe["result"]["scope"]["relay"], json!(true), "child relay scope: {qe}");
-    assert_eq!(qe["result"]["scope"]["template"], json!(true), "child template scope: {qe}");
+    assert_eq!(
+        qe["result"]["scope"]["relay"],
+        json!(true),
+        "child relay scope: {qe}"
+    );
+    assert_eq!(
+        qe["result"]["scope"]["template"],
+        json!(true),
+        "child template scope: {qe}"
+    );
     let depends: Vec<String> = qe["result"]["depends"]
         .as_array()
         .expect("depends")
@@ -1037,7 +1146,10 @@ fn layer_c_infectious_descendant_inherits_quarantine_when_gossiped() {
         depends.contains(&parent_txid),
         "child should report the quarantined parent as an infectious dependency: {qe}"
     );
-    assert!(!mempool_has(&node_b, &child_txid), "infectious child leaked into acting mempool");
+    assert!(
+        !mempool_has(&node_b, &child_txid),
+        "infectious child leaked into acting mempool"
+    );
 
     node_a.stop();
     node_b.stop();
@@ -1064,7 +1176,11 @@ fn layer_c_quarantined_tx_confirmed_in_block_clears_cleanly() {
 
     let (raw, txid) = build_spend(&node_a, &wallet, 1, vec![runestone_output()], 1_000);
     send_ok(&node_a, &raw);
-    poll_until(|| quarantine_has(&node_b, &txid), test_timeout(30), "tx not quarantined on B");
+    poll_until(
+        || quarantine_has(&node_b, &txid),
+        test_timeout(30),
+        "tx not quarantined on B",
+    );
 
     // A (no policy) mines the runestone into a block; B receives and connects it.
     mine_to(&node_a, 1, &wallet);
@@ -1077,8 +1193,13 @@ fn layer_c_quarantined_tx_confirmed_in_block_clears_cleanly() {
         test_timeout(20),
         "tx still quarantined after confirmation",
     );
-    assert!(!mempool_has(&node_b, &txid), "confirmed tx resurrected into acting mempool");
-    let info = node_b.rpc_call("getquarantineinfo").expect("getquarantineinfo");
+    assert!(
+        !mempool_has(&node_b, &txid),
+        "confirmed tx resurrected into acting mempool"
+    );
+    let info = node_b
+        .rpc_call("getquarantineinfo")
+        .expect("getquarantineinfo");
     assert!(
         info["result"]["confirmed_anyway"].as_u64().unwrap_or(0) >= 1,
         "confirmed_anyway counter not incremented: {info}"
@@ -1122,12 +1243,25 @@ fn layer_c_reload_promotes_held_tx() {
     let resp = node_b
         .rpc_call_with_params("sendrawtransaction", vec![json!(raw), json!(true)])
         .expect("sendrawtransaction rpc");
-    assert!(resp["error"].is_null(), "allowquarantined submit rejected: {resp}");
-    poll_until(|| quarantine_has(&node_b, &txid), test_timeout(20), "tx not held on B");
-    assert!(!mempool_has(&node_b, &txid), "held tx should not be on the acting surface");
+    assert!(
+        resp["error"].is_null(),
+        "allowquarantined submit rejected: {resp}"
+    );
+    poll_until(
+        || quarantine_has(&node_b, &txid),
+        test_timeout(20),
+        "tx not held on B",
+    );
+    assert!(
+        !mempool_has(&node_b, &txid),
+        "held tx should not be on the acting surface"
+    );
     // Relay-withheld: A never receives it.
     std::thread::sleep(test_timeout(3));
-    assert!(!mempool_has(&node_a, &txid), "relay-withheld held tx leaked to A before reload");
+    assert!(
+        !mempool_has(&node_a, &txid),
+        "relay-withheld held tx leaked to A before reload"
+    );
 
     // Reload B onto an empty ruleset (SIGHUP) ⇒ reapply_policy re-evaluates the
     // pool and promotes the now-unmatched held tx out of the quarantine class
@@ -1140,7 +1274,10 @@ fn layer_c_reload_promotes_held_tx() {
         test_timeout(30),
         "held tx not promoted to acting on B after reload",
     );
-    assert!(!quarantine_has(&node_b, &txid), "tx still quarantined after promotion");
+    assert!(
+        !quarantine_has(&node_b, &txid),
+        "tx still quarantined after promotion"
+    );
     let info = node_b.rpc_call("getpolicyinfo").expect("getpolicyinfo");
     assert_eq!(
         info["result"]["rules_count"],
@@ -1169,7 +1306,16 @@ fn layer_c_reload_promotes_held_tx() {
 /// keeps listening for C; Core's `-connect` would disable inbound). Returns the
 /// three nodes after they are all connected and synced to `height`, with the
 /// policy `policy_src` loaded on B. A and C run no policy.
-fn three_node_line(policy_src: &str, height: u64) -> (TestNode, TestNode, TestNode, DeterministicWallet, PolicyFile) {
+fn three_node_line(
+    policy_src: &str,
+    height: u64,
+) -> (
+    TestNode,
+    TestNode,
+    TestNode,
+    DeterministicWallet,
+    PolicyFile,
+) {
     let wallet = test_wallet();
     let node_a = TestNode::start(&[]);
     let node_c = TestNode::start(&[]);
@@ -1181,10 +1327,22 @@ fn three_node_line(policy_src: &str, height: u64) -> (TestNode, TestNode, TestNo
     assert_policy_loaded(&node_b);
     // B dials out to both A and C; B keeps listening (no -connect).
     node_b
-        .rpc_call_with_params("addnode", vec![json!(format!("127.0.0.1:{}", p2p_port(&node_a))), json!("add")])
+        .rpc_call_with_params(
+            "addnode",
+            vec![
+                json!(format!("127.0.0.1:{}", p2p_port(&node_a))),
+                json!("add"),
+            ],
+        )
         .expect("addnode A");
     node_b
-        .rpc_call_with_params("addnode", vec![json!(format!("127.0.0.1:{}", p2p_port(&node_c))), json!("add")])
+        .rpc_call_with_params(
+            "addnode",
+            vec![
+                json!(format!("127.0.0.1:{}", p2p_port(&node_c))),
+                json!("add"),
+            ],
+        )
         .expect("addnode C");
     poll_until(
         || get_rpc_u64(&node_b, "getconnectioncount").unwrap_or(0) >= 2,
@@ -1200,15 +1358,20 @@ fn three_node_line(policy_src: &str, height: u64) -> (TestNode, TestNode, TestNo
 
 #[test]
 fn layer_c_relay_scope_is_not_re_gossiped() {
-    let (mut node_a, mut node_b, mut node_c, wallet, _pf) =
-        three_node_line(RUNES_RELAY_ONLY, 110);
+    let (mut node_a, mut node_b, mut node_c, wallet, _pf) = three_node_line(RUNES_RELAY_ONLY, 110);
 
     // Positive control: a plain payment matches no rule, stays acting on B, and
     // must reach C — proving the A→B→C *tx-relay* path is live for these exact
     // node instances (three_node_line only proves block relay reaches C). Without
     // this, the negative assertion below could pass simply because tx relay was
     // silently broken.
-    let (raw_ctl, txid_ctl) = build_spend(&node_a, &wallet, 2, vec![payment_output(&wallet, 1_000_000)], 1_000);
+    let (raw_ctl, txid_ctl) = build_spend(
+        &node_a,
+        &wallet,
+        2,
+        vec![payment_output(&wallet, 1_000_000)],
+        1_000,
+    );
     send_ok(&node_a, &raw_ctl);
     poll_until(
         || mempool_has(&node_c, &txid_ctl),
@@ -1237,7 +1400,10 @@ fn layer_c_relay_scope_is_not_re_gossiped() {
         !mempool_has(&node_c, &txid),
         "relay-withheld tx was re-gossiped to C"
     );
-    assert!(!quarantine_has(&node_c, &txid), "C has no policy yet holds it");
+    assert!(
+        !quarantine_has(&node_c, &txid),
+        "C has no policy yet holds it"
+    );
 
     node_a.stop();
     node_b.stop();
@@ -1260,8 +1426,14 @@ fn layer_c_template_scope_still_re_gossips() {
         "template-scoped tx was not re-gossiped to C",
     );
     // On B itself it is quarantined (template-withheld), not acting.
-    assert!(quarantine_has(&node_b, &txid), "tx should be quarantined on B");
-    assert!(!mempool_has(&node_b, &txid), "template-withheld tx acting on B");
+    assert!(
+        quarantine_has(&node_b, &txid),
+        "tx should be quarantined on B"
+    );
+    assert!(
+        !mempool_has(&node_b, &txid),
+        "template-withheld tx acting on B"
+    );
 
     node_a.stop();
     node_b.stop();

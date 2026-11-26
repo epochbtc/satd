@@ -54,9 +54,18 @@ fn spend(prevs: &[OutPoint], each: u64, outs: usize, fee: u64) -> Transaction {
 
 #[test]
 fn template_transactions_carry_cores_hash_and_depends() {
-    let a = OutPoint { txid: Txid::from_byte_array([1; 32]), vout: 0 };
-    let b = OutPoint { txid: Txid::from_byte_array([2; 32]), vout: 0 };
-    let (cs, mp, dir) = make_funded_template_env_with(&[(a, p2wsh_coin()), (b, p2wsh_coin())], Box::new(NoopVerifier));
+    let a = OutPoint {
+        txid: Txid::from_byte_array([1; 32]),
+        vout: 0,
+    };
+    let b = OutPoint {
+        txid: Txid::from_byte_array([2; 32]),
+        vout: 0,
+    };
+    let (cs, mp, dir) = make_funded_template_env_with(
+        &[(a, p2wsh_coin()), (b, p2wsh_coin())],
+        Box::new(NoopVerifier),
+    );
 
     // A parent with two outputs, a child spending both, and an unrelated
     // transaction. The child's fee carries the parent's package ahead of the
@@ -64,14 +73,24 @@ fn template_transactions_carry_cores_hash_and_depends() {
     let parent = spend(&[a], COIN_VALUE, 2, 2_000);
     let each = parent.output[0].value.to_sat();
     let child = spend(
-        &[OutPoint { txid: parent.compute_txid(), vout: 0 }, OutPoint { txid: parent.compute_txid(), vout: 1 }],
+        &[
+            OutPoint {
+                txid: parent.compute_txid(),
+                vout: 0,
+            },
+            OutPoint {
+                txid: parent.compute_txid(),
+                vout: 1,
+            },
+        ],
         each,
         1,
         20_000,
     );
     let unrelated = spend(&[b], COIN_VALUE, 1, 1_000);
     for tx in [&parent, &child, &unrelated] {
-        mp.accept_transaction(tx.clone(), &cs, &NoopVerifier, TxSource::Rpc, false).expect("admitted");
+        mp.accept_transaction(tx.clone(), &cs, &NoopVerifier, TxSource::Rpc, false)
+            .expect("admitted");
     }
 
     let gbt = crate::rpc::mining::get_block_template(&cs, &mp).unwrap();
@@ -80,15 +99,30 @@ fn template_transactions_carry_cores_hash_and_depends() {
     let order: Vec<String> = txs.iter().map(txid).collect();
     assert_eq!(
         order,
-        vec![parent.compute_txid().to_string(), child.compute_txid().to_string(), unrelated.compute_txid().to_string()]
+        vec![
+            parent.compute_txid().to_string(),
+            child.compute_txid().to_string(),
+            unrelated.compute_txid().to_string()
+        ]
     );
 
     for (t, tx) in txs.iter().zip([&parent, &child, &unrelated]) {
-        assert_eq!(t["hash"].as_str().unwrap(), tx.compute_wtxid().to_string(), "hash is the wtxid");
-        assert_ne!(t["hash"], t["txid"], "a witness spend's wtxid differs from its txid");
+        assert_eq!(
+            t["hash"].as_str().unwrap(),
+            tx.compute_wtxid().to_string(),
+            "hash is the wtxid"
+        );
+        assert_ne!(
+            t["hash"], t["txid"],
+            "a witness spend's wtxid differs from its txid"
+        );
     }
     assert_eq!(txs[0]["depends"], serde_json::json!([]));
-    assert_eq!(txs[1]["depends"], serde_json::json!([1, 1]), "one entry per input that spends the parent");
+    assert_eq!(
+        txs[1]["depends"],
+        serde_json::json!([1, 1]),
+        "one entry per input that spends the parent"
+    );
     assert_eq!(txs[2]["depends"], serde_json::json!([]));
 
     let _ = std::fs::remove_dir_all(&dir);
@@ -102,10 +136,22 @@ fn template_gate_refuses_mainnet_without_peers_or_in_ibd() {
     use super::template_gate;
     use bitcoin::Network;
     assert_eq!(template_gate(Network::Bitcoin, 0, false).unwrap_err().0, -9);
-    assert_eq!(template_gate(Network::Bitcoin, 0, true).unwrap_err().0, -9, "no peers is reported first");
+    assert_eq!(
+        template_gate(Network::Bitcoin, 0, true).unwrap_err().0,
+        -9,
+        "no peers is reported first"
+    );
     assert_eq!(template_gate(Network::Bitcoin, 3, true).unwrap_err().0, -10);
     assert!(template_gate(Network::Bitcoin, 3, false).is_ok());
-    for net in [Network::Testnet, Network::Testnet4, Network::Signet, Network::Regtest] {
-        assert!(template_gate(net, 0, true).is_ok(), "{net:?} is a test chain");
+    for net in [
+        Network::Testnet,
+        Network::Testnet4,
+        Network::Signet,
+        Network::Regtest,
+    ] {
+        assert!(
+            template_gate(net, 0, true).is_ok(),
+            "{net:?} is a test chain"
+        );
     }
 }

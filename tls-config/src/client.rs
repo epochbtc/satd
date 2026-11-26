@@ -179,7 +179,9 @@ impl ClientTlsOptions {
         let chain = pem_certs(&read_file(cert_path, "client certificate")?)
             .map_err(|e| bad_identity(e.to_string()))?;
         if chain.is_empty() {
-            return Err(bad_identity("no certificate in the certificate file".into()));
+            return Err(bad_identity(
+                "no certificate in the certificate file".into(),
+            ));
         }
         let key = rustls_pemfile::private_key(&mut read_file(key_path, "client key")?.as_slice())
             .map_err(|e| bad_identity(e.to_string()))?
@@ -215,7 +217,8 @@ fn ca_roots(path: &Path) -> Result<RootCertStore, ClientTlsError> {
     };
     // A PEM bundle may hold an intermediate as well as the root, and an
     // operator handed a chain file should not have to split it.
-    let certs = pem_certs(&read_file(path, "CA certificate")?).map_err(|e| bad_ca(e.to_string()))?;
+    let certs =
+        pem_certs(&read_file(path, "CA certificate")?).map_err(|e| bad_ca(e.to_string()))?;
     // A file with no PEM blocks parses "successfully" into an empty list.
     // Accepting that would add no trust anchor at all and then fail the
     // handshake with an opaque TLS error — the operator who pointed this at
@@ -263,7 +266,10 @@ mod tests {
             enabled: true,
             ..Default::default()
         };
-        assert_eq!(opts.endpoint("node.local", 8336), "https://node.local:8336/");
+        assert_eq!(
+            opts.endpoint("node.local", 8336),
+            "https://node.local:8336/"
+        );
     }
 
     #[test]
@@ -373,10 +379,7 @@ mod tests {
 
     /// Minimal TLS server: one connection, one canned HTTP response.
     /// Returns the bound port and the task handle.
-    async fn spawn_tls_server(
-        cert_pem: &str,
-        key_pem: &str,
-    ) -> (u16, tokio::task::JoinHandle<()>) {
+    async fn spawn_tls_server(cert_pem: &str, key_pem: &str) -> (u16, tokio::task::JoinHandle<()>) {
         spawn_tls_server_requiring(cert_pem, key_pem, None).await
     }
 
@@ -446,7 +449,8 @@ mod tests {
     #[tokio::test]
     async fn self_signed_server_cert_verifies_when_named_as_the_ca() {
         let cert = rcgen::generate_simple_self_signed(["localhost".to_string()]).unwrap();
-        let (port, server) = spawn_tls_server(&cert.cert.pem(), &cert.key_pair.serialize_pem()).await;
+        let (port, server) =
+            spawn_tls_server(&cert.cert.pem(), &cert.key_pair.serialize_pem()).await;
 
         let dir = tempfile::tempdir().unwrap();
         let ca_path = dir.path().join("ca.pem");
@@ -471,7 +475,8 @@ mod tests {
     #[tokio::test]
     async fn an_untrusted_server_cert_is_rejected() {
         let cert = rcgen::generate_simple_self_signed(["localhost".to_string()]).unwrap();
-        let (port, server) = spawn_tls_server(&cert.cert.pem(), &cert.key_pair.serialize_pem()).await;
+        let (port, server) =
+            spawn_tls_server(&cert.cert.pem(), &cert.key_pair.serialize_pem()).await;
 
         let client = ClientTlsOptions {
             enabled: true,
@@ -492,8 +497,11 @@ mod tests {
     #[tokio::test]
     async fn the_wrong_ca_is_rejected() {
         let server_cert = rcgen::generate_simple_self_signed(["localhost".to_string()]).unwrap();
-        let (port, server) =
-            spawn_tls_server(&server_cert.cert.pem(), &server_cert.key_pair.serialize_pem()).await;
+        let (port, server) = spawn_tls_server(
+            &server_cert.cert.pem(),
+            &server_cert.key_pair.serialize_pem(),
+        )
+        .await;
 
         let other = rcgen::generate_simple_self_signed(["localhost".to_string()]).unwrap();
         let dir = tempfile::tempdir().unwrap();
@@ -524,8 +532,11 @@ mod tests {
     #[tokio::test]
     async fn rpccacert_replaces_the_public_roots() {
         let server_cert = rcgen::generate_simple_self_signed(["localhost".to_string()]).unwrap();
-        let (port, server) =
-            spawn_tls_server(&server_cert.cert.pem(), &server_cert.key_pair.serialize_pem()).await;
+        let (port, server) = spawn_tls_server(
+            &server_cert.cert.pem(),
+            &server_cert.key_pair.serialize_pem(),
+        )
+        .await;
         let public = || {
             let mut roots = RootCertStore::empty();
             roots.add(server_cert.cert.der().clone()).unwrap();
@@ -571,7 +582,8 @@ mod tests {
     #[tokio::test]
     async fn a_name_mismatch_is_rejected() {
         let cert = rcgen::generate_simple_self_signed(["not-the-host".to_string()]).unwrap();
-        let (port, server) = spawn_tls_server(&cert.cert.pem(), &cert.key_pair.serialize_pem()).await;
+        let (port, server) =
+            spawn_tls_server(&cert.cert.pem(), &cert.key_pair.serialize_pem()).await;
 
         let dir = tempfile::tempdir().unwrap();
         let ca_path = dir.path().join("ca.pem");

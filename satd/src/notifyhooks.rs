@@ -36,8 +36,7 @@ use tokio::sync::{broadcast, mpsc};
 /// Rationale appended to the startup warning for the event-driven hooks
 /// (`-blocknotify` / `-alertnotify`): these exist for Core compatibility,
 /// but the supported integration path is the Streaming Consumption API.
-pub const STREAMING_API_NOTICE: &str =
-    "This shell-hook notifier is provided for Bitcoin Core convenience/compatibility only — for \
+pub const STREAMING_API_NOTICE: &str = "This shell-hook notifier is provided for Bitcoin Core convenience/compatibility only — for \
      building on satd, consume node events via the Streaming Consumption API (gRPC / WebSocket / \
      ZMQ), which is reorg-safe, replayable, and decoupled from consensus. See the Streaming \
      Consumption API chapter of the manual.";
@@ -47,8 +46,7 @@ pub const STREAMING_API_NOTICE: &str =
 /// conveniences; the supported homes are the service manager
 /// (systemd `ExecStartPost=` / `ExecStopPost=`) for lifecycle actions and
 /// the Streaming Consumption API for building on node state.
-pub const LIFECYCLE_NOTICE: &str =
-    "This shell hook is provided for Bitcoin Core convenience/compatibility only — prefer your \
+pub const LIFECYCLE_NOTICE: &str = "This shell hook is provided for Bitcoin Core convenience/compatibility only — prefer your \
      service manager for lifecycle actions (systemd ExecStartPost= / ExecStopPost=), and the \
      Streaming Consumption API (gRPC / WebSocket / ZMQ) for building integrations on satd.";
 
@@ -139,8 +137,13 @@ mod tests {
         // Injection attempt is neutralized (metacharacters → spaces).
         let evil = "x`touch pwned`;$(rm -rf /)|cat<>&\\'\"\n";
         let safe = sanitize_subst(evil);
-        for c in ['`', '$', ';', '&', '|', '<', '>', '(', ')', '\\', '\'', '"', '\n'] {
-            assert!(!safe.contains(c), "metachar {c:?} survived sanitization: {safe:?}");
+        for c in [
+            '`', '$', ';', '&', '|', '<', '>', '(', ')', '\\', '\'', '"', '\n',
+        ] {
+            assert!(
+                !safe.contains(c),
+                "metachar {c:?} survived sanitization: {safe:?}"
+            );
         }
         // A block hash (hex) is unaffected.
         let hash = "0000000000000000000abc123def4567890abcdef1234567890abcdef12345678";

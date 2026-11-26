@@ -217,7 +217,10 @@ mod tests {
         );
         assert!(s.contains("decline to mine"), "{s}");
         assert!(s.contains("at least one output satisfies"), "{s}");
-        assert!(s.contains("the OP_RETURN payload size (bytes) is greater than 80"), "{s}");
+        assert!(
+            s.contains("the OP_RETURN payload size (bytes) is greater than 80"),
+            "{s}"
+        );
     }
 
     #[test]

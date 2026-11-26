@@ -193,9 +193,16 @@ impl RawPsbt {
                 if global.contains_type(keys::global::UNSIGNED_TX) {
                     return Err(PsbtError::UnsignedTxInV2);
                 }
-                let n_in = read_count(&global, keys::global::INPUT_COUNT, "PSBT_GLOBAL_INPUT_COUNT")?;
-                let n_out =
-                    read_count(&global, keys::global::OUTPUT_COUNT, "PSBT_GLOBAL_OUTPUT_COUNT")?;
+                let n_in = read_count(
+                    &global,
+                    keys::global::INPUT_COUNT,
+                    "PSBT_GLOBAL_INPUT_COUNT",
+                )?;
+                let n_out = read_count(
+                    &global,
+                    keys::global::OUTPUT_COUNT,
+                    "PSBT_GLOBAL_OUTPUT_COUNT",
+                )?;
                 (n_in, n_out)
             }
         };

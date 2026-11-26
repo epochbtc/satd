@@ -10,10 +10,10 @@
 //! BDK / Mutiny clients deserialize identically. Block-summary JSON
 //! shape is `BlockHeaderJson` from `crate::encode`.
 
-use bitcoin::BlockHash;
-use axum::Json;
 use axum::Extension;
+use axum::Json;
 use axum::extract::{Path, State};
+use bitcoin::BlockHash;
 
 use crate::chain_tip::Pin;
 use crate::encode::{BlockHeaderJson, block_header_json};

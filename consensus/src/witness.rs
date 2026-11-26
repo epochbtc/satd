@@ -3,7 +3,7 @@
 
 use sha2::{Digest, Sha256};
 
-use crate::checker::{ExecData, SignatureChecker, SigVersion};
+use crate::checker::{ExecData, SigVersion, SignatureChecker};
 use crate::error::ScriptError;
 use crate::eval::eval_script;
 use crate::flags;
@@ -214,7 +214,10 @@ pub fn verify_witness_program(
         let mut stack: Vec<StackItem> = witness_stack.to_vec();
 
         // Check for annex (last element starts with 0x50)
-        if stack.len() >= 2 && !stack.last().unwrap().is_empty() && stack.last().unwrap()[0] == ANNEX_TAG {
+        if stack.len() >= 2
+            && !stack.last().unwrap().is_empty()
+            && stack.last().unwrap()[0] == ANNEX_TAG
+        {
             let annex = stack.pop().unwrap();
             // Hashed once here; every signature check of the input reuses it.
             exec_data.annex_hash = annex_hash(&annex);
@@ -255,7 +258,10 @@ pub fn verify_witness_program(
                     &mut exec_data,
                 );
             }
-            if flags::has_flag(script_flags, flags::VERIFY_DISCOURAGE_UPGRADABLE_TAPROOT_VERSION) {
+            if flags::has_flag(
+                script_flags,
+                flags::VERIFY_DISCOURAGE_UPGRADABLE_TAPROOT_VERSION,
+            ) {
                 return Err(ScriptError::DiscourageUpgradableTaprootVersion);
             }
             return Ok(());
@@ -265,7 +271,10 @@ pub fn verify_witness_program(
         // (src/script/interpreter.cpp:1990).
         return Ok(());
     } else {
-        if flags::has_flag(script_flags, flags::VERIFY_DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM) {
+        if flags::has_flag(
+            script_flags,
+            flags::VERIFY_DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM,
+        ) {
             return Err(ScriptError::DiscourageUpgradableWitnessProgram);
         }
         // Other version/size/p2sh combinations return Ok for future softfork compatibility
@@ -277,7 +286,11 @@ pub fn verify_witness_program(
 /// control block's size, then that the leaf `script` (at the control
 /// block's leaf version) and the control block's path commit to the
 /// 32-byte witness `program`. Returns the tapleaf hash.
-pub fn check_taproot_commitment(control: &[u8], script: &[u8], program: &[u8]) -> Result<[u8; 32], ScriptError> {
+pub fn check_taproot_commitment(
+    control: &[u8],
+    script: &[u8],
+    program: &[u8],
+) -> Result<[u8; 32], ScriptError> {
     if control.len() < TAPROOT_CONTROL_BASE_SIZE
         || control.len() > TAPROOT_CONTROL_MAX_SIZE
         || !(control.len() - TAPROOT_CONTROL_BASE_SIZE).is_multiple_of(TAPROOT_CONTROL_NODE_SIZE)
@@ -295,14 +308,16 @@ pub fn check_taproot_commitment(control: &[u8], script: &[u8], program: &[u8]) -
 /// `(HashWriter{} << annex).GetSHA256()`.
 pub fn annex_hash(annex: &[u8]) -> [u8; 32] {
     let mut hasher = Sha256::new();
-    hasher.update(bitcoin::consensus::encode::serialize(&bitcoin::VarInt(annex.len() as u64)));
+    hasher.update(bitcoin::consensus::encode::serialize(&bitcoin::VarInt(
+        annex.len() as u64,
+    )));
     hasher.update(annex);
     hasher.finalize().into()
 }
 
 /// Compute BIP341 tapleaf hash:SHA256(SHA256("TapLeaf") || SHA256("TapLeaf") || leaf_version || compact_size(script.len()) || script)
 fn compute_tapleaf_hash(leaf_version: u8, script: &[u8]) -> [u8; 32] {
-    use bitcoin::hashes::{sha256, Hash, HashEngine};
+    use bitcoin::hashes::{Hash, HashEngine, sha256};
     let tag_hash = sha256::Hash::hash(b"TapLeaf");
     let mut engine = sha256::Hash::engine();
     engine.input(tag_hash.as_byte_array());
@@ -317,7 +332,7 @@ fn compute_tapleaf_hash(leaf_version: u8, script: &[u8]) -> [u8; 32] {
 
 /// Compute BIP341 tapbranch hash.
 fn compute_tapbranch_hash(a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {
-    use bitcoin::hashes::{sha256, Hash, HashEngine};
+    use bitcoin::hashes::{Hash, HashEngine, sha256};
     let tag_hash = sha256::Hash::hash(b"TapBranch");
     let mut engine = sha256::Hash::engine();
     engine.input(tag_hash.as_byte_array());
@@ -385,7 +400,7 @@ fn verify_taproot_commitment(control: &[u8], program: &[u8], tapleaf_hash: &[u8;
 
 /// Compute TapTweak hash.
 fn compute_tap_tweak_hash(internal_key: &[u8; 32], merkle_root: &[u8; 32]) -> [u8; 32] {
-    use bitcoin::hashes::{sha256, Hash, HashEngine};
+    use bitcoin::hashes::{Hash, HashEngine, sha256};
     let tag_hash = sha256::Hash::hash(b"TapTweak");
     let mut engine = sha256::Hash::engine();
     engine.input(tag_hash.as_byte_array());

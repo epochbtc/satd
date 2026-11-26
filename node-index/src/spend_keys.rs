@@ -29,7 +29,9 @@
 
 use bitcoin::Txid;
 
-use crate::txseq::{TXSEQ_LEN, TxSeq, VOUT_LEN, decode_txseq, decode_u24, encode_txseq, encode_u24};
+use crate::txseq::{
+    TXSEQ_LEN, TxSeq, VOUT_LEN, decode_txseq, decode_u24, encode_txseq, encode_u24,
+};
 
 /// Encoded key length (ordinal 5 + vout BE 3).
 pub const SPENT_KEY_LEN: usize = TXSEQ_LEN + VOUT_LEN;
@@ -103,8 +105,12 @@ mod tests {
 
     #[test]
     fn test_spent_key_roundtrip() {
-        for (seq, vout) in [(0u64, 0u32), (1, 7), (1 << 32, 65_536), (super::super::txseq::TXSEQ_MAX, (1 << 24) - 1)]
-        {
+        for (seq, vout) in [
+            (0u64, 0u32),
+            (1, 7),
+            (1 << 32, 65_536),
+            (super::super::txseq::TXSEQ_MAX, (1 << 24) - 1),
+        ] {
             let encoded = encode_spent_key(seq, vout);
             assert_eq!(encoded.len(), SPENT_KEY_LEN);
             assert_eq!(decode_spent_key(&encoded), Some((seq, vout)));

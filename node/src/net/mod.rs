@@ -1,10 +1,10 @@
 pub mod addr_rate;
+pub mod addrman;
+pub mod addrv2;
 pub mod altslots;
 pub mod anchors;
-pub mod addrv2;
-pub mod addrman;
-pub mod ban;
 pub mod asmap;
+pub mod ban;
 pub mod behavior;
 pub mod bg_catchup;
 pub mod block_source;
@@ -19,9 +19,9 @@ pub mod eviction;
 pub mod fingerprint;
 pub mod flags;
 pub mod flow;
-pub mod ibd;
 pub mod headers_queue;
 pub mod headerssync;
+pub mod ibd;
 pub mod ibd_store;
 pub mod limits;
 pub mod manager;
@@ -36,11 +36,11 @@ pub mod recent_rejects;
 pub mod seeding;
 pub mod send_queue;
 pub mod stats;
-pub mod tor;
-pub mod txrequest;
-pub mod tx_relay;
 pub mod survey;
 pub mod sync;
+pub mod tor;
+pub mod tx_relay;
+pub mod txrequest;
 pub mod v2transport;
 
 /// Bitcoin Core's `CNetAddr::IsValid` for an IP address: whether it can name
@@ -83,12 +83,90 @@ pub fn is_valid(ip: std::net::IpAddr) -> bool {
 pub fn is_bad_port(port: u16) -> bool {
     matches!(
         port,
-        1 | 7 | 9 | 11 | 13 | 15 | 17 | 19 | 20 | 21 | 22 | 23 | 25 | 37 | 42 | 43 | 53 | 69 | 77 | 79
-            | 87 | 95 | 101 | 102 | 103 | 104 | 109 | 110 | 111 | 113 | 115 | 117 | 119 | 123 | 135
-            | 137 | 139 | 143 | 161 | 179 | 389 | 427 | 465 | 512 | 513 | 514 | 515 | 526 | 530
-            | 531 | 532 | 540 | 548 | 554 | 556 | 563 | 587 | 601 | 636 | 989 | 990 | 993 | 995
-            | 1719 | 1720 | 1723 | 2049 | 3306 | 3389 | 3659 | 4045 | 5060 | 5061 | 5432 | 5900
-            | 6000 | 6566 | 6665 | 6666 | 6667 | 6668 | 6669 | 6697 | 10080 | 27017
+        1 | 7
+            | 9
+            | 11
+            | 13
+            | 15
+            | 17
+            | 19
+            | 20
+            | 21
+            | 22
+            | 23
+            | 25
+            | 37
+            | 42
+            | 43
+            | 53
+            | 69
+            | 77
+            | 79
+            | 87
+            | 95
+            | 101
+            | 102
+            | 103
+            | 104
+            | 109
+            | 110
+            | 111
+            | 113
+            | 115
+            | 117
+            | 119
+            | 123
+            | 135
+            | 137
+            | 139
+            | 143
+            | 161
+            | 179
+            | 389
+            | 427
+            | 465
+            | 512
+            | 513
+            | 514
+            | 515
+            | 526
+            | 530
+            | 531
+            | 532
+            | 540
+            | 548
+            | 554
+            | 556
+            | 563
+            | 587
+            | 601
+            | 636
+            | 989
+            | 990
+            | 993
+            | 995
+            | 1719
+            | 1720
+            | 1723
+            | 2049
+            | 3306
+            | 3389
+            | 3659
+            | 4045
+            | 5060
+            | 5061
+            | 5432
+            | 5900
+            | 6000
+            | 6566
+            | 6665
+            | 6666
+            | 6667
+            | 6668
+            | 6669
+            | 6697
+            | 10080
+            | 27017
     )
 }
 
@@ -201,8 +279,18 @@ mod tests {
         // Valid is wider than routable.
         assert!(is_routable(ip("1.2.3.4")));
         assert!(is_routable(ip("2001:470::1")));
-        for private in ["0.0.0.1", "127.0.0.1", "10.0.0.1", "::1", "fc00::1", "::ffff:10.0.0.1"] {
-            assert!(!is_routable(ip(private)), "{private} is valid but not routable");
+        for private in [
+            "0.0.0.1",
+            "127.0.0.1",
+            "10.0.0.1",
+            "::1",
+            "fc00::1",
+            "::ffff:10.0.0.1",
+        ] {
+            assert!(
+                !is_routable(ip(private)),
+                "{private} is valid but not routable"
+            );
         }
     }
 }

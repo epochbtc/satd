@@ -35,7 +35,7 @@ use std::sync::atomic::Ordering;
 
 use node::events::{EventPublisher, NodeEvent, NodeEventBody};
 use node::metrics::{HookCounters, WebhookMetrics};
-use satd_alert::{AlertFile, Hook, HOOK_QUEUE_CAPACITY};
+use satd_alert::{AlertFile, HOOK_QUEUE_CAPACITY, Hook};
 use tokio::sync::{mpsc, watch};
 
 /// Hook id the legacy `reorgwebhook=` alias reports under, in metric labels and
@@ -392,7 +392,11 @@ fn accepts(hook: &Hook, env: &NodeEvent, last_heartbeat: &mut Option<std::time::
             let Some(interval) = hook.heartbeat_interval_secs else {
                 return false;
             };
-            if !hook.filter.categories.contains(node::events::CATEGORY_HEARTBEAT) {
+            if !hook
+                .filter
+                .categories
+                .contains(node::events::CATEGORY_HEARTBEAT)
+            {
                 return false;
             }
             // The bus beats at 1 Hz; a dead-man's-switch receiver wants one
@@ -466,7 +470,11 @@ async fn deliver_loop(
                 None => return,
             },
         };
-        let Delivery::Event { body, delivery_id, queued_at } = item;
+        let Delivery::Event {
+            body,
+            delivery_id,
+            queued_at,
+        } = item;
 
         counters
             .queue_depth
@@ -484,8 +492,7 @@ async fn deliver_loop(
         // one retry chain. A 20-minute-old "disk is filling" alert is not
         // worth acting on however long it spent queued versus retrying.
         let signed_at = queued_at;
-        let signature =
-            satd_alert::sign_v2(&hook.secret, signed_at, &delivery_id, &hook.id, &body);
+        let signature = satd_alert::sign_v2(&hook.secret, signed_at, &delivery_id, &hook.id, &body);
         let mut attempt: u32 = 0;
         loop {
             attempt = attempt.saturating_add(1);
@@ -497,7 +504,10 @@ async fn deliver_loop(
                 .header(satd_alert::DELIVERY_HEADER, &delivery_id)
                 .header(satd_alert::HOOK_HEADER, &hook.id)
                 .header(satd_alert::ATTEMPT_HEADER, attempt.to_string())
-                .header(satd_alert::WEBHOOK_VERSION_HEADER, satd_alert::WEBHOOK_VERSION)
+                .header(
+                    satd_alert::WEBHOOK_VERSION_HEADER,
+                    satd_alert::WEBHOOK_VERSION,
+                )
                 .body(body.as_ref().clone())
                 .send()
                 .await;
@@ -536,7 +546,11 @@ async fn deliver_loop(
                     // one ever slips through, retrying it every five minutes
                     // forever would pin the head of a serial queue and drop
                     // every real alert behind it.
-                    if result.as_ref().err().is_some_and(reqwest::Error::is_builder) {
+                    if result
+                        .as_ref()
+                        .err()
+                        .is_some_and(reqwest::Error::is_builder)
+                    {
                         counters.dropped.fetch_add(1, Ordering::Relaxed);
                         tracing::error!(
                             target: "alert",
@@ -566,7 +580,9 @@ async fn deliver_loop(
                         break;
                     }
                     match result {
-                        Ok(r) => tracing::warn!(target: "alert", hook = %hook.id, status = %r.status(), attempt, "webhook delivery failed; retrying"),
+                        Ok(r) => {
+                            tracing::warn!(target: "alert", hook = %hook.id, status = %r.status(), attempt, "webhook delivery failed; retrying")
+                        }
                         // `without_url` because a webhook URL is frequently the
                         // credential itself (Slack, Discord, PagerDuty) and may
                         // carry userinfo; reqwest's `Display` appends it
@@ -788,9 +804,8 @@ impl AlertReloader {
                     }
                     None => None,
                 };
-                let running_hook = kept.unwrap_or_else(|| {
-                    start_hook(hook, &self.metrics, self.global_stop.clone())
-                });
+                let running_hook = kept
+                    .unwrap_or_else(|| start_hook(hook, &self.metrics, self.global_stop.clone()));
                 channels.push(HookChannel {
                     id: hook.id.clone(),
                     hook: hook.clone(),
@@ -903,7 +918,10 @@ pub async fn legacy_reorg_dispatcher(
                     satd_alert::LEGACY_WEBHOOK_VERSION,
                 );
             if let Some(secret) = &target.secret {
-                req = req.header(satd_alert::SIGNATURE_HEADER, satd_alert::sign_body(secret, &body));
+                req = req.header(
+                    satd_alert::SIGNATURE_HEADER,
+                    satd_alert::sign_body(secret, &body),
+                );
             }
             let result = req.body(body.clone()).send().await;
             let status = match &result {
@@ -913,7 +931,9 @@ pub async fn legacy_reorg_dispatcher(
             match satd_alert::classify_response(status) {
                 satd_alert::Disposition::Delivered => {
                     counters.delivered.fetch_add(1, Ordering::Relaxed);
-                    counters.last_success_unix.store(unix_secs(), Ordering::Relaxed);
+                    counters
+                        .last_success_unix
+                        .store(unix_secs(), Ordering::Relaxed);
                     break;
                 }
                 d => {
@@ -921,7 +941,9 @@ pub async fn legacy_reorg_dispatcher(
                     // Consumes `result` (nothing below reads it) so the error
                     // can be stripped of its URL before it is formatted.
                     match result {
-                        Ok(r) => tracing::warn!(target: "alert", status = %r.status(), attempt, "reorg webhook returned non-2xx"),
+                        Ok(r) => {
+                            tracing::warn!(target: "alert", status = %r.status(), attempt, "reorg webhook returned non-2xx")
+                        }
                         // `without_url` for the same reason the alertfile
                         // dispatcher applies it: a webhook URL is frequently
                         // the credential itself (Slack, Discord, PagerDuty)
@@ -1038,9 +1060,9 @@ min_severity = "warning"
                 seq: 1,
             },
             NodeEventBody::Chain(node::chain::events::ChainEvent::BlockConnected {
-                hash: bitcoin::BlockHash::from_raw_hash(
-                    bitcoin::hashes::Hash::from_byte_array([3u8; 32]),
-                ),
+                hash: bitcoin::BlockHash::from_raw_hash(bitcoin::hashes::Hash::from_byte_array(
+                    [3u8; 32],
+                )),
                 height: 5,
             }),
         );

@@ -105,9 +105,18 @@ impl<'a> Cursor<'a> {
         let at = self.pos;
         let first = self.u8(what)?;
         let (v, min) = match first {
-            0xfd => (u16::from_le_bytes(self.take(2, what)?.try_into().unwrap()) as u64, 0xfd),
-            0xfe => (u32::from_le_bytes(self.take(4, what)?.try_into().unwrap()) as u64, 0x1_0000),
-            0xff => (u64::from_le_bytes(self.take(8, what)?.try_into().unwrap()), 0x1_0000_0000),
+            0xfd => (
+                u16::from_le_bytes(self.take(2, what)?.try_into().unwrap()) as u64,
+                0xfd,
+            ),
+            0xfe => (
+                u32::from_le_bytes(self.take(4, what)?.try_into().unwrap()) as u64,
+                0x1_0000,
+            ),
+            0xff => (
+                u64::from_le_bytes(self.take(8, what)?.try_into().unwrap()),
+                0x1_0000_0000,
+            ),
             n => return Ok(n as u64),
         };
         if v < min {
@@ -124,7 +133,10 @@ impl<'a> Cursor<'a> {
         let n = self.compact_size(what)?;
         let room = (self.buf.len() - self.pos) as u64;
         if n.saturating_mul(min_item as u64) > room {
-            return Err(SpanError::CountTooLarge { count: n, offset: at });
+            return Err(SpanError::CountTooLarge {
+                count: n,
+                offset: at,
+            });
         }
         Ok(n)
     }
@@ -263,7 +275,10 @@ pub fn has_punched_op_return(block: &Block, xor_key: &[u8; 8]) -> bool {
             script.len() >= 2
                 && script[0] == 0x6a
                 && (0..8).any(|phase| {
-                    script[1..].iter().enumerate().all(|(j, b)| *b == xor_key[(phase + j) % 8])
+                    script[1..]
+                        .iter()
+                        .enumerate()
+                        .all(|(j, b)| *b == xor_key[(phase + j) % 8])
                 })
         })
     })
@@ -383,7 +398,9 @@ impl StripRecord {
                 return Err(RecordDecodeError::UnknownFlags(flags));
             }
             let wtxid = if flags & FLAG_HAS_WITNESS != 0 {
-                Some(Wtxid::from_byte_array(r.take(32, "wtxid")?.try_into().unwrap()))
+                Some(Wtxid::from_byte_array(
+                    r.take(32, "wtxid")?.try_into().unwrap(),
+                ))
             } else {
                 None
             };
@@ -428,7 +445,11 @@ impl StripRecord {
     /// come from `block` and the filled form from `bytes`, so a mismatch
     /// would build a record no read could ever verify, and the punch that
     /// follows would leave the block unreadable for good.
-    pub fn build(bytes: &[u8], block: &Block, threshold: u64) -> Result<Option<(Self, Vec<u8>)>, FillError> {
+    pub fn build(
+        bytes: &[u8],
+        block: &Block,
+        threshold: u64,
+    ) -> Result<Option<(Self, Vec<u8>)>, FillError> {
         if bitcoin::consensus::encode::serialize(block) != bytes {
             return Err(FillError::BytesNotBlock);
         }
@@ -486,7 +507,8 @@ impl<'a> RecordReader<'a> {
     }
 
     fn varint(&mut self, what: &'static str) -> Result<u64, RecordDecodeError> {
-        let (v, n) = decode_varint(&self.buf[self.pos..]).ok_or(RecordDecodeError::Truncated(what))?;
+        let (v, n) =
+            decode_varint(&self.buf[self.pos..]).ok_or(RecordDecodeError::Truncated(what))?;
         let mut canonical = Vec::with_capacity(10);
         encode_varint(v, &mut canonical);
         if canonical.len() != n {
@@ -527,7 +549,9 @@ pub enum FillError {
     NoSuchTx(u32),
     #[error("strip record names output {vout} of tx {tx_index}, which does not exist")]
     NoSuchOutput { tx_index: u32, vout: u32 },
-    #[error("strip record: output {vout} of tx {tx_index} is {on_disk} bytes on disk, record says {recorded}")]
+    #[error(
+        "strip record: output {vout} of tx {tx_index} is {on_disk} bytes on disk, record says {recorded}"
+    )]
     LengthMismatch {
         tx_index: u32,
         vout: u32,
@@ -544,7 +568,11 @@ pub enum FillError {
 ///
 /// Every named output is checked before any byte is written, so on an error
 /// `buf` is unchanged.
-pub fn fill_spans(buf: &mut [u8], record: &StripRecord, spans: &[TxSpans]) -> Result<(), FillError> {
+pub fn fill_spans(
+    buf: &mut [u8],
+    record: &StripRecord,
+    spans: &[TxSpans],
+) -> Result<(), FillError> {
     for range in strip_ranges(buf, record, spans)? {
         buf[range].fill(0);
     }
@@ -752,7 +780,8 @@ impl StoredBlock {
                 return Err(StoredBlockError::FilledHashMismatch);
             }
         }
-        let block: Block = deserialize(&bytes).map_err(|e| StoredBlockError::Deserialize(e.to_string()))?;
+        let block: Block =
+            deserialize(&bytes).map_err(|e| StoredBlockError::Deserialize(e.to_string()))?;
         let got = block.block_hash();
         if got != *expected {
             return Err(StoredBlockError::WrongHash {
@@ -760,7 +789,10 @@ impl StoredBlock {
                 got,
             });
         }
-        let stored = Self { block, strip: record };
+        let stored = Self {
+            block,
+            strip: record,
+        };
         if stored.strip.is_some() && !stored.verify_merkle() {
             return Err(StoredBlockError::MerkleMismatch);
         }
@@ -794,7 +826,9 @@ impl StoredBlock {
 
     pub fn wtxid(&self, i: usize) -> Wtxid {
         match self.stripped_tx(i) {
-            Some(t) => t.wtxid.unwrap_or_else(|| Wtxid::from_raw_hash(t.txid.to_raw_hash())),
+            Some(t) => t
+                .wtxid
+                .unwrap_or_else(|| Wtxid::from_raw_hash(t.txid.to_raw_hash())),
             None => crate::validation::decode::wtxid(&self.block.txdata[i]),
         }
     }
@@ -804,7 +838,9 @@ impl StoredBlock {
     }
 
     pub fn wtxids(&self) -> Vec<Wtxid> {
-        (0..self.block.txdata.len()).map(|i| self.wtxid(i)).collect()
+        (0..self.block.txdata.len())
+            .map(|i| self.wtxid(i))
+            .collect()
     }
 
     /// The indices of the stripped transactions, whose scripts a replay

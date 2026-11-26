@@ -44,7 +44,11 @@ fn accept_all(cs: &ChainState, blocks: &[Block]) {
     for b in blocks {
         cs.accept_block(b).unwrap();
     }
-    assert_eq!(cs.tip_hash(), blocks.last().unwrap().block_hash(), "premise: every block connected");
+    assert_eq!(
+        cs.tip_hash(),
+        blocks.last().unwrap().block_hash(),
+        "premise: every block connected"
+    );
 }
 
 /// A recent tip with less than the minimum chain work is still in IBD: a
@@ -58,10 +62,16 @@ fn a_recent_tip_below_the_minimum_chain_work_stays_in_ibd() {
     floor[0] = 1;
     cs.set_minimum_chain_work(Some(floor));
     accept_all(&cs, &old_then_recent());
-    assert!(cs.is_initial_block_download(), "recent tip, too little work");
+    assert!(
+        cs.is_initial_block_download(),
+        "recent tip, too little work"
+    );
 
     cs.set_minimum_chain_work(None);
-    assert!(!cs.is_initial_block_download(), "the same tip leaves IBD without the floor");
+    assert!(
+        !cs.is_initial_block_download(),
+        "the same tip leaves IBD without the floor"
+    );
 }
 
 /// Once out of IBD the node stays out when its tip goes stale. Nothing reads
@@ -76,13 +86,23 @@ fn leaving_ibd_latches_even_when_the_tip_goes_stale() {
     // The must-be-true half: the old tip on its own is in IBD.
     let (cs, _dir) = chain_state();
     accept_all(&cs, &blocks[..2]);
-    assert!(cs.is_initial_block_download(), "premise: a stale tip is in IBD");
+    assert!(
+        cs.is_initial_block_download(),
+        "premise: a stale tip is in IBD"
+    );
 
     let (cs, _dir) = chain_state();
     accept_all(&cs, &blocks);
     cs.invalidate_block(blocks[2].block_hash()).unwrap();
-    assert_eq!(cs.tip_hash(), blocks[1].block_hash(), "premise: back on the stale tip");
-    assert!(!cs.is_initial_block_download(), "left IBD at block 3; a stale tip does not re-enter it");
+    assert_eq!(
+        cs.tip_hash(),
+        blocks[1].block_hash(),
+        "premise: back on the stale tip"
+    );
+    assert!(
+        !cs.is_initial_block_download(),
+        "left IBD at block 3; a stale tip does not re-enter it"
+    );
 }
 
 /// The latch does not arm in `BulkLoad` write mode (Core's `LoadingBlocks`),
@@ -96,5 +116,8 @@ fn the_latch_does_not_arm_during_a_bulk_load() {
     assert!(cs.is_initial_block_download(), "in IBD while the load runs");
 
     cs.set_write_mode(crate::storage::WriteMode::Normal);
-    assert!(!cs.is_initial_block_download(), "leaves IBD once the load ends");
+    assert!(
+        !cs.is_initial_block_download(),
+        "leaves IBD once the load ends"
+    );
 }

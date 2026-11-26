@@ -67,9 +67,7 @@ impl Source {
                 return Ok(Source::Https(raw.to_string()));
             }
             if scheme.eq_ignore_ascii_case("http") {
-                return Err(
-                    "--fast-start requires https:// (plain http:// is refused)".to_string(),
-                );
+                return Err("--fast-start requires https:// (plain http:// is refused)".to_string());
             }
             return Err(format!("--fast-start scheme '{scheme}://' is unsupported"));
         }
@@ -251,11 +249,7 @@ fn resume_plan(existing: u64, partial_content: bool, body_len: Option<u64>) -> R
 /// bounds each socket read so a stalled body cannot hang startup forever:
 /// on expiry this attempt errors and the caller's retry loop resumes from
 /// the bytes already written.
-async fn download_once(
-    url: &str,
-    dest: &Path,
-    progress: &StartupProgress,
-) -> Result<(), String> {
+async fn download_once(url: &str, dest: &Path, progress: &StartupProgress) -> Result<(), String> {
     use reqwest::header::RANGE;
 
     let client = reqwest::Client::builder()
@@ -269,7 +263,10 @@ async fn download_once(
     if existing > 0 {
         req = req.header(RANGE, format!("bytes={existing}-"));
     }
-    let mut resp = req.send().await.map_err(|e| format!("request failed: {e}"))?;
+    let mut resp = req
+        .send()
+        .await
+        .map_err(|e| format!("request failed: {e}"))?;
     let status = resp.status();
     // We already hold `existing` bytes and asked to resume past them, but
     // the server says that range is unsatisfiable — i.e. the file is
@@ -472,7 +469,11 @@ mod tests {
         let p = resume_plan(0, false, Some(100));
         assert_eq!(
             p,
-            ResumePlan { append: false, total: Some(100), start: 0 }
+            ResumePlan {
+                append: false,
+                total: Some(100),
+                start: 0
+            }
         );
     }
 
@@ -482,7 +483,11 @@ mod tests {
         let p = resume_plan(40, true, Some(60));
         assert_eq!(
             p,
-            ResumePlan { append: true, total: Some(100), start: 40 }
+            ResumePlan {
+                append: true,
+                total: Some(100),
+                start: 40
+            }
         );
     }
 
@@ -492,7 +497,11 @@ mod tests {
         let p = resume_plan(40, false, Some(100));
         assert_eq!(
             p,
-            ResumePlan { append: false, total: Some(100), start: 0 }
+            ResumePlan {
+                append: false,
+                total: Some(100),
+                start: 0
+            }
         );
     }
 
@@ -500,7 +509,14 @@ mod tests {
     fn resume_plan_without_content_length() {
         // No Content-Length: total is unknown, but we still download.
         let p = resume_plan(0, false, None);
-        assert_eq!(p, ResumePlan { append: false, total: None, start: 0 });
+        assert_eq!(
+            p,
+            ResumePlan {
+                append: false,
+                total: None,
+                start: 0
+            }
+        );
     }
 
     #[tokio::test]

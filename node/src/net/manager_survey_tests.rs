@@ -19,7 +19,13 @@ pub(super) fn mk_pm_with(proxy: Option<&str>) -> (Arc<PeerManager>, tempfile::Te
 
 /// [`mk_pm_with`], and the sender of its shutdown signal, which a task the
 /// manager runs (a loop that ends at shutdown) needs alive.
-pub(super) fn mk_pm_live(proxy: Option<&str>) -> (Arc<PeerManager>, tempfile::TempDir, tokio::sync::watch::Sender<bool>) {
+pub(super) fn mk_pm_live(
+    proxy: Option<&str>,
+) -> (
+    Arc<PeerManager>,
+    tempfile::TempDir,
+    tokio::sync::watch::Sender<bool>,
+) {
     mk_pm_proxies(None, proxy)
 }
 
@@ -32,7 +38,11 @@ pub(super) fn mk_pm_proxied(proxy: &str) -> (Arc<PeerManager>, tempfile::TempDir
 fn mk_pm_proxies(
     proxy: Option<&str>,
     onion_proxy: Option<&str>,
-) -> (Arc<PeerManager>, tempfile::TempDir, tokio::sync::watch::Sender<bool>) {
+) -> (
+    Arc<PeerManager>,
+    tempfile::TempDir,
+    tokio::sync::watch::Sender<bool>,
+) {
     use crate::chain::state::AssumeValid;
     use crate::storage::db::InMemoryStore;
     use crate::storage::flatfile::FlatFileManager;
@@ -76,7 +86,11 @@ fn mk_pm_proxies(
 }
 
 fn enable(pm: &PeerManager, probes: bool) {
-    pm.enable_survey(SurveyConfig { interval: Duration::from_secs(60), probes, path: None });
+    pm.enable_survey(SurveyConfig {
+        interval: Duration::from_secs(60),
+        probes,
+        path: None,
+    });
 }
 
 fn add_handle(pm: &PeerManager, info: PeerInfo) {
@@ -106,7 +120,12 @@ fn outbound(id: PeerId, addr: SocketAddr, conn_type: ConnType, state: PeerState)
 }
 
 pub(super) fn book_add(pm: &PeerManager, addr: SocketAddr) {
-    pm.addrman.write().add_from(addr, now_unix_secs(), 1 | 8, "198.51.100.7".parse::<IpAddr>().unwrap());
+    pm.addrman.write().add_from(
+        addr,
+        now_unix_secs(),
+        1 | 8,
+        "198.51.100.7".parse::<IpAddr>().unwrap(),
+    );
 }
 
 pub(super) const ONION: &str = "pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.onion";
@@ -124,19 +143,46 @@ fn a_survey_connection_takes_no_outbound_slot_or_grant() {
     let limit = pm.max_automatic_outbound();
     for i in 0..limit - 1 {
         let addr = SocketAddr::from(([203, 0, 113, i as u8 + 1], 8333));
-        add_handle(&pm, outbound(1000 + i as PeerId, addr, ConnType::OutboundFullRelay, PeerState::Connected));
+        add_handle(
+            &pm,
+            outbound(
+                1000 + i as PeerId,
+                addr,
+                ConnType::OutboundFullRelay,
+                PeerState::Connected,
+            ),
+        );
     }
-    let before = (pm.automatic_outbound_peers(), pm.automatic_sockets_open(&pm.dials_in_flight.lock()));
-    add_handle(&pm, outbound(1, SocketAddr::from(([198, 51, 100, 9], 8333)), ConnType::Survey, PeerState::Connecting));
-    let after = (pm.automatic_outbound_peers(), pm.automatic_sockets_open(&pm.dials_in_flight.lock()));
+    let before = (
+        pm.automatic_outbound_peers(),
+        pm.automatic_sockets_open(&pm.dials_in_flight.lock()),
+    );
+    add_handle(
+        &pm,
+        outbound(
+            1,
+            SocketAddr::from(([198, 51, 100, 9], 8333)),
+            ConnType::Survey,
+            PeerState::Connecting,
+        ),
+    );
+    let after = (
+        pm.automatic_outbound_peers(),
+        pm.automatic_sockets_open(&pm.dials_in_flight.lock()),
+    );
     assert_eq!(before, after, "the survey connection is in no count");
     let in_flight = pm.dials_in_flight.lock();
     let pending = pm.pending_typed_dials.read();
     assert!(
-        pm.check_outbound_limit_for(ConnType::AddrFetch, &pending, &in_flight).is_ok(),
+        pm.check_outbound_limit_for(ConnType::AddrFetch, &pending, &in_flight)
+            .is_ok(),
         "the last grant is still free"
     );
-    assert!(pm.check_outbound_limit_for(ConnType::Survey, &pending, &in_flight).is_err(), "addconnection cannot open one");
+    assert!(
+        pm.check_outbound_limit_for(ConnType::Survey, &pending, &in_flight)
+            .is_err(),
+        "addconnection cannot open one"
+    );
 }
 
 /// `getpeerinfo`, `getconnectioncount` and `getpeerbehavior` leave a
@@ -144,8 +190,24 @@ fn a_survey_connection_takes_no_outbound_slot_or_grant() {
 #[test]
 fn peer_lists_leave_survey_connections_out() {
     let (pm, _dir) = mk_pm();
-    add_handle(&pm, outbound(1, SocketAddr::from(([198, 51, 100, 1], 8333)), ConnType::OutboundFullRelay, PeerState::Connected));
-    add_handle(&pm, outbound(2, SocketAddr::from(([198, 51, 100, 2], 8333)), ConnType::Survey, PeerState::Connecting));
+    add_handle(
+        &pm,
+        outbound(
+            1,
+            SocketAddr::from(([198, 51, 100, 1], 8333)),
+            ConnType::OutboundFullRelay,
+            PeerState::Connected,
+        ),
+    );
+    add_handle(
+        &pm,
+        outbound(
+            2,
+            SocketAddr::from(([198, 51, 100, 2], 8333)),
+            ConnType::Survey,
+            PeerState::Connecting,
+        ),
+    );
     assert_eq!(pm.connection_count(), 1);
     let info = pm.get_peer_info();
     assert_eq!(info.len(), 1);
@@ -160,16 +222,28 @@ fn peer_lists_leave_survey_connections_out() {
 #[test]
 fn the_survey_draws_uniformly_from_new_and_tried() {
     let (pm, _dir) = mk_pm();
-    let addrs: Vec<SocketAddr> = (0..4).map(|i| SocketAddr::from(([1 + i as u8, 2, 3, 4], 8333))).collect();
+    let addrs: Vec<SocketAddr> = (0..4)
+        .map(|i| SocketAddr::from(([1 + i as u8, 2, 3, 4], 8333)))
+        .collect();
     for a in &addrs {
         book_add(&pm, *a);
     }
-    pm.addrman.write().mark_good(PeerAddr::Socket(addrs[0]), now_unix_secs());
-    pm.addrman.write().mark_good(PeerAddr::Socket(addrs[1]), now_unix_secs());
-    assert_eq!(pm.addrman.read().counts_by_network()["ipv4"].tried, 2, "fixture: two tried, two new");
+    pm.addrman
+        .write()
+        .mark_good(PeerAddr::Socket(addrs[0]), now_unix_secs());
+    pm.addrman
+        .write()
+        .mark_good(PeerAddr::Socket(addrs[1]), now_unix_secs());
+    assert_eq!(
+        pm.addrman.read().counts_by_network()["ipv4"].tried,
+        2,
+        "fixture: two tried, two new"
+    );
     let mut seen = HashMap::new();
     for _ in 0..4_000 {
-        *seen.entry(pm.draw_survey_target().unwrap()).or_insert(0usize) += 1;
+        *seen
+            .entry(pm.draw_survey_target().unwrap())
+            .or_insert(0usize) += 1;
     }
     assert_eq!(seen.len(), 4);
     for (addr, n) in seen {
@@ -197,8 +271,14 @@ async fn a_tor_only_node_never_surveys_clearnet() {
     assert_eq!(pm.survey_tick(), None);
     assert!(pm.pending_connections.read().is_empty(), "no clearnet dial");
 
-    let onion = PeerAddr::Onion { host: ONION.to_string(), port: 8333 };
-    pm.addrman.write().add_manual(onion.clone(), false, crate::time::now_secs()).unwrap();
+    let onion = PeerAddr::Onion {
+        host: ONION.to_string(),
+        port: 8333,
+    };
+    pm.addrman
+        .write()
+        .add_manual(onion.clone(), false, crate::time::now_secs())
+        .unwrap();
     for _ in 0..200 {
         assert_eq!(pm.draw_survey_target(), Some(onion.clone()));
     }
@@ -226,7 +306,15 @@ fn the_survey_passes_over_named_banned_connected_and_bad_port_addresses() {
         crate::time::now_secs(),
         crate::time::now_secs() + 3_600,
     );
-    add_handle(&pm, outbound(1, connected, ConnType::OutboundFullRelay, PeerState::Connected));
+    add_handle(
+        &pm,
+        outbound(
+            1,
+            connected,
+            ConnType::OutboundFullRelay,
+            PeerState::Connected,
+        ),
+    );
     for _ in 0..200 {
         assert_eq!(pm.draw_survey_target(), None);
     }
@@ -242,7 +330,15 @@ async fn one_survey_connection_at_a_time() {
     let (pm, _dir) = mk_pm();
     enable(&pm, false);
     book_add(&pm, SocketAddr::from(([5, 5, 5, 5], 8333)));
-    add_handle(&pm, outbound(1, SocketAddr::from(([6, 6, 6, 6], 8333)), ConnType::Survey, PeerState::Connecting));
+    add_handle(
+        &pm,
+        outbound(
+            1,
+            SocketAddr::from(([6, 6, 6, 6], 8333)),
+            ConnType::Survey,
+            PeerState::Connecting,
+        ),
+    );
     assert_eq!(pm.survey_tick(), None, "one is open");
     pm.peers.write().clear();
     pm.set_automatic_outbound(false);
@@ -269,7 +365,10 @@ async fn with_the_survey_off_nothing_is_dialled() {
     assert_eq!(json["enabled"], false);
     assert_eq!(json["addresses"], 0);
     assert!(pm.survey_metrics().is_none());
-    assert!(json.get("connections").is_none(), "no connection counts with the survey off");
+    assert!(
+        json.get("connections").is_none(),
+        "no connection counts with the survey off"
+    );
 }
 
 // ---- The session ----
@@ -296,7 +395,10 @@ fn core_script() -> Script {
         user_agent: "/Satoshi:32.1.0/",
         negotiation: vec![NetworkMessage::WtxidRelay, NetworkMessage::SendAddrV2],
         after_verack: vec![
-            NetworkMessage::SendCmpct(bitcoin::p2p::message_compact_blocks::SendCmpct { send_compact: false, version: 2 }),
+            NetworkMessage::SendCmpct(bitcoin::p2p::message_compact_blocks::SendCmpct {
+                send_compact: false,
+                version: 2,
+            }),
             NetworkMessage::Ping(77),
         ],
         answer: true,
@@ -307,7 +409,10 @@ fn core_script() -> Script {
 
 /// Serve `scripts.len()` connections on `listener`, one after the other,
 /// each by its script, returning what each received.
-async fn serve(listener: tokio::net::TcpListener, scripts: Vec<Script>) -> Vec<Vec<NetworkMessage>> {
+async fn serve(
+    listener: tokio::net::TcpListener,
+    scripts: Vec<Script>,
+) -> Vec<Vec<NetworkMessage>> {
     let mut all = Vec::new();
     for script in scripts {
         let (stream, _) = listener.accept().await.unwrap();
@@ -375,7 +480,15 @@ async fn wait_for(cond: impl Fn() -> bool, what: &str) {
 
 /// Dial one survey connection to a scripted peer and wait for it to end.
 /// Returns what the peer received and the manager.
-async fn survey_one(script: Script, probes: Option<Vec<Probe>>) -> (Vec<NetworkMessage>, Arc<PeerManager>, SocketAddr, tempfile::TempDir) {
+async fn survey_one(
+    script: Script,
+    probes: Option<Vec<Probe>>,
+) -> (
+    Vec<NetworkMessage>,
+    Arc<PeerManager>,
+    SocketAddr,
+    tempfile::TempDir,
+) {
     let (pm, dir) = mk_pm();
     enable(&pm, probes.is_some());
     if let Some(p) = probes {
@@ -387,13 +500,23 @@ async fn survey_one(script: Script, probes: Option<Vec<Probe>>) -> (Vec<NetworkM
     let server = tokio::spawn(serve(listener, vec![script]));
     assert_eq!(pm.survey_tick(), Some(PeerAddr::Socket(target)));
     let run = || pm.survey_metrics().unwrap();
-    wait_for(|| run().completed + run().failed == 1, "the survey connection ends").await;
-    let got = tokio::time::timeout(Duration::from_secs(10), server).await.unwrap().unwrap().remove(0);
+    wait_for(
+        || run().completed + run().failed == 1,
+        "the survey connection ends",
+    )
+    .await;
+    let got = tokio::time::timeout(Duration::from_secs(10), server)
+        .await
+        .unwrap()
+        .unwrap()
+        .remove(0);
     (got, pm, target, dir)
 }
 
 fn commands(msgs: &[NetworkMessage]) -> Vec<String> {
-    msgs.iter().map(|m| crate::net::behavior::wire_command(m).to_string()).collect()
+    msgs.iter()
+        .map(|m| crate::net::behavior::wire_command(m).to_string())
+        .collect()
 }
 
 /// A survey connection's handshake is a full-relay outbound's, byte for
@@ -411,19 +534,35 @@ async fn a_survey_handshake_is_a_full_relay_outbounds() {
     // The full-relay outbound's peer hangs up after 3 s: the manager loop
     // does not run here, so nothing else would close that connection
     // before the survey dials.
-    let first = Script { hold: Duration::from_secs(3), ..core_script() };
+    let first = Script {
+        hold: Duration::from_secs(3),
+        ..core_script()
+    };
     let server = tokio::spawn(serve(listener, vec![first, core_script()]));
 
     // A full-relay outbound, held for a few seconds, then the survey.
-    pm.connect_outbound_inner(target, None, None, false).await.unwrap();
+    pm.connect_outbound_inner(target, None, None, false)
+        .await
+        .unwrap();
     tokio::time::sleep(Duration::from_secs(3)).await;
     let id = *pm.peers.read().keys().next().unwrap();
     assert_eq!(pm.conn_type_of(id), ConnType::OutboundFullRelay);
     pm.disconnect_peer(id, "test");
-    wait_for(|| pm.peers.read().is_empty() && pm.pending_connections.read().is_empty(), "the first connection closes").await;
+    wait_for(
+        || pm.peers.read().is_empty() && pm.pending_connections.read().is_empty(),
+        "the first connection closes",
+    )
+    .await;
     assert!(pm.survey_tick().is_some());
-    wait_for(|| pm.survey_metrics().unwrap().completed == 1, "the survey ends").await;
-    let mut got = tokio::time::timeout(Duration::from_secs(40), server).await.unwrap().unwrap();
+    wait_for(
+        || pm.survey_metrics().unwrap().completed == 1,
+        "the survey ends",
+    )
+    .await;
+    let mut got = tokio::time::timeout(Duration::from_secs(40), server)
+        .await
+        .unwrap()
+        .unwrap();
     let (survey, normal) = (got.pop().unwrap(), got.pop().unwrap());
 
     let past_handshake = ["getaddr", "getheaders", "addr", "addrv2", "ping", "inv"];
@@ -433,7 +572,16 @@ async fn a_survey_handshake_is_a_full_relay_outbounds() {
         .collect();
     assert_eq!(
         commands(&survey),
-        ["version", "wtxidrelay", "sendaddrv2", "verack", "sendheaders", "sendcmpct", "feefilter", "pong"],
+        [
+            "version",
+            "wtxidrelay",
+            "sendaddrv2",
+            "verack",
+            "sendheaders",
+            "sendcmpct",
+            "feefilter",
+            "pong"
+        ],
         "normal: {:?}",
         commands(&normal)
     );
@@ -450,7 +598,10 @@ async fn a_survey_handshake_is_a_full_relay_outbounds() {
             (a, b) => assert_eq!(a, *b),
         }
     }
-    assert!(commands(&normal).contains(&"getaddr".to_string()), "fixture: the full-relay outbound asked for addresses");
+    assert!(
+        commands(&normal).contains(&"getaddr".to_string()),
+        "fixture: the full-relay outbound asked for addresses"
+    );
 }
 
 /// The survey records what the peer showed (its fingerprint, user agent,
@@ -462,12 +613,21 @@ async fn a_survey_records_the_peer_and_marks_its_address_good() {
     let addr = PeerAddr::Socket(target);
     let store = pm.survey_store().unwrap();
     let r = store.get(&addr).expect("a record");
-    assert_eq!(r.fingerprint, Fingerprint::Known(Family::Core, Confidence::High));
+    assert_eq!(
+        r.fingerprint,
+        Fingerprint::Known(Family::Core, Confidence::High)
+    );
     assert_eq!(r.user_agent, "/Satoshi:32.1.0/");
-    assert_eq!(r.services, (ServiceFlags::NETWORK | ServiceFlags::WITNESS).to_u64());
+    assert_eq!(
+        r.services,
+        (ServiceFlags::NETWORK | ServiceFlags::WITNESS).to_u64()
+    );
     assert!(!r.v2);
     assert!(!r.probes.any(), "probes off");
-    assert!(pm.addrman.read().tried_bucket(&addr).is_some(), "moved to tried, as a feeler's answer moves it");
+    assert!(
+        pm.addrman.read().tried_bucket(&addr).is_some(),
+        "moved to tried, as a feeler's answer moves it"
+    );
     assert!(pm.peers.read().is_empty(), "closed and gone");
     let json = pm.get_peer_survey(false);
     assert_eq!(json["families"]["core"]["count"], 1);
@@ -488,24 +648,48 @@ async fn a_survey_of_a_shape_no_row_matches_is_claimed_and_keeps_its_shape() {
     // An `inv` straight after `verack`: no captured release sends that.
     script.after_verack = vec![NetworkMessage::Inv(Vec::new())];
     let (_got, pm, target, _dir) = survey_one(script, None).await;
-    let r = pm.survey_store().unwrap().get(&PeerAddr::Socket(target)).cloned().expect("a record");
-    assert_eq!(r.fingerprint, Fingerprint::Known(Family::Core, Confidence::Claimed));
+    let r = pm
+        .survey_store()
+        .unwrap()
+        .get(&PeerAddr::Socket(target))
+        .cloned()
+        .expect("a record");
+    assert_eq!(
+        r.fingerprint,
+        Fingerprint::Known(Family::Core, Confidence::Claimed)
+    );
     let shape = r.shape.expect("the raw shape is kept");
-    assert_eq!(shape.commands, ["version", "wtxidrelay", "sendaddrv2", "verack", "inv"]);
+    assert_eq!(
+        shape.commands,
+        ["version", "wtxidrelay", "sendaddrv2", "verack", "inv"]
+    );
     assert!(shape.relay);
-    assert_eq!(r.verdict, Verdict::Classified, "it said more than `verack`: no fake");
+    assert_eq!(
+        r.verdict,
+        Verdict::Classified,
+        "it said more than `verack`: no fake"
+    );
     let json = pm.get_peer_survey(false);
-    assert_eq!(json["families"]["core"]["count"], 0, "a claim is never an observed family");
+    assert_eq!(
+        json["families"]["core"]["count"], 0,
+        "a claim is never an observed family"
+    );
     assert_eq!(json["families"]["unknown"]["count"], 0, "nor unknown");
     assert_eq!(json["claimed"]["core"]["count"], 1);
     let metrics = pm.survey_metrics().unwrap();
-    assert_eq!((metrics.families[0], metrics.unknown, metrics.claimed[0]), (0, 0, 1));
+    assert_eq!(
+        (metrics.families[0], metrics.unknown, metrics.claimed[0]),
+        (0, 0, 1)
+    );
     let verbose = pm.get_peer_survey(true);
     let row = &verbose["peers"][0];
     assert_eq!(row["fingerprint"], "core/claimed");
     assert_eq!(row["family"], serde_json::Value::Null);
     assert_eq!(row["claimed"], "core");
-    assert_eq!(row["handshake"], serde_json::json!(["version", "wtxidrelay", "sendaddrv2", "verack", "inv"]));
+    assert_eq!(
+        row["handshake"],
+        serde_json::json!(["version", "wtxidrelay", "sendaddrv2", "verack", "inv"])
+    );
 }
 
 /// Each probe sends its message and records the answer: the `pong`'s
@@ -515,19 +699,43 @@ async fn a_survey_of_a_shape_no_row_matches_is_claimed_and_keeps_its_shape() {
 /// headers.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn probes_send_the_vetted_messages_and_record_the_answers() {
-    let order = vec![Probe::Unknown, Probe::GetData, Probe::GetHeaders, Probe::Ping];
+    let order = vec![
+        Probe::Unknown,
+        Probe::GetData,
+        Probe::GetHeaders,
+        Probe::Ping,
+    ];
     let (got, pm, target, _dir) = survey_one(core_script(), Some(order)).await;
     assert_eq!(pm.chain_state.tip_height(), 0, "fixture: at genesis");
     let cmds = commands(&got);
-    let tail: Vec<&str> = cmds.iter().map(String::as_str).skip_while(|c| *c != "pong").skip(1).collect();
+    let tail: Vec<&str> = cmds
+        .iter()
+        .map(String::as_str)
+        .skip_while(|c| *c != "pong")
+        .skip(1)
+        .collect();
     assert_eq!(tail.len(), 3, "{cmds:?}");
-    assert!(tail[0].len() >= 6 && tail[0].bytes().all(|b| b.is_ascii_lowercase()), "an unknown type: {tail:?}");
+    assert!(
+        tail[0].len() >= 6 && tail[0].bytes().all(|b| b.is_ascii_lowercase()),
+        "an unknown type: {tail:?}"
+    );
     assert_eq!(&tail[1..], ["getdata", "ping"]);
-    let r = pm.survey_store().unwrap().get(&PeerAddr::Socket(target)).cloned().unwrap();
+    let r = pm
+        .survey_store()
+        .unwrap()
+        .get(&PeerAddr::Socket(target))
+        .cloned()
+        .unwrap();
     assert_eq!(r.probes.get(Probe::Unknown), Some(ProbeOutcome::Silent));
-    assert_eq!(r.probes.get(Probe::GetData), Some(ProbeOutcome::Answered(1)));
+    assert_eq!(
+        r.probes.get(Probe::GetData),
+        Some(ProbeOutcome::Answered(1))
+    );
     assert_eq!(r.probes.get(Probe::GetHeaders), None, "not sent at genesis");
-    assert!(matches!(r.probes.get(Probe::Ping), Some(ProbeOutcome::Answered(_))));
+    assert!(matches!(
+        r.probes.get(Probe::Ping),
+        Some(ProbeOutcome::Answered(_))
+    ));
     let m = pm.survey_metrics().unwrap();
     assert_eq!(m.probe_outcomes[0][0], 1, "ping answered");
     assert_eq!(m.probe_outcomes[3][1], 1, "unknown silent");
@@ -537,17 +745,42 @@ async fn probes_send_the_vetted_messages_and_record_the_answers() {
 /// disconnected and nothing more is sent.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_peer_that_closes_over_a_probe_gets_no_more() {
-    let script = Script { answer: false, close_on_unknown: true, ..core_script() };
-    let (got, pm, target, _dir) = survey_one(script, Some(vec![Probe::GetData, Probe::Unknown, Probe::Ping])).await;
+    let script = Script {
+        answer: false,
+        close_on_unknown: true,
+        ..core_script()
+    };
+    let (got, pm, target, _dir) = survey_one(
+        script,
+        Some(vec![Probe::GetData, Probe::Unknown, Probe::Ping]),
+    )
+    .await;
     let cmds = commands(&got);
-    assert!(!cmds.iter().skip_while(|c| *c != "getdata").any(|c| c == "ping"), "{cmds:?}");
-    let r = pm.survey_store().unwrap().get(&PeerAddr::Socket(target)).cloned().unwrap();
+    assert!(
+        !cmds
+            .iter()
+            .skip_while(|c| *c != "getdata")
+            .any(|c| c == "ping"),
+        "{cmds:?}"
+    );
+    let r = pm
+        .survey_store()
+        .unwrap()
+        .get(&PeerAddr::Socket(target))
+        .cloned()
+        .unwrap();
     assert_eq!(r.probes.get(Probe::GetData), Some(ProbeOutcome::Silent));
-    assert_eq!(r.probes.get(Probe::Unknown), Some(ProbeOutcome::Disconnected));
+    assert_eq!(
+        r.probes.get(Probe::Unknown),
+        Some(ProbeOutcome::Disconnected)
+    );
     assert_eq!(r.probes.get(Probe::Ping), None);
     // Its transcript had settled before it closed: judged as it is.
     assert_eq!(r.verdict, Verdict::Classified);
-    assert_eq!(r.fingerprint, Fingerprint::Known(Family::Core, Confidence::High));
+    assert_eq!(
+        r.fingerprint,
+        Fingerprint::Known(Family::Core, Confidence::High)
+    );
 }
 
 /// A peer that closes the connection during the passive wait, its
@@ -557,9 +790,18 @@ async fn a_peer_that_closes_over_a_probe_gets_no_more() {
 /// alone. It still counts as a completed survey connection.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_peer_that_closes_during_the_passive_wait_is_closed_early() {
-    let script = Script { after_verack: vec![], hold: Duration::from_secs(1), ..core_script() };
+    let script = Script {
+        after_verack: vec![],
+        hold: Duration::from_secs(1),
+        ..core_script()
+    };
     let (_got, pm, target, _dir) = survey_one(script, Some(Probe::ALL.to_vec())).await;
-    let r = pm.survey_store().unwrap().get(&PeerAddr::Socket(target)).cloned().expect("a record");
+    let r = pm
+        .survey_store()
+        .unwrap()
+        .get(&PeerAddr::Socket(target))
+        .cloned()
+        .expect("a record");
     assert_eq!(r.verdict, Verdict::ClosedEarly);
     assert_eq!(r.fingerprint, Fingerprint::Unknown, "no fingerprint");
     assert_eq!(r.user_agent, "/Satoshi:32.1.0/");
@@ -575,8 +817,14 @@ async fn a_peer_that_closes_during_the_passive_wait_is_closed_early() {
     assert_eq!(json["fake"]["core"]["count"], 0);
     assert_eq!(json["connections"]["completed"], 1);
     let m = pm.survey_metrics().unwrap();
-    assert_eq!((m.closed_early, m.unknown, m.claimed[0], m.fake[0]), (1, 0, 0, 0));
-    assert_eq!(pm.get_peer_survey(true)["peers"][0]["fingerprint"], "closed-early");
+    assert_eq!(
+        (m.closed_early, m.unknown, m.claimed[0], m.fake[0]),
+        (1, 0, 0, 0)
+    );
+    assert_eq!(
+        pm.get_peer_survey(true)["peers"][0]["fingerprint"],
+        "closed-early"
+    );
 }
 
 /// A peer claiming Core at protocol 70016 that sends `version` and
@@ -585,12 +833,28 @@ async fn a_peer_that_closes_during_the_passive_wait_is_closed_early() {
 /// Core, a claim or unknown.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_silent_peer_claiming_core_is_fake() {
-    let script = Script { user_agent: "/Satoshi:25.0.0/", negotiation: vec![], after_verack: vec![], ..core_script() };
+    let script = Script {
+        user_agent: "/Satoshi:25.0.0/",
+        negotiation: vec![],
+        after_verack: vec![],
+        ..core_script()
+    };
     let (_got, pm, target, _dir) = survey_one(script, None).await;
-    let r = pm.survey_store().unwrap().get(&PeerAddr::Socket(target)).cloned().expect("a record");
+    let r = pm
+        .survey_store()
+        .unwrap()
+        .get(&PeerAddr::Socket(target))
+        .cloned()
+        .expect("a record");
     assert_eq!(r.verdict, Verdict::Fake(Family::Core));
-    assert_eq!(r.fingerprint, Fingerprint::Known(Family::Core, Confidence::Claimed));
-    assert_eq!(r.shape.as_ref().map(|s| s.commands.clone()), Some(vec!["version".to_string(), "verack".to_string()]));
+    assert_eq!(
+        r.fingerprint,
+        Fingerprint::Known(Family::Core, Confidence::Claimed)
+    );
+    assert_eq!(
+        r.shape.as_ref().map(|s| s.commands.clone()),
+        Some(vec!["version".to_string(), "verack".to_string()])
+    );
     let json = pm.get_peer_survey(false);
     assert_eq!(json["fake"]["core"]["count"], 1);
     for family in ["core", "unknown"] {
@@ -599,7 +863,10 @@ async fn a_silent_peer_claiming_core_is_fake() {
     assert_eq!(json["claimed"]["core"]["count"], 0);
     assert_eq!(json["closed_early"]["count"], 0);
     let m = pm.survey_metrics().unwrap();
-    assert_eq!((m.fake[0], m.claimed[0], m.unknown, m.closed_early), (1, 0, 0, 0));
+    assert_eq!(
+        (m.fake[0], m.claimed[0], m.unknown, m.closed_early),
+        (1, 0, 0, 0)
+    );
     let row = &pm.get_peer_survey(true)["peers"][0];
     assert_eq!(row["fingerprint"], "fake/core");
     assert_eq!(row["claimed"], "core");
@@ -612,14 +879,29 @@ async fn a_failed_survey_dial_records_nothing() {
     let (pm, _dir) = mk_pm();
     enable(&pm, true);
     // Bound and closed: nothing listens.
-    let target = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
+    let target = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap();
     book_add(&pm, target);
     assert!(pm.survey_tick().is_some());
-    wait_for(|| pm.survey_metrics().unwrap().failed == 1, "the dial fails").await;
+    wait_for(
+        || pm.survey_metrics().unwrap().failed == 1,
+        "the dial fails",
+    )
+    .await;
     wait_for(|| !pm.survey_open(), "the dial ends").await;
     assert!(pm.survey_store().unwrap().is_empty());
-    assert!(pm.reconnect_backoff.read().get(&target).is_some_and(|s| s.attempts > 0));
-    assert_eq!(pm.get_peer_survey(false)["connections"]["last"]["result"], "failed");
+    assert!(
+        pm.reconnect_backoff
+            .read()
+            .get(&target)
+            .is_some_and(|s| s.attempts > 0)
+    );
+    assert_eq!(
+        pm.get_peer_survey(false)["connections"]["last"]["result"],
+        "failed"
+    );
 }
 
 /// A survey connection the node closes (`disconnectnode`, a ban,
@@ -636,18 +918,38 @@ async fn a_survey_connection_the_node_closes_ends_at_once() {
     book_add(&pm, target);
     // btcd's shape: nothing after `verack`, so the passive wait runs its
     // full ten seconds unless the node ends it.
-    let script = Script { negotiation: vec![NetworkMessage::SendAddrV2], after_verack: vec![], ..core_script() };
+    let script = Script {
+        negotiation: vec![NetworkMessage::SendAddrV2],
+        after_verack: vec![],
+        ..core_script()
+    };
     let server = tokio::spawn(serve(listener, vec![script]));
     assert!(pm.survey_tick().is_some());
-    wait_for(|| pm.peers.read().values().any(|h| h.info.behavior.handshake.len() >= 3), "the handshake").await;
+    wait_for(
+        || {
+            pm.peers
+                .read()
+                .values()
+                .any(|h| h.info.behavior.handshake.len() >= 3)
+        },
+        "the handshake",
+    )
+    .await;
     let id = *pm.peers.read().keys().next().unwrap();
     let closed_at = Instant::now();
     assert!(pm.disconnect_peer(id, "test"));
-    let got = tokio::time::timeout(Duration::from_secs(5), server).await.expect("the socket closes at once").unwrap().remove(0);
+    let got = tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .expect("the socket closes at once")
+        .unwrap()
+        .remove(0);
     assert!(closed_at.elapsed() < Duration::from_secs(5));
     let cmds = commands(&got);
     for probe in ["ping", "getheaders", "getdata"] {
-        assert!(!cmds.iter().any(|c| c == probe), "no {probe} after the close: {cmds:?}");
+        assert!(
+            !cmds.iter().any(|c| c == probe),
+            "no {probe} after the close: {cmds:?}"
+        );
     }
     assert!(pm.survey_store().unwrap().is_empty(), "nothing recorded");
 }
@@ -669,7 +971,11 @@ fn the_getheaders_probe_asks_for_one_header_past_genesis() {
     assert_eq!(pm.survey_locator(), None, "none at genesis");
     let time = (crate::time::now_secs() - 600) as u32;
     let block = build_test_block(genesis, 1, time);
-    let tip = pm.chain_state.accept_block(&block).expect("connect fixture block").hash();
+    let tip = pm
+        .chain_state
+        .accept_block(&block)
+        .expect("connect fixture block")
+        .hash();
     assert_eq!(pm.survey_locator(), Some((genesis, tip)));
 }
 
@@ -721,8 +1027,15 @@ fn a_due_retry_takes_the_turn_ahead_of_the_draw() {
         assert_eq!(pm.next_survey_retry(), Some(retry.clone()));
     }
     let json = pm.get_peer_survey(true);
-    assert_eq!(json["retries"], serde_json::json!({ "pending": 1, "exhausted": 0 }), "{json}");
-    assert_eq!(json["peers"][0]["retry"]["count"], 2, "a second closed-early record: the second retry");
+    assert_eq!(
+        json["retries"],
+        serde_json::json!({ "pending": 1, "exhausted": 0 }),
+        "{json}"
+    );
+    assert_eq!(
+        json["peers"][0]["retry"]["count"], 2,
+        "a second closed-early record: the second retry"
+    );
     assert_eq!(pm.survey_metrics().unwrap().retries_pending, 1);
 }
 
@@ -739,14 +1052,25 @@ fn a_due_retry_is_passed_over_as_the_draw_passes_over() {
     let connected = SocketAddr::from(([3, 3, 3, 3], 8333));
     let bad_port = SocketAddr::from(([4, 4, 4, 4], 22));
     let dialling = SocketAddr::from(([5, 5, 5, 5], 8333));
-    let onion = PeerAddr::Onion { host: ONION.to_string(), port: 8333 };
+    let onion = PeerAddr::Onion {
+        host: ONION.to_string(),
+        port: 8333,
+    };
     pm.manual_addrs.write().insert(named);
     let _ = pm.ban_list.write().add(
         &crate::net::ban::BanTarget::Net(ipnet::IpNet::from(banned.ip())),
         crate::time::now_secs(),
         crate::time::now_secs() + 3_600,
     );
-    add_handle(&pm, outbound(1, connected, ConnType::OutboundFullRelay, PeerState::Connected));
+    add_handle(
+        &pm,
+        outbound(
+            1,
+            connected,
+            ConnType::OutboundFullRelay,
+            PeerState::Connected,
+        ),
+    );
     pm.pending_connections.write().insert(dialling);
     for a in [named, banned, connected, bad_port, dialling] {
         closed_early_due(&pm, &PeerAddr::Socket(a));
@@ -755,7 +1079,11 @@ fn a_due_retry_is_passed_over_as_the_draw_passes_over() {
     assert_eq!(pm.next_survey_retry(), None, "every due retry passed over");
     let fine = SocketAddr::from(([6, 6, 6, 6], 8333));
     book_add(&pm, fine);
-    assert_eq!(pm.draw_survey_target(), Some(PeerAddr::Socket(fine)), "the draw takes the turn");
+    assert_eq!(
+        pm.draw_survey_target(),
+        Some(PeerAddr::Socket(fine)),
+        "the draw takes the turn"
+    );
     closed_early_due(&pm, &PeerAddr::Socket(fine));
     assert_eq!(pm.next_survey_retry(), Some(PeerAddr::Socket(fine)));
 }
@@ -771,16 +1099,33 @@ async fn a_failed_retry_is_spent_and_the_next_scheduled() {
         book_add(&pm, SocketAddr::from(([1 + i as u8, 2, 3, 4], 8333)));
     }
     // Bound and closed: nothing listens.
-    let target = PeerAddr::Socket(std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap());
+    let target = PeerAddr::Socket(
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap(),
+    );
     closed_early_due(&pm, &target);
-    assert_eq!(pm.survey_tick(), Some(target.clone()), "the retry takes the turn");
-    wait_for(|| pm.survey_metrics().unwrap().failed == 1, "the dial fails").await;
+    assert_eq!(
+        pm.survey_tick(),
+        Some(target.clone()),
+        "the retry takes the turn"
+    );
+    wait_for(
+        || pm.survey_metrics().unwrap().failed == 1,
+        "the dial fails",
+    )
+    .await;
     wait_for(|| !pm.survey_open(), "the dial ends").await;
     let r = pm.survey_store().unwrap().get(&target).unwrap().retry;
     assert_eq!(r.count, 2, "spent");
     let now = crate::time::now_secs();
     let due = r.next_due.unwrap();
-    assert!((now + 1_440 - 5..=now + 2_160).contains(&due), "30 min, spread: {}", due as i64 - now as i64);
+    assert!(
+        (now + 1_440 - 5..=now + 2_160).contains(&due),
+        "30 min, spread: {}",
+        due as i64 - now as i64
+    );
     assert_eq!(pm.next_survey_retry(), None);
     assert_eq!(pm.get_peer_survey(false)["retries"]["pending"], 1);
 }
@@ -800,21 +1145,42 @@ async fn a_settled_record_survives_a_later_closed_early_session() {
     let settled = crate::net::survey::SurveyRecord {
         fingerprint: Fingerprint::Known(Family::Core, Confidence::High),
         verdict: Verdict::Classified,
-        shape: Some(crate::net::survey::SurveyShape { commands: vec!["version".into(), "verack".into()], relay: true }),
+        shape: Some(crate::net::survey::SurveyShape {
+            commands: vec!["version".into(), "verack".into()],
+            relay: true,
+        }),
         ..closed_early_record(then)
     };
     assert!(pm.insert_survey_record(addr.clone(), settled.clone(), then));
-    let evicting = Script { after_verack: vec![], hold: Duration::from_secs(1), ..core_script() };
+    let evicting = Script {
+        after_verack: vec![],
+        hold: Duration::from_secs(1),
+        ..core_script()
+    };
     let server = tokio::spawn(serve(listener, vec![evicting]));
     assert_eq!(pm.survey_tick(), Some(addr.clone()));
-    wait_for(|| pm.survey_metrics().unwrap().completed == 1, "the survey connection ends").await;
+    wait_for(
+        || pm.survey_metrics().unwrap().completed == 1,
+        "the survey connection ends",
+    )
+    .await;
     let _ = tokio::time::timeout(Duration::from_secs(10), server).await;
     let r = pm.survey_store().unwrap().get(&addr).cloned().unwrap();
     assert!(r.last_seen > then, "last seen moves on");
-    assert_eq!(crate::net::survey::SurveyRecord { last_seen: then, ..r.clone() }, settled, "all else kept");
+    assert_eq!(
+        crate::net::survey::SurveyRecord {
+            last_seen: then,
+            ..r.clone()
+        },
+        settled,
+        "all else kept"
+    );
     assert_eq!(r.retry, Default::default(), "no retry");
     let json = pm.get_peer_survey(false);
     assert_eq!(json["closed_early"]["count"], 0);
     assert_eq!(json["families"]["core"]["count"], 1);
-    assert_eq!(json["retries"], serde_json::json!({ "pending": 0, "exhausted": 0 }));
+    assert_eq!(
+        json["retries"],
+        serde_json::json!({ "pending": 0, "exhausted": 0 })
+    );
 }

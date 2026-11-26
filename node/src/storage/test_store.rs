@@ -178,13 +178,19 @@ impl StoreControls {
 
     /// Run `hook` once, against the backing store, right after the next
     /// strip-record lookup has read it.
-    pub(crate) fn after_next_strip_lookup(&self, hook: impl FnOnce(&InMemoryStore) + Send + 'static) {
+    pub(crate) fn after_next_strip_lookup(
+        &self,
+        hook: impl FnOnce(&InMemoryStore) + Send + 'static,
+    ) {
         *self.after_strip_lookup.lock().unwrap() = Some(Box::new(hook));
     }
 
     /// Run `hook` once, against the backing store, right before the next
     /// strip-record lookup reads it.
-    pub(crate) fn before_next_strip_lookup(&self, hook: impl FnOnce(&InMemoryStore) + Send + 'static) {
+    pub(crate) fn before_next_strip_lookup(
+        &self,
+        hook: impl FnOnce(&InMemoryStore) + Send + 'static,
+    ) {
         *self.before_strip_lookup.lock().unwrap() = Some(Box::new(hook));
     }
 
@@ -340,10 +346,14 @@ impl Store for ControllableStore {
         // decide which of the two it trusts. Failing at the end of the visit
         // is that case with a deterministic ordering, which the underlying
         // `HashMap` iteration order would not otherwise give.
-        self.controls.block_index_scans.fetch_add(1, Ordering::SeqCst);
+        self.controls
+            .block_index_scans
+            .fetch_add(1, Ordering::SeqCst);
         let stats = self.inner.for_each_block_index(visit)?;
         if self.controls.fail_block_index_scan.load(Ordering::SeqCst) {
-            return Err(StoreError::Database("injected block-index scan fault".into()));
+            return Err(StoreError::Database(
+                "injected block-index scan fault".into(),
+            ));
         }
         Ok(stats)
     }
@@ -368,7 +378,9 @@ impl Store for ControllableStore {
             hook(&self.inner);
         }
         let read = if self.controls.strip_unreadable.load(Ordering::SeqCst) {
-            Err(StoreError::Database("injected strip-record read fault".into()))
+            Err(StoreError::Database(
+                "injected strip-record read fault".into(),
+            ))
         } else {
             self.inner.get_opreturn_strip(hash)
         };
@@ -381,12 +393,21 @@ impl Store for ControllableStore {
     fn opreturn_strip_meta(&self) -> Result<Option<Vec<u8>>, StoreError> {
         self.inner.opreturn_strip_meta()
     }
-    fn for_each_opreturn_strip(&self, f: &mut dyn FnMut(&BlockHash, &[u8])) -> Result<(), StoreError> {
+    fn for_each_opreturn_strip(
+        &self,
+        f: &mut dyn FnMut(&BlockHash, &[u8]),
+    ) -> Result<(), StoreError> {
         self.inner.for_each_opreturn_strip(f)
     }
     fn drop_opreturn_strip_cf(&self) -> Result<(), StoreError> {
-        if self.controls.fail_next_strip_drop.swap(false, Ordering::SeqCst) {
-            return Err(StoreError::Database("injected strip-family drop fault".into()));
+        if self
+            .controls
+            .fail_next_strip_drop
+            .swap(false, Ordering::SeqCst)
+        {
+            return Err(StoreError::Database(
+                "injected strip-family drop fault".into(),
+            ));
         }
         self.inner.drop_opreturn_strip_cf()
     }
@@ -445,9 +466,9 @@ impl Store for ControllableStore {
     }
     fn read_undo(&self, hash: &BlockHash) -> Result<Option<UndoData>, StoreError> {
         match self.inner.get_undo(hash) {
-            Some(_) if self.controls.undo_unreadable.load(Ordering::SeqCst) => {
-                Err(StoreError::Serialization("injected undo decode fault".into()))
-            }
+            Some(_) if self.controls.undo_unreadable.load(Ordering::SeqCst) => Err(
+                StoreError::Serialization("injected undo decode fault".into()),
+            ),
             u => Ok(u),
         }
     }
@@ -485,7 +506,9 @@ impl Store for ControllableStore {
         self.inner.get_tx_location(txid)
     }
     fn get_tx_seq(&self, txid: &Txid) -> Option<u64> {
-        self.controls.get_tx_seq_calls.fetch_add(1, Ordering::SeqCst);
+        self.controls
+            .get_tx_seq_calls
+            .fetch_add(1, Ordering::SeqCst);
         self.inner.get_tx_seq(txid)
     }
     fn txids_of_seqs(&self, seqs: &[u64]) -> Vec<Option<Txid>> {

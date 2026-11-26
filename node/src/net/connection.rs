@@ -1,7 +1,7 @@
-use bitcoin::consensus::serialize;
-use bitcoin::p2p::message::{NetworkMessage, RawNetworkMessage};
-use bitcoin::p2p::Magic;
 use bitcoin::Network;
+use bitcoin::consensus::serialize;
+use bitcoin::p2p::Magic;
+use bitcoin::p2p::message::{NetworkMessage, RawNetworkMessage};
 use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -287,10 +287,21 @@ impl V1Connection {
     pub async fn recv(&mut self) -> io::Result<NetworkMessage> {
         if let Some(lead) = self.leading.take() {
             let mut reader = LeadingReader::new(lead, &mut self.stream);
-            return recv_message(&mut reader, self.magic, &mut self.buf, self.counters.as_ref())
-                .await;
+            return recv_message(
+                &mut reader,
+                self.magic,
+                &mut self.buf,
+                self.counters.as_ref(),
+            )
+            .await;
         }
-        recv_message(&mut self.stream, self.magic, &mut self.buf, self.counters.as_ref()).await
+        recv_message(
+            &mut self.stream,
+            self.magic,
+            &mut self.buf,
+            self.counters.as_ref(),
+        )
+        .await
     }
 
     /// Get the peer's remote address.
@@ -384,7 +395,13 @@ impl V1Reader {
     /// This method must NOT be used inside `tokio::select!` — it is not
     /// cancel-safe. Instead, run it in a dedicated task that is never cancelled.
     pub async fn recv(&mut self) -> io::Result<NetworkMessage> {
-        recv_message(&mut self.stream, self.magic, &mut self.buf, self.counters.as_ref()).await
+        recv_message(
+            &mut self.stream,
+            self.magic,
+            &mut self.buf,
+            self.counters.as_ref(),
+        )
+        .await
     }
 }
 
@@ -499,7 +516,9 @@ async fn recv_message<R: AsyncReadExt + Unpin>(
                     }
                     // The peer's own text: sanitized as Core's
                     // `SanitizeString(msg_type)`, so it cannot break a log line.
-                    let cmd = crate::net::limits::sanitize_string(&String::from_utf8_lossy(&header[4..16]));
+                    let cmd = crate::net::limits::sanitize_string(&String::from_utf8_lossy(
+                        &header[4..16],
+                    ));
                     tracing::debug!(cmd = %cmd, "Skipping unparseable message");
                     None
                 }

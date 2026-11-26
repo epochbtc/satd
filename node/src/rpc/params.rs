@@ -94,7 +94,9 @@ pub(crate) const INT_OUT_OF_RANGE: &str = "JSON integer out of range";
 /// caller's text and Rust's integer `parse` sees what `from_chars` sees. The
 /// one exception: `serde_json` reads `-0` as the integer 0, so an unsigned
 /// slot takes `-0` as 0 where Core's `from_chars` refuses the sign.
-pub(crate) fn core_int<T: std::str::FromStr>(n: &serde_json::Number) -> Result<T, ErrorObjectOwned> {
+pub(crate) fn core_int<T: std::str::FromStr>(
+    n: &serde_json::Number,
+) -> Result<T, ErrorObjectOwned> {
     n.to_string()
         .parse::<T>()
         .map_err(|_| ErrorObjectOwned::owned(-1, INT_OUT_OF_RANGE, None::<()>))
@@ -163,7 +165,12 @@ impl Args {
             .as_str()
             .and_then(|s| serde_json::from_str::<Vec<Value>>(s).ok())
             .unwrap_or_default();
-        Args { slots, pos: 0, mismatches: Vec::new(), checked: false }
+        Args {
+            slots,
+            pos: 0,
+            mismatches: Vec::new(),
+            checked: false,
+        }
     }
 
     /// Take the next slot, or `None` if the caller stopped before it.
@@ -227,7 +234,9 @@ impl Args {
         &mut self,
         name: &str,
     ) -> Result<Option<T>, ErrorObjectOwned> {
-        let Some(v) = self.next_value() else { return Ok(None) };
+        let Some(v) = self.next_value() else {
+            return Ok(None);
+        };
         let actual = json_type_name(&v);
         if actual != T::CORE_TYPE {
             self.record(name, actual, T::CORE_TYPE);
@@ -302,7 +311,9 @@ impl Args {
     /// Core handler does. A fraction or a value outside `int` is -1 "JSON
     /// integer out of range".
     pub(crate) fn verbosity(&mut self, name: &str, default: i32) -> Result<i32, ErrorObjectOwned> {
-        let Some(v) = self.next_value() else { return Ok(default) };
+        let Some(v) = self.next_value() else {
+            return Ok(default);
+        };
         match &v {
             Value::Bool(b) => Ok(i32::from(*b)),
             Value::Number(n) => match core_int::<i32>(n) {
@@ -319,8 +330,14 @@ impl Args {
     /// `ParseVerbosity` with `allow_bool = false`: a number only. A bool is
     /// refused rather than read as 0 or 1, and any `int` is returned for the
     /// caller to range-check, so the error names the value.
-    pub(crate) fn int_verbosity(&mut self, name: &str, default: i32) -> Result<i32, ErrorObjectOwned> {
-        let Some(v) = self.next_value() else { return Ok(default) };
+    pub(crate) fn int_verbosity(
+        &mut self,
+        name: &str,
+        default: i32,
+    ) -> Result<i32, ErrorObjectOwned> {
+        let Some(v) = self.next_value() else {
+            return Ok(default);
+        };
         match &v {
             Value::Bool(_) => Err(self.value_error(ErrorObjectOwned::owned(
                 -3,
@@ -379,7 +396,11 @@ impl Args {
             .mismatches
             .iter()
             .map(|(pos, name, msg)| {
-                format!("    {}: {}", json_str(&format!("Position {pos} ({name})")), json_str(msg))
+                format!(
+                    "    {}: {}",
+                    json_str(&format!("Position {pos} ({name})")),
+                    json_str(msg)
+                )
             })
             .collect::<Vec<_>>()
             .join(",\n");
@@ -449,7 +470,11 @@ mod tests {
 
         let err = a.check().expect_err("the type mismatch must be reported");
         assert_eq!(err.code(), -3);
-        assert!(err.message().contains("Position 2 (transactions)"), "{}", err.message());
+        assert!(
+            err.message().contains("Position 2 (transactions)"),
+            "{}",
+            err.message()
+        );
     }
 
     /// Core reports every mismatch at once, in position order.
@@ -518,7 +543,11 @@ mod tests {
         let mut a = Args::new(&p);
         let err = a.required::<String>("blockhash").unwrap_err();
         assert_eq!(err.code(), -3);
-        assert!(err.message().contains("Position 1 (blockhash)"), "{}", err.message());
+        assert!(
+            err.message().contains("Position 1 (blockhash)"),
+            "{}",
+            err.message()
+        );
     }
 
     #[test]
@@ -557,7 +586,11 @@ mod tests {
             }
         }
         // `int`: the sign is allowed, `-0` is 0, and the bounds are `i32`'s.
-        for (src, want) in [("[-0]", Some(0)), ("[-2147483648]", Some(i32::MIN)), ("[2147483648]", None)] {
+        for (src, want) in [
+            ("[-0]", Some(0)),
+            ("[-2147483648]", Some(i32::MIN)),
+            ("[2147483648]", None),
+        ] {
             let p = params(src);
             let mut a = Args::new(&p);
             assert_eq!(a.required::<i32>("height").ok(), want, "{src}");
@@ -572,7 +605,11 @@ mod tests {
     /// `verbosity` reads with `getInt<int>`: past `int` is the same -1.
     #[test]
     fn verbosity_outside_int_is_json_integer_out_of_range() {
-        for src in [r#"["h",2147483648]"#, r#"["h",-2147483649]"#, r#"["h",1.5]"#] {
+        for src in [
+            r#"["h",2147483648]"#,
+            r#"["h",-2147483649]"#,
+            r#"["h",1.5]"#,
+        ] {
             let p = params(src);
             let mut a = Args::new(&p);
             let _: String = a.required("blockhash").unwrap();
@@ -598,7 +635,8 @@ mod tests {
         let err = a.required::<String>("address").unwrap_err();
         assert_eq!(err.code(), -3);
         assert!(
-            err.message().contains("JSON value of type null is not of expected type string"),
+            err.message()
+                .contains("JSON value of type null is not of expected type string"),
             "{}",
             err.message()
         );
@@ -626,7 +664,10 @@ mod tests {
         let p = params(r#"["hex","0.001",1]"#);
         let mut a = Args::new(&p);
         let _: String = a.required("hexstring").unwrap();
-        assert_eq!(a.raw("maxfeerate").unwrap(), Some(Value::String("0.001".into())));
+        assert_eq!(
+            a.raw("maxfeerate").unwrap(),
+            Some(Value::String("0.001".into()))
+        );
         assert_eq!(a.raw("maxburnamount").unwrap(), Some(Value::from(1)));
         a.check().unwrap();
     }
@@ -649,8 +690,16 @@ mod tests {
         let mut a = Args::new(&p);
         assert_eq!(a.optional::<u32>("nblocks").unwrap(), None);
         let err = a.optional::<u32>("height").unwrap_err();
-        assert_eq!(err.code(), -3, "the earlier mismatch is the error Core reports");
-        assert!(err.message().contains("Position 1 (nblocks)"), "{}", err.message());
+        assert_eq!(
+            err.code(),
+            -3,
+            "the earlier mismatch is the error Core reports"
+        );
+        assert!(
+            err.message().contains("Position 1 (nblocks)"),
+            "{}",
+            err.message()
+        );
         // Reported, so dropping the `Args` is not a violation.
         drop(a);
     }
@@ -663,7 +712,11 @@ mod tests {
         assert_eq!(a.optional::<u32>("nblocks").unwrap(), None);
         let err = a.required::<u32>("height").unwrap_err();
         assert_eq!(err.code(), -3);
-        assert!(err.message().contains("Position 1 (nblocks)"), "{}", err.message());
+        assert!(
+            err.message().contains("Position 1 (nblocks)"),
+            "{}",
+            err.message()
+        );
         drop(a);
     }
 
@@ -677,7 +730,10 @@ mod tests {
         assert_eq!(a.optional::<u32>("nblocks").unwrap(), None);
         let err = a.required::<String>("blockhash").unwrap_err();
         assert_eq!(err.code(), -1);
-        assert!(err.message().contains("Missing required argument blockhash"));
+        assert!(
+            err.message()
+                .contains("Missing required argument blockhash")
+        );
         drop(a);
     }
 
@@ -689,7 +745,11 @@ mod tests {
         assert_eq!(a.optional::<u32>("nblocks").unwrap(), None);
         let err = a.verbosity("verbosity", 1).unwrap_err();
         assert_eq!(err.code(), -3);
-        assert!(err.message().contains("Position 1 (nblocks)"), "{}", err.message());
+        assert!(
+            err.message().contains("Position 1 (nblocks)"),
+            "{}",
+            err.message()
+        );
         drop(a);
     }
 }

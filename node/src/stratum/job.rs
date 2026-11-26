@@ -34,7 +34,10 @@ impl Default for JobManager {
 
 impl JobManager {
     pub fn new() -> Self {
-        Self { jobs: VecDeque::with_capacity(JOB_HISTORY), next_id: 1 }
+        Self {
+            jobs: VecDeque::with_capacity(JOB_HISTORY),
+            next_id: 1,
+        }
     }
 
     /// Allocate the id for the next job.
@@ -99,7 +102,11 @@ mod tests {
             8,
         )
         .unwrap();
-        Job { template: Arc::new(template), difficulty: 1, share_target: [0xff; 32] }
+        Job {
+            template: Arc::new(template),
+            difficulty: 1,
+            share_target: [0xff; 32],
+        }
     }
 
     #[test]

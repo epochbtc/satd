@@ -20,15 +20,15 @@
 // `common` is owned by the `e2e` test crate root (`tests/e2e.rs`); this file
 // is folded in as `mod streaming;` there, so reach it via `crate::common`.
 use crate::common::grpc_client::{
-    add_outpoints, add_script_prefixes, add_scripts, add_scripts_with_floors, add_transactions,
-    next_event_matching, next_event_opt, remove_outpoints, Body, Control, Cursor, GrpcStreamClient,
-    SubscribeControl,
+    Body, Control, Cursor, GrpcStreamClient, SubscribeControl, add_outpoints, add_script_prefixes,
+    add_scripts, add_scripts_with_floors, add_transactions, next_event_matching, next_event_opt,
+    remove_outpoints,
 };
 use crate::common::ws_client::{StreamSseClient, WsClient};
 use crate::common::{
-    block1_coinbase_txid, build_signed_p2wpkh_spend_from_block1_coinbase,
-    build_signed_p2wpkh_spend_seq, display_to_internal_hex, scripthash_hex, script_prefix_hex,
-    write_authfile, DeterministicWallet, StreamingNode, TokenSpec,
+    DeterministicWallet, StreamingNode, TokenSpec, block1_coinbase_txid,
+    build_signed_p2wpkh_spend_from_block1_coinbase, build_signed_p2wpkh_spend_seq,
+    display_to_internal_hex, script_prefix_hex, scripthash_hex, write_authfile,
 };
 use std::time::Duration;
 
@@ -448,7 +448,10 @@ async fn grpc_watch_script_funding_mempool_then_confirmed() {
     let Some(Body::ScriptMatched(s)) = ev.body else {
         unreachable!()
     };
-    assert!(s.has_amount && s.amount == 50 * 100_000_000 - 10_000, "confirmed funding value");
+    assert!(
+        s.has_amount && s.amount == 50 * 100_000_000 - 10_000,
+        "confirmed funding value"
+    );
 }
 
 /// A watched script spent by a tx input (`is_output=false`) — mempool (via the
@@ -492,7 +495,10 @@ async fn grpc_watch_script_spend_mempool_then_confirmed() {
         unreachable!()
     };
     // Confirmed spend recovers the value from block undo data.
-    assert!(s.has_amount && s.amount == 50 * 100_000_000, "confirmed spend value");
+    assert!(
+        s.has_amount && s.amount == 50 * 100_000_000,
+        "confirmed spend value"
+    );
 }
 
 /// SetWatchOptions{include_raw_tx}: a watched-script match on an opted-in stream
@@ -512,7 +518,9 @@ async fn grpc_watch_script_raw_tx_opt_in_inlines_full_tx() {
     // Opt this stream into raw-tx inlining before any match flows.
     tx.send(SubscribeControl {
         msg: Some(Control::SetWatchOptions(
-            satd_events::proto::v1::SetWatchOptions { include_raw_tx: true },
+            satd_events::proto::v1::SetWatchOptions {
+                include_raw_tx: true,
+            },
         )),
     })
     .await
@@ -535,7 +543,11 @@ async fn grpc_watch_script_raw_tx_opt_in_inlines_full_tx() {
     let decoded: bitcoin::Transaction =
         bitcoin::consensus::deserialize(&s.raw_tx).expect("raw_tx is a valid tx");
     assert_eq!(
-        decoded.compute_txid().as_raw_hash().to_byte_array().to_vec(),
+        decoded
+            .compute_txid()
+            .as_raw_hash()
+            .to_byte_array()
+            .to_vec(),
         s.txid,
         "raw_tx is the matching tx"
     );
@@ -811,7 +823,11 @@ async fn grpc_watch_script_min_value_reassert_lowers_floor_delivers() {
     let Some(Body::ScriptMatched(s)) = ev.body else {
         unreachable!()
     };
-    assert_eq!(hex::encode(&s.scripthash), dest_sh, "delivered after reassert");
+    assert_eq!(
+        hex::encode(&s.scripthash),
+        dest_sh,
+        "delivered after reassert"
+    );
 }
 
 /// A mempool spend whose *spent prevout* falls in a watched prefix bucket fires
@@ -845,7 +861,11 @@ async fn grpc_watch_prefix_spend_carries_amount_default_tier() {
     };
     // The canonical spend has a single input (the block-1 coinbase), so exactly
     // one bucketed prevout is carried.
-    assert_eq!(p.matched_prevouts.len(), 1, "single spent input in the bucket");
+    assert_eq!(
+        p.matched_prevouts.len(),
+        1,
+        "single spent input in the bucket"
+    );
     let mp = &p.matched_prevouts[0];
     // The outpoint is the load-bearing identifier a hash-tier client resolves
     // against its own UTXO set — assert it points at the spent coinbase.
@@ -855,7 +875,10 @@ async fn grpc_watch_prefix_spend_carries_amount_default_tier() {
         "matched prevout is the block-1 coinbase outpoint"
     );
     assert_eq!(mp.outpoint_vout, 0);
-    assert!(mp.has_amount, "default 'amount' tier carries the prevout value");
+    assert!(
+        mp.has_amount,
+        "default 'amount' tier carries the prevout value"
+    );
     assert_eq!(
         mp.amount, 5_000_000_000,
         "block-1 coinbase value (50 BTC regtest subsidy)"
@@ -935,10 +958,7 @@ async fn grpc_watch_depth_alarm_fires_at_threshold() {
     }
     // Depth 2 — alarm fires.
     mine_n(&sn, 1).await;
-    let ev = next_event_matching(&mut stream, 15, |b| {
-        matches!(b, Body::TxidDepthReached(_))
-    })
-    .await;
+    let ev = next_event_matching(&mut stream, 15, |b| matches!(b, Body::TxidDepthReached(_))).await;
     let Some(Body::TxidDepthReached(d)) = ev.body else {
         unreachable!()
     };
@@ -1102,7 +1122,10 @@ async fn ws_watch_prefix_spend_carries_has_amount() {
     let mps = ev["body"]["matched_prevouts"].as_array().unwrap();
     assert_eq!(mps.len(), 1, "event: {ev}");
     let mp = &mps[0];
-    assert_eq!(mp["has_amount"], true, "default 'amount' tier carries the value");
+    assert_eq!(
+        mp["has_amount"], true,
+        "default 'amount' tier carries the value"
+    );
     assert_eq!(mp["amount"].as_u64(), Some(5_000_000_000));
     assert_eq!(
         mp["script_pubkey"], "",
@@ -1178,7 +1201,8 @@ async fn ws_watch_txid_replaced_rbf() {
 async fn start_streaming_args(args: Vec<String>, env: Vec<(String, String)>) -> StreamingNode {
     tokio::task::spawn_blocking(move || {
         let refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-        let envrefs: Vec<(&str, &str)> = env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        let envrefs: Vec<(&str, &str)> =
+            env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
         StreamingNode::start_with_env(&refs, &envrefs)
     })
     .await
@@ -1233,7 +1257,11 @@ async fn grpc_subscribe_from_cursor_replays_then_live() {
     // Live handoff: mine one more → height 6, exactly once, no gap/dup.
     mine_n(&sn, 1).await;
     let ev = next_event_matching(&mut stream, 15, is_block_connected).await;
-    assert_eq!(block_height(&ev.body.unwrap()), Some(6), "live block after replay");
+    assert_eq!(
+        block_height(&ev.body.unwrap()),
+        Some(6),
+        "live block after replay"
+    );
 }
 
 /// WS `/ws?from_height=` replays then joins live.
@@ -1242,7 +1270,8 @@ async fn ws_from_cursor_replays_then_live() {
     let sn = start_streaming_async(vec![]).await;
     mine_n(&sn, 5).await;
 
-    let mut ws = crate::common::ws_client::WsClient::connect_query(sn.ws_port(), "?from_height=2").await;
+    let mut ws =
+        crate::common::ws_client::WsClient::connect_query(sn.ws_port(), "?from_height=2").await;
     let mut heights = Vec::new();
     for _ in 0..3 {
         let ev = ws
@@ -1403,7 +1432,9 @@ async fn grpc_watch_set_cursor_empty_is_rejected() {
 
     // SetCursor with no cursor → EmptyCursor rejection.
     tx.send(SubscribeControl {
-        msg: Some(Control::SetCursor(satd_events::proto::v1::SetCursor { cursor: None })),
+        msg: Some(Control::SetCursor(satd_events::proto::v1::SetCursor {
+            cursor: None,
+        })),
     })
     .await
     .unwrap();
@@ -1519,7 +1550,10 @@ async fn grpc_auth_matrix() {
     let mut anon = GrpcStreamClient::try_connect_with_token(port, None)
         .await
         .expect("tcp connect");
-    assert!(anon.try_subscribe(0).await.is_err(), "anon subscribe rejected");
+    assert!(
+        anon.try_subscribe(0).await.is_err(),
+        "anon subscribe rejected"
+    );
 
     // Wrong capability → rejected.
     let mut ro = GrpcStreamClient::connect_with_token(port, "tok-readonly").await;
@@ -1547,15 +1581,13 @@ async fn ws_auth_matrix() {
         watch_quota: None,
     }]);
     let autharg = format!("--authfile={}", fixture.authfile.display());
-    let sn = start_streaming_args(
-        vec![autharg, "--streamws-auth=1".into()],
-        vec![],
-    )
-    .await;
+    let sn = start_streaming_args(vec![autharg, "--streamws-auth=1".into()], vec![]).await;
     let port = sn.ws_port();
 
     assert!(
-        crate::common::ws_client::WsClient::try_connect(port, None).await.is_err(),
+        crate::common::ws_client::WsClient::try_connect(port, None)
+            .await
+            .is_err(),
         "anon ws upgrade rejected"
     );
     assert!(
@@ -1585,7 +1617,10 @@ async fn ws_max_conns_refuses_second() {
     tokio::time::sleep(Duration::from_millis(300)).await;
     // Second connection refused (503 → handshake error).
     let second = crate::common::ws_client::WsClient::try_connect(port, None).await;
-    assert!(second.is_err(), "second ws connection over the cap is refused");
+    assert!(
+        second.is_err(),
+        "second ws connection over the cap is refused"
+    );
 }
 
 /// An add the token's watch quota cannot hold is answered in-band with a
@@ -1613,9 +1648,15 @@ async fn grpc_watch_over_quota_add_is_rejected_in_band() {
     let Some(Body::WatchAddRejected(r)) = ev.body else {
         unreachable!()
     };
-    assert_eq!((r.kind, r.reason), (Kind::Scripts as i32, Reason::QuotaExceeded as i32));
+    assert_eq!(
+        (r.kind, r.reason),
+        (Kind::Scripts as i32, Reason::QuotaExceeded as i32)
+    );
     assert_eq!((r.required, r.held, r.quota), (2, 0, 1));
-    assert_eq!(r.scripthashes.iter().map(hex::encode).collect::<Vec<_>>(), vec![a.clone(), b.clone()]);
+    assert_eq!(
+        r.scripthashes.iter().map(hex::encode).collect::<Vec<_>>(),
+        vec![a.clone(), b.clone()]
+    );
 
     tx.send(add_scripts(&[&a])).await.expect("send add");
     tx.send(add_scripts(&[&b])).await.expect("send add");
@@ -1623,8 +1664,15 @@ async fn grpc_watch_over_quota_add_is_rejected_in_band() {
     let Some(Body::WatchAddRejected(r)) = ev.body else {
         unreachable!()
     };
-    assert_eq!((r.required, r.held, r.quota), (1, 1, 1), "the add that fit holds the unit");
-    assert_eq!(r.scripthashes.iter().map(hex::encode).collect::<Vec<_>>(), vec![b]);
+    assert_eq!(
+        (r.required, r.held, r.quota),
+        (1, 1, 1),
+        "the add that fit holds the unit"
+    );
+    assert_eq!(
+        r.scripthashes.iter().map(hex::encode).collect::<Vec<_>>(),
+        vec![b]
+    );
 }
 
 /// The WebSocket per-connection entry cap refuses an add in-band with a
@@ -1644,15 +1692,20 @@ async fn ws_add_over_entry_cap_is_rejected_in_band() {
     let mut ws = WsClient::connect(sn.ws_port()).await;
     let first = "11".repeat(32);
     let second = format!("{}{}", "22".repeat(31), "01");
-    ws.send_control(serde_json::json!({ "type": "add_transactions", "txids": [first] })).await;
-    ws.send_control(serde_json::json!({ "type": "add_transactions", "txids": [second] })).await;
+    ws.send_control(serde_json::json!({ "type": "add_transactions", "txids": [first] }))
+        .await;
+    ws.send_control(serde_json::json!({ "type": "add_transactions", "txids": [second] }))
+        .await;
     let ev = ws
         .next_json_matching(15, |v| v["body"]["category"] == "watch_add_rejected")
         .await;
     let body = &ev["body"];
     assert_eq!(body["kind"], "transactions");
     assert_eq!(body["reason"], "cap_exceeded");
-    assert_eq!((body["required"].as_u64(), body["quota"].as_u64()), (Some(2), Some(1)));
+    assert_eq!(
+        (body["required"].as_u64(), body["quota"].as_u64()),
+        (Some(2), Some(1))
+    );
     assert_eq!(body["txids"], serde_json::json!([second]));
 }
 
@@ -1684,9 +1737,11 @@ async fn flood_stream_does_not_stall_mining() {
     let height = tokio::task::spawn_blocking(move || rpc.block_count())
         .await
         .unwrap();
-    assert_eq!(height, 40, "block production advanced despite a lagging stream");
+    assert_eq!(
+        height, 40,
+        "block production advanced despite a lagging stream"
+    );
 }
-
 
 /// gRPC subscription cap: with `--events-grpc-max-subscriptions=1`, a second
 /// concurrent `Subscribe` (even on a fresh connection) is refused.
@@ -1759,9 +1814,11 @@ async fn grpc_subscribe_reorg_via_invalidateblock() {
     use satd_events::proto::v1::chain_event::Body as Ce;
 
     // The `Reorg` marker is emitted first.
-    let ev = next_event_matching(&mut stream, 15, |b| {
-        matches!(b, Body::Chain(ce) if matches!(ce.body, Some(Ce::Reorg(_))))
-    })
+    let ev = next_event_matching(
+        &mut stream,
+        15,
+        |b| matches!(b, Body::Chain(ce) if matches!(ce.body, Some(Ce::Reorg(_)))),
+    )
     .await;
     let Some(Body::Chain(ce)) = ev.body else {
         unreachable!("matched Chain above")
@@ -1773,9 +1830,11 @@ async fn grpc_subscribe_reorg_via_invalidateblock() {
     assert_eq!(r.to_height, 1, "new tip height after truncation");
 
     // Followed by a `BlockDisconnected` for the invalidated tip.
-    let ev = next_event_matching(&mut stream, 15, |b| {
-        matches!(b, Body::Chain(ce) if matches!(ce.body, Some(Ce::BlockDisconnected(_))))
-    })
+    let ev = next_event_matching(
+        &mut stream,
+        15,
+        |b| matches!(b, Body::Chain(ce) if matches!(ce.body, Some(Ce::BlockDisconnected(_)))),
+    )
     .await;
     let Some(Body::Chain(ce)) = ev.body else {
         unreachable!("matched Chain above")
@@ -1993,7 +2052,9 @@ async fn ws_status_tip_stall_raises_then_clears_on_next_block() {
 
     // The same condition is visible to an operator polling RPC.
     assert!(
-        warning_ids(&sn).await.contains(&"alert.tip_stall".to_string()),
+        warning_ids(&sn)
+            .await
+            .contains(&"alert.tip_stall".to_string()),
         "a raised status must also be an active warning",
     );
 
@@ -2004,7 +2065,9 @@ async fn ws_status_tip_stall_raises_then_clears_on_next_block() {
         .await;
     assert_status_shape(&ev, "tip_stall", "cleared");
     assert!(
-        !warning_ids(&sn).await.contains(&"alert.tip_stall".to_string()),
+        !warning_ids(&sn)
+            .await
+            .contains(&"alert.tip_stall".to_string()),
         "clearing the status must retract the warning",
     );
 }
@@ -2049,9 +2112,14 @@ async fn ws_status_tip_stall_clears_when_the_threshold_is_raised() {
         .next_json_matching(45, |v| v["body"]["category"] == "status")
         .await;
     assert_status_shape(&ev, "tip_stall", "cleared");
-    assert_eq!(ev["body"]["details"]["threshold_seconds"], "86400", "event: {ev}");
+    assert_eq!(
+        ev["body"]["details"]["threshold_seconds"], "86400",
+        "event: {ev}"
+    );
     assert!(
-        !warning_ids(&sn).await.contains(&"alert.tip_stall".to_string()),
+        !warning_ids(&sn)
+            .await
+            .contains(&"alert.tip_stall".to_string()),
         "clearing the status must retract the warning",
     );
 }
@@ -2099,8 +2167,14 @@ async fn ws_status_disk_low_raises_after_a_live_threshold_change() {
     assert_status_shape(&ev, "disk_low", "raised");
     assert_eq!(ev["body"]["severity"], "critical", "event: {ev}");
     // The actionable numbers ride in `details`, not only in the message.
-    assert!(ev["body"]["details"]["free_bytes"].is_string(), "event: {ev}");
-    assert!(ev["body"]["details"]["threshold_bytes"].is_string(), "event: {ev}");
+    assert!(
+        ev["body"]["details"]["free_bytes"].is_string(),
+        "event: {ev}"
+    );
+    assert!(
+        ev["body"]["details"]["threshold_bytes"].is_string(),
+        "event: {ev}"
+    );
     // The watched path is deliberately NOT on the wire: this event reaches
     // every `status` subscriber and any push-notification body, and an absolute
     // datadir path usually names the account satd runs under. It goes to the
@@ -2109,7 +2183,11 @@ async fn ws_status_disk_low_raises_after_a_live_threshold_change() {
         ev["body"]["details"]["path"].is_null(),
         "the datadir path must not be exposed on the wire: {ev}"
     );
-    assert!(warning_ids(&sn).await.contains(&"alert.disk_low".to_string()));
+    assert!(
+        warning_ids(&sn)
+            .await
+            .contains(&"alert.disk_low".to_string())
+    );
 }
 
 /// A reorg at or beyond `alertreorgdepth` emits a one-shot `deep_reorg` edge
@@ -2245,7 +2323,7 @@ async fn ws_status_absent_from_the_default_category_mask() {
 /// none of which the fixture tests on either side can catch alone.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn grpc_watch_silent_payment_matches_mempool_then_confirmed() {
-    use crate::common::sp_send::{sp_outputs, SpInput, SpRecipient};
+    use crate::common::sp_send::{SpInput, SpRecipient, sp_outputs};
     use bitcoin::key::TweakedPublicKey;
     use bitcoin::secp256k1::{Secp256k1, SecretKey};
     use bitcoin::{OutPoint, ScriptBuf};
@@ -2286,9 +2364,16 @@ async fn grpc_watch_silent_payment_matches_mempool_then_confirmed() {
 
     let derived = sp_outputs(
         &secp,
-        &[SpInput { outpoint, secret: wallet.sk, is_taproot: false }],
+        &[SpInput {
+            outpoint,
+            secret: wallet.sk,
+            is_taproot: false,
+        }],
         &[outpoint],
-        &[SpRecipient { scan_pubkey, spend_pubkey }],
+        &[SpRecipient {
+            scan_pubkey,
+            spend_pubkey,
+        }],
     )
     .expect("a single P2WPKH input can carry a silent payment");
     let output_key = derived[0];
@@ -2305,13 +2390,17 @@ async fn grpc_watch_silent_payment_matches_mempool_then_confirmed() {
     .await
     .unwrap();
     let rpc = sn.node.rpc_handle();
-    let sent = tokio::task::spawn_blocking(move || rpc.send_raw_tx(&raw)).await.unwrap();
+    let sent = tokio::task::spawn_blocking(move || rpc.send_raw_tx(&raw))
+        .await
+        .unwrap();
     assert_eq!(sent, txid, "sendrawtransaction returns the computed txid");
 
     // Mempool match.
-    let ev = next_event_matching(&mut stream, 20, |b| {
-        matches!(b, Body::SilentPaymentMatched(m) if !m.confirmed)
-    })
+    let ev = next_event_matching(
+        &mut stream,
+        20,
+        |b| matches!(b, Body::SilentPaymentMatched(m) if !m.confirmed),
+    )
     .await;
     let Some(Body::SilentPaymentMatched(m)) = ev.body else {
         unreachable!("matched above")
@@ -2326,12 +2415,24 @@ async fn grpc_watch_silent_payment_matches_mempool_then_confirmed() {
         hex::encode(output_key.serialize()),
         "the node derived the same output key the sender paid to"
     );
-    assert_eq!(hex::encode(&m.txid), display_to_internal_hex(&txid), "txid, internal order");
+    assert_eq!(
+        hex::encode(&m.txid),
+        display_to_internal_hex(&txid),
+        "txid, internal order"
+    );
     assert_eq!(m.vout, 0, "the only output");
-    assert_eq!(m.amount, 50 * 100_000_000 - fee_sat, "output value rides the event");
+    assert_eq!(
+        m.amount,
+        50 * 100_000_000 - fee_sat,
+        "output value rides the event"
+    );
     assert_eq!(m.k, 0, "first output for this scan key");
     assert!(!m.has_label, "no labels were registered");
-    assert_eq!(m.tweak.len(), 33, "the shared-secret tweak is a compressed point");
+    assert_eq!(
+        m.tweak.len(),
+        33,
+        "the shared-secret tweak is a compressed point"
+    );
 
     // The `tweak` + `k` pair must let a light client re-derive the output key —
     // and hence its spending key — offline, without the node ever holding a
@@ -2343,12 +2444,15 @@ async fn grpc_watch_silent_payment_matches_mempool_then_confirmed() {
     // shared secret. Skipping that step derives a plausible-looking key that
     // matches nothing, which is precisely why this is worth pinning.
     {
-        use bitcoin::hashes::{sha256, Hash as _};
+        use bitcoin::hashes::{Hash as _, sha256};
         use bitcoin::secp256k1::{PublicKey, Scalar};
 
         let t = PublicKey::from_slice(&m.tweak).expect("tweak is a compressed point");
         let ecdh = t
-            .mul_tweak(&secp, &Scalar::from_be_bytes(scan_secret.secret_bytes()).expect("< order"))
+            .mul_tweak(
+                &secp,
+                &Scalar::from_be_bytes(scan_secret.secret_bytes()).expect("< order"),
+            )
             .expect("b_scan·T");
 
         let tag = sha256::Hash::hash(b"BIP0352/SharedSecret").to_byte_array();
@@ -2385,14 +2489,20 @@ async fn grpc_watch_silent_payment_matches_mempool_then_confirmed() {
 
     // Confirmed re-emission (D7).
     mine_n(&sn, 1).await;
-    let ev = next_event_matching(&mut stream, 20, |b| {
-        matches!(b, Body::SilentPaymentMatched(m) if m.confirmed)
-    })
+    let ev = next_event_matching(
+        &mut stream,
+        20,
+        |b| matches!(b, Body::SilentPaymentMatched(m) if m.confirmed),
+    )
     .await;
     let Some(Body::SilentPaymentMatched(m)) = ev.body else {
         unreachable!("matched above")
     };
-    assert_eq!(hex::encode(&m.txid), display_to_internal_hex(&txid), "same tx, confirmed");
+    assert_eq!(
+        hex::encode(&m.txid),
+        display_to_internal_hex(&txid),
+        "same tx, confirmed"
+    );
     assert_eq!(
         hex::encode(&m.output_pubkey),
         hex::encode(output_key.serialize()),
@@ -2418,8 +2528,8 @@ async fn grpc_watch_silent_payment_matches_mempool_then_confirmed() {
 async fn grpc_watch_silent_payment_from_a_bip375_psbt() {
     use crate::common::sp_send::{self, SpInput, SpRecipient};
     use base64::Engine as _;
-    use bitcoin::secp256k1::{Secp256k1, SecretKey};
     use bitcoin::OutPoint;
+    use bitcoin::secp256k1::{Secp256k1, SecretKey};
     use serde_json::json;
     use std::str::FromStr;
 
@@ -2488,7 +2598,11 @@ async fn grpc_watch_silent_payment_from_a_bip375_psbt() {
         )
         .expect("a PSBT");
 
-        let inputs = [SpInput { outpoint, secret: w.sk, is_taproot: false }];
+        let inputs = [SpInput {
+            outpoint,
+            secret: w.sk,
+            is_taproot: false,
+        }];
         sp_send::fill_bip375(&secp, &mut psbt, &inputs, [0x5cu8; 32]).expect("fills");
         sp_send::sign_p2wpkh_inputs(&secp, &mut psbt, &w.sk).expect("signs");
         let filled = base64::engine::general_purpose::STANDARD.encode(psbt.serialize());
@@ -2509,7 +2623,10 @@ async fn grpc_watch_silent_payment_from_a_bip375_psbt() {
 
         let finalized = ok(rpc.call("finalizepsbt", vec![json!(filled)]));
         assert_eq!(finalized["complete"], true, "{finalized}");
-        let raw_tx = finalized["hex"].as_str().expect("a transaction").to_string();
+        let raw_tx = finalized["hex"]
+            .as_str()
+            .expect("a transaction")
+            .to_string();
         let txid = rpc.send_raw_tx(&raw_tx);
         (raw_tx, txid, derived)
     })
@@ -2517,9 +2634,11 @@ async fn grpc_watch_silent_payment_from_a_bip375_psbt() {
     .unwrap();
 
     // The recipient's side: a match for the scan credential it registered.
-    let ev = next_event_matching(&mut stream, 30, |b| {
-        matches!(b, Body::SilentPaymentMatched(m) if !m.confirmed)
-    })
+    let ev = next_event_matching(
+        &mut stream,
+        30,
+        |b| matches!(b, Body::SilentPaymentMatched(m) if !m.confirmed),
+    )
     .await;
     let Some(Body::SilentPaymentMatched(m)) = ev.body else {
         unreachable!("matched above")
@@ -2548,9 +2667,11 @@ async fn grpc_watch_silent_payment_from_a_bip375_psbt() {
 
     // And confirmed, after a block.
     mine_n(&sn, 1).await;
-    let ev = next_event_matching(&mut stream, 30, |b| {
-        matches!(b, Body::SilentPaymentMatched(m) if m.confirmed)
-    })
+    let ev = next_event_matching(
+        &mut stream,
+        30,
+        |b| matches!(b, Body::SilentPaymentMatched(m) if m.confirmed),
+    )
     .await;
     let Some(Body::SilentPaymentMatched(m)) = ev.body else {
         unreachable!("matched above")
@@ -2573,7 +2694,9 @@ async fn grpc_rescan_over_a_stripped_block_flags_the_stripped_tx() {
 
     let sn = start_streaming_async(vec!["--allowteststrip"]).await;
     let wallet = DeterministicWallet::from_secret([0x61; 32]);
-    let dest = DeterministicWallet::from_secret([0x62; 32]).address.script_pubkey();
+    let dest = DeterministicWallet::from_secret([0x62; 32])
+        .address
+        .script_pubkey();
     let sh = scripthash_hex(&dest);
     let rpc = sn.node.rpc_handle();
     let (block, height, stripped, intact) = tokio::task::spawn_blocking(move || {
@@ -2589,16 +2712,27 @@ async fn grpc_rescan_over_a_stripped_block_flags_the_stripped_tx() {
             &[dest.clone(), data],
             100_000,
         );
-        let (i_raw, i_txid) =
-            crate::common::build_signed_p2wpkh_spend_of_coinbases(&rpc, &[(2, &wallet)], &[dest], 100_000);
+        let (i_raw, i_txid) = crate::common::build_signed_p2wpkh_spend_of_coinbases(
+            &rpc,
+            &[(2, &wallet)],
+            &[dest],
+            100_000,
+        );
         // The helper splits the value across both outputs, so the OP_RETURN
         // burns half the coinbase: allow it.
-        let sent = rpc.call("sendrawtransaction", vec![json!(s_raw), json!(0), json!(50)]).unwrap();
+        let sent = rpc
+            .call(
+                "sendrawtransaction",
+                vec![json!(s_raw), json!(0), json!(50)],
+            )
+            .unwrap();
         assert!(sent["error"].is_null(), "{sent}");
         rpc.send_raw_tx(&i_raw);
         let block = rpc.mine(1, &addr).remove(0);
         rpc.mine(10, &addr);
-        let out = rpc.call("stripopreturns", vec![json!(block), json!(4096)]).unwrap();
+        let out = rpc
+            .call("stripopreturns", vec![json!(block), json!(4096)])
+            .unwrap();
         assert_eq!(out["result"]["outcome"], "stripped", "{out}");
         let height = rpc.call("getblockheader", vec![json!(block)]).unwrap()["result"]["height"]
             .as_u64()
@@ -2612,14 +2746,19 @@ async fn grpc_rescan_over_a_stripped_block_flags_the_stripped_tx() {
     let (tx, mut stream) = client.watch(vec![add_scripts(&[&sh])]).await;
     tx.send(SubscribeControl {
         msg: Some(Control::SetWatchOptions(
-            satd_events::proto::v1::SetWatchOptions { include_raw_tx: true },
+            satd_events::proto::v1::SetWatchOptions {
+                include_raw_tx: true,
+            },
         )),
     })
     .await
     .unwrap();
     tokio::time::sleep(Duration::from_millis(600)).await;
     tx.send(SubscribeControl {
-        msg: Some(Control::RescanBlocks(RescanBlocks { from_height: height, to_height: height })),
+        msg: Some(Control::RescanBlocks(RescanBlocks {
+            from_height: height,
+            to_height: height,
+        })),
     })
     .await
     .unwrap();
@@ -2627,11 +2766,16 @@ async fn grpc_rescan_over_a_stripped_block_flags_the_stripped_tx() {
     let (mut seen_stripped, mut seen_intact) = (false, false);
     loop {
         let ev = next_event_matching(&mut stream, 30, |b| {
-            matches!(b, Body::ScriptMatched(_) | Body::RescanComplete(_) | Body::RescanResult(_))
+            matches!(
+                b,
+                Body::ScriptMatched(_) | Body::RescanComplete(_) | Body::RescanResult(_)
+            )
         })
         .await;
         match ev.body.unwrap() {
-            Body::ScriptMatched(s) if hex::encode(&s.txid) == display_to_internal_hex(&stripped) => {
+            Body::ScriptMatched(s)
+                if hex::encode(&s.txid) == display_to_internal_hex(&stripped) =>
+            {
                 assert!(s.raw_tx.is_empty(), "no bytes for a stripped tx");
                 assert!(s.raw_tx_stripped, "and the flag says why");
                 seen_stripped = true;
@@ -2639,7 +2783,14 @@ async fn grpc_rescan_over_a_stripped_block_flags_the_stripped_tx() {
             Body::ScriptMatched(s) if hex::encode(&s.txid) == display_to_internal_hex(&intact) => {
                 let decoded: bitcoin::Transaction =
                     bitcoin::consensus::deserialize(&s.raw_tx).expect("the intact tx's bytes");
-                assert_eq!(decoded.compute_txid().as_raw_hash().to_byte_array().to_vec(), s.txid);
+                assert_eq!(
+                    decoded
+                        .compute_txid()
+                        .as_raw_hash()
+                        .to_byte_array()
+                        .to_vec(),
+                    s.txid
+                );
                 assert!(!s.raw_tx_stripped);
                 seen_intact = true;
             }
@@ -2647,7 +2798,10 @@ async fn grpc_rescan_over_a_stripped_block_flags_the_stripped_tx() {
             Body::RescanComplete(_) => break,
             Body::RescanResult(r) => {
                 use satd_events::proto::v1::rescan_result::Outcome;
-                assert!(matches!(r.outcome, Some(Outcome::Accepted(_))), "rescan refused: {r:?}");
+                assert!(
+                    matches!(r.outcome, Some(Outcome::Accepted(_))),
+                    "rescan refused: {r:?}"
+                );
             }
             other => panic!("unexpected event: {other:?}"),
         }

@@ -117,11 +117,16 @@ mod tests {
         }
 
         fn warning(&self, kind: StatusKind) -> Option<crate::warnings::Warning> {
-            self.warnings.list().into_iter().find(|w| w.id == kind.warning_id())
+            self.warnings
+                .list()
+                .into_iter()
+                .find(|w| w.id == kind.warning_id())
         }
     }
 
-    fn states(rx: &mut tokio::sync::broadcast::Receiver<crate::events::NodeEvent>) -> Vec<StatusState> {
+    fn states(
+        rx: &mut tokio::sync::broadcast::Receiver<crate::events::NodeEvent>,
+    ) -> Vec<StatusState> {
         std::iter::from_fn(|| rx.try_recv().ok())
             .filter_map(|e| match e.body {
                 NodeEventBody::Status(s) => Some(s.state),
@@ -145,19 +150,36 @@ mod tests {
         let kind = StatusKind::AssumeutxoCatchupStalled;
 
         for n in 1..=3 {
-            alerts.raise(&rig.warnings, StatusEvent::raised(kind, format!("attempt {n}")));
+            alerts.raise(
+                &rig.warnings,
+                StatusEvent::raised(kind, format!("attempt {n}")),
+            );
         }
-        assert!(rig.health.is_active(kind), "satd_alert_active follows the raise");
+        assert!(
+            rig.health.is_active(kind),
+            "satd_alert_active follows the raise"
+        );
         let w = rig.warning(kind).expect("a standing getwarnings entry");
         assert_eq!(w.count, 3, "each raise refreshes the entry");
-        assert_eq!(w.message, "attempt 3", "the entry carries the latest message");
-        assert_eq!(states(&mut rx), vec![StatusState::Raised], "one raised event");
+        assert_eq!(
+            w.message, "attempt 3",
+            "the entry carries the latest message"
+        );
+        assert_eq!(
+            states(&mut rx),
+            vec![StatusState::Raised],
+            "one raised event"
+        );
 
         alerts.clear(&rig.warnings, kind, "progress");
         alerts.clear(&rig.warnings, kind, "progress again");
         assert!(!rig.health.is_active(kind));
         assert!(rig.warning(kind).is_none());
-        assert_eq!(states(&mut rx), vec![StatusState::Cleared], "one cleared event");
+        assert_eq!(
+            states(&mut rx),
+            vec![StatusState::Cleared],
+            "one cleared event"
+        );
         assert!(!alerts.is_raised(kind));
     }
 
@@ -172,11 +194,17 @@ mod tests {
         let alerts = BackgroundAlerts::default();
         let kind = StatusKind::AssumeutxoValidationFailed;
         alerts.raise(&rig.warnings, StatusEvent::raised(kind, "hash mismatch"));
-        assert!(rig.warning(kind).is_some(), "getwarnings does not wait for the sink");
+        assert!(
+            rig.warning(kind).is_some(),
+            "getwarnings does not wait for the sink"
+        );
 
         let mut rx = rig.publisher.subscribe();
         alerts.install_sink(rig.sink());
-        assert!(rig.health.is_active(kind), "the gauge catches up on install");
+        assert!(
+            rig.health.is_active(kind),
+            "the gauge catches up on install"
+        );
         assert_eq!(states(&mut rx), vec![StatusState::Raised]);
 
         // A condition raised and cleared before the sink leaves nothing behind.

@@ -142,10 +142,7 @@ pub struct ClientAllowList {
 impl ClientAllowList {
     pub fn new(values: impl IntoIterator<Item = String>) -> Self {
         Self {
-            names: values
-                .into_iter()
-                .map(|s| s.to_ascii_lowercase())
-                .collect(),
+            names: values.into_iter().map(|s| s.to_ascii_lowercase()).collect(),
         }
     }
 
@@ -228,7 +225,10 @@ fn build_server_config(
     client_auth: &ClientAuthPolicy,
     alpn_protocols: &[&[u8]],
 ) -> Result<
-    (Arc<tokio_rustls::rustls::ServerConfig>, Arc<ReloadableCertResolver>),
+    (
+        Arc<tokio_rustls::rustls::ServerConfig>,
+        Arc<ReloadableCertResolver>,
+    ),
     TlsConfigError,
 > {
     let certs = load_certs(cert_path)?;
@@ -596,13 +596,9 @@ mod tests {
         let cert = simple_cert();
         let cert_path = write_pem(dir.path(), "cert.pem", &cert.cert.pem());
         let key_path = write_pem(dir.path(), "key.pem", &cert.key_pair.serialize_pem());
-        let (cfg, _) = build_server_config(
-            &cert_path,
-            &key_path,
-            &ClientAuthPolicy::Disabled,
-            &[b"h2"],
-        )
-        .expect("valid cert/key");
+        let (cfg, _) =
+            build_server_config(&cert_path, &key_path, &ClientAuthPolicy::Disabled, &[b"h2"])
+                .expect("valid cert/key");
         assert_eq!(
             cfg.alpn_protocols,
             vec![b"h2".to_vec()],
@@ -620,9 +616,8 @@ mod tests {
         let cert = simple_cert();
         let cert_path = write_pem(dir.path(), "cert.pem", &cert.cert.pem());
         let key_path = write_pem(dir.path(), "key.pem", &cert.key_pair.serialize_pem());
-        let (cfg, _) =
-            build_server_config(&cert_path, &key_path, &ClientAuthPolicy::Disabled, &[])
-                .expect("valid cert/key");
+        let (cfg, _) = build_server_config(&cert_path, &key_path, &ClientAuthPolicy::Disabled, &[])
+            .expect("valid cert/key");
         assert!(
             cfg.alpn_protocols.is_empty(),
             "HTTP/1.1 listeners must offer no ALPN, got {:?}",
@@ -646,7 +641,10 @@ mod tests {
             &[b"h2", b"http/1.1"],
         )
         .expect("valid cert/key");
-        assert_eq!(cfg.alpn_protocols, vec![b"h2".to_vec(), b"http/1.1".to_vec()]);
+        assert_eq!(
+            cfg.alpn_protocols,
+            vec![b"h2".to_vec(), b"http/1.1".to_vec()]
+        );
     }
 
     #[test]
@@ -716,7 +714,8 @@ mod tests {
         // A PEM-shaped blob with a recognized header but garbage body.
         // `rustls_pemfile::private_key` parses the BEGIN/END frame
         // then fails to decode the base64 inside.
-        let bad_key = "-----BEGIN PRIVATE KEY-----\nnot-base64-garbage\n-----END PRIVATE KEY-----\n";
+        let bad_key =
+            "-----BEGIN PRIVATE KEY-----\nnot-base64-garbage\n-----END PRIVATE KEY-----\n";
         let key_path = write_pem(dir.path(), "key.pem", bad_key);
         let result = build_acceptor(&cert_path, &key_path, &ClientAuthPolicy::Disabled);
         assert!(
@@ -787,11 +786,8 @@ mod tests {
 
     #[test]
     fn allowlist_new_lowercases_and_dedupes() {
-        let list = ClientAllowList::new([
-            "Alice".to_string(),
-            "alice".to_string(),
-            "BOB".to_string(),
-        ]);
+        let list =
+            ClientAllowList::new(["Alice".to_string(), "alice".to_string(), "BOB".to_string()]);
         assert_eq!(list.len(), 2);
         assert!(list.names.contains("alice"));
         assert!(list.names.contains("bob"));
@@ -799,8 +795,7 @@ mod tests {
 
     #[test]
     fn extract_leaf_names_picks_up_cn_and_san() {
-        let mut params =
-            rcgen::CertificateParams::new(vec!["server.example".to_string()]).unwrap();
+        let mut params = rcgen::CertificateParams::new(vec!["server.example".to_string()]).unwrap();
         params
             .distinguished_name
             .push(rcgen::DnType::CommonName, "alice.test");
@@ -905,7 +900,11 @@ mod tests {
         let original = current_leaf(&reloader);
 
         // Corrupt the cert file, then attempt a reload.
-        write_pem(dir.path(), "cert.pem", "-----BEGIN CERTIFICATE-----\ngarbage\n");
+        write_pem(
+            dir.path(),
+            "cert.pem",
+            "-----BEGIN CERTIFICATE-----\ngarbage\n",
+        );
         let result = reloader.reload();
         assert!(result.is_err(), "reload of a corrupt cert must fail");
         assert_eq!(

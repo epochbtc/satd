@@ -42,7 +42,15 @@ pub async fn serve_plain(
     limits: ListenerLimits,
     shutdown: watch::Receiver<bool>,
 ) {
-    serve_http_listener("esplora", listener, Transport::Plain, router, limits, shutdown).await
+    serve_http_listener(
+        "esplora",
+        listener,
+        Transport::Plain,
+        router,
+        limits,
+        shutdown,
+    )
+    .await
 }
 
 /// Serve `router` on the TLS listener until `shutdown` flips.
@@ -85,7 +93,10 @@ mod tests {
     fn a_zero_request_timeout_keeps_a_handshake_budget() {
         assert_eq!(tls_handshake_timeout(0), DEFAULT_TLS_HANDSHAKE_TIMEOUT);
         assert_eq!(tls_handshake_timeout(7), Duration::from_secs(7));
-        assert_eq!(tls_handshake_timeout(u64::MAX), node::http_serve::TIMEOUT_CEILING);
+        assert_eq!(
+            tls_handshake_timeout(u64::MAX),
+            node::http_serve::TIMEOUT_CEILING
+        );
     }
 
     fn no_limits() -> ListenerLimits {
@@ -201,7 +212,10 @@ mod tests {
             tokio::time::timeout(Duration::from_secs(5), bogus.read(&mut buf)).await,
             Ok(Ok(0)) | Ok(Err(_))
         );
-        assert!(closed, "silent client must be dropped after the handshake timeout");
+        assert!(
+            closed,
+            "silent client must be dropped after the handshake timeout"
+        );
 
         sd_tx.send(true).unwrap();
         let _ = tokio::time::timeout(Duration::from_secs(2), serve).await;

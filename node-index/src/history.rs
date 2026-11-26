@@ -97,7 +97,11 @@ pub fn mempool_history_rows(
     sh: &Scripthash,
     mempool: impl Fn(&Txid) -> Option<MempoolTxFacts>,
 ) -> Vec<HistoryRow> {
-    let txids: BTreeSet<Txid> = idx.mempool_history(sh).into_iter().map(|e| e.txid).collect();
+    let txids: BTreeSet<Txid> = idx
+        .mempool_history(sh)
+        .into_iter()
+        .map(|e| e.txid)
+        .collect();
     let mut rows: Vec<HistoryRow> = txids
         .into_iter()
         .filter_map(|txid| {
@@ -133,7 +137,11 @@ pub fn history_rows(
         .collect();
     if rows.len() < limit {
         let room = limit - rows.len();
-        rows.extend(mempool_history_rows(idx, sh, mempool).into_iter().take(room));
+        rows.extend(
+            mempool_history_rows(idx, sh, mempool)
+                .into_iter()
+                .take(room),
+        );
     }
     Ok(rows)
 }
@@ -254,9 +262,21 @@ mod tests {
         let free_b = txid(0x30, 0x10); // second by `Ord`, first by display
         let chained = txid(0x00, 0x00);
         let mut rows = vec![
-            HistoryRow { height: -1, txid: chained, fee_sat: Some(1) },
-            HistoryRow { height: 0, txid: free_a, fee_sat: Some(2) },
-            HistoryRow { height: 0, txid: free_b, fee_sat: Some(3) },
+            HistoryRow {
+                height: -1,
+                txid: chained,
+                fee_sat: Some(1),
+            },
+            HistoryRow {
+                height: 0,
+                txid: free_a,
+                fee_sat: Some(2),
+            },
+            HistoryRow {
+                height: 0,
+                txid: free_b,
+                fee_sat: Some(3),
+            },
         ];
         sort_mempool_rows(&mut rows);
         let got: Vec<(i64, Txid)> = rows.iter().map(|r| (r.height, r.txid)).collect();
@@ -274,8 +294,9 @@ mod tests {
         let p1 = txid(0x01, 0x03);
         let p2 = txid(0x02, 0x01);
         let alone = txid(0x09, 0x09);
-        let positions: HashMap<Txid, u64> =
-            [(alone, 40), (p0, 100), (p1, 101), (p2, 102)].into_iter().collect();
+        let positions: HashMap<Txid, u64> = [(alone, 40), (p0, 100), (p1, 101), (p2, 102)]
+            .into_iter()
+            .collect();
 
         let mut rows = vec![(10, p1), (5, alone), (10, p2), (10, p0)];
         let mut asked = Vec::new();
@@ -309,9 +330,21 @@ mod tests {
         let b = txid(0x03, 0x04);
         let c = txid(0x05, 0x06);
         let rows = [
-            HistoryRow { height: 5, txid: a, fee_sat: None },
-            HistoryRow { height: 0, txid: b, fee_sat: Some(10) },
-            HistoryRow { height: -1, txid: c, fee_sat: Some(20) },
+            HistoryRow {
+                height: 5,
+                txid: a,
+                fee_sat: None,
+            },
+            HistoryRow {
+                height: 0,
+                txid: b,
+                fee_sat: Some(10),
+            },
+            HistoryRow {
+                height: -1,
+                txid: c,
+                fee_sat: Some(20),
+            },
         ];
         let text = format!("{a}:5:{b}:0:{c}:-1:");
         let expected = sha256::Hash::hash(text.as_bytes()).to_byte_array();
@@ -342,15 +375,24 @@ mod tests {
                     height: 7,
                     txid: late,
                     vin: 0,
-                    prev_outpoint: OutPoint { txid: early, vout: 0 },
+                    prev_outpoint: OutPoint {
+                        txid: early,
+                        vout: 0,
+                    },
                 },
             ],
             mempool: vec![chained, gone, free],
         };
         // `gone` is still in the mempool index but no longer in the mempool.
         let facts = |t: &Txid| match *t {
-            t if t == free => Some(MempoolTxFacts { has_unconfirmed_inputs: false, fee_sat: 300 }),
-            t if t == chained => Some(MempoolTxFacts { has_unconfirmed_inputs: true, fee_sat: 400 }),
+            t if t == free => Some(MempoolTxFacts {
+                has_unconfirmed_inputs: false,
+                fee_sat: 300,
+            }),
+            t if t == chained => Some(MempoolTxFacts {
+                has_unconfirmed_inputs: true,
+                fee_sat: 400,
+            }),
             _ => None,
         };
 
@@ -358,13 +400,32 @@ mod tests {
         assert_eq!(
             rows,
             vec![
-                HistoryRow { height: 3, txid: early, fee_sat: None },
-                HistoryRow { height: 7, txid: late, fee_sat: None },
-                HistoryRow { height: 0, txid: free, fee_sat: Some(300) },
-                HistoryRow { height: -1, txid: chained, fee_sat: Some(400) },
+                HistoryRow {
+                    height: 3,
+                    txid: early,
+                    fee_sat: None
+                },
+                HistoryRow {
+                    height: 7,
+                    txid: late,
+                    fee_sat: None
+                },
+                HistoryRow {
+                    height: 0,
+                    txid: free,
+                    fee_sat: Some(300)
+                },
+                HistoryRow {
+                    height: -1,
+                    txid: chained,
+                    fee_sat: Some(400)
+                },
             ]
         );
-        assert_eq!(mempool_history_rows(&idx, &[0u8; 32], facts), rows[2..].to_vec());
+        assert_eq!(
+            mempool_history_rows(&idx, &[0u8; 32], facts),
+            rows[2..].to_vec()
+        );
 
         // A cap of N is enforced by asking for N + 1 rows.
         let capped = history_rows(&idx, &[0u8; 32], 3, facts).unwrap();

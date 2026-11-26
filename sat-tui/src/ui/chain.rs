@@ -45,16 +45,26 @@ fn draw_title(f: &mut Frame, area: Rect, state: &AppState) {
     let title = Line::from(vec![
         Span::styled(
             " satd ",
-            Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(format!(" {} ", state.chain_name), Style::default().fg(Color::White)),
-        Span::styled(dot_glyph, Style::default().fg(dot_color).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            format!(" {} ", state.chain_name),
+            Style::default().fg(Color::White),
+        ),
+        Span::styled(
+            dot_glyph,
+            Style::default().fg(dot_color).add_modifier(Modifier::BOLD),
+        ),
         Span::styled(format!("{} ", health_label), Style::default().fg(dot_color)),
         Span::styled(state.version_line(), Style::default().fg(Color::DarkGray)),
         Span::styled(uptime_str, Style::default().fg(Color::DarkGray)),
         Span::styled(
             " chain & issuance ",
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
             format!(" @ #{}", format_num(state.blocks as u64)),
@@ -102,7 +112,10 @@ fn draw_halvings(f: &mut Frame, area: Rect, state: &AppState) {
     let lines = vec![
         info_line("Subsidy Epoch:", &state.subsidy_epoch().to_string()),
         info_line("Subsidy:", &format!("{:.3} BTC", subsidy_btc)),
-        info_line("Halving In:", &format!("{} blk", format_num(to_halving as u64))),
+        info_line(
+            "Halving In:",
+            &format!("{} blk", format_num(to_halving as u64)),
+        ),
         info_line("Halving ETA:", &format!("~{}", halving_eta)),
         progress_line(progress_pct, Color::Green),
     ];
@@ -134,10 +147,7 @@ fn draw_retarget(f: &mut Frame, area: Rect, state: &AppState) {
         info_line("Blocks to Retarget:", &format_num(to_retarget as u64)),
         info_line("Retarget ETA:", &format!("~{}", retarget_eta)),
         info_line("Block Time (epoch):", &block_time_str),
-        info_line(
-            "Δ Est:",
-            &change_str,
-        ),
+        info_line("Δ Est:", &change_str),
         progress_line(progress_pct, Color::Cyan),
     ];
     render_panel(f, area, " Difficulty Retarget ", &lines);
@@ -230,7 +240,10 @@ pub fn peer_client_lines(state: &AppState) -> Vec<Line<'static>> {
     let row = |name: &str, count: usize, total: usize| {
         let pct = (count as f64 / total.max(1) as f64) * 100.0;
         Line::from(vec![
-            Span::styled(format!("  {:<24}", truncate(&crate::nap::printable(name), 24)), Style::default().fg(Color::White)),
+            Span::styled(
+                format!("  {:<24}", truncate(&crate::nap::printable(name), 24)),
+                Style::default().fg(Color::White),
+            ),
             Span::styled(format!("{:>3}", count), Style::default().fg(Color::Cyan)),
             Span::styled(format!("  {:>5.1}%", pct), Style::default().fg(Color::Gray)),
         ])
@@ -242,14 +255,19 @@ pub fn peer_client_lines(state: &AppState) -> Vec<Line<'static>> {
         let total = map.len();
         let (alt_matched, alt_fallback) = crate::behavior::alt_slot_counts(map);
         let alt = alt_matched + alt_fallback > 0;
-        let mut lines: Vec<Line<'static>> = crate::behavior::family_distribution(map, if alt { 3 } else { 4 })
-            .iter()
-            .map(|(name, count)| row(name, *count, total))
-            .collect();
+        let mut lines: Vec<Line<'static>> =
+            crate::behavior::family_distribution(map, if alt { 3 } else { 4 })
+                .iter()
+                .map(|(name, count)| row(name, *count, total))
+                .collect();
         let mismatches = crate::behavior::mismatch_count(map);
         lines.push(Line::from(Span::styled(
             format!("  fingerprint mismatches: {mismatches}"),
-            Style::default().fg(if mismatches > 0 { Color::Red } else { Color::DarkGray }),
+            Style::default().fg(if mismatches > 0 {
+                Color::Red
+            } else {
+                Color::DarkGray
+            }),
         )));
         if alt {
             lines.push(Line::from(Span::styled(
@@ -273,7 +291,9 @@ pub fn peer_client_lines(state: &AppState) -> Vec<Line<'static>> {
             Style::default().fg(Color::DarkGray),
         ))]
     } else {
-        dist.iter().map(|(name, count)| row(name, *count, total)).collect()
+        dist.iter()
+            .map(|(name, count)| row(name, *count, total))
+            .collect()
     }
 }
 
@@ -299,7 +319,10 @@ pub enum ExtraRow {
 fn survey_shown(state: &AppState) -> bool {
     match &state.peer_survey {
         None => false,
-        Some(s) if s.superseded => state.crawl.as_ref().is_some_and(|c| c.peersurvey_superseded),
+        Some(s) if s.superseded => state
+            .crawl
+            .as_ref()
+            .is_some_and(|c| c.peersurvey_superseded),
         Some(_) => true,
     }
 }
@@ -310,7 +333,12 @@ fn survey_shown(state: &AppState) -> bool {
 /// survey's first; summary lines sit at its foot, the crawl's last. A
 /// superseded survey is always its line. Where both rows are drawn the
 /// crawl keeps at least its line.
-pub fn extra_rows(state: &AppState, space: u16, survey_needed: usize, crawl_needed: usize) -> (ExtraRow, ExtraRow) {
+pub fn extra_rows(
+    state: &AppState,
+    space: u16,
+    survey_needed: usize,
+    crawl_needed: usize,
+) -> (ExtraRow, ExtraRow) {
     let crawl_shown = state.crawl.is_some();
     let mut left = space;
     let survey = if !survey_shown(state) || left == 0 {
@@ -319,7 +347,11 @@ pub fn extra_rows(state: &AppState, space: u16, survey_needed: usize, crawl_need
         ExtraRow::Line
     } else {
         let height = survey_needed as u16 + 2;
-        if left >= height + u16::from(crawl_shown) { ExtraRow::Panels(height) } else { ExtraRow::Line }
+        if left >= height + u16::from(crawl_shown) {
+            ExtraRow::Panels(height)
+        } else {
+            ExtraRow::Line
+        }
     };
     let survey = match survey {
         // One line left: it goes to the crawl.
@@ -335,7 +367,11 @@ pub fn extra_rows(state: &AppState, space: u16, survey_needed: usize, crawl_need
         ExtraRow::Hidden
     } else {
         let height = crawl_needed as u16 + 2;
-        if left >= height { ExtraRow::Panels(height) } else { ExtraRow::Line }
+        if left >= height {
+            ExtraRow::Panels(height)
+        } else {
+            ExtraRow::Line
+        }
     };
     (survey, crawl)
 }
@@ -356,8 +392,17 @@ fn draw_extra_rows(f: &mut Frame, area: Rect, state: &AppState) {
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(area);
     let inner_width = cols[0].width.saturating_sub(2);
-    let survey = state.peer_survey.as_ref().map(|s| (s, survey_left_lines(s, inner_width), survey_right_lines(s, now_unix())));
-    let crawl = state.crawl.as_ref().map(|c| (c, crawl_left_lines(c, inner_width), crawl_right_lines(c)));
+    let survey = state.peer_survey.as_ref().map(|s| {
+        (
+            s,
+            survey_left_lines(s, inner_width),
+            survey_right_lines(s, now_unix()),
+        )
+    });
+    let crawl = state
+        .crawl
+        .as_ref()
+        .map(|c| (c, crawl_left_lines(c, inner_width), crawl_right_lines(c)));
     let needed = |l: &[Line<'_>], r: &[Line<'_>]| l.len().max(r.len());
     let (survey_row, crawl_row) = extra_rows(
         state,
@@ -370,19 +415,48 @@ fn draw_extra_rows(f: &mut Frame, area: Rect, state: &AppState) {
     let mut foot = area.y + area.height;
     let mut line_at = |f: &mut Frame, text: String| {
         foot -= 1;
-        let line = Line::from(Span::styled(format!(" {text}"), Style::default().fg(Color::Gray)));
-        f.render_widget(Paragraph::new(line), Rect { y: foot, height: 1, ..area });
+        let line = Line::from(Span::styled(
+            format!(" {text}"),
+            Style::default().fg(Color::Gray),
+        ));
+        f.render_widget(
+            Paragraph::new(line),
+            Rect {
+                y: foot,
+                height: 1,
+                ..area
+            },
+        );
     };
     // Lines from the foot up: the crawl's lowest.
     if let (ExtraRow::Line, Some((c, _, _))) = (crawl_row, &crawl) {
         line_at(f, c.summary());
     }
     if let (ExtraRow::Line, Some((s, _, _))) = (survey_row, &survey) {
-        line_at(f, if s.superseded { s.superseded_line() } else { s.summary() });
+        line_at(
+            f,
+            if s.superseded {
+                s.superseded_line()
+            } else {
+                s.summary()
+            },
+        );
     }
-    let mut panels = |f: &mut Frame, height: u16, titles: (&str, &str), left: &[Line<'_>], right: &[Line<'_>]| {
-        let left_area = Rect { y: top, height, ..cols[0] };
-        let right_area = Rect { y: top, height, ..cols[1] };
+    let mut panels = |f: &mut Frame,
+                      height: u16,
+                      titles: (&str, &str),
+                      left: &[Line<'_>],
+                      right: &[Line<'_>]| {
+        let left_area = Rect {
+            y: top,
+            height,
+            ..cols[0]
+        };
+        let right_area = Rect {
+            y: top,
+            height,
+            ..cols[1]
+        };
         render_panel(f, left_area, titles.0, left);
         render_panel(f, right_area, titles.1, right);
         top += height;
@@ -400,10 +474,16 @@ fn draw_extra_rows(f: &mut Frame, area: Rect, state: &AppState) {
 /// observed records are full blocks, its claimed ones (the user agent's
 /// word alone) the dark shade after them, in the family's colour; the
 /// share is of both.
-fn family_bar_lines(bars: Vec<crate::survey::FamilyBar>, pct: impl Fn(u64) -> f64, width: u16) -> Vec<Line<'static>> {
+fn family_bar_lines(
+    bars: Vec<crate::survey::FamilyBar>,
+    pct: impl Fn(u64) -> f64,
+    width: u16,
+) -> Vec<Line<'static>> {
     const LABEL: usize = 14;
     // Two-cell indent, label, space, bar, space, `100.0%`.
-    let bar_width = (width as usize).saturating_sub(2 + LABEL + 1 + 1 + 6).clamp(4, 30);
+    let bar_width = (width as usize)
+        .saturating_sub(2 + LABEL + 1 + 1 + 6)
+        .clamp(4, 30);
     let cells = |n: u64| (pct(n) / 100.0 * bar_width as f64).round() as usize;
     bars.into_iter()
         .map(|bar| {
@@ -424,11 +504,20 @@ fn family_bar_lines(bars: Vec<crate::survey::FamilyBar>, pct: impl Fn(u64) -> f6
                 _ => Color::Yellow,
             };
             Line::from(vec![
-                Span::styled(format!("  {:<width$} ", truncate(&bar.name, LABEL), width = LABEL), Style::default().fg(Color::White)),
+                Span::styled(
+                    format!("  {:<width$} ", truncate(&bar.name, LABEL), width = LABEL),
+                    Style::default().fg(Color::White),
+                ),
                 Span::styled("\u{2588}".repeat(observed), Style::default().fg(color)),
                 Span::styled("\u{2593}".repeat(claimed), Style::default().fg(color)),
-                Span::styled("\u{2591}".repeat(empty), Style::default().fg(Color::DarkGray)),
-                Span::styled(format!(" {:>5.1}%", share), Style::default().fg(Color::Gray)),
+                Span::styled(
+                    "\u{2591}".repeat(empty),
+                    Style::default().fg(Color::DarkGray),
+                ),
+                Span::styled(
+                    format!(" {:>5.1}%", share),
+                    Style::default().fg(Color::Gray),
+                ),
             ])
         })
         .collect()
@@ -454,11 +543,20 @@ pub fn crawl_left_lines(c: &crate::crawl::Crawl, width: u16) -> Vec<Line<'static
     };
     let state = truncate(&c.state_text(), (width as usize).saturating_sub(2));
     let mut lines = vec![
-        Line::from(Span::styled(format!("  {state}"), Style::default().fg(color))),
-        Line::from(Span::styled(format!("  {} reachable", format_num(c.reachable)), Style::default().fg(Color::White))),
+        Line::from(Span::styled(
+            format!("  {state}"),
+            Style::default().fg(color),
+        )),
+        Line::from(Span::styled(
+            format!("  {} reachable", format_num(c.reachable)),
+            Style::default().fg(Color::White),
+        )),
     ];
     if c.reachable == 0 {
-        lines.push(Line::from(Span::styled("  no address reachable yet", Style::default().fg(Color::DarkGray))));
+        lines.push(Line::from(Span::styled(
+            "  no address reachable yet",
+            Style::default().fg(Color::DarkGray),
+        )));
         return lines;
     }
     lines.extend(family_bar_lines(c.family_bars(), |n| c.pct(n), width));
@@ -480,7 +578,11 @@ pub fn crawl_right_lines(c: &crate::crawl::Crawl) -> Vec<Line<'static>> {
         ])
     };
     let share = |n: u64| format!("{:.1} % ({})", c.pct(n), format_num(n));
-    let mut lines: Vec<Line<'static>> = c.by_network.iter().map(|(net, n)| row(&format!("{net}:"), share(*n))).collect();
+    let mut lines: Vec<Line<'static>> = c
+        .by_network
+        .iter()
+        .map(|(net, n)| row(&format!("{net}:"), share(*n)))
+        .collect();
     let t = &c.transport;
     lines.push(row("v2 + v1:", share(t.v2_and_v1)));
     lines.push(row("v1 only:", share(t.v1_only)));
@@ -504,13 +606,25 @@ pub fn crawl_right_lines(c: &crate::crawl::Crawl) -> Vec<Line<'static>> {
         }
         lines.push(row("closed early:", share(closed_early)));
     }
-    lines.push(row("reached:", format!("{} sessions", format_num(c.reached))));
-    lines.push(row("unreached:", format!("{} sessions", format_num(c.unreached))));
+    lines.push(row(
+        "reached:",
+        format!("{} sessions", format_num(c.reached)),
+    ));
+    lines.push(row(
+        "unreached:",
+        format!("{} sessions", format_num(c.unreached)),
+    ));
     lines.push(row(
         "in flight:",
-        format!("{}/{}, tor {}/{}", c.in_flight_clearnet, c.concurrency, c.in_flight_tor, c.tor_concurrency),
+        format!(
+            "{}/{}, tor {}/{}",
+            c.in_flight_clearnet, c.concurrency, c.in_flight_tor, c.tor_concurrency
+        ),
     ));
-    lines.push(row("book:", format!("{} / {}", format_num(c.book), format_num(c.book_max))));
+    lines.push(row(
+        "book:",
+        format!("{} / {}", format_num(c.book), format_num(c.book_max)),
+    ));
     lines
 }
 
@@ -519,11 +633,18 @@ pub fn crawl_right_lines(c: &crate::crawl::Crawl) -> Vec<Line<'static>> {
 /// eight largest, then `other`), and the non-Core share.
 pub fn survey_left_lines(s: &crate::survey::Survey, width: u16) -> Vec<Line<'static>> {
     let mut lines = vec![Line::from(Span::styled(
-        format!("  {} addrs, last {} d", format_num(s.addresses), crate::survey::WINDOW_DAYS),
+        format!(
+            "  {} addrs, last {} d",
+            format_num(s.addresses),
+            crate::survey::WINDOW_DAYS
+        ),
         Style::default().fg(Color::White),
     ))];
     if s.addresses == 0 {
-        lines.push(Line::from(Span::styled("  no address reached yet", Style::default().fg(Color::DarkGray))));
+        lines.push(Line::from(Span::styled(
+            "  no address reached yet",
+            Style::default().fg(Color::DarkGray),
+        )));
         return lines;
     }
     lines.extend(family_bar_lines(s.family_bars(), |n| s.pct(n), width));
@@ -545,7 +666,10 @@ pub fn survey_right_lines(s: &crate::survey::Survey, now: u64) -> Vec<Line<'stat
         ])
     };
     let share = |n: u64| format!("{:.1} % ({})", s.pct(n), format_num(n));
-    let mut lines = vec![row("v2:", share(s.v2)), row("mismatches:", share(s.mismatches))];
+    let mut lines = vec![
+        row("v2:", share(s.v2)),
+        row("mismatches:", share(s.mismatches)),
+    ];
     // The records no row matched whose user agent names a family: the
     // dark part of that family's bar, listed here too.
     let claimed: u64 = s.claimed.iter().map(|(_, n)| n).sum();
@@ -564,16 +688,30 @@ pub fn survey_right_lines(s: &crate::survey::Survey, now: u64) -> Vec<Line<'stat
         lines.push(row("closed early:", share(closed_early)));
     }
     if s.top_as.is_empty() {
-        let why = if s.addresses == 0 { "none" } else { "none (needs -asmap)" };
+        let why = if s.addresses == 0 {
+            "none"
+        } else {
+            "none (needs -asmap)"
+        };
         lines.push(row("top AS:", why.into()));
     } else {
         lines.push(row("top AS:", String::new()));
         for (asn, count) in s.top_as.iter().take(crate::survey::TOP_AS) {
-            lines.push(row(&format!("  AS{asn}"), format!("{:.1} %", s.pct(*count))));
+            lines.push(row(
+                &format!("  AS{asn}"),
+                format!("{:.1} %", s.pct(*count)),
+            ));
         }
     }
     lines.push(row("last survey:", s.last_line(now)));
-    lines.push(row("connections:", format!("{} ok, {} failed", format_num(s.completed), format_num(s.failed))));
+    lines.push(row(
+        "connections:",
+        format!(
+            "{} ok, {} failed",
+            format_num(s.completed),
+            format_num(s.failed)
+        ),
+    ));
     if s.probes {
         lines.push(row("probed:", format!("{} addrs", format_num(s.probed))));
     }
@@ -596,8 +734,14 @@ fn draw_trivia(f: &mut Frame, area: Rect, state: &AppState) {
     let lines = vec![
         info_line("Era index:", &state.subsidy_epoch().to_string()),
         info_line("Next halving:", &format!("~{}", halving_calendar)),
-        info_line("Next halving block:", &format_num(next_halving_block as u64)),
-        info_line("Next retarget block:", &format_num(next_retarget_block as u64)),
+        info_line(
+            "Next halving block:",
+            &format_num(next_halving_block as u64),
+        ),
+        info_line(
+            "Next retarget block:",
+            &format_num(next_retarget_block as u64),
+        ),
         info_line("Next-block subsidy:", &format!("{:.5} BTC", next_subsidy)),
     ];
     render_panel(f, area, " Trivia ", &lines);
@@ -616,15 +760,14 @@ fn progress_line(frac: f64, color: Color) -> Line<'static> {
     let width: usize = 18;
     let filled = ((frac * width as f64).round() as usize).min(width);
     let empty = width - filled;
-    let bar = format!(
-        "{}{}",
-        "\u{2588}".repeat(filled),
-        "\u{2591}".repeat(empty),
-    );
+    let bar = format!("{}{}", "\u{2588}".repeat(filled), "\u{2591}".repeat(empty),);
     Line::from(vec![
         Span::styled("  ", Style::default()),
         Span::styled(bar, Style::default().fg(color)),
-        Span::styled(format!("  {:.1}%", frac * 100.0), Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            format!("  {:.1}%", frac * 100.0),
+            Style::default().fg(Color::DarkGray),
+        ),
     ])
 }
 
@@ -634,7 +777,9 @@ fn render_panel(f: &mut Frame, area: Rect, title: &str, lines: &[Line<'_>]) {
         .border_style(Style::default().fg(Color::DarkGray))
         .title(Span::styled(
             title.to_string(),
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
         ));
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -660,7 +805,10 @@ fn draw_footer(f: &mut Frame, area: Rect, state: &AppState) {
         Span::styled(": help  ", Style::default().fg(Color::DarkGray)),
         Span::styled("r", Style::default().fg(Color::White)),
         Span::styled(": reorgs  ", Style::default().fg(Color::DarkGray)),
-        Span::styled(crate::ui::view_keys(state), Style::default().fg(Color::White)),
+        Span::styled(
+            crate::ui::view_keys(state),
+            Style::default().fg(Color::White),
+        ),
         Span::styled(": view", Style::default().fg(Color::DarkGray)),
     ]);
     f.render_widget(Paragraph::new(footer), area);
@@ -709,9 +857,18 @@ fn format_calendar_eta(unix_secs: u64) -> String {
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let year = if m <= 2 { y + 1 } else { y };
     let month_name = match m {
-        1 => "Jan", 2 => "Feb", 3 => "Mar", 4 => "Apr",
-        5 => "May", 6 => "Jun", 7 => "Jul", 8 => "Aug",
-        9 => "Sep", 10 => "Oct", 11 => "Nov", _ => "Dec",
+        1 => "Jan",
+        2 => "Feb",
+        3 => "Mar",
+        4 => "Apr",
+        5 => "May",
+        6 => "Jun",
+        7 => "Jul",
+        8 => "Aug",
+        9 => "Sep",
+        10 => "Oct",
+        11 => "Nov",
+        _ => "Dec",
     };
     format!("{} {}", month_name, year)
 }
@@ -724,7 +881,11 @@ mod tests {
     fn calendar_eta_known_dates() {
         // 2026-04-30 ≈ 1777680000 unix seconds
         let s = format_calendar_eta(1_777_680_000);
-        assert!(s.starts_with("Apr 2026") || s.starts_with("May 2026"), "got {}", s);
+        assert!(
+            s.starts_with("Apr 2026") || s.starts_with("May 2026"),
+            "got {}",
+            s
+        );
         // Distant future: 2200-01-01 ≈ 7_258_118_400
         let s2 = format_calendar_eta(7_258_118_400);
         assert!(s2.contains("2200") || s2.contains("2199"), "got {}", s2);
@@ -749,12 +910,25 @@ mod tests {
         assert!(before[0].contains("/Satoshi:27.0.0/") || before[1].contains("/Satoshi:27.0.0/"));
         assert!(!before.iter().any(|l| l.contains("mismatches")));
 
-        st.update_peer_behavior(crate::behavior::classify(Ok(crate::behavior::tests::reply())));
+        st.update_peer_behavior(crate::behavior::classify(Ok(
+            crate::behavior::tests::reply(),
+        )));
         let after: Vec<String> = peer_client_lines(&st).iter().map(line_text).collect();
-        assert!(after.iter().any(|l| l.contains("btcd [core]") && l.contains("1")), "{after:?}");
-        assert!(after.iter().any(|l| l.contains("bitcoin-seeder")), "{after:?}");
+        assert!(
+            after
+                .iter()
+                .any(|l| l.contains("btcd [core]") && l.contains("1")),
+            "{after:?}"
+        );
+        assert!(
+            after.iter().any(|l| l.contains("bitcoin-seeder")),
+            "{after:?}"
+        );
         assert!(!after.iter().any(|l| l.contains("/Satoshi:")), "{after:?}");
-        assert_eq!(after.last().map(String::as_str), Some("  fingerprint mismatches: 1"));
+        assert_eq!(
+            after.last().map(String::as_str),
+            Some("  fingerprint mismatches: 1")
+        );
         assert!(after.len() <= 6, "fits the panel's six lines: {after:?}");
 
         // A node without the method: back to user agents.
@@ -785,10 +959,20 @@ mod tests {
         assert_eq!(left[0], "  1,204 addrs, last 30 d");
         // Core's 1,080 observed and 41 claimed: 93.1 %, the claimed part
         // in the dark shade.
-        assert!(left[1].starts_with("  core           ") && left[1].ends_with(" 93.1%"), "{left:?}");
+        assert!(
+            left[1].starts_with("  core           ") && left[1].ends_with(" 93.1%"),
+            "{left:?}"
+        );
         assert!(left[1].contains('\u{2593}'), "the claimed part: {left:?}");
-        assert!(left[2].starts_with("  btcd ") && left[2].contains('\u{2593}'), "{left:?}");
-        assert!(left.iter().any(|l| l.starts_with("  unknown ") && l.ends_with("  0.4%")), "only the truly unknown: {left:?}");
+        assert!(
+            left[2].starts_with("  btcd ") && left[2].contains('\u{2593}'),
+            "{left:?}"
+        );
+        assert!(
+            left.iter()
+                .any(|l| l.starts_with("  unknown ") && l.ends_with("  0.4%")),
+            "only the truly unknown: {left:?}"
+        );
         assert!(left[9].starts_with("  other "), "{left:?}");
         assert_eq!(left.last().map(String::as_str), Some("  non-Core 5.5 %"));
         assert_eq!(left.len(), 11);
@@ -796,7 +980,10 @@ mod tests {
             assert!(l.chars().count() <= 38, "fits the panel: {l:?}");
         }
 
-        let right: Vec<String> = survey_right_lines(s, 1_790_000_042).iter().map(line_text).collect();
+        let right: Vec<String> = survey_right_lines(s, 1_790_000_042)
+            .iter()
+            .map(line_text)
+            .collect();
         assert_eq!(right[0], "  v2:           41.0 % (494)");
         assert_eq!(right[1], "  mismatches:   0.4 % (5)");
         assert_eq!(right[2], "  claimed:      3.6 % (43)");
@@ -806,40 +993,89 @@ mod tests {
         assert_eq!(right[6], "    core        0.3 % (4)");
         assert_eq!(right[7], "  closed early: 0.5 % (6)");
         assert_eq!(right[9], "    AS64496     7.0 %");
-        assert!(right.contains(&"  last survey:  42s ago, completed".to_string()), "{right:?}");
-        assert!(right.contains(&"  connections:  1,300 ok, 2,100 failed".to_string()), "{right:?}");
-        assert_eq!(right.last().map(String::as_str), Some("  probed:       600 addrs"));
+        assert!(
+            right.contains(&"  last survey:  42s ago, completed".to_string()),
+            "{right:?}"
+        );
+        assert!(
+            right.contains(&"  connections:  1,300 ok, 2,100 failed".to_string()),
+            "{right:?}"
+        );
+        assert_eq!(
+            right.last().map(String::as_str),
+            Some("  probed:       600 addrs")
+        );
         for l in &right {
-            assert!(l.chars().count() <= 38, "fits an 80-column terminal's panel: {l:?}");
+            assert!(
+                l.chars().count() <= 38,
+                "fits an 80-column terminal's panel: {l:?}"
+            );
         }
 
         // Nothing claimed (or an older node): no claimed lines.
         let mut unclaimed = s.clone();
         unclaimed.claimed.clear();
-        let right: Vec<String> = survey_right_lines(&unclaimed, 1_790_000_042).iter().map(line_text).collect();
+        let right: Vec<String> = survey_right_lines(&unclaimed, 1_790_000_042)
+            .iter()
+            .map(line_text)
+            .collect();
         assert!(!right.iter().any(|l| l.contains("claimed")), "{right:?}");
 
         // A node that reports no fake or closed-early counts: no such
         // lines. One that reports them at zero: both, at zero.
-        let older = crate::survey::Survey { closed_early: None, fake: Vec::new(), ..s.clone() };
-        let right: Vec<String> = survey_right_lines(&older, 1_790_000_042).iter().map(line_text).collect();
-        assert!(!right.iter().any(|l| l.contains("fake") || l.contains("closed early")), "{right:?}");
-        let none = crate::survey::Survey { closed_early: Some(0), fake: Vec::new(), ..s.clone() };
-        let right: Vec<String> = survey_right_lines(&none, 1_790_000_042).iter().map(line_text).collect();
-        assert!(right.contains(&"  fake:         0.0 % (0)".to_string()), "{right:?}");
-        assert!(right.contains(&"  closed early: 0.0 % (0)".to_string()), "{right:?}");
+        let older = crate::survey::Survey {
+            closed_early: None,
+            fake: Vec::new(),
+            ..s.clone()
+        };
+        let right: Vec<String> = survey_right_lines(&older, 1_790_000_042)
+            .iter()
+            .map(line_text)
+            .collect();
+        assert!(
+            !right
+                .iter()
+                .any(|l| l.contains("fake") || l.contains("closed early")),
+            "{right:?}"
+        );
+        let none = crate::survey::Survey {
+            closed_early: Some(0),
+            fake: Vec::new(),
+            ..s.clone()
+        };
+        let right: Vec<String> = survey_right_lines(&none, 1_790_000_042)
+            .iter()
+            .map(line_text)
+            .collect();
+        assert!(
+            right.contains(&"  fake:         0.0 % (0)".to_string()),
+            "{right:?}"
+        );
+        assert!(
+            right.contains(&"  closed early: 0.0 % (0)".to_string()),
+            "{right:?}"
+        );
 
         // Probes off: no probe line. No `-asmap`: no AS list.
         let mut quiet = s.clone();
         quiet.probes = false;
         quiet.top_as.clear();
-        let right: Vec<String> = survey_right_lines(&quiet, 1_790_000_042).iter().map(line_text).collect();
+        let right: Vec<String> = survey_right_lines(&quiet, 1_790_000_042)
+            .iter()
+            .map(line_text)
+            .collect();
         assert!(!right.iter().any(|l| l.contains("probed")), "{right:?}");
-        assert!(right.contains(&"  top AS:       none (needs -asmap)".to_string()), "{right:?}");
+        assert!(
+            right.contains(&"  top AS:       none (needs -asmap)".to_string()),
+            "{right:?}"
+        );
 
         // A survey that has reached nobody yet.
         let empty = crate::survey::Survey::default();
-        let left: Vec<String> = survey_left_lines(&empty, 38).iter().map(line_text).collect();
+        let left: Vec<String> = survey_left_lines(&empty, 38)
+            .iter()
+            .map(line_text)
+            .collect();
         assert_eq!(left, ["  0 addrs, last 30 d", "  no address reached yet"]);
     }
 
@@ -855,10 +1091,17 @@ mod tests {
         assert_eq!(survey_row(&st, 12), ExtraRow::Line);
         assert_eq!(survey_row(&st, 1), ExtraRow::Line);
         assert_eq!(survey_row(&st, 0), ExtraRow::Hidden, "no room at all");
-        assert_eq!(extra_rows(&st, 20, 11, 12).1, ExtraRow::Hidden, "no crawl row with the crawl off");
+        assert_eq!(
+            extra_rows(&st, 20, 11, 12).1,
+            ExtraRow::Hidden,
+            "no crawl row with the crawl off"
+        );
 
         let mut off = survey_state();
-        let mnf = crate::rpc::RpcError::Rpc { code: crate::rpc::JSONRPC_METHOD_NOT_FOUND, message: "no".into() };
+        let mnf = crate::rpc::RpcError::Rpc {
+            code: crate::rpc::JSONRPC_METHOD_NOT_FOUND,
+            message: "no".into(),
+        };
         off.update_peer_survey(crate::survey::classify(Err(mnf)));
         assert_eq!(survey_row(&off, 20), ExtraRow::Hidden);
         assert_eq!(survey_row(&AppState::new(), 20), ExtraRow::Hidden);
@@ -897,10 +1140,20 @@ mod tests {
         assert_eq!(left[1], "  21,000 reachable");
         // Core's 20,000 observed and 350 claimed: 96.9 %, the claimed part
         // in the dark shade.
-        assert!(left[2].starts_with("  core           ") && left[2].ends_with(" 96.9%"), "{left:?}");
+        assert!(
+            left[2].starts_with("  core           ") && left[2].ends_with(" 96.9%"),
+            "{left:?}"
+        );
         assert!(left[2].contains('\u{2593}'), "the claimed part: {left:?}");
-        assert!(left[3].starts_with("  btcd ") && left[3].contains('\u{2593}'), "{left:?}");
-        assert!(left.iter().any(|l| l.starts_with("  unknown ") && l.ends_with("  0.5%")), "only the truly unknown: {left:?}");
+        assert!(
+            left[3].starts_with("  btcd ") && left[3].contains('\u{2593}'),
+            "{left:?}"
+        );
+        assert!(
+            left.iter()
+                .any(|l| l.starts_with("  unknown ") && l.ends_with("  0.5%")),
+            "only the truly unknown: {left:?}"
+        );
         assert!(left[10].starts_with("  other "), "{left:?}");
         assert_eq!(left.last().map(String::as_str), Some("  non-Core 1.4 %"));
         assert_eq!(left.len(), 12);
@@ -937,28 +1190,61 @@ mod tests {
         // A node that reports no fake or closed-early counts: no such
         // lines. One that reports them at zero: both, at zero. No claimed
         // address: no claimed line.
-        let older = crate::crawl::Crawl { closed_early: None, fake: Vec::new(), ..c.clone() };
+        let older = crate::crawl::Crawl {
+            closed_early: None,
+            fake: Vec::new(),
+            ..c.clone()
+        };
         let right: Vec<String> = crawl_right_lines(&older).iter().map(line_text).collect();
-        assert!(!right.iter().any(|l| l.contains("fake") || l.contains("closed early")), "{right:?}");
-        let none = crate::crawl::Crawl { closed_early: Some(0), fake: Vec::new(), claimed: Vec::new(), ..c.clone() };
+        assert!(
+            !right
+                .iter()
+                .any(|l| l.contains("fake") || l.contains("closed early")),
+            "{right:?}"
+        );
+        let none = crate::crawl::Crawl {
+            closed_early: Some(0),
+            fake: Vec::new(),
+            claimed: Vec::new(),
+            ..c.clone()
+        };
         let right: Vec<String> = crawl_right_lines(&none).iter().map(line_text).collect();
-        assert!(right.contains(&"  fake:         0.0 % (0)".to_string()), "{right:?}");
-        assert!(right.contains(&"  closed early: 0.0 % (0)".to_string()), "{right:?}");
+        assert!(
+            right.contains(&"  fake:         0.0 % (0)".to_string()),
+            "{right:?}"
+        );
+        assert!(
+            right.contains(&"  closed early: 0.0 % (0)".to_string()),
+            "{right:?}"
+        );
         assert!(!right.iter().any(|l| l.contains("claimed")), "{right:?}");
 
         // Held, with every reason; a long state is cut to the panel.
         let mut held = c.clone();
-        held.state = crate::crawl::CrawlState::Held(vec!["initial_block_download".into(), "connect".into(), "network_inactive".into()]);
+        held.state = crate::crawl::CrawlState::Held(vec![
+            "initial_block_download".into(),
+            "connect".into(),
+            "network_inactive".into(),
+        ]);
         let left: Vec<String> = crawl_left_lines(&held, 38).iter().map(line_text).collect();
-        assert!(left[0].starts_with("  held: initial block download, -c"), "{left:?}");
+        assert!(
+            left[0].starts_with("  held: initial block download, -c"),
+            "{left:?}"
+        );
         assert!(left[0].chars().count() <= 38);
         held.state = crate::crawl::CrawlState::Stopped;
-        assert_eq!(line_text(&crawl_left_lines(&held, 38)[0]), "  stopped (a crawl task panicked)");
+        assert_eq!(
+            line_text(&crawl_left_lines(&held, 38)[0]),
+            "  stopped (a crawl task panicked)"
+        );
 
         // A crawl that has reached nobody yet.
         let empty = crate::crawl::Crawl::default();
         let left: Vec<String> = crawl_left_lines(&empty, 38).iter().map(line_text).collect();
-        assert_eq!(left, ["  running", "  0 reachable", "  no address reachable yet"]);
+        assert_eq!(
+            left,
+            ["  running", "  0 reachable", "  no address reachable yet"]
+        );
     }
 
     /// The crawl row is drawn whole where it fits and collapses to its line
@@ -968,21 +1254,47 @@ mod tests {
     #[test]
     fn crawl_row_fits_collapses_or_hides() {
         let st = crawl_state(true);
-        assert_eq!(extra_rows(&st, 30, 11, 12), (ExtraRow::Line, ExtraRow::Panels(14)));
-        assert_eq!(extra_rows(&st, 15, 11, 12), (ExtraRow::Line, ExtraRow::Panels(14)));
-        assert_eq!(extra_rows(&st, 14, 11, 12), (ExtraRow::Line, ExtraRow::Line));
+        assert_eq!(
+            extra_rows(&st, 30, 11, 12),
+            (ExtraRow::Line, ExtraRow::Panels(14))
+        );
+        assert_eq!(
+            extra_rows(&st, 15, 11, 12),
+            (ExtraRow::Line, ExtraRow::Panels(14))
+        );
+        assert_eq!(
+            extra_rows(&st, 14, 11, 12),
+            (ExtraRow::Line, ExtraRow::Line)
+        );
         assert_eq!(extra_rows(&st, 2, 11, 12), (ExtraRow::Line, ExtraRow::Line));
-        assert_eq!(extra_rows(&st, 1, 11, 12), (ExtraRow::Hidden, ExtraRow::Line), "the last line is the crawl's");
-        assert_eq!(extra_rows(&st, 0, 11, 12), (ExtraRow::Hidden, ExtraRow::Hidden));
+        assert_eq!(
+            extra_rows(&st, 1, 11, 12),
+            (ExtraRow::Hidden, ExtraRow::Line),
+            "the last line is the crawl's"
+        );
+        assert_eq!(
+            extra_rows(&st, 0, 11, 12),
+            (ExtraRow::Hidden, ExtraRow::Hidden)
+        );
 
         let st = crawl_state(false);
-        assert_eq!(extra_rows(&st, 30, 11, 12), (ExtraRow::Hidden, ExtraRow::Panels(14)), "no survey asked for");
+        assert_eq!(
+            extra_rows(&st, 30, 11, 12),
+            (ExtraRow::Hidden, ExtraRow::Panels(14)),
+            "no survey asked for"
+        );
 
         // An older node: no getcrawlinfo, the survey row as before.
         let mut old = survey_state();
-        let mnf = crate::rpc::RpcError::Rpc { code: crate::rpc::JSONRPC_METHOD_NOT_FOUND, message: "no".into() };
+        let mnf = crate::rpc::RpcError::Rpc {
+            code: crate::rpc::JSONRPC_METHOD_NOT_FOUND,
+            message: "no".into(),
+        };
         old.update_crawl(crate::crawl::classify(Err(mnf)));
-        assert_eq!(extra_rows(&old, 30, 11, 12), (ExtraRow::Panels(13), ExtraRow::Hidden));
+        assert_eq!(
+            extra_rows(&old, 30, 11, 12),
+            (ExtraRow::Panels(13), ExtraRow::Hidden)
+        );
         assert!(old.rpc_failures.is_empty());
     }
 
@@ -992,7 +1304,9 @@ mod tests {
         let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
         term.draw(|f| draw(f, st)).unwrap();
         let buf = term.backend().buffer().clone();
-        (0..h).map(|y| (0..w).map(|x| buf[(x, y)].symbol().to_string()).collect()).collect()
+        (0..h)
+            .map(|y| (0..w).map(|x| buf[(x, y)].symbol().to_string()).collect())
+            .collect()
     }
 
     /// The whole view against a test backend: the survey row below the
@@ -1004,19 +1318,36 @@ mod tests {
         let st = survey_state();
 
         let tall = render(&st, 100, 44);
-        assert!(tall[25].contains("Network Survey") && tall[25].contains("Survey Detail"), "{tall:#?}");
+        assert!(
+            tall[25].contains("Network Survey") && tall[25].contains("Survey Detail"),
+            "{tall:#?}"
+        );
         assert!(tall.iter().any(|l| l.contains("1,204 addrs, last 30 d")));
-        assert!(tall.iter().any(|l| l.contains("Trivia")) && tall.iter().any(|l| l.contains("Peer Clients")));
+        assert!(
+            tall.iter().any(|l| l.contains("Trivia"))
+                && tall.iter().any(|l| l.contains("Peer Clients"))
+        );
         assert!(!tall.iter().any(|l| l.contains("survey: 1,204")));
-        assert!(!tall.iter().any(|l| l.contains("Network Crawl") || l.contains("crawl:")));
+        assert!(
+            !tall
+                .iter()
+                .any(|l| l.contains("Network Crawl") || l.contains("crawl:"))
+        );
 
         let short = render(&st, 80, 30);
-        assert!(short[28].contains("survey: 1,204 addrs, non-Core 5.5 %, v2 41 %"), "{short:#?}");
+        assert!(
+            short[28].contains("survey: 1,204 addrs, non-Core 5.5 %, v2 41 %"),
+            "{short:#?}"
+        );
         assert!(!short.iter().any(|l| l.contains("Network Survey")));
         assert!(short.iter().any(|l| l.contains("Trivia")));
 
         let none = render(&AppState::new(), 100, 40);
-        assert!(!none.iter().any(|l| l.contains("Network Survey") || l.contains("survey: 1,204")));
+        assert!(
+            !none
+                .iter()
+                .any(|l| l.contains("Network Survey") || l.contains("survey: 1,204"))
+        );
     }
 
     /// With the crawl on: its panels below the fixed rows and the survey's
@@ -1026,17 +1357,35 @@ mod tests {
     fn chain_view_draws_the_crawl_row() {
         let st = crawl_state(true);
         let tall = render(&st, 100, 51);
-        assert!(tall[25].contains("Network Crawl") && tall[25].contains("Crawl Detail"), "{tall:#?}");
+        assert!(
+            tall[25].contains("Network Crawl") && tall[25].contains("Crawl Detail"),
+            "{tall:#?}"
+        );
         assert!(tall.iter().any(|l| l.contains("21,000 reachable")));
         assert!(tall.iter().any(|l| l.contains("v2 only:      0.2 % (40)")));
-        assert!(tall[49].contains("survey: superseded by the crawl, 1,204 addrs kept"), "{tall:#?}");
-        assert!(tall.iter().any(|l| l.contains("closed early: 0.5 % (100)")), "{tall:#?}");
+        assert!(
+            tall[49].contains("survey: superseded by the crawl, 1,204 addrs kept"),
+            "{tall:#?}"
+        );
+        assert!(
+            tall.iter().any(|l| l.contains("closed early: 0.5 % (100)")),
+            "{tall:#?}"
+        );
         assert!(!tall.iter().any(|l| l.contains("Network Survey")));
-        assert!(tall.iter().any(|l| l.contains("Trivia")) && tall.iter().any(|l| l.contains("Peer Clients")));
+        assert!(
+            tall.iter().any(|l| l.contains("Trivia"))
+                && tall.iter().any(|l| l.contains("Peer Clients"))
+        );
 
         let short = render(&st, 80, 30);
-        assert!(short[27].contains("survey: superseded by the crawl"), "{short:#?}");
-        assert!(short[28].contains("crawl: running, 21,000 reachable, non-Core 1.4 %, v2-only 40"), "{short:#?}");
+        assert!(
+            short[27].contains("survey: superseded by the crawl"),
+            "{short:#?}"
+        );
+        assert!(
+            short[28].contains("crawl: running, 21,000 reachable, non-Core 1.4 %, v2-only 40"),
+            "{short:#?}"
+        );
         assert!(!short.iter().any(|l| l.contains("Network Crawl")));
 
         let alone = render(&crawl_state(false), 100, 51);
@@ -1070,7 +1419,8 @@ mod tests {
             v[key]["[2001:db8::1]:8333"] = serde_json::json!({"count": 800, "share": 0.04});
         }
         v["stopped_by"] = serde_json::json!("203.0.113.7:8333");
-        v["peers"] = serde_json::json!([{"addr": "203.0.113.7:8333"}, {"addr": "[2001:db8::1]:8333"}]);
+        v["peers"] =
+            serde_json::json!([{"addr": "203.0.113.7:8333"}, {"addr": "[2001:db8::1]:8333"}]);
         v["limits"]["networks"] = serde_json::json!(["203.0.113.7"]);
         let mut st = AppState::new();
         st.update_crawl(crate::crawl::classify(Ok(v)));
@@ -1093,7 +1443,10 @@ mod tests {
         v[0]["alt_slot"] = serde_json::json!({"rule": "family:non-core", "trust": "unverified", "fallback": false});
         st.update_peer_behavior(crate::behavior::classify(Ok(v)));
         let lines: Vec<String> = peer_client_lines(&st).iter().map(line_text).collect();
-        assert_eq!(lines.last().map(String::as_str), Some("  alt-slots: 1 matched, 0 fallback"));
+        assert_eq!(
+            lines.last().map(String::as_str),
+            Some("  alt-slots: 1 matched, 0 fallback")
+        );
         assert!(lines.len() <= 6, "{lines:?}");
     }
 

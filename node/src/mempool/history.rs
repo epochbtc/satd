@@ -307,8 +307,14 @@ mod tests {
         let dir = tempdir().unwrap();
         let log = MempoolHistory::open(dir.path(), 10).unwrap();
         assert!(log.record_if_changed(snap(1, 5)));
-        assert!(!log.record_if_changed(snap(2, 5)), "identical sig must dedupe");
-        assert!(log.record_if_changed(snap(3, 6)), "different size must record");
+        assert!(
+            !log.record_if_changed(snap(2, 5)),
+            "identical sig must dedupe"
+        );
+        assert!(
+            log.record_if_changed(snap(3, 6)),
+            "different size must record"
+        );
     }
 
     #[test]
@@ -327,8 +333,14 @@ mod tests {
             min_fee_rate_sat_per_kvb: 5_000,
             max_fee_rate_sat_per_kvb: 10_000,
             histogram: vec![
-                HistogramBucket { feerate_sat_per_kvb: 5_000, weight: 400 },
-                HistogramBucket { feerate_sat_per_kvb: 10_000, weight: 400 },
+                HistogramBucket {
+                    feerate_sat_per_kvb: 5_000,
+                    weight: 400,
+                },
+                HistogramBucket {
+                    feerate_sat_per_kvb: 10_000,
+                    weight: 400,
+                },
             ],
         };
         let b = MempoolSnapshot {
@@ -339,8 +351,14 @@ mod tests {
             max_fee_rate_sat_per_kvb: 10_000,
             // Same size/bytes/extremes, but weight moved between buckets.
             histogram: vec![
-                HistogramBucket { feerate_sat_per_kvb: 5_000, weight: 700 },
-                HistogramBucket { feerate_sat_per_kvb: 10_000, weight: 100 },
+                HistogramBucket {
+                    feerate_sat_per_kvb: 5_000,
+                    weight: 700,
+                },
+                HistogramBucket {
+                    feerate_sat_per_kvb: 10_000,
+                    weight: 100,
+                },
             ],
         };
         assert!(log.record_if_changed(a));

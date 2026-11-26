@@ -180,11 +180,17 @@ fn match_multisig(spk: &Script) -> bool {
     if b.last() != Some(&0xae) {
         return false;
     }
-    let Some((op, data, mut pc)) = get_op(b, 0) else { return false };
-    let Some(required) = script_number(op, data, 1, MAX_PUBKEYS_PER_MULTISIG) else { return false };
+    let Some((op, data, mut pc)) = get_op(b, 0) else {
+        return false;
+    };
+    let Some(required) = script_number(op, data, 1, MAX_PUBKEYS_PER_MULTISIG) else {
+        return false;
+    };
     let mut keys = 0i64;
     let (op, data) = loop {
-        let Some((op, data, next)) = get_op(b, pc) else { return false };
+        let Some((op, data, next)) = get_op(b, pc) else {
+            return false;
+        };
         pc = next;
         if !valid_pubkey_size(data) {
             break (op, data);
@@ -277,8 +283,12 @@ pub fn is_witness_standard(tx: &Transaction, prevouts: &[TxOut]) -> bool {
         let mut program_script = prev.script_pubkey.clone();
         let mut p2sh = false;
         if prev.script_pubkey.is_p2sh() {
-            let Ok(stack) = script_sig_stack(&input.script_sig) else { return false };
-            let Some(redeem) = stack.last() else { return false };
+            let Ok(stack) = script_sig_stack(&input.script_sig) else {
+                return false;
+            };
+            let Some(redeem) = stack.last() else {
+                return false;
+            };
             program_script = bitcoin::ScriptBuf::from_bytes(redeem.clone());
             p2sh = true;
         }
@@ -292,7 +302,9 @@ pub fn is_witness_standard(tx: &Transaction, prevouts: &[TxOut]) -> bool {
             let (script, items) = witness.split_last().expect("not empty");
             if script.len() > MAX_STANDARD_P2WSH_SCRIPT_SIZE
                 || items.len() > MAX_STANDARD_P2WSH_STACK_ITEMS
-                || items.iter().any(|item| item.len() > MAX_STANDARD_P2WSH_STACK_ITEM_SIZE)
+                || items
+                    .iter()
+                    .any(|item| item.len() > MAX_STANDARD_P2WSH_STACK_ITEM_SIZE)
             {
                 return false;
             }
@@ -308,9 +320,13 @@ pub fn is_witness_standard(tx: &Transaction, prevouts: &[TxOut]) -> bool {
                 let (control, rest) = stack.split_last().expect("two items");
                 let (_script, items) = rest.split_last().expect("one item");
                 stack = items;
-                let Some(&leaf) = control.first() else { return false };
+                let Some(&leaf) = control.first() else {
+                    return false;
+                };
                 if leaf & TAPROOT_LEAF_MASK == TAPROOT_LEAF_TAPSCRIPT
-                    && stack.iter().any(|item| item.len() > MAX_STANDARD_TAPSCRIPT_STACK_ITEM_SIZE)
+                    && stack
+                        .iter()
+                        .any(|item| item.len() > MAX_STANDARD_TAPSCRIPT_STACK_ITEM_SIZE)
                 {
                     return false;
                 }

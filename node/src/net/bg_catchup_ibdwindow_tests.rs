@@ -17,7 +17,11 @@ fn heights(range: std::ops::RangeInclusive<u32>) -> Vec<(u32, BlockHash)> {
 fn given_to(out: &[(PeerId, Vec<BlockHash>)], peer: PeerId) -> Vec<u32> {
     out.iter()
         .filter(|(p, _)| *p == peer)
-        .flat_map(|(_, hashes)| hashes.iter().map(|x| u32::from_le_bytes(x.to_byte_array()[..4].try_into().unwrap())))
+        .flat_map(|(_, hashes)| {
+            hashes
+                .iter()
+                .map(|x| u32::from_le_bytes(x.to_byte_array()[..4].try_into().unwrap()))
+        })
         .collect()
 }
 
@@ -30,7 +34,10 @@ fn a_peer_at_the_cap_gets_nothing_more_on_the_next_pass() {
     let first = d.assign(&heights(1..=40), &[1], 16, now);
     assert_eq!(given_to(&first, 1).len(), 16);
     let second = d.assign(&heights(17..=40), &[1], 16, now);
-    assert!(given_to(&second, 1).is_empty(), "peer 1 given more with 16 outstanding: {second:?}");
+    assert!(
+        given_to(&second, 1).is_empty(),
+        "peer 1 given more with 16 outstanding: {second:?}"
+    );
 
     // As it delivers, it has room again.
     d.note_stored(1);
@@ -54,7 +61,11 @@ fn a_released_height_goes_to_a_different_peer() {
         d.release_stale(t0 + Duration::from_secs(31));
         assert!(!d.is_in_flight(5));
         let out = d.assign(&[h(5)], &[1, 2], 16, t0);
-        assert_eq!(given_to(&out, 2), vec![5], "start {start}: height 5 went back to peer 1: {out:?}");
+        assert_eq!(
+            given_to(&out, 2),
+            vec![5],
+            "start {start}: height 5 went back to peer 1: {out:?}"
+        );
     }
 
     let mut alone = BgDownloader::new(1024, Duration::from_secs(30));

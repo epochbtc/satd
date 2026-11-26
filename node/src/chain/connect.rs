@@ -269,7 +269,9 @@ pub fn bip34_activation_height(network: Network) -> u32 {
     // Sourced from the shared buried-deployment table so a
     // `-testactivationheight=bip34@N` override reaches it; floored at 1
     // because genesis is never subject to the height-in-coinbase rule.
-    crate::validation::script::activation_heights(network).bip34.max(1)
+    crate::validation::script::activation_heights(network)
+        .bip34
+        .max(1)
 }
 
 /// BIP 113 (MTP for locktime) / BIP 68 (sequence locks) activation height.
@@ -281,7 +283,9 @@ pub fn bip113_activation_height(network: Network) -> u32 {
     // Floored at 1: the table says 0 for the always-active networks, but this
     // gate has always treated them as active from height 1 (genesis is never
     // transaction-validated).
-    crate::validation::script::activation_heights(network).csv.max(1)
+    crate::validation::script::activation_heights(network)
+        .csv
+        .max(1)
 }
 
 /// BIP 66 (strict DER) activation height per network. Used by the mandatory
@@ -289,7 +293,9 @@ pub fn bip113_activation_height(network: Network) -> u32 {
 pub fn bip66_activation_height(network: Network) -> u32 {
     // dersig in the shared table; see `bip113_activation_height` for the
     // delegation and the `.max(1)` floor.
-    crate::validation::script::activation_heights(network).dersig.max(1)
+    crate::validation::script::activation_heights(network)
+        .dersig
+        .max(1)
 }
 
 /// BIP 65 (CHECKLOCKTIMEVERIFY) activation height per network. Used by the
@@ -297,7 +303,9 @@ pub fn bip66_activation_height(network: Network) -> u32 {
 pub fn bip65_activation_height(network: Network) -> u32 {
     // cltv in the shared table; see `bip113_activation_height` for the
     // delegation and the `.max(1)` floor.
-    crate::validation::script::activation_heights(network).cltv.max(1)
+    crate::validation::script::activation_heights(network)
+        .cltv
+        .max(1)
 }
 
 /// Enforce the mandatory minimum block version for `height` (Bitcoin Core's
@@ -315,7 +323,9 @@ pub fn check_block_version(
         || (version < 3 && height >= bip66_activation_height(network))
         || (version < 4 && height >= bip65_activation_height(network));
     if too_low {
-        return Err(crate::validation::ValidationError::BadVersion(version as u32));
+        return Err(crate::validation::ValidationError::BadVersion(
+            version as u32,
+        ));
     }
     Ok(())
 }
@@ -422,7 +432,10 @@ pub(crate) fn check_transaction_context(
     // locktime entirely. Both inequalities are strict in Core
     // (`nLockTime < nBlockHeight` / `< nBlockTime`): a locktime equal
     // to the cutoff is NOT final.
-    let is_final = tx.input.iter().all(|i| i.sequence == bitcoin::Sequence::MAX);
+    let is_final = tx
+        .input
+        .iter()
+        .all(|i| i.sequence == bitcoin::Sequence::MAX);
     if !is_final {
         let locktime = tx.lock_time.to_consensus_u32();
         if locktime > 0 {
@@ -508,8 +521,14 @@ fn bip30_enforced(
         return true;
     }
     let (bip34_height, bip34_hash) = match network {
-        Network::Bitcoin => (227_931, "000000000000024b89b42a942fe0d9fea3bb44ab7bd1b19115dd6a759c0808b8"),
-        Network::Testnet => (21_111, "0000000023b3a96d3484e5abb3755c413e7d41500f8e2a5c3f0dd01299cd8ef8"),
+        Network::Bitcoin => (
+            227_931,
+            "000000000000024b89b42a942fe0d9fea3bb44ab7bd1b19115dd6a759c0808b8",
+        ),
+        Network::Testnet => (
+            21_111,
+            "0000000023b3a96d3484e5abb3755c413e7d41500f8e2a5c3f0dd01299cd8ef8",
+        ),
         _ => return true,
     };
     // `pprev->GetAncestor(BIP34Height)` is null until the parent reaches that
@@ -602,8 +621,7 @@ pub struct ConnectParams<'a> {
     /// The stall watchdog reads from this to pinpoint where the
     /// connector wedged when a stall is detected. `None` for callers
     /// that don't need observability (tests, disconnect/reorg replay).
-    pub phase_tracker:
-        Option<&'a crate::chain::connect_phase::ConnectPhaseTracker>,
+    pub phase_tracker: Option<&'a crate::chain::connect_phase::ConnectPhaseTracker>,
     /// The chain a chainstate reindex is replaying. `Some` only on that path.
     ///
     /// BIP 68 time-based sequence locks compare the block's MTP against the MTP
@@ -642,19 +660,44 @@ pub fn connect_block(params: &ConnectParams) -> Result<StoreBatch, ConnectError>
 fn connect_block_inner(params: &ConnectParams) -> Result<StoreBatch, ConnectError> {
     #[cfg(feature = "block-filter-index")]
     let ConnectParams {
-        store, block, height, parent_chainwork, flat_pos,
-        script_verifier, median_time_past, network,
-        pre_verified_txs, num_threads, precomputed_txids, script_skip_txs,
-        address_index, filter_index, sp_index, phase_tracker,
-        replay_plan, interrupt,
+        store,
+        block,
+        height,
+        parent_chainwork,
+        flat_pos,
+        script_verifier,
+        median_time_past,
+        network,
+        pre_verified_txs,
+        num_threads,
+        precomputed_txids,
+        script_skip_txs,
+        address_index,
+        filter_index,
+        sp_index,
+        phase_tracker,
+        replay_plan,
+        interrupt,
     } = params;
     #[cfg(not(feature = "block-filter-index"))]
     let ConnectParams {
-        store, block, height, parent_chainwork, flat_pos,
-        script_verifier, median_time_past, network,
-        pre_verified_txs, num_threads, precomputed_txids, script_skip_txs,
-        address_index, sp_index, phase_tracker,
-        replay_plan, interrupt,
+        store,
+        block,
+        height,
+        parent_chainwork,
+        flat_pos,
+        script_verifier,
+        median_time_past,
+        network,
+        pre_verified_txs,
+        num_threads,
+        precomputed_txids,
+        script_skip_txs,
+        address_index,
+        sp_index,
+        phase_tracker,
+        replay_plan,
+        interrupt,
     } = params;
     let store: &dyn Store = *store;
     let script_verifier: &dyn ScriptVerifier = *script_verifier;
@@ -803,13 +846,17 @@ fn connect_block_inner(params: &ConnectParams) -> Result<StoreBatch, ConnectErro
     let block_txids: HashSet<bitcoin::Txid> = txid_slice.iter().copied().collect();
 
     // Collect external inputs (not intra-block spends)
-    let external_lookups: Vec<(usize, usize, OutPoint)> = block.txdata.iter()
+    let external_lookups: Vec<(usize, usize, OutPoint)> = block
+        .txdata
+        .iter()
         .enumerate()
         .flat_map(|(tx_idx, tx)| {
             if tx.is_coinbase() {
                 return Vec::new();
             }
-            tx.input.iter().enumerate()
+            tx.input
+                .iter()
+                .enumerate()
                 .filter(|(_, input)| !block_txids.contains(&input.previous_output.txid))
                 .map(|(in_idx, input)| (tx_idx, in_idx, input.previous_output))
                 .collect::<Vec<_>>()
@@ -825,13 +872,15 @@ fn connect_block_inner(params: &ConnectParams) -> Result<StoreBatch, ConnectErro
         HashMap::new()
     } else {
         // Batch lookup from authoritative store (hits CoinCache which was warmed by prefetch)
-        let outpoints: Vec<OutPoint> = external_lookups.iter()
-            .map(|(_, _, op)| *op)
-            .collect();
+        let outpoints: Vec<OutPoint> = external_lookups.iter().map(|(_, _, op)| *op).collect();
         // One batch, unless the caller may interrupt: then in chunks, with
         // a poll after each, since on a slow disk these lookups are most of
         // a block's connect time.
-        let chunk = if interrupt.is_some() { 1024 } else { outpoints.len() };
+        let chunk = if interrupt.is_some() {
+            1024
+        } else {
+            outpoints.len()
+        };
         let mut coins = Vec::with_capacity(outpoints.len());
         for part in outpoints.chunks(chunk) {
             coins.extend(store.get_coins_batch(part));
@@ -839,7 +888,8 @@ fn connect_block_inner(params: &ConnectParams) -> Result<StoreBatch, ConnectErro
                 return Err(ConnectError::Interrupted);
             }
         }
-        external_lookups.iter()
+        external_lookups
+            .iter()
             .zip(coins)
             .filter_map(|((tx_idx, in_idx, _), coin_opt)| {
                 coin_opt.map(|coin| ((*tx_idx, *in_idx), coin))
@@ -886,7 +936,9 @@ fn connect_block_inner(params: &ConnectParams) -> Result<StoreBatch, ConnectErro
                 }
 
                 // Lookup order: pre-resolved → intra-block → store (avoids DB hit for intra-block spends)
-                let coin = pre_resolved.get(&(tx_idx, in_idx)).cloned()
+                let coin = pre_resolved
+                    .get(&(tx_idx, in_idx))
+                    .cloned()
                     .or_else(|| intra_block_coins.remove(&outpoint))
                     .or_else(|| store.get_coin(&outpoint));
 
@@ -914,7 +966,9 @@ fn connect_block_inner(params: &ConnectParams) -> Result<StoreBatch, ConnectErro
                 // enforces BIP 68. Compared as i32, 0x80000002 would skip
                 // enforcement and accept a block Core rejects.
                 if height >= bip113_activation_height(network)
-                    && (tx.version.0 as u32) >= 2 && input.sequence != bitcoin::Sequence::MAX {
+                    && (tx.version.0 as u32) >= 2
+                    && input.sequence != bitcoin::Sequence::MAX
+                {
                     let seq = input.sequence.0;
                     let disable_flag = 1u32 << 31;
                     if seq & disable_flag == 0 {
@@ -966,11 +1020,12 @@ fn connect_block_inner(params: &ConnectParams) -> Result<StoreBatch, ConnectErro
                 // classification: every non-coinbase input contributes its
                 // prev-output scriptPubKey to the block-wide map.
                 if want_prev_output_scripts {
-                    block_prev_output_scripts
-                        .insert(outpoint, coin.script_pubkey.clone());
+                    block_prev_output_scripts.insert(outpoint, coin.script_pubkey.clone());
                 }
 
-                batch.coin_removes.push((outpoint, coin.amount, coin.height));
+                batch
+                    .coin_removes
+                    .push((outpoint, coin.amount, coin.height));
 
                 // Address-history spending row and the spend index,
                 // atomic with the chainstate update via the same
@@ -1068,8 +1123,8 @@ fn connect_block_inner(params: &ConnectParams) -> Result<StoreBatch, ConnectErro
 
             // Block sigop-cost accounting for this (non-coinbase) tx, before
             // `prev_outputs` is moved into the verify queue below.
-            block_sigops = block_sigops
-                .saturating_add(transaction_sigop_cost(tx, block_flags, &prev_outputs));
+            block_sigops =
+                block_sigops.saturating_add(transaction_sigop_cost(tx, block_flags, &prev_outputs));
             if block_sigops > MAX_BLOCK_SIGOPS_COST {
                 return Err(ConnectError::BadBlockSigops);
             }
@@ -1092,8 +1147,8 @@ fn connect_block_inner(params: &ConnectParams) -> Result<StoreBatch, ConnectErro
             // Coinbase: no resolved inputs to spend; its sigop cost is
             // legacy-only (scriptSig + output scriptPubkeys) and still counts
             // toward the block-wide limit, matching Core.
-            block_sigops = block_sigops
-                .saturating_add(transaction_sigop_cost(tx, block_flags, &[]));
+            block_sigops =
+                block_sigops.saturating_add(transaction_sigop_cost(tx, block_flags, &[]));
             if block_sigops > MAX_BLOCK_SIGOPS_COST {
                 return Err(ConnectError::BadBlockSigops);
             }
@@ -1107,7 +1162,10 @@ fn connect_block_inner(params: &ConnectParams) -> Result<StoreBatch, ConnectErro
         // grandfathered exception blocks).
         if enforce_bip30 && (!is_genesis || !is_coinbase) {
             for vout in 0..tx.output.len() {
-                let op = OutPoint { txid, vout: vout as u32 };
+                let op = OutPoint {
+                    txid,
+                    vout: vout as u32,
+                };
                 if intra_block_coins.contains_key(&op) || store.get_coin(&op).is_some() {
                     return Err(ConnectError::BadBip30);
                 }
@@ -1192,11 +1250,11 @@ fn connect_block_inner(params: &ConnectParams) -> Result<StoreBatch, ConnectErro
                 crate::validation::script::counting_progress(|| {
                     script_verifier.verify_transaction(tx, prev_outputs, script_at)
                 })
-                    // `reason()`, not the whole error: Core's
-                    // `block-script-verify-flag-failed (...)` carries the
-                    // bare script error, and the input it failed on is
-                    // reported separately.
-                    .map_err(|e| ConnectError::ScriptFailed(e.reason().to_string()))?;
+                // `reason()`, not the whole error: Core's
+                // `block-script-verify-flag-failed (...)` carries the
+                // bare script error, and the input it failed on is
+                // reported separately.
+                .map_err(|e| ConnectError::ScriptFailed(e.reason().to_string()))?;
             }
         } else {
             let queue_ref = &verify_queue;
@@ -1218,9 +1276,7 @@ fn connect_block_inner(params: &ConnectParams) -> Result<StoreBatch, ConnectErro
                                 if let Err(e) = crate::validation::script::counting_progress(|| {
                                     script_verifier.verify_transaction(tx, prev_outputs, script_at)
                                 }) {
-                                    errs.push(ConnectError::ScriptFailed(
-                                        e.reason().to_string(),
-                                    ));
+                                    errs.push(ConnectError::ScriptFailed(e.reason().to_string()));
                                 }
                             }
                             errs
@@ -1383,23 +1439,31 @@ mod tests {
     use bitcoin::hashes::Hash;
     use bitcoin::pow::CompactTarget;
     use bitcoin::transaction::Version;
-    use bitcoin::{
-        Amount, Block, BlockHash, Network, Sequence, Transaction, TxIn, TxOut, Witness,
-    };
+    use bitcoin::{Amount, Block, BlockHash, Network, Sequence, Transaction, TxIn, TxOut, Witness};
 
     /// A reorg marks a block invalid on these. A contents verdict counts; a
     /// mutation-class rejection does not (the hash does not commit to what was
     /// rejected), and neither does a failure of this node's own index state.
     #[test]
     fn only_a_verdict_on_the_contents_marks_a_block_invalid() {
-        assert!(ConnectError::MissingOrSpentInput { outpoint: OutPoint::null() }.is_verdict_on_block());
+        assert!(
+            ConnectError::MissingOrSpentInput {
+                outpoint: OutPoint::null()
+            }
+            .is_verdict_on_block()
+        );
         assert!(ConnectError::BadCoinbaseValue.is_verdict_on_block());
         assert!(ConnectError::ScriptFailed("x".into()).is_verdict_on_block());
         assert!(
             !ConnectError::TxValidation(crate::validation::ValidationError::BadMerkleRoot)
                 .is_verdict_on_block()
         );
-        assert!(!ConnectError::ChainTxGap { parent: BlockHash::all_zeros() }.is_verdict_on_block());
+        assert!(
+            !ConnectError::ChainTxGap {
+                parent: BlockHash::all_zeros()
+            }
+            .is_verdict_on_block()
+        );
         assert!(!ConnectError::SpIndexEmit("x".into()).is_verdict_on_block());
         assert!(!ConnectError::TxSeqOverflow.is_verdict_on_block());
         assert!(!ConnectError::Interrupted.is_verdict_on_block());
@@ -1438,7 +1502,8 @@ mod tests {
             filter_index: &Default::default(),
             phase_tracker: None,
             interrupt: None,
-        }).unwrap();
+        })
+        .unwrap();
 
         // Genesis coinbase should NOT be in coin_puts
         assert!(batch.coin_puts.is_empty());
@@ -1470,7 +1535,10 @@ mod tests {
             block: &genesis,
             height: 0,
             parent_chainwork: &[0u8; 32],
-            flat_pos: FlatFilePos { file_number: 0, data_pos: 0 },
+            flat_pos: FlatFilePos {
+                file_number: 0,
+                data_pos: 0,
+            },
             script_verifier: &NoopVerifier,
             median_time_past: 0,
             network: Network::Regtest,
@@ -1519,7 +1587,12 @@ mod tests {
         // OP_RETURN clause).
         assert!(!is_unspendable(bitcoin::ScriptBuf::new().as_script()));
         // Normal P2WPKH → spendable.
-        let p2wpkh = bitcoin::ScriptBuf::from(vec![0x00, 0x14].into_iter().chain([0u8; 20]).collect::<Vec<_>>());
+        let p2wpkh = bitcoin::ScriptBuf::from(
+            vec![0x00, 0x14]
+                .into_iter()
+                .chain([0u8; 20])
+                .collect::<Vec<_>>(),
+        );
         assert!(!is_unspendable(&p2wpkh));
     }
 
@@ -1556,9 +1629,18 @@ mod tests {
                 witness: Witness::new(),
             }],
             output: vec![
-                TxOut { value: Amount::from_sat(0), script_pubkey: op_return },
-                TxOut { value: Amount::from_sat(block_subsidy(Network::Regtest, 1)), script_pubkey: normal },
-                TxOut { value: Amount::from_sat(0), script_pubkey: oversized },
+                TxOut {
+                    value: Amount::from_sat(0),
+                    script_pubkey: op_return,
+                },
+                TxOut {
+                    value: Amount::from_sat(block_subsidy(Network::Regtest, 1)),
+                    script_pubkey: normal,
+                },
+                TxOut {
+                    value: Amount::from_sat(0),
+                    script_pubkey: oversized,
+                },
             ],
         };
         let mut block = Block {
@@ -1598,7 +1680,11 @@ mod tests {
         .unwrap();
 
         // Only the spendable output (vout 1) enters the UTXO set.
-        assert_eq!(batch.coin_puts.len(), 1, "only the spendable output should be added");
+        assert_eq!(
+            batch.coin_puts.len(),
+            1,
+            "only the spendable output should be added"
+        );
         assert_eq!(batch.coin_puts[0].0.vout, 1, "kept coin must be vout 1");
     }
 
@@ -1636,11 +1722,19 @@ mod tests {
         assert!(bip30_exempt(Network::Bitcoin, 91_842, &h91842));
         assert!(bip30_exempt(Network::Bitcoin, 91_880, &h91880));
         // Right height, wrong hash → not exempt (must match both).
-        assert!(!bip30_exempt(Network::Bitcoin, 91_842, &BlockHash::all_zeros()));
+        assert!(!bip30_exempt(
+            Network::Bitcoin,
+            91_842,
+            &BlockHash::all_zeros()
+        ));
         // Right hash, wrong height → not exempt.
         assert!(!bip30_exempt(Network::Bitcoin, 91_843, &h91842));
         // The same holds for the second pair.
-        assert!(!bip30_exempt(Network::Bitcoin, 91_880, &BlockHash::all_zeros()));
+        assert!(!bip30_exempt(
+            Network::Bitcoin,
+            91_880,
+            &BlockHash::all_zeros()
+        ));
         assert!(!bip30_exempt(Network::Bitcoin, 91_881, &h91880));
         // Other networks are never exempt.
         assert!(!bip30_exempt(Network::Regtest, 91_842, &h91842));
@@ -1649,12 +1743,15 @@ mod tests {
 
     #[test]
     fn test_bip30_enforced_gating() {
-        let main34: BlockHash =
-            "000000000000024b89b42a942fe0d9fea3bb44ab7bd1b19115dd6a759c0808b8".parse().unwrap();
-        let test34: BlockHash =
-            "0000000023b3a96d3484e5abb3755c413e7d41500f8e2a5c3f0dd01299cd8ef8".parse().unwrap();
+        let main34: BlockHash = "000000000000024b89b42a942fe0d9fea3bb44ab7bd1b19115dd6a759c0808b8"
+            .parse()
+            .unwrap();
+        let test34: BlockHash = "0000000023b3a96d3484e5abb3755c413e7d41500f8e2a5c3f0dd01299cd8ef8"
+            .parse()
+            .unwrap();
         let on = |h: BlockHash| move |_| Some(h);
-        let unreachable = |_| -> Option<BlockHash> { panic!("not consulted at or below the BIP 34 height") };
+        let unreachable =
+            |_| -> Option<BlockHash> { panic!("not consulted at or below the BIP 34 height") };
         // Mainnet: enforced up to and including the buried BIP34 height,
         // skipped above it on the chain whose BIP 34 block is Core's.
         assert!(bip30_enforced(Network::Bitcoin, 91_842, unreachable));
@@ -1675,18 +1772,38 @@ mod tests {
     /// the two high cases fail.
     #[test]
     fn the_bip30_skip_is_pinned_to_the_bip34_block_and_ends_at_cores_limit() {
-        let main34: BlockHash =
-            "000000000000024b89b42a942fe0d9fea3bb44ab7bd1b19115dd6a759c0808b8".parse().unwrap();
-        let test34: BlockHash =
-            "0000000023b3a96d3484e5abb3755c413e7d41500f8e2a5c3f0dd01299cd8ef8".parse().unwrap();
+        let main34: BlockHash = "000000000000024b89b42a942fe0d9fea3bb44ab7bd1b19115dd6a759c0808b8"
+            .parse()
+            .unwrap();
+        let test34: BlockHash = "0000000023b3a96d3484e5abb3755c413e7d41500f8e2a5c3f0dd01299cd8ef8"
+            .parse()
+            .unwrap();
         let other = BlockHash::all_zeros();
-        assert!(bip30_enforced(Network::Bitcoin, 300_000, |_| Some(other)), "a fork below BIP 34");
-        assert!(bip30_enforced(Network::Bitcoin, 300_000, |_| None), "no ancestor found");
-        assert!(!bip30_enforced(Network::Bitcoin, BIP34_IMPLIES_BIP30_LIMIT - 1, |_| Some(main34)));
-        assert!(bip30_enforced(Network::Bitcoin, BIP34_IMPLIES_BIP30_LIMIT, |_| Some(main34)));
-        assert!(bip30_enforced(Network::Testnet, 4_000_000, |_| Some(test34)));
+        assert!(
+            bip30_enforced(Network::Bitcoin, 300_000, |_| Some(other)),
+            "a fork below BIP 34"
+        );
+        assert!(
+            bip30_enforced(Network::Bitcoin, 300_000, |_| None),
+            "no ancestor found"
+        );
+        assert!(!bip30_enforced(
+            Network::Bitcoin,
+            BIP34_IMPLIES_BIP30_LIMIT - 1,
+            |_| Some(main34)
+        ));
+        assert!(bip30_enforced(
+            Network::Bitcoin,
+            BIP34_IMPLIES_BIP30_LIMIT,
+            |_| Some(main34)
+        ));
+        assert!(bip30_enforced(Network::Testnet, 4_000_000, |_| Some(
+            test34
+        )));
         // The ancestor is looked up at the BIP 34 height itself.
-        assert!(!bip30_enforced(Network::Bitcoin, 300_000, |h| (h == 227_931).then_some(main34)));
+        assert!(!bip30_enforced(Network::Bitcoin, 300_000, |h| (h
+            == 227_931)
+            .then_some(main34)));
     }
 
     // ── Mandatory block-version floors (Core: bad-version) ─────────────
@@ -1730,10 +1847,8 @@ mod tests {
         // A coinbase whose output carries 10 bare OP_CHECKMULTISIG opcodes:
         // 10 * 20 = 200 legacy sigops → cost 800 regardless of gate (no
         // P2SH/witness data present, so both paths agree).
-        let script = bitcoin::ScriptBuf::from(vec![
-            bitcoin::opcodes::all::OP_CHECKMULTISIG.to_u8();
-            10
-        ]);
+        let script =
+            bitcoin::ScriptBuf::from(vec![bitcoin::opcodes::all::OP_CHECKMULTISIG.to_u8(); 10]);
         let cb = Transaction {
             version: Version(2),
             lock_time: bitcoin::blockdata::locktime::absolute::LockTime::ZERO,
@@ -1743,15 +1858,24 @@ mod tests {
                 sequence: Sequence::MAX,
                 witness: Witness::new(),
             }],
-            output: vec![TxOut { value: Amount::from_sat(0), script_pubkey: script }],
+            output: vec![TxOut {
+                value: Amount::from_sat(0),
+                script_pubkey: script,
+            }],
         };
         // 10 OP_CHECKMULTISIG * 20 legacy sigops * 4 (witness scale) = 800.
         use crate::validation::script::script_verify_flags;
         assert_eq!(transaction_sigop_cost(&cb, 0, &[]), 800);
-        assert_eq!(transaction_sigop_cost(&cb, script_verify_flags(Network::Bitcoin, 0), &[]), 800);
+        assert_eq!(
+            transaction_sigop_cost(&cb, script_verify_flags(Network::Bitcoin, 0), &[]),
+            800
+        );
         // Regtest/signet: P2SH active from genesis, so the witness-aware
         // path is taken even at height 0 (same cost here — no P2SH data).
-        assert_eq!(transaction_sigop_cost(&cb, script_verify_flags(Network::Regtest, 0), &[]), 800);
+        assert_eq!(
+            transaction_sigop_cost(&cb, script_verify_flags(Network::Regtest, 0), &[]),
+            800
+        );
     }
 
     // ── helpers for connect_block tests ───────────────────────────────
@@ -1779,11 +1903,14 @@ mod tests {
     }
 
     /// Create an InMemoryStore pre-loaded with a single coin.
-    pub(super) fn make_test_store_with_coin(coin_height: u32, coinbase: bool) -> (InMemoryStore, OutPoint, Coin) {
+    pub(super) fn make_test_store_with_coin(
+        coin_height: u32,
+        coinbase: bool,
+    ) -> (InMemoryStore, OutPoint, Coin) {
         let store = test_store();
-        let txid = bitcoin::Txid::from_raw_hash(
-            bitcoin::hashes::sha256d::Hash::from_byte_array([0x42; 32]),
-        );
+        let txid = bitcoin::Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array(
+            [0x42; 32],
+        ));
         let outpoint = OutPoint { txid, vout: 0 };
         let coin = Coin {
             amount: 50_000_000,
@@ -2098,7 +2225,10 @@ mod tests {
 
         let (result, polls) = run(u32::MAX);
         assert!(result.is_ok(), "{:?}", result.err());
-        assert_eq!(polls, 3, "one lookup chunk, after the lookups, one verification batch");
+        assert_eq!(
+            polls, 3,
+            "one lookup chunk, after the lookups, one verification batch"
+        );
         for stop_on in 1..=3 {
             let (result, polls) = run(stop_on);
             assert!(
@@ -2579,9 +2709,9 @@ mod tests {
     fn connect_writes_spent_rows_keyed_on_the_funding_ordinal() {
         let store = test_store();
         let outpoint = OutPoint {
-            txid: bitcoin::Txid::from_raw_hash(
-                bitcoin::hashes::sha256d::Hash::from_byte_array([0x42; 32]),
-            ),
+            txid: bitcoin::Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array(
+                [0x42; 32],
+            )),
             vout: 0,
         };
         const FUNDING_SEQ: u64 = 77;
@@ -2637,9 +2767,9 @@ mod tests {
     fn connect_skips_spent_row_for_unknown_coin_without_tx_loc() {
         let store = test_store();
         let outpoint = OutPoint {
-            txid: bitcoin::Txid::from_raw_hash(
-                bitcoin::hashes::sha256d::Hash::from_byte_array([0x43; 32]),
-            ),
+            txid: bitcoin::Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array(
+                [0x43; 32],
+            )),
             vout: 0,
         };
         // A snapshot coin: sentinel ordinal, and no `tx_loc` row.
@@ -2716,9 +2846,9 @@ mod tests {
     fn connect_resolves_unknown_coin_via_tx_loc_when_present() {
         let store = test_store();
         let outpoint = OutPoint {
-            txid: bitcoin::Txid::from_raw_hash(
-                bitcoin::hashes::sha256d::Hash::from_byte_array([0x44; 32]),
-            ),
+            txid: bitcoin::Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array(
+                [0x44; 32],
+            )),
             vout: 0,
         };
         const FUNDING_SEQ: u64 = 91;
@@ -2804,14 +2934,19 @@ mod tests {
         let store_at = |parent_count: u64| {
             let store = InMemoryStore::new();
             let mut batch = StoreBatch::default();
-            batch.chain_tx_puts.push((BlockHash::all_zeros(), parent_count));
+            batch
+                .chain_tx_puts
+                .push((BlockHash::all_zeros(), parent_count));
             store.write_batch(batch).unwrap();
             store
         };
         let store = store_at(node_index::TXSEQ_MAX - 1);
         connect_simple(&store, &block, 1, 0).expect("the block's one tx takes the last ordinal");
         let store = store_at(node_index::TXSEQ_MAX);
-        assert!(matches!(connect_simple(&store, &block, 1, 0), Err(ConnectError::TxSeqOverflow)));
+        assert!(matches!(
+            connect_simple(&store, &block, 1, 0),
+            Err(ConnectError::TxSeqOverflow)
+        ));
     }
 
     fn connect_simple(
@@ -2922,9 +3057,9 @@ mod tests {
     fn test_spend_nonexistent_utxo() {
         let store = test_store();
         let fake_outpoint = OutPoint {
-            txid: bitcoin::Txid::from_raw_hash(
-                bitcoin::hashes::sha256d::Hash::from_byte_array([0xab; 32]),
-            ),
+            txid: bitcoin::Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array(
+                [0xab; 32],
+            )),
             vout: 0,
         };
         let block = make_block_spending(fake_outpoint, 1, 2, 0xffff_ffff, 0);
@@ -2949,7 +3084,10 @@ mod tests {
             phase_tracker: None,
             interrupt: None,
         });
-        assert!(matches!(result, Err(ConnectError::MissingOrSpentInput { .. })));
+        assert!(matches!(
+            result,
+            Err(ConnectError::MissingOrSpentInput { .. })
+        ));
     }
 
     #[test]
@@ -3142,15 +3280,13 @@ mod tests {
         let base_time = 1_700_000_000u32;
         let mut batch = StoreBatch::default();
         for h in 0..block_height {
-            let hash = BlockHash::from_raw_hash(
-                bitcoin::hashes::sha256d::Hash::from_byte_array({
-                    let mut arr = [0u8; 32];
-                    arr[0] = h as u8;
-                    arr[1] = (h >> 8) as u8;
-                    arr[3] = 0xAA; // distinguish from coin txid
-                    arr
-                }),
-            );
+            let hash = BlockHash::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array({
+                let mut arr = [0u8; 32];
+                arr[0] = h as u8;
+                arr[1] = (h >> 8) as u8;
+                arr[3] = 0xAA; // distinguish from coin txid
+                arr
+            }));
             let mut hdr = bitcoin::constants::genesis_block(Network::Regtest).header;
             hdr.time = base_time + h * 100; // 100s apart
             let entry = BlockIndexEntry {
@@ -3207,7 +3343,11 @@ mod tests {
             phase_tracker: None,
             interrupt: None,
         });
-        assert!(result.is_ok(), "BIP68 time lock should be met, got {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "BIP68 time lock should be met, got {:?}",
+            result.err()
+        );
     }
 
     #[test]
@@ -3220,15 +3360,13 @@ mod tests {
         let base_time = 1_700_000_000u32;
         let mut batch = StoreBatch::default();
         for h in 0..block_height {
-            let hash = BlockHash::from_raw_hash(
-                bitcoin::hashes::sha256d::Hash::from_byte_array({
-                    let mut arr = [0u8; 32];
-                    arr[0] = h as u8;
-                    arr[1] = (h >> 8) as u8;
-                    arr[3] = 0xAA;
-                    arr
-                }),
-            );
+            let hash = BlockHash::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array({
+                let mut arr = [0u8; 32];
+                arr[0] = h as u8;
+                arr[1] = (h >> 8) as u8;
+                arr[3] = 0xAA;
+                arr
+            }));
             let mut hdr = bitcoin::constants::genesis_block(Network::Regtest).header;
             // Only 10 seconds apart — not enough for 512s requirement
             hdr.time = base_time + h * 10;
@@ -3464,7 +3602,11 @@ mod tests {
             phase_tracker: None,
             interrupt: None,
         });
-        assert!(result.is_ok(), "Intra-block spending should succeed, got {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Intra-block spending should succeed, got {:?}",
+            result.err()
+        );
     }
 
     #[test]
@@ -3519,7 +3661,10 @@ mod tests {
             version: Version(2),
             lock_time: bitcoin::blockdata::locktime::absolute::LockTime::ZERO,
             input: vec![TxIn {
-                previous_output: OutPoint { txid: parent_txid, vout: 0 },
+                previous_output: OutPoint {
+                    txid: parent_txid,
+                    vout: 0,
+                },
                 script_sig: bitcoin::ScriptBuf::new(),
                 sequence: Sequence::MAX,
                 witness: Witness::new(),
@@ -3598,7 +3743,11 @@ mod tests {
             phase_tracker: None,
             interrupt: None,
         });
-        assert!(result.is_ok(), "BIP 34 correct height should pass, got {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "BIP 34 correct height should pass, got {:?}",
+            result.err()
+        );
     }
 
     #[test]
@@ -3763,33 +3912,45 @@ mod tests {
         };
 
         // Controls: Core's own encoding connects.
-        for (height, minimal) in [(1u32, vec![0x51]), (16, vec![0x60]), (101, vec![0x01, 0x65]), (128, vec![0x02, 0x80, 0x00])] {
+        for (height, minimal) in [
+            (1u32, vec![0x51]),
+            (16, vec![0x60]),
+            (101, vec![0x01, 0x65]),
+            (128, vec![0x02, 0x80, 0x00]),
+        ] {
             let r = connect_with(height, tail(minimal.clone()));
-            assert!(r.is_ok(), "minimal push {minimal:02x?} for {height} must connect: {r:?}");
+            assert!(
+                r.is_ok(),
+                "minimal push {minimal:02x?} for {height} must connect: {r:?}"
+            );
         }
 
         // The right value, encoded any way but Core's: bad-cb-height.
         let mut accepted = Vec::new();
         for (height, script) in [
-            (1u32, vec![0x01, 0x01]),              // a push where Core uses OP_1
-            (16, vec![0x01, 0x10]),                // a push where Core uses OP_16
-            (101, vec![0x02, 0x65, 0x00]),         // padded to two bytes
+            (1u32, vec![0x01, 0x01]),                  // a push where Core uses OP_1
+            (16, vec![0x01, 0x10]),                    // a push where Core uses OP_16
+            (101, vec![0x02, 0x65, 0x00]),             // padded to two bytes
             (101, vec![0x04, 0x65, 0x00, 0x00, 0x00]), // padded to four
             (101, vec![0x05, 0x65, 0x00, 0x00, 0x00, 0x00]), // five bytes, top one ignored
-            (128, vec![0x03, 0x80, 0x00, 0x00]),   // extra zero after the sign byte
-            (128, vec![0x01, 0x80]),               // no sign byte: a negative zero to Core
+            (128, vec![0x03, 0x80, 0x00, 0x00]),       // extra zero after the sign byte
+            (128, vec![0x01, 0x80]),                   // no sign byte: a negative zero to Core
             (101, vec![0x08, 0x65, 0, 0, 0, 0, 0, 0, 0]), // eight bytes
-            (101, vec![0x4c, 0x01, 0x65]),         // OP_PUSHDATA1, one byte
-            (128, vec![0x4c, 0x02, 0x80, 0x00]),   // OP_PUSHDATA1, the minimal bytes
-            (17, vec![0x61]),                      // OP_NOP, not a height at all
-            (101, vec![0x01, 0x64]),               // minimal, but the wrong height
+            (101, vec![0x4c, 0x01, 0x65]),             // OP_PUSHDATA1, one byte
+            (128, vec![0x4c, 0x02, 0x80, 0x00]),       // OP_PUSHDATA1, the minimal bytes
+            (17, vec![0x61]),                          // OP_NOP, not a height at all
+            (101, vec![0x01, 0x64]),                   // minimal, but the wrong height
         ] {
             let r = connect_with(height, tail(script.clone()));
             if !matches!(r, Err(ConnectError::BadCoinbaseHeight)) {
                 accepted.push(format!("{height}: {script:02x?} -> {r:?}"));
             }
         }
-        assert!(accepted.is_empty(), "non-minimal height pushes must be bad-cb-height:\n{}", accepted.join("\n"));
+        assert!(
+            accepted.is_empty(),
+            "non-minimal height pushes must be bad-cb-height:\n{}",
+            accepted.join("\n")
+        );
     }
 
     #[test]
@@ -4240,9 +4401,9 @@ mod tests {
     fn connect_emits_a_spending_row_naming_the_funding_ordinal() {
         let store = test_store();
         let outpoint = OutPoint {
-            txid: bitcoin::Txid::from_raw_hash(
-                bitcoin::hashes::sha256d::Hash::from_byte_array([0x45; 32]),
-            ),
+            txid: bitcoin::Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array(
+                [0x45; 32],
+            )),
             vout: 0,
         };
         const FUNDING_SEQ: u64 = 33;
@@ -4398,7 +4559,11 @@ mod tests {
         })
         .unwrap();
 
-        assert_eq!(batch.filter_puts.len(), 1, "expected one filter row per block");
+        assert_eq!(
+            batch.filter_puts.len(),
+            1,
+            "expected one filter row per block"
+        );
         assert_eq!(batch.filter_header_puts.len(), 1);
         assert_eq!(batch.filter_puts[0].key.height, 1);
         assert_eq!(batch.filter_puts[0].key.filter_type, 0u8);

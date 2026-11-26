@@ -14,10 +14,8 @@ use bitcoin::absolute::LockTime;
 use bitcoin::consensus::{Decodable, Encodable};
 use bitcoin::hashes::Hash;
 use bitcoin::transaction::Version;
-use bitcoin::{
-    Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid, Witness,
-};
-use helpers::{parse_flags, parse_script, parse_witness_row, TAPROOT_OUTPUT_MARKER};
+use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid, Witness};
+use helpers::{TAPROOT_OUTPUT_MARKER, parse_flags, parse_script, parse_witness_row};
 use serde_json::Value;
 use std::collections::HashMap;
 
@@ -36,13 +34,24 @@ fn rust_verify_bytes(
     };
     let spent: Vec<TxOut> = prev_outputs
         .iter()
-        .map(|(spk, val)| TxOut { value: Amount::from_sat(*val), script_pubkey: ScriptBuf::from_bytes(spk.clone()) })
+        .map(|(spk, val)| TxOut {
+            value: Amount::from_sat(*val),
+            script_pubkey: ScriptBuf::from_bytes(spk.clone()),
+        })
         .collect();
     let Ok(precomputed) = consensus::PrecomputedTransactionData::new(&tx, &spent) else {
         return false;
     };
     let spk = bitcoin::Script::from_bytes(spent_output_script);
-    consensus::verify(spk, Amount::from_sat(amount), &tx, input_index, flags, &precomputed).is_ok()
+    consensus::verify(
+        spk,
+        Amount::from_sat(amount),
+        &tx,
+        input_index,
+        flags,
+        &precomputed,
+    )
+    .is_ok()
 }
 
 /// Run a single verification through both engines and compare results.
@@ -120,9 +129,7 @@ fn build_spending_tx(
 ) -> Transaction {
     let mut buf = Vec::new();
     credit_tx.consensus_encode(&mut buf).unwrap();
-    let txid = Txid::from_byte_array(
-        bitcoin::hashes::sha256d::Hash::hash(&buf).to_byte_array(),
-    );
+    let txid = Txid::from_byte_array(bitcoin::hashes::sha256d::Hash::hash(&buf).to_byte_array());
     let mut w = Witness::new();
     for item in witness {
         w.push(item);
@@ -188,23 +195,51 @@ fn differential_script_tests() {
         total += 1;
         let mut taproot_output: Option<Vec<u8>> = None;
 
-        let (witness_items, script_sig_str, script_pubkey_str, flags_str, n_value): (Vec<Vec<u8>>, &str, &str, &str, u64) =
-            if arr[0].is_array() {
-                if arr.len() < 5 { skipped += 1; continue; }
-                let wit_arr = arr[0].as_array().unwrap();
-                let spk_str = arr[2].as_str().unwrap();
-                let amount = if let Some(v) = wit_arr.last() {
-                    if v.is_number() { (v.as_f64().unwrap() * 1e8) as u64 } else { 0 }
-                } else { 0 };
-                // Hex items, or Core's #SCRIPT# / #CONTROLBLOCK# taproot markers.
-                let row = parse_witness_row(&wit_arr[..wit_arr.len() - 1]);
-                taproot_output = row.taproot_output;
-                (row.stack, arr[1].as_str().unwrap(), spk_str, arr[3].as_str().unwrap(), amount)
+        let (witness_items, script_sig_str, script_pubkey_str, flags_str, n_value): (
+            Vec<Vec<u8>>,
+            &str,
+            &str,
+            &str,
+            u64,
+        ) = if arr[0].is_array() {
+            if arr.len() < 5 {
+                skipped += 1;
+                continue;
+            }
+            let wit_arr = arr[0].as_array().unwrap();
+            let spk_str = arr[2].as_str().unwrap();
+            let amount = if let Some(v) = wit_arr.last() {
+                if v.is_number() {
+                    (v.as_f64().unwrap() * 1e8) as u64
+                } else {
+                    0
+                }
             } else {
-                if arr.len() < 4 || !arr[0].is_string() { skipped += 1; continue; }
-                (Vec::new(), arr[0].as_str().unwrap(), arr[1].as_str().unwrap(),
-                 arr[2].as_str().unwrap(), 0u64)
+                0
             };
+            // Hex items, or Core's #SCRIPT# / #CONTROLBLOCK# taproot markers.
+            let row = parse_witness_row(&wit_arr[..wit_arr.len() - 1]);
+            taproot_output = row.taproot_output;
+            (
+                row.stack,
+                arr[1].as_str().unwrap(),
+                spk_str,
+                arr[3].as_str().unwrap(),
+                amount,
+            )
+        } else {
+            if arr.len() < 4 || !arr[0].is_string() {
+                skipped += 1;
+                continue;
+            }
+            (
+                Vec::new(),
+                arr[0].as_str().unwrap(),
+                arr[1].as_str().unwrap(),
+                arr[2].as_str().unwrap(),
+                0u64,
+            )
+        };
 
         let mut script_flags = parse_flags(flags_str);
         if script_flags & consensus::flags::VERIFY_CLEANSTACK != 0 {
@@ -217,7 +252,9 @@ fn differential_script_tests() {
         let script_sig = parse_script(script_sig_str);
         let script_pubkey = if script_pubkey_str == TAPROOT_OUTPUT_MARKER {
             taproot_rows += 1;
-            taproot_output.take().expect("no tapscript leaf to build the output from")
+            taproot_output
+                .take()
+                .expect("no tapscript leaf to build the output from")
         } else {
             parse_script(script_pubkey_str)
         };
@@ -244,9 +281,7 @@ fn differential_script_tests() {
         } else {
             mismatched += 1;
             if mismatched <= 5 {
-                let comment = arr.last()
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
+                let comment = arr.last().and_then(|v| v.as_str()).unwrap_or("");
                 eprintln!(
                     "DIFF [{}]: rust={} cpp={} flags=0x{:x} sig='{}' pub='{}'",
                     comment, rust_ok, cpp_ok, safe_flags, script_sig_str, script_pubkey_str,
@@ -259,7 +294,10 @@ fn differential_script_tests() {
         "\nDifferential script_tests: {matched} matched, {mismatched} mismatched, {skipped} skipped out of {total} \
          ({taproot_rows} taproot rows)"
     );
-    assert_eq!(mismatched, 0, "{mismatched} differential mismatches in script_tests");
+    assert_eq!(
+        mismatched, 0,
+        "{mismatched} differential mismatches in script_tests"
+    );
     assert_eq!(taproot_rows, 7, "taproot rows run");
 }
 
@@ -275,24 +313,36 @@ fn parse_prevouts_map(inputs: &[Value]) -> Option<(DiffScriptMap, DiffValueMap)>
     let mut value_map = HashMap::new();
     for input in inputs {
         let arr = input.as_array()?;
-        if arr.len() < 3 || arr.len() > 4 { return None; }
+        if arr.len() < 3 || arr.len() > 4 {
+            return None;
+        }
         let txid_hex = arr[0].as_str()?;
         let txid_bytes = hex::decode(txid_hex).ok()?;
-        if txid_bytes.len() != 32 { return None; }
+        if txid_bytes.len() != 32 {
+            return None;
+        }
         let mut txid_arr = [0u8; 32];
-        for (i, b) in txid_bytes.iter().enumerate() { txid_arr[31 - i] = *b; }
+        for (i, b) in txid_bytes.iter().enumerate() {
+            txid_arr[31 - i] = *b;
+        }
         let txid = Txid::from_byte_array(txid_arr);
         let vout = arr[1].as_u64()? as u32;
         let script = parse_script(arr[2].as_str()?);
         script_map.insert((txid, vout), script);
-        if arr.len() >= 4 { value_map.insert((txid, vout), arr[3].as_i64()?); }
+        if arr.len() >= 4 {
+            value_map.insert((txid, vout), arr[3].as_i64()?);
+        }
     }
     Some((script_map, value_map))
 }
 
 fn fill_flags(mut f: u32) -> u32 {
-    if f & consensus::flags::VERIFY_CLEANSTACK != 0 { f |= consensus::flags::VERIFY_WITNESS; }
-    if f & consensus::flags::VERIFY_WITNESS != 0 { f |= consensus::flags::VERIFY_P2SH; }
+    if f & consensus::flags::VERIFY_CLEANSTACK != 0 {
+        f |= consensus::flags::VERIFY_WITNESS;
+    }
+    if f & consensus::flags::VERIFY_WITNESS != 0 {
+        f |= consensus::flags::VERIFY_P2SH;
+    }
     f
 }
 
@@ -308,18 +358,47 @@ fn differential_tx_valid() {
     for test in &tests {
         let arr = match test.as_array() {
             Some(a) if a.len() == 3 && a[0].is_array() => a,
-            _ => { skipped += 1; continue; }
+            _ => {
+                skipped += 1;
+                continue;
+            }
         };
         let inputs = arr[0].as_array().unwrap();
-        let tx_hex = match arr[1].as_str() { Some(s) => s, None => { skipped += 1; continue; } };
-        let flags_str = match arr[2].as_str() { Some(s) => s, None => { skipped += 1; continue; } };
+        let tx_hex = match arr[1].as_str() {
+            Some(s) => s,
+            None => {
+                skipped += 1;
+                continue;
+            }
+        };
+        let flags_str = match arr[2].as_str() {
+            Some(s) => s,
+            None => {
+                skipped += 1;
+                continue;
+            }
+        };
 
         let (script_map, value_map) = match parse_prevouts_map(inputs) {
-            Some(m) => m, None => { skipped += 1; continue; }
+            Some(m) => m,
+            None => {
+                skipped += 1;
+                continue;
+            }
         };
-        let tx_bytes = match hex::decode(tx_hex) { Ok(b) => b, Err(_) => { skipped += 1; continue; } };
+        let tx_bytes = match hex::decode(tx_hex) {
+            Ok(b) => b,
+            Err(_) => {
+                skipped += 1;
+                continue;
+            }
+        };
         let tx: Transaction = match Transaction::consensus_decode(&mut tx_bytes.as_slice()) {
-            Ok(tx) => tx, Err(_) => { skipped += 1; continue; }
+            Ok(tx) => tx,
+            Err(_) => {
+                skipped += 1;
+                continue;
+            }
         };
 
         let excluded = parse_flags(flags_str);
@@ -328,21 +407,35 @@ fn differential_tx_valid() {
         let has_taproot = safe_flags & kernel_ref::VERIFY_TAPROOT != 0;
 
         // Build prev_outputs array for all inputs
-        let prevs: Vec<(Vec<u8>, u64)> = tx.input.iter().map(|inp| {
-            let key = (inp.previous_output.txid, inp.previous_output.vout);
-            let spk = script_map.get(&key).cloned().unwrap_or_default();
-            let val = value_map.get(&key).copied().unwrap_or(0) as u64;
-            (spk, val)
-        }).collect();
+        let prevs: Vec<(Vec<u8>, u64)> = tx
+            .input
+            .iter()
+            .map(|inp| {
+                let key = (inp.previous_output.txid, inp.previous_output.vout);
+                let spk = script_map.get(&key).cloned().unwrap_or_default();
+                let val = value_map.get(&key).copied().unwrap_or(0) as u64;
+                (spk, val)
+            })
+            .collect();
 
         let mut all_matched = true;
         for (i, inp) in tx.input.iter().enumerate() {
             let key = (inp.previous_output.txid, inp.previous_output.vout);
-            let spk = match script_map.get(&key) { Some(s) => s, None => { all_matched = false; break; } };
+            let spk = match script_map.get(&key) {
+                Some(s) => s,
+                None => {
+                    all_matched = false;
+                    break;
+                }
+            };
             let amount = value_map.get(&key).copied().unwrap_or(0) as u64;
 
             let (rust_ok, cpp_ok, ok) = verify_both(
-                spk, amount, &tx_bytes, i, safe_flags,
+                spk,
+                amount,
+                &tx_bytes,
+                i,
+                safe_flags,
                 if has_taproot { Some(&prevs) } else { None },
             );
             if !ok {
@@ -355,11 +448,20 @@ fn differential_tx_valid() {
             }
         }
 
-        if all_matched { matched += 1; } else { mismatched += 1; }
+        if all_matched {
+            matched += 1;
+        } else {
+            mismatched += 1;
+        }
     }
 
-    eprintln!("Differential tx_valid: {matched} matched, {mismatched} mismatched, {skipped} skipped");
-    assert_eq!(mismatched, 0, "{mismatched} differential mismatches in tx_valid");
+    eprintln!(
+        "Differential tx_valid: {matched} matched, {mismatched} mismatched, {skipped} skipped"
+    );
+    assert_eq!(
+        mismatched, 0,
+        "{mismatched} differential mismatches in tx_valid"
+    );
 }
 
 // =========================================================================
@@ -378,43 +480,86 @@ fn differential_tx_invalid() {
     for test in &tests {
         let arr = match test.as_array() {
             Some(a) if a.len() == 3 && a[0].is_array() => a,
-            _ => { skipped += 1; continue; }
+            _ => {
+                skipped += 1;
+                continue;
+            }
         };
         let inputs = arr[0].as_array().unwrap();
-        let tx_hex = match arr[1].as_str() { Some(s) => s, None => { skipped += 1; continue; } };
-        let flags_str = match arr[2].as_str() { Some(s) => s, None => { skipped += 1; continue; } };
+        let tx_hex = match arr[1].as_str() {
+            Some(s) => s,
+            None => {
+                skipped += 1;
+                continue;
+            }
+        };
+        let flags_str = match arr[2].as_str() {
+            Some(s) => s,
+            None => {
+                skipped += 1;
+                continue;
+            }
+        };
 
-        if flags_str == "BADTX" { skipped += 1; continue; }
+        if flags_str == "BADTX" {
+            skipped += 1;
+            continue;
+        }
 
         let (script_map, value_map) = match parse_prevouts_map(inputs) {
-            Some(m) => m, None => { skipped += 1; continue; }
+            Some(m) => m,
+            None => {
+                skipped += 1;
+                continue;
+            }
         };
-        let tx_bytes = match hex::decode(tx_hex) { Ok(b) => b, Err(_) => { skipped += 1; continue; } };
+        let tx_bytes = match hex::decode(tx_hex) {
+            Ok(b) => b,
+            Err(_) => {
+                skipped += 1;
+                continue;
+            }
+        };
         let tx: Transaction = match Transaction::consensus_decode(&mut tx_bytes.as_slice()) {
-            Ok(tx) => tx, Err(_) => { skipped += 1; continue; }
+            Ok(tx) => tx,
+            Err(_) => {
+                skipped += 1;
+                continue;
+            }
         };
 
         let verify_flags = fill_flags(parse_flags(flags_str));
         let safe_flags = cpp_safe_flags(verify_flags);
         let has_taproot = safe_flags & kernel_ref::VERIFY_TAPROOT != 0;
 
-        let prevs: Vec<(Vec<u8>, u64)> = tx.input.iter().map(|inp| {
-            let key = (inp.previous_output.txid, inp.previous_output.vout);
-            let spk = script_map.get(&key).cloned().unwrap_or_default();
-            let val = value_map.get(&key).copied().unwrap_or(0) as u64;
-            (spk, val)
-        }).collect();
+        let prevs: Vec<(Vec<u8>, u64)> = tx
+            .input
+            .iter()
+            .map(|inp| {
+                let key = (inp.previous_output.txid, inp.previous_output.vout);
+                let spk = script_map.get(&key).cloned().unwrap_or_default();
+                let val = value_map.get(&key).copied().unwrap_or(0) as u64;
+                (spk, val)
+            })
+            .collect();
 
         // For invalid txs, at least one input should fail in both engines.
         // We verify each input and check that both engines agree on pass/fail.
         let mut all_matched = true;
         for (i, inp) in tx.input.iter().enumerate() {
             let key = (inp.previous_output.txid, inp.previous_output.vout);
-            let spk = match script_map.get(&key) { Some(s) => s, None => continue, };
+            let spk = match script_map.get(&key) {
+                Some(s) => s,
+                None => continue,
+            };
             let amount = value_map.get(&key).copied().unwrap_or(0) as u64;
 
             let (rust_ok, cpp_ok, ok) = verify_both(
-                spk, amount, &tx_bytes, i, safe_flags,
+                spk,
+                amount,
+                &tx_bytes,
+                i,
+                safe_flags,
                 if has_taproot { Some(&prevs) } else { None },
             );
             if !ok {
@@ -427,11 +572,20 @@ fn differential_tx_invalid() {
             }
         }
 
-        if all_matched { matched += 1; } else { mismatched += 1; }
+        if all_matched {
+            matched += 1;
+        } else {
+            mismatched += 1;
+        }
     }
 
-    eprintln!("Differential tx_invalid: {matched} matched, {mismatched} mismatched, {skipped} skipped");
-    assert_eq!(mismatched, 0, "{mismatched} differential mismatches in tx_invalid");
+    eprintln!(
+        "Differential tx_invalid: {matched} matched, {mismatched} mismatched, {skipped} skipped"
+    );
+    assert_eq!(
+        mismatched, 0,
+        "{mismatched} differential mismatches in tx_invalid"
+    );
 }
 
 // =========================================================================
@@ -447,22 +601,21 @@ fn differential_bip341_key_path() {
     let tx_hex = kps["auxiliary"]["fullySignedTx"].as_str().unwrap();
     let tx_bytes = hex::decode(tx_hex).unwrap();
     let utxos_json = kps["given"]["utxosSpent"].as_array().unwrap();
-    let prevs: Vec<(Vec<u8>, u64)> = utxos_json.iter().map(|u| {
-        let spk = hex::decode(u["scriptPubKey"].as_str().unwrap()).unwrap();
-        let amount = u["amountSats"].as_u64().unwrap();
-        (spk, amount)
-    }).collect();
+    let prevs: Vec<(Vec<u8>, u64)> = utxos_json
+        .iter()
+        .map(|u| {
+            let spk = hex::decode(u["scriptPubKey"].as_str().unwrap()).unwrap();
+            let amount = u["amountSats"].as_u64().unwrap();
+            (spk, amount)
+        })
+        .collect();
 
-    let flags = kernel_ref::VERIFY_P2SH
-        | kernel_ref::VERIFY_WITNESS
-        | kernel_ref::VERIFY_TAPROOT;
+    let flags = kernel_ref::VERIFY_P2SH | kernel_ref::VERIFY_WITNESS | kernel_ref::VERIFY_TAPROOT;
 
     let mut matched = 0;
     let mut mismatched = 0;
     for (i, prev) in prevs.iter().enumerate() {
-        let (rust_ok, cpp_ok, ok) = verify_both(
-            &prev.0, prev.1, &tx_bytes, i, flags, Some(&prevs),
-        );
+        let (rust_ok, cpp_ok, ok) = verify_both(&prev.0, prev.1, &tx_bytes, i, flags, Some(&prevs));
         if ok {
             matched += 1;
         } else {
@@ -554,9 +707,7 @@ fn differential_p2sh_p2wpkh_nonstandard_sighash() {
         let spk = hex::decode(spk_hex).unwrap();
 
         let prevs = vec![(spk.clone(), value)];
-        let (rust_ok, cpp_ok, ok) = verify_both(
-            &spk, value, &tx_bytes, 0, flags, Some(&prevs),
-        );
+        let (rust_ok, cpp_ok, ok) = verify_both(&spk, value, &tx_bytes, 0, flags, Some(&prevs));
 
         if ok {
             matched += 1;
@@ -572,7 +723,10 @@ fn differential_p2sh_p2wpkh_nonstandard_sighash() {
         "Differential nonstandard_sighash: {matched} matched, {mismatched} mismatched out of {}",
         cases.len()
     );
-    assert_eq!(mismatched, 0, "{mismatched} mismatches in nonstandard sighash test");
+    assert_eq!(
+        mismatched, 0,
+        "{mismatched} mismatches in nonstandard sighash test"
+    );
 }
 
 // =========================================================================
@@ -586,17 +740,61 @@ fn differential_p2sh_p2wpkh_nonstandard_sighash() {
 #[test]
 fn differential_script_edges() {
     let cases = [
-        ("truncated PUSHDATA2", script_edges::pushdata2_missing_a_length_byte(), false),
-        ("truncated PUSHDATA2 after CHECKSIG", script_edges::pushdata2_missing_a_length_byte_after_checksig(), false),
-        ("P2SH truncated PUSHDATA2", script_edges::p2sh_redeem_script_with_a_truncated_pushdata2(), false),
-        ("PUSHDATA4 length byte 2", script_edges::pushdata4_length_with_byte_2_set(), false),
-        ("PUSHDATA4 length 1", script_edges::pushdata4_length_of_one(), true),
-        ("P2SH redeemScript in PUSHDATA4", script_edges::p2sh_redeem_script_pushed_with_pushdata4(), true),
-        ("0xab in PUSHDATA1 data", script_edges::checksig_with_codeseparator_bytes_in_pushdata1_data(), true),
-        ("v1 program of 40 bytes", script_edges::witness_v1_program_of_40_bytes(0), true),
-        ("v0 program of 40 bytes", script_edges::witness_v0_program_of_40_bytes(), false),
-        ("control block of 129 nodes", script_edges::taproot_script_path_with_nodes(129), false),
-        ("control block of 128 nodes", script_edges::taproot_script_path_with_nodes(128), true),
+        (
+            "truncated PUSHDATA2",
+            script_edges::pushdata2_missing_a_length_byte(),
+            false,
+        ),
+        (
+            "truncated PUSHDATA2 after CHECKSIG",
+            script_edges::pushdata2_missing_a_length_byte_after_checksig(),
+            false,
+        ),
+        (
+            "P2SH truncated PUSHDATA2",
+            script_edges::p2sh_redeem_script_with_a_truncated_pushdata2(),
+            false,
+        ),
+        (
+            "PUSHDATA4 length byte 2",
+            script_edges::pushdata4_length_with_byte_2_set(),
+            false,
+        ),
+        (
+            "PUSHDATA4 length 1",
+            script_edges::pushdata4_length_of_one(),
+            true,
+        ),
+        (
+            "P2SH redeemScript in PUSHDATA4",
+            script_edges::p2sh_redeem_script_pushed_with_pushdata4(),
+            true,
+        ),
+        (
+            "0xab in PUSHDATA1 data",
+            script_edges::checksig_with_codeseparator_bytes_in_pushdata1_data(),
+            true,
+        ),
+        (
+            "v1 program of 40 bytes",
+            script_edges::witness_v1_program_of_40_bytes(0),
+            true,
+        ),
+        (
+            "v0 program of 40 bytes",
+            script_edges::witness_v0_program_of_40_bytes(),
+            false,
+        ),
+        (
+            "control block of 129 nodes",
+            script_edges::taproot_script_path_with_nodes(129),
+            false,
+        ),
+        (
+            "control block of 128 nodes",
+            script_edges::taproot_script_path_with_nodes(128),
+            true,
+        ),
     ];
     for (name, case, want_ok) in cases {
         let flags = cpp_safe_flags(case.flags);
@@ -609,6 +807,10 @@ fn differential_script_edges() {
             flags,
             Some(&prevs),
         );
-        assert_eq!((rust_ok, cpp_ok), (want_ok, want_ok), "{name}: rust={rust_ok} cpp={cpp_ok} flags=0x{flags:x}");
+        assert_eq!(
+            (rust_ok, cpp_ok),
+            (want_ok, want_ok),
+            "{name}: rust={rust_ok} cpp={cpp_ok} flags=0x{flags:x}"
+        );
     }
 }

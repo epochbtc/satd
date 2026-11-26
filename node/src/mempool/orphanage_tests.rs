@@ -40,12 +40,23 @@ fn spending(outpoints: &[OutPoint], tag: u64) -> Transaction {
 
 /// A one-input orphan of the unique parent `txid(seed)`.
 fn orphan(seed: u64) -> Transaction {
-    spending(&[OutPoint { txid: txid(seed), vout: 0 }], seed)
+    spending(
+        &[OutPoint {
+            txid: txid(seed),
+            vout: 0,
+        }],
+        seed,
+    )
 }
 
 /// `n` outpoints of distinct parents, starting at `seed`.
 fn outpoints(seed: u64, n: u64) -> Vec<OutPoint> {
-    (0..n).map(|i| OutPoint { txid: txid(seed + i), vout: i as u32 }).collect()
+    (0..n)
+        .map(|i| OutPoint {
+            txid: txid(seed + i),
+            vout: i as u32,
+        })
+        .collect()
 }
 
 /// Core's `MakeMutation`: the same txid with another witness.
@@ -78,7 +89,10 @@ fn has(pool: &TxOrphanage, tx: &Transaction) -> bool {
 }
 
 fn limited(max_global_latency_score: u32, reserved_peer_usage: u64) -> TxOrphanage {
-    TxOrphanage::new(OrphanageConfig { max_global_latency_score, reserved_peer_usage })
+    TxOrphanage::new(OrphanageConfig {
+        max_global_latency_score,
+        reserved_peer_usage,
+    })
 }
 
 /// The weight of a one-input orphan, the same for all of them.
@@ -103,17 +117,31 @@ fn an_orphan_added_and_erased_leaves_nothing_behind() {
     assert!(pool.erase(&tx.compute_wtxid()));
     assert!(!pool.erase(&tx.compute_wtxid()), "already gone");
     assert!(pool.is_empty());
-    assert_eq!((pool.bytes(), pool.weight(), pool.announcements(), pool.latency_score()), (0, 0, 0, 0));
+    assert_eq!(
+        (
+            pool.bytes(),
+            pool.weight(),
+            pool.announcements(),
+            pool.latency_score()
+        ),
+        (0, 0, 0, 0)
+    );
     let inner = pool.inner.lock();
     assert!(inner.by_txid.is_empty() && inner.by_parent.is_empty() && inner.by_outpoint.is_empty());
-    assert!(inner.peers.is_empty(), "a peer with nothing announced is not tracked");
+    assert!(
+        inner.peers.is_empty(),
+        "a peer with nothing announced is not tracked"
+    );
 }
 
 #[test]
 fn an_orphan_over_the_standard_weight_is_refused() {
     let pool = TxOrphanage::with_defaults();
     let tx = bulked(orphan(1), MAX_STANDARD_TX_WEIGHT as u64 + 1);
-    assert!(matches!(pool.add(tx.clone(), 1, parents(&tx)), Err(OrphanReject::TooLarge)));
+    assert!(matches!(
+        pool.add(tx.clone(), 1, parents(&tx)),
+        Err(OrphanReject::TooLarge)
+    ));
     assert!(pool.is_empty());
 }
 
@@ -122,7 +150,10 @@ fn an_orphan_over_the_standard_weight_is_refused() {
 #[test]
 fn an_orphan_with_no_missing_parent_is_refused() {
     let pool = TxOrphanage::with_defaults();
-    assert!(matches!(pool.add(orphan(1), 1, HashSet::new()), Err(OrphanReject::NoMissingParents)));
+    assert!(matches!(
+        pool.add(orphan(1), 1, HashSet::new()),
+        Err(OrphanReject::NoMissingParents)
+    ));
     assert!(pool.is_empty());
 }
 
@@ -135,16 +166,30 @@ fn a_held_orphan_sent_again_records_the_sender() {
     let wtxid = tx.compute_wtxid();
     assert_eq!(add(&pool, &tx, 0), AddOutcome::Added);
     assert_eq!(add(&pool, &tx, 0), AddOutcome::Duplicate);
-    assert_eq!(pool.announcements(), 1, "the same peer again is no new announcement");
+    assert_eq!(
+        pool.announcements(),
+        1,
+        "the same peer again is no new announcement"
+    );
 
     assert!(pool.add_announcer(&wtxid, 2));
     assert!(!pool.add_announcer(&wtxid, 2), "already an announcer");
-    assert!(!pool.add_announcer(&orphan(9).compute_wtxid(), 2), "no such orphan");
+    assert!(
+        !pool.add_announcer(&orphan(9).compute_wtxid(), 2),
+        "no such orphan"
+    );
     assert_eq!(add(&pool, &tx, 1), AddOutcome::Duplicate);
-    assert!(pool.has_announcer(&wtxid, 1), "AddTx of a held orphan is AddAnnouncer");
+    assert!(
+        pool.has_announcer(&wtxid, 1),
+        "AddTx of a held orphan is AddAnnouncer"
+    );
     assert_eq!(pool.len(), 1);
     assert_eq!(pool.announcements(), 3);
-    assert_eq!(pool.weight(), tx.weight().to_wu(), "an orphan's weight counts once");
+    assert_eq!(
+        pool.weight(),
+        tx.weight().to_wu(),
+        "an orphan's weight counts once"
+    );
     assert_eq!(pool.entry(&wtxid).unwrap().announcers(), vec![0, 1, 2]);
     pool.sanity_check();
 }
@@ -162,8 +207,14 @@ fn a_departing_peer_takes_only_its_own_orphans() {
 
     assert_eq!(pool.erase_for_peer(1), vec![own.compute_wtxid()]);
     assert!(!has(&pool, &own));
-    assert!(!pool.contains(&own.compute_txid()), "every index forgets it");
-    assert_eq!(pool.entry(&shared.compute_wtxid()).unwrap().announcers(), vec![2]);
+    assert!(
+        !pool.contains(&own.compute_txid()),
+        "every index forgets it"
+    );
+    assert_eq!(
+        pool.entry(&shared.compute_wtxid()).unwrap().announcers(),
+        vec![2]
+    );
     assert!(pool.children_from_peer(&txid(1), 1).is_empty());
     assert!(pool.erase_for_peer(1).is_empty());
     pool.sanity_check();
@@ -188,7 +239,11 @@ fn orphans_differing_only_in_witness_are_both_held() {
     assert_eq!(add(&pool, &mutated, 0), AddOutcome::Added);
     assert!(has(&pool, &normal) && has(&pool, &mutated));
     assert_eq!(pool.children_of(&txid(1)).len(), 2);
-    assert_eq!(pool.children_from_peer(&txid(1), 0), vec![mutated.clone(), normal.clone()], "newest first");
+    assert_eq!(
+        pool.children_from_peer(&txid(1), 0),
+        vec![mutated.clone(), normal.clone()],
+        "newest first"
+    );
     pool.sanity_check();
 
     assert!(pool.erase(&mutated.compute_wtxid()));
@@ -223,17 +278,28 @@ fn a_block_takes_out_the_orphans_it_includes_or_conflicts_with() {
 
     let block = bitcoin::Block {
         header: bitcoin::constants::genesis_block(bitcoin::Network::Regtest).header,
-        txdata: vec![included.clone(), in_block_mutated, in_block_conflict, in_block_partial],
+        txdata: vec![
+            included.clone(),
+            in_block_mutated,
+            in_block_conflict,
+            in_block_partial,
+        ],
     };
     let mut removed = pool.erase_for_block(&block);
     removed.sort_unstable();
-    let mut expected: Vec<Wtxid> =
-        [&included, &held_mutation, &held_conflict, &held_partial].iter().map(|t| t.compute_wtxid()).collect();
+    let mut expected: Vec<Wtxid> = [&included, &held_mutation, &held_conflict, &held_partial]
+        .iter()
+        .map(|t| t.compute_wtxid())
+        .collect();
     expected.sort_unstable();
     assert_eq!(removed, expected);
     assert_eq!(pool.len(), 1);
     assert!(has(&pool, &control));
-    assert_eq!(pool.announcements_from_peer(1), 0, "every announcer's share goes with it");
+    assert_eq!(
+        pool.announcements_from_peer(1),
+        0,
+        "every announcer's share goes with it"
+    );
     pool.sanity_check();
 }
 
@@ -286,7 +352,10 @@ fn the_dosiest_peer_loses_its_oldest() {
     for i in 0..10u64 {
         add(&pool, &txns[(max_announcements + i) as usize], peer1);
         assert_eq!(pool.announcements_from_peer(peer1), (i + 1) as u32);
-        assert_eq!(pool.announcements_from_peer(dosy), (max_announcements - i - 1) as u32);
+        assert_eq!(
+            pool.announcements_from_peer(dosy),
+            (max_announcements - i - 1) as u32
+        );
         assert!(!has(&pool, &txns[i as usize]), "FIFO within the peer");
     }
     // Peer 2 announcing orphans peer 0 announced takes peer 0's
@@ -295,7 +364,10 @@ fn the_dosiest_peer_loses_its_oldest() {
         let tx = &txns[i as usize];
         assert!(pool.has_announcer(&tx.compute_wtxid(), dosy));
         add(&pool, tx, peer2);
-        assert_eq!(pool.announcements_from_peer(dosy), (max_announcements - i - 1) as u32);
+        assert_eq!(
+            pool.announcements_from_peer(dosy),
+            (max_announcements - i - 1) as u32
+        );
         assert_eq!(pool.announcements_from_peer(peer1), 10);
         assert_eq!(pool.announcements_from_peer(peer2), (i + 1 - 10) as u32);
         assert!(!pool.has_announcer(&tx.compute_wtxid(), dosy));
@@ -311,7 +383,11 @@ fn the_dosiest_peer_loses_its_oldest() {
         }
     }
     for peer in 0..6 {
-        assert_eq!(pool.announcements_from_peer(peer), per_peer as u32, "peer {peer}");
+        assert_eq!(
+            pool.announcements_from_peer(peer),
+            per_peer as u32,
+            "peer {peer}"
+        );
     }
     pool.sanity_check();
 }
@@ -326,7 +402,10 @@ fn the_limits_follow_the_number_of_peers() {
     let res = DEFAULT_RESERVED_ORPHAN_WEIGHT_PER_PEER;
     let limits = |pool: &TxOrphanage| {
         let inner = pool.inner.lock();
-        (pool.max_global_usage(&inner), pool.max_peer_latency_score(&inner))
+        (
+            pool.max_global_usage(&inner),
+            pool.max_peer_latency_score(&inner),
+        )
     };
     assert_eq!(limits(&pool), (res, lat));
     add(&pool, &orphan(0), 0);
@@ -353,7 +432,10 @@ fn one_large_orphan_evicts_several_of_its_senders() {
     let w = unit();
     let large = bulked(spending(&outpoints(5000, 1), 0), 10 * w);
     let large_weight = large.weight().to_wu();
-    assert!(large_weight > 10 * w && large_weight < 11 * w, "{large_weight} vs {w}");
+    assert!(
+        large_weight > 10 * w && large_weight < 11 * w,
+        "{large_weight} vs {w}"
+    );
     let pool = limited(20, large_weight);
     let (normal, big) = (0, 1);
     for i in 0..20 {
@@ -419,7 +501,10 @@ fn a_peer_within_its_reservation_keeps_its_orphan() {
     assert!(has(&pool, &kept), "the normal peer's orphan was evicted");
     assert!(pool.len() < 10 + 1 + 40, "something was evicted");
     for peer in 0..10 {
-        assert!(has(&pool, &big(peer)), "peer {peer} is within its reservation");
+        assert!(
+            has(&pool, &big(peer)),
+            "peer {peer} is within its reservation"
+        );
     }
     assert!(pool.weight() <= pool.max_weight());
     pool.sanity_check();
@@ -431,12 +516,25 @@ fn a_peer_within_its_reservation_keeps_its_orphan() {
 fn children_from_a_peer_come_newest_first() {
     let pool = TxOrphanage::with_defaults();
     let parent = txid(7);
-    let kids: Vec<Transaction> = (0..3).map(|i| spending(&[OutPoint { txid: parent, vout: i }], i as u64)).collect();
+    let kids: Vec<Transaction> = (0..3)
+        .map(|i| {
+            spending(
+                &[OutPoint {
+                    txid: parent,
+                    vout: i,
+                }],
+                i as u64,
+            )
+        })
+        .collect();
     add(&pool, &kids[0], 1);
     add(&pool, &kids[1], 2);
     add(&pool, &kids[2], 1);
     pool.add_announcer(&kids[1].compute_wtxid(), 1);
-    assert_eq!(pool.children_from_peer(&parent, 1), vec![kids[1].clone(), kids[2].clone(), kids[0].clone()]);
+    assert_eq!(
+        pool.children_from_peer(&parent, 1),
+        vec![kids[1].clone(), kids[2].clone(), kids[0].clone()]
+    );
     assert_eq!(pool.children_from_peer(&parent, 2), vec![kids[1].clone()]);
     assert!(pool.children_from_peer(&parent, 3).is_empty());
 }
@@ -452,13 +550,19 @@ fn a_reconsidered_orphan_waits_for_its_new_parents() {
     assert_eq!(pool.children_of(&txid(10)), vec![wtxid]);
 
     assert!(pool.set_missing_parents(&wtxid, HashSet::from([txid(11)])));
-    assert!(pool.children_of(&txid(10)).is_empty(), "the arrived parent is forgotten");
+    assert!(
+        pool.children_of(&txid(10)).is_empty(),
+        "the arrived parent is forgotten"
+    );
     assert_eq!(pool.children_of(&txid(11)), vec![wtxid]);
     pool.sanity_check();
 
     assert!(!pool.set_missing_parents(&wtxid, HashSet::new()));
     assert!(pool.is_empty());
-    assert!(!pool.set_missing_parents(&wtxid, HashSet::from([txid(11)])), "not held");
+    assert!(
+        !pool.set_missing_parents(&wtxid, HashSet::from([txid(11)])),
+        "not held"
+    );
     pool.sanity_check();
 }
 
@@ -469,7 +573,11 @@ fn the_orphans_are_listed_in_wtxid_order() {
     for i in 0..20 {
         add(&pool, &orphan(i), i % 3);
     }
-    let listed: Vec<Wtxid> = pool.orphans().iter().map(|(tx, _)| tx.compute_wtxid()).collect();
+    let listed: Vec<Wtxid> = pool
+        .orphans()
+        .iter()
+        .map(|(tx, _)| tx.compute_wtxid())
+        .collect();
     let mut sorted = listed.clone();
     sorted.sort_unstable();
     assert_eq!(listed.len(), 20);
@@ -517,11 +625,22 @@ fn a_departing_peer_lowers_the_limit_for_the_rest() {
     for i in 1..=15 {
         add(&pool, &orphan(i), 1);
     }
-    assert_eq!(pool.announcements_from_peer(1), 15, "within two peers' reservations");
+    assert_eq!(
+        pool.announcements_from_peer(1),
+        15,
+        "within two peers' reservations"
+    );
 
     pool.erase_for_peer(2);
-    assert_eq!(pool.announcements_from_peer(1), 10, "trimmed to one reservation");
-    assert!(!has(&pool, &orphan(1)) && has(&pool, &orphan(15)), "oldest out first");
+    assert_eq!(
+        pool.announcements_from_peer(1),
+        10,
+        "trimmed to one reservation"
+    );
+    assert!(
+        !has(&pool, &orphan(1)) && has(&pool, &orphan(15)),
+        "oldest out first"
+    );
     pool.sanity_check();
 }
 

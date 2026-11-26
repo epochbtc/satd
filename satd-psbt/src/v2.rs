@@ -334,7 +334,12 @@ impl<'a> V2View<'a> {
 
         let v0 = RawPsbt {
             global,
-            inputs: self.raw.inputs.iter().map(|m| strip(m, &dropped_in)).collect(),
+            inputs: self
+                .raw
+                .inputs
+                .iter()
+                .map(|m| strip(m, &dropped_in))
+                .collect(),
             outputs: self
                 .raw
                 .outputs
@@ -369,13 +374,13 @@ impl<'a> InputView<'a> {
     }
 
     pub fn previous_txid(&self) -> Result<Txid, PsbtError> {
-        let raw = self
-            .map
-            .get_single(keys::input::PREVIOUS_TXID)
-            .ok_or(PsbtError::MissingField {
-                map: self.id(),
-                field: "PSBT_IN_PREVIOUS_TXID",
-            })?;
+        let raw =
+            self.map
+                .get_single(keys::input::PREVIOUS_TXID)
+                .ok_or(PsbtError::MissingField {
+                    map: self.id(),
+                    field: "PSBT_IN_PREVIOUS_TXID",
+                })?;
         if raw.len() != 32 {
             return Err(PsbtError::BadFieldLength {
                 map: self.id(),
@@ -393,13 +398,13 @@ impl<'a> InputView<'a> {
     }
 
     pub fn output_index(&self) -> Result<u32, PsbtError> {
-        let raw = self
-            .map
-            .get_single(keys::input::OUTPUT_INDEX)
-            .ok_or(PsbtError::MissingField {
-                map: self.id(),
-                field: "PSBT_IN_OUTPUT_INDEX",
-            })?;
+        let raw =
+            self.map
+                .get_single(keys::input::OUTPUT_INDEX)
+                .ok_or(PsbtError::MissingField {
+                    map: self.id(),
+                    field: "PSBT_IN_OUTPUT_INDEX",
+                })?;
         le_u32(raw, self.id(), keys::input::OUTPUT_INDEX)
     }
 
@@ -450,28 +455,28 @@ impl<'a> InputView<'a> {
     pub fn witness_utxo(&self) -> Result<Option<TxOut>, PsbtError> {
         match self.map.get_single(keys::input::WITNESS_UTXO) {
             None => Ok(None),
-            Some(raw) => bitcoin::consensus::deserialize(raw)
-                .map(Some)
-                .map_err(|_| PsbtError::BadFieldLength {
+            Some(raw) => bitcoin::consensus::deserialize(raw).map(Some).map_err(|_| {
+                PsbtError::BadFieldLength {
                     map: self.id(),
                     key_type: keys::input::WITNESS_UTXO,
                     len: raw.len(),
                     expected: "a serialized transaction output",
-                }),
+                }
+            }),
         }
     }
 
     pub fn non_witness_utxo(&self) -> Result<Option<Transaction>, PsbtError> {
         match self.map.get_single(keys::input::NON_WITNESS_UTXO) {
             None => Ok(None),
-            Some(raw) => bitcoin::consensus::deserialize(raw)
-                .map(Some)
-                .map_err(|_| PsbtError::BadFieldLength {
+            Some(raw) => bitcoin::consensus::deserialize(raw).map(Some).map_err(|_| {
+                PsbtError::BadFieldLength {
                     map: self.id(),
                     key_type: keys::input::NON_WITNESS_UTXO,
                     len: raw.len(),
                     expected: "a serialized transaction",
-                }),
+                }
+            }),
         }
     }
 

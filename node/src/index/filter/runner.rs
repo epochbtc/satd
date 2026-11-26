@@ -217,12 +217,16 @@ impl BackfillRunner {
                 self.check_pause_loop()?;
                 let hash = hashes[h as usize];
                 // The stored form (see `read_via_snapshot`).
-                let block = self.chain.get_stored_block(&hash).map(|s| s.block).ok_or_else(|| {
-                    BackfillError::Chain(format!(
-                        "tail catch-up: missing block data for {} at height {}",
-                        hash, h
-                    ))
-                })?;
+                let block = self
+                    .chain
+                    .get_stored_block(&hash)
+                    .map(|s| s.block)
+                    .ok_or_else(|| {
+                        BackfillError::Chain(format!(
+                            "tail catch-up: missing block data for {} at height {}",
+                            hash, h
+                        ))
+                    })?;
                 let undo = self
                     .chain
                     .store_ref()
@@ -501,12 +505,15 @@ impl BackfillRunner {
         // byte-identical filter: BIP 158 leaves out every output script that
         // starts with OP_RETURN, and a stripped output still does; its inputs
         // and its other outputs are intact.
-        self.chain.get_stored_block(&hash).map(|s| s.block).ok_or_else(|| {
-            BackfillError::Chain(format!(
-                "missing block data for {} at height {} (pruned or corrupt?)",
-                hash, h
-            ))
-        })
+        self.chain
+            .get_stored_block(&hash)
+            .map(|s| s.block)
+            .ok_or_else(|| {
+                BackfillError::Chain(format!(
+                    "missing block data for {} at height {} (pruned or corrupt?)",
+                    hash, h
+                ))
+            })
     }
 
     fn run_pass(

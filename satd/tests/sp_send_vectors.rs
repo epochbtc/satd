@@ -18,7 +18,7 @@ use std::str::FromStr;
 
 use bitcoin::secp256k1::{PublicKey, Secp256k1, SecretKey};
 use bitcoin::{OutPoint, Txid};
-use common::sp_send::{sp_outputs, SpInput, SpRecipient};
+use common::sp_send::{SpInput, SpRecipient, sp_outputs};
 use serde_json::Value;
 
 fn vectors_path() -> std::path::PathBuf {
@@ -162,7 +162,12 @@ fn contributes_a_key(spk_hex: &str, witness_hex: &str, script_sig_hex: &str) -> 
     }
     let mut els = witness_elements(witness_hex);
     // A trailing element beginning with 0x50 is the annex, not part of the spend.
-    if els.len() >= 2 && els.last().map(|e| e.first() == Some(&0x50)).unwrap_or(false) {
+    if els.len() >= 2
+        && els
+            .last()
+            .map(|e| e.first() == Some(&0x50))
+            .unwrap_or(false)
+    {
         els.pop();
     }
     if els.len() < 2 {
@@ -189,7 +194,9 @@ fn supported(vin: &[Value]) -> bool {
         if hex::decode(sk).map(|b| b.len()) != Ok(32) {
             return false;
         }
-        let spk = v["prevout"]["scriptPubKey"]["hex"].as_str().unwrap_or_default();
+        let spk = v["prevout"]["scriptPubKey"]["hex"]
+            .as_str()
+            .unwrap_or_default();
         let b = hex::decode(spk).unwrap_or_default();
         // P2TR, P2WPKH, P2PKH, or P2SH-P2WPKH — the eligible input types with a
         // straightforward single-key spend.
@@ -210,7 +217,10 @@ fn bip352_sending_vectors() {
     let mut skipped: Vec<String> = Vec::new();
 
     for case in &cases {
-        let comment = case["comment"].as_str().unwrap_or("<no comment>").to_string();
+        let comment = case["comment"]
+            .as_str()
+            .unwrap_or("<no comment>")
+            .to_string();
         for send in case["sending"].as_array().into_iter().flatten() {
             let vin = send["given"]["vin"].as_array().expect("vin").clone();
             if !supported(&vin) {
@@ -228,18 +238,23 @@ fn bip352_sending_vectors() {
                 // those of inputs that contribute no key.
                 all_outpoints.push(op);
 
-                let spk = v["prevout"]["scriptPubKey"]["hex"].as_str().unwrap_or_default();
+                let spk = v["prevout"]["scriptPubKey"]["hex"]
+                    .as_str()
+                    .unwrap_or_default();
                 let witness = v["txinwitness"].as_str().unwrap_or_default();
                 let script_sig = v["scriptSig"].as_str().unwrap_or_default();
                 if !contributes_a_key(spk, witness, script_sig) {
                     continue;
                 }
 
-                let secret = SecretKey::from_slice(&hex32(
-                    v["private_key"].as_str().expect("private_key"),
-                ))
-                .expect("secret");
-                inputs.push(SpInput { outpoint: op, secret, is_taproot: is_p2tr(spk) });
+                let secret =
+                    SecretKey::from_slice(&hex32(v["private_key"].as_str().expect("private_key")))
+                        .expect("secret");
+                inputs.push(SpInput {
+                    outpoint: op,
+                    secret,
+                    is_taproot: is_p2tr(spk),
+                });
             }
             if inputs.is_empty() {
                 skipped.push(format!("{comment} (no contributing inputs)"));
@@ -289,7 +304,9 @@ fn bip352_sending_vectors() {
                 // vectors express this as an empty expected-output set, which
                 // the branch above already skipped, so reaching here with a
                 // non-empty expectation is a real failure.
-                panic!("{comment}: sender reported 'cannot send' but the vectors expect {alternatives:?}");
+                panic!(
+                    "{comment}: sender reported 'cannot send' but the vectors expect {alternatives:?}"
+                );
             };
             let got: BTreeSet<String> =
                 derived.iter().map(|x| hex::encode(x.serialize())).collect();
@@ -302,7 +319,10 @@ fn bip352_sending_vectors() {
         }
     }
 
-    eprintln!("BIP 352 sending vectors: {exercised} exercised, {} skipped", skipped.len());
+    eprintln!(
+        "BIP 352 sending vectors: {exercised} exercised, {} skipped",
+        skipped.len()
+    );
     for s in &skipped {
         eprintln!("  skipped: {s}");
     }
@@ -341,11 +361,23 @@ fn scalar_addition_reduces_at_the_curve_order() {
     two[31] = 2;
 
     // (n-1) + 1 == 0 mod n — the wrap that a plain 256-bit add gets wrong.
-    assert_eq!(add(&N_MINUS_1, &one), [0u8; 32], "n-1 + 1 must reduce to zero");
+    assert_eq!(
+        add(&N_MINUS_1, &one),
+        [0u8; 32],
+        "n-1 + 1 must reduce to zero"
+    );
     // (n-1) + 2 == 1 mod n.
     assert_eq!(add(&N_MINUS_1, &two), one, "n-1 + 2 must reduce to one");
     // No reduction below n.
-    assert_eq!(add(&one, &two), { let mut t = [0u8; 32]; t[31] = 3; t }, "1 + 2 == 3");
+    assert_eq!(
+        add(&one, &two),
+        {
+            let mut t = [0u8; 32];
+            t[31] = 3;
+            t
+        },
+        "1 + 2 == 3"
+    );
     // Identity.
     assert_eq!(add(&[0u8; 32], &N_MINUS_1), N_MINUS_1, "0 is the identity");
 }

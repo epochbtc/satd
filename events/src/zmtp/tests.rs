@@ -197,9 +197,16 @@ async fn zmtp_prefix_filtering() {
     let mut sub = zsub(&pubs.local_endpoint(), &["hash"]).await;
     wait_until("subscription", || pubs.has_subscriber(b"hashtx")).await;
 
-    for (i, t) in ["rawtx", "hashtx", "rawblock", "hashblock", "sequence", "hashend"]
-        .iter()
-        .enumerate()
+    for (i, t) in [
+        "rawtx",
+        "hashtx",
+        "rawblock",
+        "hashblock",
+        "sequence",
+        "hashend",
+    ]
+    .iter()
+    .enumerate()
     {
         pubs.publish(msg(t, vec![i as u8], i as u32));
     }
@@ -236,7 +243,10 @@ async fn zmtp_duplicate_subscription_is_counted() {
     s.write_all(&subscription(false, b"a")).await.unwrap();
     s.write_all(&subscription(true, b"m1")).await.unwrap();
     wait_until("marker 1", || pubs.has_subscriber(b"m1")).await;
-    assert!(pubs.has_subscriber(b"abc"), "one cancel of a doubled prefix keeps it");
+    assert!(
+        pubs.has_subscriber(b"abc"),
+        "one cancel of a doubled prefix keeps it"
+    );
 
     pubs.publish(msg("abc", vec![1], 0));
     let parts = raw_message(&mut s).await;
@@ -269,7 +279,10 @@ async fn zmtp_large_message_delivered_without_followup_send() {
 async fn stalled_sub(endpoint: &str) -> TcpStream {
     let sock = tokio::net::TcpSocket::new_v4().unwrap();
     sock.set_recv_buffer_size(4096).unwrap();
-    let mut s = sock.connect(tcp_addr(endpoint).parse().unwrap()).await.unwrap();
+    let mut s = sock
+        .connect(tcp_addr(endpoint).parse().unwrap())
+        .await
+        .unwrap();
     raw_handshake(&mut s, 0).await;
     s.write_all(&subscription(true, b"")).await.unwrap();
     s
@@ -287,7 +300,10 @@ async fn zmtp_hwm_drops_never_blocks() {
         pubs.publish(msg("x", body.clone(), i));
     }
     let elapsed = started.elapsed();
-    assert!(elapsed < Duration::from_secs(2), "publish blocked: {elapsed:?} for 200 messages");
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "publish blocked: {elapsed:?} for 200 messages"
+    );
 
     let depths = pubs.queue_depths();
     assert_eq!(depths.len(), 1);
@@ -303,7 +319,9 @@ async fn zmtp_hwm_drops_never_blocks() {
 async fn zmtp_byte_cap() {
     // Unbounded HWM, so the byte cap is the only limit.
     let cap = 4 << 20;
-    let pubs = ZmtpPub::bind_with_cap("tcp://127.0.0.1:0", 0, cap).await.unwrap();
+    let pubs = ZmtpPub::bind_with_cap("tcp://127.0.0.1:0", 0, cap)
+        .await
+        .unwrap();
     let _stalled = stalled_sub(&pubs.local_endpoint()).await;
     wait_until("subscription", || pubs.has_subscriber(b"x")).await;
 
@@ -312,12 +330,20 @@ async fn zmtp_byte_cap() {
         pubs.publish(msg("x", body.clone(), i));
     }
     let depths = pubs.queue_depths();
-    assert!(depths[0].1 <= cap, "unwritten bytes stay under the cap: {depths:?}");
+    assert!(
+        depths[0].1 <= cap,
+        "unwritten bytes stay under the cap: {depths:?}"
+    );
     let dropped = pubs.dropped_total();
-    assert!(dropped >= 50, "only {dropped} of 100 dropped at a 4 MiB cap");
+    assert!(
+        dropped >= 50,
+        "only {dropped} of 100 dropped at a 4 MiB cap"
+    );
 
     // An idle subscriber takes a message bigger than the cap.
-    let small = ZmtpPub::bind_with_cap("tcp://127.0.0.1:0", 0, 1024).await.unwrap();
+    let small = ZmtpPub::bind_with_cap("tcp://127.0.0.1:0", 0, 1024)
+        .await
+        .unwrap();
     let mut sub = zsub(&small.local_endpoint(), &[""]).await;
     wait_until("subscription", || small.has_subscriber(b"big")).await;
     small.publish(msg("big", vec![1u8; 64 << 10], 0));
@@ -352,7 +378,9 @@ async fn zmtp_ipc_endpoint_and_stale_file() {
     assert!(path.exists());
 
     let endpoint = format!("ipc://{}", path.display());
-    let pubs = ZmtpPub::bind(&endpoint, 1000).await.expect("stale socket is replaced");
+    let pubs = ZmtpPub::bind(&endpoint, 1000)
+        .await
+        .expect("stale socket is replaced");
     assert_eq!(pubs.local_endpoint(), endpoint);
     let mut sub = zsub(&endpoint, &["rawtx"]).await;
     wait_until("subscription", || pubs.has_subscriber(b"rawtx")).await;
@@ -365,7 +393,9 @@ async fn zmtp_ipc_endpoint_and_stale_file() {
     // A regular file is never deleted.
     let file = dir.path().join("not-a-socket");
     std::fs::write(&file, b"keep me").unwrap();
-    let err = ZmtpPub::bind(&format!("ipc://{}", file.display()), 1000).await.unwrap_err();
+    let err = ZmtpPub::bind(&format!("ipc://{}", file.display()), 1000)
+        .await
+        .unwrap_err();
     assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists, "{err}");
     assert_eq!(std::fs::read(&file).unwrap(), b"keep me");
 }
@@ -373,7 +403,11 @@ async fn zmtp_ipc_endpoint_and_stale_file() {
 #[tokio::test]
 async fn zmtp_tcp_star_and_ipv6() {
     let star = ZmtpPub::bind("tcp://*:0", 1000).await.unwrap();
-    assert!(star.local_endpoint().starts_with("tcp://0.0.0.0:"), "{}", star.local_endpoint());
+    assert!(
+        star.local_endpoint().starts_with("tcp://0.0.0.0:"),
+        "{}",
+        star.local_endpoint()
+    );
     let mut s = raw_sub(&star.local_endpoint(), &[b""]).await;
     wait_until("subscription", || star.has_subscriber(b"t")).await;
     star.publish(msg("t", vec![1], 0));
@@ -383,10 +417,24 @@ async fn zmtp_tcp_star_and_ipv6() {
     assert!(!wildcard_port.local_endpoint().ends_with(":0"));
 
     let named = ZmtpPub::bind("tcp://localhost:0", 1000).await.unwrap();
-    assert!(named.local_endpoint().starts_with("tcp://127.0.0.1:"), "{}", named.local_endpoint());
+    assert!(
+        named.local_endpoint().starts_with("tcp://127.0.0.1:"),
+        "{}",
+        named.local_endpoint()
+    );
 
-    for bad in ["inproc://x", "tcp://127.0.0.1", "tcp://127.0.0.1:99999", "tcp://:1", "ipc://*", "ipc://"] {
-        assert!(ZmtpPub::bind(bad, 1000).await.is_err(), "{bad} should not bind");
+    for bad in [
+        "inproc://x",
+        "tcp://127.0.0.1",
+        "tcp://127.0.0.1:99999",
+        "tcp://:1",
+        "ipc://*",
+        "ipc://",
+    ] {
+        assert!(
+            ZmtpPub::bind(bad, 1000).await.is_err(),
+            "{bad} should not bind"
+        );
     }
 
     if std::net::TcpListener::bind("[::1]:0").is_err() {
@@ -396,7 +444,9 @@ async fn zmtp_tcp_star_and_ipv6() {
     let v6 = ZmtpPub::bind("tcp://[::1]:0", 1000).await.unwrap();
     let ep = v6.local_endpoint();
     assert!(ep.starts_with("tcp://[::1]:"), "{ep}");
-    let mut s = TcpStream::connect(ep.strip_prefix("tcp://").unwrap()).await.unwrap();
+    let mut s = TcpStream::connect(ep.strip_prefix("tcp://").unwrap())
+        .await
+        .unwrap();
     raw_handshake(&mut s, 0).await;
     s.write_all(&subscription(true, b"")).await.unwrap();
     wait_until("v6 subscription", || v6.has_subscriber(b"t")).await;
@@ -409,7 +459,11 @@ async fn zmtp_keepalive_set() {
     let pubs = bind_local(1000).await;
     let _s = raw_sub(&pubs.local_endpoint(), &[b""]).await;
     wait_until("subscriber", || pubs.subscriber_count() == 1).await;
-    assert_eq!(pubs.keepalive_set_count(), 1, "the accepted socket has SO_KEEPALIVE");
+    assert_eq!(
+        pubs.keepalive_set_count(),
+        1,
+        "the accepted socket has SO_KEEPALIVE"
+    );
 }
 
 #[tokio::test]
@@ -423,11 +477,19 @@ async fn zmtp_long_frames() {
         pubs.publish(msg("rawtx", body.clone(), len as u32));
         let parts = raw_message(&mut s).await;
         assert_eq!(parts.len(), 3);
-        assert_eq!(parts[0], (0x01, b"rawtx".to_vec()), "topic: short frame, MORE");
+        assert_eq!(
+            parts[0],
+            (0x01, b"rawtx".to_vec()),
+            "topic: short frame, MORE"
+        );
         let want_flags = if len > 255 { 0x03 } else { 0x01 };
         assert_eq!(parts[1].0, want_flags, "body of {len} bytes");
         assert_eq!(parts[1].1, body);
-        assert_eq!(parts[2], (0x00, (len as u32).to_le_bytes().to_vec()), "last frame");
+        assert_eq!(
+            parts[2],
+            (0x00, (len as u32).to_le_bytes().to_vec()),
+            "last frame"
+        );
     }
 }
 
@@ -490,7 +552,9 @@ async fn zmtp_rejects_bad_peer() {
 #[tokio::test]
 async fn zmtp_zmtp31_subscribe_command() {
     let pubs = bind_local(1000).await;
-    let mut s = TcpStream::connect(tcp_addr(&pubs.local_endpoint())).await.unwrap();
+    let mut s = TcpStream::connect(tcp_addr(&pubs.local_endpoint()))
+        .await
+        .unwrap();
     raw_handshake(&mut s, 1).await;
 
     s.write_all(&command("SUBSCRIBE", b"hash")).await.unwrap();

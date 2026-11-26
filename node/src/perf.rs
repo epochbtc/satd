@@ -129,8 +129,16 @@ impl IbdPerf {
             0
         };
 
-        let avg_connect_ms = if connect_count > 0 { connect_ms / connect_count } else { 0 };
-        let avg_store_ms = if store_count > 0 { store_ms / store_count } else { 0 };
+        let avg_connect_ms = if connect_count > 0 {
+            connect_ms / connect_count
+        } else {
+            0
+        };
+        let avg_store_ms = if store_count > 0 {
+            store_ms / store_count
+        } else {
+            0
+        };
 
         tracing::info!(
             height,
@@ -153,7 +161,10 @@ macro_rules! perf_time {
     ($counter:expr, $body:expr) => {{
         let _start = std::time::Instant::now();
         let _result = $body;
-        $counter.fetch_add(_start.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+        $counter.fetch_add(
+            _start.elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
         _result
     }};
 }

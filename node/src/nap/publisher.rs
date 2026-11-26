@@ -136,7 +136,10 @@ struct Entry {
 enum Assessed {
     /// The chain has reached the anchor and the coin is gone.
     Spent,
-    Judged { status: Result<Amount, Rejection>, locks: Option<Result<Timelocks, Rejection>> },
+    Judged {
+        status: Result<Amount, Rejection>,
+        locks: Option<Result<Timelocks, Rejection>>,
+    },
 }
 
 type Key = (OutPoint, String);
@@ -166,13 +169,27 @@ impl Publisher {
             if entries.get(&key).is_some_and(|e| !supersedes(&att, &e.att)) {
                 continue;
             }
-            entries.insert(key, Entry { att, locks: None, status: None });
+            entries.insert(
+                key,
+                Entry {
+                    att,
+                    locks: None,
+                    status: None,
+                },
+            );
         }
         // The journal's records are changes the publisher made, in order.
         for record in opened.records {
             match record {
                 store::Record::Put(att) => {
-                    entries.insert((att.outpoint(), att.key().to_owned()), Entry { att, locks: None, status: None });
+                    entries.insert(
+                        (att.outpoint(), att.key().to_owned()),
+                        Entry {
+                            att,
+                            locks: None,
+                            status: None,
+                        },
+                    );
                 }
                 store::Record::Remove(outpoint, key) => {
                     entries.remove(&(outpoint, key));
@@ -244,7 +261,11 @@ impl Publisher {
             let aside = (0..)
                 .map(|n| {
                     let mut aside = file.to_path_buf().into_os_string();
-                    aside.push(if n == 0 { format!(".bad-{secs}") } else { format!(".bad-{secs}-{n}") });
+                    aside.push(if n == 0 {
+                        format!(".bad-{secs}")
+                    } else {
+                        format!(".bad-{secs}-{n}")
+                    });
                     PathBuf::from(aside)
                 })
                 .find(|p| !p.exists())
@@ -252,13 +273,20 @@ impl Publisher {
             match std::fs::rename(file, &aside) {
                 Ok(()) => Ok(Some(aside)),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-                Err(e) => Err(format!("{why}; moving it to {} failed: {e}", aside.display())),
+                Err(e) => Err(format!(
+                    "{why}; moving it to {} failed: {e}",
+                    aside.display()
+                )),
             }
         };
         // The journal follows the file, so the two go aside together.
         let base = set_aside(&path)?;
         let journal = set_aside(&store::journal_path(&path)).map_err(|e| match &base {
-            Some(moved) => format!("{e}; {} was already moved to {}", path.display(), moved.display()),
+            Some(moved) => format!(
+                "{e}; {} was already moved to {}",
+                path.display(),
+                moved.display()
+            ),
             None => e,
         })?;
         let aside: Vec<PathBuf> = [base, journal].into_iter().flatten().collect();
@@ -280,10 +308,16 @@ impl Publisher {
         let read = chain
             .read(&|v| {
                 let anchor_height = v.tip_height().checked_sub(ANCHOR_DEPTH)?;
-                Some((anchor_height, v.block_hash(anchor_height), v.coin(&outpoint), v.network()))
+                Some((
+                    anchor_height,
+                    v.block_hash(anchor_height),
+                    v.coin(&outpoint),
+                    v.network(),
+                ))
             })
             .ok_or(PublishError::Busy)?;
-        let (anchor_height, anchor_hash, coin, network) = read.ok_or(PublishError::ChainTooShort)?;
+        let (anchor_height, anchor_hash, coin, network) =
+            read.ok_or(PublishError::ChainTooShort)?;
         let anchor_hash = anchor_hash.ok_or(PublishError::Busy)?;
         let coin = coin.ok_or(PublishError::Rejected(Rejection::CoinNotFound))?;
         check_coin_value(&coin).map_err(PublishError::Rejected)?;
@@ -314,7 +348,14 @@ impl Publisher {
             }
         }
         let psbt = bip322::psbt::create(&coin.script_pubkey, text.as_bytes());
-        Ok(Draft { message: text, anchor_height, anchor_hash, coin, psbt, warnings })
+        Ok(Draft {
+            message: text,
+            anchor_height,
+            anchor_hash,
+            coin,
+            psbt,
+            warnings,
+        })
     }
 
     /// Check a signed message and store it. Returns the stored attestation
@@ -340,7 +381,10 @@ impl Publisher {
             msg.anchor_hash,
             signature,
         )?;
-        let (status, locks) = match chain.read(&|v| assess(&att, None, v)).ok_or(PublishError::Busy)? {
+        let (status, locks) = match chain
+            .read(&|v| assess(&att, None, v))
+            .ok_or(PublishError::Busy)?
+        {
             Assessed::Judged { status, locks } => (status, locks),
             Assessed::Spent => (Err(Rejection::CoinNotFound), None),
         };
@@ -362,15 +406,25 @@ impl Publisher {
                     e.status = Some(Ok(value));
                     e.locks = locks;
                 }
-                return Ok((Published { attestation: att, status: Some(Ok(value)) }, None));
+                return Ok((
+                    Published {
+                        attestation: att,
+                        status: Some(Ok(value)),
+                    },
+                    None,
+                ));
             }
             Some((cur, cur_locks)) => {
                 let cur_valid = matches!(
-                    chain.read(&|v| assess(&cur, cur_locks.clone(), v)).ok_or(PublishError::Busy)?,
+                    chain
+                        .read(&|v| assess(&cur, cur_locks.clone(), v))
+                        .ok_or(PublishError::Busy)?,
                     Assessed::Judged { status: Ok(_), .. }
                 );
                 if cur_valid && !supersedes(&att, &cur) {
-                    return Err(PublishError::Superseded { anchor_height: cur.anchor_height() });
+                    return Err(PublishError::Superseded {
+                        anchor_height: cur.anchor_height(),
+                    });
                 }
                 Some(cur.id())
             }
@@ -378,12 +432,18 @@ impl Publisher {
                 return Err(PublishError::KeyLimit);
             }
             None if self.full(total) => {
-                return Err(PublishError::StoreFull { max: self.max_attestations });
+                return Err(PublishError::StoreFull {
+                    max: self.max_attestations,
+                });
             }
             None => None,
         };
         let mut entries = self.entries.lock();
-        let entry = Entry { att: att.clone(), locks, status: Some(Ok(value)) };
+        let entry = Entry {
+            att: att.clone(),
+            locks,
+            status: Some(Ok(value)),
+        };
         let previous = entries.insert(key.clone(), entry);
         if let Err(e) = journal.append(&store::Record::Put(att.clone())) {
             match previous {
@@ -401,7 +461,13 @@ impl Publisher {
             anchor = att.anchor_height(),
             "NAP: publishing attestation"
         );
-        Ok((Published { attestation: att, status: Some(Ok(value)) }, replaced))
+        Ok((
+            Published {
+                attestation: att,
+                status: Some(Ok(value)),
+            },
+            replaced,
+        ))
     }
 
     /// Every stored attestation, judged at `chain`'s tip, ordered by
@@ -423,7 +489,10 @@ impl Publisher {
                 Some(Assessed::Spent) => Some(Err(Rejection::CoinNotFound)),
                 None => status,
             };
-            out.push(Published { attestation: att, status });
+            out.push(Published {
+                attestation: att,
+                status,
+            });
         }
         // Keep what was learned about signatures, for entries not replaced
         // in the meantime.
@@ -440,7 +509,12 @@ impl Publisher {
     #[allow(clippy::type_complexity)]
     fn snapshot(
         &self,
-    ) -> Vec<(Key, Attestation, Option<Result<Timelocks, Rejection>>, Option<Result<Amount, Rejection>>)> {
+    ) -> Vec<(
+        Key,
+        Attestation,
+        Option<Result<Timelocks, Rejection>>,
+        Option<Result<Amount, Rejection>>,
+    )> {
         self.entries
             .lock()
             .iter()
@@ -487,7 +561,9 @@ impl Publisher {
             Some(cursor) => entries.range((cursor, String::new())..),
             None => entries.range(..),
         };
-        let serving = range.filter(|(_, e)| matches!(e.status, Some(Ok(_)))).map(|(_, e)| &e.att);
+        let serving = range
+            .filter(|(_, e)| matches!(e.status, Some(Ok(_))))
+            .map(|(_, e)| &e.att);
         Some(super::p2p::page(serving, req, max_size))
     }
 
@@ -517,7 +593,9 @@ impl Publisher {
         for (key, id, assessed, tip) in judged {
             // An entry submitted or removed while the pass ran was not judged
             // here; the next tip judges it.
-            let Some(e) = entries.get_mut(&key).filter(|e| e.att.id() == id) else { continue };
+            let Some(e) = entries.get_mut(&key).filter(|e| e.att.id() == id) else {
+                continue;
+            };
             let (status, locks) = match assessed {
                 Assessed::Spent => {
                     spent.push(key);
@@ -577,7 +655,12 @@ impl Publisher {
     pub fn fold_journal(&self) -> Result<bool, String> {
         let mut journal = self.writer.lock();
         let folded = if journal.has_records() {
-            let atts: Vec<Attestation> = self.entries.lock().values().map(|e| e.att.clone()).collect();
+            let atts: Vec<Attestation> = self
+                .entries
+                .lock()
+                .values()
+                .map(|e| e.att.clone())
+                .collect();
             journal.compact(&self.path, atts.iter()).map(|()| true)
         } else {
             Ok(false)
@@ -596,7 +679,12 @@ impl Publisher {
         if !journal.wants_compaction() {
             return;
         }
-        let atts: Vec<Attestation> = self.entries.lock().values().map(|e| e.att.clone()).collect();
+        let atts: Vec<Attestation> = self
+            .entries
+            .lock()
+            .values()
+            .map(|e| e.att.clone())
+            .collect();
         if let Err(e) = journal.compact(&self.path, atts.iter()) {
             tracing::error!(target: "nap", "NAP: could not fold the journal into the attestation store: {e}");
         }
@@ -623,7 +711,12 @@ type Status = Result<Amount, Rejection>;
 ///   entry is not served and goes back to having no status, so the first
 ///   pass at or above the anchor's height decides. There, a missing anchor
 ///   is one a reorg replaced.
-pub(super) fn transition(before: Option<&Status>, now: Status, tip: u32, anchor_height: u32) -> (Option<Status>, Option<Report>) {
+pub(super) fn transition(
+    before: Option<&Status>,
+    now: Status,
+    tip: u32,
+    anchor_height: u32,
+) -> (Option<Status>, Option<Report>) {
     if now == Err(Rejection::AnchorNotOnChain) && tip < anchor_height {
         let unjudged = before.is_none_or(|s| s.is_ok());
         let keep = if unjudged { None } else { before.cloned() };
@@ -640,37 +733,58 @@ pub(super) fn transition(before: Option<&Status>, now: Status, tip: u32, anchor_
 
 /// How many keys `outpoint` has in `entries`.
 fn keys_for(entries: &BTreeMap<Key, Entry>, outpoint: OutPoint) -> usize {
-    entries.range((outpoint, String::new())..).take_while(|((op, _), _)| *op == outpoint).count()
+    entries
+        .range((outpoint, String::new())..)
+        .take_while(|((op, _), _)| *op == outpoint)
+        .count()
 }
 
 /// Judge `att` at `view`'s tip, verifying its signature unless `cached`
 /// already holds the result.
-fn assess(att: &Attestation, cached: Option<Result<Timelocks, Rejection>>, v: &dyn ChainView) -> Assessed {
+fn assess(
+    att: &Attestation,
+    cached: Option<Result<Timelocks, Rejection>>,
+    v: &dyn ChainView,
+) -> Assessed {
     // A missing coin means a spent one only on a chain that holds the anchor:
     // the coin confirmed below the anchor, so on that
     // chain nothing else removes it. A node behind the anchor (a reindex,
     // say), or on a fork without it, may see the coin again; the attestation
     // is kept and judged `AnchorNotOnChain` meanwhile.
-    if v.block_hash(att.anchor_height()) == Some(att.anchor_hash()) && v.coin(&att.outpoint()).is_none() {
+    if v.block_hash(att.anchor_height()) == Some(att.anchor_hash())
+        && v.coin(&att.outpoint()).is_none()
+    {
         return Assessed::Spent;
     }
     let coin = match check_chain(att, v) {
         Ok(coin) => coin,
-        Err(r) => return Assessed::Judged { status: Err(r), locks: cached },
+        Err(r) => {
+            return Assessed::Judged {
+                status: Err(r),
+                locks: cached,
+            };
+        }
     };
     let locks = cached.unwrap_or_else(|| verify_signature(att, &coin.script_pubkey));
     let status = match &locks {
         Ok(l) => check_timelocks(v, &coin, l).map(|()| coin.value),
         Err(r) => Err(r.clone()),
     };
-    Assessed::Judged { status, locks: Some(locks) }
+    Assessed::Judged {
+        status,
+        locks: Some(locks),
+    }
 }
 
 /// A signature string as the RPCs take it (D14), for `coin`: `smp`, `ful`,
 /// or unprefixed (legacy for P2PKH, simple otherwise); a signed BIP 322
 /// PSBT of `text` (D15), which is finalized into a simple or full proof; or
 /// the signed `to_sign` transaction in hex, a full proof.
-fn decode_signature(signature: &str, coin: &Coin, text: &str) -> Result<NapSignature, PublishError> {
+fn decode_signature(
+    signature: &str,
+    coin: &Coin,
+    text: &str,
+) -> Result<NapSignature, PublishError> {
     if let Some(bytes) = crate::rpc::signmessage::decode_base64(signature)
         && bip322::psbt::is_psbt(&bytes)
     {

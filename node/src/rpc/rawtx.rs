@@ -1,15 +1,17 @@
-use bitcoin::transaction::Version;
-use bitcoin::{Amount, OutPoint, Sequence, Transaction, TxIn, TxOut, Witness};
-use bitcoin::hashes::Hash;
-use bitcoin::key::TapTweak;
-use bitcoin::secp256k1::Secp256k1;
 use crate::chain::state::ChainState;
 use crate::mempool::pool::Mempool;
-use crate::rpc::amounts::{annotate_units, default_unit, format_amount, format_feerate_sat_per_kvb};
+use crate::rpc::amounts::{
+    annotate_units, default_unit, format_amount, format_feerate_sat_per_kvb,
+};
 use crate::rpc::script_asm::script_to_asm_str;
 use crate::storage::Store;
 use crate::storage::opreturn_strip::StoredBlock;
-use serde_json::{json, Value};
+use bitcoin::hashes::Hash;
+use bitcoin::key::TapTweak;
+use bitcoin::secp256k1::Secp256k1;
+use bitcoin::transaction::Version;
+use bitcoin::{Amount, OutPoint, Sequence, Transaction, TxIn, TxOut, Witness};
+use serde_json::{Value, json};
 
 /// Parse a JSON value as f64, handling both float and integer representations.
 /// With `arbitrary_precision`, serde_json stores numbers as strings internally,
@@ -64,7 +66,11 @@ pub fn get_raw_mempool(mempool: &Mempool, verbose: bool) -> Value {
     // descendant rollups and counts never include a quarantined relative.
     if !verbose {
         // Core's order: by mining score, with the clusters' topology.
-        let txids: Vec<String> = mempool.acting_txids_in_mining_order().iter().map(|t| t.to_string()).collect();
+        let txids: Vec<String> = mempool
+            .acting_txids_in_mining_order()
+            .iter()
+            .map(|t| t.to_string())
+            .collect();
         return json!(txids);
     }
 
@@ -106,26 +112,37 @@ pub fn get_raw_transaction(
     // mempool transaction no chain fields, not even `confirmations`, and at
     // verbosity 2 no fee or prevouts: those come from undo data (#978).
     if blockhash.is_none()
-        && let Some(entry) = mempool.get(&txid).filter(|e| e.scope.is_acting()) {
-            return if verbose {
-                let mut out = decode_transaction_verbose_net(&entry.tx, None, None, false, true, chain_state.network);
-                // Core's `getrawtransaction` adds the sigop-adjusted size of
-                // a mempool transaction (`info.vsize`, src/rpc/rawtransaction.cpp).
-                out["vsize_adjusted"] =
-                    crate::mempool::policy::weight_to_vsize(entry.adjusted_weight()).into();
-                Ok(out)
-            } else {
-                let raw = bitcoin::consensus::serialize(&entry.tx);
-                Ok(Value::String(hex::encode(raw)))
-            };
-        }
+        && let Some(entry) = mempool.get(&txid).filter(|e| e.scope.is_acting())
+    {
+        return if verbose {
+            let mut out = decode_transaction_verbose_net(
+                &entry.tx,
+                None,
+                None,
+                false,
+                true,
+                chain_state.network,
+            );
+            // Core's `getrawtransaction` adds the sigop-adjusted size of
+            // a mempool transaction (`info.vsize`, src/rpc/rawtransaction.cpp).
+            out["vsize_adjusted"] =
+                crate::mempool::policy::weight_to_vsize(entry.adjusted_weight()).into();
+            Ok(out)
+        } else {
+            let raw = bitcoin::consensus::serialize(&entry.tx);
+            Ok(Value::String(hex::encode(raw)))
+        };
+    }
 
     // Search in a specific block
     if let Some(hash_str) = blockhash {
         validate_blockhash_str(hash_str)?;
-        let block_hash: bitcoin::BlockHash = hash_str
-            .parse()
-            .map_err(|_| (-8, format!("parameter 3 must be hexadecimal string (not '{hash_str}')")))?;
+        let block_hash: bitcoin::BlockHash = hash_str.parse().map_err(|_| {
+            (
+                -8,
+                format!("parameter 3 must be hexadecimal string (not '{hash_str}')"),
+            )
+        })?;
 
         // Verify the block is known.
         let entry = chain_state
@@ -187,8 +204,17 @@ pub fn get_raw_transaction(
             Some(found) if found == txid => {
                 return if verbose {
                     match TxBlockContext::new(chain_state, block_hash) {
-                        Some(ctx) => confirmed_tx_verbose(chain_state, &stored, tx_idx, &ctx, verbosity),
-                        None => Ok(stored_tx_verbose(&stored, tx_idx, None, None, false, chain_state.network)),
+                        Some(ctx) => {
+                            confirmed_tx_verbose(chain_state, &stored, tx_idx, &ctx, verbosity)
+                        }
+                        None => Ok(stored_tx_verbose(
+                            &stored,
+                            tx_idx,
+                            None,
+                            None,
+                            false,
+                            chain_state.network,
+                        )),
                     }
                 } else {
                     stored_tx_hex(&stored, tx_idx)
@@ -211,7 +237,10 @@ pub fn get_raw_transaction(
     }
 
     let store = chain_state.store_ref();
-    Err((-5, not_found_message(store.has_txindex(), store.tx_index_complete()).to_string()))
+    Err((
+        -5,
+        not_found_message(store.has_txindex(), store.tx_index_complete()).to_string(),
+    ))
 }
 
 /// The `getrawtransaction` not-found text when no block hash was given (#1066).
@@ -223,9 +252,15 @@ pub fn get_raw_transaction(
 /// stay unindexed, and only a block hash can reach them.
 fn not_found_message(txindex: bool, complete: bool) -> &'static str {
     match (txindex, complete) {
-        (false, _) => "No such mempool transaction. Use -txindex or provide a block hash to enable blockchain transaction queries. Use gettransaction for wallet transactions.",
-        (true, false) => "No such mempool transaction. The transaction index does not cover blocks connected before -txindex was enabled; provide a block hash to query those. Use gettransaction for wallet transactions.",
-        (true, true) => "No such mempool or blockchain transaction. Use gettransaction for wallet transactions.",
+        (false, _) => {
+            "No such mempool transaction. Use -txindex or provide a block hash to enable blockchain transaction queries. Use gettransaction for wallet transactions."
+        }
+        (true, false) => {
+            "No such mempool transaction. The transaction index does not cover blocks connected before -txindex was enabled; provide a block hash to query those. Use gettransaction for wallet transactions."
+        }
+        (true, true) => {
+            "No such mempool or blockchain transaction. Use gettransaction for wallet transactions."
+        }
     }
 }
 
@@ -266,9 +301,8 @@ fn genesis_coinbase_txid(network: bitcoin::Network) -> bitcoin::Txid {
             _ => &TESTNET,
         }
     }
-    *cell(network).get_or_init(|| {
-        bitcoin::constants::genesis_block(network).txdata[0].compute_txid()
-    })
+    *cell(network)
+        .get_or_init(|| bitcoin::constants::genesis_block(network).txdata[0].compute_txid())
 }
 
 /// `decoderawtransaction` — decode a raw transaction hex to JSON.
@@ -281,11 +315,12 @@ pub fn decode_raw_transaction(
     iswitness: Option<bool>,
     network: bitcoin::Network,
 ) -> Result<Value, (i32, String)> {
-    let tx_bytes =
-        hex::decode(hex_tx).map_err(|_| (-22, "TX decode failed".to_string()))?;
+    let tx_bytes = hex::decode(hex_tx).map_err(|_| (-22, "TX decode failed".to_string()))?;
     let tx = decode_tx(&tx_bytes, iswitness != Some(true), iswitness != Some(false))
         .ok_or((-22i32, "TX decode failed".to_string()))?;
-    Ok(decode_transaction_verbose_net(&tx, None, None, false, false, network))
+    Ok(decode_transaction_verbose_net(
+        &tx, None, None, false, false, network,
+    ))
 }
 
 /// Read a transaction the way Core's `DecodeTx` (`core_io.cpp`) does.
@@ -397,7 +432,11 @@ fn check_tx_scripts_sanity(tx: &bitcoin::Transaction) -> bool {
 /// chain, and **-1** when it is not — matching Core's convention in
 /// `getrawtransaction`. The caller uses the sign to derive
 /// `in_active_chain`.
-fn confirmations_for(chain_state: &ChainState, block_hash: &bitcoin::BlockHash, block_height: u32) -> i64 {
+fn confirmations_for(
+    chain_state: &ChainState,
+    block_hash: &bitcoin::BlockHash,
+    block_height: u32,
+) -> i64 {
     if !crate::rpc::blockchain::is_on_active_chain(chain_state, block_hash, block_height) {
         return -1;
     }
@@ -595,7 +634,9 @@ fn confirmed_tx_verbose(
     verbosity: u32,
 ) -> Result<Value, (i32, String)> {
     let undo = if verbosity >= 2 && !stored.block.txdata[tx_idx].is_coinbase() {
-        chain_state.read_undo(&ctx.blockhash).map_err(|_| (-32603, UNDO_UNREADABLE.to_string()))?
+        chain_state
+            .read_undo(&ctx.blockhash)
+            .map_err(|_| (-32603, UNDO_UNREADABLE.to_string()))?
     } else {
         None
     };
@@ -603,12 +644,22 @@ fn confirmed_tx_verbose(
         Some(u) => Some(undo_by_tx(&stored.block, u).map_err(|e| (-32603, e))?),
         None => None,
     };
-    let spent = per_tx.as_ref().and_then(|p| p.get(tx_idx).copied().flatten());
-    Ok(stored_tx_verbose(stored, tx_idx, Some(ctx), spent, true, chain_state.network))
+    let spent = per_tx
+        .as_ref()
+        .and_then(|p| p.get(tx_idx).copied().flatten());
+    Ok(stored_tx_verbose(
+        stored,
+        tx_idx,
+        Some(ctx),
+        spent,
+        true,
+        chain_state.network,
+    ))
 }
 
 /// The error for a request that needs a stripped transaction's bytes.
-pub(crate) const TX_DATA_STRIPPED: &str = "Transaction data not available (OP_RETURN data stripped)";
+pub(crate) const TX_DATA_STRIPPED: &str =
+    "Transaction data not available (OP_RETURN data stripped)";
 
 /// Transaction `i` of `stored` as raw hex, or [`TX_DATA_STRIPPED`] (-1) when
 /// it is stripped: its filled bytes are not the transaction.
@@ -616,7 +667,9 @@ fn stored_tx_hex(stored: &StoredBlock, i: usize) -> Result<Value, (i32, String)>
     if stored.tx_is_stripped(i) {
         return Err((-1, TX_DATA_STRIPPED.to_string()));
     }
-    Ok(Value::String(hex::encode(bitcoin::consensus::serialize(&stored.block.txdata[i]))))
+    Ok(Value::String(hex::encode(bitcoin::consensus::serialize(
+        &stored.block.txdata[i],
+    ))))
 }
 
 /// [`decode_transaction_verbose_net`] for transaction `i` of a stored block.
@@ -637,8 +690,14 @@ pub(crate) fn stored_tx_verbose(
     show_prevout: bool,
     network: bitcoin::Network,
 ) -> Value {
-    let mut result =
-        decode_transaction_verbose_net(&stored.block.txdata[i], block, undo, show_prevout, true, network);
+    let mut result = decode_transaction_verbose_net(
+        &stored.block.txdata[i],
+        block,
+        undo,
+        show_prevout,
+        true,
+        network,
+    );
     if !stored.tx_is_stripped(i) {
         return result;
     }
@@ -732,9 +791,10 @@ pub fn create_raw_transaction(
     let mut tx_inputs = Vec::new();
     for input in inputs {
         // Parse txid — validate length and hex-ness with Core messages.
-        let txid_str = input["txid"]
-            .as_str()
-            .ok_or((-3, "JSON value of type null is not of expected type string".to_string()))?;
+        let txid_str = input["txid"].as_str().ok_or((
+            -3,
+            "JSON value of type null is not of expected type string".to_string(),
+        ))?;
         let txid: bitcoin::Txid = crate::rpc::util::parse_hash_v(txid_str, "txid")?;
 
         // Parse vout — Core says "Invalid parameter, missing vout key" for both
@@ -757,16 +817,25 @@ pub fn create_raw_transaction(
                 default_sequence
             } else if let Some(n) = seq_val.as_i64() {
                 if !(0..=0xffff_ffff_i64).contains(&n) {
-                    return Err((-8, "Invalid parameter, sequence number is out of range".to_string()));
+                    return Err((
+                        -8,
+                        "Invalid parameter, sequence number is out of range".to_string(),
+                    ));
                 }
                 n as u32
             } else if let Some(n) = seq_val.as_u64() {
                 if n > 0xffff_ffff_u64 {
-                    return Err((-8, "Invalid parameter, sequence number is out of range".to_string()));
+                    return Err((
+                        -8,
+                        "Invalid parameter, sequence number is out of range".to_string(),
+                    ));
                 }
                 n as u32
             } else {
-                return Err((-8, "Invalid parameter, sequence number is out of range".to_string()));
+                return Err((
+                    -8,
+                    "Invalid parameter, sequence number is out of range".to_string(),
+                ));
             }
         } else {
             default_sequence
@@ -858,13 +927,20 @@ pub(crate) fn normalize_output_pairs(
         for item in arr {
             if let Some(map) = item.as_object() {
                 if map.len() != 1 {
-                    return Err((-8, "Invalid parameter, key-value pair must contain exactly one key".to_string()));
+                    return Err((
+                        -8,
+                        "Invalid parameter, key-value pair must contain exactly one key"
+                            .to_string(),
+                    ));
                 }
                 for (key, val) in map {
                     pairs.push((key.clone(), val.clone()));
                 }
             } else {
-                return Err((-8, "Invalid parameter, key-value pair not an object as expected".to_string()));
+                return Err((
+                    -8,
+                    "Invalid parameter, key-value pair not an object as expected".to_string(),
+                ));
             }
         }
     }
@@ -971,7 +1047,12 @@ pub(crate) fn parse_output_entry(
                 ));
             }
         };
-        let bad_hex = || (-8, format!("Data must be hexadecimal string (not '{hex_data}')"));
+        let bad_hex = || {
+            (
+                -8,
+                format!("Data must be hexadecimal string (not '{hex_data}')"),
+            )
+        };
         if hex_data.is_empty() || hex_data.len() % 2 != 0 {
             return Err(bad_hex());
         }
@@ -1181,8 +1262,7 @@ fn parse_btc_amount(val: &Value) -> Result<Amount, (i32, String)> {
         Value::String(s) => s.clone(),
         _ => return Err((-3, "Amount is not a number or string".to_string())),
     };
-    let sat = parse_fixed_point(&amount_str, 8)
-        .ok_or((-3, "Invalid amount".to_string()))?;
+    let sat = parse_fixed_point(&amount_str, 8).ok_or((-3, "Invalid amount".to_string()))?;
     // Core's `MoneyRange`: `0 <= n <= MAX_MONEY`. Negative amounts fail here,
     // not in the parser.
     const MAX_MONEY: i64 = 21_000_000 * 100_000_000;
@@ -1202,9 +1282,15 @@ pub fn combine_raw_transaction(hex_txs: &[String]) -> Result<Value, (i32, String
     // names the one that fails by its index (src/rpc/rawtransaction.cpp).
     let mut txs = Vec::with_capacity(hex_txs.len());
     for (idx, hex_tx) in hex_txs.iter().enumerate() {
-        let tx = hex::decode(hex_tx).ok().and_then(|bytes| decode_hex_tx(&bytes)).ok_or_else(|| {
-            (-22, format!("TX decode failed for tx {idx}. {AT_LEAST_ONE_INPUT}"))
-        })?;
+        let tx = hex::decode(hex_tx)
+            .ok()
+            .and_then(|bytes| decode_hex_tx(&bytes))
+            .ok_or_else(|| {
+                (
+                    -22,
+                    format!("TX decode failed for tx {idx}. {AT_LEAST_ONE_INPUT}"),
+                )
+            })?;
         txs.push(tx);
     }
     let mut txs = txs.into_iter();
@@ -1212,7 +1298,6 @@ pub fn combine_raw_transaction(hex_txs: &[String]) -> Result<Value, (i32, String
 
     // Merge scriptSig and witness from subsequent txs
     for tx in txs {
-
         if tx.input.len() != combined.input.len() {
             return Err((-22, "Transaction input count mismatch".to_string()));
         }
@@ -1235,11 +1320,9 @@ pub fn combine_raw_transaction(hex_txs: &[String]) -> Result<Value, (i32, String
 /// (`src/rpc/rawtransaction.cpp`) does: `ScriptToUniv` without `hex`
 /// (`asm`, `desc`, `address` when the script has one, `type`), then `p2sh`
 /// and `segwit` for a script that can be wrapped.
-pub fn decode_script(
-    hex_script: &str,
-    network: bitcoin::Network,
-) -> Result<Value, (i32, String)> {
-    let script_bytes = hex::decode(hex_script).map_err(|_| (-22, "Script decode failed".to_string()))?;
+pub fn decode_script(hex_script: &str, network: bitcoin::Network) -> Result<Value, (i32, String)> {
+    let script_bytes =
+        hex::decode(hex_script).map_err(|_| (-22, "Script decode failed".to_string()))?;
     let script = bitcoin::ScriptBuf::from_bytes(script_bytes);
 
     let mut out = script_pubkey_json(&script, network);
@@ -1264,7 +1347,9 @@ pub fn decode_script(
             if segwit.is_p2wsh() {
                 // Core hands `InferDescriptor` a provider holding the
                 // witness script, so a P2WSH wrapping names what it wraps.
-                sr["desc"] = json!(crate::rpc::descriptor::infer_p2wsh_descriptor(&script, network));
+                sr["desc"] = json!(crate::rpc::descriptor::infer_p2wsh_descriptor(
+                    &script, network
+                ));
             }
             sr["p2sh-segwit"] = json!(p2sh_address(&segwit, network));
             out["segwit"] = sr;
@@ -1298,12 +1383,18 @@ fn segwit_wrapping(script: &bitcoin::Script) -> Option<bitcoin::ScriptBuf> {
             })
         }
         "pubkeyhash" => {
-            let hash = <bitcoin::hashes::hash160::Hash as Hash>::from_slice(&script.as_bytes()[3..23]).ok()?;
-            Some(bitcoin::ScriptBuf::new_p2wpkh(&bitcoin::WPubkeyHash::from_raw_hash(hash)))
+            let hash =
+                <bitcoin::hashes::hash160::Hash as Hash>::from_slice(&script.as_bytes()[3..23])
+                    .ok()?;
+            Some(bitcoin::ScriptBuf::new_p2wpkh(
+                &bitcoin::WPubkeyHash::from_raw_hash(hash),
+            ))
         }
         "multisig" => {
             let (_, keys) = crate::rpc::descriptor::bare_multisig(script)?;
-            keys.iter().all(|k| compressed(k)).then(|| bitcoin::ScriptBuf::new_p2wsh(&script.wscript_hash()))
+            keys.iter()
+                .all(|k| compressed(k))
+                .then(|| bitcoin::ScriptBuf::new_p2wsh(&script.wscript_hash()))
         }
         "nonstandard" => Some(bitcoin::ScriptBuf::new_p2wsh(&script.wscript_hash())),
         _ => None,
@@ -1376,7 +1467,9 @@ fn is_op_success(op: u8) -> bool {
 }
 
 /// Parse a sighash type string into EcdsaSighashType.
-fn parse_sighash_type(s: Option<&str>) -> Result<bitcoin::sighash::EcdsaSighashType, (i32, String)> {
+fn parse_sighash_type(
+    s: Option<&str>,
+) -> Result<bitcoin::sighash::EcdsaSighashType, (i32, String)> {
     use bitcoin::sighash::EcdsaSighashType;
     match s.unwrap_or("ALL") {
         "ALL" => Ok(EcdsaSighashType::All),
@@ -1411,8 +1504,10 @@ pub fn sign_raw_transaction_with_key(
     let mut key_map: std::collections::HashMap<bitcoin::PublicKey, bitcoin::secp256k1::SecretKey> =
         std::collections::HashMap::new();
     // Also track x-only pubkeys for taproot
-    let mut xonly_key_map: std::collections::HashMap<bitcoin::key::XOnlyPublicKey, bitcoin::secp256k1::SecretKey> =
-        std::collections::HashMap::new();
+    let mut xonly_key_map: std::collections::HashMap<
+        bitcoin::key::XOnlyPublicKey,
+        bitcoin::secp256k1::SecretKey,
+    > = std::collections::HashMap::new();
 
     for wif in privkeys {
         let privkey = bitcoin::PrivateKey::from_wif(wif)
@@ -1531,7 +1626,13 @@ pub fn sign_raw_transaction_with_key(
                     // Override sighash type if not ALL
                     if ecdsa_sighash_type != bitcoin::sighash::EcdsaSighashType::All {
                         script_sig = bitcoin::script::Builder::new()
-                            .push_slice(bitcoin::ecdsa::Signature { signature: sig, sighash_type: ecdsa_sighash_type }.serialize())
+                            .push_slice(
+                                bitcoin::ecdsa::Signature {
+                                    signature: sig,
+                                    sighash_type: ecdsa_sighash_type,
+                                }
+                                .serialize(),
+                            )
                             .push_key(pubkey)
                             .into_script();
                     }
@@ -1552,7 +1653,9 @@ pub fn sign_raw_transaction_with_key(
             let mut cache = bitcoin::sighash::SighashCache::new(&tx);
             let mut signed = false;
             for (pubkey, secret) in &key_map {
-                let Ok(wpkh) = pubkey.wpubkey_hash() else { continue };
+                let Ok(wpkh) = pubkey.wpubkey_hash() else {
+                    continue;
+                };
                 let expected = bitcoin::ScriptBuf::new_p2wpkh(&wpkh);
                 if expected.as_bytes() == script.as_bytes() {
                     let sighash = cache
@@ -1560,7 +1663,10 @@ pub fn sign_raw_transaction_with_key(
                         .map_err(|e| (-1, format!("Sighash error: {}", e)))?;
                     let msg = bitcoin::secp256k1::Message::from_digest(sighash.to_byte_array());
                     let sig = secp.sign_ecdsa(&msg, secret);
-                    let ecdsa_sig = bitcoin::ecdsa::Signature { signature: sig, sighash_type: ecdsa_sighash_type };
+                    let ecdsa_sig = bitcoin::ecdsa::Signature {
+                        signature: sig,
+                        sighash_type: ecdsa_sighash_type,
+                    };
                     let mut witness = Witness::new();
                     witness.push(ecdsa_sig.serialize());
                     witness.push(pubkey.to_bytes());
@@ -1586,15 +1692,24 @@ pub fn sign_raw_transaction_with_key(
                     if expected_p2sh.as_bytes() == script.as_bytes() {
                         let mut cache = bitcoin::sighash::SighashCache::new(&tx);
                         let sighash = cache
-                            .p2wpkh_signature_hash(i, &redeem_script, prevout.value, ecdsa_sighash_type)
+                            .p2wpkh_signature_hash(
+                                i,
+                                &redeem_script,
+                                prevout.value,
+                                ecdsa_sighash_type,
+                            )
                             .map_err(|e| (-1, format!("Sighash error: {}", e)))?;
                         let msg = bitcoin::secp256k1::Message::from_digest(sighash.to_byte_array());
                         let sig = secp.sign_ecdsa(&msg, secret);
-                        let ecdsa_sig = bitcoin::ecdsa::Signature { signature: sig, sighash_type: ecdsa_sighash_type };
+                        let ecdsa_sig = bitcoin::ecdsa::Signature {
+                            signature: sig,
+                            sighash_type: ecdsa_sighash_type,
+                        };
 
                         // P2SH scriptSig pushes the redeem script
-                        let redeem_bytes = bitcoin::script::PushBytesBuf::try_from(redeem_script.to_bytes())
-                            .map_err(|_| (-1, "Redeem script too large".to_string()))?;
+                        let redeem_bytes =
+                            bitcoin::script::PushBytesBuf::try_from(redeem_script.to_bytes())
+                                .map_err(|_| (-1, "Redeem script too large".to_string()))?;
                         tx.input[i].script_sig = bitcoin::script::Builder::new()
                             .push_slice(&redeem_bytes)
                             .into_script();
@@ -1690,7 +1805,10 @@ pub fn sign_raw_transaction_with_key(
     }
 
     let complete = errors.is_empty()
-        && tx.input.iter().all(|inp| !inp.script_sig.is_empty() || !inp.witness.is_empty());
+        && tx
+            .input
+            .iter()
+            .all(|inp| !inp.script_sig.is_empty() || !inp.witness.is_empty());
     let raw = crate::validation::decode::serialize_transaction(&tx);
 
     let mut result = json!({
@@ -1737,11 +1855,13 @@ pub(crate) fn script_type(script: &bitcoin::Script) -> &'static str {
     // Data carrier: OP_RETURN followed only by pushes (`IsPushOnly`, which
     // counts OP_RESERVED and OP_1NEGATE..OP_16 as pushes).
     if b.first() == Some(&OP_RETURN.to_u8())
-        && bitcoin::Script::from_bytes(&b[1..]).instructions().all(|insn| match insn {
-            Ok(bitcoin::script::Instruction::PushBytes(_)) => true,
-            Ok(bitcoin::script::Instruction::Op(op)) => op.to_u8() <= OP_PUSHNUM_16.to_u8(),
-            Err(_) => false,
-        })
+        && bitcoin::Script::from_bytes(&b[1..])
+            .instructions()
+            .all(|insn| match insn {
+                Ok(bitcoin::script::Instruction::PushBytes(_)) => true,
+                Ok(bitcoin::script::Instruction::Op(op)) => op.to_u8() <= OP_PUSHNUM_16.to_u8(),
+                Err(_) => false,
+            })
     {
         return "nulldata";
     }
@@ -1751,7 +1871,9 @@ pub(crate) fn script_type(script: &bitcoin::Script) -> &'static str {
     if script.is_p2pkh() {
         return "pubkeyhash";
     }
-    if crate::rpc::descriptor::bare_multisig(script).is_some_and(|(_, keys)| keys.into_iter().all(pubkey_valid_size)) {
+    if crate::rpc::descriptor::bare_multisig(script)
+        .is_some_and(|(_, keys)| keys.into_iter().all(pubkey_valid_size))
+    {
         return "multisig";
     }
     "nonstandard"
@@ -1835,8 +1957,12 @@ pub fn send_raw_transaction_preflight(
         Ok((_txid, vsize, fee)) => Some((fee, vsize as u64)),
         // Already in the pool: the submission re-announces the resident one.
         Err(MempoolError::AlreadyExists | MempoolError::SameNonWitnessData) => None,
-        Err(_) if mempool.has_policy() => fee_from_inputs(chain_state, mempool, tx)
-            .map(|fee| (fee, crate::mempool::policy::weight_to_vsize(tx.weight().to_wu()))),
+        Err(_) if mempool.has_policy() => fee_from_inputs(chain_state, mempool, tx).map(|fee| {
+            (
+                fee,
+                crate::mempool::policy::weight_to_vsize(tx.weight().to_wu()),
+            )
+        }),
         Err(_) => None,
     };
     if let Some((fee, vsize)) = priced {
@@ -1930,8 +2056,8 @@ pub fn get_tx_out_proof(
     txids: &[String],
     blockhash_str: Option<&str>,
 ) -> Result<Value, (i32, String)> {
-    use bitcoin::consensus::serialize;
     use crate::storage::blockindex::BlockStatus;
+    use bitcoin::consensus::serialize;
     use std::collections::HashSet;
 
     if txids.is_empty() {
@@ -2011,9 +2137,10 @@ pub fn get_tx_out_proof(
 
     // Load the block. A stripped one still proves: the proof needs only the
     // header and the txids, which its strip record holds.
-    let stored = chain_state
-        .get_stored_block(&block_hash)
-        .ok_or((-1i32, "Block not available (not fully downloaded)".to_string()))?;
+    let stored = chain_state.get_stored_block(&block_hash).ok_or((
+        -1i32,
+        "Block not available (not fully downloaded)".to_string(),
+    ))?;
 
     // Build a set of the block's txids for the predicate.
     let block_txids: Vec<bitcoin::Txid> = stored.txids();
@@ -2047,8 +2174,7 @@ pub fn verify_tx_out_proof(
 ) -> Result<Value, (i32, String)> {
     use bitcoin::consensus::deserialize;
 
-    let proof_bytes =
-        hex::decode(proof_hex).map_err(|_| (-22i32, "Invalid hex".to_string()))?;
+    let proof_bytes = hex::decode(proof_hex).map_err(|_| (-22i32, "Invalid hex".to_string()))?;
     let merkle_block: bitcoin::MerkleBlock =
         deserialize(&proof_bytes).map_err(|_| (-22i32, "Invalid proof".to_string()))?;
 
@@ -2072,10 +2198,7 @@ pub fn verify_tx_out_proof(
         .get_block_index(&block_hash)
         .filter(|e| e.num_tx > 0)
         .filter(|e| chain_state.active_chain_contains(&block_hash, e.height))
-        .ok_or((
-            -5i32,
-            "Block not found in chain".to_string(),
-        ))?;
+        .ok_or((-5i32, "Block not found in chain".to_string()))?;
 
     // Core also requires the proof to cover the whole block:
     // `pindex->nTx == merkleBlock.txn.GetNumTransactions()`. A proof built
@@ -2127,7 +2250,10 @@ mod tests {
 
         // Wrappable: Core's MULTISIG / NONSTANDARD / PUBKEY / PUBKEYHASH /
         // WITNESS_V0_* arm.
-        assert!(p2sh_of("51").is_some(), "OP_TRUE is nonstandard and wrappable");
+        assert!(
+            p2sh_of("51").is_some(),
+            "OP_TRUE is nonstandard and wrappable"
+        );
         // P2WPKH output script: OP_0 <20 bytes>.
         assert!(p2sh_of("0014000102030405060708090a0b0c0d0e0f10111213").is_some());
 
@@ -2209,10 +2335,8 @@ mod tests {
                 TxOut {
                     value: Amount::from_sat(50_000),
                     script_pubkey: bitcoin::ScriptBuf::from_bytes(vec![
-                        0x76, 0xa9, 0x14,
-                        0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                        0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                        0x88, 0xac,
+                        0x76, 0xa9, 0x14, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                        0, 0x88, 0xac,
                     ]),
                 },
                 TxOut {
@@ -2270,8 +2394,12 @@ mod tests {
         cs.accept_block(&a2).expect("accept A2");
 
         let a1_txid = a1.txdata[0].compute_txid().to_string();
-        let proof = get_tx_out_proof(&cs, std::slice::from_ref(&a1_txid), Some(&a1_hash.to_string()))
-            .expect("proof for an active block");
+        let proof = get_tx_out_proof(
+            &cs,
+            std::slice::from_ref(&a1_txid),
+            Some(&a1_hash.to_string()),
+        )
+        .expect("proof for an active block");
         let proof_hex = proof.as_str().expect("proof is a hex string").to_string();
 
         let verified = verify_tx_out_proof(&cs, &proof_hex).expect("verifies on the active chain");
@@ -2295,8 +2423,8 @@ mod tests {
             "premise: A1 is still indexed, just no longer on the chain"
         );
 
-        let err = verify_tx_out_proof(&cs, &proof_hex)
-            .expect_err("A1 is no longer on the active chain");
+        let err =
+            verify_tx_out_proof(&cs, &proof_hex).expect_err("A1 is no longer on the active chain");
         assert_eq!(err.0, -5);
         assert_eq!(err.1, "Block not found in chain");
 
@@ -2310,11 +2438,14 @@ mod tests {
         let mut key_bytes = [0u8; 32];
         key_bytes[31] = 1;
         let sk = bitcoin::secp256k1::SecretKey::from_slice(&key_bytes).unwrap();
-        let pk = bitcoin::PublicKey::from_private_key(&secp, &bitcoin::PrivateKey {
-            compressed: true,
-            network: bitcoin::NetworkKind::Test,
-            inner: sk,
-        });
+        let pk = bitcoin::PublicKey::from_private_key(
+            &secp,
+            &bitcoin::PrivateKey {
+                compressed: true,
+                network: bitcoin::NetworkKind::Test,
+                inner: sk,
+            },
+        );
         let wif = bitcoin::PrivateKey {
             compressed: true,
             network: bitcoin::NetworkKind::Test,
@@ -2337,9 +2468,7 @@ mod tests {
             }],
             output: vec![TxOut {
                 value: Amount::from_sat(49_9900_0000),
-                script_pubkey: bitcoin::ScriptBuf::new_p2wpkh(
-                    &bitcoin::WPubkeyHash::all_zeros(),
-                ),
+                script_pubkey: bitcoin::ScriptBuf::new_p2wpkh(&bitcoin::WPubkeyHash::all_zeros()),
             }],
         }
     }
@@ -2363,25 +2492,44 @@ mod tests {
         assert_eq!(signed["hex"], json!(EMPTY), "{signed}");
         assert_eq!(signed["complete"], json!(true), "{signed}");
 
-        let data = create_raw_transaction(&[], &json!([{"data": "00"}]), None, None, None, bitcoin::Network::Regtest)
-            .unwrap();
+        let data = create_raw_transaction(
+            &[],
+            &json!([{"data": "00"}]),
+            None,
+            None,
+            None,
+            bitcoin::Network::Regtest,
+        )
+        .unwrap();
         let data = data.as_str().unwrap().to_string();
         assert_eq!(data, "0200000000010000000000000000036a010000000000");
         assert_eq!(
             combine_raw_transaction(std::slice::from_ref(&data)),
-            Err((-22, "TX decode failed for tx 0. Make sure the tx has at least one input.".to_string()))
+            Err((
+                -22,
+                "TX decode failed for tx 0. Make sure the tx has at least one input.".to_string()
+            ))
         );
         assert_eq!(
             combine_raw_transaction(&[EMPTY.to_string(), data.clone()]),
-            Err((-22, "TX decode failed for tx 1. Make sure the tx has at least one input.".to_string()))
+            Err((
+                -22,
+                "TX decode failed for tx 1. Make sure the tx has at least one input.".to_string()
+            ))
         );
         assert_eq!(
             sign_raw_transaction_with_key(&cs, &data, &[], None, None),
-            Err((-22, "TX decode failed. Make sure the tx has at least one input.".to_string()))
+            Err((
+                -22,
+                "TX decode failed. Make sure the tx has at least one input.".to_string()
+            ))
         );
         assert_eq!(
             sign_raw_transaction_with_key(&cs, "zz", &[], None, None),
-            Err((-22, "TX decode failed. Make sure the tx has at least one input.".to_string()))
+            Err((
+                -22,
+                "TX decode failed. Make sure the tx has at least one input.".to_string()
+            ))
         );
     }
 
@@ -2395,14 +2543,31 @@ mod tests {
         assert_eq!(empty, json!("02000000000000000000"));
         let d = decode_raw_transaction(empty.as_str().unwrap(), None, net).unwrap();
         let txid = "4ebd325a4b394cff8c57e8317ccf5a8d0e2bdf1b8526f8aad6c8e43d8240621a";
-        assert_eq!((&d["txid"], &d["hash"]), (&json!(txid), &json!(txid)), "{d}");
-        assert_eq!((&d["size"], &d["vsize"], &d["weight"]), (&json!(10), &json!(10), &json!(40)), "{d}");
+        assert_eq!(
+            (&d["txid"], &d["hash"]),
+            (&json!(txid), &json!(txid)),
+            "{d}"
+        );
+        assert_eq!(
+            (&d["size"], &d["vsize"], &d["weight"]),
+            (&json!(10), &json!(10), &json!(40)),
+            "{d}"
+        );
 
-        let data = create_raw_transaction(&[], &json!([{"data": "00"}]), None, None, None, net).unwrap();
+        let data =
+            create_raw_transaction(&[], &json!([{"data": "00"}]), None, None, None, net).unwrap();
         let d = decode_raw_transaction(data.as_str().unwrap(), None, net).unwrap();
         let txid = "a3d7f8ae2affadf33258cb830bcccd1451cfc122d766ec5e8e9922c5e4ad60a9";
-        assert_eq!((&d["txid"], &d["hash"]), (&json!(txid), &json!(txid)), "{d}");
-        assert_eq!((&d["size"], &d["vsize"], &d["weight"]), (&json!(22), &json!(22), &json!(88)), "{d}");
+        assert_eq!(
+            (&d["txid"], &d["hash"]),
+            (&json!(txid), &json!(txid)),
+            "{d}"
+        );
+        assert_eq!(
+            (&d["size"], &d["vsize"], &d["weight"]),
+            (&json!(22), &json!(22), &json!(88)),
+            "{d}"
+        );
         assert_eq!(d["vout"][0]["scriptPubKey"]["hex"], json!("6a0100"), "{d}");
         // Core: forcing the extended reading fails.
         assert_eq!(
@@ -2431,14 +2596,8 @@ mod tests {
             "amount": 50.0,
         })];
 
-        let result = sign_raw_transaction_with_key(
-            &cs,
-            &hex_tx,
-            &[wif],
-            Some(&prevtxs),
-            None,
-        )
-        .unwrap();
+        let result =
+            sign_raw_transaction_with_key(&cs, &hex_tx, &[wif], Some(&prevtxs), None).unwrap();
 
         assert_eq!(result["complete"], true);
         // The signed tx should be longer than the unsigned tx
@@ -2471,14 +2630,8 @@ mod tests {
             "amount": 50.0,
         })];
 
-        let result = sign_raw_transaction_with_key(
-            &cs,
-            &hex_tx,
-            &[wif],
-            Some(&prevtxs),
-            None,
-        )
-        .unwrap();
+        let result =
+            sign_raw_transaction_with_key(&cs, &hex_tx, &[wif], Some(&prevtxs), None).unwrap();
 
         assert_eq!(result["complete"], true);
 
@@ -2510,14 +2663,8 @@ mod tests {
             "amount": 50.0,
         })];
 
-        let result = sign_raw_transaction_with_key(
-            &cs,
-            &hex_tx,
-            &[wif],
-            Some(&prevtxs),
-            None,
-        )
-        .unwrap();
+        let result =
+            sign_raw_transaction_with_key(&cs, &hex_tx, &[wif], Some(&prevtxs), None).unwrap();
 
         assert_eq!(result["complete"], true);
 
@@ -2547,10 +2694,9 @@ mod tests {
             )
             .unwrap();
         let msg = bitcoin::secp256k1::Message::from_digest(sighash.to_byte_array());
-        let sig = bitcoin::secp256k1::schnorr::Signature::from_slice(
-            &signed_tx.input[0].witness[0],
-        )
-        .unwrap();
+        let sig =
+            bitcoin::secp256k1::schnorr::Signature::from_slice(&signed_tx.input[0].witness[0])
+                .unwrap();
         secp.verify_schnorr(&sig, &msg, expect_key)
             .expect("signature must verify under the output key");
     }
@@ -2581,14 +2727,8 @@ mod tests {
             "amount": 50.0,
         })];
 
-        let result = sign_raw_transaction_with_key(
-            &cs,
-            &hex_tx,
-            &[wif],
-            Some(&prevtxs),
-            None,
-        )
-        .unwrap();
+        let result =
+            sign_raw_transaction_with_key(&cs, &hex_tx, &[wif], Some(&prevtxs), None).unwrap();
 
         assert_eq!(
             result["complete"], true,
@@ -2656,11 +2796,13 @@ mod tests {
         );
         let errors = result["errors"].as_array().unwrap();
         assert_eq!(errors.len(), 2, "one error per input: {errors:?}");
-        assert!(errors.iter().any(|e| e["vout"] == 0
-            && e["error"]
-                .as_str()
-                .unwrap()
-                .contains("missing spent-output data")));
+        assert!(errors.iter().any(|e| {
+            e["vout"] == 0
+                && e["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("missing spent-output data")
+        }));
         assert!(
             errors
                 .iter()
@@ -2708,14 +2850,9 @@ mod tests {
             "amount": 50.0,
         })];
 
-        let result = sign_raw_transaction_with_key(
-            &cs,
-            &hex_tx,
-            &[wif, wif_tweaked],
-            Some(&prevtxs),
-            None,
-        )
-        .unwrap();
+        let result =
+            sign_raw_transaction_with_key(&cs, &hex_tx, &[wif, wif_tweaked], Some(&prevtxs), None)
+                .unwrap();
 
         assert_eq!(
             result["complete"], true,
@@ -2739,11 +2876,14 @@ mod tests {
         let mut key2_bytes = [0u8; 32];
         key2_bytes[31] = 2;
         let sk2 = bitcoin::secp256k1::SecretKey::from_slice(&key2_bytes).unwrap();
-        let pk2 = bitcoin::PublicKey::from_private_key(&secp, &bitcoin::PrivateKey {
-            compressed: true,
-            network: bitcoin::NetworkKind::Test,
-            inner: sk2,
-        });
+        let pk2 = bitcoin::PublicKey::from_private_key(
+            &secp,
+            &bitcoin::PrivateKey {
+                compressed: true,
+                network: bitcoin::NetworkKind::Test,
+                inner: sk2,
+            },
+        );
         let script_pubkey = bitcoin::ScriptBuf::new_p2wpkh(&pk2.wpubkey_hash().unwrap());
 
         let outpoint = OutPoint {
@@ -2760,14 +2900,8 @@ mod tests {
             "amount": 50.0,
         })];
 
-        let result = sign_raw_transaction_with_key(
-            &cs,
-            &hex_tx,
-            &[wif],
-            Some(&prevtxs),
-            None,
-        )
-        .unwrap();
+        let result =
+            sign_raw_transaction_with_key(&cs, &hex_tx, &[wif], Some(&prevtxs), None).unwrap();
 
         assert_eq!(result["complete"], false);
         assert!(!result["errors"].as_array().unwrap().is_empty());
@@ -2802,9 +2936,18 @@ mod tests {
     fn test_parse_sighash_types() {
         use bitcoin::sighash::EcdsaSighashType;
         assert_eq!(parse_sighash_type(None).unwrap(), EcdsaSighashType::All);
-        assert_eq!(parse_sighash_type(Some("ALL")).unwrap(), EcdsaSighashType::All);
-        assert_eq!(parse_sighash_type(Some("NONE")).unwrap(), EcdsaSighashType::None);
-        assert_eq!(parse_sighash_type(Some("SINGLE")).unwrap(), EcdsaSighashType::Single);
+        assert_eq!(
+            parse_sighash_type(Some("ALL")).unwrap(),
+            EcdsaSighashType::All
+        );
+        assert_eq!(
+            parse_sighash_type(Some("NONE")).unwrap(),
+            EcdsaSighashType::None
+        );
+        assert_eq!(
+            parse_sighash_type(Some("SINGLE")).unwrap(),
+            EcdsaSighashType::Single
+        );
         assert_eq!(
             parse_sighash_type(Some("ALL|ANYONECANPAY")).unwrap(),
             EcdsaSighashType::AllPlusAnyoneCanPay
@@ -2856,8 +2999,7 @@ mod tests {
         // iteration order is not stable across the two pools).
         let mut a: Vec<String> =
             serde_json::from_value(get_raw_mempool(&reference, false)).unwrap();
-        let mut b: Vec<String> =
-            serde_json::from_value(get_raw_mempool(&occupied, false)).unwrap();
+        let mut b: Vec<String> = serde_json::from_value(get_raw_mempool(&occupied, false)).unwrap();
         a.sort();
         b.sort();
         assert_eq!(a, b, "getrawmempool must list the acting class only");
@@ -2933,8 +3075,14 @@ mod tests {
         // (address, the network it belongs to)
         let cases = [
             ("3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy", Network::Bitcoin),
-            ("bc1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq9e75rs", Network::Bitcoin),
-            ("bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202", Network::Regtest),
+            (
+                "bc1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq9e75rs",
+                Network::Bitcoin,
+            ),
+            (
+                "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202",
+                Network::Regtest,
+            ),
         ];
         for (addr, home) in cases {
             for network in [Network::Bitcoin, Network::Regtest] {
@@ -2945,7 +3093,11 @@ mod tests {
                 } else {
                     let (code, msg) = got.expect_err("{addr} is not a {network} address");
                     assert_eq!(code, -5, "{addr} on {network}");
-                    assert_eq!(msg, format!("Invalid Bitcoin address: {addr}"), "{addr} on {network}");
+                    assert_eq!(
+                        msg,
+                        format!("Invalid Bitcoin address: {addr}"),
+                        "{addr} on {network}"
+                    );
                 }
             }
         }
@@ -2971,7 +3123,10 @@ mod tests {
         )
         .expect_err("a mainnet address is not a regtest destination");
         assert_eq!(code, -5);
-        assert_eq!(msg, "Invalid Bitcoin address: 3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy");
+        assert_eq!(
+            msg,
+            "Invalid Bitcoin address: 3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy"
+        );
 
         // ...and the shared parser is what gives `createpsbt` the array form
         // and string amounts it did not have when it had its own loop.
@@ -2979,8 +3134,15 @@ mod tests {
             { "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202": "0.01" },
             { "data": "deadbeef" },
         ]);
-        let v = crate::rpc::psbt::create_psbt(&inputs, &outputs, None, bitcoin::Network::Regtest, None, None)
-            .expect("array-form outputs");
+        let v = crate::rpc::psbt::create_psbt(
+            &inputs,
+            &outputs,
+            None,
+            bitcoin::Network::Regtest,
+            None,
+            None,
+        )
+        .expect("array-form outputs");
         assert!(v.as_str().expect("base64").starts_with("cHNidP8"));
     }
 
@@ -3010,13 +3172,29 @@ mod tests {
             );
         }
         for (num, sat) in [(json!(0.29), 29_000_000u64), (json!(1), 100_000_000)] {
-            assert_eq!(parse_btc_amount(&num).unwrap(), Amount::from_sat(sat), "{num}");
+            assert_eq!(
+                parse_btc_amount(&num).unwrap(),
+                Amount::from_sat(sat),
+                "{num}"
+            );
         }
 
         // The domain bug. `NaN` is the sharp one: it is neither `< 0.0` nor
         // `> 21_000_000.0`, so both range guards fell through and the
         // saturating cast produced a zero-value output with no error at all.
-        for bad in ["NaN", "inf", "-inf", "1.000000009", ".5", "1.", "01.0", "+1.0", "", " 1", "1 "] {
+        for bad in [
+            "NaN",
+            "inf",
+            "-inf",
+            "1.000000009",
+            ".5",
+            "1.",
+            "01.0",
+            "+1.0",
+            "",
+            " 1",
+            "1 ",
+        ] {
             assert!(
                 parse_btc_amount(&json!(bad)).is_err(),
                 "{bad:?} must not parse as an amount"
@@ -3075,10 +3253,17 @@ mod tests {
         let outs = parse_outputs(&json!({"data": 1234}), network).expect("numeric data");
         assert_eq!(outs.len(), 1);
         // An empty string is not hex; it used to build `OP_RETURN OP_0`.
-        for bad in [json!({"data": ""}), json!({"data": "abc"}), json!({"data": "zz"})] {
+        for bad in [
+            json!({"data": ""}),
+            json!({"data": "abc"}),
+            json!({"data": "zz"}),
+        ] {
             let (code, msg) = parse_outputs(&bad, network).expect_err("{bad}");
             assert_eq!(code, -8, "{bad}");
-            assert!(msg.starts_with("Data must be hexadecimal string (not '"), "{msg}");
+            assert!(
+                msg.starts_with("Data must be hexadecimal string (not '"),
+                "{msg}"
+            );
         }
     }
 
@@ -3095,7 +3280,10 @@ mod tests {
         )
         .expect_err("one destination, written twice");
         assert_eq!(code, -8);
-        assert_eq!(msg, format!("Invalid parameter, duplicated address: {LOWER}"));
+        assert_eq!(
+            msg,
+            format!("Invalid parameter, duplicated address: {LOWER}")
+        );
     }
 
     /// Core's `ParseOutputs` decodes, parses the amount, *then* throws on an
@@ -3126,7 +3314,10 @@ mod tests {
         let (code, msg) = parse_outputs(&json!([{ ADDR: 0.01 }, { ADDR: 0.02 }]), network)
             .expect_err("the same destination twice");
         assert_eq!(code, -8);
-        assert_eq!(msg, format!("Invalid parameter, duplicated address: {ADDR}"));
+        assert_eq!(
+            msg,
+            format!("Invalid parameter, duplicated address: {ADDR}")
+        );
     }
 
     /// Core reads a repeated key's value as `outputs[name_]`, which is the
@@ -3145,7 +3336,10 @@ mod tests {
         let (code, msg) = parse_outputs(&json!([{ ADDR: 0.01 }, { ADDR: "wat" }]), network)
             .expect_err("the same destination twice");
         assert_eq!(code, -8, "the unparseable second value is never reached");
-        assert_eq!(msg, format!("Invalid parameter, duplicated address: {ADDR}"));
+        assert_eq!(
+            msg,
+            format!("Invalid parameter, duplicated address: {ADDR}")
+        );
 
         // And the first value is the one a bad *first* entry is judged on.
         let (code, _) = parse_outputs(&json!([{ ADDR: "wat" }, { ADDR: 0.01 }]), network)
@@ -3184,11 +3378,10 @@ mod tests {
                 None,
                 bitcoin::Network::Regtest,
             )
-                .expect("well-formed request");
+            .expect("well-formed request");
             let hex = v.as_str().expect("hex string");
             let raw = hex::decode(hex).expect("valid hex");
-            let tx: bitcoin::Transaction =
-                bitcoin::consensus::deserialize(&raw).expect("valid tx");
+            let tx: bitcoin::Transaction = bitcoin::consensus::deserialize(&raw).expect("valid tx");
             u64::from(tx.input[0].sequence.0)
         };
 
@@ -3345,7 +3538,10 @@ mod tests {
             }],
         };
         let mut bytes = bitcoin::consensus::serialize(&tx);
-        assert!(decode_tx(&bytes, true, true).is_some(), "the fixture must decode");
+        assert!(
+            decode_tx(&bytes, true, true).is_some(),
+            "the fixture must decode"
+        );
         bytes.push(0xff);
         assert!(
             decode_tx(&bytes, true, true).is_none(),

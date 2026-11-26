@@ -23,21 +23,36 @@ impl Rig {
         let (cs, dir) = make_chain_state();
         build_and_connect_chain(&cs, n);
         let anchor = utxo_anchor(&cs);
-        cs.attach_background(dir.join("chainstate_background"), n, cs.tip_hash(), anchor, 64, -1)
-            .unwrap();
+        cs.attach_background(
+            dir.join("chainstate_background"),
+            n,
+            cs.tip_hash(),
+            anchor,
+            64,
+            -1,
+        )
+        .unwrap();
         let publisher = crate::events::EventPublisher::new(
             crate::events::EdgeIdentity::new([4; 16], None).unwrap(),
             1024,
         );
         let rx = publisher.subscribe();
         let health = Arc::new(crate::health::HealthState::new());
-        cs.background_alerts().install_sink(crate::health::AlertSink {
-            warnings: cs.warnings().clone(),
-            publisher,
-            health: Some(health.clone()),
-        });
+        cs.background_alerts()
+            .install_sink(crate::health::AlertSink {
+                warnings: cs.warnings().clone(),
+                publisher,
+                health: Some(health.clone()),
+            });
         let (shutdown_tx, _) = tokio::sync::watch::channel(false);
-        Rig { cs: Arc::new(cs), dir, health, rx, shutdown_tx, thread: None }
+        Rig {
+            cs: Arc::new(cs),
+            dir,
+            health,
+            rx,
+            shutdown_tx,
+            thread: None,
+        }
     }
 
     /// Run the real connector loop on its own thread with its clocks shrunk:
@@ -103,10 +118,17 @@ impl Drop for Rig {
 #[test]
 fn a_transient_connect_failure_is_retried_to_the_handoff() {
     let mut rig = Rig::new(5);
-    rig.cs.bg_connect_faults.0.store(CONNECT_RETRY_LIMIT - 1, Ordering::Relaxed);
+    rig.cs
+        .bg_connect_faults
+        .0
+        .store(CONNECT_RETRY_LIMIT - 1, Ordering::Relaxed);
     rig.start();
     rig.wait_for("the handoff", || !rig.cs.has_background());
-    assert_eq!(rig.cs.bg_connect_faults.0.load(Ordering::Relaxed), 0, "every fault was retried");
+    assert_eq!(
+        rig.cs.bg_connect_faults.0.load(Ordering::Relaxed),
+        0,
+        "every fault was retried"
+    );
     assert!(
         rig.status_events().is_empty(),
         "a failure inside the retry budget raises nothing"
@@ -129,7 +151,10 @@ fn a_persistent_connect_failure_raises_the_stall_and_progress_clears_it() {
     let mut rig = Rig::new(5);
     let kind = StatusKind::AssumeutxoCatchupStalled;
     // Two budgets' worth and a bit: raised at 30, refreshed at 60.
-    rig.cs.bg_connect_faults.0.store(2 * CONNECT_RETRY_LIMIT + 5, Ordering::Relaxed);
+    rig.cs
+        .bg_connect_faults
+        .0
+        .store(2 * CONNECT_RETRY_LIMIT + 5, Ordering::Relaxed);
     rig.start();
     rig.wait_for("the handoff", || !rig.cs.has_background());
 
@@ -140,10 +165,22 @@ fn a_persistent_connect_failure_raises_the_stall_and_progress_clears_it() {
         vec![(kind, StatusState::Raised), (kind, StatusState::Cleared)],
         "one raise for the episode and one clear on progress"
     );
-    assert_eq!(events[0].details.get("reason").map(String::as_str), Some("connect_failing"));
-    assert_eq!(events[0].details.get("height").map(String::as_str), Some("1"));
+    assert_eq!(
+        events[0].details.get("reason").map(String::as_str),
+        Some("connect_failing")
+    );
+    assert_eq!(
+        events[0].details.get("height").map(String::as_str),
+        Some("1")
+    );
     assert!(!rig.health.is_active(kind));
-    assert!(rig.cs.warnings().list().iter().all(|w| w.id != kind.warning_id()));
+    assert!(
+        rig.cs
+            .warnings()
+            .list()
+            .iter()
+            .all(|w| w.id != kind.warning_id())
+    );
 }
 
 /// A block that fails validation stops the connector at once: one attempt, no
@@ -161,14 +198,23 @@ fn an_invalid_block_halts_the_connector_without_retrying() {
     rig.wait_for("the connector to stop", || thread.is_finished());
     thread.join().unwrap();
 
-    let bg = rig.cs.background().expect("still attached: nothing was validated");
+    let bg = rig
+        .cs
+        .background()
+        .expect("still attached: nothing was validated");
     assert_eq!(bg.tip_height(), 0, "it stopped at the failing block");
-    assert!(!bg.is_rejected(), "a block verdict does not condemn the snapshot");
+    assert!(
+        !bg.is_rejected(),
+        "a block verdict does not condemn the snapshot"
+    );
     let kind = StatusKind::AssumeutxoCatchupStalled;
     assert!(rig.health.is_active(kind));
     let events = rig.status_events();
     assert_eq!(events.len(), 1, "{events:?}");
-    assert_eq!(events[0].details.get("reason").map(String::as_str), Some("invalid_block"));
+    assert_eq!(
+        events[0].details.get("reason").map(String::as_str),
+        Some("invalid_block")
+    );
 }
 
 /// Every structural refusal is permanent for the background connector, and
@@ -183,7 +229,9 @@ fn structural_refusals_are_not_retried_and_io_is() {
     use crate::chain::state::ChainError;
     use crate::validation::ValidationError;
     assert!(ChainError::ForkBeforeCheckpoint(7).is_verdict_on_block());
-    assert!(PeerManager::block_error_is_the_blocks(&ChainError::ForkBeforeCheckpoint(7)));
+    assert!(PeerManager::block_error_is_the_blocks(
+        &ChainError::ForkBeforeCheckpoint(7)
+    ));
     for e in [
         ChainError::Duplicate,
         ChainError::PrevBlockNotFound,
@@ -225,7 +273,10 @@ fn a_structural_refusal_halts_the_connector_without_retrying() {
     assert_eq!(rig.cs.background().expect("still attached").tip_height(), 0);
     let events = rig.status_events();
     assert_eq!(events.len(), 1, "{events:?}");
-    assert_eq!(events[0].details.get("reason").map(String::as_str), Some("cannot_connect"));
+    assert_eq!(
+        events[0].details.get("reason").map(String::as_str),
+        Some("cannot_connect")
+    );
 }
 
 /// The retry notice goes when the background does: nothing is left to retry.
@@ -235,9 +286,15 @@ fn a_structural_refusal_halts_the_connector_without_retrying() {
 #[test]
 fn the_retry_notice_clears_when_the_background_goes_away() {
     let mut rig = Rig::new(5);
-    rig.cs.bg_connect_faults.0.store(u32::MAX, Ordering::Relaxed);
+    rig.cs
+        .bg_connect_faults
+        .0
+        .store(u32::MAX, Ordering::Relaxed);
     let has_notice = |cs: &ChainState| {
-        cs.warnings().list().iter().any(|w| w.id == "assumeutxo.connect_retry")
+        cs.warnings()
+            .list()
+            .iter()
+            .any(|w| w.id == "assumeutxo.connect_retry")
     };
     rig.start();
     rig.wait_for("the retry notice", || has_notice(&rig.cs));
@@ -254,20 +311,35 @@ fn the_retry_notice_clears_when_the_background_goes_away() {
 fn a_replaced_snapshot_does_not_inherit_the_old_failures() {
     let mut rig = Rig::new(5);
     let kind = StatusKind::AssumeutxoCatchupStalled;
-    rig.cs.bg_connect_faults.0.store(u32::MAX, Ordering::Relaxed);
+    rig.cs
+        .bg_connect_faults
+        .0
+        .store(u32::MAX, Ordering::Relaxed);
     rig.start();
-    rig.wait_for("the first stall", || rig.cs.background_alerts().is_raised(kind));
+    rig.wait_for("the first stall", || {
+        rig.cs.background_alerts().is_raised(kind)
+    });
     let first = rig.status_events();
     assert_eq!(first.len(), 1, "{first:?}");
 
     let tip = rig.cs.get_block_hash_by_height(4).unwrap();
     rig.cs
-        .attach_background(rig.dir.join("chainstate_background2"), 4, tip, [7; 32], 64, -1)
+        .attach_background(
+            rig.dir.join("chainstate_background2"),
+            4,
+            tip,
+            [7; 32],
+            64,
+            -1,
+        )
         .unwrap();
     let mut seen: Vec<StatusEvent> = Vec::new();
     let deadline = Instant::now() + Duration::from_secs(30);
     while !(seen.len() >= 2 && seen[1].state == StatusState::Raised) {
-        assert!(Instant::now() < deadline, "no clear and re-raise after the replacement: {seen:?}");
+        assert!(
+            Instant::now() < deadline,
+            "no clear and re-raise after the replacement: {seen:?}"
+        );
         seen.extend(rig.status_events());
         std::thread::sleep(Duration::from_millis(5));
     }
@@ -281,11 +353,18 @@ fn a_replaced_snapshot_does_not_inherit_the_old_failures() {
 }
 
 /// Collect status events until `done` holds of what has been seen.
-fn collect_until(rig: &mut Rig, what: &str, done: impl Fn(&[StatusEvent]) -> bool) -> Vec<StatusEvent> {
+fn collect_until(
+    rig: &mut Rig,
+    what: &str,
+    done: impl Fn(&[StatusEvent]) -> bool,
+) -> Vec<StatusEvent> {
     let mut seen = Vec::new();
     let deadline = Instant::now() + Duration::from_secs(30);
     while !done(&seen) {
-        assert!(Instant::now() < deadline, "timed out waiting for {what}: {seen:?}");
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for {what}: {seen:?}"
+        );
         seen.extend(rig.status_events());
         std::thread::sleep(Duration::from_millis(5));
     }
@@ -297,7 +376,10 @@ fn handoff(e: &StatusEvent, state: StatusState) -> bool {
 }
 
 fn attempts(e: &StatusEvent) -> u32 {
-    e.details.get("attempts").and_then(|a| a.parse().ok()).expect("attempts detail")
+    e.details
+        .get("attempts")
+        .and_then(|a| a.parse().ok())
+        .expect("attempts detail")
 }
 
 /// A replacement at the same height, mid-handoff, clears the standing handoff
@@ -311,19 +393,32 @@ fn a_same_height_replacement_clears_the_handoff_alert() {
     let mut rig = Rig::new(3);
     rig.cs.bg_handoff_faults.store(u32::MAX, Ordering::Relaxed);
     rig.start();
-    collect_until(&mut rig, "the handoff alert", |s| s.iter().any(|e| handoff(e, StatusState::Raised)));
+    collect_until(&mut rig, "the handoff alert", |s| {
+        s.iter().any(|e| handoff(e, StatusState::Raised))
+    });
 
     // Same height, another anchor block.
     let other = rig.cs.get_block_hash_by_height(2).unwrap();
     rig.cs
-        .attach_background(rig.dir.join("chainstate_background2"), 3, other, [7; 32], 64, -1)
+        .attach_background(
+            rig.dir.join("chainstate_background2"),
+            3,
+            other,
+            [7; 32],
+            64,
+            -1,
+        )
         .unwrap();
     let seen = collect_until(&mut rig, "a clear and a fresh raise", |s| {
-        s.iter().position(|e| handoff(e, StatusState::Cleared)).is_some_and(|i| {
-            s[i..].iter().any(|e| handoff(e, StatusState::Raised))
-        })
+        s.iter()
+            .position(|e| handoff(e, StatusState::Cleared))
+            .is_some_and(|i| s[i..].iter().any(|e| handoff(e, StatusState::Raised)))
     });
-    let raised = seen.iter().rev().find(|e| handoff(e, StatusState::Raised)).unwrap();
+    let raised = seen
+        .iter()
+        .rev()
+        .find(|e| handoff(e, StatusState::Raised))
+        .unwrap();
     assert_eq!(raised.details.get("height").map(String::as_str), Some("3"));
 }
 
@@ -342,7 +437,9 @@ fn a_reattached_snapshot_starts_a_fresh_handoff_episode() {
     let snapshot = rig.cs.tip_hash();
     let anchor = utxo_anchor(&rig.cs);
     rig.start();
-    collect_until(&mut rig, "the handoff alert", |s| s.iter().any(|e| handoff(e, StatusState::Raised)));
+    collect_until(&mut rig, "the handoff alert", |s| {
+        s.iter().any(|e| handoff(e, StatusState::Raised))
+    });
     // Let the first episode run up its count well past the escalation point.
     std::thread::sleep(Duration::from_millis(600));
     let first = rig
@@ -351,16 +448,35 @@ fn a_reattached_snapshot_starts_a_fresh_handoff_episode() {
         .list()
         .into_iter()
         .find(|w| w.id == StatusKind::AssumeutxoHandoffFailing.warning_id())
-        .and_then(|w| w.context["attempts"].as_str().and_then(|a| a.parse::<u32>().ok()))
+        .and_then(|w| {
+            w.context["attempts"]
+                .as_str()
+                .and_then(|a| a.parse::<u32>().ok())
+        })
         .expect("the standing entry counts attempts");
 
     rig.cs.detach_background_for_test();
-    collect_until(&mut rig, "the clear", |s| s.iter().any(|e| handoff(e, StatusState::Cleared)));
+    collect_until(&mut rig, "the clear", |s| {
+        s.iter().any(|e| handoff(e, StatusState::Cleared))
+    });
     rig.cs
-        .attach_background(rig.dir.join("chainstate_background2"), 3, snapshot, anchor, 64, -1)
+        .attach_background(
+            rig.dir.join("chainstate_background2"),
+            3,
+            snapshot,
+            anchor,
+            64,
+            -1,
+        )
         .unwrap();
-    let seen = collect_until(&mut rig, "the second raise", |s| s.iter().any(|e| handoff(e, StatusState::Raised)));
-    let second = attempts(seen.iter().find(|e| handoff(e, StatusState::Raised)).unwrap());
+    let seen = collect_until(&mut rig, "the second raise", |s| {
+        s.iter().any(|e| handoff(e, StatusState::Raised))
+    });
+    let second = attempts(
+        seen.iter()
+            .find(|e| handoff(e, StatusState::Raised))
+            .unwrap(),
+    );
     assert!(
         second < first,
         "the second episode reported {second} attempts, the first had {first} when it ended"

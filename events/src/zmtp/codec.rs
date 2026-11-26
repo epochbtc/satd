@@ -58,7 +58,9 @@ pub(crate) async fn read_peer_greeting<R: AsyncRead + Unpin>(r: &mut R) -> io::R
     let mut mechanism = [0u8; 20];
     r.read_exact(&mut mechanism).await?;
     if &mechanism[..4] != b"NULL" || mechanism[4..].iter().any(|b| *b != 0) {
-        return Err(protocol("peer asked for a security mechanism other than NULL"));
+        return Err(protocol(
+            "peer asked for a security mechanism other than NULL",
+        ));
     }
     // as-server (1 byte) and filler (31 bytes): nothing to check for NULL.
     let mut rest = [0u8; 32];
@@ -100,7 +102,10 @@ pub(crate) fn pong_frame(context: &[u8]) -> Vec<u8> {
 /// one byte and the long form (with [`FLAG_LONG`] set) otherwise. Returns
 /// the header bytes and their length in a fixed buffer.
 pub(crate) fn frame_header(flags: u8, len: usize) -> HeaderBuf {
-    let mut h = HeaderBuf { bytes: [0; 9], len: 0 };
+    let mut h = HeaderBuf {
+        bytes: [0; 9],
+        len: 0,
+    };
     if len <= u8::MAX as usize {
         h.bytes[0] = flags;
         h.bytes[1] = len as u8;
@@ -155,7 +160,9 @@ impl InFrame {
 pub(crate) async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> io::Result<InFrame> {
     let flags = r.read_u8().await?;
     if flags & !(FLAG_MORE | FLAG_LONG | FLAG_COMMAND) != 0 {
-        return Err(protocol(format!("reserved frame flag bits set: {flags:#04x}")));
+        return Err(protocol(format!(
+            "reserved frame flag bits set: {flags:#04x}"
+        )));
     }
     if flags & FLAG_COMMAND != 0 && flags & FLAG_MORE != 0 {
         return Err(protocol("command frame with MORE set"));
@@ -166,7 +173,9 @@ pub(crate) async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> io::Result<In
         u64::from(r.read_u8().await?)
     };
     if len > MAX_INBOUND_FRAME {
-        return Err(protocol(format!("peer frame of {len} bytes is over the limit")));
+        return Err(protocol(format!(
+            "peer frame of {len} bytes is over the limit"
+        )));
     }
     let mut body = vec![0u8; len as usize];
     r.read_exact(&mut body).await?;

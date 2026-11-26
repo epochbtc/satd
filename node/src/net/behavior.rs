@@ -41,7 +41,10 @@ pub const LATENCY_BUCKETS: usize = LATENCY_BOUNDS_MS.len() + 1;
 /// and `feefilter` (BIP 133). The transcript runs past `verack` while the
 /// peer sends these, and ends at the first message that is not one.
 pub fn is_handshake_announcement(command: &str) -> bool {
-    matches!(command, "wtxidrelay" | "sendaddrv2" | "sendtxrcncl" | "sendheaders" | "sendcmpct" | "feefilter")
+    matches!(
+        command,
+        "wtxidrelay" | "sendaddrv2" | "sendtxrcncl" | "sendheaders" | "sendcmpct" | "feefilter"
+    )
 }
 
 /// A message's command as it came over the wire: the peer's own text for a
@@ -81,7 +84,11 @@ pub struct HandshakeCapture {
 
 impl Default for HandshakeCapture {
     fn default() -> Self {
-        Self { commands: [[0; COMMAND_LEN]; HANDSHAKE_CAPTURE_MAX], len: 0, state: CaptureState::Waiting }
+        Self {
+            commands: [[0; COMMAND_LEN]; HANDSHAKE_CAPTURE_MAX],
+            len: 0,
+            state: CaptureState::Waiting,
+        }
     }
 }
 
@@ -124,7 +131,13 @@ impl HandshakeCapture {
         self.commands[..usize::from(self.len)].iter().map(|word| {
             word.iter()
                 .take_while(|b| **b != 0)
-                .map(|b| if b.is_ascii_graphic() { char::from(*b) } else { '?' })
+                .map(|b| {
+                    if b.is_ascii_graphic() {
+                        char::from(*b)
+                    } else {
+                        '?'
+                    }
+                })
                 .collect()
         })
     }
@@ -169,7 +182,10 @@ impl LatencyHistogram {
     pub fn record(&mut self, delay: Duration) {
         let ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX);
         // A bound is inclusive above: under 1 ms goes in the first bucket.
-        let i = LATENCY_BOUNDS_MS.iter().position(|bound| ms < *bound).unwrap_or(LATENCY_BOUNDS_MS.len());
+        let i = LATENCY_BOUNDS_MS
+            .iter()
+            .position(|bound| ms < *bound)
+            .unwrap_or(LATENCY_BOUNDS_MS.len());
         self.buckets[i] = self.buckets[i].saturating_add(1);
     }
 
@@ -224,7 +240,11 @@ struct AnnounceRing {
 
 impl Default for AnnounceRing {
     fn default() -> Self {
-        Self { slots: Box::new([(0, None); ANNOUNCE_RING]), next: 0, salt: RandomState::new() }
+        Self {
+            slots: Box::new([(0, None); ANNOUNCE_RING]),
+            next: 0,
+            salt: RandomState::new(),
+        }
     }
 }
 
@@ -250,7 +270,10 @@ impl AnnounceRing {
 
     fn take(&mut self, hash: &[u8; 32]) -> Option<Instant> {
         let key = self.key(hash);
-        self.slots.iter_mut().find(|(k, at)| *k == key && at.is_some()).and_then(|(_, at)| at.take())
+        self.slots
+            .iter_mut()
+            .find(|(k, at)| *k == key && at.is_some())
+            .and_then(|(_, at)| at.take())
     }
 
     fn held(&self) -> usize {
@@ -269,7 +292,10 @@ fn tx_hash(inv: &Inventory) -> Option<[u8; 32]> {
 
 /// Whether an `inv` or `getdata` entry names a block.
 fn is_block(inv: &Inventory) -> bool {
-    matches!(inv, Inventory::Block(_) | Inventory::WitnessBlock(_) | Inventory::CompactBlock(_))
+    matches!(
+        inv,
+        Inventory::Block(_) | Inventory::WitnessBlock(_) | Inventory::CompactBlock(_)
+    )
 }
 
 /// One peer's record. See the module documentation.
@@ -322,7 +348,11 @@ pub struct PeerBehavior {
 
 impl PeerBehavior {
     /// The peer's `version` arrived, with our tip's height then.
-    pub fn note_version(&mut self, version: &bitcoin::p2p::message_network::VersionMessage, our_tip: u32) {
+    pub fn note_version(
+        &mut self,
+        version: &bitcoin::p2p::message_network::VersionMessage,
+        our_tip: u32,
+    ) {
         self.version = Some(VersionFields {
             protocol_version: version.version,
             services: version.services.to_u64(),
@@ -360,7 +390,8 @@ impl PeerBehavior {
                     if let Some(hash) = tx_hash(i) {
                         self.getdata_tx_in = self.getdata_tx_in.saturating_add(1);
                         if let Some(at) = self.announced.take(&hash) {
-                            self.getdata_latency.record(now.saturating_duration_since(at));
+                            self.getdata_latency
+                                .record(now.saturating_duration_since(at));
                         }
                     } else if is_block(i) {
                         self.blocks_req = self.blocks_req.saturating_add(1);
@@ -506,7 +537,8 @@ pub(crate) fn replay_fixture(name: &str) -> Replayed {
 
 #[cfg(test)]
 fn read_fixture(path: &std::path::Path) -> serde_json::Value {
-    let text = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("reading {}: {e}", path.display()));
+    let text =
+        std::fs::read_to_string(path).unwrap_or_else(|e| panic!("reading {}: {e}", path.display()));
     serde_json::from_str(&text).unwrap()
 }
 
@@ -515,7 +547,9 @@ fn read_fixture(path: &std::path::Path) -> serde_json::Value {
 /// besides (the BIP 324 greeting, the probes' answers, the `getaddr`
 /// answer's message).
 #[cfg(test)]
-pub(crate) fn replay_crawl_fixture(name: &str) -> (Replayed, crate::net::fingerprint::CrawlFeatures) {
+pub(crate) fn replay_crawl_fixture(
+    name: &str,
+) -> (Replayed, crate::net::fingerprint::CrawlFeatures) {
     use crate::net::fingerprint::{AddrKind, CrawlFeatures};
     use crate::net::survey::{Probe, ProbeOutcome};
     let fixture = read_fixture(&fixture_dir().join("crawl").join(format!("{name}.json")));
@@ -541,7 +575,11 @@ pub(crate) fn replay_crawl_fixture(name: &str) -> (Replayed, crate::net::fingerp
             ProbeOutcome::Disconnected
         } else if p["answered"].as_bool().unwrap() {
             // `ping`'s value is its round trip, the others' a count.
-            let value = if probe == Probe::Ping { &p["latency_ms"] } else { &p["reply_fields"]["count"] };
+            let value = if probe == Probe::Ping {
+                &p["latency_ms"]
+            } else {
+                &p["reply_fields"]["count"]
+            };
             ProbeOutcome::Answered(value.as_u64().unwrap_or(0) as u32)
         } else {
             ProbeOutcome::Silent
@@ -563,7 +601,11 @@ fn replay_value(fixture: &serde_json::Value) -> Replayed {
     let mut events: Vec<(u64, bool, String)> = Vec::new();
     for (key, sent) in [("sent", true), ("received", false)] {
         for m in fixture[key].as_array().unwrap() {
-            events.push((m["t_ms"].as_u64().unwrap(), !sent, m["command"].as_str().unwrap().to_string()));
+            events.push((
+                m["t_ms"].as_u64().unwrap(),
+                !sent,
+                m["command"].as_str().unwrap().to_string(),
+            ));
         }
     }
     events.sort_by_key(|(t, received, _)| (*t, *received));
@@ -600,7 +642,11 @@ fn replay_value(fixture: &serde_json::Value) -> Replayed {
         start_height: v["start_height"].as_i64().unwrap() as i32,
         user_agent: crate::net::limits::sanitize_string(v["user_agent"].as_str().unwrap()),
     });
-    Replayed { capture, version, inbound: fixture["connection"] == "inbound" }
+    Replayed {
+        capture,
+        version,
+        inbound: fixture["connection"] == "inbound",
+    }
 }
 
 #[cfg(test)]
@@ -629,7 +675,18 @@ mod tests {
             ("feefilter", false),
             ("getaddr", false),
         ]);
-        assert_eq!(got, ["version", "wtxidrelay", "sendaddrv2", "verack", "sendheaders", "sendcmpct", "getheaders"]);
+        assert_eq!(
+            got,
+            [
+                "version",
+                "wtxidrelay",
+                "sendaddrv2",
+                "verack",
+                "sendheaders",
+                "sendcmpct",
+                "getheaders"
+            ]
+        );
     }
 
     #[test]
@@ -649,7 +706,12 @@ mod tests {
     fn anything_before_verack_is_recorded() {
         // Core ignores a non-negotiation message before `verack`, but the
         // peer sent it, and it is the kind of thing that tells peers apart.
-        let got = capture(&[("version", false), ("getaddr", false), ("verack", false), ("ping", false)]);
+        let got = capture(&[
+            ("version", false),
+            ("getaddr", false),
+            ("verack", false),
+            ("ping", false),
+        ]);
         assert_eq!(got, ["version", "getaddr", "verack", "ping"]);
     }
 
@@ -675,7 +737,10 @@ mod tests {
         c.observe("version", false);
         c.observe("verack", false);
         c.observe("ab\ncd", false);
-        assert_eq!(c.commands().collect::<Vec<_>>(), ["version", "verack", "ab?cd"]);
+        assert_eq!(
+            c.commands().collect::<Vec<_>>(),
+            ["version", "verack", "ab?cd"]
+        );
     }
 
     /// The announcement ring holds at most 128 entries however many are
@@ -699,7 +764,11 @@ mod tests {
             NetworkMessage::GetData(vec![Inventory::WTx(bitcoin::Wtxid::from_byte_array(h))])
         };
         b.note_received(&getdata(oldest), t0);
-        assert_eq!(b.getdata_latency.count(), 0, "the oldest announcement was overwritten");
+        assert_eq!(
+            b.getdata_latency.count(),
+            0,
+            "the oldest announcement was overwritten"
+        );
         b.note_received(&getdata(newest), t0 + Duration::from_millis(3));
         assert_eq!(b.getdata_latency.count(), 1);
         assert_eq!(b.announced_held(), ANNOUNCE_RING - 1);
@@ -735,8 +804,14 @@ mod tests {
             version: 70016,
             services: bitcoin::p2p::ServiceFlags::NONE,
             timestamp: 0,
-            receiver: bitcoin::p2p::Address::new(&"0.0.0.0:0".parse().unwrap(), bitcoin::p2p::ServiceFlags::NONE),
-            sender: bitcoin::p2p::Address::new(&"0.0.0.0:0".parse().unwrap(), bitcoin::p2p::ServiceFlags::NONE),
+            receiver: bitcoin::p2p::Address::new(
+                &"0.0.0.0:0".parse().unwrap(),
+                bitcoin::p2p::ServiceFlags::NONE,
+            ),
+            sender: bitcoin::p2p::Address::new(
+                &"0.0.0.0:0".parse().unwrap(),
+                bitcoin::p2p::ServiceFlags::NONE,
+            ),
             nonce: 0,
             user_agent: "/x/".into(),
             start_height,
@@ -780,23 +855,44 @@ mod tests {
             ("bcoin-2.2.0-inbound", "version verack addr"),
             ("bcoin-2.2.0-outbound-v2", ""),
             ("bcoin-2.2.0-outbound", "version verack addr"),
-            ("bitcoin-seeder-92d2b46-inbound-v2", "version verack getaddr"),
+            (
+                "bitcoin-seeder-92d2b46-inbound-v2",
+                "version verack getaddr",
+            ),
             ("bitcoin-seeder-92d2b46-inbound", "version verack getaddr"),
-            ("bitnodes-036dc5c-inbound-v2", "version sendaddrv2 verack getaddr"),
-            ("bitnodes-036dc5c-inbound", "version sendaddrv2 verack getaddr"),
-            ("btcd-0.24.2-inbound-v2", "version sendaddrv2 verack getaddr"),
+            (
+                "bitnodes-036dc5c-inbound-v2",
+                "version sendaddrv2 verack getaddr",
+            ),
+            (
+                "bitnodes-036dc5c-inbound",
+                "version sendaddrv2 verack getaddr",
+            ),
+            (
+                "btcd-0.24.2-inbound-v2",
+                "version sendaddrv2 verack getaddr",
+            ),
             ("btcd-0.24.2-inbound", "version sendaddrv2 verack getaddr"),
             ("btcd-0.24.2-outbound-survey-v2", ""),
-            ("btcd-0.24.2-outbound-survey", "version sendaddrv2 verack getblocks"),
+            (
+                "btcd-0.24.2-outbound-survey",
+                "version sendaddrv2 verack getblocks",
+            ),
             ("btcd-0.24.2-outbound-v2", ""),
             ("btcd-0.24.2-outbound", "version sendaddrv2 verack"),
-            ("btcd-0.25.0-inbound-v2", "version sendaddrv2 verack getaddr"),
+            (
+                "btcd-0.25.0-inbound-v2",
+                "version sendaddrv2 verack getaddr",
+            ),
             ("btcd-0.25.0-inbound", "version sendaddrv2 verack getaddr"),
             ("btcd-0.25.0-outbound-survey-v2", ""),
             ("btcd-0.25.0-outbound-survey", "version sendaddrv2 verack"),
             ("btcd-0.25.0-outbound-v2", ""),
             ("btcd-0.25.0-outbound", "version sendaddrv2 verack"),
-            ("btcd-0.27.0-inbound-v2", "version sendaddrv2 verack getaddr"),
+            (
+                "btcd-0.27.0-inbound-v2",
+                "version sendaddrv2 verack getaddr",
+            ),
             ("btcd-0.27.0-inbound", "version sendaddrv2 verack getaddr"),
             ("btcd-0.27.0-outbound-v2", ""),
             ("btcd-0.27.0-outbound", "version sendaddrv2 verack"),
@@ -805,138 +901,453 @@ mod tests {
             ("core-0.20.2-inbound-v2", "version verack getaddr"),
             ("core-0.20.2-inbound", "version verack getaddr"),
             ("core-0.20.2-outbound-survey-v2", ""),
-            ("core-0.20.2-outbound-survey", "version verack sendheaders sendcmpct sendcmpct ping"),
+            (
+                "core-0.20.2-outbound-survey",
+                "version verack sendheaders sendcmpct sendcmpct ping",
+            ),
             ("core-0.20.2-outbound-v2", ""),
-            ("core-0.20.2-outbound", "version verack sendheaders sendcmpct sendcmpct ping"),
-            ("core-0.21.2-inbound-s2", "version wtxidrelay sendaddrv2 verack getaddr"),
-            ("core-0.21.2-inbound-v2-s2", "version wtxidrelay sendaddrv2 verack getaddr"),
-            ("core-0.21.2-inbound-v2", "version wtxidrelay sendaddrv2 verack getaddr"),
-            ("core-0.21.2-inbound", "version wtxidrelay sendaddrv2 verack getaddr"),
+            (
+                "core-0.20.2-outbound",
+                "version verack sendheaders sendcmpct sendcmpct ping",
+            ),
+            (
+                "core-0.21.2-inbound-s2",
+                "version wtxidrelay sendaddrv2 verack getaddr",
+            ),
+            (
+                "core-0.21.2-inbound-v2-s2",
+                "version wtxidrelay sendaddrv2 verack getaddr",
+            ),
+            (
+                "core-0.21.2-inbound-v2",
+                "version wtxidrelay sendaddrv2 verack getaddr",
+            ),
+            (
+                "core-0.21.2-inbound",
+                "version wtxidrelay sendaddrv2 verack getaddr",
+            ),
             ("core-0.21.2-outbound-survey-v2", ""),
-            ("core-0.21.2-outbound-survey", "version wtxidrelay sendaddrv2 verack sendheaders sendcmpct sendcmpct ping"),
+            (
+                "core-0.21.2-outbound-survey",
+                "version wtxidrelay sendaddrv2 verack sendheaders sendcmpct sendcmpct ping",
+            ),
             ("core-0.21.2-outbound-v2", ""),
-            ("core-0.21.2-outbound", "version wtxidrelay sendaddrv2 verack sendheaders sendcmpct sendcmpct ping"),
-            ("core-22.1-inbound-s2", "version wtxidrelay sendaddrv2 verack getaddr"),
-            ("core-22.1-inbound-v2-s2", "version wtxidrelay sendaddrv2 verack getaddr"),
-            ("core-22.1-inbound-v2", "version wtxidrelay sendaddrv2 verack getaddr"),
-            ("core-22.1-inbound", "version wtxidrelay sendaddrv2 verack getaddr"),
+            (
+                "core-0.21.2-outbound",
+                "version wtxidrelay sendaddrv2 verack sendheaders sendcmpct sendcmpct ping",
+            ),
+            (
+                "core-22.1-inbound-s2",
+                "version wtxidrelay sendaddrv2 verack getaddr",
+            ),
+            (
+                "core-22.1-inbound-v2-s2",
+                "version wtxidrelay sendaddrv2 verack getaddr",
+            ),
+            (
+                "core-22.1-inbound-v2",
+                "version wtxidrelay sendaddrv2 verack getaddr",
+            ),
+            (
+                "core-22.1-inbound",
+                "version wtxidrelay sendaddrv2 verack getaddr",
+            ),
             ("core-22.1-outbound-survey-v2", ""),
-            ("core-22.1-outbound-survey", "version wtxidrelay sendaddrv2 verack sendheaders sendcmpct sendcmpct ping"),
+            (
+                "core-22.1-outbound-survey",
+                "version wtxidrelay sendaddrv2 verack sendheaders sendcmpct sendcmpct ping",
+            ),
             ("core-22.1-outbound-v2", ""),
-            ("core-22.1-outbound", "version wtxidrelay sendaddrv2 verack sendheaders sendcmpct sendcmpct ping"),
-            ("core-23.2-inbound-s2", "version wtxidrelay sendaddrv2 verack getaddr"),
-            ("core-23.2-inbound-v2-s2", "version wtxidrelay sendaddrv2 verack getaddr"),
-            ("core-23.2-inbound-v2", "version wtxidrelay sendaddrv2 verack getaddr"),
-            ("core-23.2-inbound", "version wtxidrelay sendaddrv2 verack getaddr"),
+            (
+                "core-22.1-outbound",
+                "version wtxidrelay sendaddrv2 verack sendheaders sendcmpct sendcmpct ping",
+            ),
+            (
+                "core-23.2-inbound-s2",
+                "version wtxidrelay sendaddrv2 verack getaddr",
+            ),
+            (
+                "core-23.2-inbound-v2-s2",
+                "version wtxidrelay sendaddrv2 verack getaddr",
+            ),
+            (
+                "core-23.2-inbound-v2",
+                "version wtxidrelay sendaddrv2 verack getaddr",
+            ),
+            (
+                "core-23.2-inbound",
+                "version wtxidrelay sendaddrv2 verack getaddr",
+            ),
             ("core-23.2-outbound-survey-v2", ""),
-            ("core-23.2-outbound-survey", "version wtxidrelay sendaddrv2 verack sendheaders sendcmpct sendcmpct ping"),
+            (
+                "core-23.2-outbound-survey",
+                "version wtxidrelay sendaddrv2 verack sendheaders sendcmpct sendcmpct ping",
+            ),
             ("core-23.2-outbound-v2", ""),
-            ("core-23.2-outbound", "version wtxidrelay sendaddrv2 verack sendheaders sendcmpct sendcmpct ping"),
-            ("core-24.2-inbound-s2", "version wtxidrelay sendaddrv2 verack getaddr"),
-            ("core-24.2-inbound-v2-s2", "version wtxidrelay sendaddrv2 verack getaddr"),
-            ("core-24.2-inbound-v2", "version wtxidrelay sendaddrv2 verack getaddr"),
-            ("core-24.2-inbound", "version wtxidrelay sendaddrv2 verack getaddr"),
+            (
+                "core-23.2-outbound",
+                "version wtxidrelay sendaddrv2 verack sendheaders sendcmpct sendcmpct ping",
+            ),
+            (
+                "core-24.2-inbound-s2",
+                "version wtxidrelay sendaddrv2 verack getaddr",
+            ),
+            (
+                "core-24.2-inbound-v2-s2",
+                "version wtxidrelay sendaddrv2 verack getaddr",
+            ),
+            (
+                "core-24.2-inbound-v2",
+                "version wtxidrelay sendaddrv2 verack getaddr",
+            ),
+            (
+                "core-24.2-inbound",
+                "version wtxidrelay sendaddrv2 verack getaddr",
+            ),
             ("core-24.2-outbound-survey-v2", ""),
-            ("core-24.2-outbound-survey", "version wtxidrelay sendaddrv2 verack sendcmpct ping"),
+            (
+                "core-24.2-outbound-survey",
+                "version wtxidrelay sendaddrv2 verack sendcmpct ping",
+            ),
             ("core-24.2-outbound-v2", ""),
-            ("core-24.2-outbound", "version wtxidrelay sendaddrv2 verack sendcmpct ping"),
-            ("core-25.2-inbound-s2", "version wtxidrelay sendaddrv2 verack getaddr"),
-            ("core-25.2-inbound-v2-s2", "version wtxidrelay sendaddrv2 verack getaddr"),
-            ("core-25.2-inbound-v2", "version wtxidrelay sendaddrv2 verack getaddr"),
-            ("core-25.2-inbound", "version wtxidrelay sendaddrv2 verack getaddr"),
+            (
+                "core-24.2-outbound",
+                "version wtxidrelay sendaddrv2 verack sendcmpct ping",
+            ),
+            (
+                "core-25.2-inbound-s2",
+                "version wtxidrelay sendaddrv2 verack getaddr",
+            ),
+            (
+                "core-25.2-inbound-v2-s2",
+                "version wtxidrelay sendaddrv2 verack getaddr",
+            ),
+            (
+                "core-25.2-inbound-v2",
+                "version wtxidrelay sendaddrv2 verack getaddr",
+            ),
+            (
+                "core-25.2-inbound",
+                "version wtxidrelay sendaddrv2 verack getaddr",
+            ),
             ("core-25.2-outbound-survey-v2", ""),
-            ("core-25.2-outbound-survey", "version wtxidrelay sendaddrv2 verack sendcmpct ping"),
+            (
+                "core-25.2-outbound-survey",
+                "version wtxidrelay sendaddrv2 verack sendcmpct ping",
+            ),
             ("core-25.2-outbound-v2", ""),
-            ("core-25.2-outbound", "version wtxidrelay sendaddrv2 verack sendcmpct ping"),
-            ("core-28.1-inbound-s2", "version wtxidrelay sendaddrv2 verack getaddr"),
-            ("core-28.1-inbound-v2-s2", "version wtxidrelay sendaddrv2 verack getaddr"),
-            ("core-28.1-inbound-v2", "version wtxidrelay sendaddrv2 verack getaddr"),
-            ("core-28.1-inbound", "version wtxidrelay sendaddrv2 verack getaddr"),
-            ("core-28.1-outbound-survey-v2", "version wtxidrelay sendaddrv2 verack sendcmpct ping"),
-            ("core-28.1-outbound-survey", "version wtxidrelay sendaddrv2 verack sendcmpct ping"),
-            ("core-28.1-outbound-v2", "version wtxidrelay sendaddrv2 verack sendcmpct ping"),
-            ("core-28.1-outbound", "version wtxidrelay sendaddrv2 verack sendcmpct ping"),
-            ("core-31.2-inbound-s2", "version wtxidrelay sendaddrv2 verack getaddr"),
-            ("core-31.2-inbound-v2-s2", "version wtxidrelay sendaddrv2 verack getaddr"),
-            ("core-31.2-inbound-v2", "version wtxidrelay sendaddrv2 verack getaddr"),
-            ("core-31.2-inbound", "version wtxidrelay sendaddrv2 verack getaddr"),
-            ("core-31.2-outbound-v2", "version wtxidrelay sendaddrv2 verack sendcmpct ping"),
-            ("core-31.2-outbound", "version wtxidrelay sendaddrv2 verack sendcmpct ping"),
-            ("core-32.1-inbound-s2", "version wtxidrelay sendaddrv2 verack getaddr"),
-            ("core-32.1-inbound-v2-s2", "version wtxidrelay sendaddrv2 verack getaddr"),
-            ("core-32.1-inbound-v2", "version wtxidrelay sendaddrv2 verack getaddr"),
-            ("core-32.1-inbound", "version wtxidrelay sendaddrv2 verack getaddr"),
-            ("core-32.1-outbound-survey-v2", "version wtxidrelay sendaddrv2 verack sendcmpct ping"),
-            ("core-32.1-outbound-survey", "version wtxidrelay sendaddrv2 verack sendcmpct ping"),
-            ("core-32.1-outbound-v2", "version wtxidrelay sendaddrv2 verack sendcmpct ping"),
-            ("core-32.1-outbound", "version wtxidrelay sendaddrv2 verack sendcmpct ping"),
-            ("floresta-0.9.1-inbound-s2", "version sendaddrv2 verack getaddr"),
-            ("floresta-0.9.1-inbound-v2", "version sendaddrv2 verack feefilter getaddr"),
-            ("floresta-0.9.1-inbound", "version sendaddrv2 verack getaddr"),
-            ("knots-28.1.knots20250305-inbound-s2", "version wtxidrelay sendaddrv2 verack getaddr"),
-            ("knots-28.1.knots20250305-inbound-v2-s2", "version wtxidrelay sendaddrv2 verack getaddr"),
-            ("knots-28.1.knots20250305-inbound-v2", "version wtxidrelay sendaddrv2 verack getaddr"),
-            ("knots-28.1.knots20250305-inbound", "version wtxidrelay sendaddrv2 verack getaddr"),
-            ("knots-28.1.knots20250305-outbound-survey-v2", "version wtxidrelay sendaddrv2 verack sendcmpct ping"),
-            ("knots-28.1.knots20250305-outbound-survey", "version wtxidrelay sendaddrv2 verack sendcmpct ping"),
-            ("knots-28.1.knots20250305-outbound-v2", "version wtxidrelay sendaddrv2 verack sendcmpct ping"),
-            ("knots-28.1.knots20250305-outbound", "version wtxidrelay sendaddrv2 verack sendcmpct ping"),
-            ("knots-29.4.3.knots20260508-inbound-s2", "version wtxidrelay sendaddrv2 verack getaddr"),
-            ("knots-29.4.3.knots20260508-inbound-v2-s2", "version wtxidrelay sendaddrv2 verack getaddr"),
-            ("knots-29.4.3.knots20260508-inbound-v2", "version wtxidrelay sendaddrv2 verack getaddr"),
-            ("knots-29.4.3.knots20260508-inbound", "version wtxidrelay sendaddrv2 verack getaddr"),
-            ("knots-29.4.3.knots20260508-outbound-v2", "version wtxidrelay sendaddrv2 verack sendcmpct ping"),
-            ("knots-29.4.3.knots20260508-outbound", "version wtxidrelay sendaddrv2 verack sendcmpct ping"),
+            (
+                "core-25.2-outbound",
+                "version wtxidrelay sendaddrv2 verack sendcmpct ping",
+            ),
+            (
+                "core-28.1-inbound-s2",
+                "version wtxidrelay sendaddrv2 verack getaddr",
+            ),
+            (
+                "core-28.1-inbound-v2-s2",
+                "version wtxidrelay sendaddrv2 verack getaddr",
+            ),
+            (
+                "core-28.1-inbound-v2",
+                "version wtxidrelay sendaddrv2 verack getaddr",
+            ),
+            (
+                "core-28.1-inbound",
+                "version wtxidrelay sendaddrv2 verack getaddr",
+            ),
+            (
+                "core-28.1-outbound-survey-v2",
+                "version wtxidrelay sendaddrv2 verack sendcmpct ping",
+            ),
+            (
+                "core-28.1-outbound-survey",
+                "version wtxidrelay sendaddrv2 verack sendcmpct ping",
+            ),
+            (
+                "core-28.1-outbound-v2",
+                "version wtxidrelay sendaddrv2 verack sendcmpct ping",
+            ),
+            (
+                "core-28.1-outbound",
+                "version wtxidrelay sendaddrv2 verack sendcmpct ping",
+            ),
+            (
+                "core-31.2-inbound-s2",
+                "version wtxidrelay sendaddrv2 verack getaddr",
+            ),
+            (
+                "core-31.2-inbound-v2-s2",
+                "version wtxidrelay sendaddrv2 verack getaddr",
+            ),
+            (
+                "core-31.2-inbound-v2",
+                "version wtxidrelay sendaddrv2 verack getaddr",
+            ),
+            (
+                "core-31.2-inbound",
+                "version wtxidrelay sendaddrv2 verack getaddr",
+            ),
+            (
+                "core-31.2-outbound-v2",
+                "version wtxidrelay sendaddrv2 verack sendcmpct ping",
+            ),
+            (
+                "core-31.2-outbound",
+                "version wtxidrelay sendaddrv2 verack sendcmpct ping",
+            ),
+            (
+                "core-32.1-inbound-s2",
+                "version wtxidrelay sendaddrv2 verack getaddr",
+            ),
+            (
+                "core-32.1-inbound-v2-s2",
+                "version wtxidrelay sendaddrv2 verack getaddr",
+            ),
+            (
+                "core-32.1-inbound-v2",
+                "version wtxidrelay sendaddrv2 verack getaddr",
+            ),
+            (
+                "core-32.1-inbound",
+                "version wtxidrelay sendaddrv2 verack getaddr",
+            ),
+            (
+                "core-32.1-outbound-survey-v2",
+                "version wtxidrelay sendaddrv2 verack sendcmpct ping",
+            ),
+            (
+                "core-32.1-outbound-survey",
+                "version wtxidrelay sendaddrv2 verack sendcmpct ping",
+            ),
+            (
+                "core-32.1-outbound-v2",
+                "version wtxidrelay sendaddrv2 verack sendcmpct ping",
+            ),
+            (
+                "core-32.1-outbound",
+                "version wtxidrelay sendaddrv2 verack sendcmpct ping",
+            ),
+            (
+                "floresta-0.9.1-inbound-s2",
+                "version sendaddrv2 verack getaddr",
+            ),
+            (
+                "floresta-0.9.1-inbound-v2",
+                "version sendaddrv2 verack feefilter getaddr",
+            ),
+            (
+                "floresta-0.9.1-inbound",
+                "version sendaddrv2 verack getaddr",
+            ),
+            (
+                "knots-28.1.knots20250305-inbound-s2",
+                "version wtxidrelay sendaddrv2 verack getaddr",
+            ),
+            (
+                "knots-28.1.knots20250305-inbound-v2-s2",
+                "version wtxidrelay sendaddrv2 verack getaddr",
+            ),
+            (
+                "knots-28.1.knots20250305-inbound-v2",
+                "version wtxidrelay sendaddrv2 verack getaddr",
+            ),
+            (
+                "knots-28.1.knots20250305-inbound",
+                "version wtxidrelay sendaddrv2 verack getaddr",
+            ),
+            (
+                "knots-28.1.knots20250305-outbound-survey-v2",
+                "version wtxidrelay sendaddrv2 verack sendcmpct ping",
+            ),
+            (
+                "knots-28.1.knots20250305-outbound-survey",
+                "version wtxidrelay sendaddrv2 verack sendcmpct ping",
+            ),
+            (
+                "knots-28.1.knots20250305-outbound-v2",
+                "version wtxidrelay sendaddrv2 verack sendcmpct ping",
+            ),
+            (
+                "knots-28.1.knots20250305-outbound",
+                "version wtxidrelay sendaddrv2 verack sendcmpct ping",
+            ),
+            (
+                "knots-29.4.3.knots20260508-inbound-s2",
+                "version wtxidrelay sendaddrv2 verack getaddr",
+            ),
+            (
+                "knots-29.4.3.knots20260508-inbound-v2-s2",
+                "version wtxidrelay sendaddrv2 verack getaddr",
+            ),
+            (
+                "knots-29.4.3.knots20260508-inbound-v2",
+                "version wtxidrelay sendaddrv2 verack getaddr",
+            ),
+            (
+                "knots-29.4.3.knots20260508-inbound",
+                "version wtxidrelay sendaddrv2 verack getaddr",
+            ),
+            (
+                "knots-29.4.3.knots20260508-outbound-v2",
+                "version wtxidrelay sendaddrv2 verack sendcmpct ping",
+            ),
+            (
+                "knots-29.4.3.knots20260508-outbound",
+                "version wtxidrelay sendaddrv2 verack sendcmpct ping",
+            ),
             ("libbitcoin-3.8.0-inbound-s2", "version verack"),
             ("libbitcoin-3.8.0-inbound-v2-s2", "version verack"),
             ("libbitcoin-3.8.0-inbound-v2", "version verack"),
             ("libbitcoin-3.8.0-inbound", "version verack"),
             ("libbitcoin-3.8.0-outbound-v2", ""),
             ("libbitcoin-3.8.0-outbound", "version verack"),
-            ("rbitcoin-0.8.0-inbound-v2-s2", "version wtxidrelay sendaddrv2 verack sendheaders sendcmpct ping"),
-            ("rbitcoin-0.8.0-inbound-v2", "version wtxidrelay sendaddrv2 verack"),
+            (
+                "rbitcoin-0.8.0-inbound-v2-s2",
+                "version wtxidrelay sendaddrv2 verack sendheaders sendcmpct ping",
+            ),
+            (
+                "rbitcoin-0.8.0-inbound-v2",
+                "version wtxidrelay sendaddrv2 verack",
+            ),
             ("rbitcoin-0.8.0-inbound", ""),
-            ("rbitcoin-0.8.0-outbound-v2", "version wtxidrelay sendaddrv2 verack sendheaders sendcmpct ping"),
+            (
+                "rbitcoin-0.8.0-outbound-v2",
+                "version wtxidrelay sendaddrv2 verack sendheaders sendcmpct ping",
+            ),
             ("rbitcoin-0.8.0-outbound", ""),
-            ("rbitcoin-0.8.99-inbound-v2-s2", "version wtxidrelay sendaddrv2 verack sendheaders sendcmpct ping"),
-            ("rbitcoin-0.8.99-inbound-v2", "version wtxidrelay sendaddrv2 verack sendheaders sendcmpct ping"),
-            ("rbitcoin-0.8.99-outbound-survey-v2", "version wtxidrelay sendaddrv2 verack sendheaders sendcmpct ping"),
+            (
+                "rbitcoin-0.8.99-inbound-v2-s2",
+                "version wtxidrelay sendaddrv2 verack sendheaders sendcmpct ping",
+            ),
+            (
+                "rbitcoin-0.8.99-inbound-v2",
+                "version wtxidrelay sendaddrv2 verack sendheaders sendcmpct ping",
+            ),
+            (
+                "rbitcoin-0.8.99-outbound-survey-v2",
+                "version wtxidrelay sendaddrv2 verack sendheaders sendcmpct ping",
+            ),
             ("rbitcoin-0.8.99-outbound-survey", ""),
-            ("rbitcoin-0.8.99-outbound-v2", "version wtxidrelay sendaddrv2 verack sendheaders sendcmpct ping"),
+            (
+                "rbitcoin-0.8.99-outbound-v2",
+                "version wtxidrelay sendaddrv2 verack sendheaders sendcmpct ping",
+            ),
             ("rbitcoin-0.8.99-outbound", ""),
-            ("rbitcoin-0.9.99-inbound-v2-s2", "version wtxidrelay sendaddrv2 verack sendheaders sendcmpct ping"),
-            ("rbitcoin-0.9.99-inbound-v2", "version wtxidrelay sendaddrv2 verack sendheaders sendcmpct ping"),
-            ("rbitcoin-0.9.99-outbound-survey-v2", "version wtxidrelay sendaddrv2 verack sendheaders sendcmpct ping"),
+            (
+                "rbitcoin-0.9.99-inbound-v2-s2",
+                "version wtxidrelay sendaddrv2 verack sendheaders sendcmpct ping",
+            ),
+            (
+                "rbitcoin-0.9.99-inbound-v2",
+                "version wtxidrelay sendaddrv2 verack sendheaders sendcmpct ping",
+            ),
+            (
+                "rbitcoin-0.9.99-outbound-survey-v2",
+                "version wtxidrelay sendaddrv2 verack sendheaders sendcmpct ping",
+            ),
             ("rbitcoin-0.9.99-outbound-survey", ""),
-            ("rbitcoin-0.9.99-outbound-v2", "version wtxidrelay sendaddrv2 verack sendheaders sendcmpct ping"),
+            (
+                "rbitcoin-0.9.99-outbound-v2",
+                "version wtxidrelay sendaddrv2 verack sendheaders sendcmpct ping",
+            ),
             ("rbitcoin-0.9.99-outbound", ""),
-            ("satd-0.7.0-inbound-s2", "version wtxidrelay sendaddrv2 verack sendheaders getheaders"),
-            ("satd-0.7.0-inbound-v2-s2", "version wtxidrelay sendaddrv2 verack sendheaders getheaders"),
-            ("satd-0.7.0-inbound-v2", "version wtxidrelay sendaddrv2 verack sendheaders getheaders"),
-            ("satd-0.7.0-inbound", "version wtxidrelay sendaddrv2 verack sendheaders getheaders"),
-            ("satd-0.7.0-outbound-v2", "version wtxidrelay sendaddrv2 verack getheaders"),
-            ("satd-0.7.0-outbound", "version wtxidrelay sendaddrv2 verack getheaders"),
-            ("satd-0.7.2-inbound-s2", "version wtxidrelay sendaddrv2 verack sendheaders getheaders"),
-            ("satd-0.7.2-inbound-v2-s2", "version wtxidrelay sendaddrv2 verack sendheaders getheaders"),
-            ("satd-0.7.2-inbound-v2", "version wtxidrelay sendaddrv2 verack sendheaders getheaders"),
-            ("satd-0.7.2-inbound", "version wtxidrelay sendaddrv2 verack sendheaders getheaders"),
-            ("satd-0.7.2-outbound-survey-v2", "version wtxidrelay sendaddrv2 verack getheaders"),
-            ("satd-0.7.2-outbound-survey", "version wtxidrelay sendaddrv2 verack getheaders"),
-            ("satd-0.7.2-outbound-v2", "version wtxidrelay sendaddrv2 verack getheaders"),
-            ("satd-0.7.2-outbound", "version wtxidrelay sendaddrv2 verack getheaders"),
-            ("satd-0.8.0-pre-inbound-s2", "version wtxidrelay sendaddrv2 verack sendheaders getheaders"),
-            ("satd-0.8.0-pre-inbound-v2-s2", "version wtxidrelay sendaddrv2 verack sendheaders getheaders"),
-            ("satd-0.8.0-pre-inbound-v2", "version wtxidrelay sendaddrv2 verack sendheaders getheaders"),
-            ("satd-0.8.0-pre-inbound", "version wtxidrelay sendaddrv2 verack sendheaders getheaders"),
-            ("satd-0.8.0-pre-outbound-survey-v2", "version wtxidrelay sendaddrv2 verack getheaders"),
-            ("satd-0.8.0-pre-outbound-survey", "version wtxidrelay sendaddrv2 verack getheaders"),
-            ("satd-0.8.0-pre-outbound-v2", "version wtxidrelay sendaddrv2 verack getheaders"),
-            ("satd-0.8.0-pre-outbound", "version wtxidrelay sendaddrv2 verack getheaders"),
+            (
+                "satd-0.7.0-inbound-s2",
+                "version wtxidrelay sendaddrv2 verack sendheaders getheaders",
+            ),
+            (
+                "satd-0.7.0-inbound-v2-s2",
+                "version wtxidrelay sendaddrv2 verack sendheaders getheaders",
+            ),
+            (
+                "satd-0.7.0-inbound-v2",
+                "version wtxidrelay sendaddrv2 verack sendheaders getheaders",
+            ),
+            (
+                "satd-0.7.0-inbound",
+                "version wtxidrelay sendaddrv2 verack sendheaders getheaders",
+            ),
+            (
+                "satd-0.7.0-outbound-v2",
+                "version wtxidrelay sendaddrv2 verack getheaders",
+            ),
+            (
+                "satd-0.7.0-outbound",
+                "version wtxidrelay sendaddrv2 verack getheaders",
+            ),
+            (
+                "satd-0.7.2-inbound-s2",
+                "version wtxidrelay sendaddrv2 verack sendheaders getheaders",
+            ),
+            (
+                "satd-0.7.2-inbound-v2-s2",
+                "version wtxidrelay sendaddrv2 verack sendheaders getheaders",
+            ),
+            (
+                "satd-0.7.2-inbound-v2",
+                "version wtxidrelay sendaddrv2 verack sendheaders getheaders",
+            ),
+            (
+                "satd-0.7.2-inbound",
+                "version wtxidrelay sendaddrv2 verack sendheaders getheaders",
+            ),
+            (
+                "satd-0.7.2-outbound-survey-v2",
+                "version wtxidrelay sendaddrv2 verack getheaders",
+            ),
+            (
+                "satd-0.7.2-outbound-survey",
+                "version wtxidrelay sendaddrv2 verack getheaders",
+            ),
+            (
+                "satd-0.7.2-outbound-v2",
+                "version wtxidrelay sendaddrv2 verack getheaders",
+            ),
+            (
+                "satd-0.7.2-outbound",
+                "version wtxidrelay sendaddrv2 verack getheaders",
+            ),
+            (
+                "satd-0.8.0-pre-inbound-s2",
+                "version wtxidrelay sendaddrv2 verack sendheaders getheaders",
+            ),
+            (
+                "satd-0.8.0-pre-inbound-v2-s2",
+                "version wtxidrelay sendaddrv2 verack sendheaders getheaders",
+            ),
+            (
+                "satd-0.8.0-pre-inbound-v2",
+                "version wtxidrelay sendaddrv2 verack sendheaders getheaders",
+            ),
+            (
+                "satd-0.8.0-pre-inbound",
+                "version wtxidrelay sendaddrv2 verack sendheaders getheaders",
+            ),
+            (
+                "satd-0.8.0-pre-outbound-survey-v2",
+                "version wtxidrelay sendaddrv2 verack getheaders",
+            ),
+            (
+                "satd-0.8.0-pre-outbound-survey",
+                "version wtxidrelay sendaddrv2 verack getheaders",
+            ),
+            (
+                "satd-0.8.0-pre-outbound-v2",
+                "version wtxidrelay sendaddrv2 verack getheaders",
+            ),
+            (
+                "satd-0.8.0-pre-outbound",
+                "version wtxidrelay sendaddrv2 verack getheaders",
+            ),
         ];
         let names = fixture_names();
         let mut listed: Vec<String> = EXPECTED.iter().map(|(n, _)| n.to_string()).collect();
         listed.sort();
-        assert_eq!(names, listed, "every fixture has a row here, and every row a fixture");
+        assert_eq!(
+            names, listed,
+            "every fixture has a row here, and every row a fixture"
+        );
 
         for (name, want) in EXPECTED {
             let got: Vec<String> = replay_fixture(name).capture.commands().collect();

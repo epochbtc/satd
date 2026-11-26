@@ -26,7 +26,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let bits = 16;
     let prefixes = watcher.prefixes(bits);
 
-    let mut client = StreamClient::builder(endpoint).keepalive_default().connect().await?;
+    let mut client = StreamClient::builder(endpoint)
+        .keepalive_default()
+        .connect()
+        .await?;
     let (watch, mut events) = client.watch().await?;
     watch.add_script_prefixes(prefixes).await?;
 
@@ -35,10 +38,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // The bucket fired; decode and re-filter against our real scripts.
             let hits = watcher.filter(&m)?;
             for f in &hits.funding {
-                println!("funding hit tx={} vout={} value={}", hits.txid, f.vout, f.value);
+                println!(
+                    "funding hit tx={} vout={} value={}",
+                    hits.txid, f.vout, f.value
+                );
             }
             for s in &hits.spending {
-                println!("spend hit tx={} outpoint={}:{}", hits.txid, hex(&s.outpoint.txid), s.outpoint.vout);
+                println!(
+                    "spend hit tx={} outpoint={}:{}",
+                    hits.txid,
+                    hex(&s.outpoint.txid),
+                    s.outpoint.vout
+                );
             }
             if hits.has_unresolved() {
                 // Server didn't retain the prevout script (mempool below the

@@ -160,7 +160,10 @@ pub(crate) struct Subscriber {
 
 impl Subscriber {
     pub(crate) fn matches(&self, topic: &[u8]) -> bool {
-        self.subs.lock().unwrap_or_else(PoisonError::into_inner).matches(topic)
+        self.subs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .matches(topic)
     }
 
     /// Queue `msg` (of `size` bytes), unless the queue is at its high-water
@@ -189,11 +192,17 @@ impl Subscriber {
     }
 
     fn subscribe(&self, prefix: &[u8]) -> io::Result<()> {
-        self.subs.lock().unwrap_or_else(PoisonError::into_inner).add(prefix)
+        self.subs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .add(prefix)
     }
 
     fn cancel(&self, prefix: &[u8]) {
-        self.subs.lock().unwrap_or_else(PoisonError::into_inner).cancel(prefix)
+        self.subs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .cancel(prefix)
     }
 }
 

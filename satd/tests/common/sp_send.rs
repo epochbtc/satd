@@ -23,9 +23,9 @@
 //! **sending** cases. Agreement with the spec is the bar; agreement with our
 //! receiver is what the E2E test then goes on to demonstrate.
 
-use bitcoin::hashes::{sha256, Hash};
-use bitcoin::secp256k1::{All, PublicKey, Scalar, Secp256k1, SecretKey, XOnlyPublicKey};
 use bitcoin::OutPoint;
+use bitcoin::hashes::{Hash, sha256};
+use bitcoin::secp256k1::{All, PublicKey, Scalar, Secp256k1, SecretKey, XOnlyPublicKey};
 
 const TAG_INPUTS: &[u8] = b"BIP0352/Inputs";
 const TAG_SHARED_SECRET: &[u8] = b"BIP0352/SharedSecret";
@@ -170,7 +170,10 @@ pub fn sp_outputs(
     all_outpoints: &[OutPoint],
     recipients: &[SpRecipient],
 ) -> Option<Vec<XOnlyPublicKey>> {
-    assert!(!inputs.is_empty(), "silent payments need at least one contributing input");
+    assert!(
+        !inputs.is_empty(),
+        "silent payments need at least one contributing input"
+    );
     assert!(
         !all_outpoints.is_empty(),
         "all_outpoints must list every input's outpoint, not just the eligible ones"
@@ -181,8 +184,7 @@ pub fn sp_outputs(
     let mut acc = [0u8; 32];
     for inp in inputs {
         let sk = if inp.is_taproot
-            && inp.secret.public_key(secp).x_only_public_key().1
-                == bitcoin::secp256k1::Parity::Odd
+            && inp.secret.public_key(secp).x_only_public_key().1 == bitcoin::secp256k1::Parity::Odd
         {
             inp.secret.negate()
         } else {
@@ -205,8 +207,9 @@ pub fn sp_outputs(
     let input_hash = tagged_hash(TAG_INPUTS, &msg);
 
     // The scalar the recipient's scan key is multiplied by: input_hash · a_sum.
-    let shared_scalar =
-        a_sum.mul_tweak(&Scalar::from_be_bytes(input_hash).ok()?).ok()?;
+    let shared_scalar = a_sum
+        .mul_tweak(&Scalar::from_be_bytes(input_hash).ok()?)
+        .ok()?;
 
     // k counts per scan key, not globally.
     let mut k_by_scan: std::collections::HashMap<[u8; 33], u32> = Default::default();
@@ -214,7 +217,10 @@ pub fn sp_outputs(
     for r in recipients {
         let ecdh = r
             .scan_pubkey
-            .mul_tweak(secp, &Scalar::from_be_bytes(shared_scalar.secret_bytes()).ok()?)
+            .mul_tweak(
+                secp,
+                &Scalar::from_be_bytes(shared_scalar.secret_bytes()).ok()?,
+            )
             .ok()?;
 
         let k = k_by_scan.entry(r.scan_pubkey.serialize()).or_insert(0);
@@ -264,8 +270,7 @@ pub fn input_secret_sum(secp: &Secp256k1<All>, inputs: &[SpInput]) -> Option<Sec
     let mut acc = [0u8; 32];
     for inp in inputs {
         let sk = if inp.is_taproot
-            && inp.secret.public_key(secp).x_only_public_key().1
-                == bitcoin::secp256k1::Parity::Odd
+            && inp.secret.public_key(secp).x_only_public_key().1 == bitcoin::secp256k1::Parity::Odd
         {
             inp.secret.negate()
         } else {
@@ -285,7 +290,9 @@ pub fn dleq_prove(
     aux: &[u8; 32],
 ) -> Option<[u8; 64]> {
     let big_a = a.public_key(secp);
-    let big_c = b.mul_tweak(secp, &Scalar::from_be_bytes(a.secret_bytes()).ok()?).ok()?;
+    let big_c = b
+        .mul_tweak(secp, &Scalar::from_be_bytes(a.secret_bytes()).ok()?)
+        .ok()?;
 
     // t = bytes(32, a) XOR hash_BIP0374/aux(r)
     let aux_hash = tagged_hash(TAG_DLEQ_AUX, aux);
@@ -374,7 +381,10 @@ pub fn fill_bip375(
     }
     for scan in &scan_keys {
         let share = scan
-            .mul_tweak(secp, &Scalar::from_be_bytes(a_sum.secret_bytes()).map_err(|_| "a")?)
+            .mul_tweak(
+                secp,
+                &Scalar::from_be_bytes(a_sum.secret_bytes()).map_err(|_| "a")?,
+            )
             .map_err(|_| "a·B_scan is not a point")?;
         let proof = dleq_prove(secp, &a_sum, scan, &aux).ok_or("could not prove")?;
         raw.global.set(RawPair::new(
@@ -392,7 +402,10 @@ pub fn fill_bip375(
     // The output scripts, `k` counting within each scan key in output order.
     let mut k_by_scan: std::collections::HashMap<[u8; 33], u32> = Default::default();
     for output in &mut raw.outputs {
-        let Some(info) = output.get_single(keys::output::SP_V0_INFO).map(<[u8]>::to_vec) else {
+        let Some(info) = output
+            .get_single(keys::output::SP_V0_INFO)
+            .map(<[u8]>::to_vec)
+        else {
             continue;
         };
         let scan = PublicKey::from_slice(&info[..33]).map_err(|_| "a bad scan key")?;
@@ -448,9 +461,8 @@ pub fn sign_p2wpkh_inputs(
     use satd_psbt::raw::RawPair;
 
     let pubkey = bitcoin::PublicKey::new(secret.public_key(secp));
-    let want = bitcoin::ScriptBuf::new_p2wpkh(
-        &pubkey.wpubkey_hash().map_err(|_| "an uncompressed key")?,
-    );
+    let want =
+        bitcoin::ScriptBuf::new_p2wpkh(&pubkey.wpubkey_hash().map_err(|_| "an uncompressed key")?);
 
     let tx = {
         let view = satd_psbt::V2View::new(raw).map_err(|e| e.to_string())?;
@@ -508,15 +520,31 @@ pub fn build_psbt(
     use satd_psbt::raw::{RawMap, RawPair, RawPsbt};
 
     let mut global = RawMap::new();
-    global.set(RawPair::new(keys::global::VERSION, Vec::new(), 2u32.to_le_bytes().to_vec()));
-    global.set(RawPair::new(keys::global::TX_VERSION, Vec::new(), 2u32.to_le_bytes().to_vec()));
+    global.set(RawPair::new(
+        keys::global::VERSION,
+        Vec::new(),
+        2u32.to_le_bytes().to_vec(),
+    ));
+    global.set(RawPair::new(
+        keys::global::TX_VERSION,
+        Vec::new(),
+        2u32.to_le_bytes().to_vec(),
+    ));
     global.set(RawPair::new(
         keys::global::FALLBACK_LOCKTIME,
         Vec::new(),
         0u32.to_le_bytes().to_vec(),
     ));
-    global.set(RawPair::new(keys::global::INPUT_COUNT, Vec::new(), vec![1u8]));
-    global.set(RawPair::new(keys::global::OUTPUT_COUNT, Vec::new(), vec![2u8]));
+    global.set(RawPair::new(
+        keys::global::INPUT_COUNT,
+        Vec::new(),
+        vec![1u8],
+    ));
+    global.set(RawPair::new(
+        keys::global::OUTPUT_COUNT,
+        Vec::new(),
+        vec![2u8],
+    ));
     // Both modifiable: nothing has committed to the input set yet.
     global.set(RawPair::new(
         keys::global::TX_MODIFIABLE,

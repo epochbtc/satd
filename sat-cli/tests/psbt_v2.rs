@@ -163,15 +163,31 @@ fn sp_psbt(
     let script = ScriptBuf::new_p2wpkh(&pubkey.wpubkey_hash().expect("compressed"));
 
     let mut global = RawMap::new();
-    global.set(RawPair::new(keys::global::VERSION, Vec::new(), 2u32.to_le_bytes().to_vec()));
-    global.set(RawPair::new(keys::global::TX_VERSION, Vec::new(), 2u32.to_le_bytes().to_vec()));
+    global.set(RawPair::new(
+        keys::global::VERSION,
+        Vec::new(),
+        2u32.to_le_bytes().to_vec(),
+    ));
+    global.set(RawPair::new(
+        keys::global::TX_VERSION,
+        Vec::new(),
+        2u32.to_le_bytes().to_vec(),
+    ));
     global.set(RawPair::new(
         keys::global::FALLBACK_LOCKTIME,
         Vec::new(),
         0u32.to_le_bytes().to_vec(),
     ));
-    global.set(RawPair::new(keys::global::INPUT_COUNT, Vec::new(), vec![1u8]));
-    global.set(RawPair::new(keys::global::OUTPUT_COUNT, Vec::new(), vec![1u8]));
+    global.set(RawPair::new(
+        keys::global::INPUT_COUNT,
+        Vec::new(),
+        vec![1u8],
+    ));
+    global.set(RawPair::new(
+        keys::global::OUTPUT_COUNT,
+        Vec::new(),
+        vec![1u8],
+    ));
     global.set(RawPair::new(
         keys::global::TX_MODIFIABLE,
         Vec::new(),
@@ -273,8 +289,12 @@ fn parse(b64: &str) -> RawPsbt {
 fn signpsbtwithkey_does_the_bip375_signers_work() {
     let secp = Secp256k1::new();
     let wallet = wallet_key();
-    let scan = SecretKey::from_slice(&[0x71u8; 32]).unwrap().public_key(&secp);
-    let spend = SecretKey::from_slice(&[0x72u8; 32]).unwrap().public_key(&secp);
+    let scan = SecretKey::from_slice(&[0x71u8; 32])
+        .unwrap()
+        .public_key(&secp);
+    let spend = SecretKey::from_slice(&[0x72u8; 32])
+        .unwrap()
+        .public_key(&secp);
 
     let psbt = sp_psbt(&secp, &wallet, &scan, &spend);
     let (code, stdout, stderr) = run_sign(&psbt, &wallet);
@@ -303,7 +323,11 @@ fn signpsbtwithkey_does_the_bip375_signers_work() {
             .is_some()
     );
     let report = sp::verify(&view, None).expect("verifies");
-    assert_eq!(report.outputs[0].status, sp::OutputStatus::Ready, "{report:?}");
+    assert_eq!(
+        report.outputs[0].status,
+        sp::OutputStatus::Ready,
+        "{report:?}"
+    );
     assert_eq!(report.outputs[0].script_state, sp::ScriptState::Matches);
     assert!(report.extractable());
 
@@ -324,8 +348,12 @@ fn signpsbtwithkey_does_the_bip375_signers_work() {
     // But the share and the script are a function of the keys, so they must
     // not change.
     assert_eq!(
-        signed.global.get(keys::global::SP_ECDH_SHARE, &scan.serialize()),
-        again.global.get(keys::global::SP_ECDH_SHARE, &scan.serialize())
+        signed
+            .global
+            .get(keys::global::SP_ECDH_SHARE, &scan.serialize()),
+        again
+            .global
+            .get(keys::global::SP_ECDH_SHARE, &scan.serialize())
     );
     assert_eq!(
         signed.outputs[0].get_single(keys::output::SCRIPT),
@@ -342,14 +370,21 @@ fn signpsbtwithkey_reports_a_partial_run_rather_than_signing() {
     let wallet = wallet_key();
     let stranger =
         bitcoin::PrivateKey::from_slice(&[0x62u8; 32], bitcoin::Network::Regtest).unwrap();
-    let scan = SecretKey::from_slice(&[0x73u8; 32]).unwrap().public_key(&secp);
-    let spend = SecretKey::from_slice(&[0x74u8; 32]).unwrap().public_key(&secp);
+    let scan = SecretKey::from_slice(&[0x73u8; 32])
+        .unwrap()
+        .public_key(&secp);
+    let spend = SecretKey::from_slice(&[0x74u8; 32])
+        .unwrap()
+        .public_key(&secp);
 
     let psbt = sp_psbt(&secp, &wallet, &scan, &spend);
     let (code, stdout, stderr) = run_sign(&psbt, &stranger);
     assert_eq!(code, 2, "stderr: {stderr}");
     assert!(stderr.contains("still owe an ECDH share"), "{stderr}");
-    assert!(stderr.contains("[0]"), "the message should name the input: {stderr}");
+    assert!(
+        stderr.contains("[0]"),
+        "the message should name the input: {stderr}"
+    );
 
     let out = parse(&stdout);
     // Nothing was signed, and the output still has no script — which is the
@@ -371,8 +406,12 @@ fn signpsbtwithkey_refuses_an_ineligible_transaction() {
 
     let secp = Secp256k1::new();
     let wallet = wallet_key();
-    let scan = SecretKey::from_slice(&[0x75u8; 32]).unwrap().public_key(&secp);
-    let spend = SecretKey::from_slice(&[0x76u8; 32]).unwrap().public_key(&secp);
+    let scan = SecretKey::from_slice(&[0x75u8; 32])
+        .unwrap()
+        .public_key(&secp);
+    let spend = SecretKey::from_slice(&[0x76u8; 32])
+        .unwrap()
+        .public_key(&secp);
 
     let mut psbt = sp_psbt(&secp, &wallet, &scan, &spend);
     psbt.inputs[0].set(RawPair::new(
@@ -399,8 +438,12 @@ fn signpsbtwithkey_refuses_an_ineligible_transaction() {
 fn signpsbtwithkey_refuses_a_share_that_does_not_verify() {
     let secp = Secp256k1::new();
     let wallet = wallet_key();
-    let scan = SecretKey::from_slice(&[0x77u8; 32]).unwrap().public_key(&secp);
-    let spend = SecretKey::from_slice(&[0x78u8; 32]).unwrap().public_key(&secp);
+    let scan = SecretKey::from_slice(&[0x77u8; 32])
+        .unwrap()
+        .public_key(&secp);
+    let spend = SecretKey::from_slice(&[0x78u8; 32])
+        .unwrap()
+        .public_key(&secp);
 
     let mut psbt = sp_psbt(&secp, &wallet, &scan, &spend);
     // Somebody else's share, with a proof that covers nothing.
@@ -430,10 +473,13 @@ fn two_signers_cover_a_transaction_neither_could_alone() {
 
     let secp = Secp256k1::new();
     let first = wallet_key();
-    let second =
-        bitcoin::PrivateKey::from_slice(&[0x63u8; 32], bitcoin::Network::Regtest).unwrap();
-    let scan = SecretKey::from_slice(&[0x79u8; 32]).unwrap().public_key(&secp);
-    let spend = SecretKey::from_slice(&[0x7au8; 32]).unwrap().public_key(&secp);
+    let second = bitcoin::PrivateKey::from_slice(&[0x63u8; 32], bitcoin::Network::Regtest).unwrap();
+    let scan = SecretKey::from_slice(&[0x79u8; 32])
+        .unwrap()
+        .public_key(&secp);
+    let spend = SecretKey::from_slice(&[0x7au8; 32])
+        .unwrap()
+        .public_key(&secp);
 
     let mut psbt = sp_psbt(&secp, &first, &scan, &spend);
     // A second input, belonging to the other signer.
@@ -471,7 +517,11 @@ fn two_signers_cover_a_transaction_neither_could_alone() {
         vec![0u8; 4],
     ));
     psbt.inputs.push(extra);
-    psbt.global.set(RawPair::new(keys::global::INPUT_COUNT, Vec::new(), vec![2u8]));
+    psbt.global.set(RawPair::new(
+        keys::global::INPUT_COUNT,
+        Vec::new(),
+        vec![2u8],
+    ));
 
     // The first signer: a per-input share for its own input, nothing signed.
     let (code, stdout, stderr) = run_sign(&psbt, &first);
@@ -511,22 +561,37 @@ fn two_signers_cover_a_transaction_neither_could_alone() {
     );
     let view = V2View::new(&done).expect("version 2");
     let report = sp::verify(&view, None).expect("verifies");
-    assert_eq!(report.outputs[0].status, sp::OutputStatus::Ready, "{stderr}");
+    assert_eq!(
+        report.outputs[0].status,
+        sp::OutputStatus::Ready,
+        "{stderr}"
+    );
     assert_eq!(report.outputs[0].script_state, sp::ScriptState::Matches);
-    assert_eq!(view.tx_modifiable().unwrap(), 0, "the transaction is frozen");
+    assert_eq!(
+        view.tx_modifiable().unwrap(),
+        0,
+        "the transaction is frozen"
+    );
     // Input 1 is signed; input 0 is not, because this signer does not hold it.
-    assert!(done.inputs[1].contains_type(keys::input::PARTIAL_SIG), "{stderr}");
+    assert!(
+        done.inputs[1].contains_type(keys::input::PARTIAL_SIG),
+        "{stderr}"
+    );
     assert!(!done.inputs[0].contains_type(keys::input::PARTIAL_SIG));
     assert_eq!(code, 2, "one input still unsigned: {stderr}");
 
     // And the first signer, seeing it again, signs its own input. The scripts
     // are already there, so nothing about the transaction moves.
-    let scripts_before = done.outputs[0].get_single(keys::output::SCRIPT).map(<[u8]>::to_vec);
+    let scripts_before = done.outputs[0]
+        .get_single(keys::output::SCRIPT)
+        .map(<[u8]>::to_vec);
     let (code, stdout, stderr) = run_sign(&done, &first);
     assert_eq!(code, 0, "stderr: {stderr}");
     let finished = parse(&stdout);
     assert_eq!(
-        finished.outputs[0].get_single(keys::output::SCRIPT).map(<[u8]>::to_vec),
+        finished.outputs[0]
+            .get_single(keys::output::SCRIPT)
+            .map(<[u8]>::to_vec),
         scripts_before,
         "the output script must not move once it is computed"
     );
@@ -544,7 +609,10 @@ fn fake_signer(tag: &str, reply: &str) -> std::path::PathBuf {
     use std::os::unix::fs::PermissionsExt;
 
     let mut path = std::env::temp_dir();
-    path.push(format!("satcli-fake-signer-{tag}-{}.sh", std::process::id()));
+    path.push(format!(
+        "satcli-fake-signer-{tag}-{}.sh",
+        std::process::id()
+    ));
     let script = format!(
         "#!/bin/sh\nfor a in \"$@\"; do\n  case \"$a\" in\n    enumerate) \
          echo '[{{\"fingerprint\":\"00000000\",\"name\":\"fake\"}}]'; exit 0;;\n    \
@@ -583,11 +651,14 @@ fn run_with_signer(psbt_b64: &str, signer: &std::path::Path) -> (i32, String, St
 /// `sat-cli` must do is check the reply.
 #[test]
 fn an_unaware_signer_may_sign_an_already_computed_silent_payment_psbt() {
-
     let secp = Secp256k1::new();
     let wallet = wallet_key();
-    let scan = SecretKey::from_slice(&[0x7bu8; 32]).unwrap().public_key(&secp);
-    let spend = SecretKey::from_slice(&[0x7cu8; 32]).unwrap().public_key(&secp);
+    let scan = SecretKey::from_slice(&[0x7bu8; 32])
+        .unwrap()
+        .public_key(&secp);
+    let spend = SecretKey::from_slice(&[0x7cu8; 32])
+        .unwrap()
+        .public_key(&secp);
 
     // Another signer has already done the BIP 375 work, so this PSBT is
     // complete except for the signature.
@@ -621,8 +692,12 @@ fn a_signer_that_rewrites_a_silent_payment_script_is_refused() {
 
     let secp = Secp256k1::new();
     let wallet = wallet_key();
-    let scan = SecretKey::from_slice(&[0x7du8; 32]).unwrap().public_key(&secp);
-    let spend = SecretKey::from_slice(&[0x7eu8; 32]).unwrap().public_key(&secp);
+    let scan = SecretKey::from_slice(&[0x7du8; 32])
+        .unwrap()
+        .public_key(&secp);
+    let spend = SecretKey::from_slice(&[0x7eu8; 32])
+        .unwrap()
+        .public_key(&secp);
 
     let psbt = sp_psbt(&secp, &wallet, &scan, &spend);
     let (code, computed, stderr) = run_sign(&psbt, &wallet);
@@ -635,8 +710,7 @@ fn a_signer_that_rewrites_a_silent_payment_script_is_refused() {
         hex::decode("5120000000000000000000000000000000000000000000000000000000000000dead")
             .expect("hex"),
     ));
-    let tampered_b64 =
-        base64::engine::general_purpose::STANDARD.encode(tampered.serialize());
+    let tampered_b64 = base64::engine::general_purpose::STANDARD.encode(tampered.serialize());
 
     let signer = fake_signer("rewrite", &format!(r#"{{"psbt":"{tampered_b64}"}}"#));
     let (code, stdout, stderr) = run_with_signer(&computed, &signer);
@@ -656,9 +730,15 @@ fn a_signer_that_returns_a_different_transaction_is_refused() {
 
     let secp = Secp256k1::new();
     let wallet = wallet_key();
-    let scan = SecretKey::from_slice(&[0x7fu8; 32]).unwrap().public_key(&secp);
-    let spend = SecretKey::from_slice(&[0x80u8; 32]).unwrap().public_key(&secp);
-    let other = SecretKey::from_slice(&[0x81u8; 32]).unwrap().public_key(&secp);
+    let scan = SecretKey::from_slice(&[0x7fu8; 32])
+        .unwrap()
+        .public_key(&secp);
+    let spend = SecretKey::from_slice(&[0x80u8; 32])
+        .unwrap()
+        .public_key(&secp);
+    let other = SecretKey::from_slice(&[0x81u8; 32])
+        .unwrap()
+        .public_key(&secp);
 
     let psbt = sp_psbt(&secp, &wallet, &scan, &spend);
     let sent = base64::engine::general_purpose::STANDARD.encode(psbt.serialize());
@@ -668,8 +748,7 @@ fn a_signer_that_returns_a_different_transaction_is_refused() {
         Vec::new(),
         80_000i64.to_le_bytes().to_vec(),
     ));
-    let different =
-        base64::engine::general_purpose::STANDARD.encode(different.serialize());
+    let different = base64::engine::general_purpose::STANDARD.encode(different.serialize());
 
     let signer = fake_signer("swap", &format!(r#"{{"psbt":"{different}"}}"#));
     let (code, stdout, stderr) = run_with_signer(&sent, &signer);
@@ -691,15 +770,16 @@ fn a_signer_that_refuses_gets_its_message_relayed_with_an_explanation() {
 
     let secp = Secp256k1::new();
     let wallet = wallet_key();
-    let scan = SecretKey::from_slice(&[0x82u8; 32]).unwrap().public_key(&secp);
-    let spend = SecretKey::from_slice(&[0x83u8; 32]).unwrap().public_key(&secp);
+    let scan = SecretKey::from_slice(&[0x82u8; 32])
+        .unwrap()
+        .public_key(&secp);
+    let spend = SecretKey::from_slice(&[0x83u8; 32])
+        .unwrap()
+        .public_key(&secp);
     let psbt = sp_psbt(&secp, &wallet, &scan, &spend);
     let b64 = base64::engine::general_purpose::STANDARD.encode(psbt.serialize());
 
-    let signer = fake_signer(
-        "refuse",
-        r#"{"error":"Unsupported PSBT version"}"#,
-    );
+    let signer = fake_signer("refuse", r#"{"error":"Unsupported PSBT version"}"#);
     let (code, stdout, stderr) = run_with_signer(&b64, &signer);
     assert_eq!(code, 1, "stderr: {stderr}");
     assert!(stderr.contains("Unsupported PSBT version"), "{stderr}");
@@ -734,10 +814,14 @@ fn a_signer_that_restates_a_prevout_is_refused() {
 
     let secp = Secp256k1::new();
     let wallet = wallet_key();
-    let attacker = bitcoin::PrivateKey::from_slice(&[0x86u8; 32], bitcoin::Network::Regtest)
-        .expect("a key");
-    let scan = SecretKey::from_slice(&[0x84u8; 32]).unwrap().public_key(&secp);
-    let spend = SecretKey::from_slice(&[0x85u8; 32]).unwrap().public_key(&secp);
+    let attacker =
+        bitcoin::PrivateKey::from_slice(&[0x86u8; 32], bitcoin::Network::Regtest).expect("a key");
+    let scan = SecretKey::from_slice(&[0x84u8; 32])
+        .unwrap()
+        .public_key(&secp);
+    let spend = SecretKey::from_slice(&[0x85u8; 32])
+        .unwrap()
+        .public_key(&secp);
 
     // What the host sends: one input paying the wallet's key.
     let sent = base64::engine::general_purpose::STANDARD
@@ -757,7 +841,10 @@ fn a_signer_that_restates_a_prevout_is_refused() {
 
     let signer = fake_signer("prevout", &format!(r#"{{"psbt":"{reply}"}}"#));
     let (code, stdout, stderr) = run_with_signer(&sent, &signer);
-    assert_eq!(code, 1, "it verifies internally, so only the comparison catches it: {stderr}");
+    assert_eq!(
+        code, 1,
+        "it verifies internally, so only the comparison catches it: {stderr}"
+    );
     assert!(
         stderr.contains("changed what input 0 spends")
             || stderr.contains("changed the public key bound to input 0"),
@@ -781,8 +868,12 @@ fn a_signer_that_finalizes_a_scriptsig_before_the_scripts_is_refused() {
 
     let secp = Secp256k1::new();
     let wallet = wallet_key();
-    let scan = SecretKey::from_slice(&[0x87u8; 32]).unwrap().public_key(&secp);
-    let spend = SecretKey::from_slice(&[0x88u8; 32]).unwrap().public_key(&secp);
+    let scan = SecretKey::from_slice(&[0x87u8; 32])
+        .unwrap()
+        .public_key(&secp);
+    let spend = SecretKey::from_slice(&[0x88u8; 32])
+        .unwrap()
+        .public_key(&secp);
 
     // Uncomputed: the output carries its scan and spend keys and no script.
     let psbt = sp_psbt(&secp, &wallet, &scan, &spend);
@@ -800,10 +891,7 @@ fn a_signer_that_finalizes_a_scriptsig_before_the_scripts_is_refused() {
     let signer = fake_signer("scriptsig", &format!(r#"{{"psbt":"{tampered_b64}"}}"#));
     let (code, stdout, stderr) = run_with_signer(&sent, &signer);
     assert_eq!(code, 1, "stderr: {stderr}");
-    assert!(
-        stderr.contains("still has no script"),
-        "{stderr}"
-    );
+    assert!(stderr.contains("still has no script"), "{stderr}");
     assert!(stdout.is_empty(), "nothing should have been emitted");
     std::fs::remove_file(&signer).ok();
 }
@@ -829,12 +917,19 @@ fn a_signer_may_declare_a_key_the_psbt_did_not_have() {
 
     let secp = Secp256k1::new();
     let wallet = wallet_key();
-    let scan = SecretKey::from_slice(&[0x89u8; 32]).unwrap().public_key(&secp);
-    let spend = SecretKey::from_slice(&[0x8au8; 32]).unwrap().public_key(&secp);
+    let scan = SecretKey::from_slice(&[0x89u8; 32])
+        .unwrap()
+        .public_key(&secp);
+    let spend = SecretKey::from_slice(&[0x8au8; 32])
+        .unwrap()
+        .public_key(&secp);
 
     // A PSBT as the node builds one: prevout known, no key declared.
     let mut bare = sp_psbt(&secp, &wallet, &scan, &spend);
-    bare.inputs[0].remove(keys::input::BIP32_DERIVATION, &wallet.public_key(&secp).to_bytes());
+    bare.inputs[0].remove(
+        keys::input::BIP32_DERIVATION,
+        &wallet.public_key(&secp).to_bytes(),
+    );
     assert!(
         !bare.inputs[0].contains_type(keys::input::BIP32_DERIVATION),
         "the point of this test is a PSBT that names no key"
@@ -851,7 +946,13 @@ fn a_signer_may_declare_a_key_the_psbt_did_not_have() {
 
     let signer = fake_signer("declares", &format!(r#"{{"psbt":"{reply}"}}"#));
     let (code, stdout, stderr) = run_with_signer(&sent, &signer);
-    assert_eq!(code, 0, "a signer declaring its own key must not be refused: {stderr}");
-    assert!(!stdout.is_empty(), "the signed PSBT should have been emitted");
+    assert_eq!(
+        code, 0,
+        "a signer declaring its own key must not be refused: {stderr}"
+    );
+    assert!(
+        !stdout.is_empty(),
+        "the signed PSBT should have been emitted"
+    );
     std::fs::remove_file(&signer).ok();
 }
