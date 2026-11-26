@@ -395,8 +395,9 @@ blockstream.info and mempool.space within these constraints:
   being in the row that funded it) read the script's whole history, so
   they are capped: a script whose confirmed history holds more than 200,000
   transactions gets 400 `Too many history entries (more than 200000
-  transactions)`, as mempool.space's electrs answers above its history
-  limit. Opening `/address/:addr/sse` or `/scripthash/:hash/sse` for such a
+  transactions)`. The wording is Blockstream electrs' history-cap error;
+  mempool.space's electrs words its cap differently (`Too many history
+  transactions (>N)`). Opening `/address/:addr/sse` or `/scripthash/:hash/sse` for such a
   script gets the same 400: its status is not recomputed above the cap, so
   the stream would carry no events, and a stream already open for a script
   that grows past the cap stops receiving them. The refusal counts the history's transactions and stops at the
