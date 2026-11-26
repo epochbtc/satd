@@ -2697,15 +2697,16 @@ async fn a_proxy_whose_targets_never_answer_is_taken_as_down() {
     assert_eq!(run.proxy_failures.load(Ordering::Relaxed), 2);
 }
 
-/// A refusal (0x05, and 0x02) proves the proxy reaches the network: it is
-/// the target's failed dial, never counts toward the silent streak, and
-/// resets it, so a streak one short of the limit does not trip on it nor on
-/// the silent failure after it. A refusal also ends an outage.
+/// A refusal (0x05) proves the proxy reaches the network: it is the
+/// target's failed dial, never counts toward the silent streak, and resets
+/// it, so a streak one short of the limit does not trip on it nor on the
+/// silent failure after it. A refusal also ends an outage.
 /// Perturbation: count a refusal toward the streak and it trips here.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_refusal_resets_the_silent_streak() {
     use super::crawl_conn::PROXY_SILENT_STREAK;
-    for code in [0x05u8, 0x02] {
+    {
+        let code = 0x05u8;
         let (pm, _dir) = mk_pm_with(None);
         let proxy = test_proxy(ProxyMode::Refuse(code)).await;
         let run = enable(&pm, with_crawl_proxy(proxy.addr));
@@ -2729,4 +2730,39 @@ async fn a_refusal_resets_the_silent_streak() {
         crawl_once(&pm, &loopback_target(3)).await;
         assert!(!run.proxy_down.load(Ordering::Relaxed), "a refusal ends an outage");
     }
+}
+
+/// A proxy answering 0x02 (not allowed by ruleset) for everything decides by
+/// its own policy, never asking a target, so it proves nothing of its
+/// uplink: each such dial is its target's failure below the streak, counts
+/// toward it, trips it at `PROXY_SILENT_STREAK`, and while the proxy is down
+/// is released like any silent failure; 0x02 never ends the outage.
+/// Perturbation: put 0x02 back among the refusals and the streak never
+/// trips here.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_proxy_ruling_out_every_target_trips_the_silent_streak() {
+    use super::crawl_conn::PROXY_SILENT_STREAK;
+    let (pm, _dir) = mk_pm_with(None);
+    let proxy = test_proxy(ProxyMode::Refuse(0x02)).await;
+    let run = enable(&pm, with_crawl_proxy(proxy.addr));
+    let below = loopback_target(1);
+    crawl_once(&pm, &below).await;
+    assert_eq!(failures_of(&pm, &below), 1, "below the streak: the target's");
+    assert_eq!(run.proxy_silent_streak.load(Ordering::Relaxed), 1, "it counts");
+    for _ in 0..PROXY_SILENT_STREAK - 2 {
+        let _ = pm.crawl_dial(&loopback_target(2), Duration::from_secs(2)).await;
+    }
+    let trips = loopback_target(3);
+    run.book.lock().seed(trips.clone(), 0, crate::time::now_secs());
+    let before = record_of(&pm, &trips);
+    crawl_once(&pm, &trips).await;
+    assert!(run.proxy_down.load(Ordering::Relaxed), "0x02 for everything trips the streak");
+    assert_eq!(run.proxy_failures.load(Ordering::Relaxed), 1);
+    assert_eq!(record_of(&pm, &trips), before, "released");
+    let next = loopback_target(4);
+    run.book.lock().seed(next.clone(), 0, crate::time::now_secs());
+    let before = record_of(&pm, &next);
+    crawl_once(&pm, &next).await;
+    assert_eq!(record_of(&pm, &next), before, "released while down");
+    assert!(run.proxy_down.load(Ordering::Relaxed), "0x02 does not end the outage");
 }

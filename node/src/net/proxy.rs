@@ -116,14 +116,16 @@ pub enum Socks5Failure {
     /// a malformed reply). Nothing is known of the target.
     Proxy(String),
     /// The proxy took the CONNECT and got no answer from the target: reply
-    /// 0x01 (general failure), 0x03 (network unreachable), 0x04 (host
-    /// unreachable) or 0x06 (TTL expired), no reply by the deadline, or the
-    /// proxy closing the connection instead of replying. The target's, but
-    /// also what a proxy whose own uplink is down gives for every target.
+    /// 0x01 (general failure), 0x02 (not allowed by ruleset: the proxy's
+    /// own policy, given without contacting the target), 0x03 (network
+    /// unreachable), 0x04 (host unreachable) or 0x06 (TTL expired), no
+    /// reply by the deadline, or the proxy closing the connection instead
+    /// of replying. The target's, but also what a proxy whose own uplink is
+    /// down gives for every target.
     Target(String),
-    /// The target answered, with a refusal: reply 0x02 (not allowed by
-    /// ruleset) or 0x05 (connection refused). The target's, and proof that
-    /// the proxy reaches the network.
+    /// The target answered, with a refusal: reply 0x05 (connection
+    /// refused). The target's, and proof that the proxy reaches the
+    /// network.
     Refused(String),
 }
 
@@ -236,7 +238,7 @@ pub async fn connect_socks5_staged(
     };
     if let Some(reason) = reason {
         let why = format!("{target}: {reason} (SOCKS5 reply {:#04x})", head[1]);
-        return Err(if matches!(head[1], 0x02 | 0x05) {
+        return Err(if head[1] == 0x05 {
             Socks5Failure::Refused(why)
         } else {
             Socks5Failure::Target(why)
@@ -641,7 +643,8 @@ mod tests {
     /// (0x07, 0x08, an unassigned code) too, and a request the proxy does
     /// not take by the deadline. Replies 0x01, 0x03, 0x04 and 0x06, no reply
     /// in time, and a close instead of a reply are the target's, no answer;
-    /// 0x02 and 0x05 the target's, a refusal.
+    /// 0x02 (the proxy's ruleset, which never asked the target) too; 0x05
+    /// the target's, a refusal.
     /// Perturbation: map 0x05 to `Proxy` and the refused case fails here;
     /// leave the request's write unbounded and the blocked write outlives
     /// the test's own bound.
@@ -674,12 +677,12 @@ mod tests {
             let got = staged(p, "203.0.113.7:8333").await;
             assert!(matches!(got, Err(Socks5Failure::Proxy(_))), "{code:#04x}: {got:?}");
         }
-        for code in [0x01u8, 0x03, 0x04, 0x06] {
+        for code in [0x01u8, 0x02, 0x03, 0x04, 0x06] {
             let (p, _t) = staged_proxy(Staged::Reply(code)).await;
             let got = staged(p, "203.0.113.7:8333").await;
             assert!(matches!(got, Err(Socks5Failure::Target(_))), "{code:#04x}: {got:?}");
         }
-        for code in [0x02u8, 0x05] {
+        for code in [0x05u8] {
             let (p, _t) = staged_proxy(Staged::Reply(code)).await;
             let got = staged(p, "203.0.113.7:8333").await;
             assert!(matches!(got, Err(Socks5Failure::Refused(_))), "{code:#04x}: {got:?}");

@@ -97,8 +97,9 @@
 //! or no reply in time) is the target's, as a failed direct dial is, with
 //! one backstop: [`PROXY_SILENT_STREAK`] dials in a row with no answer from
 //! any target (no success, no refusal) put the proxy down too, and while
-//! it is down such a dial is the proxy's. A success or a refusal (0x02,
-//! 0x05) ends the outage.
+//! it is down such a dial is the proxy's. A success or a refusal (0x05)
+//! ends the outage; 0x02, the proxy's own ruleset, proves nothing of its
+//! uplink and counts as no answer.
 //!
 //! # Failure
 //!
@@ -201,7 +202,7 @@ impl CrawlRun {
         }
     }
 
-    /// A proxied dial got no answer from its target (reply 0x01, 0x03,
+    /// A proxied dial got no answer from its target (reply 0x01, 0x02, 0x03,
     /// 0x04, 0x06, no reply, or a close instead of one). Whether it is
     /// taken as the proxy's failure: while the proxy is down, or when it
     /// makes [`PROXY_SILENT_STREAK`] such dials in a row with no success
@@ -237,7 +238,7 @@ impl CrawlRun {
 pub(super) const PROXY_PAUSE: Duration = Duration::from_secs(5);
 
 /// Proxied dials in a row that got no answer from their target (reply
-/// 0x01, 0x03, 0x04 or 0x06, no reply, a close instead of one), with no
+/// 0x01, 0x02, 0x03, 0x04 or 0x06, no reply, a close instead of one), with no
 /// success and no refusal between them, after which the proxy is taken as
 /// down: a SOCKS server that greets but whose own uplink is down answers
 /// every CONNECT that way, and charging each to its target would decay the

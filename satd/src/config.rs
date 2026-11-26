@@ -9097,10 +9097,11 @@ fn resolve_crawl(
 
 /// `-crawlproxy` must not be the node's Tor proxy (`-proxy` or `-onion`):
 /// the clearnet crawl would leave through Tor exits, which the crawl never
-/// does. Compared as socket addresses, the IP canonical (`[::ffff:a.b.c.d]`
-/// is `a.b.c.d`), so another spelling of one address is caught. A `-proxy`
-/// or `-onion` given as a host name and port is not resolved for this, so
-/// it is not compared.
+/// does. Each of `-proxy` and `-onion` is taken as an IP address and port
+/// or, failing that, resolved once here as a host name and port
+/// (`ToSocketAddrs`); a value that resolves to nothing (no port, an
+/// unknown name, no resolver) is not refused on that basis. Nothing is
+/// resolved without `-crawlproxy`.
 fn check_crawlproxy_not_tor(
     crawlproxy: Option<std::net::SocketAddr>,
     proxy: Option<&str>,
@@ -9109,12 +9110,29 @@ fn check_crawlproxy_not_tor(
     let Some(crawl) = crawlproxy else {
         return Ok(());
     };
-    let canonical = |sa: std::net::SocketAddr| (sa.ip().to_canonical(), sa.port());
-    for (flag, value) in [("-proxy", proxy), ("-onion", onion)] {
-        let Some(sa) = value.and_then(|v| v.trim().parse::<std::net::SocketAddr>().ok()) else {
-            continue;
+    let resolve = |value: Option<&str>| -> Vec<std::net::SocketAddr> {
+        use std::net::ToSocketAddrs as _;
+        let Some(v) = value.map(str::trim) else {
+            return Vec::new();
         };
-        if canonical(sa) == canonical(crawl) {
+        if let Ok(sa) = v.parse::<std::net::SocketAddr>() {
+            return vec![sa];
+        }
+        v.to_socket_addrs().map(Iterator::collect).unwrap_or_default()
+    };
+    crawlproxy_clashes(crawl, &[("-proxy", resolve(proxy)), ("-onion", resolve(onion))])
+}
+
+/// Whether `crawl` is any of the addresses each Tor proxy option resolved
+/// to, compared as socket addresses with the IP canonical (`[::ffff:a.b.c.d]`
+/// is `a.b.c.d`), so another spelling of one address is caught.
+fn crawlproxy_clashes(
+    crawl: std::net::SocketAddr,
+    tor: &[(&str, Vec<std::net::SocketAddr>)],
+) -> Result<(), String> {
+    let canonical = |sa: &std::net::SocketAddr| (sa.ip().to_canonical(), sa.port());
+    for (flag, addrs) in tor {
+        if addrs.iter().any(|sa| canonical(sa) == canonical(&crawl)) {
             return Err(format!(
                 "-crawlproxy must not be the Tor proxy ({flag}): the clearnet crawl would go through Tor exits"
             ));
@@ -13550,7 +13568,7 @@ blockmintxfee=0.00001
         std::fs::write(dir.path().join("bitcoin.conf"), "").unwrap();
 
         // Never the Tor proxy: -proxy or -onion at the same address, in
-        // another spelling too. A name is not resolved, so not compared.
+        // another spelling too.
         for tor in [
             "-proxy=127.0.0.1:9050",
             "-onion=127.0.0.1:9050",
@@ -13563,7 +13581,56 @@ blockmintxfee=0.00001
             .expect_err("the crawl proxy spelled another way");
         assert!(err.contains("Tor exits"), "{err}");
         assert!(load(&["-proxy=127.0.0.1:9050", "-crawlproxy=127.0.0.1:1081"]).is_ok());
-        assert!(load(&["-proxy=localhost:9050", "-crawlproxy=127.0.0.1:9050"]).is_ok());
+        // A host name is resolved: whatever this host's `localhost` names
+        // first is refused, and a name that resolves to nothing is not.
+        use std::net::ToSocketAddrs as _;
+        if let Some(local) = "localhost:9050".to_socket_addrs().ok().and_then(|mut a| a.next()) {
+            let err = load(&["-proxy=localhost:9050", &format!("-crawlproxy={local}")])
+                .expect_err("a -proxy host name is resolved");
+            assert!(err.contains("(-proxy)"), "{err}");
+            let err = load(&["-onion=localhost:9050", &format!("-crawlproxy={local}")])
+                .expect_err("an -onion host name is resolved");
+            assert!(err.contains("(-onion)"), "{err}");
+        }
+        assert!(load(&["-proxy=proxy.invalid:9050", "-crawlproxy=127.0.0.1:9050"]).is_ok());
+    }
+
+    /// The comparison against resolved addresses: any of a name's addresses
+    /// matching `-crawlproxy`, canonically, is refused; none matching is
+    /// not; an option that resolved to nothing never refuses.
+    #[test]
+    fn crawlproxy_clashes_with_any_resolved_tor_address() {
+        let localhost: Vec<std::net::SocketAddr> =
+            vec!["127.0.0.1:9050".parse().unwrap(), "[::1]:9050".parse().unwrap()];
+        for crawl in ["127.0.0.1:9050", "[::1]:9050", "[::ffff:127.0.0.1]:9050"] {
+            let err = crawlproxy_clashes(
+                crawl.parse().unwrap(),
+                &[("-proxy", localhost.clone()), ("-onion", Vec::new())],
+            )
+            .expect_err(crawl);
+            assert!(err.contains("(-proxy)"), "{crawl}: {err}");
+        }
+        let err = crawlproxy_clashes(
+            "[::1]:9050".parse().unwrap(),
+            &[("-proxy", Vec::new()), ("-onion", localhost.clone())],
+        )
+        .unwrap_err();
+        assert!(err.contains("(-onion)"), "{err}");
+        assert!(
+            crawlproxy_clashes(
+                "127.0.0.1:1081".parse().unwrap(),
+                &[("-proxy", localhost.clone()), ("-onion", localhost)],
+            )
+            .is_ok()
+        );
+        assert!(
+            crawlproxy_clashes(
+                "127.0.0.1:9050".parse().unwrap(),
+                &[("-proxy", Vec::new()), ("-onion", Vec::new())],
+            )
+            .is_ok(),
+            "unresolved: not refused"
+        );
     }
 
     /// The crawl's export options: `crawlexportkeyfile` relative to the

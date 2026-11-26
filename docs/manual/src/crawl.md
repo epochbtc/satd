@@ -285,8 +285,9 @@ SOCKS5 proxy, so the crawl's source address is the proxy host's and the
 node stays where it is. The proxy must be one that is not a Tor exit:
 `-crawlproxy` at the address of `-proxy` or `-onion` is refused at
 startup (compared as addresses, so `[::ffff:127.0.0.1]:9050` matches
-`127.0.0.1:9050`; a `-proxy` given as a host name is not resolved for the
-check).
+`127.0.0.1:9050`; a `-proxy` or `-onion` given as a host name and port is
+resolved once at startup and refused if any of its addresses matches, and
+one that does not resolve is not refused on that basis).
 
 The best setup is a SOCKS5 server on the far host, bound to its
 loopback, reached through an SSH tunnel:
@@ -327,10 +328,11 @@ crawlproxy=127.0.0.1:1081
   fails and once when it answers again.
 - **A proxy that greets but reaches nothing** (its host's own uplink
   down) answers every CONNECT with no reply, 0x01, 0x03, 0x04 or 0x06.
-  After 200 such dials in a row, with no success and no refusal (0x02,
-  0x05) between them, the crawl takes the proxy as down, as above; while
-  it is down such a dial is the proxy's, and a success or a refusal ends
-  the outage. At most 199 dials of such an outage are recorded against
+  After 200 such dials in a row, with no success and no refusal (0x05)
+  between them, the crawl takes the proxy as down, as above; while it is
+  down such a dial is the proxy's, and a success or a refusal ends the
+  outage. 0x02 (not allowed by ruleset) comes from the proxy's own policy
+  without asking the target, so it counts toward the 200 too. At most 199 dials of such an outage are recorded against
   their targets before it is seen.
 - **Proxy or target.** A failure to reach the proxy, a failed SOCKS5
   greeting, or a CONNECT the proxy cannot serve (reply 0x07 command not
