@@ -244,6 +244,13 @@ pub struct TxJson {
     /// from "we can't tell" (review L4). `Some(0)` for coinbase txs.
     pub fee: Option<u64>,
     pub status: TxStatusJson,
+    /// The transaction's BIP 141 sigop cost, as Bitcoin Core's
+    /// `GetTransactionSigOpCost` counts it (see [`sigop_cost`]). Not in
+    /// upstream Esplora; rbitcoin's Esplora serves it under this name.
+    /// For an OP_RETURN-stripped transaction it is counted over the
+    /// stored scripts, so it leaves out any sigop opcodes a stripped
+    /// script held outside its pushes (none in a standard one).
+    pub sigops: u64,
     /// satd extension, present (and `true`) only on a transaction whose
     /// OP_RETURN payloads were stripped from this node's block files.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
@@ -467,22 +474,26 @@ fn build_tx_json(
     let mut vin = Vec::with_capacity(tx.input.len());
     let mut sum_inputs: u64 = 0;
     let mut have_all_prevouts = true;
+    // The output each input spends, for the sigop cost.
+    let mut spent: Vec<Option<bitcoin::TxOut>> = Vec::with_capacity(tx.input.len());
     for input in &tx.input {
         let is_coinbase = input.previous_output.is_null();
-        let prevout = if is_coinbase {
+        let spent_output = if is_coinbase {
             None
         } else {
-            match resolve_prev_output(state, &input.previous_output) {
-                Some(out) => {
-                    sum_inputs += out.value.to_sat();
-                    Some(prevout_json(&out, state.network))
-                }
-                None => {
-                    have_all_prevouts = false;
-                    None
-                }
+            resolve_prev_output(state, &input.previous_output)
+        };
+        let prevout = match &spent_output {
+            Some(out) => {
+                sum_inputs += out.value.to_sat();
+                Some(prevout_json(out, state.network))
+            }
+            None => {
+                have_all_prevouts &= is_coinbase;
+                None
             }
         };
+        spent.push(spent_output);
         let witness: Vec<String> = input.witness.iter().map(hex::encode).collect();
         vin.push(VinJson {
             // Always emit txid/vout from the outpoint. For coinbase the
@@ -553,8 +564,42 @@ fn build_tx_json(
         weight: tx.weight().to_wu() as u32,
         fee,
         status,
+        // A stripped output's script is zero-filled past its `OP_RETURN`,
+        // which counts no sigops. Pushed data never counted, so this is the
+        // original cost unless the script held bare sigop opcodes, which a
+        // standard `OP_RETURN` output cannot.
+        sigops: sigop_cost(tx, &spent),
         opreturn_stripped: view.stripped.is_some(),
     })
+}
+
+/// The `sigops` field: Bitcoin Core's `GetTransactionSigOpCost` under the
+/// P2SH and witness rules, from the counter block validation and the mempool
+/// use. Legacy sigops (every scriptSig and output script, a multisig opcode
+/// counting 20) cost 4 each, the sigops of a P2SH redeem script 4 each, and
+/// those of a witness program (1 for P2WPKH, the witness script's for P2WSH,
+/// either under P2SH too) 1 each. A taproot spend costs nothing.
+///
+/// `spent` holds the output each input spends. An input whose output could
+/// not be found adds no P2SH or witness sigops, as in rbitcoin's Esplora:
+/// the cost is then a lower bound, and the transaction's `fee` is `null`.
+/// A coinbase costs its legacy sigops.
+fn sigop_cost(tx: &Transaction, spent: &[Option<bitcoin::TxOut>]) -> u64 {
+    // An empty script is neither P2SH nor a witness program.
+    let prevouts: Vec<bitcoin::TxOut> = spent
+        .iter()
+        .map(|out| {
+            out.clone().unwrap_or(bitcoin::TxOut {
+                value: bitcoin::Amount::ZERO,
+                script_pubkey: bitcoin::ScriptBuf::new(),
+            })
+        })
+        .collect();
+    node::validation::sigops::transaction_sigop_cost(
+        tx,
+        &prevouts,
+        node::validation::sigops::SigOpFlags::P2shWitness,
+    )
 }
 
 fn prevout_json(out: &bitcoin::TxOut, network: Network) -> PrevOutJson {
@@ -686,3 +731,7 @@ fn _block_unused(_: Block) {}
 #[cfg(test)]
 #[path = "tx_esplorapaging_tests.rs"]
 mod esplorapaging_tests;
+
+#[cfg(test)]
+#[path = "tx_sigops_tests.rs"]
+mod sigops_tests;

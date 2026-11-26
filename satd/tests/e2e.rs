@@ -51,6 +51,10 @@ mod esplora_block_summary;
 // the transactions themselves.
 #[path = "e2e/esplora_address_summary.rs"]
 mod esplora_address_summary;
+// Esplora `sigops` in the transaction JSON for each kind of spend, and
+// `GET /txs/outspends` against the single-transaction route.
+#[path = "e2e/esplora_sigops_outspends.rs"]
+mod esplora_sigops_outspends;
 #[path = "e2e/electrum_asof.rs"]
 mod electrum_asof;
 // Electrum protocol 1.6: package broadcast (CPFP) and the canonical mempool
