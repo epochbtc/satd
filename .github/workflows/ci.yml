@@ -429,8 +429,13 @@ jobs:
         with:
           profile: minimal
           toolchain: 1.93
-          components: clippy
+          components: clippy, rustfmt
           override: true
+
+      # `cargo fmt` is the source of truth (CONTRIBUTING.md). Cheap, so it
+      # runs before the cache restore and fails fast.
+      - name: Check formatting
+        run: cargo fmt --all -- --check
 
       # Caches ~/.cargo/{registry,git,bin} AND target/, pruning the
       # fast-changing first-party crate artifacts so the expensive dependency

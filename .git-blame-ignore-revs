@@ -1,0 +1,6 @@
+# Commits that only reformat code. `git blame` skips them when run with
+#   git config blame.ignoreRevsFile .git-blame-ignore-revs
+# GitHub's blame view reads this file automatically.
+
+# chore: cargo fmt --all (#1392)
+750e5c4e14801b883db23b9d62cae0be99d7c772

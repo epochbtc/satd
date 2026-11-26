@@ -72,7 +72,10 @@ are not required to. Verification details are in `SECURITY.md`.
 
 ## Code style
 
-- Edition 2024 Rust. `cargo fmt` is the source of truth.
+- Edition 2024 Rust. `cargo fmt` is the source of truth; CI's Lint job runs
+  `cargo fmt --all -- --check`. Formatting-only commits are listed in
+  `.git-blame-ignore-revs`; run `git config blame.ignoreRevsFile .git-blame-ignore-revs`
+  once so `git blame` skips them.
 - `clippy` runs with `-D warnings` in CI; fix or `#[allow]` with a brief
   justification comment.
 - Errors use `thiserror`. No `unwrap()` / `expect()` in non-test code
