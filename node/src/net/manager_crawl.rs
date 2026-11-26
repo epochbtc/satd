@@ -228,7 +228,9 @@ impl CrawlRun {
     fn proxy_answered(&self) {
         self.proxy_silent_streak.store(0, Ordering::Relaxed);
         if self.proxy_down.swap(false, Ordering::Relaxed) {
-            tracing::info!("The crawl proxy (-crawlproxy) answers again: clearnet crawl dials resume");
+            tracing::info!(
+                "The crawl proxy (-crawlproxy) answers again: clearnet crawl dials resume"
+            );
         }
     }
 }

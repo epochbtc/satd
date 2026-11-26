@@ -9134,9 +9134,14 @@ fn check_crawlproxy_not_tor(
         if !resolve_names {
             return Vec::new();
         }
-        v.to_socket_addrs().map(Iterator::collect).unwrap_or_default()
+        v.to_socket_addrs()
+            .map(Iterator::collect)
+            .unwrap_or_default()
     };
-    crawlproxy_clashes(crawl, &[("-proxy", resolve(proxy)), ("-onion", resolve(onion))])
+    crawlproxy_clashes(
+        crawl,
+        &[("-proxy", resolve(proxy)), ("-onion", resolve(onion))],
+    )
 }
 
 /// Whether `crawl` is any of the addresses each Tor proxy option resolved
@@ -13570,7 +13575,10 @@ blockmintxfee=0.00001
         let c = load(&[]).unwrap();
         assert_eq!(c.crawlproxy, None);
         assert_eq!(c.crawl_config(None).proxy, None);
-        assert_eq!(c.effective_view()["crawl"]["proxy"], serde_json::Value::Null);
+        assert_eq!(
+            c.effective_view()["crawl"]["proxy"],
+            serde_json::Value::Null
+        );
 
         let c = load(&["-crawlproxy=127.0.0.1:1081"]).unwrap();
         let want: std::net::SocketAddr = "127.0.0.1:1081".parse().unwrap();
@@ -13594,7 +13602,11 @@ blockmintxfee=0.00001
             assert!(err.contains("-crawlproxy"), "{bad}: {err}");
         }
 
-        std::fs::write(dir.path().join("bitcoin.conf"), "crawlproxy=192.0.2.7:1080\n").unwrap();
+        std::fs::write(
+            dir.path().join("bitcoin.conf"),
+            "crawlproxy=192.0.2.7:1080\n",
+        )
+        .unwrap();
         assert_eq!(
             load(&[]).unwrap().crawlproxy,
             Some("192.0.2.7:1080".parse().unwrap()),
@@ -13612,10 +13624,16 @@ blockmintxfee=0.00001
             "-proxy=[::ffff:127.0.0.1]:9050",
         ] {
             let err = load(&[tor, "-crawlproxy=127.0.0.1:9050"]).expect_err(tor);
-            assert!(err.contains("-crawlproxy must not be the Tor proxy"), "{tor}: {err}");
+            assert!(
+                err.contains("-crawlproxy must not be the Tor proxy"),
+                "{tor}: {err}"
+            );
         }
-        let err = load(&["-proxy=127.0.0.1:9050", "-crawlproxy=[::ffff:127.0.0.1]:9050"])
-            .expect_err("the crawl proxy spelled another way");
+        let err = load(&[
+            "-proxy=127.0.0.1:9050",
+            "-crawlproxy=[::ffff:127.0.0.1]:9050",
+        ])
+        .expect_err("the crawl proxy spelled another way");
         assert!(err.contains("Tor exits"), "{err}");
         // Loopback in the other family, or another loopback address, is the
         // same host: one Tor daemon may listen on all of them.
@@ -13634,14 +13652,22 @@ blockmintxfee=0.00001
         // is read (a reload must not wait on a lookup); a name that
         // resolves to nothing is not refused.
         use std::net::ToSocketAddrs as _;
-        if let Some(local) = "localhost:9050".to_socket_addrs().ok().and_then(|mut a| a.next()) {
+        if let Some(local) = "localhost:9050"
+            .to_socket_addrs()
+            .ok()
+            .and_then(|mut a| a.next())
+        {
             let c = load(&["-proxy=localhost:9050", &format!("-crawlproxy={local}")])
                 .expect("no name is looked up while the config is read");
-            let err = c.check_crawlproxy_tor_names().expect_err("a -proxy host name is resolved");
+            let err = c
+                .check_crawlproxy_tor_names()
+                .expect_err("a -proxy host name is resolved");
             assert!(err.contains("(-proxy)"), "{err}");
             let c = load(&["-onion=localhost:9050", &format!("-crawlproxy={local}")])
                 .expect("no name is looked up while the config is read");
-            let err = c.check_crawlproxy_tor_names().expect_err("an -onion host name is resolved");
+            let err = c
+                .check_crawlproxy_tor_names()
+                .expect_err("an -onion host name is resolved");
             assert!(err.contains("(-onion)"), "{err}");
         }
         let c = load(&["-proxy=proxy.invalid:9050", "-crawlproxy=127.0.0.1:9050"]).unwrap();
@@ -13653,8 +13679,10 @@ blockmintxfee=0.00001
     /// not; an option that resolved to nothing never refuses.
     #[test]
     fn crawlproxy_clashes_with_any_resolved_tor_address() {
-        let localhost: Vec<std::net::SocketAddr> =
-            vec!["127.0.0.1:9050".parse().unwrap(), "[::1]:9050".parse().unwrap()];
+        let localhost: Vec<std::net::SocketAddr> = vec![
+            "127.0.0.1:9050".parse().unwrap(),
+            "[::1]:9050".parse().unwrap(),
+        ];
         for crawl in ["127.0.0.1:9050", "[::1]:9050", "[::ffff:127.0.0.1]:9050"] {
             let err = crawlproxy_clashes(
                 crawl.parse().unwrap(),

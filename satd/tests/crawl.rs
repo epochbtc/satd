@@ -1140,7 +1140,11 @@ fn the_crawl_dials_clearnet_through_the_crawl_proxy() {
         c.rpc_ok("getcrawlinfo", vec![])["reachable"]["total"] == 1
     });
     let info = c.rpc_ok("getcrawlinfo", vec![]);
-    assert_eq!(info["proxy"], json!({ "set": true, "failures": 0 }), "{info}");
+    assert_eq!(
+        info["proxy"],
+        json!({ "set": true, "failures": 0 }),
+        "{info}"
+    );
     assert!(
         info["limits"]["networks"]
             .as_array()

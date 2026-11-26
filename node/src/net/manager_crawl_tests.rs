@@ -2422,7 +2422,10 @@ async fn under_proxy_clearnet_is_crawled_through_the_crawl_proxy() {
     let public = PeerAddr::Socket("23.1.2.3:8333".parse().unwrap());
     assert!(pm.crawl_may_dial(&public), "clearnet, through -crawlproxy");
     let nets = pm.crawl_networks();
-    assert!(nets.contains(&Net::Ipv4) && nets.contains(&Net::Ipv6), "{nets:?}");
+    assert!(
+        nets.contains(&Net::Ipv4) && nets.contains(&Net::Ipv6),
+        "{nets:?}"
+    );
     let (target, _log) = scripted("127.0.0.1", core_script()).await;
     let out = pm.crawl_session(&target, SessionKind::Liveness).await;
     assert_eq!(out.result.v1, Attempt::Ok);
@@ -2470,10 +2473,17 @@ async fn a_crawl_proxy_failure_is_never_held_against_the_target() {
 
     crawl_once(&pm, &target).await;
     assert!(log.lock().is_empty(), "no direct dial");
-    assert_eq!(record_of(&pm, &target), before, "not held against the target");
+    assert_eq!(
+        record_of(&pm, &target),
+        before,
+        "not held against the target"
+    );
     assert_eq!(run.proxy_failures.load(Ordering::Relaxed), 1);
     assert_eq!(
-        (run.reached.load(Ordering::Relaxed), run.unreached.load(Ordering::Relaxed)),
+        (
+            run.reached.load(Ordering::Relaxed),
+            run.unreached.load(Ordering::Relaxed)
+        ),
         (0, 0)
     );
     let book = pm.crawl_book().unwrap();
@@ -2500,7 +2510,11 @@ async fn a_crawl_proxy_failure_is_never_held_against_the_target() {
     // The proxy is back.
     *proxy.mode.lock() = ProxyMode::Relay;
     crawl_once(&pm, &target).await;
-    assert_eq!(run.reached.load(Ordering::Relaxed), 1, "reached once it is back");
+    assert_eq!(
+        run.reached.load(Ordering::Relaxed),
+        1,
+        "reached once it is back"
+    );
     assert_eq!(log.lock().len(), 1);
     assert_eq!(*proxy.asked.lock(), vec![target.to_string()]);
 }
@@ -2529,7 +2543,10 @@ async fn a_socks_refusal_is_the_targets_failed_dial() {
         assert!(e.retry_at.is_some(), "backed off");
         assert_eq!(run.unreached.load(Ordering::Relaxed), 1);
         assert_eq!(run.proxy_failures.load(Ordering::Relaxed), 0);
-        assert!(pm.crawl_may_dial(&target), "no pause for the target's failure");
+        assert!(
+            pm.crawl_may_dial(&target),
+            "no pause for the target's failure"
+        );
     }
     let (pm, _dir) = mk_pm_with(None);
     let proxy = test_proxy(ProxyMode::Refuse(0x08)).await;
@@ -2553,12 +2570,18 @@ async fn onion_crawl_dials_keep_the_onion_proxy() {
         host: ONION.to_string(),
         port: 8333,
     };
-    for (proxy, onion_proxy) in [(Some(tor_addr.as_str()), None), (None, Some(tor_addr.as_str()))] {
+    for (proxy, onion_proxy) in [
+        (Some(tor_addr.as_str()), None),
+        (None, Some(tor_addr.as_str())),
+    ] {
         let (pm, _dir, _shutdown) = mk_pm_proxies(proxy, onion_proxy);
         enable(&pm, with_crawl_proxy(crawl_proxy.addr));
         assert!(pm.crawl_may_dial(&onion));
         let got = pm.crawl_dial(&onion, Duration::from_secs(2)).await;
-        assert!(matches!(got, Err(crawl_conn::DialFailure::Target(_))), "{got:?}");
+        assert!(
+            matches!(got, Err(crawl_conn::DialFailure::Target(_))),
+            "{got:?}"
+        );
     }
     assert_eq!(
         *tor.asked.lock(),
@@ -2621,7 +2644,10 @@ async fn getcrawlinfo_states_a_crawl_proxy_and_never_its_address() {
     let target = PeerAddr::Socket("127.0.0.9:8333".parse().unwrap());
     crawl_once(&pm, &target).await;
     let info = pm.get_crawl_info();
-    assert_eq!(info["proxy"], serde_json::json!({ "set": true, "failures": 1 }));
+    assert_eq!(
+        info["proxy"],
+        serde_json::json!({ "set": true, "failures": 1 })
+    );
     let text = info.to_string();
     assert!(
         !text.contains(&proxy.to_string()) && !text.contains("127.0.0.1"),
@@ -2659,35 +2685,62 @@ async fn a_proxy_whose_targets_never_answer_is_taken_as_down() {
 
     let below = loopback_target(1);
     crawl_once(&pm, &below).await;
-    assert_eq!(failures_of(&pm, &below), 1, "below the streak: the target's");
+    assert_eq!(
+        failures_of(&pm, &below),
+        1,
+        "below the streak: the target's"
+    );
     for _ in 0..PROXY_SILENT_STREAK - 2 {
-        let got = pm.crawl_dial(&loopback_target(2), Duration::from_secs(2)).await;
-        assert!(matches!(got, Err(crawl_conn::DialFailure::Target(_))), "{got:?}");
+        let got = pm
+            .crawl_dial(&loopback_target(2), Duration::from_secs(2))
+            .await;
+        assert!(
+            matches!(got, Err(crawl_conn::DialFailure::Target(_))),
+            "{got:?}"
+        );
     }
     assert_eq!(run.proxy_failures.load(Ordering::Relaxed), 0);
     assert!(!run.proxy_down.load(Ordering::Relaxed));
 
     let trips = loopback_target(3);
-    run.book.lock().seed(trips.clone(), 0, crate::time::now_secs());
+    run.book
+        .lock()
+        .seed(trips.clone(), 0, crate::time::now_secs());
     let before = record_of(&pm, &trips);
     crawl_once(&pm, &trips).await;
-    assert!(run.proxy_down.load(Ordering::Relaxed), "the streak puts the proxy down");
+    assert!(
+        run.proxy_down.load(Ordering::Relaxed),
+        "the streak puts the proxy down"
+    );
     assert_eq!(run.proxy_failures.load(Ordering::Relaxed), 1);
-    assert_eq!(record_of(&pm, &trips), before, "the tripping dial is released");
+    assert_eq!(
+        record_of(&pm, &trips),
+        before,
+        "the tripping dial is released"
+    );
     assert!(!pm.crawl_may_dial(&trips), "proxied dials pause");
 
     let next = loopback_target(4);
-    run.book.lock().seed(next.clone(), 0, crate::time::now_secs());
+    run.book
+        .lock()
+        .seed(next.clone(), 0, crate::time::now_secs());
     let before = record_of(&pm, &next);
     crawl_once(&pm, &next).await;
-    assert_eq!(record_of(&pm, &next), before, "released while the proxy is down");
+    assert_eq!(
+        record_of(&pm, &next),
+        before,
+        "released while the proxy is down"
+    );
     assert_eq!(run.proxy_failures.load(Ordering::Relaxed), 2);
 
     *proxy.mode.lock() = ProxyMode::Relay;
     let (live, _log) = scripted("127.0.0.1", core_script()).await;
     let out = pm.crawl_session(&live, SessionKind::Liveness).await;
     assert_eq!(out.result.v1, Attempt::Ok);
-    assert!(!run.proxy_down.load(Ordering::Relaxed), "a success ends the outage");
+    assert!(
+        !run.proxy_down.load(Ordering::Relaxed),
+        "a success ends the outage"
+    );
     assert_eq!(run.proxy_silent_streak.load(Ordering::Relaxed), 0);
 
     *proxy.mode.lock() = ProxyMode::Refuse(0x04);
@@ -2728,7 +2781,10 @@ async fn a_refusal_resets_the_silent_streak() {
         run.proxy_down.store(true, Ordering::Relaxed);
         *proxy.mode.lock() = ProxyMode::Refuse(code);
         crawl_once(&pm, &loopback_target(3)).await;
-        assert!(!run.proxy_down.load(Ordering::Relaxed), "a refusal ends an outage");
+        assert!(
+            !run.proxy_down.load(Ordering::Relaxed),
+            "a refusal ends an outage"
+        );
     }
 }
 
@@ -2747,22 +2803,42 @@ async fn a_proxy_ruling_out_every_target_trips_the_silent_streak() {
     let run = enable(&pm, with_crawl_proxy(proxy.addr));
     let below = loopback_target(1);
     crawl_once(&pm, &below).await;
-    assert_eq!(failures_of(&pm, &below), 1, "below the streak: the target's");
-    assert_eq!(run.proxy_silent_streak.load(Ordering::Relaxed), 1, "it counts");
+    assert_eq!(
+        failures_of(&pm, &below),
+        1,
+        "below the streak: the target's"
+    );
+    assert_eq!(
+        run.proxy_silent_streak.load(Ordering::Relaxed),
+        1,
+        "it counts"
+    );
     for _ in 0..PROXY_SILENT_STREAK - 2 {
-        let _ = pm.crawl_dial(&loopback_target(2), Duration::from_secs(2)).await;
+        let _ = pm
+            .crawl_dial(&loopback_target(2), Duration::from_secs(2))
+            .await;
     }
     let trips = loopback_target(3);
-    run.book.lock().seed(trips.clone(), 0, crate::time::now_secs());
+    run.book
+        .lock()
+        .seed(trips.clone(), 0, crate::time::now_secs());
     let before = record_of(&pm, &trips);
     crawl_once(&pm, &trips).await;
-    assert!(run.proxy_down.load(Ordering::Relaxed), "0x02 for everything trips the streak");
+    assert!(
+        run.proxy_down.load(Ordering::Relaxed),
+        "0x02 for everything trips the streak"
+    );
     assert_eq!(run.proxy_failures.load(Ordering::Relaxed), 1);
     assert_eq!(record_of(&pm, &trips), before, "released");
     let next = loopback_target(4);
-    run.book.lock().seed(next.clone(), 0, crate::time::now_secs());
+    run.book
+        .lock()
+        .seed(next.clone(), 0, crate::time::now_secs());
     let before = record_of(&pm, &next);
     crawl_once(&pm, &next).await;
     assert_eq!(record_of(&pm, &next), before, "released while down");
-    assert!(run.proxy_down.load(Ordering::Relaxed), "0x02 does not end the outage");
+    assert!(
+        run.proxy_down.load(Ordering::Relaxed),
+        "0x02 does not end the outage"
+    );
 }

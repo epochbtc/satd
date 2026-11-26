@@ -634,7 +634,13 @@ mod tests {
 
     async fn staged(proxy: SocketAddr, target: &str) -> Result<TcpStream, Socks5Failure> {
         let deadline = tokio::time::Instant::now() + Duration::from_millis(800);
-        connect_socks5_staged(proxy, target.parse().unwrap(), Duration::from_secs(2), deadline).await
+        connect_socks5_staged(
+            proxy,
+            target.parse().unwrap(),
+            Duration::from_secs(2),
+            deadline,
+        )
+        .await
     }
 
     /// A staged dial tells the proxy's failures from the target's: a
@@ -675,17 +681,26 @@ mod tests {
         for code in [0x07u8, 0x08, 0x09, 0xff] {
             let (p, _t) = staged_proxy(Staged::Reply(code)).await;
             let got = staged(p, "203.0.113.7:8333").await;
-            assert!(matches!(got, Err(Socks5Failure::Proxy(_))), "{code:#04x}: {got:?}");
+            assert!(
+                matches!(got, Err(Socks5Failure::Proxy(_))),
+                "{code:#04x}: {got:?}"
+            );
         }
         for code in [0x01u8, 0x02, 0x03, 0x04, 0x06] {
             let (p, _t) = staged_proxy(Staged::Reply(code)).await;
             let got = staged(p, "203.0.113.7:8333").await;
-            assert!(matches!(got, Err(Socks5Failure::Target(_))), "{code:#04x}: {got:?}");
+            assert!(
+                matches!(got, Err(Socks5Failure::Target(_))),
+                "{code:#04x}: {got:?}"
+            );
         }
         for code in [0x05u8] {
             let (p, _t) = staged_proxy(Staged::Reply(code)).await;
             let got = staged(p, "203.0.113.7:8333").await;
-            assert!(matches!(got, Err(Socks5Failure::Refused(_))), "{code:#04x}: {got:?}");
+            assert!(
+                matches!(got, Err(Socks5Failure::Refused(_))),
+                "{code:#04x}: {got:?}"
+            );
         }
         // The request's write is bounded and the proxy's. A 10-byte write to
         // a loopback socket never blocks (the kernel buffers it), so the
@@ -701,12 +716,18 @@ mod tests {
         )
         .await
         .expect("the request's write is bounded by the deadline");
-        assert!(matches!(&got, Err(Socks5Failure::Proxy(e)) if e.contains("in time")), "{got:?}");
+        assert!(
+            matches!(&got, Err(Socks5Failure::Proxy(e)) if e.contains("in time")),
+            "{got:?}"
+        );
         let (mut near, far) = tokio::io::duplex(1);
         drop(far);
         let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
         let got = send_request(&mut near, &request, deadline, any).await;
-        assert!(matches!(&got, Err(Socks5Failure::Proxy(e)) if e.contains("not sent")), "{got:?}");
+        assert!(
+            matches!(&got, Err(Socks5Failure::Proxy(e)) if e.contains("not sent")),
+            "{got:?}"
+        );
         for how in [Staged::SilentConnect, Staged::CloseOnConnect] {
             let (p, _t) = staged_proxy(how).await;
             let started = std::time::Instant::now();
@@ -714,7 +735,10 @@ mod tests {
                 staged(p, "203.0.113.7:8333").await,
                 Err(Socks5Failure::Target(_))
             ));
-            assert!(started.elapsed() < Duration::from_secs(3), "bounded by the deadline");
+            assert!(
+                started.elapsed() < Duration::from_secs(3),
+                "bounded by the deadline"
+            );
         }
     }
 }
