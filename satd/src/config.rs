@@ -797,6 +797,9 @@ pub struct Config {
     pub crawlnet: Vec<String>,
     /// `-crawlbind`: the crawl's source addresses, at most one per family.
     pub crawlbind: Vec<std::net::IpAddr>,
+    /// `-crawlproxy`: the SOCKS5 proxy the crawl's IPv4 and IPv6 dials go
+    /// through, an IP address and port.
+    pub crawlproxy: Option<std::net::SocketAddr>,
     /// `-crawlseed`: addresses the crawl starts from.
     pub crawlseed: Vec<String>,
     /// `-crawluacomment`: a comment for the crawl's user agent.
@@ -4558,6 +4561,7 @@ impl Config {
             crawlmaxage: crawl.max_age,
             crawlnet: crawl.nets,
             crawlbind: crawl.binds,
+            crawlproxy: crawl.proxy,
             crawlseed: crawl.seeds,
             crawluacomment: crawl.ua_comment,
             crawlprobes: crawl.probes,
@@ -5379,6 +5383,7 @@ impl Config {
             "max_age_secs": self.crawlmaxage,
             "networks": self.crawlnet,
             "bind": self.crawlbind.iter().map(|ip| ip.to_string()).collect::<Vec<_>>(),
+            "proxy": self.crawlproxy.map(|p| p.to_string()),
             "seeds": self.crawlseed.len(),
             "uacomment": self.crawluacomment,
             "probes": self.crawlprobes,
@@ -8748,6 +8753,7 @@ pub struct CrawlArgs {
     pub crawlmaxage: Option<u64>,
     pub crawlnet: Vec<String>,
     pub crawlbind: Vec<String>,
+    pub crawlproxy: Option<String>,
     pub crawlseed: Vec<String>,
     pub crawluacomment: Option<String>,
     pub crawlprobes: Option<bool>,
@@ -8803,6 +8809,12 @@ const CRAWL_ARG_SPECS: &[(&str, &str, StratumArgKind, &str)] = &[
         "IP",
         StratumArgKind::TextList,
         "With -crawl, the source address of direct crawl dials, at most one IPv4 and one IPv6 (repeatable) (default: the system's choice)",
+    ),
+    (
+        "crawlproxy",
+        "IP:PORT",
+        StratumArgKind::Text,
+        "With -crawl, a SOCKS5 proxy (no authentication) every IPv4 and IPv6 crawl dial goes through, so they leave from the proxy's host; even under -proxy, with no direct fallback and -crawlbind not applying. Onion dials and the node's own connections do not use it (default: none)",
     ),
     (
         "crawlseed",
@@ -8869,6 +8881,7 @@ impl clap::FromArgMatches for CrawlArgs {
             crawlmaxage: m.remove_one("crawlmaxage"),
             crawlnet: list(m, "crawlnet"),
             crawlbind: list(m, "crawlbind"),
+            crawlproxy: m.remove_one("crawlproxy"),
             crawlseed: list(m, "crawlseed"),
             crawluacomment: m.remove_one("crawluacomment"),
             crawlprobes: m.remove_one("crawlprobes"),
@@ -8897,6 +8910,7 @@ struct CrawlSettings {
     max_age: u64,
     nets: Vec<String>,
     binds: Vec<std::net::IpAddr>,
+    proxy: Option<std::net::SocketAddr>,
     seeds: Vec<String>,
     ua_comment: Option<String>,
     probes: bool,
@@ -8908,9 +8922,9 @@ struct CrawlSettings {
 /// (concurrency 256, rate 100 a second), which no option lifts; the
 /// liveness interval below two hours (more than 14 sessions a target a
 /// day), a `-crawlnet` that names a network the crawl never dials, two
-/// `-crawlbind` addresses of one family, a `-crawlseed` that is not an IP
-/// address or onion, and a `-crawluacomment` that cannot go in a user agent
-/// are refused too. Command-line lists replace the config file's.
+/// `-crawlbind` addresses of one family, a `-crawlproxy` that is not an IP
+/// address and port, a `-crawlseed` that is not an IP address or onion, and
+/// a `-crawluacomment` that cannot go in a user agent are refused too. Command-line lists replace the config file's.
 #[inline(never)]
 fn resolve_crawl(
     cli: &CrawlArgs,
@@ -9002,6 +9016,21 @@ fn resolve_crawl(
         }
         binds.push(ip);
     }
+    // An IP address and port, never a name: a name would need a lookup of
+    // its own, outside the proxy.
+    let proxy = match cli.crawlproxy.clone().or_else(|| file_get("crawlproxy")) {
+        None => None,
+        Some(v) if v.trim().is_empty() => None,
+        Some(v) => {
+            let sa: std::net::SocketAddr = v.trim().parse().map_err(|_| {
+                format!("-crawlproxy={v}: an IP address and port (127.0.0.1:1080, [::1]:1080)")
+            })?;
+            if sa.port() == 0 {
+                return Err(format!("-crawlproxy={v}: port 0"));
+            }
+            Some(sa)
+        }
+    };
     let port = node::net::peer::default_p2p_port(network);
     let mut seeds = Vec::new();
     for v in list(&cli.crawlseed, "crawlseed") {
@@ -9053,6 +9082,7 @@ fn resolve_crawl(
         max_age,
         nets,
         binds,
+        proxy,
         seeds,
         ua_comment,
         probes: cli
@@ -9096,6 +9126,7 @@ impl Config {
                 std::net::IpAddr::V6(v6) => Some(*v6),
                 _ => None,
             }),
+            proxy: self.crawlproxy,
             seeds: self
                 .crawlseed
                 .iter()
@@ -10288,6 +10319,7 @@ pub fn normalize_args(args: Vec<String>) -> Vec<String> {
         "crawlmaxage",
         "crawlnet",
         "crawlbind",
+        "crawlproxy",
         "crawlseed",
         "crawluacomment",
         "crawlprobes",
@@ -11168,6 +11200,7 @@ pub const KNOWN_CONFIG_KEYS: &[&str] = &[
     "crawlmaxage",
     "crawlnet",
     "crawlbind",
+    "crawlproxy",
     "crawlseed",
     "crawluacomment",
     "crawlprobes",
@@ -13433,6 +13466,58 @@ blockmintxfee=0.00001
         assert!(load(&[]).is_err(), "the ceiling holds in the file too");
         std::fs::write(dir.path().join("bitcoin.conf"), "crawlnope=1\n").unwrap();
         assert!(load(&[]).is_err(), "an unknown crawl key is refused");
+    }
+
+    /// `-crawlproxy`: an IP address and port, v4 or v6, from the command
+    /// line or the file, into the crawl's config and the effective view; a
+    /// name, a bare address or port 0 is refused at startup. Unset, none.
+    #[test]
+    fn crawlproxy_is_an_ip_address_and_port() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let load = |extra: &[&str]| {
+            let mut args = vec![
+                "satd",
+                "--regtest",
+                "--datadir",
+                dir.path().to_str().unwrap(),
+            ];
+            args.extend_from_slice(extra);
+            Config::from_cli(
+                parse_cli(normalize_args(args.iter().map(|a| a.to_string()).collect())).unwrap(),
+            )
+        };
+        let c = load(&[]).unwrap();
+        assert_eq!(c.crawlproxy, None);
+        assert_eq!(c.crawl_config(None).proxy, None);
+        assert_eq!(c.effective_view()["crawl"]["proxy"], serde_json::Value::Null);
+
+        let c = load(&["-crawlproxy=127.0.0.1:1081"]).unwrap();
+        let want: std::net::SocketAddr = "127.0.0.1:1081".parse().unwrap();
+        assert_eq!(c.crawlproxy, Some(want));
+        assert_eq!(c.crawl_config(None).proxy, Some(want));
+        assert_eq!(c.effective_view()["crawl"]["proxy"], "127.0.0.1:1081");
+        let c = load(&["-crawlproxy=[::1]:1081"]).unwrap();
+        assert_eq!(c.crawlproxy, Some("[::1]:1081".parse().unwrap()));
+
+        for bad in [
+            "-crawlproxy=proxy.example.com:1080",
+            "-crawlproxy=127.0.0.1",
+            "-crawlproxy=127.0.0.1:0",
+            "-crawlproxy=127.0.0.1:99999",
+            "-crawlproxy=::1:1080",
+        ] {
+            let err = load(&[bad]).expect_err(bad);
+            assert!(err.contains("-crawlproxy"), "{bad}: {err}");
+        }
+
+        std::fs::write(dir.path().join("bitcoin.conf"), "crawlproxy=192.0.2.7:1080\n").unwrap();
+        assert_eq!(
+            load(&[]).unwrap().crawlproxy,
+            Some("192.0.2.7:1080".parse().unwrap()),
+            "from the file"
+        );
+        std::fs::write(dir.path().join("bitcoin.conf"), "crawlproxy=nope\n").unwrap();
+        assert!(load(&[]).is_err(), "a bad value in the file is refused too");
     }
 
     /// The crawl's export options: `crawlexportkeyfile` relative to the

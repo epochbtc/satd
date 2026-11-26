@@ -10,7 +10,8 @@ rather than sampling it, which the [network survey](peer-behavior.md#network-sur
 
 > **Read [Risks to the operator](#risks-to-the-operator) before turning it
 > on.** The crawl dials tens of thousands of addresses a day from this
-> host's IP address (or `-crawlbind`'s). Other operators' monitors will
+> host's IP address (or `-crawlbind`'s, or with `-crawlproxy` the proxy
+> host's). Other operators' monitors will
 > record that address as a crawler, it can end up on ban lists that then
 > refuse the node's own connections too, and hosting providers may receive
 > abuse reports. **Run it on a dedicated host**, not from home and not from
@@ -196,7 +197,8 @@ restart-only).
 | `-crawlliveness` | 7200 | Seconds between liveness checks of a reachable address; at least 7200. Also the window an address counts as reachable in. |
 | `-crawlmaxage` | 432000 | Seconds past which an entry of a `getaddr` answer is ignored; at least 3600. |
 | `-crawlnet` | every network the node reaches | `ipv4`, `ipv6`, `onion` (repeatable or comma-separated). Narrows only. `i2p` and `cjdns` are refused. |
-| `-crawlbind` | none | The source address of direct crawl dials: at most one IPv4 and one IPv6 (repeatable). |
+| `-crawlbind` | none | The source address of direct crawl dials: at most one IPv4 and one IPv6 (repeatable). Not applied to dials through `-crawlproxy`. |
+| `-crawlproxy` | none | A SOCKS5 proxy (no authentication), as an IP address and port, that every IPv4 and IPv6 crawl dial goes through, so they leave from the proxy's host. Clearnet is crawled through it under `-proxy` too; onion dials and the node's own connections never use it. No direct fallback. See [Crawling through a proxy](#crawling-through-a-proxy--crawlproxy). |
 | `-crawlseed` | none | An IP address or onion to start from, at the network's port unless one is given (repeatable). No names. |
 | `-crawluacomment` | none | A comment for the crawler's user agent: `/satd:<version>(crawler; <comment>)/`. Use one that tells other operators who runs the crawl. |
 | `-crawlprobes` | on | Send the four [survey probes](peer-behavior.md#probes) on each discovery session. |
@@ -257,6 +259,9 @@ Each onion dial gets SOCKS credentials of its own, whatever
 `-proxyrandomize` says, so no crawl circuit is shared with another or with
 the node's own peers.
 
+`-crawlproxy` changes how clearnet is dialled, never whether: see
+[Crawling through a proxy](#crawling-through-a-proxy--crawlproxy).
+
 I2P and CJDNS addresses that nodes name are recorded and counted as
 learned, and never dialled: satd has no transport for either.
 
@@ -272,6 +277,57 @@ match, or circuits queue and onion sessions time out:
 
 A Tor daemon of its own for the crawl keeps its circuit load off the one
 the node's own onion connections use.
+
+### Crawling through a proxy (`-crawlproxy`)
+
+`-crawlproxy=<ip>:<port>` sends every IPv4 and IPv6 crawl dial through a
+SOCKS5 proxy, so the crawl's source address is the proxy host's and the
+node stays where it is. The proxy must be one that is not a Tor exit: an
+SSH dynamic forward to a host you rent for the purpose is the simplest.
+
+```sh
+# On the node's host: a SOCKS5 proxy on loopback, its exits on the other host
+ssh -N -D 127.0.0.1:1081 user@crawl-host.example
+```
+
+```ini
+crawl=1
+crawlproxy=127.0.0.1:1081
+```
+
+- **The proxy host's address is the crawler.** Other operators' monitors
+  and ban lists will record that address, and its hosting provider gets
+  any abuse reports (see [Risks to the operator](#risks-to-the-operator)).
+  The node's own address is not in the crawl's connections.
+- **Only the crawl uses it.** The node's peers, `-proxy` and `-onion` are
+  unchanged, and onion crawl dials still go through `-onion`/`-proxy` with
+  credentials of their own. `-onlynet` and `-crawlnet` still narrow what
+  is crawled; with `-crawlproxy` set clearnet is crawled under `-proxy`
+  too, since the operator has named a proxy that is not a Tor exit.
+- **No fallback.** With the proxy down, a clearnet dial fails and is
+  counted as the proxy's failure (`getcrawlinfo`'s `proxy.failures`): it
+  is never retried direct and never held against the target, whose
+  reachability, retries and liveness stay as they were. The address stays
+  due, proxied dials pause for 5 seconds after each failure, and the crawl
+  resumes once the proxy answers. The log says so once when the proxy
+  fails and once when it answers again.
+- **Proxy or target.** A failure to reach the proxy, a failed SOCKS5
+  greeting, or a CONNECT the proxy cannot serve (reply 0x07 command not
+  supported, 0x08 address type not supported, or an unassigned code) is
+  the proxy's. A reply the proxy gives for the target (0x01 general
+  failure, 0x02 not allowed by ruleset, 0x03 network unreachable, 0x04
+  host unreachable, 0x05 refused, 0x06 TTL expired), no reply in time, or
+  the proxy closing instead of replying, is the target's, as a failed
+  direct dial is. An SSH dynamic forward accepts every CONNECT at once and
+  closes the channel when the far side cannot connect, so a target down
+  behind it reads as a target that closed. A proxy host without IPv6
+  answers IPv6 CONNECTs with 0x08 or 0x04: add `-crawlnet=ipv4`.
+- `-crawlbind` does not apply to proxied dials, and a proxied session's
+  `version` names the dummy address as the receiver, as an onion dial's
+  does. DNS seeding is unchanged: under `-proxy` the onion seeds, else a
+  local lookup.
+- The value is an IP address and port (`127.0.0.1:1081`, `[::1]:1081`),
+  never a host name; anything else is refused at startup.
 
 ## What it stores
 
@@ -406,6 +462,7 @@ than a country is read at all.
   "limits": {"concurrency": 32, "tor_concurrency": 8, "rate": 10,
              "liveness": 7200, "max_age": 432000, "probes": true,
              "networks": ["ipv4", "ipv6", "onion"], "bind": false},
+  "proxy": {"set": false, "failures": 0},
   "book": {"entries": 61234, "max_entries": 250000,
            "learned": {"ipv4": 41000, "ipv6": 9000, "onion": 11000, "i2p": 200, "cjdns": 34},
            "ever_reached": {"ipv4": 14000, "ipv6": 3100, "onion": 6400, "i2p": 0, "cjdns": 0}},
@@ -442,6 +499,7 @@ than a country is read at all.
 | `started` | The crawl has left its initial-block-download hold at least once this run. |
 | `peersurvey_superseded` | `-peersurvey` was asked for too; the survey opens no connection. |
 | `limits` | The limits in force: after the ceilings and the file-descriptor fitting. `networks` are those the crawl dials; `bind` whether `-crawlbind` is set (not the address). |
+| `proxy` | `set`: whether `-crawlproxy` is set (never its address). `failures`: the dials it failed since start, the proxy's failures and not the targets' (see [Crawling through a proxy](#crawling-through-a-proxy--crawlproxy)). |
 | `book` | Entries in the book and its cap; entries per network, and those ever reached. I2P and CJDNS are learned only. |
 | `reachable` | Addresses whose last completed handshake is within the liveness window, per dialled network. This is the crawl's count of the reachable network. |
 | `transport` | The reachable addresses in five classes that add up to `reachable.total`: `v2_and_v1`, `v1_only` (v1 worked and the last BIP 324 attempt failed), `v1_v2_untried` (v1 worked and BIP 324 was never tried, the node not advertising it), `v2_only` (a v1 attempt failed within the liveness window of a BIP 324 success), `v2_unconfirmed` (BIP 324 worked, v1 not checked yet). `v2_advertised` counts those whose address was last advertised with `NODE_P2P_V2` (in a `getaddr` answer or the address book), whatever their own `version` said. Shares are of `reachable.total`. |

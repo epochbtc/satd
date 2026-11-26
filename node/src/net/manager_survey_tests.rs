@@ -35,7 +35,7 @@ pub(super) fn mk_pm_proxied(proxy: &str) -> (Arc<PeerManager>, tempfile::TempDir
     (pm, dir)
 }
 
-fn mk_pm_proxies(
+pub(super) fn mk_pm_proxies(
     proxy: Option<&str>,
     onion_proxy: Option<&str>,
 ) -> (

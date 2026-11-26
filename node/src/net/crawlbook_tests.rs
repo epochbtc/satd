@@ -2000,3 +2000,39 @@ fn next_due_where_applies_the_filter_before_the_limit() {
     let due = book.next_due_where(NOW + 2, 3, PeerAddr::is_onion);
     assert_eq!(due, vec![(onion, SessionKind::Discovery)]);
 }
+
+// ---- A session ended at the crawl proxy ----
+
+/// A session released (its dial failed at `-crawlproxy`) leaves the entry
+/// exactly as it was before the session opened, its open-session token
+/// aside: no attempt, failure, back-off or reachability, and the address
+/// is due again with the same kind. A stale token releases nothing.
+/// Perturbation: record a `down()` result instead and the failures, the
+/// back-off and the due time move.
+#[test]
+fn a_released_session_changes_nothing_but_the_marker() {
+    let a = v4(7);
+    let at = 1_790_000_000;
+    let mut book = reached_book(&a, at);
+    let now = at + DEFAULT_LIVENESS_SECS + 1;
+    let kind = due_kind(&book, &a, now).expect("due for liveness");
+    let before = book.get(&CrawlAddr::Peer(a.clone())).unwrap().clone();
+    let token = book.mark_dialling(&a, now).expect("dialling");
+    assert_eq!(due_kind(&book, &a, now), None, "not due while open");
+    assert!(!book.release(&a, Some(token + 1)), "a stale token");
+    assert!(book.release(&a, Some(token)));
+    let after = book.get(&CrawlAddr::Peer(a.clone())).unwrap().clone();
+    assert!(!after.in_flight(now));
+    let public = |e: &CrawlEntry| {
+        (
+            (e.attempts, e.last_attempt, e.last_success),
+            (e.failures, e.failing_since, e.retry_at),
+            (e.v2_ok, e.v1_ok, e.v2_only, e.reachable_count),
+            e.observation.clone(),
+            e.closed_early_retry,
+            (e.last_discovery, e.last_v1_check),
+        )
+    };
+    assert_eq!(public(&after), public(&before));
+    assert_eq!(due_kind(&book, &a, now), Some(kind), "due again, as before");
+}

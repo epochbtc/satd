@@ -78,6 +78,24 @@
 //! circuit is shared with another or with the node's peers. Direct dials
 //! leave from `-crawlbind` when it names an address of the family.
 //!
+//! `-crawlproxy` names a SOCKS5 proxy that is not a Tor exit (an SSH
+//! dynamic forward to another host, say): every IPv4 and IPv6 crawl dial
+//! then goes through it, so the crawl's source address is the proxy
+//! host's. It decides how clearnet is dialled, never whether: `-onlynet`
+//! and `-crawlnet` still narrow, and clearnet is crawled under `-proxy`
+//! too. Onion dials keep `-onion`/`-proxy`, and the node's own connections
+//! never use it. `-crawlbind` does not apply to a proxied dial, and its
+//! `version` names the dummy address as the receiver, as an onion dial's
+//! does. There is no fallback: a dial the proxy fails
+//! ([`proxy::Socks5Failure::Proxy`]: unreachable, a failed greeting, a
+//! CONNECT it cannot serve) is never made direct and never held against
+//! the target. The session ends with nothing recorded
+//! ([`CrawlBook::release`]), the address stays due, proxied dials pause
+//! for [`PROXY_PAUSE`], and `getcrawlinfo` counts the failure; the log
+//! says once when the proxy fails and once when it answers again. A
+//! failure the proxy reports for the target (a SOCKS5 reply 0x01 to 0x06,
+//! or no reply in time) is the target's, as a failed direct dial is.
+//!
 //! # Failure
 //!
 //! A panic in a crawl task stops the crawl, with an error in the log; the
@@ -120,6 +138,15 @@ pub(super) struct CrawlRun {
     /// Sessions that ended, reached or not, this run.
     pub(super) reached: AtomicU64,
     pub(super) unreached: AtomicU64,
+    /// Dials `-crawlproxy` failed this run (the proxy's failures, not the
+    /// targets').
+    pub(super) proxy_failures: AtomicU64,
+    /// `-crawlproxy` failed its last dial: the log has said so, and says
+    /// so again only after the proxy answers once more.
+    proxy_down: AtomicBool,
+    /// No proxied dial starts before this, on the crawl's clock
+    /// ([`CrawlRun::now_ms`]): set by a proxy failure.
+    pub(super) proxy_paused_until_ms: AtomicU64,
     /// The aggregate the metrics and the status page read, and when it was
     /// taken: they are polled often, and a walk of a full book is not free.
     pub(super) aggregate: parking_lot::Mutex<Option<(Instant, crawlreport::Aggregate)>>,
@@ -145,7 +172,40 @@ impl CrawlRun {
     fn now_ms(&self) -> u64 {
         self.epoch.elapsed().as_millis() as u64
     }
+
+    /// Whether a proxied dial may start now: `-crawlproxy` has not failed
+    /// within [`PROXY_PAUSE`].
+    fn proxy_ready(&self) -> bool {
+        self.now_ms() >= self.proxy_paused_until_ms.load(Ordering::Relaxed)
+    }
+
+    /// `-crawlproxy` failed a dial: count it, pause proxied dials, and
+    /// warn if it answered the dial before.
+    fn proxy_failed(&self, error: &str) {
+        self.proxy_failures.fetch_add(1, Ordering::Relaxed);
+        self.proxy_paused_until_ms.store(
+            self.now_ms() + PROXY_PAUSE.as_millis() as u64,
+            Ordering::Relaxed,
+        );
+        if !self.proxy_down.swap(true, Ordering::Relaxed) {
+            tracing::warn!(
+                "The crawl proxy (-crawlproxy) failed: clearnet crawl dials wait for it, none is made direct ({error})"
+            );
+        }
+    }
+
+    /// `-crawlproxy` answered a dial's CONNECT, for the target or against
+    /// it: the proxy is up.
+    fn proxy_answered(&self) {
+        if self.proxy_down.swap(false, Ordering::Relaxed) {
+            tracing::info!("The crawl proxy (-crawlproxy) answers again: clearnet crawl dials resume");
+        }
+    }
 }
+
+/// How long proxied dials wait after `-crawlproxy` fails one, so a proxy
+/// that is down is tried every few seconds, not at the crawl's rate.
+pub(super) const PROXY_PAUSE: Duration = Duration::from_secs(5);
 
 /// How long the metrics and the status page reuse an aggregate before they
 /// take a new one.
@@ -203,10 +263,21 @@ impl Drop for NonceGuard<'_> {
     }
 }
 
+/// Why a crawl dial failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum DialFailure {
+    /// The target's: nothing reached it, as a direct dial that fails.
+    Target(String),
+    /// `-crawlproxy`'s: nothing is known of the target.
+    Proxy(String),
+}
+
 /// How one transport attempt went.
 enum Opened {
     /// The dial itself failed: nothing reached.
     NoDial,
+    /// The dial failed at `-crawlproxy`: nothing is known of the target.
+    ProxyFailed,
     /// The v2 key exchange failed with nothing received, as against a
     /// v1-only node.
     V1Only,
@@ -233,6 +304,9 @@ struct Handshaken {
 pub(super) struct SessionOutput {
     pub(super) result: SessionResult,
     pub(super) answer: Option<Vec<AddrV2Message>>,
+    /// A dial failed at `-crawlproxy`: the session is not the target's
+    /// and records nothing.
+    pub(super) proxy_failed: bool,
 }
 
 /// A `getaddr` answer: its entries, the message it came in, and its delay
@@ -323,6 +397,9 @@ impl PeerManager {
             stopped: AtomicBool::new(false),
             reached: AtomicU64::new(0),
             unreached: AtomicU64::new(0),
+            proxy_failures: AtomicU64::new(0),
+            proxy_down: AtomicBool::new(false),
+            proxy_paused_until_ms: AtomicU64::new(0),
             aggregate: parking_lot::Mutex::new(None),
             snapshots,
             #[cfg(test)]
@@ -432,16 +509,19 @@ impl PeerManager {
     }
 
     /// The networks the crawl dials: those the node's dialer reaches,
-    /// `-crawlnet` kept, and clearnet only when it does not go through the
-    /// proxy. As [`Self::crawl_may_dial`]: only a routable address goes
-    /// through the proxy, so where the book admits local addresses
-    /// (regtest) clearnet is dialled with a proxy set too.
+    /// `-crawlnet` kept, and clearnet only when it goes through
+    /// `-crawlproxy` or does not go through the proxy. As
+    /// [`Self::crawl_may_dial`]: only a routable address goes through the
+    /// proxy, so where the book admits local addresses (regtest) clearnet
+    /// is dialled with a proxy set too.
     pub fn crawl_networks(&self) -> Vec<Network> {
         use crate::net::reachable::Network as Reach;
         let Some(run) = self.crawl.get() else {
             return Vec::new();
         };
-        let direct = self.proxy.is_none() || run.book.lock().params().allow_local;
+        let direct = run.config.proxy.is_some()
+            || self.proxy.is_none()
+            || run.book.lock().params().allow_local;
         crawlreport::DIALLED
             .into_iter()
             .filter(|n| {
@@ -514,6 +594,7 @@ impl PeerManager {
                 "concurrency": 0, "tor_concurrency": 0, "rate": 0, "liveness": 0, "max_age": 0,
                 "probes": false, "networks": [], "bind": false,
             });
+            out["proxy"] = serde_json::json!({ "set": false, "failures": 0 });
             out["sessions"] = serde_json::json!({ "reached": 0, "unreached": 0, "in_flight": { "clearnet": 0, "tor": 0 } });
             out["totals"] = serde_json::json!({ "totalbytessent": 0, "totalbytesrecv": 0 });
             return out;
@@ -548,6 +629,11 @@ impl PeerManager {
                 "probes": run.config.probes,
                 "networks": self.crawl_networks().iter().map(|n| n.name()).collect::<Vec<_>>(),
                 "bind": run.config.bind_v4.is_some() || run.config.bind_v6.is_some(),
+            },
+            // Whether one is set, never its address.
+            "proxy": {
+                "set": run.config.proxy.is_some(),
+                "failures": run.proxy_failures.load(Ordering::Relaxed),
             },
             "sessions": {
                 "reached": run.reached.load(Ordering::Relaxed),
@@ -747,7 +833,8 @@ impl PeerManager {
     }
 
     /// Whether the crawl may dial `addr`: on a network the node's dialer
-    /// reaches and `-crawlnet` keeps, not clearnet through the proxy, not
+    /// reaches and `-crawlnet` keeps, not clearnet through the proxy (but
+    /// through `-crawlproxy`, while it is not paused after a failure), not
     /// banned, not one of the node's own addresses, and not a bad port.
     pub(super) fn crawl_may_dial(&self, addr: &PeerAddr) -> bool {
         let Some(run) = self.crawl.get() else {
@@ -765,7 +852,10 @@ impl PeerManager {
             PeerAddr::Socket(sa) => {
                 crate::net::is_valid(sa.ip())
                     && self.reachable.read().contains_socket(sa)
-                    && !self.dials_through_proxy(*sa)
+                    && match run.config.proxy {
+                        Some(_) => run.proxy_ready(),
+                        None => !self.dials_through_proxy(*sa),
+                    }
             }
             PeerAddr::Onion { .. } => self.network_reachable(crate::net::reachable::Network::Onion),
         };
@@ -838,9 +928,18 @@ impl PeerManager {
                 SessionOutput {
                     result: SessionResult::default(),
                     answer: None,
+                    proxy_failed: false,
                 }
             }
         };
+        if out.proxy_failed {
+            // Not the target's: no attempt, failure or back-off, and the
+            // address is due again once the proxy is.
+            tracing::debug!(%addr, kind = ?kind, "crawl session ended at the crawl proxy");
+            run.book.lock().release(&addr, session);
+            run.scheduler.lock().finish(&addr);
+            return;
+        }
         let reached = out.result.v2 == Attempt::Ok || out.result.v1 == Attempt::Ok;
         let obs = out.result.observation.as_ref();
         tracing::debug!(
@@ -951,17 +1050,52 @@ impl PeerManager {
         }
     }
 
-    /// Reach `target`: directly from `-crawlbind`'s address for its family,
-    /// or an onion through the proxy with credentials of its own.
-    async fn crawl_dial(&self, target: &PeerAddr) -> Result<TcpStream, String> {
+    /// Reach `target` within `connect`: through `-crawlproxy` when it is set
+    /// and `target` is clearnet, else directly from `-crawlbind`'s address
+    /// for its family; an onion through the proxy with credentials of its
+    /// own.
+    pub(super) async fn crawl_dial(
+        &self,
+        target: &PeerAddr,
+        connect: Duration,
+    ) -> Result<TcpStream, DialFailure> {
         let Some(run) = self.crawl.get() else {
-            return Err("the crawl is off".into());
+            return Err(DialFailure::Target("the crawl is off".into()));
         };
         #[cfg(test)]
         run.dialled.lock().push(target.clone());
+        let timed_out = || DialFailure::Target("connect timeout".into());
         match target {
             PeerAddr::Socket(sa) => {
                 let sa = SocketAddr::new(sa.ip().to_canonical(), sa.port());
+                if let Some(proxy_addr) = run.config.proxy {
+                    // -crawlbind does not apply: the source is the proxy's
+                    // host. No fallback: a proxy failure is never dialled
+                    // direct.
+                    let deadline = tokio::time::Instant::now() + connect;
+                    let proxy_connect = self.socks_dial_timeouts().proxy_connect;
+                    return match proxy::connect_socks5_staged(
+                        proxy_addr,
+                        sa,
+                        proxy_connect,
+                        deadline,
+                    )
+                    .await
+                    {
+                        Ok(stream) => {
+                            run.proxy_answered();
+                            Ok(stream)
+                        }
+                        Err(proxy::Socks5Failure::Target(e)) => {
+                            run.proxy_answered();
+                            Err(DialFailure::Target(e))
+                        }
+                        Err(proxy::Socks5Failure::Proxy(e)) => {
+                            run.proxy_failed(&e);
+                            Err(DialFailure::Proxy(e))
+                        }
+                    };
+                }
                 let (socket, bind) = match sa.ip() {
                     IpAddr::V4(_) => (
                         tokio::net::TcpSocket::new_v4(),
@@ -972,37 +1106,45 @@ impl PeerManager {
                         run.config.bind_v6.map(IpAddr::V6),
                     ),
                 };
-                let socket = socket.map_err(|e| format!("socket: {e}"))?;
+                let socket = socket.map_err(|e| DialFailure::Target(format!("socket: {e}")))?;
                 if let Some(ip) = bind {
                     socket
                         .bind(SocketAddr::new(ip, 0))
-                        .map_err(|e| format!("bind {ip}: {e}"))?;
+                        .map_err(|e| DialFailure::Target(format!("bind {ip}: {e}")))?;
                 }
-                socket
-                    .connect(sa)
+                tokio::time::timeout(connect, socket.connect(sa))
                     .await
-                    .map_err(|e| format!("connect: {e}"))
+                    .map_err(|_| timed_out())?
+                    .map_err(|e| DialFailure::Target(format!("connect: {e}")))
             }
             PeerAddr::Onion { host, port } => {
                 if self.onion_disabled.load(Ordering::Relaxed) {
-                    return Err(".onion connections are disabled (-onion=0)".into());
+                    return Err(DialFailure::Target(
+                        ".onion connections are disabled (-onion=0)".into(),
+                    ));
                 }
                 let proxy_addr = self
                     .onion_proxy
                     .as_deref()
                     .or(self.proxy.as_deref())
-                    .ok_or("no proxy configured for .onion connections")?;
+                    .ok_or_else(|| {
+                        DialFailure::Target("no proxy configured for .onion connections".into())
+                    })?;
                 // A circuit of its own, whatever -proxyrandomize says.
                 let token = format!("{:016x}", rand::random::<u64>());
-                proxy::connect_socks5_onion(
-                    proxy_addr,
-                    host,
-                    *port,
-                    Some((&token, &token)),
-                    self.socks_dial_timeouts(),
+                tokio::time::timeout(
+                    connect,
+                    proxy::connect_socks5_onion(
+                        proxy_addr,
+                        host,
+                        *port,
+                        Some((&token, &token)),
+                        self.socks_dial_timeouts(),
+                    ),
                 )
                 .await
-                .map_err(|e| format!("connect to onion via proxy: {e}"))
+                .map_err(|_| timed_out())?
+                .map_err(|e| DialFailure::Target(format!("connect to onion via proxy: {e}")))
             }
         }
     }
@@ -1017,11 +1159,12 @@ impl PeerManager {
         } else {
             (t.connect, t.handshake)
         };
-        let stream = tokio::time::timeout(connect, self.crawl_dial(target)).await;
+        let stream = self.crawl_dial(target, connect).await;
         let deadline = tokio::time::Instant::now() + handshake;
         let mut stream = match stream {
-            Ok(Ok(s)) => s,
-            _ => return (Opened::NoDial, deadline),
+            Ok(s) => s,
+            Err(DialFailure::Proxy(_)) => return (Opened::ProxyFailed, deadline),
+            Err(DialFailure::Target(_)) => return (Opened::NoDial, deadline),
         };
         let _ = stream.set_nodelay(true);
         let magic = self.chain_state.p2p_magic();
@@ -1069,9 +1212,10 @@ impl PeerManager {
         deadline: tokio::time::Instant,
     ) -> Result<Handshaken, String> {
         let run = self.crawl.get().expect("the crawl is on");
+        // Through a proxy the dummy, as Core sends for a proxied peer.
         let receiver = match target {
-            PeerAddr::Socket(sa) => *sa,
-            PeerAddr::Onion { .. } => SocketAddr::from(([0, 0, 0, 0], 0)),
+            PeerAddr::Socket(sa) if run.config.proxy.is_none() => *sa,
+            _ => SocketAddr::from(([0, 0, 0, 0], 0)),
         };
         let ours = self.build_version_message(receiver, ConnType::Crawl);
         run.nonces.lock().insert(ours.nonce);
@@ -1147,14 +1291,21 @@ impl PeerManager {
                 .lock()
                 .get(&CrawlAddr::Peer(target.clone()))
                 .is_some_and(|e| e.dials_v2_first());
+        let proxy_failed = || SessionOutput {
+            result: SessionResult::default(),
+            answer: None,
+            proxy_failed: true,
+        };
         let opened = if !v2_first {
             match self.crawl_open(target, false).await {
                 (Opened::Open(c, g), d) => Some((*c, g, d)),
+                (Opened::ProxyFailed, _) => return proxy_failed(),
                 _ => None,
             }
         } else {
             match self.crawl_open(target, true).await {
                 (Opened::Open(c, g), d) => Some((*c, g, d)),
+                (Opened::ProxyFailed, _) => return proxy_failed(),
                 (Opened::NoDial, _) => None,
                 (Opened::Failed, _) => {
                     result.v2 = Attempt::Failed;
@@ -1164,6 +1315,8 @@ impl PeerManager {
                     result.v2 = Attempt::Failed;
                     match self.crawl_open(target, false).await {
                         (Opened::Open(c, g), d) => Some((*c, g, d)),
+                        // The v1 redial says nothing of the target either.
+                        (Opened::ProxyFailed, _) => return proxy_failed(),
                         _ => None,
                     }
                 }
@@ -1173,6 +1326,7 @@ impl PeerManager {
             return SessionOutput {
                 result,
                 answer: None,
+                proxy_failed: false,
             };
         };
         let v2 = greeting.is_some();
@@ -1189,6 +1343,7 @@ impl PeerManager {
                 return SessionOutput {
                     result,
                     answer: None,
+                    proxy_failed: false,
                 };
             }
         };
@@ -1366,7 +1521,11 @@ impl PeerManager {
             shape,
             verdict,
         });
-        SessionOutput { result, answer }
+        SessionOutput {
+            result,
+            answer,
+            proxy_failed: false,
+        }
     }
 
     /// The chain check (`crawl::chain_check`) on the `getheaders` probe's

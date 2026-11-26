@@ -181,6 +181,10 @@ pub struct CrawlConfig {
     /// `-crawlbind`: the source address of direct IPv4 and IPv6 dials.
     pub bind_v4: Option<Ipv4Addr>,
     pub bind_v6: Option<Ipv6Addr>,
+    /// `-crawlproxy`: a SOCKS5 proxy (no authentication) every IPv4 and
+    /// IPv6 crawl dial goes through, `-crawlbind` not applying. Onion dials
+    /// keep `-onion`/`-proxy`.
+    pub proxy: Option<std::net::SocketAddr>,
     /// `-crawlseed`.
     pub seeds: Vec<PeerAddr>,
     /// `-crawluacomment`.
@@ -215,6 +219,7 @@ impl Default for CrawlConfig {
             networks: None,
             bind_v4: None,
             bind_v6: None,
+            proxy: None,
             seeds: Vec::new(),
             ua_comment: None,
             probes: true,

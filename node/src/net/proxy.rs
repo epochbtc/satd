@@ -107,6 +107,136 @@ async fn socks5_connect<'t>(
     Ok(stream.into_inner())
 }
 
+/// Which side of a SOCKS5 dial failed: the proxy, or the target behind it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Socks5Failure {
+    /// The proxy itself: it could not be reached, its greeting failed, or
+    /// it answered the CONNECT in a way that says it cannot serve it
+    /// (command or address type not supported, an unassigned reply code,
+    /// a malformed reply). Nothing is known of the target.
+    Proxy(String),
+    /// The proxy took the CONNECT and the target failed it: one of the
+    /// reply codes 0x01 to 0x06 (general failure, not allowed by ruleset,
+    /// network unreachable, host unreachable, refused, TTL expired), or no
+    /// reply before the exchange budget ran out, or the proxy closing the
+    /// connection instead of replying.
+    Target(String),
+}
+
+/// Connect to `target` through a no-authentication SOCKS5 proxy at
+/// `proxy_addr`, telling a failure of the proxy from a failure of the
+/// target ([`Socks5Failure`]). The TCP connect to the proxy is bounded by
+/// `proxy_connect`, and the whole dial, greeting and CONNECT reply
+/// included, by `deadline`.
+///
+/// Written out rather than through `tokio_socks`, whose single error does
+/// not say whether a timeout or an EOF came during the greeting (the proxy)
+/// or while the proxy dialled the target. 0x01, general failure, is the
+/// target's: a proxy that answered the greeting is up, and a code given per
+/// CONNECT held against the proxy would redial that target for ever.
+pub async fn connect_socks5_staged(
+    proxy_addr: SocketAddr,
+    target: SocketAddr,
+    proxy_connect: Duration,
+    deadline: tokio::time::Instant,
+) -> Result<TcpStream, Socks5Failure> {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    let proxy_err = |what: &str| Socks5Failure::Proxy(format!("proxy {proxy_addr}: {what}"));
+    let connect_by = deadline.min(tokio::time::Instant::now() + proxy_connect);
+    let mut sock = match tokio::time::timeout_at(connect_by, TcpStream::connect(proxy_addr)).await {
+        Err(_) => return Err(proxy_err("did not accept in time")),
+        Ok(Err(e)) => return Err(proxy_err(&format!("unreachable: {e}"))),
+        Ok(Ok(s)) => s,
+    };
+    // Greeting: version 5, one method, no authentication.
+    let greeting = async {
+        sock.write_all(&[0x05, 0x01, 0x00]).await?;
+        let mut choice = [0u8; 2];
+        sock.read_exact(&mut choice).await?;
+        Ok::<_, std::io::Error>(choice)
+    };
+    match tokio::time::timeout_at(deadline, greeting).await {
+        Err(_) => return Err(proxy_err("no greeting reply in time")),
+        Ok(Err(e)) => return Err(proxy_err(&format!("greeting failed: {e}"))),
+        Ok(Ok([0x05, 0x00])) => {}
+        Ok(Ok(choice)) => {
+            return Err(proxy_err(&format!(
+                "refused the greeting (version {}, method {:#04x})",
+                choice[0], choice[1]
+            )));
+        }
+    }
+    let mut request = vec![0x05, 0x01, 0x00];
+    match target.ip().to_canonical() {
+        std::net::IpAddr::V4(v4) => {
+            request.push(0x01);
+            request.extend_from_slice(&v4.octets());
+        }
+        std::net::IpAddr::V6(v6) => {
+            request.push(0x04);
+            request.extend_from_slice(&v6.octets());
+        }
+    }
+    request.extend_from_slice(&target.port().to_be_bytes());
+    if let Err(e) = sock.write_all(&request).await {
+        return Err(proxy_err(&format!("request not sent: {e}")));
+    }
+    // The reply's head: version, reply code, reserved, address type.
+    let mut head = [0u8; 4];
+    match tokio::time::timeout_at(deadline, sock.read_exact(&mut head)).await {
+        Err(_) => {
+            return Err(Socks5Failure::Target(format!(
+                "{target}: no CONNECT reply in time"
+            )));
+        }
+        Ok(Err(e)) => {
+            return Err(Socks5Failure::Target(format!(
+                "{target}: the proxy closed without a reply: {e}"
+            )));
+        }
+        Ok(Ok(_)) => {}
+    }
+    if head[0] != 0x05 {
+        return Err(proxy_err(&format!("reply version {}", head[0])));
+    }
+    let reason = match head[1] {
+        0x00 => None,
+        0x01 => Some("general failure"),
+        0x02 => Some("not allowed by ruleset"),
+        0x03 => Some("network unreachable"),
+        0x04 => Some("host unreachable"),
+        0x05 => Some("connection refused"),
+        0x06 => Some("TTL expired"),
+        0x07 => return Err(proxy_err("CONNECT not supported")),
+        0x08 => return Err(proxy_err("address type not supported")),
+        code => return Err(proxy_err(&format!("unassigned reply code {code:#04x}"))),
+    };
+    if let Some(reason) = reason {
+        return Err(Socks5Failure::Target(format!(
+            "{target}: {reason} (SOCKS5 reply {:#04x})",
+            head[1]
+        )));
+    }
+    // The bound address, which nothing here needs.
+    let rest = match head[3] {
+        0x01 => 4 + 2,
+        0x04 => 16 + 2,
+        0x03 => {
+            let mut len = [0u8; 1];
+            match tokio::time::timeout_at(deadline, sock.read_exact(&mut len)).await {
+                Ok(Ok(_)) => usize::from(len[0]) + 2,
+                _ => return Err(proxy_err("truncated reply")),
+            }
+        }
+        atyp => return Err(proxy_err(&format!("reply address type {atyp}"))),
+    };
+    let mut bound = vec![0u8; rest];
+    match tokio::time::timeout_at(deadline, sock.read_exact(&mut bound)).await {
+        Ok(Ok(_)) => Ok(sock),
+        _ => Err(proxy_err("truncated reply")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -416,5 +546,118 @@ mod tests {
             pass, "iso-tok-42",
             "isolation password must reach the proxy"
         );
+    }
+
+    /// How the staged-dial test proxy behaves.
+    #[derive(Clone, Copy)]
+    enum Staged {
+        /// Answer the greeting, then the CONNECT with this reply code, and
+        /// the IPv6 or IPv4 request it got.
+        Reply(u8),
+        /// Accept and say nothing.
+        SilentGreeting,
+        /// Answer the greeting with a method it was not offered.
+        WrongMethod,
+        /// Answer the greeting, then say nothing to the CONNECT.
+        SilentConnect,
+        /// Answer the greeting, then close on the CONNECT.
+        CloseOnConnect,
+    }
+
+    /// A one-connection proxy behaving as `how`; the request's address
+    /// type comes back.
+    async fn staged_proxy(how: Staged) -> (SocketAddr, tokio::task::JoinHandle<Option<u8>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let task = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.ok()?;
+            if let Staged::SilentGreeting = how {
+                tokio::time::sleep(Duration::from_secs(10)).await;
+                return None;
+            }
+            let mut head = [0u8; 2];
+            sock.read_exact(&mut head).await.ok()?;
+            let mut methods = vec![0u8; head[1] as usize];
+            sock.read_exact(&mut methods).await.ok()?;
+            if let Staged::WrongMethod = how {
+                let _ = sock.write_all(&[0x05, 0xff]).await;
+                tokio::time::sleep(Duration::from_secs(10)).await;
+                return None;
+            }
+            sock.write_all(&[0x05, 0x00]).await.ok()?;
+            let mut req = [0u8; 4];
+            sock.read_exact(&mut req).await.ok()?;
+            let len = if req[3] == 0x04 { 16 } else { 4 };
+            let mut rest = vec![0u8; len + 2];
+            sock.read_exact(&mut rest).await.ok()?;
+            match how {
+                Staged::Reply(code) => {
+                    let _ = sock
+                        .write_all(&[0x05, code, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+                        .await;
+                    tokio::time::sleep(Duration::from_secs(3)).await;
+                }
+                Staged::SilentConnect => tokio::time::sleep(Duration::from_secs(10)).await,
+                _ => {}
+            }
+            Some(req[3])
+        });
+        (addr, task)
+    }
+
+    async fn staged(proxy: SocketAddr, target: &str) -> Result<TcpStream, Socks5Failure> {
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(800);
+        connect_socks5_staged(proxy, target.parse().unwrap(), Duration::from_secs(2), deadline).await
+    }
+
+    /// A staged dial tells the proxy's failures from the target's: a
+    /// proxy nothing listens on, one that never greets, or one that refuses
+    /// the greeting fails as the proxy; a CONNECT the proxy cannot serve
+    /// (0x07, 0x08, an unassigned code) too. Reply codes 0x01 to 0x06, no
+    /// reply in time, and a close instead of a reply are the target's.
+    /// Perturbation: map 0x05 to `Proxy` and the refused case fails here.
+    #[tokio::test]
+    async fn a_staged_dial_tells_the_proxy_from_the_target() {
+        let (ok, task) = staged_proxy(Staged::Reply(0x00)).await;
+        assert!(staged(ok, "203.0.113.7:8333").await.is_ok());
+        assert_eq!(task.await.unwrap(), Some(0x01), "IPv4 by address");
+        let (ok6, task) = staged_proxy(Staged::Reply(0x00)).await;
+        assert!(staged(ok6, "[2001:db8::7]:8333").await.is_ok());
+        assert_eq!(task.await.unwrap(), Some(0x04), "IPv6 by address");
+
+        let closed = {
+            let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            l.local_addr().unwrap()
+        };
+        assert!(matches!(
+            staged(closed, "203.0.113.7:8333").await,
+            Err(Socks5Failure::Proxy(_))
+        ));
+        for how in [Staged::SilentGreeting, Staged::WrongMethod] {
+            let (p, _t) = staged_proxy(how).await;
+            assert!(matches!(
+                staged(p, "203.0.113.7:8333").await,
+                Err(Socks5Failure::Proxy(_))
+            ));
+        }
+        for code in [0x07u8, 0x08, 0x09, 0xff] {
+            let (p, _t) = staged_proxy(Staged::Reply(code)).await;
+            let got = staged(p, "203.0.113.7:8333").await;
+            assert!(matches!(got, Err(Socks5Failure::Proxy(_))), "{code:#04x}: {got:?}");
+        }
+        for code in 0x01u8..=0x06 {
+            let (p, _t) = staged_proxy(Staged::Reply(code)).await;
+            let got = staged(p, "203.0.113.7:8333").await;
+            assert!(matches!(got, Err(Socks5Failure::Target(_))), "{code:#04x}: {got:?}");
+        }
+        for how in [Staged::SilentConnect, Staged::CloseOnConnect] {
+            let (p, _t) = staged_proxy(how).await;
+            let started = std::time::Instant::now();
+            assert!(matches!(
+                staged(p, "203.0.113.7:8333").await,
+                Err(Socks5Failure::Target(_))
+            ));
+            assert!(started.elapsed() < Duration::from_secs(3), "bounded by the deadline");
+        }
     }
 }
