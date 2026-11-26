@@ -32,9 +32,10 @@ pub enum EsploraError {
     #[error("watch-set quota exceeded")]
     WatchQuotaExceeded,
     /// 400: the script's history is over the per-request cap, so the
-    /// request is refused rather than computed. mempool.space's electrs
-    /// answers the same way (400, "Too many history entries") above its
-    /// history limit.
+    /// request is refused rather than computed. The wording is Blockstream
+    /// electrs' history-cap error (`ErrorKind::TooPopular`, "Too many
+    /// history entries"); electrs answers its own capped REST lookups with
+    /// a 400 too.
     #[error("Too many history entries (more than {0} transactions)")]
     HistoryTooLarge(usize),
     #[error("internal: {0}")]
