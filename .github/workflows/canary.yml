@@ -337,6 +337,42 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
+  # rbitcoin-space canary — the block explorer's own regtest tooling
+  # (dev/regtest/regtest.py at RBITCOIN_SPACE_VERSION), unmodified, against
+  # satd through a stand-in `docker`. Its scenario checks the mempool,
+  # Esplora address history and Electrum history it builds; `hostile` sends a
+  # transaction with several OP_RETURN outputs, and `tagged` hand-built blocks.
+  canary-explorer:
+    name: canary / rbitcoin-space
+    needs: [build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Download satd binaries
+        uses: actions/download-artifact@v8
+        with:
+          name: satd-canary-binaries
+          path: target/release/
+
+      - name: Mark binaries executable
+        run: chmod +x target/release/satd target/release/sat-cli
+
+      - name: Run rbitcoin-space canary
+        run: bash scripts/canary/explorer-smoke.sh
+
+      - name: Upload satd log on failure
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: explorer-canary-logs
+          path: /tmp/satd-canary-explorer.*/satd.log
+          if-no-files-found: ignore
+          retention-days: 7
+
   # Electrum protocol canary — line-delimited JSON-RPC over TCP via
   # raw `nc`. Catches wire-format breaks at a level below the Rust
   # `electrum-client` crate (which the in-tree e2e suite already
