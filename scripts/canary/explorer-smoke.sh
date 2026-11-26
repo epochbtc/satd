@@ -34,7 +34,7 @@ source "$SCRIPT_DIR/PINS"
 
 WORK="$(mktemp -d -t satd-canary-explorer.XXXXXX)"
 DATADIR="$WORK/satd"
-PORT_BASE=18700
+PORT_BASE=19100  # distinct from every other canary, so local runs can overlap
 RPC_PORT=$PORT_BASE
 P2P_PORT=$((PORT_BASE + 1))
 ESPLORA_PORT=$((PORT_BASE + 2))
