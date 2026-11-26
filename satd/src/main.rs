@@ -743,6 +743,12 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
             node::shutdown::exit_now(1);
         }
     };
+    // -crawlproxy against -proxy/-onion given as host names: resolved once,
+    // here, never on a SIGHUP reload.
+    if let Err(e) = config.check_crawlproxy_tor_names() {
+        eprintln!("Error: {}", e);
+        node::shutdown::exit_now(1);
+    }
     replay_stop_budget.store(
         config.max_shutdown_secs,
         std::sync::atomic::Ordering::Relaxed,

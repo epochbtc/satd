@@ -4433,7 +4433,10 @@ impl Config {
         let alt_slots =
             resolve_alt_slots(&cli.alt_slot_args, &file_get, &file_get_all, maxconnections)?;
         let crawl = resolve_crawl(&cli.crawl_args, &file_get, &file_get_all, network)?;
-        check_crawlproxy_not_tor(crawl.proxy, proxy.as_deref(), onion.as_deref())?;
+        // Literal addresses only here: this runs on every SIGHUP reload
+        // too, where a name lookup could stall. Names are compared once, at
+        // startup (`Config::check_crawlproxy_tor_names`).
+        check_crawlproxy_not_tor(crawl.proxy, proxy.as_deref(), onion.as_deref(), false)?;
 
         Ok(Config {
             network,
@@ -9029,6 +9032,13 @@ fn resolve_crawl(
             if sa.port() == 0 {
                 return Err(format!("-crawlproxy={v}: port 0"));
             }
+            // 0.0.0.0 and [::] name no proxy, and a connect to one reaches
+            // this host's loopback, where the Tor proxy may listen.
+            if sa.ip().is_unspecified() {
+                return Err(format!(
+                    "-crawlproxy={v}: an unspecified address (0.0.0.0, [::]) names no proxy"
+                ));
+            }
             Some(sa)
         }
     };
@@ -9098,14 +9108,16 @@ fn resolve_crawl(
 /// `-crawlproxy` must not be the node's Tor proxy (`-proxy` or `-onion`):
 /// the clearnet crawl would leave through Tor exits, which the crawl never
 /// does. Each of `-proxy` and `-onion` is taken as an IP address and port
-/// or, failing that, resolved once here as a host name and port
+/// or, with `resolve_names`, failing that resolved as a host name and port
 /// (`ToSocketAddrs`); a value that resolves to nothing (no port, an
 /// unknown name, no resolver) is not refused on that basis. Nothing is
-/// resolved without `-crawlproxy`.
+/// resolved without `-crawlproxy`, nor without `resolve_names`: config
+/// parsing passes false (it runs on every reload), startup true, once.
 fn check_crawlproxy_not_tor(
     crawlproxy: Option<std::net::SocketAddr>,
     proxy: Option<&str>,
     onion: Option<&str>,
+    resolve_names: bool,
 ) -> Result<(), String> {
     let Some(crawl) = crawlproxy else {
         return Ok(());
@@ -9117,6 +9129,9 @@ fn check_crawlproxy_not_tor(
         };
         if let Ok(sa) = v.parse::<std::net::SocketAddr>() {
             return vec![sa];
+        }
+        if !resolve_names {
+            return Vec::new();
         }
         v.to_socket_addrs().map(Iterator::collect).unwrap_or_default()
     };
@@ -9142,6 +9157,19 @@ fn crawlproxy_clashes(
 }
 
 impl Config {
+    /// [`check_crawlproxy_not_tor`] with `-proxy` and `-onion` host names
+    /// resolved: called once at startup, never on a reload (a lookup there
+    /// could stall it). Literal addresses were already compared when the
+    /// config was read.
+    pub fn check_crawlproxy_tor_names(&self) -> Result<(), String> {
+        check_crawlproxy_not_tor(
+            self.crawlproxy,
+            self.proxy.as_deref(),
+            self.onion.as_deref(),
+            true,
+        )
+    }
+
     /// The crawl's settings as the peer manager takes them. Every value was
     /// checked when the config was read. `datadir`, the network's data
     /// directory, holds the book, the snapshots and the default export key,
@@ -13552,6 +13580,8 @@ blockmintxfee=0.00001
             "-crawlproxy=127.0.0.1:0",
             "-crawlproxy=127.0.0.1:99999",
             "-crawlproxy=::1:1080",
+            "-crawlproxy=0.0.0.0:9050",
+            "-crawlproxy=[::]:9050",
         ] {
             let err = load(&[bad]).expect_err(bad);
             assert!(err.contains("-crawlproxy"), "{bad}: {err}");
@@ -13581,18 +13611,23 @@ blockmintxfee=0.00001
             .expect_err("the crawl proxy spelled another way");
         assert!(err.contains("Tor exits"), "{err}");
         assert!(load(&["-proxy=127.0.0.1:9050", "-crawlproxy=127.0.0.1:1081"]).is_ok());
-        // A host name is resolved: whatever this host's `localhost` names
-        // first is refused, and a name that resolves to nothing is not.
+        // A host name is resolved, at startup only: whatever this host's
+        // `localhost` names first is refused there, never while the config
+        // is read (a reload must not wait on a lookup); a name that
+        // resolves to nothing is not refused.
         use std::net::ToSocketAddrs as _;
         if let Some(local) = "localhost:9050".to_socket_addrs().ok().and_then(|mut a| a.next()) {
-            let err = load(&["-proxy=localhost:9050", &format!("-crawlproxy={local}")])
-                .expect_err("a -proxy host name is resolved");
+            let c = load(&["-proxy=localhost:9050", &format!("-crawlproxy={local}")])
+                .expect("no name is looked up while the config is read");
+            let err = c.check_crawlproxy_tor_names().expect_err("a -proxy host name is resolved");
             assert!(err.contains("(-proxy)"), "{err}");
-            let err = load(&["-onion=localhost:9050", &format!("-crawlproxy={local}")])
-                .expect_err("an -onion host name is resolved");
+            let c = load(&["-onion=localhost:9050", &format!("-crawlproxy={local}")])
+                .expect("no name is looked up while the config is read");
+            let err = c.check_crawlproxy_tor_names().expect_err("an -onion host name is resolved");
             assert!(err.contains("(-onion)"), "{err}");
         }
-        assert!(load(&["-proxy=proxy.invalid:9050", "-crawlproxy=127.0.0.1:9050"]).is_ok());
+        let c = load(&["-proxy=proxy.invalid:9050", "-crawlproxy=127.0.0.1:9050"]).unwrap();
+        assert!(c.check_crawlproxy_tor_names().is_ok());
     }
 
     /// The comparison against resolved addresses: any of a name's addresses

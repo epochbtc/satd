@@ -286,8 +286,9 @@ node stays where it is. The proxy must be one that is not a Tor exit:
 `-crawlproxy` at the address of `-proxy` or `-onion` is refused at
 startup (compared as addresses, so `[::ffff:127.0.0.1]:9050` matches
 `127.0.0.1:9050`; a `-proxy` or `-onion` given as a host name and port is
-resolved once at startup and refused if any of its addresses matches, and
-one that does not resolve is not refused on that basis).
+resolved once at startup, never on a `SIGHUP` reload, and refused if any
+of its addresses matches, and one that does not resolve is not refused on
+that basis).
 
 The best setup is a SOCKS5 server on the far host, bound to its
 loopback, reached through an SSH tunnel:
@@ -349,7 +350,8 @@ crawlproxy=127.0.0.1:1081
   does. DNS seeding is unchanged: under `-proxy` the onion seeds, else a
   local lookup.
 - The value is an IP address and port (`127.0.0.1:1081`, `[::1]:1081`),
-  never a host name; anything else is refused at startup.
+  never a host name and never an unspecified address (`0.0.0.0`, `[::]`);
+  anything else is refused at startup.
 
 ## What it stores
 
