@@ -285,7 +285,8 @@ SOCKS5 proxy, so the crawl's source address is the proxy host's and the
 node stays where it is. The proxy must be one that is not a Tor exit:
 `-crawlproxy` at the address of `-proxy` or `-onion` is refused at
 startup (compared as addresses, so `[::ffff:127.0.0.1]:9050` matches
-`127.0.0.1:9050`; a `-proxy` or `-onion` given as a host name and port is
+`127.0.0.1:9050`, and every loopback address counts as one host, so
+`[::1]:9050` matches it too; a `-proxy` or `-onion` given as a host name and port is
 resolved once at startup, never on a `SIGHUP` reload, and refused if any
 of its addresses matches, and one that does not resolve is not refused on
 that basis).

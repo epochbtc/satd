@@ -9033,8 +9033,9 @@ fn resolve_crawl(
                 return Err(format!("-crawlproxy={v}: port 0"));
             }
             // 0.0.0.0 and [::] name no proxy, and a connect to one reaches
-            // this host's loopback, where the Tor proxy may listen.
-            if sa.ip().is_unspecified() {
+            // this host's loopback, where the Tor proxy may listen. Checked
+            // canonical, so [::ffff:0.0.0.0] is 0.0.0.0.
+            if sa.ip().to_canonical().is_unspecified() {
                 return Err(format!(
                     "-crawlproxy={v}: an unspecified address (0.0.0.0, [::]) names no proxy"
                 ));
@@ -9140,14 +9141,19 @@ fn check_crawlproxy_not_tor(
 
 /// Whether `crawl` is any of the addresses each Tor proxy option resolved
 /// to, compared as socket addresses with the IP canonical (`[::ffff:a.b.c.d]`
-/// is `a.b.c.d`), so another spelling of one address is caught.
+/// is `a.b.c.d`), so another spelling of one address is caught. Every
+/// loopback address is one host: `127.0.0.1:9050` and `[::1]:9050` clash,
+/// since one Tor daemon may listen on both.
 fn crawlproxy_clashes(
     crawl: std::net::SocketAddr,
     tor: &[(&str, Vec<std::net::SocketAddr>)],
 ) -> Result<(), String> {
-    let canonical = |sa: &std::net::SocketAddr| (sa.ip().to_canonical(), sa.port());
+    let same = |a: &std::net::SocketAddr, b: &std::net::SocketAddr| {
+        let (ia, ib) = (a.ip().to_canonical(), b.ip().to_canonical());
+        a.port() == b.port() && (ia == ib || (ia.is_loopback() && ib.is_loopback()))
+    };
     for (flag, addrs) in tor {
-        if addrs.iter().any(|sa| canonical(sa) == canonical(&crawl)) {
+        if addrs.iter().any(|sa| same(sa, &crawl)) {
             return Err(format!(
                 "-crawlproxy must not be the Tor proxy ({flag}): the clearnet crawl would go through Tor exits"
             ));
@@ -13582,6 +13588,7 @@ blockmintxfee=0.00001
             "-crawlproxy=::1:1080",
             "-crawlproxy=0.0.0.0:9050",
             "-crawlproxy=[::]:9050",
+            "-crawlproxy=[::ffff:0.0.0.0]:9050",
         ] {
             let err = load(&[bad]).expect_err(bad);
             assert!(err.contains("-crawlproxy"), "{bad}: {err}");
@@ -13610,6 +13617,17 @@ blockmintxfee=0.00001
         let err = load(&["-proxy=127.0.0.1:9050", "-crawlproxy=[::ffff:127.0.0.1]:9050"])
             .expect_err("the crawl proxy spelled another way");
         assert!(err.contains("Tor exits"), "{err}");
+        // Loopback in the other family, or another loopback address, is the
+        // same host: one Tor daemon may listen on all of them.
+        for (tor, crawl) in [
+            ("-proxy=127.0.0.1:9050", "-crawlproxy=[::1]:9050"),
+            ("-onion=[::1]:9050", "-crawlproxy=127.0.0.1:9050"),
+            ("-proxy=127.0.0.1:9050", "-crawlproxy=127.0.0.2:9050"),
+        ] {
+            let err = load(&[tor, crawl]).expect_err(crawl);
+            assert!(err.contains("Tor exits"), "{tor} {crawl}: {err}");
+        }
+        assert!(load(&["-proxy=127.0.0.1:9050", "-crawlproxy=[::1]:1081"]).is_ok());
         assert!(load(&["-proxy=127.0.0.1:9050", "-crawlproxy=127.0.0.1:1081"]).is_ok());
         // A host name is resolved, at startup only: whatever this host's
         // `localhost` names first is refused there, never while the config
