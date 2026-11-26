@@ -216,7 +216,7 @@ pub fn is_standard_output_script(script: &bitcoin::Script, permit_bare_multisig:
     script.is_p2pkh()
         || script.is_p2sh()
         || is_p2pk(script)
-        || script.is_op_return()
+        || is_null_data(script)
         // Witness programs: v0 only at the two sizes Core recognises, and any
         // other version at any valid program size (`WITNESS_UNKNOWN`, which
         // also covers pay-to-anchor). A v0 program of some other length is
@@ -229,6 +229,15 @@ pub fn is_standard_output_script(script: &bitcoin::Script, permit_bare_multisig:
             Some(v) if v != bitcoin::WitnessVersion::V0
         )
         || (permit_bare_multisig && is_standard_bare_multisig(script))
+}
+
+/// Core's `NULL_DATA` (`Solver`, `src/script/solver.cpp`): `OP_RETURN`
+/// followed only by pushes. rust-bitcoin's `is_op_return` checks the first
+/// byte alone, so `OP_RETURN OP_CHECKSIG` passed it; Core calls that
+/// `NONSTANDARD` and refuses it as `scriptpubkey`.
+pub fn is_null_data(script: &bitcoin::Script) -> bool {
+    let b = script.as_bytes();
+    b.first() == Some(&0x6a) && bitcoin::Script::from_bytes(&b[1..]).is_push_only()
 }
 
 /// Core's `MatchPayToPubkey` (`src/script/solver.cpp`): a single 33- or
@@ -251,7 +260,7 @@ fn is_p2pk(script: &bitcoin::Script) -> bool {
 
 /// Core's `IsStandard` accepts `MULTISIG` only up to x-of-3: `1 <= n <= 3` and
 /// `1 <= m <= n`. `Script::is_multisig` checks the shape but not the bound.
-fn is_standard_bare_multisig(script: &bitcoin::Script) -> bool {
+pub(crate) fn is_standard_bare_multisig(script: &bitcoin::Script) -> bool {
     if !script.is_multisig() {
         return false;
     }
@@ -466,6 +475,9 @@ mod tests {
                     v
                 }),
             ),
+            // `OP_RETURN` then a non-push: Core's Solver needs push-only
+            // after the `OP_RETURN` for NULL_DATA.
+            ("OP_RETURN OP_CHECKSIG", ScriptBuf::from_bytes(vec![0x6a, 0xac])),
             (
                 "P2PK with a bad key prefix",
                 ScriptBuf::from_bytes({

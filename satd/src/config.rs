@@ -5944,7 +5944,7 @@ pub struct CliArgs {
     #[arg(
         long,
         value_name = "BYTES",
-        help = "Maximum OP_RETURN size in bytes (default: 83, 0 = reject all)"
+        help = "Maximum total size in bytes of a transaction's OP_RETURN output scripts, all of them together (default: 100000, 0 = reject all)"
     )]
     pub datacarriersize: Option<usize>,
 

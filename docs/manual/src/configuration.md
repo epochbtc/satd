@@ -74,7 +74,7 @@ data with Bitcoin Core requires a patched fork such as Bitcoin Knots:
 | Flag | Default | Notes |
 |---|---|---|
 | `--datacarrier=<0\|1>` | `1` | If set to `0`, rejects all transactions containing `OP_RETURN` outputs from entering the mempool or being relayed. |
-| `--datacarriersize=<bytes>` | `83` | The maximum permitted size of an `OP_RETURN` script. Anything larger is rejected as non-standard. |
+| `--datacarriersize=<bytes>` | `100000` | The maximum total size of a transaction's `OP_RETURN` output scripts. A transaction may carry several `OP_RETURN` outputs; their scripts count together against this one budget, as in Core v30. A transaction over it is non-standard (`datacarrier`). |
 | `--dustrelayfee=<sat/kvB>` | `3000` | The threshold used to calculate dust. Raising it forces transactions that create tiny, unspendable UTXOs to pay higher fees. |
 | `--permitbaremultisig=<0\|1>` | `1` | If `0`, rejects non-standard bare multisig setups, a construction often used for data storage. |
 | `--limitclustercount=<N>` | `64` | Do not accept a transaction whose cluster (the unconfirmed transactions connected to it through spends, itself included) would hold more than `N`; it is rejected as `too-large-cluster`. This is the limit that gates admission; `64` is also the maximum, so the option can only lower it. |

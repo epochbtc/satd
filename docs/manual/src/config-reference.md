@@ -300,7 +300,7 @@ startup error.
 | `minrelaytxfee` | 1000 sat/kvB | hot | core | Minimum relay fee rate. A bare integer is sat/kvB; a decimal is BTC/kvB, Bitcoin Core's spelling (`0.00001` = 1000 sat/kvB). |
 | `dustrelayfee` | 3000 sat/kvB | hot | core | Dust relay fee rate. A bare integer is sat/kvB; a decimal is BTC/kvB, Bitcoin Core's spelling (`0.00003` = 3000 sat/kvB). |
 | `datacarrier` | on | hot | core | Accept `OP_RETURN` outputs. |
-| `datacarriersize` | 83 bytes | hot | core | Maximum `OP_RETURN` size in bytes (`0` = reject all). |
+| `datacarriersize` | 100000 bytes | hot | core | Maximum total size in bytes of a transaction's `OP_RETURN` output scripts, all of them together, as in Core v30 (`0` = reject all). |
 | `limitclustercount` | 64 | hot | core | Do not accept a transaction whose cluster, the unconfirmed transactions connected to it through spends in either direction and itself included, would hold more than this many; it is rejected as `too-large-cluster`. 64 is both the default and the maximum, so the option can only lower it; a larger value is a startup error. |
 | `limitclustersize` | 101 kvB | hot | core | Do not accept a transaction whose cluster would come to more than this many kilobytes of sigop-adjusted virtual size; it is rejected as `too-large-cluster`. `maxmempool` must leave room for 40 such clusters. |
 | `limitancestorcount` | 25 | hot | core | Maximum unconfirmed ancestor count. Deprecated in Bitcoin Core v31 and superseded by `limitclustercount`; accepted for config compatibility but no longer gates admission. |

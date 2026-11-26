@@ -3115,7 +3115,31 @@ impl Mempool {
             return Err(MempoolError::Validation("tx-size".to_string()));
         }
 
-        // Dust output check. Core's `IsStandardTx` (`src/policy/policy.cpp`)
+        // Output scripts, in output order, as Core's `IsStandardTx`
+        // (`src/policy/policy.cpp`): a script `Solver` calls NONSTANDARD is
+        // `scriptpubkey`; a NULL_DATA output spends from one datacarrier byte
+        // budget shared by every NULL_DATA output in the transaction
+        // (`-datacarriersize`, 0 under `-datacarrier=0`), so a transaction may
+        // carry several OP_RETURN outputs as long as their scripts fit
+        // together (Core v30); a bare multisig under `-permitbaremultisig=0`
+        // is `bare-multisig`. The first failing output decides the reason.
+        let mut datacarrier_bytes_left = if cfg.data_carrier { cfg.data_carrier_size } else { 0 };
+        for output in &tx.output {
+            let spk = &output.script_pubkey;
+            if !policy::is_standard_output_script(spk, true) {
+                return Err(MempoolError::Validation("scriptpubkey".to_string()));
+            }
+            if policy::is_null_data(spk) {
+                if spk.len() > datacarrier_bytes_left {
+                    return Err(MempoolError::NonStandardOpReturn);
+                }
+                datacarrier_bytes_left -= spk.len();
+            } else if !cfg.permit_bare_multisig && policy::is_standard_bare_multisig(spk) {
+                return Err(MempoolError::Validation("bare-multisig".to_string()));
+            }
+        }
+
+        // Dust output check, after the outputs as in Core. Core's `IsStandardTx` (`src/policy/policy.cpp`)
         // permits up to `MAX_DUST_OUTPUTS_PER_TX` dust outputs — one — so that
         // a zero-fee ephemeral-dust parent stays standard; the zero-fee
         // requirement on that one output is `PreCheckEphemeralTx`'s job, and
@@ -3128,35 +3152,6 @@ impl Mempool {
         // and no output is dust, which is exactly how Core switches it off.
         if Self::count_dust_outputs(tx, cfg.dust_relay_fee) > policy::MAX_DUST_OUTPUTS_PER_TX {
             return Err(MempoolError::Dust);
-        }
-
-        // OP_RETURN limits (configurable via -datacarrier and -datacarriersize).
-        if !cfg.data_carrier {
-            for output in &tx.output {
-                if output.script_pubkey.is_op_return() {
-                    return Err(MempoolError::NonStandardOpReturn);
-                }
-            }
-        } else {
-            let mut op_return_count = 0;
-            for output in &tx.output {
-                if output.script_pubkey.is_op_return() {
-                    op_return_count += 1;
-                    if op_return_count > 1 {
-                        return Err(MempoolError::NonStandardOpReturn);
-                    }
-                    if output.script_pubkey.len() > cfg.data_carrier_size {
-                        return Err(MempoolError::NonStandardOpReturn);
-                    }
-                }
-            }
-        }
-
-        // Non-standard output scripts.
-        for output in &tx.output {
-            if !policy::is_standard_output_script(&output.script_pubkey, cfg.permit_bare_multisig) {
-                return Err(MempoolError::Validation("scriptpubkey".to_string()));
-            }
         }
 
         Ok(())
@@ -11399,20 +11394,14 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn test_multiple_op_return_rejected() {
+    /// A transaction with the given outputs and one dummy input, for the
+    /// output half of `check_standardness`.
+    fn tx_with_outputs(outputs: Vec<bitcoin::ScriptBuf>) -> Transaction {
         use bitcoin::blockdata::locktime::absolute::LockTime;
         use bitcoin::hashes::Hash;
-        use bitcoin::transaction;
-        use bitcoin::{Amount, ScriptBuf, Sequence, TxIn, TxOut, Witness};
-
-        let (cs, mp, dir) = make_test_env();
-
-        // Build a tx with two OP_RETURN outputs (each within size limit)
-        let op_return_script = ScriptBuf::from_bytes(vec![0x6a, 0x04, 0xde, 0xad, 0xbe, 0xef]);
-
-        let tx = Transaction {
-            version: transaction::Version(2),
+        use bitcoin::{Amount, Sequence, TxIn, TxOut, Witness};
+        Transaction {
+            version: bitcoin::transaction::Version(2),
             lock_time: LockTime::ZERO,
             input: vec![TxIn {
                 previous_output: OutPoint {
@@ -11421,26 +11410,182 @@ mod tests {
                     ),
                     vout: 0,
                 },
-                script_sig: ScriptBuf::new(),
+                script_sig: bitcoin::ScriptBuf::new(),
                 sequence: Sequence::MAX,
                 witness: Witness::new(),
             }],
-            output: vec![
-                TxOut {
-                    value: Amount::ZERO,
-                    script_pubkey: op_return_script.clone(),
-                },
-                TxOut {
-                    value: Amount::ZERO,
-                    script_pubkey: op_return_script,
-                },
-            ],
+            output: outputs
+                .into_iter()
+                .map(|script_pubkey| TxOut {
+                    // Zero for OP_RETURN, well above dust for the rest.
+                    value: if script_pubkey.as_bytes().first() == Some(&0x6a) {
+                        Amount::ZERO
+                    } else {
+                        Amount::from_sat(100_000)
+                    },
+                    script_pubkey,
+                })
+                .collect(),
+        }
+    }
+
+    fn standardness_reason(tx: &Transaction, cfg: &MempoolConfig) -> Option<String> {
+        let weight = tx.weight().to_wu() as usize;
+        Mempool::check_standardness(tx, cfg, weight)
+            .err()
+            .map(|e| e.reject_reason())
+    }
+
+    fn data_output(len: usize) -> bitcoin::ScriptBuf {
+        // OP_RETURN, then OP_PUSHDATA1 of the rest: `len` bytes in all.
+        assert!(len >= 3 && len - 3 <= 0xff);
+        let mut v = vec![0x6a, 0x4c, (len - 3) as u8];
+        v.resize(len, 0xab);
+        bitcoin::ScriptBuf::from_bytes(v)
+    }
+
+    fn p2wpkh_output() -> bitcoin::ScriptBuf {
+        let mut v = vec![0x00, 0x14];
+        v.extend_from_slice(&[0x11; 20]);
+        bitcoin::ScriptBuf::from_bytes(v)
+    }
+
+    /// Core v30's `IsStandardTx`: every NULL_DATA output draws on one
+    /// `-datacarriersize` budget, so several OP_RETURN outputs are standard
+    /// while their scripts fit together. satd used to refuse the second
+    /// OP_RETURN output whatever its size.
+    #[test]
+    fn op_return_outputs_share_one_datacarrier_budget() {
+        let tx = tx_with_outputs(vec![data_output(40), p2wpkh_output(), data_output(43)]);
+        let at = |size| MempoolConfig {
+            data_carrier_size: size,
+            ..Default::default()
         };
+        assert_eq!(standardness_reason(&tx, &MempoolConfig::default()), None);
+        assert_eq!(
+            standardness_reason(&tx, &at(83)),
+            None,
+            "40 + 43 fits a budget of 83"
+        );
+        assert_eq!(
+            standardness_reason(&tx, &at(82)).as_deref(),
+            Some("datacarrier"),
+            "40 + 43 does not fit 82, though each fits alone"
+        );
+        let three = tx_with_outputs(vec![data_output(10), data_output(10), data_output(10)]);
+        assert_eq!(standardness_reason(&three, &at(30)), None);
+        assert_eq!(
+            standardness_reason(&three, &at(29)).as_deref(),
+            Some("datacarrier")
+        );
+    }
 
-        let result = mp.accept_transaction(tx, &cs, &NoopVerifier, TxSource::Rpc, false);
-        assert!(matches!(result, Err(MempoolError::NonStandardOpReturn)));
+    /// `-datacarrier=0` leaves a budget of 0: even a bare `OP_RETURN` is
+    /// refused, as in Core.
+    #[test]
+    fn datacarrier_off_refuses_a_bare_op_return() {
+        let cfg = MempoolConfig {
+            data_carrier: false,
+            ..Default::default()
+        };
+        let tx = tx_with_outputs(vec![bitcoin::ScriptBuf::from_bytes(vec![0x6a])]);
+        assert_eq!(
+            standardness_reason(&tx, &cfg).as_deref(),
+            Some("datacarrier")
+        );
+        let plain = tx_with_outputs(vec![p2wpkh_output()]);
+        assert_eq!(standardness_reason(&plain, &cfg), None);
+    }
 
-        let _ = std::fs::remove_dir_all(&dir);
+    /// Core's NULL_DATA is `OP_RETURN` followed by pushes only; anything else
+    /// after it is NONSTANDARD, refused as `scriptpubkey`, and draws nothing
+    /// from the datacarrier budget.
+    #[test]
+    fn op_return_followed_by_a_non_push_is_scriptpubkey() {
+        let tx = tx_with_outputs(vec![bitcoin::ScriptBuf::from_bytes(vec![0x6a, 0xac])]);
+        assert_eq!(
+            standardness_reason(&tx, &MempoolConfig::default()).as_deref(),
+            Some("scriptpubkey")
+        );
+        // OP_RESERVED (0x50) and the small-number opcodes count as pushes.
+        let pushes = tx_with_outputs(vec![bitcoin::ScriptBuf::from_bytes(vec![
+            0x6a, 0x50, 0x51, 0x00,
+        ])]);
+        assert_eq!(
+            standardness_reason(&pushes, &MempoolConfig::default()),
+            None
+        );
+    }
+
+    /// Core checks outputs in order, and the first failing one decides the
+    /// reason; the dust count comes after every output has passed.
+    #[test]
+    fn first_failing_output_decides_the_reason_before_dust() {
+        let cfg = MempoolConfig {
+            data_carrier_size: 83,
+            ..Default::default()
+        };
+        let junk = bitcoin::ScriptBuf::from_bytes(vec![0xff; 10]);
+        let a = tx_with_outputs(vec![junk.clone(), data_output(100)]);
+        assert_eq!(
+            standardness_reason(&a, &cfg).as_deref(),
+            Some("scriptpubkey")
+        );
+        let b = tx_with_outputs(vec![data_output(100), junk]);
+        assert_eq!(
+            standardness_reason(&b, &cfg).as_deref(),
+            Some("datacarrier")
+        );
+
+        // Two dust outputs (one is allowed) and an oversize OP_RETURN: Core's
+        // output loop refuses it as `datacarrier` before it counts dust.
+        let mut dusty = tx_with_outputs(vec![p2wpkh_output(), p2wpkh_output(), data_output(100)]);
+        dusty.output[0].value = bitcoin::Amount::from_sat(1);
+        dusty.output[1].value = bitcoin::Amount::from_sat(1);
+        assert_eq!(
+            standardness_reason(&dusty, &cfg).as_deref(),
+            Some("datacarrier")
+        );
+        dusty.output.pop();
+        assert_eq!(standardness_reason(&dusty, &cfg).as_deref(), Some("dust"));
+    }
+
+    /// Under `-permitbaremultisig=0` Core refuses an x-of-3 bare multisig as
+    /// `bare-multisig`; past x-of-3 it is NONSTANDARD, `scriptpubkey`, either
+    /// way.
+    #[test]
+    fn bare_multisig_reasons_match_core() {
+        fn multisig(m: u8, n: u8) -> bitcoin::ScriptBuf {
+            let mut v = vec![0x50 + m];
+            for _ in 0..n {
+                v.push(33);
+                v.push(0x02);
+                v.extend_from_slice(&[0x11; 32]);
+            }
+            v.push(0x50 + n);
+            v.push(0xae);
+            bitcoin::ScriptBuf::from_bytes(v)
+        }
+        let off = MempoolConfig {
+            permit_bare_multisig: false,
+            ..Default::default()
+        };
+        let on = MempoolConfig::default();
+        let one_of_two = tx_with_outputs(vec![multisig(1, 2)]);
+        assert_eq!(standardness_reason(&one_of_two, &on), None);
+        assert_eq!(
+            standardness_reason(&one_of_two, &off).as_deref(),
+            Some("bare-multisig")
+        );
+        let four = tx_with_outputs(vec![multisig(1, 4)]);
+        assert_eq!(
+            standardness_reason(&four, &on).as_deref(),
+            Some("scriptpubkey")
+        );
+        assert_eq!(
+            standardness_reason(&four, &off).as_deref(),
+            Some("scriptpubkey")
+        );
     }
 
     #[test]
